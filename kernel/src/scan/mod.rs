@@ -20,7 +20,7 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
@@ -118,7 +118,7 @@ pub struct StatsOptions {
     /// the existing JSON is passed through regardless.
     pub(crate) synthesize_json: bool,
 
-    /// Which struct stats columns to emit in `stats_parsed`.
+    /// Which struct stats columns to request in `stats_parsed`.
     pub(crate) struct_stats: StructStats,
 }
 
@@ -131,7 +131,7 @@ pub enum StructStats {
     None,
     /// Emit all indexed stats columns.
     All,
-    /// Emit only the specified stats columns.
+    /// Emit at least the specified stats columns. Predicate-referenced columns may also appear.
     Columns(Vec<ColumnName>),
 }
 
@@ -161,8 +161,8 @@ impl StatsOptions {
         }
     }
 
-    /// Struct stats projected to the specified columns without JSON synthesis. Like
-    /// [`Self::all_struct`] but narrowed to a subset of indexed columns.
+    /// Struct stats for at least the specified columns without JSON synthesis. Predicate-referenced
+    /// columns may also appear because scan paths can retain stats used for data skipping.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
@@ -1084,7 +1084,6 @@ impl Scan {
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
-        let log_segment = self.snapshot.log_segment();
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
         let plan_executor = engine.require_plan_executor()?;
@@ -1093,14 +1092,7 @@ impl Scan {
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
         )?;
-        scan_plan::build_metadata_scan_plan(
-            &self.state_info,
-            log_segment,
-            &shape,
-            &self.stats,
-            &self.partition_values,
-            self.physical_stats_output_schema.as_ref(),
-        )
+        self.build_metadata_scan_plan(&shape)
     }
 
     // Factored out to facilitate testing
@@ -1179,7 +1171,7 @@ impl Scan {
         )?;
 
         let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add"]),
+            prefix: column_name!("add"),
         };
         let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))

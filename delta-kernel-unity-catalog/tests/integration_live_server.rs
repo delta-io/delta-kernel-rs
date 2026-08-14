@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray, StructArray};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::column_name;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -206,10 +206,7 @@ async fn live_create_table() {
     create_table(table_root.as_str(), schema, "delta-kernel-rs-live-test")
         .with_table_properties(disk_props)
         .with_data_layout(DataLayout::Clustered {
-            columns: vec![
-                ColumnName::new(["name"]),
-                ColumnName::new(["address", "city"]),
-            ],
+            columns: vec![column_name!("name"), column_name!("address", "city")],
         })
         .build(engine.as_ref(), committer)
         .expect("failed to build create-table transaction")

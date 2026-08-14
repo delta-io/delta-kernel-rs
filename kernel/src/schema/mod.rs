@@ -24,8 +24,8 @@ use crate::table_features::{
     StaleAnnotationPolicy,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::utils::require;
-use crate::{CollectInto, DeltaResult, Error};
+use crate::utils::{require, CollectInto};
+use crate::{DeltaResult, Error};
 
 pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
@@ -714,15 +714,6 @@ impl StructField {
     #[inline]
     pub const fn metadata(&self) -> &HashMap<String, MetadataValue> {
         &self.metadata
-    }
-
-    /// Convert our metadata into a HashMap<String, String>. Note this copies all the data so can be
-    /// expensive for large metadata
-    pub fn metadata_with_string_values(&self) -> HashMap<String, String> {
-        self.metadata
-            .iter()
-            .map(|(key, val)| (key.clone(), val.to_string()))
-            .collect()
     }
 
     /// Applies physical name and field ID mappings to this field.
@@ -2436,6 +2427,17 @@ impl DataType {
     pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
     pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
     pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
+
+    /// Compact type name for diagnostics that must not expand nested schemas.
+    pub(crate) fn kind_name(&self) -> String {
+        match self {
+            Self::Primitive(primitive) => primitive.to_string(),
+            Self::Array(_) => "array".to_string(),
+            Self::Struct(_) => "struct".to_string(),
+            Self::Map(_) => "map".to_string(),
+            Self::Variant(_) => "variant".to_string(),
+        }
+    }
 
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
@@ -4761,28 +4763,28 @@ mod tests {
         ]);
 
         // Mismatched casing -> normalized to schema
-        let cols = vec![ColumnName::new(["eventdate"])];
+        let cols = vec![column_name!("eventdate")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["EventDate"]
         );
 
         // Nested path -> each field name normalized
-        let cols = vec![ColumnName::new(["address", "city"])];
+        let cols = vec![column_name!("address.city")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["Address", "City"]
         );
 
         // Already matching -> unchanged
-        let cols = vec![ColumnName::new(["id"])];
+        let cols = vec![column_name!("id")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["id"]
         );
 
         // Unrecognized -> keeps original
-        let cols = vec![ColumnName::new(["nonexistent"])];
+        let cols = vec![column_name!("nonexistent")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["nonexistent"]

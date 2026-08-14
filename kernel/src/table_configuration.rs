@@ -863,8 +863,13 @@ impl TableConfiguration {
                     // Legacy reader: protocol reader version meets minimum requirement
                     self.protocol.min_reader_version() >= min_reader_version
                 } else {
-                    // Table features reader: feature is in reader_features list
+                    // Reader-supported if the feature is in reader_features, or it is a legacy
+                    // ReaderWriter feature (only ColumnMapping) whose minimum reader version is
+                    // met. The second case stays compatible with tables a past delta-spark bug
+                    // created with ReaderWriter features in writerFeatures only, absent from
+                    // readerFeatures.
                     Self::has_feature(self.protocol.reader_features(), feature)
+                        || feature.is_valid_for_legacy_reader(self.protocol.min_reader_version())
                 };
 
                 let writer_supported = if self.is_legacy_writer_version() {
@@ -936,7 +941,9 @@ mod test {
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
-    use crate::schema::{schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{
+        column_name, schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType,
+    };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -1704,6 +1711,43 @@ mod test {
     }
 
     #[test]
+    fn test_is_feature_supported_orphaned_column_mapping() {
+        // A (3, 7) table with ColumnMapping in writerFeatures but missing from readerFeatures.
+        // ColumnMapping is a legacy ReaderWriter feature whose minimum reader version (2) is met by
+        // reader version 3, so it counts as reader-supported even though it is absent from
+        // readerFeatures. It is in writerFeatures, so it is writer-supported too.
+        let config = create_mock_table_config_with_cm(
+            &[],
+            Some(ColumnMappingMode::Name),
+            &TableFeature::EMPTY_LIST,
+            &[TableFeature::ColumnMapping],
+        );
+        assert!(config.is_feature_supported(&TableFeature::ColumnMapping));
+
+        // A non-legacy ReaderWriter feature in the same writer-only position has no legacy reader
+        // version to fall back on, so the protocol is rejected outright rather than tolerated.
+        assert!(Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(TableFeature::EMPTY_LIST),
+            Some(vec![TableFeature::DeletionVectors]),
+        )
+        .is_err());
+
+        // The conformant shape (ColumnMapping in both lists) is still reported supported: the
+        // legacy-version fallback does not perturb the normal reader_features membership path.
+        let conformant = create_mock_table_config(&[], &[TableFeature::ColumnMapping]);
+        assert!(conformant.is_feature_supported(&TableFeature::ColumnMapping));
+    }
+
+    #[test]
+    fn test_column_mapping_absent_from_both_lists_is_unsupported() {
+        // ColumnMapping in neither list must not be treated as supported: the writer half fails.
+        let config = create_mock_table_config(&[], &[TableFeature::AppendOnly]);
+        assert!(!config.is_feature_supported(&TableFeature::ColumnMapping));
+    }
+
+    #[test]
     fn test_is_feature_enabled_with_property_check() {
         use crate::table_properties::APPEND_ONLY;
 
@@ -2203,15 +2247,12 @@ mod test {
         );
 
         let column_names = config.physical_stats_column_names(None);
-        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
+        assert_eq!(column_names, vec![column_name!("phys_data")]);
 
         // Also verify partition columns are excluded when passed as required columns
-        let required = [
-            ColumnName::new(["phys_part_a"]),
-            ColumnName::new(["phys_part_b"]),
-        ];
+        let required = [column_name!("phys_part_a"), column_name!("phys_part_b")];
         let column_names = config.physical_stats_column_names(Some(&required));
-        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
+        assert_eq!(column_names, vec![column_name!("phys_data")]);
     }
 
     #[test]
@@ -2235,7 +2276,7 @@ mod test {
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
         let column_names = config.physical_stats_column_names(None);
-        assert_eq!(column_names, vec![ColumnName::new(["data_col"])]);
+        assert_eq!(column_names, vec![column_name!("data_col")]);
     }
 
     #[test]
@@ -2272,10 +2313,7 @@ mod test {
         // Should return physical names, not logical names
         assert_eq!(
             column_names,
-            vec![
-                ColumnName::new(["phys_col_a"]),
-                ColumnName::new(["phys_col_b"]),
-            ],
+            vec![column_name!("phys_col_a"), column_name!("phys_col_b"),],
             "Expected physical column names, not logical names"
         );
     }
@@ -2290,10 +2328,7 @@ mod test {
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(
             column_names,
-            vec![
-                ColumnName::new(["phys_id"]),
-                ColumnName::new(["phys_info", "phys_name"]),
-            ],
+            vec![column_name!("phys_id"), column_name!("phys_info.phys_name"),],
         );
     }
 
@@ -2305,7 +2340,7 @@ mod test {
             [("delta.dataSkippingStatsColumns", "id,nonexistent")],
         );
         let column_names = config.physical_stats_column_names(None);
-        assert_eq!(column_names, vec![ColumnName::new(["phys_id"])],);
+        assert_eq!(column_names, vec![column_name!("phys_id")],);
     }
 
     #[rstest]
@@ -2313,83 +2348,83 @@ mod test {
     #[case::flat_none(
         test_schema_flat(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        vec![column_name!("id"), column_name!("name")],
     )]
     #[case::flat_name(
         test_schema_flat_with_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_name")],
     )]
     #[case::flat_id(
         test_schema_flat_with_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_name")],
     )]
     // --- nested schema (includes map/array inside struct as leaf columns) ---
     #[case::nested_none(
         test_schema_nested(),
         "none",
         vec![
-            ColumnName::new(["id"]),
-            ColumnName::new(["info", "name"]),
-            ColumnName::new(["info", "age"]),
-            ColumnName::new(["info", "tags"]),
-            ColumnName::new(["info", "scores"]),
+            column_name!("id"),
+            column_name!("info.name"),
+            column_name!("info.age"),
+            column_name!("info.tags"),
+            column_name!("info.scores"),
         ],
     )]
     #[case::nested_name(
         test_schema_nested_with_column_mapping(),
         "name",
         vec![
-            ColumnName::new(["phys_id"]),
-            ColumnName::new(["phys_info", "phys_name"]),
-            ColumnName::new(["phys_info", "phys_age"]),
-            ColumnName::new(["phys_info", "phys_tags"]),
-            ColumnName::new(["phys_info", "phys_scores"]),
+            column_name!("phys_id"),
+            column_name!("phys_info.phys_name"),
+            column_name!("phys_info.phys_age"),
+            column_name!("phys_info.phys_tags"),
+            column_name!("phys_info.phys_scores"),
         ],
     )]
     #[case::nested_id(
         test_schema_nested_with_column_mapping(),
         "id",
         vec![
-            ColumnName::new(["phys_id"]),
-            ColumnName::new(["phys_info", "phys_name"]),
-            ColumnName::new(["phys_info", "phys_age"]),
-            ColumnName::new(["phys_info", "phys_tags"]),
-            ColumnName::new(["phys_info", "phys_scores"]),
+            column_name!("phys_id"),
+            column_name!("phys_info.phys_name"),
+            column_name!("phys_info.phys_age"),
+            column_name!("phys_info.phys_tags"),
+            column_name!("phys_info.phys_scores"),
         ],
     )]
     // --- schema with map (included as leaf for nullCount stats) ---
     #[case::map_none(
         test_schema_with_map(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["entries"]), ColumnName::new(["name"])],
+        vec![column_name!("id"), column_name!("entries"), column_name!("name")],
     )]
     #[case::map_name(
         test_schema_with_map_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_entries"), column_name!("phys_name")],
     )]
     #[case::map_id(
         test_schema_with_map_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_entries"), column_name!("phys_name")],
     )]
     // --- schema with array (included as leaf for nullCount stats) ---
     #[case::array_none(
         test_schema_with_array(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["items"]), ColumnName::new(["name"])],
+        vec![column_name!("id"), column_name!("items"), column_name!("name")],
     )]
     #[case::array_name(
         test_schema_with_array_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_items"), column_name!("phys_name")],
     )]
     #[case::array_id(
         test_schema_with_array_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_items"), column_name!("phys_name")],
     )]
     fn test_physical_stats_column_names_all_schemas(
         #[case] schema: SchemaRef,

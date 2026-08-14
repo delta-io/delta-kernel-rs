@@ -246,22 +246,31 @@ impl From<&Aggregate> for proto_plan::AggregateNode {
 impl From<&Agg> for proto_plan::Agg {
     fn from(agg: &Agg) -> Self {
         let func = match agg {
-            Agg::Min { value } => proto_agg::Func::Min(proto_plan::MinAgg {
+            Agg::Min(value) => proto_agg::Func::Min(proto_plan::MinAgg {
                 value: Some(value.into()),
             }),
-            Agg::Max { value } => proto_agg::Func::Max(proto_plan::MaxAgg {
+            Agg::Max(value) => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
-            Agg::MinNonNullBy { value, key } => {
+            Agg::Sum(value) => proto_agg::Func::Sum(proto_plan::SumAgg {
+                value: Some(value.into()),
+            }),
+            Agg::Count(value) => proto_agg::Func::Count(proto_plan::CountAgg {
+                value: Some(value.into()),
+            }),
+            Agg::CountStar => proto_agg::Func::CountStar(proto_plan::CountStarAgg {}),
+            Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
-            Agg::MaxNonNullBy { value, key } => {
+            Agg::MaxNonNullBy(operands) => {
                 proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
         };
@@ -969,8 +978,8 @@ mod tests {
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
-        lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
-        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
+        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, DecimalData,
+        Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
         OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator, StructData,
         UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
     };
@@ -1228,10 +1237,7 @@ mod tests {
                 },
                 PlanNode {
                     op: Operator::Filter(Filter {
-                        predicate: Arc::new(Predicate::gt(
-                            Expression::Column(ColumnName::new(["id"])),
-                            lit(5i32),
-                        )),
+                        predicate: Arc::new(Predicate::gt(col!("id"), lit(5i32))),
                     }),
                     inputs: vec![0],
                 },
@@ -1305,10 +1311,10 @@ mod tests {
             file_type: FileType::Parquet,
             base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],
-            path_column: ColumnName::new(["path"]),
-            file_size_column: ColumnName::new(["size"]),
-            last_modified_column: ColumnName::new(["filemod"]),
-            dv_column: ColumnName::new(["dv"]),
+            path_column: column_name!("path"),
+            file_size_column: column_name!("size"),
+            last_modified_column: column_name!("filemod"),
+            dv_column: column_name!("dv"),
         }),
         "dynamic_scan"
     )]
@@ -1449,10 +1455,10 @@ mod tests {
             file_type,
             base_url,
             ["c"],
-            ColumnName::new(["path"]),
-            ColumnName::new(["size"]),
-            ColumnName::new(["filemod"]),
-            ColumnName::new(["dv"]),
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+            column_name!("dv"),
         )?;
         let proto = proto_plan::DynamicScanNode::from(&node);
         assert!(proto.schema.is_some());
@@ -1488,8 +1494,8 @@ mod tests {
     #[test]
     fn from_aggregate() {
         let node = Aggregate {
-            group_by: vec![ColumnName::new(["g"])],
-            aggs: vec![Agg::max(ColumnName::new(["a"]))],
+            group_by: vec![column_name!("g")],
+            aggs: vec![Agg::max(column_name!("a"))],
             schema: sample_schema(),
         };
         let proto = proto_plan::AggregateNode::from(&node);
@@ -1500,16 +1506,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Agg::min(ColumnName::new(["a"])), "min")]
-    #[case(Agg::max(ColumnName::new(["a"])), "max")]
-    #[case(Agg::min_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "min_non_null_by")]
-    #[case(Agg::max_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "max_non_null_by")]
+    #[case(Agg::min(column_name!("a")), "min")]
+    #[case(Agg::max(column_name!("a")), "max")]
+    #[case(Agg::sum(column_name!("a")), "sum")]
+    #[case(Agg::count(column_name!("a")), "count")]
+    #[case(Agg::count_star(), "count_star")]
+    #[case(Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "min_non_null_by")]
+    #[case(Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
         use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);
         let kind = match proto.func.unwrap() {
             Func::Min(_) => "min",
             Func::Max(_) => "max",
+            Func::Sum(_) => "sum",
+            Func::Count(_) => "count",
+            Func::CountStar(_) => "count_star",
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
@@ -1522,8 +1534,8 @@ mod tests {
     fn from_semi_join(#[case] inverted: bool) {
         let node = SemiJoin {
             inverted,
-            probe_keys: vec![ColumnName::new(["p"])],
-            build_keys: vec![ColumnName::new(["b"])],
+            probe_keys: vec![column_name!("p")],
+            build_keys: vec![column_name!("b")],
         };
         let proto = proto_plan::SemiJoinNode::from(&node);
         assert_eq!(proto.inverted, inverted);
@@ -1542,7 +1554,7 @@ mod tests {
 
     #[rstest]
     #[case(lit(1), "literal")]
-    #[case(Expression::Column(ColumnName::new(["a"])), "column")]
+    #[case(col!("a"), "column")]
     #[case(Expression::Predicate(Box::new(Predicate::TRUE)), "predicate")]
     #[case(Expression::struct_from([lit(1)]), "struct_expr")]
     #[case(
@@ -1556,7 +1568,7 @@ mod tests {
     #[case(Expression::coalesce([lit(1), lit(2)]), "variadic")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
-    #[case(Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))), "map_to_struct")]
+    #[case(Expression::map_to_struct(col!("m")), "map_to_struct")]
     #[case(Expression::unknown("x"), "unknown")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
@@ -1602,7 +1614,7 @@ mod tests {
 
     #[test]
     fn from_column_name() {
-        let proto = proto_expr::ColumnName::from(&ColumnName::new(["a", "b", "c"]));
+        let proto = proto_expr::ColumnName::from(&column_name!("a.b.c"));
         assert_eq!(proto.path, vec!["a", "b", "c"]);
     }
 
@@ -1686,9 +1698,9 @@ mod tests {
 
     #[test]
     fn from_map_to_struct_expression() {
-        let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
-            Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))),
-        ) else {
+        let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
+            expr_kind_of(Expression::map_to_struct(col!("m")))
+        else {
             panic!("expected a map_to_struct expression");
         };
         assert!(map_to_struct.map_expr.is_some());

@@ -568,7 +568,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_utils::{struct_list_fixture_as, CollectNVisitor, ListFlavor};
     use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
-    use crate::expressions::ArrayData;
+    use crate::expressions::{column_name, ArrayData};
     use crate::schema::{
         schema_ref, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, StructField, StructType,
     };
@@ -961,7 +961,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                    LazyLock::new(|| vec![column_name!("data")]);
                 static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::BINARY]);
                 (&NAMES, &TYPES)
             }
@@ -983,7 +983,7 @@ mod tests {
         }
 
         let mut visitor = BinaryVisitor { values: vec![] };
-        arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor)?;
+        arrow_data.visit_rows(&[column_name!("data")], &mut visitor)?;
 
         // Verify the extracted values
         assert_eq!(visitor.values.len(), 4);
@@ -1023,7 +1023,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                    LazyLock::new(|| vec![column_name!("data")]);
                 static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::BINARY]);
                 (&NAMES, &TYPES)
             }
@@ -1045,7 +1045,7 @@ mod tests {
         }
 
         let mut visitor = BinaryVisitor { values: vec![] };
-        let result = arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor);
+        let result = arrow_data.visit_rows(&[column_name!("data")], &mut visitor);
 
         // Verify that we get a type mismatch error
         assert_result_error_with_message(
@@ -1090,10 +1090,10 @@ mod tests {
         // Column names requested in reverse order (not schema order)
         static REQUESTED_COLUMNS: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
             vec![
-                ColumnName::new(["nested", "y"]),
-                ColumnName::new(["field_b"]),
-                ColumnName::new(["nested", "x"]),
-                ColumnName::new(["field_a"]),
+                column_name!("nested.y"),
+                column_name!("field_b"),
+                column_name!("nested.x"),
+                column_name!("field_a"),
             ]
         });
 
@@ -1150,7 +1150,7 @@ mod tests {
 
         // Request the duplicate column
         static REQUESTED_COLUMNS: LazyLock<Vec<ColumnName>> =
-            LazyLock::new(|| vec![ColumnName::new(["field_a"])]);
+            LazyLock::new(|| vec![column_name!("field_a")]);
 
         struct DummyVisitor;
         impl RowVisitor for DummyVisitor {
@@ -1294,11 +1294,11 @@ mod tests {
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static COLUMNS: LazyLock<[ColumnName; 5]> = LazyLock::new(|| {
                     [
-                        ColumnName::new(["s"]),
-                        ColumnName::new(["i"]),
-                        ColumnName::new(["l"]),
-                        ColumnName::new(["b"]),
-                        ColumnName::new(["bin"]),
+                        column_name!("s"),
+                        column_name!("i"),
+                        column_name!("l"),
+                        column_name!("b"),
+                        column_name!("bin"),
                     ]
                 });
                 static TYPES: &[DataType] = &[
@@ -1651,7 +1651,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["name"])]);
+                    LazyLock::new(|| vec![column_name!("name")]);
                 static TYPES: &[DataType] = &[DataType::STRING];
                 (&NAMES, TYPES)
             }
@@ -1669,7 +1669,7 @@ mod tests {
         }
 
         let mut visitor = Visitor { values: vec![] };
-        arrow_data.visit_rows(&[ColumnName::new(["name"])], &mut visitor)?;
+        arrow_data.visit_rows(&[column_name!("name")], &mut visitor)?;
         assert_eq!(
             visitor.values,
             vec![Some("alice".into()), None, Some("charlie".into())]
@@ -1702,7 +1702,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                    LazyLock::new(|| vec![column_name!("data")]);
                 static TYPES: &[DataType] = &[DataType::BINARY];
                 (&NAMES, TYPES)
             }
@@ -1720,7 +1720,7 @@ mod tests {
         }
 
         let mut visitor = Visitor { values: vec![] };
-        arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor)?;
+        arrow_data.visit_rows(&[column_name!("data")], &mut visitor)?;
         assert_eq!(
             visitor.values,
             vec![Some(b"hello".to_vec()), None, Some(b"\x00\x01".to_vec())]
@@ -1756,7 +1756,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["tags"])]);
+                    LazyLock::new(|| vec![column_name!("tags")]);
                 static TYPES: LazyLock<Vec<DataType>> =
                     LazyLock::new(|| vec![ArrayType::new(DataType::STRING, false).into()]);
                 (&NAMES, &TYPES)
@@ -1775,7 +1775,7 @@ mod tests {
         }
 
         let mut visitor = Visitor { values: vec![] };
-        arrow_data.visit_rows(&[ColumnName::new(["tags"])], &mut visitor)?;
+        arrow_data.visit_rows(&[column_name!("tags")], &mut visitor)?;
         assert_eq!(
             visitor.values,
             vec![

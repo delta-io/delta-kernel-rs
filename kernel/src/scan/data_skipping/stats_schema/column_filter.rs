@@ -245,6 +245,7 @@ impl<'col> StatsColumnFilter<'col> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::column_name;
     use crate::schema::StructType;
     use crate::table_properties::TableProperties;
 
@@ -358,7 +359,7 @@ mod tests {
         let props = make_props_with_num_cols(2);
 
         // Required column is deeply nested: user.address.city
-        let required_cols = vec![ColumnName::new(["user", "address", "city"])];
+        let required_cols = vec![column_name!("user.address.city")];
 
         let address_struct = StructType::new_unchecked([
             StructField::nullable("street", DataType::STRING),
@@ -389,9 +390,9 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["name"]),
-                ColumnName::new(["user", "address", "city"]),
+                column_name!("id"),
+                column_name!("name"),
+                column_name!("user.address.city"),
             ]
         );
     }
@@ -400,15 +401,12 @@ mod tests {
     fn test_required_column_not_in_schema() {
         // Required column that doesn't exist in schema should be silently ignored
         let props = make_props_with_num_cols(2);
-        let required_cols = vec![ColumnName::new(["nonexistent", "column"])];
+        let required_cols = vec![column_name!("nonexistent.column")];
         let schema = abc_schema();
 
         let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
 
         // Should only include normal columns, required column not found
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["a"]), ColumnName::new(["b"]),]
-        );
+        assert_eq!(columns, vec![column_name!("a"), column_name!("b"),]);
     }
 }

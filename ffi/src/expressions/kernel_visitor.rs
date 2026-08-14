@@ -841,7 +841,7 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{Expression, Scalar};
+    use delta_kernel::expressions::{col, lit, Expression, Scalar};
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
 
@@ -1369,8 +1369,8 @@ mod tests {
 
         // Build the predicate through the FFI symbol, then extract the kernel `Predicate`.
         let mut state = KernelExpressionVisitorState::default();
-        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
-        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let col_id = wrap_expression(&mut state, col!("id"));
+        let target = wrap_expression(&mut state, lit(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
         let name = "IN_RANGE";
         let id = ok_or_panic(unsafe {
@@ -1498,8 +1498,8 @@ mod tests {
         unsafe extern "C" fn noop_free(_: *mut c_void) {}
 
         let mut state = KernelExpressionVisitorState::default();
-        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
-        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let col_id = wrap_expression(&mut state, col!("id"));
+        let target = wrap_expression(&mut state, lit(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
         let name = "IN_RANGE";
         let id = ok_or_panic(unsafe {

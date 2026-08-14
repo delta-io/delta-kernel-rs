@@ -33,8 +33,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version,
+    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
+    Version,
 };
 
 mod crc_replay;
@@ -140,9 +140,7 @@ fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<Predica
         .fields()
         .map(|field| action_presence_witness(field.name()))
         .collect::<Option<_>>()?;
-    let mut predicates = columns
-        .into_iter()
-        .map(|col| Expression::column(col).is_not_null());
+    let mut predicates = columns.into_iter().map(Predicate::is_not_null);
     let first = predicates.next()?;
     Some(Arc::new(predicates.fold(first, Predicate::or)))
 }

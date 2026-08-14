@@ -249,10 +249,10 @@ mod tests {
         fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
             static COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
                 let names = vec![
-                    ColumnName::new([DV_LOCATION]),
-                    ColumnName::new([DV_OFFSET]),
-                    ColumnName::new([DV_SIZE_IN_BYTES]),
-                    ColumnName::new([DV_CARDINALITY]),
+                    column_name!(DV_LOCATION),
+                    column_name!(DV_OFFSET),
+                    column_name!(DV_SIZE_IN_BYTES),
+                    column_name!(DV_CARDINALITY),
                 ];
                 let types = vec![
                     DataType::STRING,

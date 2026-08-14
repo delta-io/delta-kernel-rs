@@ -192,7 +192,7 @@ fn to_wire_protocol(protocol: &Protocol) -> WireProtocol {
 mod tests {
     use std::sync::Arc;
 
-    use delta_kernel::expressions::ColumnName;
+    use delta_kernel::expressions::column_name;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
     use delta_kernel::snapshot::Snapshot;
@@ -394,10 +394,7 @@ mod tests {
             schema,
             disk_props,
             DataLayout::Clustered {
-                columns: vec![
-                    ColumnName::new(["region"]),
-                    ColumnName::new(["address", "city"]),
-                ],
+                columns: vec![column_name!("region"), column_name!("address", "city")],
             },
         );
 

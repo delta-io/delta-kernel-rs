@@ -223,16 +223,20 @@ impl Transaction {
     /// of scan file data. It joins the two together internally and will generate appropriate
     /// remove/add actions on commit to update the deletion vectors.
     ///
+    /// Required AddFile fields on matched rows are validated at commit. Staging can therefore
+    /// succeed for metadata that commit later rejects, including an empty path, negative size,
+    /// or incorrect physical partition keys.
+    ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`.
     ///
     /// # Arguments
     ///
     /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to the
     ///   new deletion vector descriptor for that file.
-    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
-    ///   selected elements of each FilteredEngineData must be a superset of the paths that key
-    ///   `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
-    ///   accurate `numRecords` statistic, so matched scan metadata must preserve that stat.
+    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata using
+    ///   [`scan_row_schema`]. Selected rows must preserve the scan-file values and cover every path
+    ///   in `new_dv_descriptors`. Files with deletion vectors must have an accurate
+    ///   `stats.numRecords` value.
     ///
     /// # Errors
     ///

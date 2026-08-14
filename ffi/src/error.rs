@@ -145,20 +145,6 @@ impl From<Error> for KernelError {
     }
 }
 
-#[cfg(test)]
-mod error_code_tests {
-    use super::*;
-
-    #[test]
-    fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
-        assert_eq!(
-            KernelError::from(Error::RowTrackingChangeFeedUnsupported(7)),
-            KernelError::RowTrackingChangeFeedUnsupported
-        );
-        assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
-    }
-}
-
 /// An error that can be returned to the engine. Engines that wish to associate additional
 /// information can define and use any type that is [pointer
 /// interconvertible](https://en.cppreference.com/w/cpp/language/static_cast#pointer-interconvertible)
@@ -376,6 +362,20 @@ impl From<EngineExecError> for Error {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            KernelError::from(Error::RowTrackingChangeFeedUnsupported(7)),
+            KernelError::RowTrackingChangeFeedUnsupported
+        );
+        assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
     }
 }
 

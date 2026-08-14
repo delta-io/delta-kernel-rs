@@ -223,8 +223,9 @@ fn dv_descriptor_map_insert_impl(
 /// Stage deletion-vector update actions on the transaction. For every entry in `dv_map`
 /// the kernel emits a Remove + Add action pair on commit (the Add carries the new DV
 /// descriptor; row-level statistics from the original Add are preserved).
-/// Matched scan metadata must include an accurate `numRecords` statistic because the Delta
-/// protocol requires it for files with deletion vectors.
+/// Every descriptor path must match a selected scan row. Matched scan metadata must have an
+/// accurate `numRecords` statistic and valid AddFile fields, including a non-empty path,
+/// non-negative size, and exact physical partition keys.
 ///
 /// Consumes both `dv_map` and `scan_iter`. The engine should pass an iterator that covers
 /// at least every file path mentioned in the map; extra files are ignored. If the map
