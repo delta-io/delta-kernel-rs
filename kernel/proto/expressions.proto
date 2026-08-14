@@ -150,8 +150,20 @@ message ParseJsonExpression {
   delta.kernel.schema.StructType output_schema = 2;
 }
 
+message MapToStructOptions {
+  // Optional IANA timezone or fixed offset for interpreting offset-less TIMESTAMP values. An
+  // explicit offset in a value takes precedence; absence preserves the default UTC behavior.
+  optional string timestamp_timezone = 1;
+}
+
 message MapToStructExpression {
   Expression map_expr = 1;
+  MapToStructOptions options = 2;
+}
+
+message ElementAtExpression {
+  Expression map_expr = 1;
+  Expression key_expr = 2;
 }
 
 // `nullability_predicate` is optional: when set and it evaluates to false/null, the whole
@@ -239,5 +251,6 @@ message Expression {
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;
     string unknown = 13;
+    ElementAtExpression element_at = 14;
   }
 }

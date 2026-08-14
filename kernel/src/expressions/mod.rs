@@ -359,6 +359,19 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
+/// Looks up one value in a `Map<String, String>` for each input row.
+///
+/// Missing keys, null maps, and null keys evaluate to NULL. Duplicate keys are resolved by taking
+/// the rightmost entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ElementAtExpression {
+    /// The expression that evaluates to a `Map<String, String>` column.
+    pub map_expr: Box<Expression>,
+
+    /// The expression that evaluates to a STRING key column.
+    pub key_expr: Box<Expression>,
+}
+
 /// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
 /// value that cannot be represented in the target type evaluates to NULL rather than erroring.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -517,6 +530,8 @@ pub enum Expression {
     /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
     /// [`MapToStructExpression`] for how values are parsed.
     MapToStruct(MapToStructExpression),
+    /// Looks up a STRING value in a `Map<String, String>`.
+    ElementAt(ElementAtExpression),
     /// Cast a child expression to a target type. See [`CastExpression`].
     Cast(CastExpression),
 }
@@ -641,29 +656,71 @@ impl ParseJsonExpression {
     }
 }
 
+/// Options controlling how a [`MapToStructExpression`] parses map values.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MapToStructOptions {
+    /// Reader timezone used to interpret offset-less `TIMESTAMP` values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp_timezone: Option<String>,
+}
+
+impl MapToStructOptions {
+    /// Interpret offset-less `TIMESTAMP` values in `timestamp_timezone`.
+    ///
+    /// The timezone may be an IANA name or a fixed offset such as `+12:45:30`. Explicit offsets in
+    /// values take precedence. Ambiguous local times use the earlier instant, while nonexistent
+    /// local times use the pre-transition offset. Invalid timezones are reported during
+    /// evaluation.
+    pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
+        self.timestamp_timezone = Some(timestamp_timezone.into());
+        self
+    }
+
+    /// Returns the timezone used to interpret offset-less `TIMESTAMP` values.
+    pub fn timestamp_timezone(&self) -> Option<&str> {
+        self.timestamp_timezone.as_deref()
+    }
+
+    fn is_default(&self) -> bool {
+        self.timestamp_timezone.is_none()
+    }
+}
+
+impl ElementAtExpression {
+    pub(crate) fn new(map_expr: impl Into<Expression>, key_expr: impl Into<Expression>) -> Self {
+        Self {
+            map_expr: Box::new(map_expr.into()),
+            key_expr: Box::new(key_expr.into()),
+        }
+    }
+}
+
 /// Transforms a `Map<String, String>` column into a struct whose schema is provided by the
 /// evaluator's output type (via `result_type`). Each row in the map column becomes one row in
 /// the output struct column: a `key` -> `value` mapping in the map means the struct field named
-/// `key` receives `value`, parsed into the field's target type via [`PrimitiveType::parse_scalar`].
-/// An empty-string value is the exception (aligning with Spark): it casts to itself for string, to
-/// empty bytes for binary, and to null for every other type. This empty-string rule is specific to
-/// this operator; [`ParseJsonExpression`] does not share it.
+/// `key` receives `value`, parsed into the field's target type. Offset-less `TIMESTAMP` values use
+/// the timezone in [`MapToStructOptions`], or UTC when no timezone is configured. An empty-string
+/// value is the exception (aligning with Spark): it casts to itself for string, to empty bytes for
+/// binary, and to null for every other type. This empty-string rule is specific to this operator;
+/// [`ParseJsonExpression`] does not share it.
 ///
 /// - Missing keys produce null values
 /// - A value that cannot be parsed as its target field type returns [`Error::ParseError`]
 /// - Duplicate map keys are resolved by taking the rightmost entry
-///
-/// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MapToStructExpression {
     /// The expression that evaluates to a `Map<String, String>` column.
     pub map_expr: Box<Expression>,
+    /// Options controlling value parsing.
+    #[serde(default, skip_serializing_if = "MapToStructOptions::is_default")]
+    pub options: MapToStructOptions,
 }
 
 impl MapToStructExpression {
-    pub(crate) fn new(map_expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(map_expr: impl Into<Expression>, options: MapToStructOptions) -> Self {
         Self {
             map_expr: Box::new(map_expr.into()),
+            options,
         }
     }
 }
@@ -856,12 +913,19 @@ impl Expression {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
 
-    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct. The output
-    /// struct schema is determined by the evaluator's `result_type`. An empty-string value is the
-    /// exception (aligning with Spark): it casts to itself for string, to empty bytes for binary,
-    /// and to null for every other type. See [`MapToStructExpression`] for the full contract.
-    pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
-        Self::MapToStruct(MapToStructExpression::new(map_expr))
+    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct according
+    /// to `options`. The output struct schema is determined by the evaluator's `result_type`.
+    /// [`MapToStructOptions::default`] interprets offset-less timestamps in UTC. An empty-string
+    /// value is the exception (aligning with Spark): it casts to itself for string, to empty bytes
+    /// for binary, and to null for every other type. See [`MapToStructExpression`] for the full
+    /// contract.
+    pub fn map_to_struct(map_expr: impl Into<Expression>, options: MapToStructOptions) -> Self {
+        Self::MapToStruct(MapToStructExpression::new(map_expr, options))
+    }
+
+    /// Looks up a STRING value in a `Map<String, String>` for each input row.
+    pub fn element_at(map_expr: impl Into<Expression>, key_expr: impl Into<Expression>) -> Self {
+        Self::ElementAt(ElementAtExpression::new(map_expr, key_expr))
     }
 
     /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
@@ -1154,7 +1218,15 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
-            MapToStruct(m) => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
+            MapToStruct(m) => match m.options.timestamp_timezone() {
+                Some(timezone) => write!(
+                    f,
+                    "MAP_TO_STRUCT({}, timestamp_timezone=\"{}\")",
+                    m.map_expr, timezone
+                ),
+                None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
+            },
+            ElementAt(e) => write!(f, "ELEMENT_AT({}, {})", e.map_expr, e.key_expr),
             Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
         }
     }
@@ -1265,7 +1337,9 @@ mod tests {
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{col, column_pred, lit, DataType, Expression as Expr, Predicate as Pred};
+    use super::{
+        col, column_pred, lit, DataType, Expression as Expr, MapToStructOptions, Predicate as Pred,
+    };
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1300,6 +1374,32 @@ mod tests {
             let result = format!("{expr}");
             assert_eq!(result, expected);
         }
+    }
+
+    #[test]
+    fn test_map_to_struct_options_state_and_format() {
+        let default = Expr::map_to_struct(col!("m"), MapToStructOptions::default());
+        let Expr::MapToStruct(default_state) = &default else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(default_state.options.timestamp_timezone(), None);
+        assert_eq!(format!("{default}"), "MAP_TO_STRUCT(Column(m))");
+
+        let configured = Expr::map_to_struct(
+            col!("m"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+        let Expr::MapToStruct(configured_state) = &configured else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(
+            configured_state.options.timestamp_timezone(),
+            Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            format!("{configured}"),
+            "MAP_TO_STRUCT(Column(m), timestamp_timezone=\"America/Los_Angeles\")"
+        );
     }
 
     #[test]
@@ -1342,7 +1442,7 @@ mod tests {
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             col, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-            ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
+            ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1573,13 +1673,23 @@ mod tests {
         #[test]
         fn test_map_to_struct_expression_roundtrip() {
             let cases: Vec<Expression> = vec![
-                Expression::map_to_struct(col!("pv")),
-                Expression::map_to_struct(lit("ignored")),
+                Expression::map_to_struct(col!("pv"), MapToStructOptions::default()),
+                Expression::map_to_struct(lit("ignored"), MapToStructOptions::default()),
+                Expression::map_to_struct(
+                    col!("pv"),
+                    MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                ),
             ];
 
             for expr in &cases {
                 assert_roundtrip(expr);
             }
+        }
+
+        #[test]
+        fn test_element_at_expression_roundtrip() {
+            let expr = Expression::element_at(col!("partitionValues"), col!("partitionKey"));
+            assert_roundtrip(&expr);
         }
 
         // ==================== Predicate Tests ====================

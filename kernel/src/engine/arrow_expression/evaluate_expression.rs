@@ -3,7 +3,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
@@ -14,7 +13,7 @@ use crate::arrow::array::{
     RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
+use crate::arrow::compute::kernels::cast_utils::Parser;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -30,6 +29,7 @@ use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
 use crate::delta_kernel_derive::internal_api;
 use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_ROOT};
+use crate::engine::arrow_data::as_string_accessor;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -43,6 +43,7 @@ use crate::expressions::{
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::timestamp_timezone::TimestampTimezone;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -389,11 +390,21 @@ pub fn evaluate_expression(
         }
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
-            let result = evaluate_map_to_struct(&map_arr, output_schema)?;
+            let timestamp_timezone =
+                TimestampTimezone::parse(m.options.timestamp_timezone().unwrap_or("UTC"))?;
+            let result = evaluate_map_to_struct(&map_arr, output_schema, timestamp_timezone)?;
             Ok(Arc::new(result) as ArrayRef)
         }
         (MapToStruct(_), dt) => Err(Error::Generic(format!(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
+        ))),
+        (ElementAt(e), None | Some(&DataType::STRING)) => {
+            let map_arr = evaluate_expression(&e.map_expr, batch, None)?;
+            let key_arr = evaluate_expression(&e.key_expr, batch, Some(&DataType::STRING))?;
+            evaluate_element_at(&map_arr, &key_arr)
+        }
+        (ElementAt(_), Some(data_type)) => Err(Error::generic(format!(
+            "ElementAt expression requires a STRING result type, but got {data_type:?}"
         ))),
         (Cast(c), result_type) => {
             let input = evaluate_expression(&c.expr, batch, None)?;
@@ -944,13 +955,14 @@ pub fn coalesce_arrays(
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
 ///
-/// Date and timestamp use arrow's `Date32Type::parse` / `string_to_datetime`, which are much
-/// faster than `parse_scalar`'s chrono path and yield the same value for valid Delta partition
-/// values. These arrow parsers accept a superset of the canonical formats (e.g. `20240115`, or a
-/// timestamp carrying an explicit offset) and interpret no-offset timestamps as UTC, matching
-/// `parse_scalar`; spec-compliant writers only emit canonical values, so the extra leniency is
-/// harmless on the read path. All other types go through `parse_scalar`.
-fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
+/// Dates use Arrow's `Date32Type::parse`, while zoned timestamps use `timestamp_timezone` for
+/// offset-less values and honor an explicit offset in the value. `TIMESTAMP_NTZ` retains its UTC
+/// wall-clock representation. All other types go through `parse_scalar`.
+fn parse_partition_scalar(
+    prim: &PrimitiveType,
+    raw: &str,
+    timestamp_timezone: TimestampTimezone,
+) -> DeltaResult<Option<Scalar>> {
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
     }
@@ -962,16 +974,10 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
             return Ok(Some(Scalar::Date(days)));
         }
         PrimitiveType::Timestamp => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
+            let micros = timestamp_timezone.parse_timestamp(raw).ok_or_else(|| {
+                Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
+            })?;
             return Ok(Some(Scalar::Timestamp(micros)));
-        }
-        PrimitiveType::TimestampNtz => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
-            return Ok(Some(Scalar::TimestampNtz(micros)));
         }
         _ => {}
     }
@@ -982,6 +988,7 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
 /// casts via [`PrimitiveType::empty_string_partition_cast`].
+/// `timestamp_timezone` controls the interpretation of offset-less `TIMESTAMP` values.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -989,6 +996,7 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
+    timestamp_timezone: TimestampTimezone,
 ) -> DeltaResult<StructArray> {
     let map_array = map_arr
         .as_any()
@@ -1069,7 +1077,7 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw)? {
+                match parse_partition_scalar(target_types[i], raw, timestamp_timezone)? {
                     Some(scalar) => scalar.append_to(builder, 1)?,
                     None => Scalar::append_null(builder, field.data_type(), 1)?,
                 }
@@ -1104,6 +1112,43 @@ fn evaluate_map_to_struct(
     )?)
 }
 
+fn evaluate_element_at(map_arr: &ArrayRef, key_arr: &ArrayRef) -> DeltaResult<ArrayRef> {
+    let map_array = map_arr
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| Error::generic("ElementAt requires a MapArray as input"))?;
+    let map_keys = as_string_accessor(map_array.keys().as_ref())
+        .ok_or_else(|| Error::generic("ElementAt requires maps with string keys"))?;
+    let map_values = as_string_accessor(map_array.values().as_ref())
+        .ok_or_else(|| Error::generic("ElementAt requires maps with string values"))?;
+    let key_array = as_string_accessor(key_arr.as_ref())
+        .ok_or_else(|| Error::generic("ElementAt requires string keys"))?;
+    if map_array.len() != key_array.len() {
+        return Err(Error::generic(format!(
+            "ElementAt map has {} rows, but key has {} rows",
+            map_array.len(),
+            key_array.len()
+        )));
+    }
+
+    let offsets = map_array.value_offsets();
+    let values = (0..map_array.len()).map(|row| {
+        if map_array.is_null(row) || !key_array.is_valid(row) {
+            return None;
+        }
+        let key = key_array.value(row);
+        let entry_start = offsets[row] as usize;
+        let entry_end = offsets[row + 1] as usize;
+        let entry_idx = (entry_start..entry_end)
+            .rev()
+            .find(|entry_idx| map_keys.value(*entry_idx) == key)?;
+        map_values
+            .is_valid(entry_idx)
+            .then(|| map_values.value(entry_idx))
+    });
+    Ok(Arc::new(StringArray::from_iter(values)))
+}
+
 fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaResult<ArrayRef> {
     if let Some(expected) = expected {
         ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)?;
@@ -1119,9 +1164,9 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, ListArray, MapBuilder, StringArray, StringBuilder, StructArray,
-        TimestampMicrosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int32Builder, Int64Array,
+        LargeStringArray, ListArray, MapBuilder, StringArray, StringBuilder, StringViewArray,
+        StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -1130,7 +1175,7 @@ mod tests {
     use crate::expressions::{
         col, column_expr_ref, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
         Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        Predicate as Pred, StructData,
+        MapToStructOptions, Predicate as Pred, StructData,
     };
     use crate::schema::{
         schema, schema_ref, ArrayType, DataType, MapType, StructField, StructType,
@@ -2690,6 +2735,225 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap()
     }
 
+    fn element_at_batch(map: ArrayRef, key: ArrayRef) -> RecordBatch {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("map", map.data_type().clone(), true),
+            ArrowField::new("key", key.data_type().clone(), true),
+        ]);
+        RecordBatch::try_new(Arc::new(schema), vec![map, key]).unwrap()
+    }
+
+    #[test]
+    fn test_element_at_returns_matching_value() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("region");
+        builder.values().append_value("us");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("region")])),
+        );
+
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values, &StringArray::from(vec![Some("us")]));
+    }
+
+    #[rstest]
+    fn test_element_at_accepts_all_arrow_string_representations(
+        #[values(ArrowDataType::Utf8, ArrowDataType::LargeUtf8, ArrowDataType::Utf8View)]
+        string_type: ArrowDataType,
+    ) {
+        let make_array = |value: &str| -> ArrayRef {
+            match &string_type {
+                ArrowDataType::Utf8 => Arc::new(StringArray::from(vec![Some(value)])),
+                ArrowDataType::LargeUtf8 => Arc::new(LargeStringArray::from(vec![Some(value)])),
+                ArrowDataType::Utf8View => Arc::new(StringViewArray::from(vec![Some(value)])),
+                other => panic!("unexpected string type: {other:?}"),
+            }
+        };
+        let fields: Fields = vec![
+            Arc::new(ArrowField::new("key", string_type.clone(), false)),
+            Arc::new(ArrowField::new("value", string_type.clone(), true)),
+        ]
+        .into();
+        let entries = StructArray::try_new(
+            fields.clone(),
+            vec![make_array("region"), make_array("us")],
+            None,
+        )
+        .unwrap();
+        let map = MapArray::try_new(
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(fields),
+                false,
+            )),
+            OffsetBuffer::new(vec![0i32, 1].into()),
+            entries,
+            None,
+            false,
+        )
+        .unwrap();
+        let batch = element_at_batch(Arc::new(map), make_array("region"));
+
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values, &StringArray::from(vec![Some("us")]));
+    }
+
+    #[test]
+    fn test_element_at_returns_null_for_missing_key_null_map_null_key_and_null_value() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("other");
+        builder.values().append_value("value");
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
+        builder.keys().append_value("region");
+        builder.values().append_value("us");
+        builder.append(true).unwrap();
+        builder.keys().append_value("region");
+        builder.values().append_null();
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![
+                Some("region"),
+                Some("region"),
+                None,
+                Some("region"),
+            ])),
+        );
+
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values.null_count(), 4);
+    }
+
+    #[test]
+    fn test_element_at_uses_rightmost_duplicate_key() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("region");
+        builder.values().append_value("first");
+        builder.keys().append_value("region");
+        builder.values().append_value("last");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("region")])),
+        );
+
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values.value(0), "last");
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_map_input() {
+        let batch = element_at_batch(
+            Arc::new(StringArray::from(vec![Some("not a map")])),
+            Arc::new(StringArray::from(vec![Some("key")])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        );
+        assert_result_error_with_message(result, "requires a MapArray");
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_string_map_keys() {
+        let mut builder = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+        builder.keys().append_value(1);
+        builder.values().append_value("one");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("1")])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        );
+        assert_result_error_with_message(result, "maps with string keys");
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_string_map_values() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.keys().append_value("one");
+        builder.values().append_value(1);
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("one")])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        );
+        assert_result_error_with_message(result, "maps with string values");
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_string_key_expression() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("one");
+        builder.values().append_value("value");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(Int32Array::from(vec![Some(1)])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_string_result_type() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("one");
+        builder.values().append_value("value");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("one")])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::INTEGER),
+        );
+        assert_result_error_with_message(result, "requires a STRING result type");
+    }
+
     #[test]
     fn test_map_to_struct_basic() {
         use crate::arrow::array::Date32Array;
@@ -2701,7 +2965,7 @@ mod tests {
             StructField::nullable("date", DataType::DATE),
         ]);
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2742,7 +3006,7 @@ mod tests {
         let batch = create_partition_map_batch();
         let output_schema = schema! { nullable "nonexistent": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let col = structs
@@ -2778,7 +3042,7 @@ mod tests {
         let output_schema =
             StructType::new_unchecked(vec![StructField::nullable("region", DataType::STRING)]);
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2809,7 +3073,7 @@ mod tests {
 
         let output_schema = schema! { nullable "count": INTEGER };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
     }
@@ -2832,7 +3096,7 @@ mod tests {
         let output_schema =
             StructType::new_unchecked(vec![StructField::nullable("ts", DataType::TIMESTAMP)]);
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let ts = structs
@@ -2841,6 +3105,125 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), 1718443800000000); // 2024-06-15T09:30:00Z
+    }
+
+    fn expected_timestamp_micros(value: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .timestamp_micros()
+    }
+
+    fn evaluate_map_timestamp_timezone(
+        raw: &str,
+        target: DataType,
+        timestamp_timezone: Option<&str>,
+    ) -> DeltaResult<Option<i64>> {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("ts");
+        builder.values().append_value(raw);
+        builder.append(true).unwrap();
+        let map = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new("pv", map.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map)]).unwrap();
+        let output_schema = StructType::new_unchecked(vec![StructField::nullable("ts", target)]);
+        let result_type = DataType::from(output_schema);
+        let expr = match timestamp_timezone {
+            Some(timezone) => Expr::map_to_struct(
+                col!("pv"),
+                MapToStructOptions::default().with_timestamp_timezone(timezone),
+            ),
+            None => Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
+        };
+        let result = evaluate_expression(&expr, &batch, Some(&result_type))?;
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let timestamps = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        Ok(timestamps.is_valid(0).then(|| timestamps.value(0)))
+    }
+
+    #[rstest]
+    #[case::default_compatibility(
+        None,
+        "2024-01-15 12:30:45.123456",
+        "2024-01-15T12:30:45.123456Z"
+    )]
+    #[case::iana_winter(
+        Some("America/Los_Angeles"),
+        "2024-01-15 12:30:45.123456",
+        "2024-01-15T20:30:45.123456Z"
+    )]
+    #[case::iana_summer(
+        Some("America/Los_Angeles"),
+        "2024-06-15 08:00:00.500500",
+        "2024-06-15T15:00:00.500500Z"
+    )]
+    #[case::fixed_offset_with_seconds(
+        Some("+12:45:30"),
+        "2024-01-15 12:30:45.123456",
+        "2024-01-14T23:45:15.123456Z"
+    )]
+    #[case::explicit_input_offset(
+        Some("America/Los_Angeles"),
+        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T10:30:45Z"
+    )]
+    #[case::dst_overlap(
+        Some("America/Los_Angeles"),
+        "2024-11-03 01:30:00",
+        "2024-11-03T08:30:00Z"
+    )]
+    #[case::dst_gap(
+        Some("America/Los_Angeles"),
+        "2024-03-10 02:30:00",
+        "2024-03-10T10:30:00Z"
+    )]
+    #[case::skipped_day(Some("Pacific/Apia"), "2011-12-30 12:00:00", "2011-12-30T22:00:00Z")]
+    fn test_map_to_struct_timestamp_timezone(
+        #[case] timestamp_timezone: Option<&str>,
+        #[case] raw: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            evaluate_map_timestamp_timezone(raw, DataType::TIMESTAMP, timestamp_timezone).unwrap(),
+            Some(expected_timestamp_micros(expected))
+        );
+    }
+
+    #[test]
+    fn test_map_to_struct_timestamp_timezone_does_not_affect_timestamp_ntz() {
+        let raw = "2024-01-15 12:30:45.123456";
+        assert_eq!(
+            evaluate_map_timestamp_timezone(
+                raw,
+                DataType::TIMESTAMP_NTZ,
+                Some("America/Los_Angeles")
+            )
+            .unwrap(),
+            Some(expected_timestamp_micros("2024-01-15T12:30:45.123456Z"))
+        );
+    }
+
+    #[test]
+    fn test_map_to_struct_timestamp_timezone_reports_invalid_inputs() {
+        let invalid_timezone = evaluate_map_timestamp_timezone(
+            "2024-01-15 12:30:45",
+            DataType::TIMESTAMP,
+            Some("Not/AZone"),
+        )
+        .unwrap_err();
+        assert!(invalid_timezone.to_string().contains("Not/AZone"));
+
+        assert!(matches!(
+            evaluate_map_timestamp_timezone(
+                "not a timestamp",
+                DataType::TIMESTAMP,
+                Some("America/Los_Angeles")
+            ),
+            Err(Error::ParseError(..))
+        ));
     }
 
     #[test]
@@ -2862,7 +3245,7 @@ mod tests {
 
         let output_schema = schema! { nullable "x": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let col = structs
@@ -2916,7 +3299,7 @@ mod tests {
             StructField::new("id", DataType::INTEGER, false),
         ]);
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2952,7 +3335,10 @@ mod tests {
 
         let output_schema = schema! { not_null "date": DATE };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::coalesce([col!("pv_parsed"), Expr::map_to_struct(col!("pv"))]);
+        let expr = Expr::coalesce([
+            col!("pv_parsed"),
+            Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
+        ]);
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2970,7 +3356,7 @@ mod tests {
 
         let output_schema = schema! { nullable "x": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("s"));
+        let expr = Expr::map_to_struct(col!("s"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
     }
@@ -3002,7 +3388,7 @@ mod tests {
             StructField::nullable("count", DataType::INTEGER),
         ]);
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -3054,7 +3440,7 @@ mod tests {
             StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
         ]);
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
