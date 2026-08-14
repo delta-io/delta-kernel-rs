@@ -467,8 +467,23 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         Ok(fields) => fields,
         Err(e) => return e.to_compile_error().into(),
     };
-    let (field_idents, field_types): (Vec<_>, Vec<_>) =
-        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
+    let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
+    // Match `ToSchema`: an `#[allow_null_container_values]` field's value must be value-nullable
+    // too.
+    let field_values: Vec<_> = fields
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            if has_named_attr(&f.attrs, "allow_null_container_values") {
+                quote! {
+                    delta_kernel::expressions::Scalar::from(value.#ident)
+                        .with_nullable_container_values()
+                }
+            } else {
+                quote! { value.#ident.into() }
+            }
+        })
+        .collect();
 
     let expanded = quote! {
         #[automatically_derived]
@@ -480,7 +495,7 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
             fn from(value: #struct_name) -> Self {
                 Self::from_values_unchecked(
                     <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
-                    vec![ #(value.#field_idents.into()),* ],
+                    vec![ #(#field_values),* ],
                 )
             }
         }
