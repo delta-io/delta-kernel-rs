@@ -9,9 +9,9 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
-    col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
-    ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
-    Predicate as Pred, PredicateRef, Scalar,
+    col, column_name, column_pred, lit, BinaryPredicateOp, CastOptions, ColumnName,
+    Expression as Expr, ExpressionRef, JunctionPredicateOp, MapToStructOptions,
+    OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -741,6 +741,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         _op: BinaryPredicateOp,
         _col: &ColumnName,
         _target: &DataType,
+        _options: &CastOptions,
         _val: &Scalar,
         _inverted: bool,
     ) -> Option<Pred> {
@@ -863,6 +864,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         op: BinaryPredicateOp,
         col: &ColumnName,
         target: &DataType,
+        options: &CastOptions,
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
@@ -875,7 +877,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
             BinaryPredicateOp::GreaterThan => Ordering::Greater,
             BinaryPredicateOp::Distinct | BinaryPredicateOp::In => return None,
         };
-        let cast = Expr::cast(partition_value_expr(col), target.clone());
+        let cast = Expr::cast(partition_value_expr(col), target.clone(), options.clone());
         Some(comparison_predicate(ord, cast, val, inverted))
     }
 

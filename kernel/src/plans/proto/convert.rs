@@ -12,11 +12,11 @@ use super::{
 };
 use crate::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    ColumnName, DecimalData, ElementAtExpression, Expression, ExpressionFieldPatch,
-    ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression,
-    MapToStructOptions, OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar,
-    StructData, UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
-    VariadicExpression, VariadicExpressionOp,
+    CastExpression, CastOptions, ColumnName, DecimalData, ElementAtExpression, Expression,
+    ExpressionFieldPatch, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, MapData,
+    MapToStructExpression, MapToStructOptions, OpaqueExpression, OpaquePredicate,
+    ParseJsonExpression, Predicate, Scalar, StructData, UnaryExpression, UnaryExpressionOp,
+    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
     Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
@@ -326,8 +326,7 @@ impl From<&Expression> for proto_expr::Expression {
                 Kind::MapToStruct(Box::new(map_to_struct.into()))
             }
             Expression::ElementAt(element_at) => Kind::ElementAt(Box::new(element_at.into())),
-            // No proto cast node yet; serialize as an opaque unknown.
-            Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
+            Expression::Cast(cast) => Kind::Cast(Box::new(cast.into())),
         };
         proto_expr::Expression { kind: Some(kind) }
     }
@@ -426,6 +425,24 @@ impl From<&ElementAtExpression> for proto_expr::ElementAtExpression {
         Self {
             map_expr: Some(Box::new(element_at.map_expr.as_ref().into())),
             key_expr: Some(Box::new(element_at.key_expr.as_ref().into())),
+        }
+    }
+}
+
+impl From<&CastExpression> for proto_expr::CastExpression {
+    fn from(cast: &CastExpression) -> Self {
+        Self {
+            expr: Some(Box::new(cast.expr.as_ref().into())),
+            target: Some((&cast.target).into()),
+            options: (cast.options != CastOptions::default()).then(|| (&cast.options).into()),
+        }
+    }
+}
+
+impl From<&CastOptions> for proto_expr::CastOptions {
+    fn from(options: &CastOptions) -> Self {
+        Self {
+            timestamp_timezone: options.timestamp_timezone().map(ToOwned::to_owned),
         }
     }
 }
@@ -999,10 +1016,11 @@ mod tests {
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
-        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, DecimalData,
-        Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
-        OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
-        StructData, UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
+        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, CastOptions,
+        DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
+        MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar,
+        ScalarExpressionEvaluator, StructData, UnaryExpressionOp, UnaryPredicateOp,
+        VariadicExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1594,6 +1612,10 @@ mod tests {
         "map_to_struct"
     )]
     #[case(Expression::element_at(col!("m"), lit("key")), "element_at")]
+    #[case(
+        Expression::cast(lit("1"), DataType::INTEGER, CastOptions::default(),),
+        "cast"
+    )]
     #[case(Expression::unknown("x"), "unknown")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
@@ -1612,6 +1634,7 @@ mod tests {
             Kind::MapToStruct(_) => "map_to_struct",
             Kind::Unknown(_) => "unknown",
             Kind::ElementAt(_) => "element_at",
+            Kind::Cast(_) => "cast",
         };
         assert_eq!(kind, expected);
     }
@@ -1709,6 +1732,34 @@ mod tests {
         };
         assert!(element_at.map_expr.is_some());
         assert!(element_at.key_expr.is_some());
+    }
+
+    #[test]
+    fn from_cast_expression() {
+        let proto_expr::expression::Kind::Cast(cast) = expr_kind_of(Expression::cast(
+            lit("1"),
+            DataType::INTEGER,
+            CastOptions::default(),
+        )) else {
+            panic!("expected a cast expression");
+        };
+        assert!(cast.expr.is_some());
+        assert_eq!(cast.target, Some((&DataType::INTEGER).into()));
+        assert_eq!(cast.options, None);
+
+        let proto_expr::expression::Kind::Cast(cast) = expr_kind_of(Expression::cast(
+            lit("1"),
+            DataType::TIMESTAMP,
+            CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        )) else {
+            panic!("expected a cast expression");
+        };
+        assert_eq!(
+            cast.options
+                .as_ref()
+                .and_then(|options| options.timestamp_timezone.as_deref()),
+            Some("America/Los_Angeles")
+        );
     }
 
     #[test]

@@ -263,8 +263,10 @@ pub struct EngineExpressionVisitor {
         op: Handle<SharedOpaquePredicateOp>,
         child_list_id: usize,
     ),
-    /// Visits the name of an `Expression::Unknown` or `Predicate::Unknown` belonging to the
-    /// list identified by `sibling_list_id`.
+    /// Visits a node represented as unknown across FFI, belonging to `sibling_list_id`.
+    ///
+    /// Casts use `cast_to_<target>`, or `cast_with_timestamp_timezone_to_<target>` when
+    /// configured.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
 }
@@ -696,6 +698,11 @@ fn visit_expression_impl(
         // The FFI expression visitor has no ElementAt callback. Surface an explicit unknown node
         // so engines cannot silently interpret it as another expression.
         Expression::ElementAt(_) => visit_unknown(visitor, sibling_list_id, "element_at"),
+        Expression::Cast(cast) if cast.options.timestamp_timezone().is_some() => visit_unknown(
+            visitor,
+            sibling_list_id,
+            &format!("cast_with_timestamp_timezone_to_{}", cast.target),
+        ),
         // TODO(#2975): Add a dedicated visitor callback for cast expressions.
         Expression::Cast(cast) => visit_unknown(
             visitor,
@@ -766,7 +773,8 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar};
+    use delta_kernel::expressions::{CastOptions, Expression, MapToStructOptions, Scalar};
+    use delta_kernel::schema::DataType;
     use rstest::rstest;
 
     use super::*;
@@ -984,6 +992,36 @@ mod tests {
             vec![LiteralEvent::Unknown {
                 sibling_list_id: 0,
                 name: "map_to_struct_with_timestamp_timezone".to_string(),
+            }]
+        );
+    }
+
+    #[rstest]
+    #[case::plain(None, "cast_to_timestamp")]
+    #[case::timezone(
+        Some("America/Los_Angeles"),
+        "cast_with_timestamp_timezone_to_timestamp"
+    )]
+    fn cast_visits_unknown(#[case] timezone: Option<&str>, #[case] expected_name: &str) {
+        let options = timezone.map_or_else(CastOptions::default, |timezone| {
+            CastOptions::default().with_timestamp_timezone(timezone)
+        });
+        let expression = Expression::cast(
+            Expression::column(["partitionValue"]),
+            DataType::TIMESTAMP,
+            options,
+        );
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Unknown {
+                sibling_list_id: 0,
+                name: expected_name.to_string(),
             }]
         );
     }

@@ -356,10 +356,7 @@ pub trait ExpressionTransform<'a> {
         expr: &'a MapToStructExpression,
     ) -> Self::Output<MapToStructExpression> {
         let nested = self.transform_expr(&expr.map_expr);
-        let rebuild = |map_expr| MapToStructExpression {
-            map_expr: Box::new(map_expr),
-            options: expr.options.clone(),
-        };
+        let rebuild = |map_expr| MapToStructExpression::new(map_expr, expr.options.clone());
         map_owned_or_else(expr, nested, rebuild)
     }
 
@@ -376,8 +373,8 @@ pub trait ExpressionTransform<'a> {
 
     /// Recursively transforms the child expression of a cast expression (unary).
     fn recurse_into_expr_cast(&mut self, expr: &'a CastExpression) -> Self::Output<CastExpression> {
-        let f = |child| CastExpression::new(child, expr.target.clone());
-        map_owned_or_else(expr, self.transform_expr(&expr.expr), f)
+        let rebuild = |child| CastExpression::new(child, expr.target.clone(), expr.options.clone());
+        map_owned_or_else(expr, self.transform_expr(&expr.expr), rebuild)
     }
 
     /// Recursively transforms the children of an opaque expression (variadic).
@@ -594,9 +591,9 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        col, column_name, column_pred, lit, Expression, Expression as Expr, MapToStructOptions,
-        OpaqueExpressionOp, OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
-        ScalarExpressionEvaluator, VariadicExpression,
+        col, column_name, column_pred, lit, CastOptions, Expression, Expression as Expr,
+        MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp, ParseJsonExpression,
+        Predicate as Pred, Scalar, ScalarExpressionEvaluator, VariadicExpression,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -926,6 +923,23 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_options_survive_child_transform() {
+        let expr = Expr::cast(
+            col!("old_col"),
+            DataType::TIMESTAMP,
+            CastOptions::default().with_timestamp_timezone("Europe/Berlin"),
+        );
+        let Expr::Cast(transformed) = ColumnReplacer.transform_expr(&expr).into_owned() else {
+            panic!("expected cast expression");
+        };
+        assert_eq!(transformed.expr.as_ref(), &col!("new_col"));
+        assert_eq!(
+            transformed.options.timestamp_timezone(),
+            Some("Europe/Berlin")
+        );
+    }
+
+    #[test]
     fn test_transform_expr_parse_json_child_unchanged() {
         // Test when child column doesn't match replacement criteria - should return Cow::Borrowed
         let parse_json_expr = ParseJsonExpression::new(col!("unchanged_col"), test_output_schema());
@@ -1141,7 +1155,11 @@ mod tests {
 
     #[test]
     fn test_depth_checker_counts_cast_expressions() {
-        let expr = Expr::cast(Expr::cast(col!("x"), DataType::INTEGER), DataType::LONG);
+        let expr = Expr::cast(
+            Expr::cast(col!("x"), DataType::INTEGER, CastOptions::default()),
+            DataType::LONG,
+            CastOptions::default(),
+        );
 
         assert_eq!(
             ExpressionDepthChecker::check_expr_with_call_count(&expr, 0),

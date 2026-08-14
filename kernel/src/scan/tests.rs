@@ -20,7 +20,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
-    col, column_name, column_pred, lit, Expression as Expr, Predicate as Pred,
+    col, column_name, column_pred, lit, CastOptions, Expression as Expr, Predicate as Pred,
 };
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
@@ -1119,11 +1119,19 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 ), None)]
 #[case::date_cast_range(Pred::and(
     Pred::ge(
-        Expr::cast(col!("modified"), DataType::DATE),
+        Expr::cast(
+            col!("modified"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_641),
     ),
     Pred::lt(
-        Expr::cast(col!("modified"), DataType::DATE),
+        Expr::cast(
+            col!("modified"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_644),
     ),
 ), Some("CAST(Column(add.partitionValues_parsed.modified) AS date)"))]
@@ -1248,7 +1256,7 @@ fn test_build_actions_meta_predicate_partition_column_mapping(
 
     let predicate = if casted {
         Pred::eq(
-            Expr::cast(col!("category"), DataType::DATE),
+            Expr::cast(col!("category"), DataType::DATE, CastOptions::default()),
             Scalar::Date(20_641),
         )
     } else {
@@ -1668,7 +1676,7 @@ fn standard_multi_rg() -> Bytes {
 #[case::partition_all_pruned(Pred::eq(col!("part"), lit("z")), vec![])]
 #[case::partition_cast_kept(
     Pred::eq(
-        Expr::cast(col!("part"), DataType::DATE),
+        Expr::cast(col!("part"), DataType::DATE, CastOptions::default()),
         Scalar::Date(18_628),
     ),
     vec![1, 2, 3, 4]
@@ -1676,7 +1684,7 @@ fn standard_multi_rg() -> Bytes {
 #[case::partition_cast_and_stats(
     Pred::and(
         Pred::eq(
-            Expr::cast(col!("part"), DataType::DATE),
+            Expr::cast(col!("part"), DataType::DATE, CastOptions::default()),
             Scalar::Date(18_628),
         ),
         Pred::gt(col!("x"), lit(150i64)),

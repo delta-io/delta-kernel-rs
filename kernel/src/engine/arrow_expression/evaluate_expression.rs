@@ -10,7 +10,7 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
     AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    RecordBatch, StringArray, StructArray,
+    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::Parser;
@@ -409,11 +409,32 @@ pub fn evaluate_expression(
         (Cast(c), result_type) => {
             let input = evaluate_expression(&c.expr, batch, None)?;
             let target = ArrowDataType::try_from_kernel(&c.target)?;
-            // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
-            // that to an all-NULL column so an unsupported cast keeps the file.
-            let output = if can_cast_types(input.data_type(), &target) {
+            let string_input = matches!(
+                input.data_type(),
+                ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
+            );
+            let timestamp_timezone = c
+                .options
+                .timestamp_timezone()
+                .filter(|_| c.target == DataType::TIMESTAMP && string_input);
+            let output = if let Some(timestamp_timezone) = timestamp_timezone {
+                let timezone = TimestampTimezone::parse(timestamp_timezone)?;
+                let strings = as_string_accessor(input.as_ref()).ok_or_else(|| {
+                    Error::generic(format!("expected string input, got {}", input.data_type()))
+                })?;
+                let values = (0..strings.len()).map(|index| {
+                    strings
+                        .is_valid(index)
+                        .then(|| strings.value(index))
+                        .and_then(|raw| timezone.parse_timestamp(raw))
+                });
+                Arc::new(TimestampMicrosecondArray::from_iter(values).with_timezone("UTC"))
+                    as ArrayRef
+            } else if can_cast_types(input.data_type(), &target) {
                 cast(&input, &target)?
             } else {
+                // Arrow errors rather than producing per-value nulls for an unsupported type pair.
+                // Degrade that case to an all-null column, matching SQL CAST null semantics.
                 new_null_array(&target, input.len())
             };
             validate_array_type(output, result_type)
@@ -1173,7 +1194,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        col, column_expr_ref, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
+        col, column_expr_ref, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, CastOptions,
         Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
         MapToStructOptions, Predicate as Pred, StructData,
     };
@@ -3144,6 +3165,30 @@ mod tests {
         Ok(timestamps.is_valid(0).then(|| timestamps.value(0)))
     }
 
+    fn evaluate_cast_timestamp_timezone(
+        raw: &str,
+        target: DataType,
+        timestamp_timezone: Option<&str>,
+    ) -> DeltaResult<Option<i64>> {
+        let strings = StringArray::from(vec![Some(raw)]);
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(strings)]).unwrap();
+        let expr = match timestamp_timezone {
+            Some(timezone) => Expr::cast(
+                col!("s"),
+                target.clone(),
+                CastOptions::default().with_timestamp_timezone(timezone),
+            ),
+            None => Expr::cast(col!("s"), target.clone(), CastOptions::default()),
+        };
+        let result = evaluate_expression(&expr, &batch, Some(&target))?;
+        let timestamps = result
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        Ok(timestamps.is_valid(0).then(|| timestamps.value(0)))
+    }
+
     #[rstest]
     #[case::default_compatibility(
         None,
@@ -3170,6 +3215,8 @@ mod tests {
         "2024-01-15 12:30:45+02:00",
         "2024-01-15T10:30:45Z"
     )]
+    #[case::iso_t_separator(Some("UTC"), "2024-01-15T12:30:45", "2024-01-15T12:30:45Z")]
+    #[case::date_only(Some("UTC"), "2024-01-15", "2024-01-15T00:00:00Z")]
     #[case::dst_overlap(
         Some("America/Los_Angeles"),
         "2024-11-03 01:30:00",
@@ -3181,20 +3228,62 @@ mod tests {
         "2024-03-10T10:30:00Z"
     )]
     #[case::skipped_day(Some("Pacific/Apia"), "2011-12-30 12:00:00", "2011-12-30T22:00:00Z")]
-    fn test_map_to_struct_timestamp_timezone(
+    fn test_timestamp_timezone_matrix_for_map_to_struct_and_cast(
         #[case] timestamp_timezone: Option<&str>,
         #[case] raw: &str,
         #[case] expected: &str,
     ) {
+        let expected = Some(expected_timestamp_micros(expected));
         assert_eq!(
             evaluate_map_timestamp_timezone(raw, DataType::TIMESTAMP, timestamp_timezone).unwrap(),
-            Some(expected_timestamp_micros(expected))
+            expected
+        );
+        assert_eq!(
+            evaluate_cast_timestamp_timezone(raw, DataType::TIMESTAMP, timestamp_timezone).unwrap(),
+            expected
         );
     }
 
+    #[rstest]
+    fn test_cast_timestamp_timezone_accepts_all_string_representations(
+        #[values(ArrowDataType::Utf8, ArrowDataType::LargeUtf8, ArrowDataType::Utf8View)]
+        input_type: ArrowDataType,
+    ) {
+        let values: ArrayRef = match input_type {
+            ArrowDataType::Utf8 => {
+                Arc::new(StringArray::from(vec![Some("2024-06-15 09:30:00"), None]))
+            }
+            ArrowDataType::LargeUtf8 => Arc::new(LargeStringArray::from(vec![
+                Some("2024-06-15 09:30:00"),
+                None,
+            ])),
+            ArrowDataType::Utf8View => Arc::new(StringViewArray::from(vec![
+                Some("2024-06-15 09:30:00"),
+                None,
+            ])),
+            other => panic!("unexpected string representation: {other:?}"),
+        };
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", input_type, true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![values]).unwrap();
+        let expr = Expr::cast(
+            col!("s"),
+            DataType::TIMESTAMP,
+            CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::TIMESTAMP)).unwrap();
+        let timestamps = result
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), 1_718_469_000_000_000);
+        assert!(timestamps.is_null(1));
+    }
+
     #[test]
-    fn test_map_to_struct_timestamp_timezone_does_not_affect_timestamp_ntz() {
+    fn test_timestamp_timezone_does_not_affect_timestamp_ntz() {
         let raw = "2024-01-15 12:30:45.123456";
+        let expected = Some(expected_timestamp_micros("2024-01-15T12:30:45.123456Z"));
         assert_eq!(
             evaluate_map_timestamp_timezone(
                 raw,
@@ -3202,19 +3291,36 @@ mod tests {
                 Some("America/Los_Angeles")
             )
             .unwrap(),
-            Some(expected_timestamp_micros("2024-01-15T12:30:45.123456Z"))
+            expected
+        );
+        assert_eq!(
+            evaluate_cast_timestamp_timezone(
+                raw,
+                DataType::TIMESTAMP_NTZ,
+                Some("America/Los_Angeles")
+            )
+            .unwrap(),
+            expected
         );
     }
 
     #[test]
-    fn test_map_to_struct_timestamp_timezone_reports_invalid_inputs() {
-        let invalid_timezone = evaluate_map_timestamp_timezone(
+    fn test_timestamp_timezone_invalid_zone_and_timestamp_errors() {
+        let map_error = evaluate_map_timestamp_timezone(
             "2024-01-15 12:30:45",
             DataType::TIMESTAMP,
             Some("Not/AZone"),
         )
         .unwrap_err();
-        assert!(invalid_timezone.to_string().contains("Not/AZone"));
+        assert!(map_error.to_string().contains("Not/AZone"));
+
+        let cast_error = evaluate_cast_timestamp_timezone(
+            "2024-01-15 12:30:45",
+            DataType::TIMESTAMP,
+            Some("+19:00"),
+        )
+        .unwrap_err();
+        assert!(cast_error.to_string().contains("+19:00"));
 
         assert!(matches!(
             evaluate_map_timestamp_timezone(
@@ -3224,6 +3330,30 @@ mod tests {
             ),
             Err(Error::ParseError(..))
         ));
+        assert_eq!(
+            evaluate_cast_timestamp_timezone(
+                "not a timestamp",
+                DataType::TIMESTAMP,
+                Some("America/Los_Angeles")
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_timestamp_timezone_on_non_timestamp_cast_uses_existing_cast() {
+        let strings = StringArray::from(vec![Some("42")]);
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(strings)]).unwrap();
+        let expr = Expr::cast(
+            col!("s"),
+            DataType::INTEGER,
+            CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let values = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.value(0), 42);
     }
 
     #[test]
@@ -4031,7 +4161,7 @@ mod tests {
         let parts = StringArray::from(vec![Some("2025-04-11"), Some("not-a-date"), None]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(parts)]).unwrap();
 
-        let expr = Expr::cast(col!("part"), DataType::DATE);
+        let expr = Expr::cast(col!("part"), DataType::DATE, CastOptions::default());
         let result = evaluate_expression(&expr, &batch, None).unwrap();
 
         let dates = result.as_primitive::<Date32Type>();
@@ -4046,7 +4176,7 @@ mod tests {
         let parts = StringArray::from(vec![Some("2025-04-11")]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(parts)]).unwrap();
 
-        let expr = Expr::cast(col!("part"), DataType::DATE);
+        let expr = Expr::cast(col!("part"), DataType::DATE, CastOptions::default());
         // The declared result type must match the cast target.
         assert!(evaluate_expression(&expr, &batch, Some(&DataType::LONG)).is_err());
         assert!(evaluate_expression(&expr, &batch, Some(&DataType::DATE)).is_ok());
@@ -4059,7 +4189,7 @@ mod tests {
         let flags = BooleanArray::from(vec![Some(true), Some(false)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(flags)]).unwrap();
 
-        let expr = Expr::cast(col!("flag"), DataType::DATE);
+        let expr = Expr::cast(col!("flag"), DataType::DATE, CastOptions::default());
         let result = evaluate_expression(&expr, &batch, None).unwrap();
 
         assert_eq!(result.len(), 2);

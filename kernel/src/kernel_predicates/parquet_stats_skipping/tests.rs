@@ -1,5 +1,5 @@
 use super::*;
-use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
+use crate::expressions::{col, lit, CastOptions, Expression as Expr, Predicate as Pred};
 use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::DataType;
 
@@ -43,7 +43,10 @@ impl ParquetStatsProvider for UnimplementedTestFilter {
 #[test]
 fn test_cast_stays_unknown_for_parquet_stats() {
     let filter = UnimplementedTestFilter;
-    let pred = Pred::eq(Expr::cast(col!("x"), DataType::DATE), Scalar::Date(19_723));
+    let pred = Pred::eq(
+        Expr::cast(col!("x"), DataType::DATE, CastOptions::default()),
+        Scalar::Date(19_723),
+    );
 
     expect_eq!(filter.eval(&pred), NULL, "{pred:#?}");
 }

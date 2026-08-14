@@ -585,7 +585,10 @@ fn test_checkpoint_skipping_floating_partition_comparison_is_disabled(#[case] va
 #[test]
 fn test_checkpoint_skipping_floating_partition_cast_rewrites_exact_value() {
     let partition_columns = HashSet::from([column_name!("part_col")]);
-    let pred = Pred::eq(Expr::cast(col!("part_col"), DataType::INTEGER), lit(42));
+    let pred = Pred::eq(
+        Expr::cast(col!("part_col"), DataType::INTEGER, CastOptions::default()),
+        lit(42),
+    );
 
     let skipping_pred = as_checkpoint_skipping_predicate(
         &pred,
@@ -600,10 +603,43 @@ fn test_checkpoint_skipping_floating_partition_cast_rewrites_exact_value() {
     );
 }
 
+#[test]
+fn checkpoint_partition_cast_preserves_options() {
+    let partition_columns = HashSet::from([column_name!("part_ts")]);
+    let pred = Pred::gt(
+        Expr::cast(
+            col!("part_ts"),
+            DataType::TIMESTAMP,
+            CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        ),
+        Scalar::Timestamp(1_705_334_400_000_000),
+    );
+
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        skipping_pred.to_string(),
+        concat!(
+            "CAST(Column(partitionValues_parsed.part_ts) AS timestamp USING ",
+            "\"America/Los_Angeles\") > 1705334400000000"
+        )
+    );
+}
+
 #[rstest]
 #[case::range(
     {
-        let cast = Expr::cast(col!("part_col"), DataType::DATE);
+        let cast = Expr::cast(
+            col!("part_col"),
+            DataType::DATE,
+            CastOptions::default(),
+        );
         Pred::and(
             Pred::ge(cast.clone(), Scalar::Date(20_641)),
             Pred::lt(cast, Scalar::Date(20_644)),
@@ -616,28 +652,44 @@ fn test_checkpoint_skipping_floating_partition_cast_rewrites_exact_value() {
 )]
 #[case::equality(
     Pred::eq(
-        Expr::cast(col!("part_col"), DataType::DATE),
+        Expr::cast(
+            col!("part_col"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_641),
     ),
     Some("CAST(Column(partitionValues_parsed.part_col) AS date) = 20641"),
 )]
 #[case::inverted_less(
     Pred::ge(
-        Expr::cast(col!("part_col"), DataType::DATE),
+        Expr::cast(
+            col!("part_col"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_641),
     ),
     Some("NOT(CAST(Column(partitionValues_parsed.part_col) AS date) < 20641)"),
 )]
 #[case::inverted_greater(
     Pred::le(
-        Expr::cast(col!("part_col"), DataType::DATE),
+        Expr::cast(
+            col!("part_col"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_641),
     ),
     Some("NOT(CAST(Column(partitionValues_parsed.part_col) AS date) > 20641)"),
 )]
 #[case::inverted_equality(
     Pred::ne(
-        Expr::cast(col!("part_col"), DataType::DATE),
+        Expr::cast(
+            col!("part_col"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_641),
     ),
     Some("NOT(CAST(Column(partitionValues_parsed.part_col) AS date) = 20641)"),
@@ -645,14 +697,22 @@ fn test_checkpoint_skipping_floating_partition_cast_rewrites_exact_value() {
 #[case::literal_on_left(
     Pred::lt(
         Scalar::Date(20_641),
-        Expr::cast(col!("part_col"), DataType::DATE),
+        Expr::cast(
+            col!("part_col"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
     ),
     Some("CAST(Column(partitionValues_parsed.part_col) AS date) > 20641"),
 )]
 #[case::distinct(
     Pred::binary(
         BinaryPredicateOp::Distinct,
-        Expr::cast(col!("part_col"), DataType::DATE),
+        Expr::cast(
+            col!("part_col"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_641),
     ),
     None,
@@ -660,7 +720,11 @@ fn test_checkpoint_skipping_floating_partition_cast_rewrites_exact_value() {
 #[case::in_list(
     Pred::binary(
         BinaryPredicateOp::In,
-        Expr::cast(col!("part_col"), DataType::DATE),
+        Expr::cast(
+            col!("part_col"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_641),
     ),
     None,
@@ -682,7 +746,7 @@ fn test_checkpoint_skipping_partition_date_cast_comparisons(
 }
 
 fn partition_date_cast() -> Expr {
-    Expr::cast(col!("part_col"), DataType::DATE)
+    Expr::cast(col!("part_col"), DataType::DATE, CastOptions::default())
 }
 
 #[rstest]
@@ -764,11 +828,11 @@ fn test_checkpoint_partition_cast_eval_discriminates_per_operator(
 fn test_partition_date_cast_is_checkpoint_only() {
     let partition_columns = test_partition_columns();
     let partition_cast = Pred::eq(
-        Expr::cast(col!("part_col"), DataType::DATE),
+        Expr::cast(col!("part_col"), DataType::DATE, CastOptions::default()),
         Scalar::Date(20_641),
     );
     let data_cast = Pred::eq(
-        Expr::cast(col!("data_col"), DataType::DATE),
+        Expr::cast(col!("data_col"), DataType::DATE, CastOptions::default()),
         Scalar::Date(20_641),
     );
 
@@ -794,7 +858,7 @@ fn test_partition_date_cast_is_checkpoint_only() {
 fn test_checkpoint_partition_cast_reference_eval_is_conservative(#[case] partition_value: Scalar) {
     let partition_columns = test_partition_columns();
     let pred = Pred::eq(
-        Expr::cast(col!("part_col"), DataType::DATE),
+        Expr::cast(col!("part_col"), DataType::DATE, CastOptions::default()),
         Scalar::Date(20_641),
     );
     let skipping_pred = as_checkpoint_skipping_predicate(
@@ -821,7 +885,7 @@ fn partition_cast_preserves_supported_in_memory_conjunct() {
     let partition_columns = test_partition_columns();
     let pred = Pred::and(
         Pred::ge(
-            Expr::cast(col!("part_col"), DataType::DATE),
+            Expr::cast(col!("part_col"), DataType::DATE, CastOptions::default()),
             Scalar::Date(20_641),
         ),
         Pred::gt(col!("data_col"), lit(100)),
@@ -896,7 +960,7 @@ fn test_checkpoint_skipping_partition_missing_stats_keeps_all() {
         Pred::eq(col!("part_col"), lit("B")),
         Pred::lt(col!("part_col"), lit("B")),
         Pred::eq(
-            Expr::cast(col!("part_col"), DataType::DATE),
+            Expr::cast(col!("part_col"), DataType::DATE, CastOptions::default()),
             Scalar::Date(20_641),
         ),
         Pred::is_null(col!("part_col")),

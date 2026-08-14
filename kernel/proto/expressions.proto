@@ -166,6 +166,19 @@ message ElementAtExpression {
   Expression key_expr = 2;
 }
 
+message CastOptions {
+  // Optional IANA timezone or fixed offset for interpreting offset-less strings cast to
+  // TIMESTAMP. An explicit offset in a value takes precedence; absence preserves the default UTC
+  // behavior.
+  optional string timestamp_timezone = 1;
+}
+
+message CastExpression {
+  Expression expr = 1;
+  delta.kernel.schema.DataType target = 2;
+  CastOptions options = 3;
+}
+
 // `nullability_predicate` is optional: when set and it evaluates to false/null, the whole
 // struct is null.
 message StructExpression {
@@ -252,5 +265,6 @@ message Expression {
     MapToStructExpression map_to_struct = 12;
     string unknown = 13;
     ElementAtExpression element_at = 14;
+    CastExpression cast = 15;
   }
 }

@@ -851,7 +851,7 @@ mod tests {
         use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicateOp as _;
         use delta_kernel::expressions::{
             col, column_name, joined_column_expr, lit, BinaryExpressionOp, BinaryPredicateOp,
-            ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+            CastOptions, ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
         };
         use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
         use delta_kernel::schema::DataType;
@@ -975,6 +975,7 @@ mod tests {
                 _: BinaryPredicateOp,
                 _: &ColumnName,
                 _: &DataType,
+                _: &CastOptions,
                 _: &Scalar,
                 _: bool,
             ) -> Option<Predicate> {
