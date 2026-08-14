@@ -44,7 +44,7 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::Transaction;
+use crate::transaction::{CommitInfoClientOptions, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler};
 
@@ -726,6 +726,7 @@ pub struct CreateTableTransactionBuilder {
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
     correlation_id: Option<Arc<str>>,
+    commit_info_options: CommitInfoClientOptions,
 }
 
 impl CreateTableTransactionBuilder {
@@ -741,6 +742,7 @@ impl CreateTableTransactionBuilder {
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
             correlation_id: None,
+            commit_info_options: CommitInfoClientOptions::new(),
         }
     }
 
@@ -832,6 +834,15 @@ impl CreateTableTransactionBuilder {
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
         self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Set the commit-info options for the create-table commit.
+    ///
+    /// Merges into the current options (fields set in `options` override; unset fields are kept).
+    /// The operation is always `CREATE TABLE`, regardless of these options.
+    pub fn with_commit_info_options(mut self, options: CommitInfoClientOptions) -> Self {
+        self.commit_info_options.merge(options);
         self
     }
 
@@ -957,10 +968,14 @@ impl CreateTableTransactionBuilder {
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
-        // Create Transaction<CreateTable> with the effective table configuration
+        // Fall back to the builder's engine info when the options omit it.
+        let mut commit_info_options = self.commit_info_options;
+        commit_info_options
+            .engine_info
+            .get_or_insert(self.engine_info);
         Transaction::try_new_create_table(
             table_configuration,
-            self.engine_info,
+            commit_info_options,
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,

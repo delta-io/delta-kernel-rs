@@ -42,7 +42,7 @@ use crate::expressions::ColumnName;
 use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
-use crate::transaction::{CreateTable, Transaction};
+use crate::transaction::{CommitInfoClientOptions, CreateTable, Transaction};
 use crate::utils::current_time_ms;
 use crate::DeltaResult;
 
@@ -140,7 +140,7 @@ impl CreateTableTransaction {
     /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
     pub(crate) fn try_new_create_table(
         effective_table_config: TableConfiguration,
-        engine_info: String,
+        commit_info_options: CommitInfoClientOptions,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
@@ -151,6 +151,9 @@ impl CreateTableTransaction {
             path = %effective_table_config.table_root(),
             operation = "CREATE",
         );
+        // CREATE TABLE's operation is kernel-owned: override any caller-supplied value.
+        let mut commit_info_options = commit_info_options;
+        commit_info_options.operation = Some("CREATE TABLE".to_string());
         Ok(Transaction {
             span,
             operation_id: MetricId::new(),
@@ -160,8 +163,7 @@ impl CreateTableTransaction {
             should_emit_protocol: true,
             should_emit_metadata: true,
             committer,
-            operation: Some("CREATE TABLE".to_string()),
-            engine_info: Some(engine_info),
+            commit_info_options,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
@@ -171,7 +173,6 @@ impl CreateTableTransaction {
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
-            engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,

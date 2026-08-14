@@ -13,7 +13,7 @@ use crate::committer::Committer;
 use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::transaction::{AlterTable, Transaction};
+use crate::transaction::{AlterTable, CommitInfoClientOptions, Transaction};
 use crate::utils::current_time_ms;
 use crate::DeltaResult;
 
@@ -40,6 +40,7 @@ impl AlterTableTransaction {
         effective_table_config: TableConfiguration,
         committer: Box<dyn Committer>,
         correlation_id: Option<Arc<str>>,
+        commit_info_options: CommitInfoClientOptions,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
             "txn",
@@ -48,6 +49,9 @@ impl AlterTableTransaction {
             operation = "ALTER TABLE",
         );
 
+        // ALTER TABLE's operation is kernel-owned: override any caller-supplied value.
+        let mut commit_info_options = commit_info_options;
+        commit_info_options.operation = Some("ALTER TABLE".to_string());
         Ok(Transaction {
             span,
             operation_id: MetricId::new(),
@@ -57,8 +61,7 @@ impl AlterTableTransaction {
             should_emit_protocol: false,
             should_emit_metadata: true,
             committer,
-            operation: Some("ALTER TABLE".to_string()),
-            engine_info: None,
+            commit_info_options,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
@@ -68,7 +71,6 @@ impl AlterTableTransaction {
             user_domain_removals: vec![],
             data_change: false,
             column_defaults_acknowledged: false,
-            engine_commit_info: None,
             // TODO(#2446): match delta-spark's per-op isBlindAppend policy
             // (ADD/DROP/DROP NOT NULL -> true, SET NOT NULL -> false). Hardcoded false for
             // now: safe, but misses the true-case optimization delta-spark applies.

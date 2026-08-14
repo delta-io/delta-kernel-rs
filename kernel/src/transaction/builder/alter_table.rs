@@ -41,6 +41,7 @@ use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
     apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
 };
+use crate::transaction::CommitInfoClientOptions;
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Error};
 
@@ -77,6 +78,7 @@ pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
     correlation_id: Option<Arc<str>>,
+    commit_info_options: CommitInfoClientOptions,
     // PhantomData marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
     _state: PhantomData<S>,
@@ -94,6 +96,7 @@ impl<S> AlterTableTransactionBuilder<S> {
             snapshot: self.snapshot,
             operations: self.operations,
             correlation_id: self.correlation_id,
+            commit_info_options: self.commit_info_options,
             _state: PhantomData,
         }
     }
@@ -102,6 +105,13 @@ impl<S> AlterTableTransactionBuilder<S> {
     /// events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
         self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Set the commit-info options for the alter-table commit. The operation is always
+    /// `ALTER TABLE`, regardless of these options.
+    pub fn with_commit_info_options(mut self, options: CommitInfoClientOptions) -> Self {
+        self.commit_info_options.merge(options);
         self
     }
 }
@@ -113,6 +123,7 @@ impl AlterTableTransactionBuilder<Ready> {
             snapshot,
             operations: Vec::new(),
             correlation_id: None,
+            commit_info_options: CommitInfoClientOptions::new(),
             _state: PhantomData,
         }
     }
@@ -236,6 +247,7 @@ impl AlterTableTransactionBuilder<Modifying> {
             evolved_table_config,
             committer,
             self.correlation_id,
+            self.commit_info_options,
         )
     }
 }

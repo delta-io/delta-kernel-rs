@@ -96,6 +96,7 @@ The builder methods:
 
 | Method | Purpose |
 |--------|---------|
+| `with_commit_info_options(CommitInfoClientOptions)` | Client-owned commit-info fields (operation parameters, metrics, engine info) |
 | `with_operation(String)` | Operation name stored in the commit log (e.g. `"INSERT"`, `"MERGE"`) |
 | `with_engine_info(impl Into<String>)` | Identifies your application in the commit log |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
@@ -240,39 +241,69 @@ returns an error:
 > the table first. This gives the committer the information it needs to resolve conflicts
 > safely in multi-writer scenarios.
 
-## Custom commit info
+## Commit info options
 
-Kernel always writes a `commitInfo` action for every commit. To include your own fields in
-that action, call `with_commit_info()` with your custom data and its schema:
+Kernel writes a `commitInfo` action for every commit. You set some fields. Kernel sets the rest.
+Set your fields with `with_operation()` and `CommitInfoClientOptions`:
 
 ```rust,ignore
 let txn = snapshot
     .transaction(Box::new(FileSystemCommitter::new()), &engine)?
     .with_operation("INSERT".to_string())
-    .with_commit_info(engine_commit_info, commit_info_schema);
+    .with_commit_info_options(
+        CommitInfoClientOptions::new()
+            .with_engine_info("my-engine/1.0")
+            .with_operation_parameters([("mode", "Append")])
+            .with_operation_metrics([("numFiles", "1")]),
+    );
 ```
 
-The `engine_commit_info` argument is a `Box<dyn EngineData>` containing the fields you want
-to add, and `commit_info_schema` is the corresponding `SchemaRef`. Kernel merges your fields
-into the final `commitInfo` action.
+### Fields you set
 
-Kernel reserves certain fields and overrides them regardless of what you provide. Do not set
-these fields in your custom commit info:
+| Setter | `commitInfo` field | Notes |
+|--------|--------------------|-------|
+| `with_operation(String)` | `operation` | A transaction setting, not an option. Call order does not matter. |
+| `CommitInfoClientOptions::with_operation_parameters` | `operationParameters` | Kernel always writes this field. An unset value becomes `{}`. |
+| `CommitInfoClientOptions::with_operation_metrics` | `operationMetrics` | Kernel writes this field only when you set it. An empty map becomes `{}`. |
+| `CommitInfoClientOptions::with_engine_info` | `engineInfo` | `Transaction::with_engine_info()` is a shortcut for this option. |
 
-| Field | Set by Kernel to |
-|-------|------------------|
-| `timestamp` | The transaction's commit timestamp |
-| `inCommitTimestamp` | The in-commit timestamp (if ICT is enabled on the table) |
-| `operation` | The value from `with_operation()` |
-| `operationParameters` | Operation parameters (if any) |
+`with_commit_info_options()` replaces all options. To keep the engine info, call
+`with_engine_info()` after it.
+
+### Fields kernel sets
+
+Kernel always sets these fields. You cannot override them.
+
+| Field | Kernel sets it to |
+|-------|-------------------|
+| `timestamp` | The commit timestamp |
+| `inCommitTimestamp` | The in-commit timestamp, if the table uses in-commit timestamps |
 | `kernelVersion` | The Kernel library version |
-| `isBlindAppend` | `true` if `with_blind_append()` was called, omitted otherwise |
-| `engineInfo` | The value from `with_engine_info()` |
+| `isBlindAppend` | `true` if you called `with_blind_append()`. Omitted otherwise. |
 | `txnId` | A unique transaction identifier |
 
-Any field in your custom data that shares a name with a Kernel-reserved field is replaced
-with Kernel's value. Fields with names that do not collide are preserved as-is in the final
-`commitInfo`.
+### Additional fields
+
+For fields the typed setters do not cover, use
+`CommitInfoClientOptions::with_additional_commit_info()`. You pass an `EngineData` batch plus its
+`SchemaRef`. Kernel merges your fields into the `commitInfo` action. Your fields can be any Delta
+type, including nested structs and arrays:
+
+```rust,ignore
+// `engine_commit_info: Box<dyn EngineData>` holds your fields (for example a "notebook" struct and
+// a "clusterId" string); `commit_info_schema: SchemaRef` is its schema.
+let txn = snapshot
+    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .with_operation("INSERT".to_string())
+    .with_commit_info_options(
+        CommitInfoClientOptions::new().with_additional_commit_info(engine_commit_info, commit_info_schema),
+    );
+```
+
+`Transaction::with_additional_commit_info()` is a shortcut that sets the same payload on the options.
+
+Kernel-managed fields always win. Do not set a field with a reserved name (any field in the two
+tables above); kernel overrides it. Prefer the typed setters for the fields they cover.
 
 ## After committing
 

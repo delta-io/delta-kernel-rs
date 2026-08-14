@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
-use super::Transaction;
+use super::{CommitInfoClientOptions, Transaction};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::committer::Committer;
@@ -93,8 +93,7 @@ impl Transaction {
             should_emit_protocol: false,
             should_emit_metadata: false,
             committer,
-            operation: None,
-            engine_info: None,
+            commit_info_options: CommitInfoClientOptions::new(),
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
@@ -104,7 +103,6 @@ impl Transaction {
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
-            engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,
@@ -129,7 +127,7 @@ impl Transaction {
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
+        self.commit_info_options.operation = Some(operation);
         self
     }
 
