@@ -150,7 +150,7 @@ jobs:
   # enabled, the kernel will be compiled with those features (even if we specify
   # --no-default-features).
   #
-  # To cope with this, we split build/clippy --no-default-features into two runs:
+  # To cope with this, we split build/clippy --no-default-features into separate runs:
   # 1. build/clippy all packages that depend on the kernel with some features enabled:
   #    - acceptance
   #    - test_utils
@@ -161,11 +161,9 @@ jobs:
   #    - read-table-changes
   #    - read-table-multi-threaded
   #    - read-table-single-threaded
-  # 2. build/clippy all packages that only have no-feature kernel dependency
-  #    - delta_kernel
-  #    - delta_kernel_derive
-  #    - delta_kernel_ffi
-  #    - delta_kernel_ffi_macros
+  # 2. build the kernel by itself, so no other selected package can enable kernel features.
+  # 3. build the default engine by itself with defaults off and an explicit Arrow feature.
+  # 4. lint the remaining packages that only have no-feature kernel dependency.
   build:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -189,8 +187,14 @@ jobs:
         run: cargo clippy --locked --benches --tests --all-features -- -D warnings
       - name: lint without default features - packages which depend on kernel with features enabled
         run: cargo clippy --locked --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+      - name: check without default features - kernel
+        env:
+          RUSTFLAGS: --cap-lints=warn
+        run: cargo check --locked --no-default-features --package delta_kernel
+      - name: check without default features - default engine
+        run: cargo check --locked --no-default-features --package delta_kernel_default_engine --features arrow
       - name: lint without default features - packages which don't depend on kernel with features enabled
-        run: cargo clippy --locked --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
+        run: cargo clippy --locked --no-default-features --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
       - name: check kernel declarative-plans feature-only build
         run: cargo check --locked -p delta_kernel --no-default-features --features declarative-plans,vendored-protoc
       - name: lint kernel declarative-plans feature-only build
