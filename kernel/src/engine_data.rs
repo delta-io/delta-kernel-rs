@@ -195,6 +195,13 @@ impl<'a> MapItem<'a> {
         self.values.is_valid(idx).then(|| self.values.value(idx))
     }
 
+    /// Returns the map's keys in storage order, including keys whose value is null. Unlike
+    /// [`MapItem::materialize`], which drops null-valued entries, this exposes the full key set.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &'a str> + 'a {
+        let keys = self.keys;
+        self.offsets.clone().map(move |idx| keys.value(idx))
+    }
+
     pub fn materialize(&self) -> HashMap<String, String> {
         let mut ret = HashMap::with_capacity(self.offsets.len());
         for idx in self.offsets.clone() {
@@ -206,6 +213,42 @@ impl<'a> MapItem<'a> {
             }
         }
         ret
+    }
+}
+
+/// Read access to the element structs of an array-of-structs column, abstracting over how the
+/// engine stores them. Backs [`StructList`], mirroring how [`StringArrayAccessor`] backs
+/// [`ListItem`]. Engines implement this for their list column types.
+pub trait StructListAccessor {
+    /// Visits the element structs of the list at `row_index`, one visited row per element.
+    /// Implementations must reject, not skip, a null element struct.
+    fn visit_elems_of_row(
+        &self,
+        row_index: usize,
+        column_names: &[ColumnName],
+        visitor: &mut dyn RowVisitor,
+    ) -> DeltaResult<()>;
+}
+
+/// A handle to a single row's array of element structs. Unlike [`ListItem`], which materializes
+/// strings, the elements are structs visited in place by a nested [`RowVisitor`].
+pub struct StructList<'a> {
+    list: &'a dyn StructListAccessor,
+    row_index: usize,
+}
+
+impl<'a> StructList<'a> {
+    pub fn new(list: &'a dyn StructListAccessor, row_index: usize) -> StructList<'a> {
+        StructList { list, row_index }
+    }
+
+    /// Drives a nested [`RowVisitor`] over this row's element structs, one visited row per
+    /// element. The visitor's columns resolve against the element struct's schema, not the outer
+    /// row's. Errors if any element struct in this row is null.
+    pub fn visit_with(&self, visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
+        let column_names = visitor.selected_column_names_and_types().0;
+        self.list
+            .visit_elems_of_row(self.row_index, column_names, visitor)
     }
 }
 
@@ -225,6 +268,8 @@ macro_rules! impl_default_get {
 /// default all these methods will return an `Error` that an incorrect type has been asked
 /// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
+///
+/// All methods return `Ok(None)` when the row's value is null.
 pub trait GetData<'a> {
     impl_default_get!(
         (get_bool, bool),
@@ -240,7 +285,8 @@ pub trait GetData<'a> {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct_list, StructList<'a>)
     );
 }
 
@@ -269,7 +315,8 @@ impl<'a> GetData<'a> for () {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct_list, StructList<'a>)
     );
 }
 
@@ -569,7 +616,7 @@ pub trait EngineData: AsAny {
 
     /// Returns `true` if a field at the given (possibly nested) path exists in this data's schema.
     ///
-    /// For a top-level field named `"foo"`, use `ColumnName::new(["foo"])`. For nested fields,
+    /// For a top-level field named `"foo"`, use `column_name!("foo")`. For nested fields,
     /// each non-leaf element of the path must be a struct field at that level.
     fn has_field(&self, name: &ColumnName) -> bool;
 }
@@ -836,5 +883,33 @@ mod tests {
         #[case] expected: Vec<usize>,
     ) {
         assert_eq!(collect_indices(row_count, selection), expected);
+    }
+
+    #[test]
+    fn map_item_keys_includes_null_valued_keys() {
+        // Map { "a" => "1", "b" => null }: `keys()` must expose both keys, while `materialize()`
+        // (and `get`) drop the null-valued entry.
+        let keys = StringArray::from(vec!["a", "b"]);
+        let values = StringArray::from(vec![Some("1"), None]);
+        let map = MapItem::new(&keys, &values, 0..2);
+
+        let mut seen: Vec<&str> = map.keys().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec!["a", "b"]);
+
+        assert_eq!(map.get("a"), Some("1"));
+        assert_eq!(map.get("b"), None);
+        assert_eq!(
+            map.materialize(),
+            HashMap::from([("a".to_string(), "1".to_string())])
+        );
+    }
+
+    #[test]
+    fn map_item_keys_empty() {
+        let keys = StringArray::from(Vec::<&str>::new());
+        let values = StringArray::from(Vec::<&str>::new());
+        let map = MapItem::new(&keys, &values, 0..0);
+        assert_eq!(map.keys().count(), 0);
     }
 }

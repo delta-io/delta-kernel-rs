@@ -54,6 +54,7 @@ files themselves are parquet and are read by the `ParquetHandler` below.
 |--------|---------|
 | `parse_json(strings, schema)` | Parse JSON strings into columnar `EngineData` |
 | `read_json_files(files, schema, predicate)` | Read JSON files and return `EngineData` (predicate is an optional hint) |
+| `read_json_files_with_cancellation(files, schema, predicate, token)` | As above, but a cooperative engine can abandon the read when `token` fires. Optional to override — see [Cancellation](#cancellation) |
 | `write_json_file(path, data, overwrite)` | Atomically write a stream of `FilteredEngineData` rows as a newline-delimited JSON file (one JSON object per row, nulls omitted) |
 
 ### ParquetHandler
@@ -64,11 +65,42 @@ checkpoint sidecars) and for reading data files during scans.
 | Method | Purpose |
 |--------|---------|
 | `read_parquet_files(files, schema, predicate)` | Read Parquet files into `EngineData` |
+| `read_parquet_files_with_cancellation(files, schema, predicate, token)` | As above, but a cooperative engine can abandon the read when `token` fires — see [Cancellation](#cancellation) |
 | `write_parquet_file(url, data)` | Write a stream of `EngineData` batches as a single Parquet file at the given URL |
 | `read_parquet_footer(file)` | Read file footer metadata (schema, field IDs) without reading data |
+| `read_parquet_footer_with_cancellation(file, token)` | As above, but a cooperative engine can abandon the footer read when `token` fires — see [Cancellation](#cancellation) |
 
 The Parquet handler also supports metadata columns (row index, file path) and field-ID-based
 column matching for column mapping.
+
+### Cancellation
+
+Reading the Delta log for a large table can touch many commit and checkpoint files, and a
+connector often wants to abandon that work when the request behind it goes away — a cancelled
+query, a dropped RPC, a closed session. Kernel supports this cooperatively through an optional
+[`CancellationToken`] that a caller attaches to a scan (see
+[Advanced reads with scan_metadata()](../reading/scan_metadata.md#cancelling-a-scan)).
+
+Cancellation reaches the handlers in two ways, and an engine can honor either or both:
+
+- **Between batches.** Kernel polls the token at each action-batch boundary regardless of what the
+  handler does, so even a handler that ignores the token entirely still stops promptly between
+  reads.
+- **During a read.** The `read_*_with_cancellation` variants above hand the token down into the
+  read itself. Overriding them lets a cooperative engine interrupt an I/O that is already in
+  flight — the case that matters when one file read blocks for a long time — instead of waiting for
+  it to finish before the next batch-boundary check.
+
+These variants are optional. Their default implementations return early if the token is already
+cancelled and otherwise delegate to the plain `read_parquet_files` / `read_json_files` /
+`read_parquet_footer`, so an existing handler keeps working unchanged and simply doesn't interrupt
+mid-read. Whenever cancellation is observed, the read surfaces `Error::Cancelled` as a terminal
+error — never a short or empty result that could be mistaken for a complete one.
+
+For how to implement the cancellation-aware variants, see
+[Implementing the Engine Trait](../connector/implementing_engine.md#cancellation-aware-reads).
+
+[`CancellationToken`]: https://docs.rs/delta_kernel/latest/delta_kernel/cancellation/trait.CancellationToken.html
 
 ### EvaluationHandler
 

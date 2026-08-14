@@ -4,6 +4,8 @@ use super::plan::agg as proto_agg;
 use super::schema::data_type::Kind as DataTypeKind;
 use super::schema::metadata_value::Value as MetadataValueKind;
 use super::schema::primitive_type::Kind as PrimitiveTypeKind;
+#[cfg(feature = "geo-type-in-dev")]
+use super::schema::EdgeInterpolationAlgorithm as EdgeAlgo;
 use super::schema::SimplePrimitiveType as Simple;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
@@ -16,8 +18,8 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
+    ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -25,6 +27,8 @@ use crate::schema::{
     ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
 use crate::{DeltaResult, Error, FileMeta, FileSlice};
 
 // === Helpers ===
@@ -143,7 +147,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Values(n) => Op::Values(n.into()),
             Operator::Project(n) => Op::Project(n.into()),
             Operator::Filter(n) => Op::Filter(n.into()),
-            Operator::Load(n) => Op::Load(n.into()),
+            Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
@@ -214,25 +218,17 @@ impl From<&Filter> for proto_plan::FilterNode {
     }
 }
 
-impl From<&Load> for proto_plan::LoadNode {
-    fn from(node: &Load) -> Self {
-        proto_plan::LoadNode {
+impl From<&DynamicScan> for proto_plan::DynamicScanNode {
+    fn from(node: &DynamicScan) -> Self {
+        proto_plan::DynamicScanNode {
             schema: Some(node.schema.as_ref().into()),
             file_type: proto_plan::FileType::from(node.file_type) as i32,
-            base_url: node.base_url.as_ref().map(ToString::to_string),
+            base_url: node.base_url.to_string(),
             file_constant_columns: node.file_constant_columns.clone(),
-            file_meta: Some((&node.file_meta).into()),
+            path_column: Some((&node.path_column).into()),
+            file_size_column: Some((&node.file_size_column).into()),
+            last_modified_column: Some((&node.last_modified_column).into()),
             dv_column: Some((&node.dv_column).into()),
-        }
-    }
-}
-
-impl From<&LoadColumnFileMeta> for proto_plan::LoadColumnFileMeta {
-    fn from(meta: &LoadColumnFileMeta) -> Self {
-        proto_plan::LoadColumnFileMeta {
-            path_column: Some((&meta.path_column).into()),
-            file_size_column: Some((&meta.file_size_column).into()),
-            num_records_column: Some((&meta.num_records_column).into()),
         }
     }
 }
@@ -250,22 +246,31 @@ impl From<&Aggregate> for proto_plan::AggregateNode {
 impl From<&Agg> for proto_plan::Agg {
     fn from(agg: &Agg) -> Self {
         let func = match agg {
-            Agg::Min { value } => proto_agg::Func::Min(proto_plan::MinAgg {
+            Agg::Min(value) => proto_agg::Func::Min(proto_plan::MinAgg {
                 value: Some(value.into()),
             }),
-            Agg::Max { value } => proto_agg::Func::Max(proto_plan::MaxAgg {
+            Agg::Max(value) => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
-            Agg::MinNonNullBy { value, key } => {
+            Agg::Sum(value) => proto_agg::Func::Sum(proto_plan::SumAgg {
+                value: Some(value.into()),
+            }),
+            Agg::Count(value) => proto_agg::Func::Count(proto_plan::CountAgg {
+                value: Some(value.into()),
+            }),
+            Agg::CountStar => proto_agg::Func::CountStar(proto_plan::CountStarAgg {}),
+            Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
-            Agg::MaxNonNullBy { value, key } => {
+            Agg::MaxNonNullBy(operands) => {
                 proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
         };
@@ -319,6 +324,8 @@ impl From<&Expression> for proto_expr::Expression {
             Expression::MapToStruct(map_to_struct) => {
                 Kind::MapToStruct(Box::new(map_to_struct.into()))
             }
+            // No proto cast node yet; serialize as an opaque unknown.
+            Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
         };
         proto_expr::Expression { kind: Some(kind) }
     }
@@ -540,6 +547,8 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Boolean(v) => Value::Boolean(*v),
             Scalar::Timestamp(v) => Value::Timestamp(*v),
             Scalar::TimestampNtz(v) => Value::TimestampNtz(*v),
+            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(*v),
+            Scalar::IntervalDayTime(v) => Value::IntervalDayTime(*v),
             Scalar::Date(v) => Value::Date(*v),
             Scalar::Binary(v) => Value::Binary(v.clone()),
             Scalar::Decimal(decimal) => Value::Decimal(decimal.into()),
@@ -628,6 +637,14 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             PrimitiveType::Timestamp => PrimitiveTypeKind::Simple(Simple::Timestamp as i32),
             PrimitiveType::TimestampNtz => PrimitiveTypeKind::Simple(Simple::TimestampNtz as i32),
             PrimitiveType::Decimal(decimal) => PrimitiveTypeKind::Decimal((*decimal).into()),
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveType::Geometry(geometry) => {
+                PrimitiveTypeKind::Geometry(geometry.as_ref().into())
+            }
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveType::Geography(geography) => {
+                PrimitiveTypeKind::Geography(geography.as_ref().into())
+            }
             PrimitiveType::Void => PrimitiveTypeKind::Simple(Simple::Void as i32),
             PrimitiveType::IntervalYearMonth => {
                 PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
@@ -645,6 +662,38 @@ impl From<DecimalType> for proto_schema::DecimalType {
         proto_schema::DecimalType {
             precision: u32::from(decimal.precision()),
             scale: u32::from(decimal.scale()),
+        }
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<&GeometryType> for proto_schema::GeometryType {
+    fn from(geometry: &GeometryType) -> Self {
+        proto_schema::GeometryType {
+            crs: geometry.crs().to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<&GeographyType> for proto_schema::GeographyType {
+    fn from(geography: &GeographyType) -> Self {
+        proto_schema::GeographyType {
+            crs: geography.crs().to_string(),
+            algorithm: EdgeAlgo::from(geography.algorithm()) as i32,
+        }
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<&EdgeInterpolationAlgorithm> for EdgeAlgo {
+    fn from(algorithm: &EdgeInterpolationAlgorithm) -> Self {
+        match algorithm {
+            EdgeInterpolationAlgorithm::Spherical => EdgeAlgo::Spherical,
+            EdgeInterpolationAlgorithm::Vincenty => EdgeAlgo::Vincenty,
+            EdgeInterpolationAlgorithm::Thomas => EdgeAlgo::Thomas,
+            EdgeInterpolationAlgorithm::Andoyer => EdgeAlgo::Andoyer,
+            EdgeInterpolationAlgorithm::Karney => EdgeAlgo::Karney,
         }
     }
 }
@@ -792,6 +841,22 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                 }
             }
             PrimitiveTypeKind::Decimal(decimal) => PrimitiveType::Decimal(decimal.try_into()?),
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveTypeKind::Geometry(geometry) => {
+                PrimitiveType::Geometry(Box::new(geometry.try_into()?))
+            }
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveTypeKind::Geography(geography) => {
+                PrimitiveType::Geography(Box::new(geography.try_into()?))
+            }
+            // The proto oneof always carries the geo variants, but kernel only knows how to decode
+            // them when the geo feature is enabled.
+            #[cfg(not(feature = "geo-type-in-dev"))]
+            PrimitiveTypeKind::Geometry(_) | PrimitiveTypeKind::Geography(_) => {
+                return Err(Error::schema(
+                    "geometry/geography types require the 'geo-type-in-dev' feature",
+                ))
+            }
         };
         Ok(primitive)
     }
@@ -806,6 +871,50 @@ impl TryFrom<proto_schema::DecimalType> for DecimalType {
         let scale = u8::try_from(proto.scale)
             .map_err(|_| Error::invalid_decimal(format!("scale out of range: {}", proto.scale)))?;
         DecimalType::try_new(precision, scale)
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl TryFrom<proto_schema::GeometryType> for GeometryType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::GeometryType) -> DeltaResult<Self> {
+        GeometryType::try_new(&proto.crs)
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl TryFrom<proto_schema::GeographyType> for GeographyType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::GeographyType) -> DeltaResult<Self> {
+        let algorithm = EdgeAlgo::try_from(proto.algorithm)
+            .map_err(|_| {
+                Error::invalid_geo_params(format!(
+                    "unknown EdgeInterpolationAlgorithm value: {}",
+                    proto.algorithm
+                ))
+            })?
+            .try_into()?;
+        GeographyType::try_new(&proto.crs, algorithm)
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
+    type Error = Error;
+    fn try_from(proto: EdgeAlgo) -> DeltaResult<Self> {
+        let algorithm = match proto {
+            EdgeAlgo::Spherical => EdgeInterpolationAlgorithm::Spherical,
+            EdgeAlgo::Vincenty => EdgeInterpolationAlgorithm::Vincenty,
+            EdgeAlgo::Thomas => EdgeInterpolationAlgorithm::Thomas,
+            EdgeAlgo::Andoyer => EdgeInterpolationAlgorithm::Andoyer,
+            EdgeAlgo::Karney => EdgeInterpolationAlgorithm::Karney,
+            EdgeAlgo::Unspecified => {
+                return Err(Error::invalid_geo_params(
+                    "EdgeInterpolationAlgorithm is unspecified",
+                ))
+            }
+        };
+        Ok(algorithm)
     }
 }
 
@@ -865,9 +974,12 @@ mod tests {
     use rstest::rstest;
     use url::Url;
 
+    #[cfg(feature = "geo-type-in-dev")]
+    use super::EdgeAlgo;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
-        lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
-        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
+        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, DecimalData,
+        Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
         OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator, StructData,
         UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
     };
@@ -876,8 +988,8 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
-        ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
+        ScanParquet, SemiJoin, UnionAll, Values,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -887,8 +999,10 @@ mod tests {
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
         ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
-        StructField, StructType,
+        StructField, StructType, ToSchema as _,
     };
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::{DeltaResult, FileMeta, FileSlice};
 
     // === Test helpers ===
@@ -1123,10 +1237,7 @@ mod tests {
                 },
                 PlanNode {
                     op: Operator::Filter(Filter {
-                        predicate: Arc::new(Predicate::gt(
-                            Expression::Column(ColumnName::new(["id"])),
-                            lit(5i32),
-                        )),
+                        predicate: Arc::new(Predicate::gt(col!("id"), lit(5i32))),
                     }),
                     inputs: vec![0],
                 },
@@ -1193,17 +1304,19 @@ mod tests {
         }),
         "project"
     )]
-    #[case(Operator::Filter(Filter { predicate: Arc::new(Predicate::literal(true)) }), "filter")]
+    #[case(Operator::Filter(Filter { predicate: Arc::new(Predicate::TRUE) }), "filter")]
     #[case(
-        Operator::Load(Load {
+        Operator::DynamicScan(DynamicScan {
             schema: sample_schema(),
             file_type: FileType::Parquet,
-            base_url: None,
+            base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],
-            file_meta: sample_load_column_file_meta(),
-            dv_column: ColumnName::new(["dv"]),
+            path_column: column_name!("path"),
+            file_size_column: column_name!("size"),
+            last_modified_column: column_name!("filemod"),
+            dv_column: column_name!("dv"),
         }),
-        "load"
+        "dynamic_scan"
     )]
     #[case(
         Operator::Aggregate(Aggregate {
@@ -1226,7 +1339,7 @@ mod tests {
             Op::Values(_) => "values",
             Op::Project(_) => "project",
             Op::Filter(_) => "filter",
-            Op::Load(_) => "load",
+            Op::DynamicScan(_) => "dynamic_scan",
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
             Op::UnionAll(_) => "union_all",
@@ -1297,61 +1410,92 @@ mod tests {
     #[test]
     fn from_filter() {
         let node = Filter {
-            predicate: Arc::new(Predicate::literal(true)),
+            predicate: Arc::new(Predicate::TRUE),
         };
         let proto = proto_plan::FilterNode::from(&node);
         assert!(proto.predicate.is_some());
     }
 
-    fn sample_load_column_file_meta() -> LoadColumnFileMeta {
-        LoadColumnFileMeta {
-            path_column: ColumnName::new(["path"]),
-            file_size_column: ColumnName::new(["size"]),
-            num_records_column: ColumnName::new(["num_records"]),
-        }
+    fn sample_dynamic_scan_input_schema() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("filemod", DataType::LONG),
+            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
+            StructField::nullable("c", DataType::INTEGER),
+        ]))
+    }
+
+    fn sample_dynamic_scan_output_schema() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("c", DataType::INTEGER),
+        ]))
     }
 
     #[rstest]
     #[case(
         FileType::Json,
-        Some(Url::parse("memory:///base/").unwrap()),
-        Some("memory:///base/")
+        Url::parse("memory:///base/").unwrap(),
+        "memory:///base/"
     )]
-    #[case(FileType::Parquet, None, None)]
-    fn from_load(
+    #[case(
+        FileType::Parquet,
+        Url::parse("file:///table/").unwrap(),
+        "file:///table/"
+    )]
+    fn from_dynamic_scan(
         #[case] file_type: FileType,
-        #[case] base_url: Option<Url>,
-        #[case] expected_base_url: Option<&str>,
-    ) {
-        let node = Load {
-            schema: sample_schema(),
+        #[case] base_url: Url,
+        #[case] expected_base_url: &str,
+    ) -> DeltaResult<()> {
+        let node = DynamicScan::try_new(
+            &sample_dynamic_scan_input_schema(),
+            sample_dynamic_scan_output_schema(),
             file_type,
             base_url,
-            file_constant_columns: vec!["c".to_string()],
-            file_meta: sample_load_column_file_meta(),
-            dv_column: ColumnName::new(["dv"]),
-        };
-        let proto = proto_plan::LoadNode::from(&node);
+            ["c"],
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+            column_name!("dv"),
+        )?;
+        let proto = proto_plan::DynamicScanNode::from(&node);
         assert!(proto.schema.is_some());
         assert_eq!(
             proto.file_type,
             proto_plan::FileType::from(file_type) as i32
         );
-        assert_eq!(proto.base_url.as_deref(), expected_base_url);
+        assert_eq!(proto.base_url, expected_base_url);
         assert_eq!(proto.file_constant_columns.len(), 1);
         assert!(proto.dv_column.is_some());
 
-        let file_meta = proto.file_meta.expect("file_meta present");
-        assert!(file_meta.path_column.is_some());
-        assert!(file_meta.file_size_column.is_some());
-        assert!(file_meta.num_records_column.is_some());
+        assert_eq!(
+            proto.path_column.expect("path column present").path,
+            ["path"]
+        );
+        assert_eq!(
+            proto
+                .file_size_column
+                .expect("file size column present")
+                .path,
+            ["size"]
+        );
+        assert_eq!(
+            proto
+                .last_modified_column
+                .expect("last modified column present")
+                .path,
+            ["filemod"]
+        );
+        Ok(())
     }
 
     #[test]
     fn from_aggregate() {
         let node = Aggregate {
-            group_by: vec![ColumnName::new(["g"])],
-            aggs: vec![Agg::max(ColumnName::new(["a"]))],
+            group_by: vec![column_name!("g")],
+            aggs: vec![Agg::max(column_name!("a"))],
             schema: sample_schema(),
         };
         let proto = proto_plan::AggregateNode::from(&node);
@@ -1362,16 +1506,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Agg::min(ColumnName::new(["a"])), "min")]
-    #[case(Agg::max(ColumnName::new(["a"])), "max")]
-    #[case(Agg::min_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "min_non_null_by")]
-    #[case(Agg::max_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "max_non_null_by")]
+    #[case(Agg::min(column_name!("a")), "min")]
+    #[case(Agg::max(column_name!("a")), "max")]
+    #[case(Agg::sum(column_name!("a")), "sum")]
+    #[case(Agg::count(column_name!("a")), "count")]
+    #[case(Agg::count_star(), "count_star")]
+    #[case(Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "min_non_null_by")]
+    #[case(Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
         use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);
         let kind = match proto.func.unwrap() {
             Func::Min(_) => "min",
             Func::Max(_) => "max",
+            Func::Sum(_) => "sum",
+            Func::Count(_) => "count",
+            Func::CountStar(_) => "count_star",
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
@@ -1384,8 +1534,8 @@ mod tests {
     fn from_semi_join(#[case] inverted: bool) {
         let node = SemiJoin {
             inverted,
-            probe_keys: vec![ColumnName::new(["p"])],
-            build_keys: vec![ColumnName::new(["b"])],
+            probe_keys: vec![column_name!("p")],
+            build_keys: vec![column_name!("b")],
         };
         let proto = proto_plan::SemiJoinNode::from(&node);
         assert_eq!(proto.inverted, inverted);
@@ -1404,8 +1554,8 @@ mod tests {
 
     #[rstest]
     #[case(lit(1), "literal")]
-    #[case(Expression::Column(ColumnName::new(["a"])), "column")]
-    #[case(Expression::Predicate(Box::new(Predicate::literal(true))), "predicate")]
+    #[case(col!("a"), "column")]
+    #[case(Expression::Predicate(Box::new(Predicate::TRUE)), "predicate")]
     #[case(Expression::struct_from([lit(1)]), "struct_expr")]
     #[case(
         Expression::StructPatch(
@@ -1418,7 +1568,7 @@ mod tests {
     #[case(Expression::coalesce([lit(1), lit(2)]), "variadic")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
-    #[case(Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))), "map_to_struct")]
+    #[case(Expression::map_to_struct(col!("m")), "map_to_struct")]
     #[case(Expression::unknown("x"), "unknown")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
@@ -1441,14 +1591,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Predicate::literal(true), "boolean_expression")]
-    #[case(Predicate::not(Predicate::literal(true)), "not")]
+    #[case(Predicate::TRUE, "boolean_expression")]
+    #[case(Predicate::not(Predicate::TRUE), "not")]
     #[case(Predicate::is_null(lit(1)), "unary")]
     #[case(Predicate::gt(lit(1), lit(2)), "binary")]
-    #[case(
-        Predicate::and(Predicate::literal(true), Predicate::literal(false)),
-        "junction"
-    )]
+    #[case(Predicate::and(Predicate::TRUE, Predicate::FALSE), "junction")]
     #[case(Predicate::opaque(TestOpaquePredOp, [lit(1)]), "opaque")]
     #[case(Predicate::Unknown("x".to_string()), "unknown")]
     fn from_predicate(#[case] pred: Predicate, #[case] expected: &str) {
@@ -1467,7 +1614,7 @@ mod tests {
 
     #[test]
     fn from_column_name() {
-        let proto = proto_expr::ColumnName::from(&ColumnName::new(["a", "b", "c"]));
+        let proto = proto_expr::ColumnName::from(&column_name!("a.b.c"));
         assert_eq!(proto.path, vec!["a", "b", "c"]);
     }
 
@@ -1551,9 +1698,9 @@ mod tests {
 
     #[test]
     fn from_map_to_struct_expression() {
-        let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
-            Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))),
-        ) else {
+        let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
+            expr_kind_of(Expression::map_to_struct(col!("m")))
+        else {
             panic!("expected a map_to_struct expression");
         };
         assert!(map_to_struct.map_expr.is_some());
@@ -1583,10 +1730,9 @@ mod tests {
 
     #[test]
     fn from_junction_predicate() {
-        let proto_expr::predicate::Kind::Junction(junction) = pred_kind_of(Predicate::and(
-            Predicate::literal(true),
-            Predicate::literal(false),
-        )) else {
+        let proto_expr::predicate::Kind::Junction(junction) =
+            pred_kind_of(Predicate::and(Predicate::TRUE, Predicate::FALSE))
+        else {
             panic!("expected a junction predicate");
         };
         assert_eq!(junction.op, proto_expr::JunctionPredicateOp::And as i32);
@@ -1778,6 +1924,8 @@ mod tests {
             Value::Boolean(_) => "boolean",
             Value::Timestamp(_) => "timestamp",
             Value::TimestampNtz(_) => "timestamp_ntz",
+            Value::IntervalYearMonth(_) => "interval_year_month",
+            Value::IntervalDayTime(_) => "interval_day_time",
             Value::Date(_) => "date",
             Value::Binary(_) => "binary",
             Value::Decimal(_) => "decimal",
@@ -1787,6 +1935,30 @@ mod tests {
             Value::Map(_) => "map",
         };
         assert_eq!(kind, expected);
+    }
+
+    #[rstest]
+    #[case(
+        Scalar::IntervalYearMonth(30),
+        proto_expr::scalar::Value::IntervalYearMonth(30)
+    )]
+    #[case(
+        Scalar::IntervalYearMonth(i32::MIN),
+        proto_expr::scalar::Value::IntervalYearMonth(i32::MIN)
+    )]
+    #[case(
+        Scalar::IntervalDayTime(-5),
+        proto_expr::scalar::Value::IntervalDayTime(-5)
+    )]
+    #[case(
+        Scalar::IntervalDayTime(i64::MAX),
+        proto_expr::scalar::Value::IntervalDayTime(i64::MAX)
+    )]
+    fn from_interval_scalar_preserves_payload(
+        #[case] scalar: Scalar,
+        #[case] expected: proto_expr::scalar::Value,
+    ) {
+        assert_eq!(scalar_value_of(scalar), expected);
     }
 
     #[test]
@@ -2046,6 +2218,54 @@ mod tests {
         assert_data_type_round_trips(DataType::Primitive(
             PrimitiveType::decimal(precision, scale).unwrap(),
         ));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(GeometryType::try_new("OGC:CRS84").unwrap())]
+    #[case(GeometryType::try_new("EPSG:4326").unwrap())]
+    fn round_trip_geometry(#[case] geometry: GeometryType) {
+        assert_data_type_round_trips(DataType::Primitive(PrimitiveType::Geometry(Box::new(
+            geometry,
+        ))));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    fn round_trip_geography(
+        #[values("OGC:CRS84", "EPSG:4326")] crs: &str,
+        #[values(
+            EdgeInterpolationAlgorithm::Spherical,
+            EdgeInterpolationAlgorithm::Vincenty,
+            EdgeInterpolationAlgorithm::Thomas,
+            EdgeInterpolationAlgorithm::Andoyer,
+            EdgeInterpolationAlgorithm::Karney
+        )]
+        algorithm: EdgeInterpolationAlgorithm,
+    ) {
+        let geography = GeographyType::try_new(crs, algorithm).unwrap();
+        assert_data_type_round_trips(DataType::Primitive(PrimitiveType::Geography(Box::new(
+            geography,
+        ))));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(EdgeInterpolationAlgorithm::Spherical, 1)]
+    #[case(EdgeInterpolationAlgorithm::Vincenty, 2)]
+    #[case(EdgeInterpolationAlgorithm::Thomas, 3)]
+    #[case(EdgeInterpolationAlgorithm::Andoyer, 4)]
+    #[case(EdgeInterpolationAlgorithm::Karney, 5)]
+    fn edge_algo_proto_discriminant_is_stable(
+        #[case] algorithm: EdgeInterpolationAlgorithm,
+        #[case] proto_tag: i32,
+    ) {
+        assert_eq!(EdgeAlgo::from(&algorithm) as i32, proto_tag);
+        let proto = EdgeAlgo::try_from(proto_tag).unwrap();
+        assert_eq!(
+            EdgeInterpolationAlgorithm::try_from(proto).unwrap(),
+            algorithm
+        );
     }
 
     #[rstest]

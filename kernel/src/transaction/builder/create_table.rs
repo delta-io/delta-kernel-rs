@@ -27,8 +27,9 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     find_max_column_id_in_schema, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
-    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
+    strip_stray_column_mapping_metadata, ColumnMappingMode, TableFeature,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
@@ -245,8 +246,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values must be
-///    representable as directory-path strings)
+/// 4. Of a supported primitive type (Struct, Array, and Map are rejected because the Delta protocol
+///    does not define their partition-value serialization)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -283,13 +284,13 @@ fn validate_partition_columns(
             Error::generic(format!("Partition column '{col}' not found in schema"))
         })?;
 
-        if !matches!(field.data_type(), DataType::Primitive(_)) {
+        let DataType::Primitive(_) = field.data_type() else {
             return Err(Error::generic(format!(
                 "Partition column '{col}' has non-primitive type '{}'. \
                  Partition columns must have primitive types.",
                 field.data_type()
             )));
-        }
+        };
     }
     Ok(())
 }
@@ -891,12 +892,23 @@ impl CreateTableTransactionBuilder {
         let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
 
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
-        let (effective_schema, column_mapping_mode) =
+        let (mut effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated, pre_cm)?;
 
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
         validate_schema(&effective_schema, column_mapping_mode)?;
+
+        // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
+        // any annotation the caller supplied is newly introduced (see
+        // `strip_stray_column_mapping_metadata`).
+        if column_mapping_mode == ColumnMappingMode::None {
+            // A new table has no prior schema, so nothing was carried in (`current_has_cm =
+            // false`).
+            if let Some(stripped) = strip_stray_column_mapping_metadata(false, &effective_schema) {
+                effective_schema = Arc::new(stripped);
+            }
+        }
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
@@ -964,7 +976,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::ColumnName;
+    use crate::expressions::{column_name, ColumnName};
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
         schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
@@ -975,7 +987,7 @@ mod tests {
         PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, build_complex_nested_kernel_schema,
     };
 
@@ -1172,7 +1184,7 @@ mod tests {
     #[test]
     fn test_clustering_support_valid() {
         use crate::clustering::CLUSTERING_DOMAIN_NAME;
-        use crate::expressions::ColumnName;
+        use crate::expressions::column_name;
 
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
@@ -1184,7 +1196,7 @@ mod tests {
 
         let dm = validate_clustering_and_make_domain_metadata(
             &schema,
-            &[ColumnName::new(["id"])],
+            &[column_name!("id")],
             &mut reader_features,
             &mut writer_features,
         )
@@ -1200,7 +1212,7 @@ mod tests {
 
     #[test]
     fn test_clustering_support_multiple_columns() {
-        use crate::expressions::ColumnName;
+        use crate::expressions::column_name;
 
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
@@ -1213,7 +1225,7 @@ mod tests {
 
         let dm = validate_clustering_and_make_domain_metadata(
             &schema,
-            &[ColumnName::new(["id"]), ColumnName::new(["date"])],
+            &[column_name!("id"), column_name!("date")],
             &mut reader_features,
             &mut writer_features,
         )
@@ -1229,7 +1241,7 @@ mod tests {
 
     #[test]
     fn test_clustering_column_not_in_schema() {
-        use crate::expressions::ColumnName;
+        use crate::expressions::column_name;
 
         let schema = schema_ref! { not_null "id": INTEGER };
 
@@ -1238,7 +1250,7 @@ mod tests {
 
         let result = validate_clustering_and_make_domain_metadata(
             &schema,
-            &[ColumnName::new(["nonexistent"])],
+            &[column_name!("nonexistent")],
             &mut reader_features,
             &mut writer_features,
         );
@@ -1253,7 +1265,7 @@ mod tests {
     #[test]
     fn test_clustering_nested_column_accepted() {
         use crate::clustering::CLUSTERING_DOMAIN_NAME;
-        use crate::expressions::ColumnName;
+        use crate::expressions::column_name;
 
         let address_struct = StructType::new_unchecked(vec![
             StructField::new("city", DataType::STRING, true),
@@ -1267,7 +1279,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let nested_col = ColumnName::new(["address", "city"]);
+        let nested_col = column_name!("address.city");
         let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[nested_col],
@@ -1517,14 +1529,14 @@ mod tests {
         layout: DataLayout::partitioned(["date"]),
         has_domain_metadata: false,
         has_clustering_columns: false,
-        expected_partition_columns: Some(vec![ColumnName::new(["date"])]),
+        expected_partition_columns: Some(vec![column_name!("date")]),
         expected_writer_features: vec![],
     })]
     #[case::partitioned_multiple(DataLayoutExpectation {
         layout: DataLayout::partitioned(["id", "date"]),
         has_domain_metadata: false,
         has_clustering_columns: false,
-        expected_partition_columns: Some(vec![ColumnName::new(["id"]), ColumnName::new(["date"])]),
+        expected_partition_columns: Some(vec![column_name!("id"), column_name!("date")]),
         expected_writer_features: vec![],
     })]
     fn test_apply_data_layout(#[case] expectation: DataLayoutExpectation) {
@@ -1598,7 +1610,7 @@ mod tests {
             StructField::new("address", address_struct, true),
         ]);
 
-        let columns = vec![ColumnName::new(["address", "city"])];
+        let columns = vec![column_name!("address.city")];
         let result = validate_partition_columns(&schema, &columns);
         assert!(result.is_err());
         assert!(result
@@ -1638,18 +1650,38 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn test_validate_partition_columns_nested_interval_types_rejected(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] data_type: DataType,
+    ) {
+        let schema = StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::not_null(
+                "nested",
+                StructType::new_unchecked([StructField::not_null("col", data_type)]),
+            ),
+        ]);
+
+        let error = validate_partition_columns(&schema, &[column_name!("nested.col")])
+            .expect_err("nested partition columns must be rejected")
+            .to_string();
+        assert!(error.contains("must be a top-level column"));
+    }
+
+    #[rstest::rstest]
     #[case::integer(DataType::INTEGER)]
     #[case::string(DataType::STRING)]
     #[case::date(DataType::DATE)]
     #[case::timestamp(DataType::TIMESTAMP)]
     #[case::boolean(DataType::BOOLEAN)]
     #[case::long(DataType::LONG)]
+    #[case::interval_year_month(DataType::INTERVAL_YEAR_MONTH)]
+    #[case::interval_day_time(DataType::INTERVAL_DAY_TIME)]
     fn test_validate_partition_columns_primitive_types_accepted(#[case] data_type: DataType) {
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("col", data_type, false),
         ]);
-        let columns = vec![ColumnName::new(["col"])];
+        let columns = vec![column_name!("col")];
         assert!(validate_partition_columns(&schema, &columns).is_ok());
     }
 

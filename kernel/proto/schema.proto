@@ -37,10 +37,34 @@ message DecimalType {
   uint32 scale = 2;
 }
 
+// Edge interpolation algorithm for geography type.
+enum EdgeInterpolationAlgorithm {
+  EDGE_INTERPOLATION_ALGORITHM_UNSPECIFIED = 0;
+  EDGE_INTERPOLATION_ALGORITHM_SPHERICAL = 1;
+  EDGE_INTERPOLATION_ALGORITHM_VINCENTY = 2;
+  EDGE_INTERPOLATION_ALGORITHM_THOMAS = 3;
+  EDGE_INTERPOLATION_ALGORITHM_ANDOYER = 4;
+  EDGE_INTERPOLATION_ALGORITHM_KARNEY = 5;
+}
+
+// Geometry column type carrying a coordinate reference system (CRS) in
+// AUTHORITY:CODE form.
+message GeometryType {
+  string crs = 1;
+}
+
+// Geography column type carrying a CRS and an edge interpolation algorithm.
+message GeographyType {
+  string crs = 1;
+  EdgeInterpolationAlgorithm algorithm = 2;
+}
+
 message PrimitiveType {
   oneof kind {
     SimplePrimitiveType simple = 1;
     DecimalType decimal = 2;
+    GeometryType geometry = 3;
+    GeographyType geography = 4;
   }
 }
 

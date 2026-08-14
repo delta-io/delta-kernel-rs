@@ -1,9 +1,11 @@
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments,
-    Type, Visibility,
+    parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Field,
+    Fields, Item, Lit, Meta, PathArguments, Token, Type, Visibility,
 };
 
 mod schema_macro;
@@ -43,24 +45,69 @@ pub fn lazy_schema_ref(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
     )
 }
 
-/// Parses a dot-delimited column name into an array of field names. See
-/// `delta_kernel::expressions::column_name::column_name` macro for details.
+/// Builds `&[&str]` from the arguments to `column_name!`. Each **string-literal** argument is a
+/// dot-separated path, split into individual segments; every other (constant) argument is taken as
+/// a single segment, validated at const-eval time. All segments must match `[a-zA-Z0-9_]+`.
 #[proc_macro]
-pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let is_valid = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
-    let err = match syn::parse(input) {
-        Ok(syn::Lit::Str(name)) => match name.value().chars().find(|c| !is_valid(*c)) {
-            Some(bad_char) => Error::new(name.span(), format!("Invalid character: {bad_char:?}")),
-            _ => {
-                let path = name.value();
-                let path = path.split('.').map(proc_macro2::Literal::string);
-                return quote_spanned! { name.span() => [#(#path),*] }.into();
+pub fn column_name_segments(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    column_name_segments_impl(input.into())
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn column_name_segments_impl(input: TokenStream) -> Result<TokenStream, Error> {
+    // `column_name!` requires at least one argument, so no empty check is needed here.
+    let mut emitted = Vec::new();
+    for expr in Punctuated::<Expr, Token![,]>::parse_terminated.parse2(input)? {
+        // Fragment-forwarding macros (col!, column_name!, joined_column_name!, ...) capture with
+        // `:literal`/`:expr` and re-emit, which wraps the argument in an invisible (none-delimited)
+        // group. Peel away those groups to recover an underlying string literal.
+        let mut inner = &expr;
+        while let Expr::Group(group) = inner {
+            inner = &group.expr;
+        }
+        match inner {
+            // A string literal is a dot-separated path: split it and validate each segment now.
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(lit_str),
+                ..
+            }) => {
+                for segment in lit_str.value().split('.') {
+                    validate_single_segment(segment, lit_str.span())?;
+                    let literal = proc_macro2::Literal::string(segment);
+                    emitted.push(quote_spanned! { lit_str.span() => #literal });
+                }
             }
-        },
-        Ok(lit) => Error::new(lit.span(), "Expected a string literal"),
-        Err(err) => err,
-    };
-    err.into_compile_error().into()
+            // A string constant's value isn't visible until const-eval (after this macro expands),
+            // so wrap the value in a const fn validator with failure as a compile-time panic.
+            _ => emitted.push(quote_spanned! { expr.span() =>
+                match ::delta_kernel::expressions::__require_valid_simple_column_segment(#expr) {
+                    Some(segment) => segment,
+                    None => panic!("String constants passed to column_name! must be simple names \
+                                    matching [a-zA-Z0-9_]+; use a string literal for dot-separated \
+                                    paths, or ColumnName::new() to disambiguate"),
+                }
+            }),
+        }
+    }
+
+    Ok(quote! { &[ #(#emitted),* ] })
+}
+
+fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
+    if segment.is_empty() {
+        return Err(Error::new(span, "empty column name segment"));
+    }
+    if let Some(bad) = segment
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
+    {
+        return Err(Error::new(
+            span,
+            format!("invalid character {bad:?} in column name segment {segment:?}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Derive a `delta_kernel::schemas::ToSchema` implementation for the annotated struct. The actual
@@ -71,16 +118,32 @@ pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStr
 /// action (this macro allows the use of standard rust snake_case, and will convert to the correct
 /// delta schema camelCase version).
 ///
-/// If a field sets `allow_null_container_values`, it means the underlying data can contain null in
-/// the values of the container (i.e. a `key` -> `null` in a `HashMap`). Therefore the schema should
-/// mark the value field as nullable, but those mappings will be dropped when converting to an
-/// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
-#[proc_macro_derive(ToSchema, attributes(allow_null_container_values))]
+/// Supported field attributes:
+/// - `#[field_id = N]`: Sets the Parquet field ID for this field. `N` must be in `0..=i32::MAX`
+///   (`0` is a valid reserved Iceberg field ID, e.g. the manifest-entry `status` field).
+/// - `#[nested_field_id = N]`: Sets the Parquet field ID for the element of a list field (`Vec<T>`
+///   or `Option<Vec<T>>`; rejected on any other type). Stored as `ColumnMappingNestedIds` metadata
+///   (`{"fieldName.element": N}`) on the parent `StructField` and propagated to the inner Arrow
+///   list element during schema conversion. `N` must be in `0..=i32::MAX`.
+/// - `#[allow_null_container_values]`: Marks the value field of a container as nullable, i.e. the
+///   underlying data can contain null in the values of the container (a `key` -> `null` in a
+///   `HashMap`). Those mappings will be dropped when converting to an actual rust `HashMap`.
+///   Currently this can _only_ be set on `HashMap` fields.
+/// - `#[skip_schema]`: Excludes this field from the generated schema (and, on a struct that also
+///   derives `IntoEngineData` / `IntoStructData`, from the produced engine data / struct scalar).
+///   NOTE: `TryFromStructData` rejects skipped fields because it cannot reconstruct them.
+#[proc_macro_derive(
+    ToSchema,
+    attributes(allow_null_container_values, field_id, nested_field_id, skip_schema)
+)]
 pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
 
-    let schema_fields = gen_schema_fields(&input.data);
+    let schema_fields = match gen_schema_fields(&input.data, struct_ident.span()) {
+        Ok(tokens) => tokens,
+        Err(e) => return e.to_compile_error().into(),
+    };
     let output = quote! {
         #[automatically_derived]
         impl delta_kernel::schema::ToSchema for #struct_ident {
@@ -119,8 +182,53 @@ fn get_schema_name(name: &Ident) -> Ident {
     Ident::new(&ret, name.span())
 }
 
-/// Check if a path segment is `Option<HashMap<K, V>>`.
-fn is_option_of_hashmap(seg: &syn::PathSegment) -> bool {
+/// Reads a `#[<attr_name> = N]` field attribute, returning `Ok(None)` if absent. The value must be
+/// an integer literal in `1..=i32::MAX` (the valid Parquet field-id range); a bare `#[<attr_name>]`
+/// or `#[<attr_name>(..)]` shape, a non-integer, or an out-of-range value is a hard error. If the
+/// attribute is repeated, the first occurrence wins.
+fn get_named_attr_id(
+    field_attributes: &[Attribute],
+    attr_name: &str,
+) -> Result<Option<i64>, Error> {
+    // Match on the attribute path first so a malformed shape (bare path / list form) on the right
+    // name is a diagnosable error rather than silently skipped.
+    let Some(attr) = field_attributes
+        .iter()
+        .find(|attr| attr.path().is_ident(attr_name))
+    else {
+        return Ok(None);
+    };
+    let Meta::NameValue(nv) = &attr.meta else {
+        return Err(Error::new(
+            attr.span(),
+            format!("{attr_name} error: expected `#[{attr_name} = N]`"),
+        ));
+    };
+    let Expr::Lit(ExprLit {
+        lit: Lit::Int(lit_int),
+        ..
+    }) = &nv.value
+    else {
+        return Err(Error::new(
+            nv.value.span(),
+            format!("{attr_name} error: expected an integer"),
+        ));
+    };
+    let value: i64 = lit_int
+        .base10_parse()
+        .map_err(|e| Error::new(lit_int.span(), format!("{attr_name} error: {e}")))?;
+    if !(0..=i64::from(i32::MAX)).contains(&value) {
+        return Err(Error::new(
+            lit_int.span(),
+            format!("{attr_name} error: field id {value} must be in 0..=2147483647"),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// Check if a path segment is `Option<{inner}<..>>` (e.g. `Option<HashMap<K, V>>`), matching on the
+/// inner type's last segment identifier.
+fn is_option_of(seg: &syn::PathSegment, inner: &str) -> bool {
     if seg.ident != "Option" {
         return false;
     }
@@ -131,70 +239,172 @@ fn is_option_of_hashmap(seg: &syn::PathSegment) -> bool {
     let Some(syn::GenericArgument::Type(Type::Path(inner_type))) = angle_args.args.first() else {
         return false;
     };
-    // Check if the inner type's last segment is HashMap
     inner_type
         .path
         .segments
         .last()
-        .is_some_and(|seg| seg.ident == "HashMap")
+        .is_some_and(|seg| seg.ident == inner)
 }
 
-fn gen_schema_fields(data: &Data) -> TokenStream {
-    let fields = match data {
-        Data::Struct(DataStruct {
-            fields: Fields::Named(fields),
-            ..
-        }) => &fields.named,
-        _ => {
-            return Error::new(
-                Span::call_site(),
-                "this derive macro only works on structs with named fields",
-            )
-            .to_compile_error()
-        }
-    };
+/// Check if a path segment is a list-shaped type: `Vec<T>` or `Option<Vec<T>>`.
+fn is_list_segment(seg: &syn::PathSegment) -> bool {
+    seg.ident == "Vec" || is_option_of(seg, "Vec")
+}
 
-    let schema_fields = fields.iter().map(|field| {
-        let name = field.ident.as_ref().unwrap(); // we know these are named fields
-        let name = get_schema_name(name);
-        let have_schema_null = field.attrs.iter().any(|attr| {
-            // check if we have allow_null_container_values attr
-            match &attr.meta {
-                Meta::Path(path) => path.get_ident().is_some_and(|ident| ident == "allow_null_container_values"),
-                _ => false,
-            }
-        });
+/// Check if any of `attrs` is a bare-path attribute named `name` (e.g. `#[skip_schema]`).
+fn has_named_attr(attrs: &[Attribute], name: &str) -> bool {
+    attrs.iter().any(|attr| match &attr.meta {
+        Meta::Path(path) => path.is_ident(name),
+        _ => false,
+    })
+}
 
-        match field.ty {
-            Type::Path(ref type_path) => {
-                let type_path_quoted = type_path.path.segments.iter().map(|segment| {
-                    let segment_ident = &segment.ident;
-                    match &segment.arguments {
-                        PathArguments::None => quote! { #segment_ident :: },
-                        PathArguments::AngleBracketed(angle_args) => quote! { #segment_ident::#angle_args :: },
-                        _ => Error::new(segment.arguments.span(), "Can only handle <> type path args").to_compile_error()
+fn gen_schema_field(field: &Field) -> TokenStream {
+    let name = get_schema_name(field.ident.as_ref().unwrap());
+    let have_schema_null = has_named_attr(&field.attrs, "allow_null_container_values");
+
+    match field.ty {
+        Type::Path(ref type_path) => {
+            let type_path_quoted = type_path.path.segments.iter().map(|segment| {
+                let segment_ident = &segment.ident;
+                match &segment.arguments {
+                    PathArguments::None => quote! { #segment_ident :: },
+                    PathArguments::AngleBracketed(angle_args) => {
+                        quote! { #segment_ident::#angle_args :: }
                     }
-                });
-                if have_schema_null {
-                    if let Some(last_seg) = type_path.path.segments.last() {
-                        let is_valid =
-                            last_seg.ident == "HashMap" || is_option_of_hashmap(last_seg);
-                        if !is_valid {
-                            return Error::new(
-                                last_seg.ident.span(),
-                                format!("Can only use allow_null_container_values on HashMap or Option<HashMap> fields, not {}", last_seg.ident)
-                            ).to_compile_error()
-                        }
-                    }
-                    quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name))}
-                } else {
-                    quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name))}
+                    _ => Error::new(
+                        segment.arguments.span(),
+                        "Can only handle <> type path args",
+                    )
+                    .to_compile_error(),
                 }
+            });
+
+            let base_call = if have_schema_null {
+                if let Some(last_seg) = type_path.path.segments.last() {
+                    let is_valid = last_seg.ident == "HashMap" || is_option_of(last_seg, "HashMap");
+                    if !is_valid {
+                        return Error::new(
+                            last_seg.ident.span(),
+                            format!(
+                                "Can only use allow_null_container_values on HashMap or \
+                                 Option<HashMap> fields, not {}",
+                                last_seg.ident
+                            ),
+                        )
+                        .to_compile_error();
+                    }
+                }
+                quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name)) }
+            } else {
+                quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name)) }
+            };
+
+            let field_id = match get_named_attr_id(&field.attrs, "field_id") {
+                Ok(v) => v,
+                Err(e) => return e.to_compile_error(),
+            };
+            let nested_field_id = match get_named_attr_id(&field.attrs, "nested_field_id") {
+                Ok(v) => v,
+                Err(e) => return e.to_compile_error(),
+            };
+
+            let with_field_id = if let Some(id) = field_id {
+                quote_spanned! { field.span() => #base_call.add_metadata([(delta_kernel::schema::ColumnMetadataKey::ParquetFieldId.as_ref(), #id)]) }
+            } else {
+                quote_spanned! { field.span() => #base_call }
+            };
+
+            if let Some(elem_id) = nested_field_id {
+                // The `<field>.element` nested id is only meaningful for a list element; reject it
+                // on any other type, mirroring the allow_null_container_values guard above.
+                let is_list = type_path.path.segments.last().is_some_and(is_list_segment);
+                if !is_list {
+                    return Error::new(
+                        field.span(),
+                        format!(
+                            "Can only use nested_field_id on Vec or Option<Vec> fields, not {}",
+                            type_path.path.segments.last().map_or_else(
+                                || "<empty path>".to_string(),
+                                |seg| seg.ident.to_string()
+                            )
+                        ),
+                    )
+                    .to_compile_error();
+                }
+                let nested_key = format!("{}.element", name);
+                quote_spanned! { field.span() =>
+                    #with_field_id.add_metadata([(
+                        delta_kernel::schema::ColumnMetadataKey::ColumnMappingNestedIds.as_ref().to_string(),
+                        delta_kernel::schema::MetadataValue::Other(
+                            ::serde_json::json!({ #nested_key: #elem_id })
+                        )
+                    )])
+                }
+            } else {
+                with_field_id
             }
-            _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty)).to_compile_error()
         }
-    });
-    quote! { #(#schema_fields),* }
+        _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty))
+            .to_compile_error(),
+    }
+}
+
+fn has_skip_schema(field: &Field) -> bool {
+    has_named_attr(&field.attrs, "skip_schema")
+}
+
+/// Schema-facing fields of a named struct, in declaration order, with `#[skip_schema]` dropped.
+///
+/// Shared by all derives that walk a struct's fields, so they cannot disagree on which fields
+/// participate (or in what order).
+fn schema_fields<'a>(
+    data: &'a Data,
+    derive_name: &str,
+    span: Span,
+) -> Result<Vec<&'a Field>, Error> {
+    Ok(partition_fields(data, derive_name, span)?.0)
+}
+
+/// Splits a named struct's fields into schema-facing fields and `#[skip_schema]` fields, each in
+/// declaration order. Derives that must also account for skipped fields use this directly.
+fn partition_fields<'a>(
+    data: &'a Data,
+    derive_name: &str,
+    span: Span,
+) -> Result<(Vec<&'a Field>, Vec<&'a Field>), Error> {
+    let Data::Struct(DataStruct {
+        fields: Fields::Named(fields),
+        ..
+    }) = data
+    else {
+        return Err(Error::new(
+            span,
+            format!("{derive_name} can only be derived for structs with named fields"),
+        ));
+    };
+    Ok(fields.named.iter().partition(|f| !has_skip_schema(f)))
+}
+
+fn try_from_struct_data_fields<'a>(
+    data: &'a Data,
+    derive_name: &str,
+    span: Span,
+) -> Result<Vec<&'a Field>, Error> {
+    let (fields, skipped) = partition_fields(data, derive_name, span)?;
+    if let Some(field) = skipped.first() {
+        return Err(Error::new(
+            field.span(),
+            "TryFromStructData does not support #[skip_schema] fields",
+        ));
+    }
+    Ok(fields)
+}
+
+fn gen_schema_fields(data: &Data, span: Span) -> Result<TokenStream, Error> {
+    let fields = schema_fields(data, "ToSchema", span)?;
+    let fields = fields.iter().map(|f| gen_schema_field(f));
+    Ok(quote! { #(#fields),* })
 }
 
 /// Derive an IntoEngineData trait for a struct that has all fields implement `TryInto<Scalar>`.
@@ -207,22 +417,12 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
     let input = parse_macro_input!(input as DeriveInput);
     let struct_name = &input.ident;
 
-    let Data::Struct(DataStruct {
-        fields: Fields::Named(fields),
-        ..
-    }) = &input.data
-    else {
-        return Error::new(
-            struct_name.span(),
-            "IntoEngineData can only be derived for structs with named fields",
-        )
-        .to_compile_error()
-        .into();
+    let fields = match schema_fields(&input.data, "IntoEngineData", struct_name.span()) {
+        Ok(fields) => fields,
+        Err(e) => return e.to_compile_error().into(),
     };
-
-    let fields = &fields.named;
-    let field_idents = fields.iter().map(|f| &f.ident);
-    let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
+    let (field_idents, field_types): (Vec<_>, Vec<_>) =
+        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
 
     let expanded = quote! {
         #[automatically_derived]
@@ -248,6 +448,138 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
     };
 
     proc_macro::TokenStream::from(expanded)
+}
+
+/// Derive `From` conversions into `StructData` and `Scalar` for a rust struct.
+///
+/// Emits both:
+/// - `From<Self> for StructData` — field values via `.into()`, schema from `ToSchema`
+/// - `From<Self> for Scalar` — `Scalar::Struct(self.into())`
+///
+/// Honors `#[skip_schema]`, producing the same field set as `ToSchema`. Every schema field type
+/// must implement `Into<Scalar>` (and the struct must implement `ToSchema`).
+#[proc_macro_derive(IntoStructData)]
+pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let struct_name = &input.ident;
+
+    let fields = match schema_fields(&input.data, "IntoStructData", struct_name.span()) {
+        Ok(fields) => fields,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let (field_idents, field_types): (Vec<_>, Vec<_>) =
+        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
+
+    let expanded = quote! {
+        #[automatically_derived]
+        impl From<#struct_name> for delta_kernel::expressions::StructData
+        where
+            #struct_name: delta_kernel::schema::ToSchema,
+            #(#field_types: Into<delta_kernel::expressions::Scalar>,)*
+        {
+            fn from(value: #struct_name) -> Self {
+                Self::from_values_unchecked(
+                    <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
+                    vec![ #(value.#field_idents.into()),* ],
+                )
+            }
+        }
+
+        #[automatically_derived]
+        impl From<#struct_name> for delta_kernel::expressions::Scalar
+        where
+            #struct_name: Into<delta_kernel::expressions::StructData>,
+        {
+            fn from(value: #struct_name) -> Self {
+                Self::Struct(value.into())
+            }
+        }
+    };
+
+    proc_macro::TokenStream::from(expanded)
+}
+
+/// Derive the inverse of [`IntoStructData`](macro@IntoStructData): `TryFrom` conversions from
+/// `StructData` and `Scalar` for a rust struct.
+///
+/// Emits both:
+/// - `TryFrom<StructData> for Self` — values matched by schema field name and converted via each
+///   field's `TryFrom<Scalar>`
+/// - `TryFrom<Scalar> for Self` — unwraps `Scalar::Struct`, else errors
+///
+/// Missing, duplicate, and unknown fields are errors. Every field type must implement
+/// `TryFrom<Scalar, Error = Error>`. `#[skip_schema]` is rejected because the reverse conversion
+/// cannot infer a value or schema for a field omitted by `ToSchema`.
+#[proc_macro_derive(TryFromStructData, attributes(skip_schema))]
+pub fn try_from_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    try_from_struct_data_impl(&input)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> {
+    let struct_name = &input.ident;
+    let fields = try_from_struct_data_fields(&input.data, "TryFromStructData", struct_name.span())?;
+    let (field_idents, field_types): (Vec<_>, Vec<_>) =
+        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
+    let schema_field_names: Vec<_> = field_idents
+        .iter()
+        .map(|ident| ident.as_ref().map(get_schema_name))
+        .collect::<Option<_>>()
+        .ok_or_else(|| {
+            Error::new(
+                struct_name.span(),
+                "TryFromStructData can only be derived for structs with named fields",
+            )
+        })?;
+
+    Ok(quote! {
+        #[automatically_derived]
+        impl TryFrom<delta_kernel::expressions::StructData> for #struct_name
+        where
+            #struct_name: delta_kernel::schema::ToSchema,
+            #(#field_types:
+                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::Error>,)*
+        {
+            type Error = delta_kernel::Error;
+
+            fn try_from(
+                value: delta_kernel::expressions::StructData,
+            ) -> delta_kernel::DeltaResult<Self> {
+                let mut fields =
+                    delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
+                        value,
+                        <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
+                    )?;
+                let result = Self {
+                    #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
+                };
+                fields.finish()?;
+                Ok(result)
+            }
+        }
+
+        #[automatically_derived]
+        impl TryFrom<delta_kernel::expressions::Scalar> for #struct_name
+        where
+            #struct_name: TryFrom<
+                delta_kernel::expressions::StructData,
+                Error = delta_kernel::Error,
+            >,
+        {
+            type Error = delta_kernel::Error;
+
+            fn try_from(
+                value: delta_kernel::expressions::Scalar,
+            ) -> delta_kernel::DeltaResult<Self> {
+                match value {
+                    delta_kernel::expressions::Scalar::Struct(data) => data.try_into(),
+                    other => Err(other.conversion_error(stringify!(#struct_name))),
+                }
+            }
+        }
+    })
 }
 
 /// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
@@ -326,4 +658,176 @@ fn make_public(mut item: Item) -> Item {
     }
 
     item
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    /// Expand `gen_schema_fields` for `input` and return the generated tokens as a string. Macro
+    /// errors are embedded as `compile_error!` tokens in that string; `Err` only signals that the
+    /// input itself failed to parse as a `DeriveInput`.
+    fn schema_fields_tokens(input: &str) -> Result<String, String> {
+        let input = syn::parse_str::<DeriveInput>(input).map_err(|e| e.to_string())?;
+        let tokens = gen_schema_fields(&input.data, input.ident.span())
+            .unwrap_or_else(|e| e.to_compile_error());
+        Ok(tokens.to_string())
+    }
+
+    #[test]
+    fn test_valid_field_id_parsing() {
+        let input = r#"
+            struct TestStruct {
+                #[field_id = 123]
+                valid_field: String,
+
+                #[field_id = 456]
+                another_valid_field: i32,
+
+                normal_field: bool,
+            }
+        "#;
+
+        let tokens = schema_fields_tokens(input).unwrap();
+        assert!(tokens.contains("123"));
+        assert!(tokens.contains("456"));
+        assert!(!tokens.contains("compile_error"));
+    }
+
+    #[rstest]
+    #[case::zero("0", "0i64")]
+    #[case::one("1", "1i64")]
+    #[case::max("2147483647", "2147483647i64")]
+    fn field_id_in_range_renders_literal(#[case] id: &str, #[case] expected: &str) {
+        let input = format!("struct S {{ #[field_id = {id}] f: String }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        let needle = format!(
+            "(delta_kernel :: schema :: ColumnMetadataKey :: ParquetFieldId . as_ref () , {expected})"
+        );
+        assert!(tokens.contains(&needle), "found: {tokens}");
+    }
+
+    #[rstest]
+    #[case::negative("#[field_id = -1]")]
+    #[case::overflow_i32("#[field_id = 2147483648]")]
+    #[case::overflow_i64("#[field_id = 9223372036854775808]")]
+    #[case::not_an_integer(r#"#[field_id = "x"]"#)]
+    #[case::bare_path("#[field_id]")]
+    #[case::list_form("#[field_id(1)]")]
+    fn field_id_rejected(#[case] attr: &str) {
+        let input = format!("struct S {{ {attr} f: String }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(
+            tokens.contains("compile_error"),
+            "expected rejection, found: {tokens}"
+        );
+    }
+
+    #[rstest]
+    // With a companion field_id, both metadata keys are emitted.
+    #[case::with_field_id("#[field_id = 132]\n#[nested_field_id = 133]", true)]
+    // Element id alone emits only the nested id, not ParquetFieldId.
+    #[case::without_field_id("#[nested_field_id = 133]", false)]
+    fn nested_field_id_on_list(#[case] attrs: &str, #[case] expect_parquet_field_id: bool) {
+        let input = format!("struct S {{ {attrs}\nsplit_offsets: Option<Vec<i64>> }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(!tokens.contains("compile_error"), "found: {tokens}");
+        assert!(tokens.contains("ColumnMappingNestedIds"), "found: {tokens}");
+        assert!(tokens.contains("splitOffsets.element"), "found: {tokens}");
+        assert!(tokens.contains("133i64"), "found: {tokens}");
+        assert_eq!(
+            tokens.contains("ParquetFieldId . as_ref"),
+            expect_parquet_field_id,
+            "found: {tokens}"
+        );
+    }
+
+    #[rstest]
+    #[case::scalar("f: String")]
+    #[case::map("f: std::collections::HashMap<String, i64>")]
+    fn nested_field_id_rejected_on_non_list(#[case] field: &str) {
+        let input = format!("struct S {{ #[nested_field_id = 5] {field} }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(
+            tokens.contains("compile_error"),
+            "expected rejection, found: {tokens}"
+        );
+    }
+
+    #[test]
+    fn skip_schema_excludes_field() {
+        let input = r#"
+            struct TestStruct {
+                #[skip_schema]
+                skipped: String,
+                kept: i32,
+            }
+        "#;
+        let tokens = schema_fields_tokens(input).unwrap();
+        assert!(tokens.contains("kept"), "kept field must remain: {tokens}");
+        assert!(
+            !tokens.contains("skipped"),
+            "skipped field must be absent: {tokens}"
+        );
+    }
+
+    #[test]
+    fn try_from_struct_data_rejects_skipped_field() {
+        let input = syn::parse_str::<DeriveInput>(
+            r#"
+            struct TestStruct {
+                #[skip_schema]
+                skipped: String,
+                kept: i32,
+            }
+            "#,
+        )
+        .unwrap();
+        let error =
+            try_from_struct_data_fields(&input.data, "TryFromStructData", input.ident.span())
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "TryFromStructData does not support #[skip_schema] fields"
+        );
+    }
+
+    #[rstest]
+    #[case::hashmap("std::collections::HashMap<String, i64>")]
+    #[case::option_hashmap("Option<std::collections::HashMap<String, i64>>")]
+    fn allow_null_container_values_on_map(#[case] ty: &str) {
+        let input = format!("struct S {{ #[allow_null_container_values] f: {ty} }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(!tokens.contains("compile_error"), "found: {tokens}");
+        assert!(
+            tokens.contains("get_nullable_container_struct_field"),
+            "found: {tokens}"
+        );
+    }
+
+    #[rstest]
+    #[case::scalar("String")]
+    #[case::vec("Vec<i64>")]
+    fn allow_null_container_values_rejected_on_non_map(#[case] ty: &str) {
+        let input = format!("struct S {{ #[allow_null_container_values] f: {ty} }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(
+            tokens.contains("compile_error"),
+            "expected rejection, found: {tokens}"
+        );
+    }
+
+    #[rstest]
+    #[case::tuple("f: (i32, i32)")]
+    #[case::array("f: [i32; 4]")]
+    fn non_path_field_type_rejected(#[case] field: &str) {
+        let input = format!("struct S {{ {field} }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(
+            tokens.contains("compile_error"),
+            "expected rejection, found: {tokens}"
+        );
+    }
 }

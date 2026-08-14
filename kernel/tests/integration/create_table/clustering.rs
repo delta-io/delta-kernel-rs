@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
@@ -130,7 +130,7 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
 
     // Verify clustering columns via snapshot read path
     let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
-    assert_eq!(clustering_columns, Some(vec![ColumnName::new(["id"])]));
+    assert_eq!(clustering_columns, Some(vec![column_name!("id")]));
 
     Ok(())
 }

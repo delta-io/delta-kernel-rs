@@ -18,9 +18,11 @@ use delta_kernel::history_manager::{
     get_earliest_commit as kernel_get_earliest_commit,
     latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
 };
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -45,12 +47,16 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+mod alloc_stats;
+
 pub mod commit_range;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
+#[cfg(feature = "default-engine-base")]
+pub mod rest_engine;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
@@ -61,6 +67,7 @@ pub mod expressions;
 pub mod ffi_metrics;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
+pub mod incremental_scan;
 pub mod log_path;
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
@@ -73,6 +80,7 @@ mod ffi_test_utils;
 #[cfg(feature = "test-ffi")]
 pub mod test_ffi;
 pub mod transaction;
+use transaction::MutableCommitter;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 
@@ -362,6 +370,58 @@ mod private {
         len: usize,
     }
 
+    /// An owned byte buffer allocated by the kernel. Any time the engine receives a
+    /// `KernelOwnedBytes` as a return value from a kernel method, the engine owns the buffer and
+    /// must free it by calling [super::free_kernel_bytes] exactly once.
+    #[cfg(feature = "declarative-plans")]
+    #[repr(C)]
+    pub struct KernelOwnedBytes {
+        ptr: NonNull<u8>,
+        len: usize,
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl KernelOwnedBytes {
+        /// Converts this buffer back into a `Vec<u8>`.
+        ///
+        /// # Safety
+        ///
+        /// The buffer must have been originally created `From<Vec<u8>>`, and must not have already
+        /// been consumed by a previous call to this method.
+        pub unsafe fn into_vec(self) -> Vec<u8> {
+            if self.len == 0 {
+                Default::default()
+            } else {
+                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
+            }
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl From<Vec<u8>> for KernelOwnedBytes {
+        fn from(val: Vec<u8>) -> Self {
+            let len = val.len();
+            let boxed = val.into_boxed_slice();
+            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            // safety: Box::leak always returns a valid, non-null pointer
+            let ptr = unsafe { NonNull::new_unchecked(leaked_ptr) };
+            KernelOwnedBytes { ptr, len }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The engine assumes ownership of the buffer memory when kernel passes it a
+    /// [KernelOwnedBytes], but must only free it by calling [super::free_kernel_bytes]. Since the
+    /// global allocator is threadsafe, it doesn't matter which engine thread invokes that method.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Send for KernelOwnedBytes {}
+    /// # Safety
+    ///
+    /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Sync for KernelOwnedBytes {}
+
     impl KernelBoolSlice {
         /// Creates an empty slice.
         pub fn empty() -> KernelBoolSlice {
@@ -469,6 +529,8 @@ mod private {
         }
     }
 }
+#[cfg(feature = "declarative-plans")]
+pub use private::KernelOwnedBytes;
 pub use private::{KernelBoolSlice, KernelRowIndexArray};
 
 /// # Safety
@@ -486,6 +548,17 @@ pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
 #[no_mangle]
 pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
     let _ = slice.into_vec();
+}
+
+/// Free a [`KernelOwnedBytes`] buffer obtained from kernel.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid buffer, and must not use it again afterwards.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
+    let _ = unsafe { bytes.into_vec() };
 }
 
 // TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void
@@ -569,12 +642,29 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
     delta_kernel::try_parse_uri(path)
 }
 
-/// A builder that allows setting options on the `Engine` before actually building it
+/// How [`EngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
+/// build time.
+#[cfg(feature = "default-engine-base")]
+#[derive(Default)]
+pub(crate) enum ObjectStoreBackend {
+    /// `url` and [`set_builder_option`] keys are passed to [`store_from_url_opts`].
+    #[default]
+    UrlScheme,
+    /// REST file API; configured via [`set_builder_rest_object_store`].
+    Rest(Box<rest_engine::RestBuilderState>),
+}
+
+/// A builder that allows setting options on the `Engine` before actually building it.
+///
+/// For a normal object store backend, `url` is the table storage location (`s3://…`, `file://…`).
+/// For REST, call [`set_builder_rest_object_store`] with a [`rest_engine::CRestEndpointConfig`]
+/// and set `url` to the REST service base URL; see [`rest_engine`] for TLS and auth options.
 #[cfg(feature = "default-engine-base")]
 pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
+    object_store_backend: ObjectStoreBackend,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
@@ -584,8 +674,8 @@ pub struct EngineBuilder {
 }
 
 #[cfg(feature = "default-engine-base")]
-#[derive(Default)]
-struct IoConcurrencyConfig {
+#[derive(Default, Clone)]
+pub(crate) struct IoConcurrencyConfig {
     /// Maximum number of files read concurrently (file-level readahead depth). `None` uses the
     /// engine default.
     buffer_size: Option<NonZero<usize>>,
@@ -594,7 +684,8 @@ struct IoConcurrencyConfig {
 }
 
 #[cfg(feature = "default-engine-base")]
-struct MultithreadedExecutorConfig {
+#[derive(Clone)]
+pub(crate) struct MultithreadedExecutorConfig {
     /// Number of worker threads for the tokio runtime. `None` uses Tokio's default.
     worker_threads: Option<usize>,
     /// Maximum number of threads for blocking operations. `None` uses Tokio's default.
@@ -633,6 +724,7 @@ fn get_engine_builder_impl(
         url: url?,
         allocate_fn,
         options: HashMap::default(),
+        object_store_backend: ObjectStoreBackend::default(),
         multithreaded_executor_config: None,
         io_config: IoConcurrencyConfig::default(),
     });
@@ -722,6 +814,45 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
     };
 }
 
+/// Select a REST-backed object store. See [`rest_engine`] for setup, option keys, and callbacks.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer and a non-null `endpoint_config`. When `callback` is
+/// non-null, `context` must remain valid for the engine lifetime and the callback must be safe to
+/// invoke from any thread concurrently (see [`rest_engine::CAuthHeaderCallback`]).
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_rest_object_store(
+    builder: &mut EngineBuilder,
+    endpoint_config: *const rest_engine::CRestEndpointConfig,
+    callback: Option<rest_engine::CAuthHeaderCallback>,
+    context: NullableCvoid,
+) -> ExternResult<bool> {
+    set_builder_rest_object_store_impl(builder, endpoint_config, callback, context)
+        .into_extern_result(&builder.allocate_fn)
+}
+
+#[cfg(feature = "default-engine-base")]
+fn set_builder_rest_object_store_impl(
+    builder: &mut EngineBuilder,
+    endpoint_config: *const rest_engine::CRestEndpointConfig,
+    callback: Option<rest_engine::CAuthHeaderCallback>,
+    context: NullableCvoid,
+) -> DeltaResult<bool> {
+    // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
+    let endpoint_config = unsafe { endpoint_config.as_ref() }
+        .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
+    builder.object_store_backend =
+        ObjectStoreBackend::Rest(Box::new(rest_engine::rest_builder_state_from_ffi(
+            endpoint_config,
+            callback,
+            context,
+            builder.allocate_fn,
+        )?));
+    Ok(true)
+}
+
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
 /// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
 /// drop/free it afterwards.
@@ -739,6 +870,7 @@ pub unsafe extern "C" fn builder_build(
     get_default_engine_impl(
         builder_box.url,
         builder_box.options,
+        builder_box.object_store_backend,
         builder_box.multithreaded_executor_config,
         builder_box.io_config,
         builder_box.allocate_fn,
@@ -768,6 +900,7 @@ fn get_default_default_engine_impl(
     get_default_engine_impl(
         url?,
         Default::default(),
+        ObjectStoreBackend::default(),
         None,
         IoConcurrencyConfig::default(),
         allocate_error,
@@ -797,14 +930,32 @@ fn engine_to_handle(
 fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
+    object_store_backend: ObjectStoreBackend,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
-    use delta_kernel_default_engine::DefaultEngineBuilder;
 
-    let store = store_from_url_opts(&url, options)?;
+    let store = match object_store_backend {
+        ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
+        ObjectStoreBackend::Rest(rest) => {
+            rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
+        }
+    };
+    build_engine_from_store(store, executor_config, io_config, allocate_error)
+}
+
+/// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
+/// tuning. Shared by the URL-scheme and REST engine builder paths.
+#[cfg(feature = "default-engine-base")]
+pub(crate) fn build_engine_from_store(
+    store: Arc<dyn ObjectStore>,
+    executor_config: Option<MultithreadedExecutorConfig>,
+    io_config: IoConcurrencyConfig,
+    allocate_error: AllocateErrorFn,
+) -> DeltaResult<Handle<SharedExternEngine>> {
+    use delta_kernel_default_engine::DefaultEngineBuilder;
 
     // The builder is generic over the executor type, so apply the shared I/O config via a generic
     // helper to both branches without naming the concrete builder type.
@@ -1156,6 +1307,36 @@ pub unsafe extern "C" fn checkpoint_snapshot(
         .into_extern_result(&engine_ref)
 }
 
+/// Publish unpublished catalog commits on a catalog-managed snapshot.
+///
+/// No-op (still returns a caller-owned snapshot handle at the same version) when there is
+/// nothing to publish. Errors when unpublished commits exist but the table is not
+/// catalog-managed or the committer is not a catalog committer.
+///
+/// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
+/// committer is consumed (do not free). The returned snapshot carries the published watermark
+/// used by subsequent catalog commits -- use it for the next `transaction_with_committer` /
+/// checkpoint.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot, committer, and engine handles. The committer handle is
+/// consumed and must not be used or freed afterward.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_publish_with_committer(
+    snapshot: Handle<SharedSnapshot>,
+    committer: Handle<MutableCommitter>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    let committer = unsafe { committer.into_inner() };
+    snapshot_ref
+        .publish(engine_ref.engine().as_ref(), committer.as_ref())
+        .map(|updated| updated.into())
+        .into_extern_result(&engine_ref)
+}
+
 /// Get the version of the specified snapshot
 ///
 /// # Safety
@@ -1189,6 +1370,49 @@ pub unsafe extern "C" fn snapshot_timestamp(
     snapshot
         .get_timestamp(engine_ref.engine().as_ref())
         .into_extern_result(&engine_ref)
+}
+
+/// File-level statistics for a snapshot, sourced from the snapshot's CRC.
+///
+/// Pass-by-value mirror of the scalar fields of kernel's [`FileStats`].
+// TODO: expose kernel's `FileStats` file-size histogram once it has a C-ABI-friendly
+// representation. It is a variable-length structure, so it needs a different accessor shape.
+#[derive(Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiFileStats {
+    /// Number of active `Add` file actions in this table version.
+    pub num_files: i64,
+    /// Total size of the table in bytes (sum of all active `Add` file sizes).
+    pub table_size_bytes: i64,
+}
+
+impl From<FileStats> for FfiFileStats {
+    fn from(stats: FileStats) -> Self {
+        Self {
+            num_files: stats.num_files(),
+            table_size_bytes: stats.table_size_bytes(),
+        }
+    }
+}
+
+/// Get the file-level statistics ([`FfiFileStats`]) for this snapshot from its CRC.
+///
+/// Returns [`OptionalValue::None`] when no CRC is resolved at this version (none on disk, a read
+/// failure, or the nearest on-disk CRC is stale), or its CRC does not carry complete file stats.
+/// Performs no I/O.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_file_stats(
+    snapshot: Handle<SharedSnapshot>,
+) -> OptionalValue<FfiFileStats> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .get_file_stats_if_present()
+        .map(FfiFileStats::from)
+        .into()
 }
 
 /// Selects which commit type to return for the history_manager query. FFI-safe mirror of
@@ -1380,7 +1604,10 @@ pub unsafe extern "C" fn snapshot_table_root(
 #[no_mangle]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot.table_configuration().partition_columns().len()
+    snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .len()
 }
 
 /// Get an iterator of the list of partition columns for this snapshot.
@@ -1393,7 +1620,10 @@ pub unsafe extern "C" fn get_partition_columns(
 ) -> Handle<StringSliceIterator> {
     let snapshot = unsafe { snapshot.as_ref() };
     // NOTE: Clippy doesn't like it, but we need to_vec+into_iter to decouple lifetimes
-    let partition_columns = snapshot.table_configuration().partition_columns().to_vec();
+    let partition_columns = snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .to_vec();
     let iter: Box<StringIter> = Box::new(partition_columns.into_iter());
     iter.into()
 }
@@ -1849,6 +2079,48 @@ mod tests {
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshot_file_stats_present() -> Result<(), Box<dyn std::error::Error>> {
+        // The crc-full fixture has a CRC at version 0 with complete file stats.
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .to_string();
+
+        let engine = get_default_engine(&table_root);
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        assert_eq!(
+            unsafe { snapshot_file_stats(snapshot.shallow_copy()) },
+            OptionalValue::Some(FfiFileStats {
+                num_files: 10,
+                table_size_bytes: 5259
+            }),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_file_stats_absent_without_crc() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // A metadata-only table has no CRC, so file stats are absent.
+        let table_root = "memory:///test_file_stats_no_crc/";
+        let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
+
+        assert_eq!(
+            unsafe { snapshot_file_stats(snapshot.shallow_copy()) },
+            OptionalValue::None
+        );
+
+        unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
     }
@@ -2336,6 +2608,18 @@ mod tests {
         }),
         4
     )]
+    // Skipped under Miri: writes checkpoint parquet (minutes of safe work under the interpreter).
+    // Its unsafe (checkpoint_snapshot) is unconditional in `spec`, so the Some(V2WithSidecar) path
+    // adds no unsafe over test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error (runs
+    // under Miri); the checkpoint/free handles are covered by test_setting_multithread_executor.
+    // Sidecar-shape is safe kernel logic. Runs (all cases) under normal cargo test / nextest.
+    //
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_sidecar_shape(
         #[case] is_v2: bool,
@@ -2418,6 +2702,16 @@ mod tests {
     // the first checkpoint.)
     //
     // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. AlreadyExists/overwrite is safe kernel
+    // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2457,6 +2751,16 @@ mod tests {
     // `checkpoint_snapshot` returns `AlreadyExists` (same table version). Also validates the
     // `_delta_log/_last_checkpoint` content (version, numOfAddFiles, size, sizeInBytes), which
     // `test_checkpoint_snapshot_sidecar_shape` doesn't cover.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. _last_checkpoint content is safe kernel
+    // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_written_snapshot_is_usable(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2514,6 +2818,11 @@ mod tests {
     // Test checkpoint using FFI engine builder APIs with multithreaded executor.
     // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to
     // build engine without existing tokio runtime.
+    //
+    // Miri anchor for checkpoint FFI: covers the success-path checkpoint_snapshot -> Written
+    // handle -> free_snapshot that the skipped checkpoint tests share, and uniquely covers
+    // set_builder_with_multithreaded_executor (no other test calls it). Skipping it drops that
+    // coverage under Miri.
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
@@ -2755,9 +3064,9 @@ mod tests {
             invalid_snapshot,
             KernelError::GenericError,
             Some(concat!(
-                "Generic delta kernel error: Staged commits in log_tail require ",
-                "max_catalog_version to be set. Use with_max_catalog_version() ",
-                "when providing staged commits."
+                "Max catalog version error: Max catalog version is required when providing ",
+                "staged commits in the log tail. ",
+                "Use with_max_catalog_version()."
             )),
         );
 

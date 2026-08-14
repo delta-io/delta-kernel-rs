@@ -170,9 +170,11 @@ impl CreateTableTransaction {
             system_domain_metadata_additions: system_domain_metadata,
             user_domain_removals: vec![],
             data_change: true,
+            column_defaults_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
+            num_dv_updates: 0,
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })

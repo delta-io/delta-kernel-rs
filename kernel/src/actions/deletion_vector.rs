@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
-use delta_kernel_derive::ToSchema;
+use delta_kernel_derive::{internal_api, ToSchema};
 use roaring::RoaringTreemap;
 use url::Url;
 
@@ -254,21 +254,48 @@ impl DeletionVectorDescriptor {
         }
     }
 
+    /// Decodes a `PersistedRelative` path to its relative-path form
+    /// (`<prefix>/deletion_vector_<uuid>.bin`).
+    ///
+    /// The encoded path is an optional random prefix followed by a fixed-length 20-character z85
+    /// UUID; the prefix becomes a directory component, and is omitted entirely when absent:
+    ///
+    /// ```text
+    /// "ab^-aqEH.-t@S}K{vb[*k^" -> "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+    /// "vBn[lx{q8@P<9BNH/isA"   -> "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+    /// ```
+    ///
+    /// Errors if called on a non-`PersistedRelative` descriptor, if the encoded path is shorter
+    /// than the 20-character z85 UUID suffix, or if that suffix fails to decode into a UUID.
+    pub(crate) fn relative_path(&self) -> DeltaResult<String> {
+        require!(
+            self.storage_type == DeletionVectorStorageType::PersistedRelative,
+            Error::DeletionVector(format!(
+                "relative_path is only valid for PersistedRelative, got {:?}",
+                self.storage_type
+            ))
+        );
+        // Byte-slice rather than char-slice: z85 is ASCII-only, and string slicing would panic if
+        // a non-ASCII byte boundary fell inside the trailing 20-byte window. Mirrors `try_new`.
+        let bytes = self.path_or_inline_dv.as_bytes();
+        require!(
+            bytes.len() >= 20,
+            Error::DeletionVector(format!("Invalid length {}, must be >= 20", bytes.len()))
+        );
+        let prefix_len = bytes.len() - 20;
+        let decoded = z85::decode(&bytes[prefix_len..])
+            .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
+        let uuid = uuid::Uuid::from_slice(&decoded)
+            .map_err(|err| Error::DeletionVector(err.to_string()))?;
+        let prefix = std::str::from_utf8(&bytes[..prefix_len])
+            .map_err(|_| Error::deletion_vector("DV path prefix is not valid UTF-8"))?;
+        Ok(DeletionVectorPath::relative_path(prefix, &uuid))
+    }
+
     pub fn absolute_path(&self, parent: &Url) -> DeltaResult<Option<Url>> {
         match self.storage_type {
             DeletionVectorStorageType::PersistedRelative => {
-                let path_len = self.path_or_inline_dv.len();
-                require!(
-                    path_len >= 20,
-                    Error::DeletionVector(format!("Invalid length {path_len}, must be >= 20"))
-                );
-                let prefix_len = path_len - 20;
-                let decoded = z85::decode(&self.path_or_inline_dv[prefix_len..])
-                    .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
-                let uuid = uuid::Uuid::from_slice(&decoded)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                let dv_suffix =
-                    DeletionVectorPath::relative_path(&self.path_or_inline_dv[..prefix_len], &uuid);
+                let dv_suffix = self.relative_path()?;
                 let dv_path = parent
                     .join(&dv_suffix)
                     .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;
@@ -474,18 +501,21 @@ fn slice_to_u32(buf: &[u8], endian: Endian) -> DeltaResult<u32> {
 
 /// helper function to convert a treemap into a boolean vector where, for index i, if the bit is
 /// set, the vector will be false, and otherwise at index i the vector will be true
+#[internal_api]
 pub(crate) fn deletion_treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
     treemap_to_bools_with(treemap, false)
 }
 
 /// helper function to convert a treemap into a boolean vector where, for index i, if the bit is
 /// set, the vector will be true, and otherwise at index i the vector will be false
+#[internal_api]
 pub(crate) fn selection_treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
     treemap_to_bools_with(treemap, true)
 }
 
 /// helper function to generate vectors of bools from treemap. If `set_bit` is `true`, this is
 /// [`selection_treemap_to_bools`]. If `set_bit` is false, this is [`deletion_treemap_to_bools`]
+#[internal_api]
 fn treemap_to_bools_with(treemap: RoaringTreemap, set_bit: bool) -> Vec<bool> {
     fn combine(high_bits: u32, low_bits: u32) -> usize {
         ((u64::from(high_bits) << 32) | u64::from(low_bits)) as usize
@@ -620,6 +650,74 @@ mod tests {
             .unwrap();
         let example = dv_example();
         assert_eq!(dv_url, example.absolute_path(&parent).unwrap().unwrap());
+    }
+
+    fn dv_with_path(
+        storage_type: DeletionVectorStorageType,
+        path_or_inline_dv: &str,
+    ) -> DeletionVectorDescriptor {
+        DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv: path_or_inline_dv.to_string(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        }
+    }
+
+    #[rstest::rstest]
+    // z85 UUID with a random prefix -> `<prefix>/deletion_vector_<uuid>.bin`.
+    #[case(
+        "ab^-aqEH.-t@S}K{vb[*k^",
+        "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+    )]
+    // Bare 20-char z85 UUID, no prefix.
+    #[case(
+        "vBn[lx{q8@P<9BNH/isA",
+        "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+    )]
+    fn test_relative_path_decodes(#[case] encoded: &str, #[case] expected: &str) {
+        let dv = dv_with_path(DeletionVectorStorageType::PersistedRelative, encoded);
+        assert_eq!(dv.relative_path().unwrap(), expected);
+    }
+
+    #[rstest::rstest]
+    // Non-relative storage types are rejected by the guard.
+    #[case(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+        "only valid for PersistedRelative"
+    )]
+    #[case(
+        DeletionVectorStorageType::Inline,
+        "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L",
+        "only valid for PersistedRelative"
+    )]
+    // Path shorter than the 20-byte z85 UUID suffix.
+    #[case(
+        DeletionVectorStorageType::PersistedRelative,
+        "short",
+        "Invalid length"
+    )]
+    // A non-ASCII byte straddling the trailing-20-byte window must error, not panic. `é` is two
+    // bytes, so this 21-byte path leaves `prefix_len == 1` inside the multi-byte `é`; byte-slicing
+    // (vs the pre-fix char-slicing) errors cleanly instead of panicking.
+    #[case(
+        DeletionVectorStorageType::PersistedRelative,
+        "éaaaaaaaaaaaaaaaaaaa",
+        "Failed to decode DV uuid"
+    )]
+    fn test_relative_path_errors(
+        #[case] storage_type: DeletionVectorStorageType,
+        #[case] path_or_inline_dv: &str,
+        #[case] expected_error: &str,
+    ) {
+        let dv = dv_with_path(storage_type, path_or_inline_dv);
+        let err = dv.relative_path().unwrap_err().to_string();
+        assert!(
+            err.contains(expected_error),
+            "error {err:?} did not contain {expected_error:?}"
+        );
     }
 
     #[test]

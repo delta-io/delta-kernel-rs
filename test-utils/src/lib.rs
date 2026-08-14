@@ -161,6 +161,7 @@ define_sweeps! {
     ),
 }
 use std::collections::{HashMap, HashSet};
+use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
@@ -172,9 +173,10 @@ use delta_kernel::actions::{
 };
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
-    RecordBatch, StringArray, StructArray,
+    MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::compute::concat;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
 };
@@ -196,10 +198,11 @@ use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
+use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, Error, FileMeta,
-    FilteredEngineData, LogPath, Snapshot,
+    try_parse_uri, CancellationToken, CancelledFuture, DeltaResult, DeltaResultIterator, Engine,
+    EngineData, Error, FileMeta, FilteredEngineData, LogPath, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -367,29 +370,29 @@ pub fn record_batch_to_bytes_with_props(
 
 /// Anything that implements `IntoArray` can turn itself into a reference to an arrow array
 pub trait IntoArray {
-    fn into_array(self) -> ArrayRef;
+    fn into_arrow_array(self) -> ArrayRef;
 }
 
 impl IntoArray for Vec<i32> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(Int32Array::from(self))
     }
 }
 
 impl IntoArray for Vec<i64> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(Int64Array::from(self))
     }
 }
 
 impl IntoArray for Vec<bool> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(BooleanArray::from(self))
     }
 }
 
 impl IntoArray for Vec<&'static str> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(StringArray::from(self))
     }
 }
@@ -408,8 +411,8 @@ where
 /// respectively
 pub fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
     generate_batch(vec![
-        ("id", vec![1, 2, 3].into_array()),
-        ("val", vec!["a", "b", "c"].into_array()),
+        ("id", vec![1, 2, 3].into_arrow_array()),
+        ("val", vec!["a", "b", "c"].into_arrow_array()),
     ])
 }
 
@@ -510,14 +513,127 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-/// Helper to create a DefaultEngine with the default executor for tests.
+/// A modification to an add-file batch's `partitionValues` keys.
+#[derive(Clone, Copy)]
+pub enum AddFilePartitionKeyModify<'a> {
+    Drop {
+        key: &'a str,
+    },
+    Insert {
+        key: &'a str,
+        value: Option<&'a str>,
+    },
+}
+
+/// Applies `modifications` in order to every `partitionValues` row in an add-file batch.
 ///
-/// Uses `TokioBackgroundExecutor` as the default executor.
+/// `Drop` removes every entry with the given key. `Insert` appends a new entry.
+///
+/// # Panics
+///
+/// Panics when `batch` does not contain a string-keyed and string-valued `partitionValues` map, or
+/// when the modified batch cannot be constructed.
+pub fn modify_add_file_partition_keys(
+    batch: RecordBatch,
+    modifications: &[AddFilePartitionKeyModify<'_>],
+) -> RecordBatch {
+    if modifications.is_empty() {
+        return batch;
+    }
+
+    let index = batch
+        .schema()
+        .index_of("partitionValues")
+        .expect("partitionValues field in add-file batch");
+    let map = batch.column(index).as_map();
+    let (entry_field, ordered) = match map.data_type() {
+        ArrowDataType::Map(entry_field, ordered) => (entry_field.clone(), *ordered),
+        _ => unreachable!("partitionValues column must be a map"),
+    };
+    let (key_field, value_field) = map.entries_fields();
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(key_field.clone())
+        .with_values_field(value_field.clone());
+    for row in 0..map.len() {
+        let entries = map.value(row);
+        let keys = entries.column(0).as_string::<i32>();
+        let values = entries.column(1).as_string::<i32>();
+        let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
+            .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
+            .collect();
+        for modification in modifications {
+            match *modification {
+                AddFilePartitionKeyModify::Drop { key } => {
+                    partition_values.retain(|(existing_key, _)| *existing_key != key);
+                }
+                AddFilePartitionKeyModify::Insert { key, value } => {
+                    partition_values.push((key, value));
+                }
+            }
+        }
+        for (key, value) in partition_values {
+            builder.keys().append_value(key);
+            match value {
+                Some(value) => builder.values().append_value(value),
+                None => builder.values().append_null(),
+            }
+        }
+        builder
+            .append(true)
+            .expect("failed to append partition-values map row");
+    }
+    let (_, offsets, entries, nulls, _) = builder.finish().into_parts();
+    let new_map: ArrayRef = Arc::new(
+        MapArray::try_new(entry_field, offsets, entries, nulls, ordered)
+            .expect("failed to rebuild partition-values map"),
+    );
+
+    let mut columns = batch.columns().to_vec();
+    columns[index] = new_map;
+    RecordBatch::try_new(batch.schema(), columns)
+        .expect("failed to rebuild add-file batch after modifying a partition key")
+}
+
+/// Replaces one row in an Arrow array with a one-row array of the same type.
+///
+/// # Panics
+///
+/// Panics if `replacement` does not contain exactly one row, `row` is out of bounds, or the arrays
+/// cannot be concatenated.
+pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -> ArrayRef {
+    assert_eq!(
+        replacement.len(),
+        1,
+        "replacement must contain exactly one row"
+    );
+    let slices = [
+        column.slice(0, row),
+        replacement,
+        column.slice(row + 1, column.len() - row - 1),
+    ];
+    let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
+    concat(&arrays).expect("replacement value must match the modified column type")
+}
+
 pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+    create_default_engine_with_batch(table_root, None)
+}
+
+/// Helper to create a DefaultEngine with the default executor for tests.
+///
+/// Uses `TokioBackgroundExecutor` as the default executor.
+pub fn create_default_engine_with_batch(
+    table_root: &url::Url,
+    batch_size: Option<usize>,
+) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
-    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
+    let mut builder = DefaultEngineBuilder::new(store);
+    if let Some(batch_size) = batch_size {
+        builder = builder.with_batch_size(NonZero::new(batch_size).unwrap());
+    }
+    Ok(Arc::new(builder.build()))
 }
 
 /// Helper to create a DefaultEngine with the default executor for tests.
@@ -627,10 +743,36 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
-    reader_features: Vec<&str>,
-    writer_features: Vec<&str>,
+    mut reader_features: Vec<&str>,
+    mut writer_features: Vec<&str>,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
+
+    // IcebergCompatV3 requires ColumnMapping, RowTracking, and DomainMetadata. Add them so callers
+    // can pass just `icebergCompatV3` (plus e.g. `allowColumnDefaults`) and get a loadable table.
+    let enable_iceberg_compat_v3 = writer_features.contains(&"icebergCompatV3");
+    if enable_iceberg_compat_v3 {
+        if !reader_features.contains(&"columnMapping") {
+            reader_features.push("columnMapping");
+        }
+        for f in ["columnMapping", "rowTracking", "domainMetadata"] {
+            if !writer_features.contains(&f) {
+                writer_features.push(f);
+            }
+        }
+    }
+
+    // Column mapping requires per-field `id`/`physicalName` metadata, without which snapshot load
+    // fails. Assign it here (with nested ids for iceberg v3); `max_column_id` feeds
+    // `delta.columnMapping.maxColumnId` below.
+    let (schema, max_column_id) = if reader_features.contains(&"columnMapping") {
+        let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
+        let schema =
+            assign_column_mapping_metadata(&schema, &mut max_id, enable_iceberg_compat_v3)?;
+        (Arc::new(schema), max_id)
+    } else {
+        (schema, 0i64)
+    };
     let schema = serde_json::to_string(&schema)?;
 
     let protocol = if use_37_protocol {
@@ -656,6 +798,13 @@ pub async fn create_table(
 
         if reader_features.contains(&"columnMapping") {
             config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+            config.insert(
+                "delta.columnMapping.maxColumnId".to_string(),
+                json!(max_column_id.to_string()),
+            );
+        }
+        if writer_features.contains(&"icebergCompatV3") {
+            config.insert("delta.enableIcebergCompatV3".to_string(), json!("true"));
         }
         if writer_features.contains(&"rowTracking") {
             config.insert("delta.enableRowTracking".to_string(), json!("true"));
@@ -916,6 +1065,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
         .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())
         .with_data_change(data_change);
+    txn.ack_column_defaults();
     if is_blind_append {
         txn = txn.with_blind_append();
     }
@@ -1336,6 +1486,7 @@ pub async fn write_batch_to_table(
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
+    txn.ack_column_defaults();
     let write_context = if txn.logical_partition_columns().is_empty() {
         assert!(
             partition_values.is_empty(),
@@ -1362,6 +1513,56 @@ pub async fn write_batch_to_table(
 pub struct AddInfo {
     pub path: String,
     pub stats: Option<serde_json::Value>,
+}
+
+/// A [`CancellationToken`] for tests. Start uncancelled and flip it with
+/// [`cancel`](Self::cancel), or construct one already cancelled with
+/// [`cancelled`](Self::cancelled).
+///
+/// The [`cancelled_future`](CancellationToken::cancelled_future) future is backed by a
+/// [`tokio::sync::Notify`] so it resolves when [`cancel`](Self::cancel) fires even from another
+/// thread -- this drives the default engine's mid-read cancellation race, not just the synchronous
+/// `is_cancelled` poll.
+#[derive(Debug, Default)]
+pub struct TestCancellationToken {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl TestCancellationToken {
+    /// A token that is already cancelled.
+    pub fn cancelled() -> Self {
+        let token = Self::default();
+        token.cancel();
+        token
+    }
+
+    /// Request cancellation, waking any future returned by
+    /// [`cancelled_future`](CancellationToken::cancelled_future).
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
+impl CancellationToken for TestCancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn cancelled_future(&self) -> CancelledFuture<'_> {
+        Box::pin(async move {
+            // `notified()` must be registered before the cancellation check to avoid missing a
+            // `notify_waiters` that races between the two; an already-cancelled token still
+            // returns immediately via the check.
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        })
+    }
 }
 
 /// Reads all [`AddInfo`]s from a snapshot's log segment.

@@ -67,12 +67,14 @@ impl AlterTableTransaction {
             system_domain_metadata_additions: vec![],
             user_domain_removals: vec![],
             data_change: false,
+            column_defaults_acknowledged: false,
             engine_commit_info: None,
             // TODO(#2446): match delta-spark's per-op isBlindAppend policy
             // (ADD/DROP/DROP NOT NULL -> true, SET NOT NULL -> false). Hardcoded false for
             // now: safe, but misses the true-case optimization delta-spark applies.
             is_blind_append: false,
             dv_matched_files: vec![],
+            num_dv_updates: 0,
             physical_clustering_columns: None,
             _state: PhantomData,
         })

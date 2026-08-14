@@ -1,5 +1,465 @@
 # Changelog
 
+
+## [v0.27.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.27.1/) (2026-08-14)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.26.0...v0.27.1)
+
+
+### 🏗️ Breaking changes
+
+1. Preserve typed schema-field metadata across FFI ([#3086])
+   - `EngineSchemaVisitor`'s `visit_*` callbacks now take `&CMetadataMap` instead of `&CStringMap`, so
+     metadata values keep their kernel type; read it from the `CMetadataValueKind` tag instead of a key
+     allow-list. Adds `visit_metadata_map` and `get_from_metadata_map`, removes
+     `StructField::metadata_with_string_values()`. Partition values still use `CStringMap`.
+2. Expose clustering column infos read path via FFI ([#2573])
+   - New FFI symbol `visit_clustering_columns` (with a `ClusteringColumnVisitor` callback) reports one
+     descriptor per clustering column: logical and physical path, plus a type tag. The Rust API only
+     gains a symbol, but the FFI ABI changes, so implement the visitor if you read clustering metadata.
+3. Make the `col!` macro a preferred alias of `column_expr!` ([#3071])
+   - `col!` is now an alias of `column_expr!`: string literals always split on `.`, constants are allowed
+     only without dots or special chars, and runtime values no longer compile. Use `Expression::column`
+     for runtime column names. `column_expr!` still works but is now `doc(hidden)`.
+4. Require acknowledging column defaults before writing ([#3036])
+   - On tables with column defaults, `partitioned_write_context` and `unpartitioned_write_context` now
+     fail unless `Transaction::ack_column_defaults()` was called first (the connector takes responsibility
+     for applying the defaults).
+5. Validate add file partition columns at commit time ([#2939])
+   - Add-file partition values are now checked against the table's partition columns at commit; missing,
+     extra, or mismatched keys that used to slip through now fail the commit.
+6. Deterministically select among complete checkpoints at one version ([#3046])
+   - Read path only. When a version has more than one complete checkpoint, kernel picks one
+     deterministically (by naming scheme, then part count, then file name) instead of whichever it
+     happened to hit, and tables that used to fail loading on a `_last_checkpoint` part-count mismatch now
+     load. Nothing to change on your end.
+7. Add Cast expression node ([#2962])
+   - The public `Expression` enum isn't `#[non_exhaustive]`, and it gains a `Cast(CastExpression)`
+     variant. Add an arm to any exhaustive match on `Expression`. Compile break only.
+8. Add interval `Scalar` variants ([#2854])
+   - `Scalar` (also not `#[non_exhaustive]`) gains `IntervalYearMonth(i32)` and `IntervalDayTime(i64)`,
+     the value-side companions to the interval `PrimitiveType`s from v0.26.0. Add arms to any exhaustive
+     match on `Scalar`. Interval support is still limited, so this is mostly a compile break.
+9. Add interval support to FFI visitors ([#2903])
+   - Another FFI ABI break: this adds callback fields to the `#[repr(C)]` `EngineSchemaVisitor` and
+     `EngineExpressionVisitor` structs. Rebuild against the regenerated header and handle the new interval
+     callbacks.
+10. Label snapshot-load metric events with source and load type ([#2915], [#2916])
+   - The public metric structs `LogSegmentLoadSuccess`, `ProtocolMetadataLoadSuccess`, and
+     `SnapshotBuildSuccess` gain fields (a fresh-vs-incremental load type, and a `source` on
+     protocol/metadata loads), and `crc_versions_behind` goes from a bool to a count. None are
+     `#[non_exhaustive]`, so code that constructs or exhaustively matches them needs updating.
+     `LogSegmentLoad` and `ProtocolMetadataLoad` now fire on incremental loads too, not just fresh.
+11. Derive `Scalar` from POD structs; infallible `Vec`/`HashMap` conversions ([#3095])
+   - Converting a `Vec` or `HashMap` into `Scalar::Array` / `Scalar::Map` is now infallible (it used to
+     return a `Result`), so drop the `?`/`unwrap` at those call sites. Also adds a proc macro that
+     derives `From<MyStruct> for Scalar`.
+12. Derive macro for populating a struct from a `Scalar` ([#3101])
+   - `StructData::into_values` is replaced by `StructData::into_parts`, which also returns field info, so
+     update callers to `into_parts`. Adds a derive macro for `TryFrom<Scalar>`, round-tripping a struct
+     through `Scalar`.
+
+### 🚀 Features / new APIs
+
+1. Add predicate pushdown to incremental scan ([#2860])
+2. Add method to calculate base stats field IDs ([#2923])
+3. Strip newly-introduced column mapping metadata on none-mode writes ([#2897])
+4. Support a fallback on PlanBasedEngine ([#2924])
+5. Add UC Delta-Tables API wire models and UpdateTableClient trait ([#2906])
+6. Send User-Agent header on UC Delta-Tables API requests ([#2909])
+7. Add UC OSS-server live integration test CI for get_config and load_table ([#2925])
+8. Read interval types in default engine ([#2769])
+9. Register intervalType reader-writer table feature ([#2880])
+10. Expose several internal apis for connectors to do log cleanup ([#2926])
+11. Add UC Delta-Tables credential-vending wire types and client method ([#2934])
+12. Add single-comparison parser for CHECK constraint predicates ([#2883])
+13. Expose incremental scan via FFI ([#2864])
+14. Column defaults flag removal ([#2922])
+15. Re-introduce CRC caching ([#2908])
+16. Added write support with nullCount stats ([#2845])
+17. Add benchmark registry ([#2918])
+18. Add UC Delta-Tables create-table wire types and staging E2E test ([#2941])
+19. Declarative P&M query ([#2874])
+20. Add geometry and geography schema types ([#2930])
+21. Add CDF file listing implementation for read time CDF ([#2803])
+22. Enhance ToSchema macro with additional field tags ([#2932])
+23. *(ffi)* Expose with_stats with_partition_values scan builder APIs ([#2988])
+24. Enable checkpoint row group skipping for partition columns ([#2978])
+25. Add base Structs for modelling AMT ([#2933])
+26. *(ffi)* Expose snapshot file stats from CRC ([#2977])
+27. Add cooperative cancellation to scan_metadata ([#2937])
+28. Use stale CRC in DomainMetadata queries ([#2961])
+29. Add checkpoint structure/schema for adaptive metadata tree. ([#2851])
+30. Validation for required addFile fields at commit time ([#2856])
+31. Add retry when data skipping before dedup fails ([#2944])
+32. *(ffi)* Expose snapshot_publish_with_committer for catalog-managed tables ([#2899])
+33. Enable reading tables with geospatial columns ([#2931])
+34. Push checkpoint partition casts to parquet handlers ([#2983])
+35. Add declarative metadata scan plan ([#2887])
+36. Expose parquet stats collection ([#3022])
+37. Migrate UC integration to Delta Tables LoadTable and UpdateTable APIs ([#2855])
+38. *(ffi)* Expose declarative metadata scan plan ([#3023])
+39. Create Unity Catalog managed tables via the Delta Tables API ([#2826])
+40. SetTxn queries: fix retention bug, root in CRC ([#3001])
+41. *(ffi)* Track peak native memory via optional tracking allocator ([#2973])
+42. Add DataFusionExecutor struct ([#2929])
+43. Kernel to datafusion scalar conversion ([#2957])
+44. Add UC Delta-Tables reportMetrics wire types and client method ([#2956])
+45. Add FileStatsAccumulator to merge per-row-group stats ([#3010])
+46. Respect scan metadata output options in declarative plans ([#3015])
+47. Expression conversion ([#2958])
+48. Tag UC client User Agent and rename unity-catalog-delta-rest-client ([#3033])
+49. Add create_staging_table and create_table to UCClient ([#3034])
+50. Utilities for converting between AMT and Delta DV structs ([#3021])
+51. Define and use Predicate TRUE/FALSE/NULL constants ([#3065])
+52. Make the PlanBasedEngine fallback optional ([#3069])
+53. Gate vendored protoc behind its own feature ([#3054])
+54. Rename Load to DynamicScan and require file metadata ([#3024])
+55. Refine agg definitions and sync engine impl ([#3081])
+56. 3-arg Min/MaxNotNullBy ([#3082])
+57. Define and implement SUM/COUNT aggregates ([#3083])
+58. Initial predicate conversion ([#2971])
+59. Typed Struct and StructPatch expression conversion ([#2972])
+60. Convert MapToStruct expressions to DataFusion ([#2996])
+61. Lower ParseJson to a kernel-delegating scalar UDF ([#3056])
+62. Validate required fields for dv update ([#3026])
+
+### 🐛 Bug Fixes
+
+1. Change PlanBasedEngine FFI to not free fallback engine ([#2943])
+2. Clarify schema JSON recursion limit errors ([#2940])
+3. Bump parquet to 58.1 and preserve exact zero null counts ([#2952])
+4. Stop tracing events from warning on metrics ([#2799])
+5. Source checkpoint partition columns from physical schema ([#2976])
+6. Interval table feature cleanup ([#2959])
+7. Make generic errors more specific in snapshot creation ([#2987])
+8. Reclassify MalformedJson error during schema parsing to Schema error ([#2999])
+9. Normalize decimal scalar parsing failures to ParseError ([#2954])
+10. Accept `timestampWithoutTimezone` feature alias for legacy tables ([#2842])
+11. Include offending feature in InvalidProtocol feature-validation errors ([#3008])
+12. Three plan/executor improvements ([#3029])
+13. Correctly generate `extendedFileMetadata` for removeFile ([#3006])
+14. Dv update respect shorten selection vector ([#3051])
+15. Remove `interval-type-in-dev` feature flag ([#3041])
+16. Truncate timestamp stats to milliseconds in JSON encoding ([#3073])
+17. Dv resolution when multiple batches are produced ([#3077])
+18. Block dataChange removeFile for appendOnly tables ([#3042])
+19. Remove version from kernel in datafusion executor ([#3108])
+20. Logical comparison for NULL instead of physical comparison ([#3085])
+21. Read tables with orphaned columnMapping reader feature ([#3097])
+22. Spurious delta acceptance failure due to network connection issues ([#3109])
+23. Fix default-feature build (import CollectInto from crate::utils) ([#3123])
+
+### 📚 Documentation
+
+1. Document plan expression semantics for executor authors ([#3017])
+2. Add crate metadata and READMEs for the UC crates ([#3061])
+3. Explain why timestamp stats are floored, not rounded or ceiled ([#3090])
+4. Explain why kernel fails on a dangling _last_checkpoint hint ([#3084])
+
+### ⚡ Performance
+
+1. Skip non-add checkpoint row groups during scans ([#2991])
+2. Omit raw checkpoint stats when structured stats are compatible ([#2998])
+3. Speed up the Miri CI job and widen its coverage ([#3035])
+
+### 🚜 Refactor
+
+1. Extract log_tail_from_commits helper in UC kernel client ([#2927])
+2. Rename NullGuarded to Checkpoint data skipping creator ([#2960])
+3. Extract StatColumns and emit prefixes from the checkpoint creator ([#2963])
+4. Expose treemap to bool functions from internal api ([#2986])
+5. Consolidate test engine wrappers behind DelegatingEngine ([#3031])
+6. Extract unit test utils from `kernel/src/utils.rs` ([#3018])
+7. Move plan construction to `Scan` ([#3039])
+
+### 🧪 Testing
+
+1. Strengthen scan metadata struct columns coverage ([#3053])
+
+### ⚙️ Chores/CI
+
+1. Split no-declarative-plans tests into a parallel job ([#3038])
+2. Scaffold datafusion-executor crate ([#2928])
+3. Version the UC crates independently at 0.1.0 ([#3062])
+4. Use col! instead of column_expr! ([#3074])
+5. Use col and col_name macros everywhere they make sense ([#3121])
+
+
+[#2860]: https://github.com/delta-io/delta-kernel-rs/pull/2860
+[#2923]: https://github.com/delta-io/delta-kernel-rs/pull/2923
+[#2897]: https://github.com/delta-io/delta-kernel-rs/pull/2897
+[#2924]: https://github.com/delta-io/delta-kernel-rs/pull/2924
+[#2906]: https://github.com/delta-io/delta-kernel-rs/pull/2906
+[#2909]: https://github.com/delta-io/delta-kernel-rs/pull/2909
+[#2925]: https://github.com/delta-io/delta-kernel-rs/pull/2925
+[#2769]: https://github.com/delta-io/delta-kernel-rs/pull/2769
+[#2880]: https://github.com/delta-io/delta-kernel-rs/pull/2880
+[#2926]: https://github.com/delta-io/delta-kernel-rs/pull/2926
+[#2927]: https://github.com/delta-io/delta-kernel-rs/pull/2927
+[#2934]: https://github.com/delta-io/delta-kernel-rs/pull/2934
+[#2943]: https://github.com/delta-io/delta-kernel-rs/pull/2943
+[#2883]: https://github.com/delta-io/delta-kernel-rs/pull/2883
+[#2864]: https://github.com/delta-io/delta-kernel-rs/pull/2864
+[#2922]: https://github.com/delta-io/delta-kernel-rs/pull/2922
+[#2908]: https://github.com/delta-io/delta-kernel-rs/pull/2908
+[#2915]: https://github.com/delta-io/delta-kernel-rs/pull/2915
+[#2845]: https://github.com/delta-io/delta-kernel-rs/pull/2845
+[#2940]: https://github.com/delta-io/delta-kernel-rs/pull/2940
+[#2918]: https://github.com/delta-io/delta-kernel-rs/pull/2918
+[#2952]: https://github.com/delta-io/delta-kernel-rs/pull/2952
+[#2941]: https://github.com/delta-io/delta-kernel-rs/pull/2941
+[#2874]: https://github.com/delta-io/delta-kernel-rs/pull/2874
+[#2960]: https://github.com/delta-io/delta-kernel-rs/pull/2960
+[#2963]: https://github.com/delta-io/delta-kernel-rs/pull/2963
+[#2799]: https://github.com/delta-io/delta-kernel-rs/pull/2799
+[#2962]: https://github.com/delta-io/delta-kernel-rs/pull/2962
+[#2930]: https://github.com/delta-io/delta-kernel-rs/pull/2930
+[#2803]: https://github.com/delta-io/delta-kernel-rs/pull/2803
+[#2976]: https://github.com/delta-io/delta-kernel-rs/pull/2976
+[#2959]: https://github.com/delta-io/delta-kernel-rs/pull/2959
+[#2986]: https://github.com/delta-io/delta-kernel-rs/pull/2986
+[#2932]: https://github.com/delta-io/delta-kernel-rs/pull/2932
+[#2991]: https://github.com/delta-io/delta-kernel-rs/pull/2991
+[#2988]: https://github.com/delta-io/delta-kernel-rs/pull/2988
+[#2978]: https://github.com/delta-io/delta-kernel-rs/pull/2978
+[#2933]: https://github.com/delta-io/delta-kernel-rs/pull/2933
+[#2977]: https://github.com/delta-io/delta-kernel-rs/pull/2977
+[#2937]: https://github.com/delta-io/delta-kernel-rs/pull/2937
+[#2961]: https://github.com/delta-io/delta-kernel-rs/pull/2961
+[#2987]: https://github.com/delta-io/delta-kernel-rs/pull/2987
+[#2851]: https://github.com/delta-io/delta-kernel-rs/pull/2851
+[#2856]: https://github.com/delta-io/delta-kernel-rs/pull/2856
+[#2944]: https://github.com/delta-io/delta-kernel-rs/pull/2944
+[#2999]: https://github.com/delta-io/delta-kernel-rs/pull/2999
+[#2899]: https://github.com/delta-io/delta-kernel-rs/pull/2899
+[#2931]: https://github.com/delta-io/delta-kernel-rs/pull/2931
+[#2916]: https://github.com/delta-io/delta-kernel-rs/pull/2916
+[#2954]: https://github.com/delta-io/delta-kernel-rs/pull/2954
+[#2998]: https://github.com/delta-io/delta-kernel-rs/pull/2998
+[#2842]: https://github.com/delta-io/delta-kernel-rs/pull/2842
+[#2854]: https://github.com/delta-io/delta-kernel-rs/pull/2854
+[#2903]: https://github.com/delta-io/delta-kernel-rs/pull/2903
+[#2983]: https://github.com/delta-io/delta-kernel-rs/pull/2983
+[#3008]: https://github.com/delta-io/delta-kernel-rs/pull/3008
+[#2887]: https://github.com/delta-io/delta-kernel-rs/pull/2887
+[#3022]: https://github.com/delta-io/delta-kernel-rs/pull/3022
+[#3017]: https://github.com/delta-io/delta-kernel-rs/pull/3017
+[#3029]: https://github.com/delta-io/delta-kernel-rs/pull/3029
+[#2855]: https://github.com/delta-io/delta-kernel-rs/pull/2855
+[#3023]: https://github.com/delta-io/delta-kernel-rs/pull/3023
+[#2826]: https://github.com/delta-io/delta-kernel-rs/pull/2826
+[#3006]: https://github.com/delta-io/delta-kernel-rs/pull/3006
+[#3031]: https://github.com/delta-io/delta-kernel-rs/pull/3031
+[#3038]: https://github.com/delta-io/delta-kernel-rs/pull/3038
+[#3001]: https://github.com/delta-io/delta-kernel-rs/pull/3001
+[#2928]: https://github.com/delta-io/delta-kernel-rs/pull/2928
+[#2973]: https://github.com/delta-io/delta-kernel-rs/pull/2973
+[#2929]: https://github.com/delta-io/delta-kernel-rs/pull/2929
+[#2957]: https://github.com/delta-io/delta-kernel-rs/pull/2957
+[#2939]: https://github.com/delta-io/delta-kernel-rs/pull/2939
+[#2956]: https://github.com/delta-io/delta-kernel-rs/pull/2956
+[#3010]: https://github.com/delta-io/delta-kernel-rs/pull/3010
+[#3015]: https://github.com/delta-io/delta-kernel-rs/pull/3015
+[#3018]: https://github.com/delta-io/delta-kernel-rs/pull/3018
+[#3036]: https://github.com/delta-io/delta-kernel-rs/pull/3036
+[#2958]: https://github.com/delta-io/delta-kernel-rs/pull/2958
+[#3051]: https://github.com/delta-io/delta-kernel-rs/pull/3051
+[#3033]: https://github.com/delta-io/delta-kernel-rs/pull/3033
+[#3034]: https://github.com/delta-io/delta-kernel-rs/pull/3034
+[#2573]: https://github.com/delta-io/delta-kernel-rs/pull/2573
+[#3046]: https://github.com/delta-io/delta-kernel-rs/pull/3046
+[#3041]: https://github.com/delta-io/delta-kernel-rs/pull/3041
+[#3073]: https://github.com/delta-io/delta-kernel-rs/pull/3073
+[#3061]: https://github.com/delta-io/delta-kernel-rs/pull/3061
+[#3062]: https://github.com/delta-io/delta-kernel-rs/pull/3062
+[#3021]: https://github.com/delta-io/delta-kernel-rs/pull/3021
+[#3065]: https://github.com/delta-io/delta-kernel-rs/pull/3065
+[#3069]: https://github.com/delta-io/delta-kernel-rs/pull/3069
+[#3077]: https://github.com/delta-io/delta-kernel-rs/pull/3077
+[#3054]: https://github.com/delta-io/delta-kernel-rs/pull/3054
+[#3090]: https://github.com/delta-io/delta-kernel-rs/pull/3090
+[#3024]: https://github.com/delta-io/delta-kernel-rs/pull/3024
+[#3035]: https://github.com/delta-io/delta-kernel-rs/pull/3035
+[#3039]: https://github.com/delta-io/delta-kernel-rs/pull/3039
+[#3042]: https://github.com/delta-io/delta-kernel-rs/pull/3042
+[#3086]: https://github.com/delta-io/delta-kernel-rs/pull/3086
+[#3081]: https://github.com/delta-io/delta-kernel-rs/pull/3081
+[#3084]: https://github.com/delta-io/delta-kernel-rs/pull/3084
+[#3071]: https://github.com/delta-io/delta-kernel-rs/pull/3071
+[#3082]: https://github.com/delta-io/delta-kernel-rs/pull/3082
+[#3074]: https://github.com/delta-io/delta-kernel-rs/pull/3074
+[#3083]: https://github.com/delta-io/delta-kernel-rs/pull/3083
+[#2971]: https://github.com/delta-io/delta-kernel-rs/pull/2971
+[#3108]: https://github.com/delta-io/delta-kernel-rs/pull/3108
+[#3085]: https://github.com/delta-io/delta-kernel-rs/pull/3085
+[#3097]: https://github.com/delta-io/delta-kernel-rs/pull/3097
+[#3095]: https://github.com/delta-io/delta-kernel-rs/pull/3095
+[#3101]: https://github.com/delta-io/delta-kernel-rs/pull/3101
+[#2972]: https://github.com/delta-io/delta-kernel-rs/pull/2972
+[#2996]: https://github.com/delta-io/delta-kernel-rs/pull/2996
+[#3056]: https://github.com/delta-io/delta-kernel-rs/pull/3056
+[#3026]: https://github.com/delta-io/delta-kernel-rs/pull/3026
+[#3109]: https://github.com/delta-io/delta-kernel-rs/pull/3109
+[#3053]: https://github.com/delta-io/delta-kernel-rs/pull/3053
+[#3121]: https://github.com/delta-io/delta-kernel-rs/pull/3121
+[#3123]: https://github.com/delta-io/delta-kernel-rs/pull/3123
+
+
+## [v0.26.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.26.0/) (2026-07-13)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.25.0...v0.26.0)
+
+
+### 🏗️ Breaking changes
+
+1. Read interval types in core kernel ([#2768])
+   - `PrimitiveType` gains `IntervalYearMonth` / `IntervalDayTime` variants (with
+     `DataType::INTERVAL_YEAR_MONTH` / `INTERVAL_DAY_TIME` constants). Add arms to any exhaustive
+     match on `PrimitiveType` or `DataType`. Interval reads are not yet functional, so this is
+     only a compile break.
+2. Expose checkpoint writes via checkpoint_snapshot + FfiCheckpointSpec ([#2722])
+   - FFI only. `checkpoint_snapshot` gains a `spec: Option<&FfiCheckpointSpec>` argument and
+     returns `FfiCheckpointWriteResult` instead of `bool`. Pass `NULL` for the old auto-V1/V2
+     behavior, switch on the result tag, and `free_snapshot` the handle it carries.
+3. Carry scan sub-step latencies as nanoseconds ([#2850])
+   - `ScanMetadataCompleted`'s `dedup_visitor_time_ms` / `predicate_eval_time_ms` become
+     `Duration` fields `dedup_visitor_time` / `predicate_eval_time`; call `.as_millis()` for the
+     old value. The FFI struct instead renames them to `*_time_ns` (nanoseconds).
+4. Add arrow-59, drop arrow-57 ([#2847])
+   - The `arrow-57` cargo feature is removed and `arrow-59` added; the default `arrow` feature now
+     resolves to `arrow-59` (was `arrow-58`). Move any explicit `arrow-57` pin to `arrow-58` or
+     `arrow-59`; transitive Arrow 59 changes may surface.
+5. Added delete functionality to StorageHandler ([#2823])
+   - The `StorageHandler` trait gains a required `fn delete(&self, path: &Url) -> DeltaResult<()>`
+     (no default impl). Implement it on your storage handler.
+6. Make default engine read I/O concurrency configurable ([#2813])
+   - `DefaultParquetHandler::with_readahead` is removed; `with_buffer_size` / `with_batch_size`
+     (both handlers) now take `NonZero<usize>`. Wrap existing size args in json handler with `NonZero::new`.
+7. Improve the column_name! macro and friends ([#2891])
+   - The internal re-exported proc macro `delta_kernel_derive::parse_column_name` is renamed to
+     `column_name_segments`. Additionally, `column_name!` now requires at least one argument 
+     and rejects empty path segments. Previously accepted empty/zero-segment invocations now 
+     fail to compile. `column_name!` also gains multi-argument / string-constant support.
+
+### 🚀 Features / new APIs
+
+1. Accept millisecond-precision timestamps in arrow-to-kernel conversion ([#2805])
+2. Expose the FFI function for CommitRange builder ([#2775])
+3. Add java_package option to declarative-plan protos ([#2817])
+4. Add column defaults struct ([#2797])
+5. Allow maintenance properties during CREATE TABLE ([#2816])
+6. Add without_row_transforms scan opt-out ([#2756])
+7. Emit partitionValues_parsed via PartitionValuesOptions in scan output ([#2755])
+8. Schema! macro for easier schema creation ([#2795])
+9. Add with_correlation_id to create-table and alter-table builders ([#2834])
+10. Add schema and transaction methods for column defaults ([#2808])
+11. Add commit range iterator FFI bindings ([#2776])
+12. Expose create-table data layout/partitioned write context via FFI ([#2774])
+13. Parse the full v2Checkpoint object from _last_checkpoint ([#2777])
+14. Support more cases for `snap.write_checksum` ([#2853])
+15. Add checkpoint-shape resolution via PlanExecutor ([#2779])
+16. Add generic REST/HTTP ObjectStore for the default engine ([#2661])
+17. Add SQL predicate tokenizer for CHECK constraints ([#2882])
+18. Expose if a snapshot is built as latest from intent level ([#2905])
+19. Add proper declarative plan agg node ([#2790])
+20. Conversion utilities for plan IR to proto bytes ([#2802])
+21. Introduce fluent PlanBuilder to easily construct Plans ([#2772])
+22. Simplify agg alias handling ([#2868])
+23. Embed proto serialized schema inside of CParquetFooter ([#2865])
+24. Add reader/writer features for AMT ([#2871])
+
+### 🐛 Bug Fixes
+
+1. Update use statements in default engine doc strings ([#2801])
+2. Update snapshot builder info to not include fields ([#2807])
+3. Accept LargeBinary and BinaryView for variant fields ([#2737])
+4. Pair struct fields by name instead of by position ([#2822])
+5. Parse empty-string partition values with spark cast semantics ([#2859])
+6. Tolerate stale column mapping annotations when disabled ([#2886])
+7. Rename IntoArray::into_array to avoid std name collision on Rust 1.97 ([#2901])
+
+### 📚 Documentation
+
+1. Minor test comment update ([#2838])
+2. Add incremental scan user-guide page ([#2863])
+3. Recommend TestTableBuilder for integration test setup ([#2873])
+
+### 🚜 Refactor
+
+1. Extract shared table-feature promotion helpers ([#2844])
+2. Define and use FoldWithOption extension trait ([#2878])
+3. Identify plan nodes by index, drop RefId and output ([#2829])
+
+### 🧪 Testing
+
+1. Add VersionTarget::AtTimestamp and IncrementalFrom to TestTableBuilder ([#2652])
+2. Assert row_id is unique for row tracking enabled feature sets ([#2794])
+3. Extend TableConfig with numIndexedCols and dataSkippingStatsColumns ([#2653])
+4. Cover all-null file pruning across operators and log-replay sources ([#2830])
+5. Verify all primitive values in parsed_stats test ([#2835])
+6. Ensuring dv works with row tracking feature ([#2806])
+
+### ⚙️ Chores/CI
+
+1. Upgrade to strum-28 ([#2849])
+2. Define XXX_FIELD to go with XXX_NAME ([#2870])
+
+
+[#2790]: https://github.com/delta-io/delta-kernel-rs/pull/2790
+[#2801]: https://github.com/delta-io/delta-kernel-rs/pull/2801
+[#2807]: https://github.com/delta-io/delta-kernel-rs/pull/2807
+[#2652]: https://github.com/delta-io/delta-kernel-rs/pull/2652
+[#2794]: https://github.com/delta-io/delta-kernel-rs/pull/2794
+[#2805]: https://github.com/delta-io/delta-kernel-rs/pull/2805
+[#2802]: https://github.com/delta-io/delta-kernel-rs/pull/2802
+[#2775]: https://github.com/delta-io/delta-kernel-rs/pull/2775
+[#2768]: https://github.com/delta-io/delta-kernel-rs/pull/2768
+[#2817]: https://github.com/delta-io/delta-kernel-rs/pull/2817
+[#2797]: https://github.com/delta-io/delta-kernel-rs/pull/2797
+[#2653]: https://github.com/delta-io/delta-kernel-rs/pull/2653
+[#2816]: https://github.com/delta-io/delta-kernel-rs/pull/2816
+[#2829]: https://github.com/delta-io/delta-kernel-rs/pull/2829
+[#2830]: https://github.com/delta-io/delta-kernel-rs/pull/2830
+[#2756]: https://github.com/delta-io/delta-kernel-rs/pull/2756
+[#2755]: https://github.com/delta-io/delta-kernel-rs/pull/2755
+[#2838]: https://github.com/delta-io/delta-kernel-rs/pull/2838
+[#2795]: https://github.com/delta-io/delta-kernel-rs/pull/2795
+[#2834]: https://github.com/delta-io/delta-kernel-rs/pull/2834
+[#2808]: https://github.com/delta-io/delta-kernel-rs/pull/2808
+[#2722]: https://github.com/delta-io/delta-kernel-rs/pull/2722
+[#2849]: https://github.com/delta-io/delta-kernel-rs/pull/2849
+[#2844]: https://github.com/delta-io/delta-kernel-rs/pull/2844
+[#2835]: https://github.com/delta-io/delta-kernel-rs/pull/2835
+[#2737]: https://github.com/delta-io/delta-kernel-rs/pull/2737
+[#2850]: https://github.com/delta-io/delta-kernel-rs/pull/2850
+[#2806]: https://github.com/delta-io/delta-kernel-rs/pull/2806
+[#2847]: https://github.com/delta-io/delta-kernel-rs/pull/2847
+[#2772]: https://github.com/delta-io/delta-kernel-rs/pull/2772
+[#2776]: https://github.com/delta-io/delta-kernel-rs/pull/2776
+[#2822]: https://github.com/delta-io/delta-kernel-rs/pull/2822
+[#2813]: https://github.com/delta-io/delta-kernel-rs/pull/2813
+[#2859]: https://github.com/delta-io/delta-kernel-rs/pull/2859
+[#2823]: https://github.com/delta-io/delta-kernel-rs/pull/2823
+[#2868]: https://github.com/delta-io/delta-kernel-rs/pull/2868
+[#2870]: https://github.com/delta-io/delta-kernel-rs/pull/2870
+[#2774]: https://github.com/delta-io/delta-kernel-rs/pull/2774
+[#2865]: https://github.com/delta-io/delta-kernel-rs/pull/2865
+[#2878]: https://github.com/delta-io/delta-kernel-rs/pull/2878
+[#2777]: https://github.com/delta-io/delta-kernel-rs/pull/2777
+[#2853]: https://github.com/delta-io/delta-kernel-rs/pull/2853
+[#2863]: https://github.com/delta-io/delta-kernel-rs/pull/2863
+[#2886]: https://github.com/delta-io/delta-kernel-rs/pull/2886
+[#2901]: https://github.com/delta-io/delta-kernel-rs/pull/2901
+[#2871]: https://github.com/delta-io/delta-kernel-rs/pull/2871
+[#2779]: https://github.com/delta-io/delta-kernel-rs/pull/2779
+[#2891]: https://github.com/delta-io/delta-kernel-rs/pull/2891
+[#2661]: https://github.com/delta-io/delta-kernel-rs/pull/2661
+[#2882]: https://github.com/delta-io/delta-kernel-rs/pull/2882
+[#2873]: https://github.com/delta-io/delta-kernel-rs/pull/2873
+[#2905]: https://github.com/delta-io/delta-kernel-rs/pull/2905
+
+
 ## [v0.25.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.25.0/) (2026-06-17)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.24.0...v0.25.0)

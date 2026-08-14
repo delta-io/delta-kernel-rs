@@ -168,21 +168,21 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     // Step 1: Create and write two parquet files
     let data_batch_1 = generate_batch(vec![
-        ("id", vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].into_array()),
+        ("id", vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].into_arrow_array()),
         (
             "value",
-            vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"].into_array(),
+            vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"].into_arrow_array(),
         ),
     ])?;
 
     let data_batch_2 = generate_batch(vec![
         (
             "id",
-            vec![10, 11, 12, 13, 14, 15, 16, 17, 18, 19].into_array(),
+            vec![10, 11, 12, 13, 14, 15, 16, 17, 18, 19].into_arrow_array(),
         ),
         (
             "value",
-            vec!["k", "l", "m", "n", "o", "p", "q", "r", "s", "t"].into_array(),
+            vec!["k", "l", "m", "n", "o", "p", "q", "r", "s", "t"].into_arrow_array(),
         ),
     ])?;
 

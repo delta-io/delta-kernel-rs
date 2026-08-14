@@ -355,7 +355,7 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
     fn accepts_safe_decimal_casts() {
@@ -872,6 +872,45 @@ mod tests {
                 &ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
                 ValidationMode::TypesAndNames,
             ),
+            "Incorrect datatype",
+        );
+    }
+
+    #[test]
+    fn interval_maps_to_physical_integer() {
+        assert_eq!(
+            ensure_data_types(
+                &DataType::INTERVAL_YEAR_MONTH,
+                &ArrowDataType::Int32,
+                ValidationMode::TypesAndNames
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::INTERVAL_DAY_TIME,
+                &ArrowDataType::Int64,
+                ValidationMode::TypesAndNames
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+    }
+
+    #[rstest]
+    fn interval_rejects_incompatible_arrow_types(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+        #[values(
+            ArrowDataType::Utf8,
+            ArrowDataType::Boolean,
+            ArrowDataType::Date32,
+            ArrowDataType::Float64
+        )]
+        arrow_type: ArrowDataType,
+    ) {
+        assert_result_error_with_message(
+            ensure_data_types(&interval, &arrow_type, ValidationMode::TypesAndNames),
             "Incorrect datatype",
         );
     }

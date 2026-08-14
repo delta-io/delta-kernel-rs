@@ -95,6 +95,11 @@ scan_builder_with_predicate() ->  Handle<ExclusiveScanBuilder>
         |
 scan_builder_with_schema()    ->  Handle<ExclusiveScanBuilder>
         |
+scan_builder_with_stats()     ->  Handle<ExclusiveScanBuilder>
+        |
+scan_builder_with_partition_values()
+                              ->  Handle<ExclusiveScanBuilder>
+        |
 scan_builder_build()          ->  Handle<SharedScan>
 ```
 
@@ -179,7 +184,7 @@ to pass to `scan_builder_with_schema`).
 | Function | Purpose |
 |----------|---------|
 | `scan` | Create a scan with optional predicate and projection (convenience function) |
-| `scan_builder` / `scan_builder_with_predicate` / `scan_builder_with_schema` / `scan_builder_build` | Build a scan incrementally with the builder pattern |
+| `scan_builder` / `scan_builder_with_predicate` / `scan_builder_with_schema` / `scan_builder_with_stats` / `scan_builder_with_partition_values` / `scan_builder_build` | Build a scan incrementally and configure predicate, projection, stats, and partition-value output |
 | `scan_logical_schema` / `scan_physical_schema` / `scan_table_root` | Inspect the scan's logical/physical read schemas and table root |
 | `scan_metadata_iter_init` / `scan_metadata_next` | Iterate over scan metadata (per-file lists, deletion vectors, transforms) |
 | `scan_metadata_next_arrow` / `free_scan_metadata_arrow_result` | Pull the next scan-metadata batch as an Arrow `RecordBatch` and release it (requires `default-engine-base`) |
@@ -229,14 +234,17 @@ Partitioned writes (which would use one context per partition) are tracked in
 [#2355](https://github.com/delta-io/delta-kernel-rs/issues/2355).
 
 Engines must append their own `<uuid>.parquet` filename (and any subdirectory
-layout) onto the returned table root. The kernel-side `WriteContext::write_dir`
-helper -- which produces the recommended directory (Hive-style partition paths
-for partitioned tables when column mapping is off, or a random 2-char prefix
-when column mapping is on) -- is internal and has no FFI binding.
+layout) onto the returned table root. For partitioned tables, use
+[`get_write_dir`](https://docs.rs/delta_kernel_ffi/latest/delta_kernel_ffi/fn.get_write_dir.html)
+for the kernel-recommended subdirectory (Hive-style partition paths when column mapping is off, or
+a random 2-char prefix when column mapping is on). `get_write_path` returns the table root for
+unpartitioned writes.
 
 | Function | Purpose |
 |----------|---------|
 | `get_unpartitioned_write_context` | Get a `SharedWriteContext` covering all rows in the transaction |
+| `get_partitioned_write_context` | Get a `SharedWriteContext` for one partition (requires a `PartitionValueMap`) |
+| `get_write_dir` | Return the recommended write subdirectory for a partitioned `SharedWriteContext` |
 | `get_write_path` | Return the table root URL from a `SharedWriteContext` (engines append their own subdirectory and filename) |
 | `get_write_schema` | Return the logical (user-facing) write schema from a `SharedWriteContext` |
 | `free_write_context` | Release the write-context handle |

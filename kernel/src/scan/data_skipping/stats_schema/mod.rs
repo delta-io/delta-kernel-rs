@@ -372,8 +372,8 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 /// This is also used to validate clustering column types, since clustering requires
 /// per-file statistics on clustering columns.
 ///
-/// Note: Boolean and Binary are intentionally excluded as min/max statistics provide minimal
-/// skipping benefit for low-cardinality or opaque data types.
+/// Note: Boolean, Binary, and Interval are intentionally excluded as min/max statistics provide
+/// minimal skipping benefit or do not have stable protocol-level ordering semantics.
 ///
 /// Void is also excluded: void columns are never materialized to Parquet, so min/max are not
 /// meaningful. When `nullCount` stats are present for a void column, `eval_pred_is_null` can
@@ -399,9 +399,25 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "geo-type-in-dev")]
+    use rstest::rstest;
+
     use super::*;
+    use crate::expressions::column_name;
     use crate::schema::ArrayType;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::table_properties::TableProperties;
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap())))]
+    #[case(PrimitiveType::Geography(Box::new(
+        GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap()
+    )))]
+    fn test_geo_types_are_not_skipping_eligible(#[case] ptype: PrimitiveType) {
+        assert!(!is_skipping_eligible_datatype(&ptype));
+    }
 
     fn stats_config_from_table_properties(properties: &TableProperties) -> StatsConfig<'_> {
         StatsConfig {
@@ -655,10 +671,12 @@ mod tests {
         // - "id" (LONG) - eligible for both null count and min/max
         // - "is_active" (BOOLEAN) - eligible for null count but NOT for min/max
         // - "metadata" (BINARY) - eligible for null count but NOT for min/max
+        // - "duration" (INTERVAL_DAY_TIME) - eligible for null count but NOT for min/max
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("is_active", DataType::BOOLEAN),
             StructField::nullable("metadata", DataType::BINARY),
+            StructField::nullable("duration", DataType::INTERVAL_DAY_TIME),
         ]);
 
         let stats_schema = expected_stats_schema(
@@ -674,9 +692,10 @@ mod tests {
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("is_active", DataType::LONG),
             StructField::nullable("metadata", DataType::LONG),
+            StructField::nullable("duration", DataType::LONG),
         ]);
 
-        // Expected minValues/maxValues schema: only eligible fields (no boolean, no binary)
+        // Expected minValues/maxValues schema: only eligible fields
         let expected_min_max =
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
@@ -748,6 +767,7 @@ mod tests {
         let file_schema = StructType::new_unchecked([
             StructField::nullable("is_active", DataType::BOOLEAN),
             StructField::nullable("metadata", DataType::BINARY),
+            StructField::nullable("duration", DataType::INTERVAL_DAY_TIME),
             StructField::nullable("tags", ArrayType::new(DataType::STRING, false)),
         ]);
 
@@ -759,14 +779,15 @@ mod tests {
         )
         .unwrap();
 
-        // nullCount includes boolean, binary, and array (all non-struct types get nullCount)
+        // nullCount includes all selected non-struct fields
         let expected_null_count = StructType::new_unchecked([
             StructField::nullable("is_active", DataType::LONG),
             StructField::nullable("metadata", DataType::LONG),
+            StructField::nullable("duration", DataType::LONG),
             StructField::nullable("tags", DataType::LONG),
         ]);
 
-        // minValues/maxValues: no fields are eligible (boolean/binary/array excluded)
+        // minValues/maxValues: no fields are eligible
         let expected = StructType::new_unchecked([
             StructField::nullable(NUM_RECORDS, DataType::LONG),
             StructField::nullable(NULL_COUNT, expected_null_count),
@@ -774,6 +795,39 @@ mod tests {
         ]);
 
         assert_eq!(&expected, &stats_schema);
+    }
+
+    #[rstest::rstest]
+    #[case::num_indexed_cols("delta.dataSkippingNumIndexedCols", "1")]
+    #[case::stats_columns("delta.dataSkippingStatsColumns", "iv")]
+    fn test_interval_stats_respect_column_selection(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+        #[case] property_name: &str,
+        #[case] property_value: &str,
+    ) {
+        let properties: TableProperties = [(property_name, property_value)].into();
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("iv", interval),
+            StructField::nullable("value", DataType::LONG),
+        ]);
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let expected = StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(
+                NULL_COUNT,
+                StructType::new_unchecked([StructField::nullable("iv", DataType::LONG)]),
+            ),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
+        ]);
+        assert_eq!(expected, stats_schema);
     }
 
     #[test]
@@ -898,9 +952,9 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["user", "name"]),
-                ColumnName::new(["user", "age"]),
+                column_name!("id"),
+                column_name!("user.name"),
+                column_name!("user.age"),
             ]
         );
     }
@@ -927,10 +981,7 @@ mod tests {
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Only first 2 columns should be included
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["a"]), ColumnName::new(["b"]),]
-        );
+        assert_eq!(columns, vec![column_name!("a"), column_name!("b"),]);
     }
 
     #[test]
@@ -958,10 +1009,7 @@ mod tests {
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Only specified columns should be included (user.name and extra excluded)
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["id"]), ColumnName::new(["user", "age"]),]
-        );
+        assert_eq!(columns, vec![column_name!("id"), column_name!("user.age"),]);
     }
 
     #[test]
@@ -989,11 +1037,11 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["tags"]),
-                ColumnName::new(["metadata"]),
-                ColumnName::new(["v"]),
-                ColumnName::new(["name"]),
+                column_name!("id"),
+                column_name!("tags"),
+                column_name!("metadata"),
+                column_name!("v"),
+                column_name!("name"),
             ]
         );
     }
@@ -1016,7 +1064,7 @@ mod tests {
         ]);
 
         // "c" is a clustering column, should be included even though limit is 1
-        let clustering_columns = vec![ColumnName::new(["c"])];
+        let clustering_columns = vec![column_name!("c")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1051,7 +1099,7 @@ mod tests {
             StructField::nullable("value", DataType::INTEGER),
         ]);
 
-        let columns = [ColumnName::new(["id"])];
+        let columns = [column_name!("id")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1105,7 +1153,7 @@ mod tests {
         ]);
 
         // "name" is outside the limit (limit is 1), and is only requested, not required
-        let columns = [ColumnName::new(["name"])];
+        let columns = [column_name!("name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1133,7 +1181,7 @@ mod tests {
             StructField::nullable("name", DataType::STRING),
         ]);
 
-        let columns = [ColumnName::new(["name"])];
+        let columns = [column_name!("name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1164,7 +1212,7 @@ mod tests {
             StructField::nullable("value", DataType::INTEGER),
         ]);
 
-        let columns = [ColumnName::new(["name"])];
+        let columns = [column_name!("name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1193,7 +1241,7 @@ mod tests {
             StructField::nullable("value", DataType::INTEGER),
         ]);
 
-        let columns = [ColumnName::new(["id"]), ColumnName::new(["name"])];
+        let columns = [column_name!("id"), column_name!("name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1228,7 +1276,7 @@ mod tests {
             StructField::nullable("user", user_struct),
         ]);
 
-        let columns = [ColumnName::new(["user", "name"])];
+        let columns = [column_name!("user.name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1293,7 +1341,7 @@ mod tests {
             StructField::nullable("value", DataType::DOUBLE),
         ]);
 
-        let columns = [ColumnName::new(["id"]), ColumnName::new(["user", "age"])];
+        let columns = [column_name!("id"), column_name!("user.age")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),

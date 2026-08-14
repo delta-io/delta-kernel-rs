@@ -1,4 +1,4 @@
-//! Write-time validation for void type usage in schemas.
+//! Write-time validation for data types in schemas.
 //!
 //! The Delta protocol allows void columns in table metadata. Void columns are never written to
 //! Parquet files; reads generate null values on the fly for missing void columns. However, certain
@@ -60,10 +60,8 @@ pub(crate) fn strip_void_from_schema(schema: SchemaRef) -> SchemaRef {
 }
 
 /// Validates that a schema is suitable for writing data. This is the kernel-internal write-time
-/// rejection point for invalid void placements: [`StructType::try_new`] validates structural
-/// properties only (field-name uniqueness, metadata-column rules) and accepts schemas like
-/// `Array<Void>` or all-void structs. Both JSON-deserialized metadata (which round-trips through
-/// `try_new`) and any `new_unchecked` paths therefore rely on this validator.
+/// rejection point for unsupported data types and invalid void placements. Both JSON-deserialized
+/// metadata and programmatically constructed schemas rely on this validator before writing files.
 ///
 /// Writes are rejected when:
 /// - Void is nested inside Array or Map. Parquet's UNKNOWN logical type can in principle annotate

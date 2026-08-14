@@ -95,6 +95,16 @@ void print_table_type(TableType tt) {
   }
 }
 
+// utility to print out a log-segment load type
+void print_load_type(LogSegmentLoadType lt) {
+  printf("  load_type:");
+  switch (lt) {
+  case LogSegmentLoadTypeFull: printf(" Full,\n"); break;
+  case LogSegmentLoadTypeIncremental: printf(" Incremental,\n"); break;
+  case LogSegmentLoadTypeUnknown: printf(" Unknown,\n"); break;
+  }
+}
+
 #define PM_START(name) printf("\nMetric " #name " {\n")
 #define PM_END printf("}\n\n");
 #define PM_ID(s, f) print_metric_id(#f, (s).f)
@@ -111,11 +121,13 @@ void print_metric(MetricEvent event) {
     PM_ID(lsls, operation_id);
     PM_SLICE(lsls, correlation_id);
     print_table_type(lsls.table_type);
+    print_load_type(lsls.load_type);
     PM_U64(lsls, duration_ns);
     PM_U64(lsls, num_commit_files);
     PM_U64(lsls, num_checkpoint_files);
     PM_U64(lsls, num_compaction_files);
-    PM_BOOL(lsls, has_latest_crc_file);
+    PM_BOOL(lsls, has_crc);
+    PM_U64(lsls, crc_versions_behind);
     PM_END;
     return;
 
@@ -125,6 +137,7 @@ void print_metric(MetricEvent event) {
     PM_ID(lslf, operation_id);
     PM_SLICE(lslf, correlation_id);
     print_table_type(lslf.table_type);
+    print_load_type(lslf.load_type);
     PM_END;
     return;
 
@@ -134,6 +147,7 @@ void print_metric(MetricEvent event) {
     PM_ID(pmls, operation_id);
     PM_SLICE(pmls, correlation_id);
     print_table_type(pmls.table_type);
+    print_load_type(pmls.load_type);
     PM_U64(pmls, duration_ns);
     PM_END;
     return;
@@ -144,6 +158,7 @@ void print_metric(MetricEvent event) {
     PM_ID(pmlf, operation_id);
     PM_SLICE(pmlf, correlation_id);
     print_table_type(pmlf.table_type);
+    print_load_type(pmlf.load_type);
     PM_END;
     return;
 
@@ -153,6 +168,7 @@ void print_metric(MetricEvent event) {
     PM_ID(sbs, operation_id);
     PM_SLICE(sbs, correlation_id);
     print_table_type(sbs.table_type);
+    print_load_type(sbs.load_type);
     PM_U64(sbs, version);
     PM_U64(sbs, duration_ns);
     PM_END;
@@ -164,6 +180,7 @@ void print_metric(MetricEvent event) {
     PM_ID(slf, operation_id);
     PM_SLICE(slf, correlation_id);
     print_table_type(slf.table_type);
+    print_load_type(slf.load_type);
     PM_END;
     return;
 

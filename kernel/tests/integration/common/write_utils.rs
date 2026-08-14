@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::deletion_vector_writer::{
     KernelDeletionVector, StreamingDeletionVectorWriter,
 };
@@ -34,7 +34,8 @@ use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExe
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     begin_transaction, create_add_files_metadata, create_table, engine_store_setup,
-    load_and_begin_transaction,
+    into_record_batch, load_and_begin_transaction, modify_add_file_partition_keys,
+    AddFilePartitionKeyModify,
 };
 use url::Url;
 use uuid::Uuid;
@@ -362,10 +363,12 @@ pub fn assert_min_max_stats(
     );
 }
 
-/// Creates a table with deletion vector support and writes the specified files.
+/// Creates a table with deletion vector support and writes files with `partition_values`.
+/// An empty `partition_values` creates an unpartitioned table.
 pub async fn create_dv_table_with_files(
     table_name: &str,
     schema: Arc<StructType>,
+    partition_values: &[(&str, Option<&str>)],
     file_paths: &[&str],
 ) -> Result<
     (
@@ -378,13 +381,14 @@ pub async fn create_dv_table_with_files(
 > {
     let (store, engine, table_url) = engine_store_setup(table_name, None);
     let engine = Arc::new(engine);
+    let partition_columns: Vec<_> = partition_values.iter().map(|(key, _)| *key).collect();
 
     // Create table with DV support (protocol 3/7 with deletionVectors feature)
     create_table(
         store.clone(),
         table_url.clone(),
         schema.clone(),
-        &[],
+        &partition_columns,
         true, // use_37_protocol
         vec!["deletionVectors"],
         vec!["deletionVectors"],
@@ -414,12 +418,46 @@ pub async fn create_dv_table_with_files(
         })
         .collect();
     let metadata = create_add_files_metadata(add_files_schema, files)?;
+    let metadata = if partition_values.is_empty() {
+        metadata
+    } else {
+        let modifications: Vec<_> = partition_values
+            .iter()
+            .map(|(key, value)| AddFilePartitionKeyModify::Insert { key, value: *value })
+            .collect();
+        Box::new(ArrowEngineData::new(modify_add_file_partition_keys(
+            into_record_batch(metadata),
+            &modifications,
+        )))
+    };
     txn.add_files(metadata);
 
     let _ = txn.commit(engine.as_ref())?;
 
     let paths: Vec<String> = file_paths.iter().map(|&s| s.to_string()).collect();
     Ok((store, engine, table_url, paths))
+}
+
+/// Build a `path -> descriptor` map assigning each file a distinct synthetic DV descriptor.
+pub fn sequential_dv_descriptors(
+    file_paths: &[String],
+) -> HashMap<String, DeletionVectorDescriptor> {
+    file_paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            (
+                path.clone(),
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: format!("dv_file_{idx}.bin"),
+                    offset: Some(idx as i32 * 10),
+                    size_in_bytes: 40 + idx as i32,
+                    cardinality: idx as i64 + 1,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Extracts scan files from a snapshot for use in deletion vector updates.

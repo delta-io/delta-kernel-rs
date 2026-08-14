@@ -29,8 +29,9 @@ use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObject
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
-    FileMeta, FoldWithOption as _, ParquetFooter, ParquetHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, FoldWithOption as _, ParquetFooter, ParquetHandler,
+    PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -194,12 +195,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
+        physical_schema: &StructType,
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
         // Collect statistics before writing (includes numRecords)
-        let stats = collect_stats(record_batch, stats_columns)?;
+        let stats = collect_stats(record_batch, stats_columns, physical_schema)?;
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new_with_options(
@@ -258,6 +260,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
                 &write_context.write_dir(),
                 data,
                 write_context.stats_columns(),
+                write_context.physical_schema().as_ref(),
             )
             .await?;
         super::build_add_file_metadata(file_metadata, write_context)
@@ -324,6 +327,16 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        self.read_parquet_files_with_cancellation(files, physical_schema, predicate, None)
+    }
+
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
         let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -332,7 +345,11 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             self.buffer_size.get(),
             self.batch_size.get(),
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -389,11 +406,19 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.read_parquet_footer_with_cancellation(file, None)
+    }
+
+    fn read_parquet_footer_with_cancellation(
+        &self,
+        file: &FileMeta,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<ParquetFooter> {
         let store = self.store.clone();
         let location = file.location.clone();
         let file_size = file.size;
 
-        self.task_executor.block_on(async move {
+        let footer_future = async move {
             let metadata = if location.is_presigned() {
                 let client = reqwest::Client::new();
                 let response =
@@ -411,11 +436,16 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
 
-            let schema = StructType::try_from_arrow(metadata.schema().as_ref())
-                .map(Arc::new)
-                .map_err(Error::Arrow)?;
+            let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
             Ok(ParquetFooter { schema })
-        })
+        };
+
+        // Race the footer read against cancellation so a cancelled request stops promptly.
+        match cancellation_token {
+            Some(token) => super::block_on_or_cancelled(&self.task_executor, token, footer_future)
+                .unwrap_or(Err(Error::Cancelled)),
+            None => self.task_executor.block_on(footer_future),
+        }
     }
 }
 
@@ -603,6 +633,10 @@ mod tests {
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
+
+    fn long_schema(name: &str) -> StructType {
+        StructType::new_unchecked([StructField::nullable(name, DataType::LONG)])
+    }
 
     /// Test `ObjectStore` that counts footer fetches. `get_opts` (footer range GETs) is counted;
     /// column-chunk data goes through `get_ranges` and is not counted, so the count isolates
@@ -1026,9 +1060,15 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
             .await
             .unwrap();
 
@@ -1105,10 +1145,16 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
+                .write_parquet(
+                    &Url::parse("memory:///data").unwrap(),
+                    data,
+                    &[],
+                    &physical_schema,
+                )
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
@@ -1687,8 +1733,14 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
         let metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
             .await
             .unwrap();
 

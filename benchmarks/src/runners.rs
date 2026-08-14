@@ -5,8 +5,6 @@
 //! Results are discarded for benchmarking purposes.
 //!
 //! Engine and snapshot construction is handled based on `TableInfo`:
-//! - UC tables (`catalog_info`): UC-vended credentials; catalog-managed tables use
-//!   `UCKernelClient::load_snapshot`, others use the standard snapshot builder
 //! - S3 tables (`table_path` with s3://): credentials from `AWS_*` env vars
 //! - Local tables: local filesystem engine
 
@@ -19,24 +17,34 @@ use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Stat
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
-use delta_kernel_unity_catalog::UCKernelClient;
+use delta_kernel_unity_catalog::snapshot_builder_from_load_table;
 use delta_kernel_workloads::models::{
-    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
-    TimeTravel,
+    ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo, TimeTravel,
 };
 use delta_kernel_workloads::predicate_parser::parse_predicate;
-use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
-use unity_catalog_delta_rest_client::{
-    ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
-};
+use unity_catalog_delta_client_api::Operation;
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 use url::Url;
 
-/// Delta table property indicating catalog-managed support.
-const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
+use crate::registry::{ParallelScan, ReadConfig};
 
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
+}
+
+/// Builds `{table}/{case}` from `table_info.name` and `case_name`.
+pub fn benchmark_name(table_info: &TableInfo, case_name: &str) -> String {
+    format!("{}/{case_name}", table_info.name)
+}
+
+/// Builds `{table}/{case}/{config}` from `table_info.name`, `case_name`, and `config_name`.
+pub fn configured_benchmark_name(
+    table_info: &TableInfo,
+    case_name: &str,
+    config_name: &str,
+) -> String {
+    format!("{}/{case_name}/{config_name}", table_info.name)
 }
 
 fn build_engine(
@@ -56,11 +64,12 @@ fn build_engine(
 enum SnapshotStrategy {
     /// Standard snapshot builder (local, S3, or UC-managed non-catalog-managed tables).
     Standard { url: Url },
-    /// Catalog-managed table: snapshot loaded via `UCKernelClient::load_snapshot`.
+    /// Catalog-managed table: snapshot loaded via the UC Delta-Tables API. The three-part table
+    /// name is resolved via `UCClient::load_table`, whose response is turned into a snapshot
+    /// builder by `snapshot_builder_from_load_table`.
     CatalogManaged {
-        table_id: String,
-        table_uri: String,
-        commits_client: Box<UCCommitsRestClient>,
+        table_name: String,
+        client: Box<UCClient>,
     },
 }
 
@@ -80,35 +89,36 @@ impl SnapshotStrategy {
                 }
                 Ok(builder.build(engine)?)
             }
-            SnapshotStrategy::CatalogManaged {
-                table_id,
-                table_uri,
-                commits_client,
-            } => {
-                let catalog = UCKernelClient::new(commits_client.as_ref());
-                let result = match time_travel {
-                    Some(tt) => {
-                        let version = tt.as_version()?;
-                        runtime.block_on(
-                            catalog.load_snapshot_at(table_id, table_uri, version, engine),
-                        )
-                    }
-                    None => runtime.block_on(catalog.load_snapshot(table_id, table_uri, engine)),
-                };
-                result.map_err(|e| format!("Catalog snapshot failed: {e}").into())
+            SnapshotStrategy::CatalogManaged { table_name, client } => {
+                let (catalog, schema, table) = parse_three_part_name(table_name)?;
+                let resp = runtime
+                    .block_on(client.load_table(catalog, schema, table))
+                    .map_err(|e| format!("Catalog load_table failed: {e}"))?;
+                let mut builder = snapshot_builder_from_load_table(&resp)?;
+                if let Some(tt) = time_travel {
+                    builder = builder.at_version(tt.as_version()?);
+                }
+                Ok(builder.build(engine)?)
             }
         }
     }
 }
 
-/// Resolves engine credentials and snapshot strategy from a [`TableInfo`].
+/// Splits a `"catalog.schema.table"` name into its three parts.
+fn parse_three_part_name(name: &str) -> Result<(&str, &str, &str), Box<dyn std::error::Error>> {
+    match name.split('.').collect::<Vec<_>>()[..] {
+        [catalog, schema, table] => Ok((catalog, schema, table)),
+        _ => Err(
+            format!("expected a three-part table name 'catalog.schema.table', got: {name}").into(),
+        ),
+    }
+}
+
+/// Resolves the engine and snapshot strategy from a [`TableInfo`].
 ///
-/// For UC-managed tables (`catalog_info` is present), credentials are vended via
-/// `UCClient`. The `delta.feature.catalogManaged` property then determines whether to use
-/// `UCKernelClient` (catalog-managed) or the standard snapshot builder.
-///
-/// For non-UC tables, the engine is built from env vars (`AWS_*` for S3, local filesystem
-/// otherwise).
+/// For catalog-managed tables (`catalog_info` is present), credentials are vended via `UCClient`
+/// and the snapshot is loaded through the UC Delta-Tables API (`load_table`). For non-UC tables,
+/// the engine is built from env vars (`AWS_*` for S3, local filesystem otherwise).
 fn resolve_snapshot_strategy(
     table_info: &TableInfo,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -121,57 +131,52 @@ fn resolve_snapshot_strategy(
 
     let endpoint = std::env::var("UC_WORKSPACE").map_err(|_| "UC_WORKSPACE required")?;
     let token = std::env::var("UC_TOKEN").map_err(|_| "UC_TOKEN required")?;
-
     let config = ClientConfig::build(&endpoint, &token).build()?;
-    let client = UCClient::new(config.clone())?;
+    let client = Box::new(UCClient::new(config)?);
 
-    let result: Result<_, UcRestError> = runtime.block_on(async {
-        let table = client.get_table(&cm.table_name).await?;
-        let creds = client
-            .get_credentials(&table.table_id, Operation::Read)
-            .await?;
-        let aws = creds
-            .aws_temp_credentials
-            .ok_or(UcApiError::UnsupportedOperation(
-                // TODO(#2305): support non-AWS credential types
-                "Credential vending returned no AWS credentials".into(),
-            ))?;
-        Ok((
-            table.table_id,
-            table.storage_location,
-            table.properties,
-            aws,
-        ))
-    });
-    let (table_id, table_uri, uc_properties, aws) = result?;
+    let (catalog, schema, table) = parse_three_part_name(&cm.table_name)?;
+    let creds = runtime
+        .block_on(client.get_table_credentials(catalog, schema, table, Operation::Read))
+        .map_err(|e| format!("Credential vending failed: {e}"))?;
 
-    let table_url = Url::parse(&table_uri)?;
-    let region = std::env::var("AWS_REGION").map_err(|_| "AWS_REGION required")?;
-    let options = [
-        ("region", region.as_str()),
-        ("access_key_id", aws.access_key_id.as_str()),
-        ("secret_access_key", aws.secret_access_key.as_str()),
-        ("session_token", aws.session_token.as_str()),
-    ];
-    let (store, _) = delta_kernel::object_store::parse_url_opts(&table_url, options)?;
+    let resp = runtime
+        .block_on(client.load_table(catalog, schema, table))
+        .map_err(|e| format!("load_table failed: {e}"))?;
+    let table_url = Url::parse(&resp.metadata.location)?;
+
+    let opts = object_store_options(&creds.storage_credentials);
+    let (store, _) = delta_kernel::object_store::parse_url_opts(&table_url, opts)?;
     let engine = build_engine(store.into(), runtime);
 
-    let is_catalog_managed = uc_properties
-        .get(CATALOG_MANAGED_PROPERTY)
-        .is_some_and(|v| v == "supported");
-
-    let strategy = if is_catalog_managed {
-        let commits_client = Box::new(UCCommitsRestClient::new(config)?);
+    Ok((
+        engine,
         SnapshotStrategy::CatalogManaged {
-            table_id,
-            table_uri,
-            commits_client,
-        }
-    } else {
-        SnapshotStrategy::Standard { url: table_url }
-    };
+            table_name: cm.table_name.clone(),
+            client,
+        },
+    ))
+}
 
-    Ok((engine, strategy))
+/// Maps vended UC storage credentials into `object_store` option keys.
+fn object_store_options(
+    creds: &[unity_catalog_delta_client_api::StorageCredential],
+) -> Vec<(String, String)> {
+    let mut opts = Vec::new();
+    for cred in creds {
+        for (key, value) in &cred.config {
+            let mapped = match key.as_str() {
+                "s3.access-key-id" => "access_key_id",
+                "s3.secret-access-key" => "secret_access_key",
+                "s3.session-token" => "session_token",
+                other => other,
+            };
+            opts.push((mapped.to_string(), value.clone()));
+        }
+    }
+    if let Ok(region) = std::env::var("UC_AWS_REGION") {
+        opts.push(("region".to_string(), region));
+    }
+    opts
 }
 
 /// Builds an engine from the table URL scheme and env vars (S3 or local).
@@ -216,10 +221,10 @@ pub struct ReadMetadataRunner {
 
 impl ReadMetadataRunner {
     pub fn setup(
-        table_info: &TableInfo,
-        case_name: &str,
+        name: String,
         read_spec: &ReadSpec,
         config: ReadConfig,
+        table_info: &TableInfo,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
@@ -232,8 +237,6 @@ impl ReadMetadataRunner {
             .map(|sql| parse_predicate(sql, &snapshot.schema()))
             .transpose()?
             .map(Arc::new);
-
-        let name = format!("{}/{}/{}", table_info.name, case_name, config.name,);
 
         let thread_pool = match &config.parallel_scan {
             ParallelScan::Enabled { num_threads } => {
@@ -343,18 +346,19 @@ impl WorkloadRunner for ReadMetadataRunner {
     }
 }
 
-/// Factory function that creates the appropriate read runner for a given operation and config
+/// Factory function that creates the appropriate read runner for a given operation and config.
+/// `name` is the full benchmark identifier (`{table_name}/{case}/{config}`).
 pub fn create_read_runner(
-    table_info: &TableInfo,
-    case_name: &str,
+    name: String,
     read_spec: &ReadSpec,
     operation: ReadOperation,
     config: ReadConfig,
+    table_info: &TableInfo,
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<Box<dyn WorkloadRunner>, Box<dyn std::error::Error>> {
     match operation {
         ReadOperation::ReadMetadata => Ok(Box::new(ReadMetadataRunner::setup(
-            table_info, case_name, read_spec, config, runtime,
+            name, read_spec, config, table_info, runtime,
         )?)),
         ReadOperation::ReadData => Err("ReadDataRunner not yet implemented".into()),
     }
@@ -370,13 +374,11 @@ pub struct SnapshotConstructionRunner {
 
 impl SnapshotConstructionRunner {
     pub fn setup(
-        table_info: &TableInfo,
-        case_name: &str,
+        name: String,
         snapshot_spec: &SnapshotConstructionSpec,
+        table_info: &TableInfo,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let name = format!("{}/{}", table_info.name, case_name,);
-
         let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
 
         Ok(Self {
@@ -407,13 +409,16 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::slice;
     use std::sync::LazyLock;
 
-    use delta_kernel_workloads::models::{
-        ParallelScan, ReadConfig, ReadSpec, TableInfo, TimeTravel,
-    };
+    use delta_kernel_workloads::models::{ReadSpec, Spec, TableInfo, TimeTravel, Workload};
 
     use super::*;
+    use crate::registry::BenchRegistry;
+    use crate::utils::load_all_workloads;
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {
@@ -481,12 +486,23 @@ mod tests {
     }
 
     #[test]
+    fn configured_benchmark_name_uses_human_readable_table_name() {
+        let mut table_info = test_table_info();
+        table_info.name = "Human readable table".to_string();
+
+        assert_eq!(
+            configured_benchmark_name(&table_info, "testCase", "serial"),
+            "Human readable table/testCase/serial"
+        );
+    }
+
+    #[test]
     fn test_read_metadata_runner_serial() {
         let runner = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "testCase",
+            configured_benchmark_name(&test_table_info(), "testCase", "serial"),
             &test_read_spec(),
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
@@ -497,10 +513,10 @@ mod tests {
     #[test]
     fn test_read_metadata_runner_parallel() {
         let runner = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "testCase",
+            configured_benchmark_name(&test_table_info(), "testCase", "parallel2"),
             &test_read_spec(),
             parallel_config(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
@@ -518,9 +534,9 @@ mod tests {
     #[test]
     fn test_snapshot_construction_runner_setup() {
         let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
+            benchmark_name(&test_table_info(), "testCase"),
             &test_snapshot_spec(),
+            &test_table_info(),
             test_runtime(),
         );
         assert!(runner.is_ok());
@@ -529,9 +545,9 @@ mod tests {
     #[test]
     fn test_snapshot_construction_runner_name() {
         let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
+            benchmark_name(&test_table_info(), "testCase"),
             &test_snapshot_spec(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
@@ -541,23 +557,84 @@ mod tests {
     #[test]
     fn test_snapshot_construction_runner_execute() {
         let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
+            benchmark_name(&test_table_info(), "testCase"),
             &test_snapshot_spec(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
         assert!(runner.execute().is_ok());
     }
 
+    /// Guards the checked-in `bench-registry.json` so a malformed edit or a duplicate config name
+    /// fails fast in `cargo test` rather than only when the harness runs.
+    #[test]
+    fn checked_in_registry_loads_and_validates() {
+        let path = format!("{}/bench-registry.json", env!("CARGO_MANIFEST_DIR"));
+        let registry = BenchRegistry::load_from_path(Path::new(&path))
+            .expect("checked-in bench-registry.json must load");
+        let mut table_info = test_table_info();
+        table_info.table_info_dir = PathBuf::from("10kAdds0CommitsSinceChkpt1V2Chkpt");
+        let workload = Workload {
+            table_info,
+            case_name: "readMetadataLatest".to_string(),
+            spec: Spec::Read(test_read_spec()),
+        };
+        registry
+            .validate(slice::from_ref(&workload))
+            .expect("checked-in bench-registry.json must validate");
+        let read = registry.read_configs(&workload).unwrap();
+        assert_eq!(
+            read.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["serial", "parallel2"]
+        );
+    }
+
+    /// Every registry key must name a real read workload. A key miss silently falls back to the
+    /// serial default, so a stale/typo'd key would otherwise be invisible until the harness runs.
+    /// Skips when the downloaded workload archive is absent (e.g. offline unit runs).
+    #[test]
+    fn checked_in_registry_keys_match_real_workloads() {
+        let Ok(workloads) = load_all_workloads() else {
+            return; // workload archive not downloaded -- nothing to cross-check
+        };
+        let workload_by_key: HashMap<(&str, &str), &Workload> = workloads
+            .iter()
+            .map(|w| {
+                (
+                    (
+                        w.table_info
+                            .registry_table_key()
+                            .expect("loaded workloads must have a registry table key"),
+                        w.case_name.as_str(),
+                    ),
+                    w,
+                )
+            })
+            .collect();
+
+        let path = format!("{}/bench-registry.json", env!("CARGO_MANIFEST_DIR"));
+        let registry = BenchRegistry::load_from_path(Path::new(&path))
+            .expect("checked-in bench-registry.json must load");
+        registry
+            .validate(&workloads)
+            .expect("registry configs must match workload types");
+
+        for (table, case) in registry.keys() {
+            workload_by_key.get(&(table, case)).unwrap_or_else(|| {
+                panic!("registry key '{table}/{case}' matches no workload (stale or typo'd?)")
+            });
+        }
+    }
+
     #[test]
     fn test_create_read_runner_read_metadata() {
         let runner = create_read_runner(
-            &test_table_info(),
-            "testCase",
+            configured_benchmark_name(&test_table_info(), "testCase", "serial"),
             &test_read_spec(),
             ReadOperation::ReadMetadata,
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("create_read_runner should succeed");
@@ -569,10 +646,10 @@ mod tests {
         let mut spec = test_read_spec();
         spec.predicate = Some("letter = 'a'".to_string());
         let runner = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "test_case",
+            configured_benchmark_name(&test_table_info(), "test_case", "serial"),
             &spec,
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
@@ -584,10 +661,10 @@ mod tests {
         let mut spec = test_read_spec();
         spec.predicate = Some("a LIKE '%foo'".to_string());
         let result = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "test_case",
+            configured_benchmark_name(&test_table_info(), "test_case", "serial"),
             &spec,
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         );
         assert!(result.is_err());
@@ -596,11 +673,11 @@ mod tests {
     #[test]
     fn test_create_read_runner_read_data_unimplemented() {
         let result = create_read_runner(
-            &test_table_info(),
-            "testCase",
+            configured_benchmark_name(&test_table_info(), "testCase", "serial"),
             &test_read_spec(),
             ReadOperation::ReadData,
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         );
         assert!(result.is_err());
@@ -620,9 +697,9 @@ mod tests {
             expected: None,
         };
         let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
+            benchmark_name(&test_table_info(), "testCase"),
             &spec,
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");

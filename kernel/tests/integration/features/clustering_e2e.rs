@@ -10,7 +10,7 @@ use std::sync::Arc;
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::column_name;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::create_table::create_table;
@@ -41,7 +41,7 @@ async fn test_clustered_table_write_and_checkpoint(
         ])
         .unwrap(),
     );
-    let expected_clustering = vec![ColumnName::new(["id"]), ColumnName::new(["city"])];
+    let expected_clustering = vec![column_name!("id"), column_name!("city")];
 
     // Create table clustered on "id" and "city"
     let create_result = create_table(&table_path, schema, "Test/1.0")
@@ -67,18 +67,21 @@ async fn test_clustered_table_write_and_checkpoint(
 
     // First write: 3 rows
     let batch = generate_batch(vec![
-        ("id", vec![1, 2, 3].into_array()),
-        ("name", vec!["alice", "bob", "charlie"].into_array()),
-        ("city", vec!["seattle", "portland", "seattle"].into_array()),
+        ("id", vec![1, 2, 3].into_arrow_array()),
+        ("name", vec!["alice", "bob", "charlie"].into_arrow_array()),
+        (
+            "city",
+            vec!["seattle", "portland", "seattle"].into_arrow_array(),
+        ),
     ])?;
     let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     assert_eq!(snapshot.version(), 1);
 
     // Second write: 2 more rows
     let batch = generate_batch(vec![
-        ("id", vec![4, 5].into_array()),
-        ("name", vec!["dave", "eve"].into_array()),
-        ("city", vec!["austin", "portland"].into_array()),
+        ("id", vec![4, 5].into_arrow_array()),
+        ("name", vec!["dave", "eve"].into_arrow_array()),
+        ("city", vec!["austin", "portland"].into_arrow_array()),
     ])?;
     let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     assert_eq!(snapshot.version(), 2);
@@ -159,10 +162,7 @@ async fn test_clustered_table_write_all_null_clustering_column() {
     // Create table clustered on "category" and "region_id"
     let create_result = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::Clustered {
-            columns: vec![
-                ColumnName::new(["category"]),
-                ColumnName::new(["region_id"]),
-            ],
+            columns: vec![column_name!("category"), column_name!("region_id")],
         })
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .unwrap()
@@ -179,7 +179,7 @@ async fn test_clustered_table_write_all_null_clustering_column() {
     // This should succeed -- all-null clustering columns are valid.
     let all_null_region: ArrayRef = Arc::new(Int32Array::from(vec![None, None, None]));
     let batch = generate_batch(vec![
-        ("category", vec!["a", "b", "c"].into_array()),
+        ("category", vec!["a", "b", "c"].into_arrow_array()),
         ("region_id", all_null_region),
     ])
     .unwrap();

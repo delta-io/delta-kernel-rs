@@ -1,5 +1,5 @@
 use super::*;
-use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
 use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::DataType;
 
@@ -38,6 +38,14 @@ impl ParquetStatsProvider for UnimplementedTestFilter {
     fn get_parquet_rowcount_stat(&self) -> Option<i64> {
         unimplemented!()
     }
+}
+
+#[test]
+fn test_cast_stays_unknown_for_parquet_stats() {
+    let filter = UnimplementedTestFilter;
+    let pred = Pred::eq(Expr::cast(col!("x"), DataType::DATE), Scalar::Date(19_723));
+
+    expect_eq!(filter.eval(&pred), NULL, "{pred:#?}");
 }
 
 /// Tests apply_junction and apply_scalar
@@ -94,7 +102,7 @@ fn test_junctions() {
             .iter()
             .map(|val| match val {
                 Some(v) => Pred::literal(*v),
-                None => Pred::null_literal(),
+                None => Pred::NULL,
             })
             .collect();
 
@@ -161,12 +169,12 @@ fn test_eval_binary_comparisons() {
     const NULL_VAL: Scalar = Scalar::Null(DataType::INTEGER);
 
     let predicates = [
-        Pred::lt(column_expr!("x"), Expr::literal(10)),
-        Pred::le(column_expr!("x"), Expr::literal(10)),
-        Pred::eq(column_expr!("x"), Expr::literal(10)),
-        Pred::ne(column_expr!("x"), Expr::literal(10)),
-        Pred::gt(column_expr!("x"), Expr::literal(10)),
-        Pred::ge(column_expr!("x"), Expr::literal(10)),
+        Pred::lt(col!("x"), lit(10)),
+        Pred::le(col!("x"), lit(10)),
+        Pred::eq(col!("x"), lit(10)),
+        Pred::ne(col!("x"), lit(10)),
+        Pred::gt(col!("x"), lit(10)),
+        Pred::ge(col!("x"), lit(10)),
     ];
 
     let do_test = |min: Scalar, max: Scalar, expected: &[Option<bool>]| {
@@ -228,10 +236,7 @@ impl ParquetStatsProvider for NullCountTestFilter {
 
 #[test]
 fn test_eval_is_null() {
-    let expressions = [
-        Pred::is_null(column_expr!("x")),
-        Pred::is_not_null(column_expr!("x")),
-    ];
+    let expressions = [Pred::is_null(col!("x")), Pred::is_not_null(col!("x"))];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {
         let filter = NullCountTestFilter::new(Some(nullcount), 2);

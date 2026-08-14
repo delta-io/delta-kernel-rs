@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
+use crate::expressions::joined_column_name;
 
 /// Represents the difference between two schemas
 #[derive(Debug, Clone, PartialEq)]
@@ -29,7 +30,7 @@ pub(crate) struct SchemaDiff {
 pub(crate) struct FieldChange {
     /// The field that was added or removed
     pub(crate) field: StructField,
-    /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
+    /// The path to this field (e.g., column_name!("user.address.street"))
     pub(crate) path: ColumnName,
 }
 
@@ -40,7 +41,7 @@ pub(crate) struct FieldUpdate {
     pub(crate) before: StructField,
     /// The field as it exists in the new schema
     pub(crate) after: StructField,
-    /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
+    /// The path to this field (e.g., column_name!("user.address.street"))
     pub(crate) path: ColumnName,
     /// The types of changes that occurred (can be multiple, e.g. renamed + nullability changed)
     pub(crate) change_types: Vec<FieldChangeType>,
@@ -202,15 +203,11 @@ fn compute_schema_diff(
     after: &StructType,
 ) -> Result<SchemaDiff, SchemaDiffError> {
     // Collect all fields with their paths from both schemas
-    let empty_path: Vec<String> = vec![];
+    let root = ColumnName::default();
     let mut before_fields = Vec::new();
-    collect_all_fields_with_paths(
-        before,
-        &ColumnName::new(empty_path.clone()),
-        &mut before_fields,
-    )?;
+    collect_all_fields_with_paths(before, &root, &mut before_fields)?;
     let mut after_fields = Vec::new();
-    collect_all_fields_with_paths(after, &ColumnName::new(empty_path), &mut after_fields)?;
+    collect_all_fields_with_paths(after, &root, &mut after_fields)?;
 
     // Build maps by field ID
     let before_by_id = build_field_map_by_id(&before_fields)?;
@@ -460,7 +457,7 @@ fn collect_fields_from_datatype(
             // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
 
             // For arrays, we use "element" as the path segment and recurse into element type
-            let element_path = parent_path.join(&ColumnName::new(["element"]));
+            let element_path = joined_column_name!(parent_path, "element");
             collect_fields_from_datatype(array_type.element_type(), &element_path, out)?;
         }
         DataType::Map(map_type) => {
@@ -470,10 +467,10 @@ fn collect_fields_from_datatype(
             // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
 
             // For maps, we use "key" and "value" as path segments and recurse into both types
-            let key_path = parent_path.join(&ColumnName::new(["key"]));
+            let key_path = joined_column_name!(parent_path, "key");
             collect_fields_from_datatype(map_type.key_type(), &key_path, out)?;
 
-            let value_path = parent_path.join(&ColumnName::new(["value"]));
+            let value_path = joined_column_name!(parent_path, "value");
             collect_fields_from_datatype(map_type.value_type(), &value_path, out)?;
         }
         _ => {
@@ -739,6 +736,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::expressions::column_name;
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
     fn create_field_with_id(
@@ -807,7 +805,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
-        assert_eq!(diff.added_fields[0].path, ColumnName::new(["name"]));
+        assert_eq!(diff.added_fields[0].path, column_name!("name"));
         assert_eq!(diff.added_fields[0].field.name(), "name");
         assert!(diff.has_breaking_changes()); // Adding non-nullable field is breaking
     }
@@ -1010,8 +1008,8 @@ mod tests {
         match result {
             Err(SchemaDiffError::DuplicateFieldId { id, path1, path2 }) => {
                 assert_eq!(id, 1);
-                assert_eq!(path1, ColumnName::new(["field1"]));
-                assert_eq!(path2, ColumnName::new(["field2"]));
+                assert_eq!(path1, column_name!("field1"));
+                assert_eq!(path2, column_name!("field2"));
             }
             _ => panic!("Expected DuplicateFieldId error"),
         }
@@ -1031,16 +1029,16 @@ mod tests {
             added_fields: vec![
                 FieldChange {
                     field: top_level_field.clone(),
-                    path: ColumnName::new(["name"]), // Top-level (depth 1)
+                    path: column_name!("name"), // Top-level (depth 1)
                 },
                 FieldChange {
                     field: nested_field.clone(),
-                    path: ColumnName::new(["address", "street"]), // Nested (depth 2)
+                    path: column_name!("address.street"), // Nested (depth 2)
                 },
             ],
             removed_fields: vec![FieldChange {
                 field: deeply_nested_field.clone(),
-                path: ColumnName::new(["user", "address", "city"]), // Deeply nested (depth 3)
+                path: column_name!("user.address.city"), // Deeply nested (depth 3)
             }],
             updated_fields: vec![],
             breaking_changes: false,
@@ -1049,19 +1047,16 @@ mod tests {
         // Test top_level_changes - should only return depth 1 fields
         let (top_added, top_removed, top_updated) = diff.top_level_changes();
         assert_eq!(top_added.len(), 1);
-        assert_eq!(top_added[0].path, ColumnName::new(["name"]));
+        assert_eq!(top_added[0].path, column_name!("name"));
         assert_eq!(top_removed.len(), 0);
         assert_eq!(top_updated.len(), 0);
 
         // Test nested_changes - should only return depth > 1 fields
         let (nested_added, nested_removed, nested_updated) = diff.nested_changes();
         assert_eq!(nested_added.len(), 1);
-        assert_eq!(nested_added[0].path, ColumnName::new(["address", "street"]));
+        assert_eq!(nested_added[0].path, column_name!("address.street"));
         assert_eq!(nested_removed.len(), 1);
-        assert_eq!(
-            nested_removed[0].path,
-            ColumnName::new(["user", "address", "city"])
-        );
+        assert_eq!(nested_removed[0].path, column_name!("user.address.city"));
         assert_eq!(nested_updated.len(), 0);
     }
 
@@ -1099,7 +1094,7 @@ mod tests {
         let diff = SchemaDiff::new(&without_user, &with_user).unwrap();
 
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, ColumnName::new(["user"]));
+        assert_eq!(diff.added_fields[0].path, column_name!("user"));
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
         // The filtered paths would have been: user.name, user.email, user.address,
@@ -1110,7 +1105,7 @@ mod tests {
         let diff = SchemaDiff::new(&with_user, &without_user).unwrap();
 
         assert_eq!(diff.removed_fields.len(), 1);
-        assert_eq!(diff.removed_fields[0].path, ColumnName::new(["user"]));
+        assert_eq!(diff.removed_fields[0].path, column_name!("user"));
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
         assert!(!diff.has_breaking_changes()); // Removing fields is safe
@@ -1139,7 +1134,7 @@ mod tests {
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(diff.added_fields[0].path, column_name!("items"));
 
         let (nested_added, nested_removed, nested_updated) = diff.nested_changes();
         assert_eq!(nested_added.len(), 0);
@@ -1178,13 +1173,10 @@ mod tests {
 
         // Should see the nested field changes but NOT a type change on the parent struct
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, ColumnName::new(["user", "age"]));
+        assert_eq!(diff.added_fields[0].path, column_name!("user.age"));
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(
-            diff.updated_fields[0].path,
-            ColumnName::new(["user", "full_name"])
-        );
+        assert_eq!(diff.updated_fields[0].path, column_name!("user.full_name"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::Renamed]
@@ -1230,7 +1222,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["data"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("data"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::TypeChanged]
@@ -1238,10 +1230,7 @@ mod tests {
         assert!(diff.has_breaking_changes());
 
         // The new nested field should also be reported as added
-        assert_eq!(
-            diff.added_fields[0].path,
-            ColumnName::new(["data", "nested"])
-        );
+        assert_eq!(diff.added_fields[0].path, column_name!("data.nested"));
         assert!(diff.has_breaking_changes());
     }
 
@@ -1285,7 +1274,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].path,
-            ColumnName::new(["items", "element", "title"])
+            column_name!("items.element.title")
         );
         assert_eq!(
             diff.updated_fields[0].change_types,
@@ -1296,7 +1285,7 @@ mod tests {
         let array_updates: Vec<_> = diff
             .updated_fields
             .iter()
-            .filter(|u| u.path == ColumnName::new(["items"]))
+            .filter(|u| u.path == column_name!("items"))
             .collect();
         assert_eq!(array_updates.len(), 0);
         assert!(!diff.has_breaking_changes());
@@ -1350,13 +1339,13 @@ mod tests {
         // Should see: existing changed, existing_struct changed, existing_struct.old_name->new_name
         // renamed, new_struct added
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, ColumnName::new(["new_struct"]));
+        assert_eq!(diff.added_fields[0].path, column_name!("new_struct"));
 
         assert_eq!(diff.updated_fields.len(), 3);
         let paths = updated_paths(&diff);
-        assert!(paths.contains(&ColumnName::new(["existing"])));
-        assert!(paths.contains(&ColumnName::new(["existing_struct"])));
-        assert!(paths.contains(&ColumnName::new(["existing_struct", "new_name"])));
+        assert!(paths.contains(&column_name!("existing")));
+        assert!(paths.contains(&column_name!("existing_struct")));
+        assert!(paths.contains(&column_name!("existing_struct.new_name")));
 
         // Added a non-nullable struct "new_struct"
         assert!(diff.has_breaking_changes());
@@ -1390,7 +1379,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
-        assert_eq!(update.path, ColumnName::new(["user", "full_name"]));
+        assert_eq!(update.path, column_name!("user.full_name"));
         assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
         assert!(!diff.has_breaking_changes()); // Rename is not breaking
     }
@@ -1422,7 +1411,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 0);
 
         let added = &diff.added_fields[0];
-        assert_eq!(added.path, ColumnName::new(["user", "age"]));
+        assert_eq!(added.path, column_name!("user.age"));
         assert_eq!(added.field.name(), "age");
         assert!(!diff.has_breaking_changes()); // Adding nullable field is not breaking
     }
@@ -1482,10 +1471,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
-        assert_eq!(
-            update.path,
-            ColumnName::new(["level1", "level2", "very_deep_field"])
-        );
+        assert_eq!(update.path, column_name!("level1.level2.very_deep_field"));
         assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
     }
 
@@ -1528,15 +1514,12 @@ mod tests {
 
         assert_eq!(top_added.len(), 0);
         assert_eq!(top_updated.len(), 1);
-        assert_eq!(top_updated[0].path, ColumnName::new(["renamed_top"]));
+        assert_eq!(top_updated[0].path, column_name!("renamed_top"));
 
         assert_eq!(nested_added.len(), 1);
-        assert_eq!(nested_added[0].path, ColumnName::new(["user", "age"]));
+        assert_eq!(nested_added[0].path, column_name!("user.age"));
         assert_eq!(nested_updated.len(), 1);
-        assert_eq!(
-            nested_updated[0].path,
-            ColumnName::new(["user", "full_name"])
-        );
+        assert_eq!(nested_updated[0].path, column_name!("user.full_name"));
     }
 
     #[test]
@@ -1581,16 +1564,16 @@ mod tests {
         // Check specific changes
         let added_paths: HashSet<ColumnName> =
             diff.added_fields.iter().map(|f| f.path.clone()).collect();
-        assert!(added_paths.contains(&ColumnName::new(["user", "age"])));
-        assert!(added_paths.contains(&ColumnName::new(["created_at"])));
+        assert!(added_paths.contains(&column_name!("user.age")));
+        assert!(added_paths.contains(&column_name!("created_at")));
 
         let removed_paths: HashSet<ColumnName> =
             diff.removed_fields.iter().map(|f| f.path.clone()).collect();
-        assert!(removed_paths.contains(&ColumnName::new(["user", "email"])));
+        assert!(removed_paths.contains(&column_name!("user.email")));
 
         let paths = updated_paths(&diff);
-        assert!(paths.contains(&ColumnName::new(["identifier"])));
-        assert!(paths.contains(&ColumnName::new(["user", "full_name"])));
+        assert!(paths.contains(&column_name!("identifier")));
+        assert!(paths.contains(&column_name!("user.full_name")));
     }
 
     #[test]
@@ -1632,18 +1615,18 @@ mod tests {
         // Check added field
         assert_eq!(
             diff.added_fields[0].path,
-            ColumnName::new(["items", "element", "added_field"])
+            column_name!("items.element.added_field")
         );
 
         // Check removed field
         assert_eq!(
             diff.removed_fields[0].path,
-            ColumnName::new(["items", "element", "removed_field"])
+            column_name!("items.element.removed_field")
         );
 
         // Check updated field (rename)
         let update = &diff.updated_fields[0];
-        assert_eq!(update.path, ColumnName::new(["items", "element", "title"]));
+        assert_eq!(update.path, column_name!("items.element.title"));
         assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
 
         assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
@@ -1674,7 +1657,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::TypeChanged]
@@ -1705,7 +1688,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::TypeChanged]
@@ -1742,7 +1725,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityLoosened]
@@ -1779,7 +1762,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityTightened]
@@ -1816,7 +1799,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityLoosened]
@@ -1853,7 +1836,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityTightened]
@@ -1883,7 +1866,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityLoosened]
@@ -1912,7 +1895,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityTightened]
@@ -1960,18 +1943,18 @@ mod tests {
         // Check added field
         assert_eq!(
             diff.added_fields[0].path,
-            ColumnName::new(["lookup", "value", "added_field"])
+            column_name!("lookup.value.added_field")
         );
 
         // Check removed field
         assert_eq!(
             diff.removed_fields[0].path,
-            ColumnName::new(["lookup", "value", "removed_field"])
+            column_name!("lookup.value.removed_field")
         );
 
         // Check updated field (rename)
         let update = &diff.updated_fields[0];
-        assert_eq!(update.path, ColumnName::new(["lookup", "value", "count"]));
+        assert_eq!(update.path, column_name!("lookup.value.count"));
         assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
 
         assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
@@ -2018,7 +2001,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityLoosened]
@@ -2055,7 +2038,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["lookup"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("lookup"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityLoosened]
@@ -2104,7 +2087,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityTightened]
@@ -2141,7 +2124,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["lookup"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("lookup"));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityTightened]
@@ -2174,7 +2157,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
         // Should have both TypeChanged and ContainerNullabilityLoosened
         let change_types = &diff.updated_fields[0].change_types;
         assert!(change_types.contains(&FieldChangeType::TypeChanged));
@@ -2227,7 +2210,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].path,
-            ColumnName::new(["lookup", "key", "identifier"])
+            column_name!("lookup.key.identifier")
         );
         assert_eq!(
             diff.updated_fields[0].change_types,
@@ -2316,15 +2299,15 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.added_fields[0].path,
-            ColumnName::new(["data", "items", "element", "inner", "added"])
+            column_name!("data.items.element.inner.added")
         );
         assert_eq!(
             diff.removed_fields[0].path,
-            ColumnName::new(["data", "items", "element", "inner", "removed"])
+            column_name!("data.items.element.inner.removed")
         );
         assert_eq!(
             diff.updated_fields[0].path,
-            ColumnName::new(["data", "items", "element", "inner", "renamed_a"])
+            column_name!("data.items.element.inner.renamed_a")
         );
         assert_eq!(
             diff.updated_fields[0].change_types,
@@ -2404,7 +2387,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].path,
-            ColumnName::new(["lookup", "value", "nested", "value", "renamed_x"])
+            column_name!("lookup.value.nested.value.renamed_x")
         );
         assert_eq!(
             diff.updated_fields[0].change_types,
@@ -2459,11 +2442,11 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.added_fields[0].path,
-            ColumnName::new(["matrix", "element", "element", "y"])
+            column_name!("matrix.element.element.y")
         );
         assert_eq!(
             diff.updated_fields[0].path,
-            ColumnName::new(["matrix", "element", "element", "renamed_x"])
+            column_name!("matrix.element.element.renamed_x")
         );
         assert_eq!(
             diff.updated_fields[0].change_types,
@@ -2547,18 +2530,10 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 2);
 
         let paths = updated_paths(&diff);
-        assert!(paths.contains(&ColumnName::new([
-            "complex_map",
-            "key",
-            "element",
-            "renamed_key_field"
-        ])));
-        assert!(paths.contains(&ColumnName::new([
-            "complex_map",
-            "value",
-            "element",
-            "renamed_value_field"
-        ])));
+        assert!(paths.contains(&column_name!("complex_map.key.element.renamed_key_field")));
+        assert!(paths.contains(&column_name!(
+            "complex_map.value.element.renamed_value_field"
+        )));
         assert!(!diff.has_breaking_changes());
     }
 
@@ -2596,39 +2571,36 @@ mod tests {
             1,
         )]);
 
-        let after =
-            StructType::new_unchecked([
-                create_field_with_id(
-                    "nested_maps",
-                    MapType::new(
-                        DataType::try_struct_type([create_field_with_id(
-                            "renamed_outer_key", // Renamed!
-                            DataType::INTEGER,
-                            false,
-                            2,
-                        )])
-                        .unwrap(),
-                        MapType::new(
-                            DataType::try_struct_type([create_field_with_id(
-                                "renamed_inner_key", // Renamed!
-                                DataType::INTEGER,
-                                false,
-                                3,
-                            )])
-                            .unwrap(),
-                            DataType::try_struct_type([
-                                create_field_with_id("renamed_data", DataType::STRING, false, 4), // Renamed!
-                                create_field_with_id("added", DataType::LONG, true, 6), // Added!
-                            ])
-                            .unwrap(),
-                            false,
-                        ),
-                        false,
-                    ),
+        let after = StructType::new_unchecked([create_field_with_id(
+            "nested_maps",
+            MapType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "renamed_outer_key", // Renamed!
+                    DataType::INTEGER,
                     false,
-                    1,
+                    2,
+                )])
+                .unwrap(),
+                MapType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "renamed_inner_key", // Renamed!
+                        DataType::INTEGER,
+                        false,
+                        3,
+                    )])
+                    .unwrap(),
+                    DataType::try_struct_type([
+                        create_field_with_id("renamed_data", DataType::STRING, false, 4), // Renamed!
+                        create_field_with_id("added", DataType::LONG, true, 6),           // Added!
+                    ])
+                    .unwrap(),
+                    false,
                 ),
-            ]);
+                false,
+            ),
+            false,
+            1,
+        )]);
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -2638,31 +2610,17 @@ mod tests {
 
         assert_eq!(
             diff.added_fields[0].path,
-            ColumnName::new(["nested_maps", "value", "value", "added"])
+            column_name!("nested_maps.value.value.added")
         );
         assert_eq!(
             diff.removed_fields[0].path,
-            ColumnName::new(["nested_maps", "value", "value", "removed"])
+            column_name!("nested_maps.value.value.removed")
         );
 
         let paths = updated_paths(&diff);
-        assert!(paths.contains(&ColumnName::new([
-            "nested_maps",
-            "key",
-            "renamed_outer_key"
-        ])));
-        assert!(paths.contains(&ColumnName::new([
-            "nested_maps",
-            "value",
-            "key",
-            "renamed_inner_key"
-        ])));
-        assert!(paths.contains(&ColumnName::new([
-            "nested_maps",
-            "value",
-            "value",
-            "renamed_data"
-        ])));
+        assert!(paths.contains(&column_name!("nested_maps.key.renamed_outer_key")));
+        assert!(paths.contains(&column_name!("nested_maps.value.key.renamed_inner_key")));
+        assert!(paths.contains(&column_name!("nested_maps.value.value.renamed_data")));
 
         assert!(!diff.has_breaking_changes());
     }
@@ -2746,7 +2704,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].path,
-            ColumnName::new(["wrapper", "element", "items", "element", "value"])
+            column_name!("wrapper.element.items.element.value")
         );
         assert_eq!(
             diff.updated_fields[0].change_types,
@@ -2816,7 +2774,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].path,
-            ColumnName::new(["wrapper", "element", "items"])
+            column_name!("wrapper.element.items")
         );
         assert_eq!(
             diff.updated_fields[0].change_types,
