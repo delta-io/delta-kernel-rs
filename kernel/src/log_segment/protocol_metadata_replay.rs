@@ -172,7 +172,7 @@ impl LogSegment {
                 (metadata_opt.is_none() || protocol_opt.is_none()) && crc_protocol.is_none();
             if known_adaptive || incomplete_without_crc {
                 if let Some((metadata, protocol)) =
-                    self.resolve_pm_anchored_on_checkpoint(engine)?
+                    self.read_pm_including_checkpoint_action(engine)?
                 {
                     return Ok((Some(metadata), Some(protocol)));
                 }
@@ -186,15 +186,16 @@ impl LogSegment {
     /// actions in later commits.
     ///
     /// An adaptiveMetadata manifest commit stores its Protocol and Metadata inside a `checkpoint`
-    /// action (see [`CheckpointAction`]). Replaying newest-first with first-of-each-wins, top-level
-    /// actions from later commits win over the checkpoint's embedded values, and the newest
-    /// `checkpoint` action supplies whatever they did not set.
+    /// action (see [`CheckpointAction`]) rather than as top-level actions. Replaying newest-first,
+    /// top-level actions from later commits are seen first and win; the newest `checkpoint` action
+    /// supplies whatever they did not set.
     ///
-    /// Returns `None` when the log has no `checkpoint` action, leaving the caller's top-level
-    /// resolution in force. Errors with [`Error::invalid_protocol`] if a `checkpoint` action is
-    /// present but the protocol does not enable the `adaptiveMetadata` reader feature.
+    /// Returns `None` when the top-level actions already resolve both, or when the log has no
+    /// `checkpoint` action at all -- in both cases the caller's top-level result stands. Errors
+    /// with [`Error::invalid_protocol`] if a `checkpoint` action is present but the protocol
+    /// does not enable the `adaptiveMetadata` reader feature.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn resolve_pm_anchored_on_checkpoint(
+    fn read_pm_including_checkpoint_action(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
@@ -202,7 +203,6 @@ impl LogSegment {
             get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CHECKPOINT_ACTION_NAME])?;
         let mut metadata_opt = None;
         let mut protocol_opt = None;
-        let mut saw_checkpoint = false;
         for actions_batch in self.read_actions(engine, schema)? {
             let actions = actions_batch?.actions;
             // Keep the first (newest) protocol and metadata seen.
@@ -212,37 +212,32 @@ impl LogSegment {
             if protocol_opt.is_none() {
                 protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             }
-            if !saw_checkpoint {
-                if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
-                    // The first checkpoint reached is the newest; use it for any P&M not yet set.
-                    saw_checkpoint = true;
-                    metadata_opt.get_or_insert_with(|| checkpoint.metadata().clone());
-                    protocol_opt.get_or_insert_with(|| checkpoint.protocol().clone());
-                }
+
+            // A checkpoint action is complete state at its version. On reaching it (newest-first),
+            // everything newer is already captured above and everything older is subsumed, so fill
+            // any remaining gaps from it and we are done.
+            if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
+                let metadata = metadata_opt.unwrap_or_else(|| checkpoint.metadata().clone());
+                let protocol = protocol_opt.unwrap_or_else(|| checkpoint.protocol().clone());
+                require!(
+                    protocol_enables_adaptive(&protocol),
+                    Error::invalid_protocol(
+                        "found a checkpoint action but the protocol does not enable the \
+                         adaptiveMetadata reader feature"
+                    )
+                );
+                return Ok(Some((metadata, protocol)));
             }
-            if saw_checkpoint && metadata_opt.is_some() && protocol_opt.is_some() {
-                break;
+
+            // Both resolved from top-level commits newer than any checkpoint, so no checkpoint can
+            // override them; the caller's top-level result already matches.
+            if metadata_opt.is_some() && protocol_opt.is_some() {
+                return Ok(None);
             }
         }
 
-        // No checkpoint action means the table is not adaptive; let the caller keep its result.
-        if !saw_checkpoint {
-            return Ok(None);
-        }
-        // A checkpoint action always embeds both Protocol and Metadata.
-        let (Some(metadata), Some(protocol)) = (metadata_opt, protocol_opt) else {
-            return Ok(None);
-        };
-
-        // A checkpoint action is only valid when the protocol enables the adaptiveMetadata feature.
-        require!(
-            protocol_enables_adaptive(&protocol),
-            Error::invalid_protocol(
-                "found a checkpoint action but the protocol does not enable the \
-                 adaptiveMetadata reader feature"
-            )
-        );
-        Ok(Some((metadata, protocol)))
+        // No checkpoint action: not an adaptiveMetadata table, so the caller keeps its result.
+        Ok(None)
     }
 
     #[cfg(feature = "declarative-plans")]
