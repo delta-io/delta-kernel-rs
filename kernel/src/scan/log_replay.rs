@@ -1,5 +1,5 @@
 use std::clone::Clone;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
@@ -12,8 +12,9 @@ use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    col, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, MapToStructOptions,
-    Predicate, PredicateRef, UnaryExpressionOp,
+    col, column_expr_ref, column_name, CastOptions, ColumnName, Expression, ExpressionFieldPatch,
+    ExpressionRef, ExpressionStructPatch, MapToStructOptions, Predicate, PredicateRef,
+    UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -905,8 +906,8 @@ fn get_add_transform_expr(
     Arc::new(Expression::struct_from(fields))
 }
 
-/// Build typed partition values, reparsing the raw map when reader-timezone interpretation is
-/// required.
+/// Build typed partition values, selectively reparsing zoned timestamps when a native checkpoint
+/// struct is available.
 pub(super) fn parsed_partition_values_expr(
     raw_partition_values: Expression,
     base_partition_values: Option<ColumnName>,
@@ -923,16 +924,53 @@ pub(super) fn parsed_partition_values_expr(
         }
     };
 
-    match base_partition_values {
-        Some(base_partition_values)
-            if !partition_schema.fields().any(|field| {
-                partition_value_requires_timezone_reparse(field.data_type(), timestamp_timezone)
-            }) =>
-        {
-            Expression::from(base_partition_values)
+    let Some(base_partition_values) = base_partition_values else {
+        return full_parse();
+    };
+    let native_or_patched = if let Some(timestamp_timezone) = timestamp_timezone {
+        let mut field_patches = HashMap::with_capacity(partition_schema.num_fields());
+        for field in partition_schema.fields() {
+            if !partition_value_requires_timezone_reparse(
+                field.data_type(),
+                Some(timestamp_timezone),
+            ) {
+                continue;
+            }
+            let raw_value = Expression::element_at(
+                raw_partition_values.clone(),
+                Expression::literal(field.name().to_string()),
+            );
+            let parsed_value = Expression::cast(
+                raw_value,
+                DataType::TIMESTAMP,
+                CastOptions::default()
+                    .with_timestamp_timezone(timestamp_timezone)
+                    .with_invalid_input_error()
+                    .with_empty_string_as_null(),
+            );
+            field_patches.insert(
+                field.name().to_string(),
+                ExpressionFieldPatch {
+                    keep_input: false,
+                    insertions: vec![Arc::new(parsed_value)],
+                    optional: false,
+                },
+            );
         }
-        _ => full_parse(),
-    }
+
+        if field_patches.is_empty() {
+            Expression::from(base_partition_values)
+        } else {
+            Expression::StructPatch(ExpressionStructPatch {
+                input_path: Some(base_partition_values),
+                field_patches,
+                ..ExpressionStructPatch::default()
+            })
+        }
+    } else {
+        Expression::from(base_partition_values)
+    };
+    Expression::coalesce([native_or_patched, full_parse()])
 }
 
 /// Whether a native checkpoint partition value must be replaced with a reader-timezone parse.
@@ -1213,10 +1251,18 @@ mod tests {
         SerializableScanState,
     };
     use crate::actions::get_commit_schema;
+    use crate::arrow::array::{
+        Array, Int32Array, MapBuilder, StringBuilder, StructArray, TimestampMicrosecondArray,
+    };
+    use crate::arrow::buffer::NullBuffer;
+    use crate::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_expression::evaluate_expression::evaluate_expression;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        col, column_name, lit, BinaryExpressionOp, Expression, MapToStructOptions,
-        OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator, UnaryExpressionOp,
+        col, column_name, lit, BinaryExpressionOp, CastOptions, Expression, ExpressionFieldPatch,
+        ExpressionStructPatch, MapToStructOptions, OpaquePredicateOp, Predicate, Scalar,
+        ScalarExpressionEvaluator, UnaryExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1281,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn parsed_partition_values_expr_returns_native_struct_when_reparse_is_unnecessary() {
+    fn parsed_partition_values_expr_falls_back_without_timestamp_patch() {
         let raw = col!("add.partitionValues");
         let base = column_name!("add.partitionValues_parsed");
         let timestamp_schema =
@@ -1293,21 +1339,30 @@ mod tests {
 
         assert_eq!(
             parsed_partition_values_expr(raw.clone(), Some(base.clone()), &timestamp_schema, None),
-            Expression::from(base.clone())
+            Expression::coalesce([
+                Expression::from(base.clone()),
+                Expression::map_to_struct(raw.clone(), MapToStructOptions::default()),
+            ])
         );
         assert_eq!(
             parsed_partition_values_expr(
-                raw,
+                raw.clone(),
                 Some(base.clone()),
                 &timestamp_free_schema,
                 Some("America/Los_Angeles")
             ),
-            Expression::from(base)
+            Expression::coalesce([
+                Expression::from(base),
+                Expression::map_to_struct(
+                    raw,
+                    MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                ),
+            ])
         );
     }
 
     #[test]
-    fn parsed_partition_values_expr_reparses_complete_map_for_reader_timezone() {
+    fn parsed_partition_values_expr_patches_only_physical_timestamp_fields() {
         let raw = col!("add.partitionValues");
         let base = column_name!("add.partitionValues_parsed");
         let schema = StructType::new_unchecked([
@@ -1322,11 +1377,208 @@ mod tests {
             &schema,
             Some("America/Los_Angeles"),
         );
-        let expected = Expression::map_to_struct(
-            raw,
-            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
-        );
+        let expected_patch = Expression::StructPatch(ExpressionStructPatch {
+            input_path: Some(base),
+            field_patches: HashMap::from([(
+                "physical_ts".to_string(),
+                ExpressionFieldPatch {
+                    keep_input: false,
+                    insertions: vec![Arc::new(Expression::cast(
+                        Expression::element_at(raw.clone(), Expression::literal("physical_ts")),
+                        DataType::TIMESTAMP,
+                        CastOptions::default()
+                            .with_timestamp_timezone("America/Los_Angeles")
+                            .with_invalid_input_error()
+                            .with_empty_string_as_null(),
+                    ))],
+                    optional: false,
+                },
+            )]),
+            ..ExpressionStructPatch::default()
+        });
+        let expected = Expression::coalesce([
+            expected_patch,
+            Expression::map_to_struct(
+                raw,
+                MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+            ),
+        ]);
         assert_eq!(actual, expected);
+    }
+
+    fn selective_partition_values_batch(
+        raw_timestamp: &str,
+        raw_integer: &str,
+        native_timestamp_timezone: Option<&str>,
+    ) -> RecordBatch {
+        let mut raw = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for (timestamp, integer) in [(raw_timestamp, raw_integer), ("2024-06-15 08:00:00", "8")] {
+            raw.keys().append_value("physical_ts");
+            raw.values().append_value(timestamp);
+            raw.keys().append_value("physical_int");
+            raw.values().append_value(integer);
+            raw.append(true).unwrap();
+        }
+        let raw = raw.finish();
+
+        let native_timestamp = TimestampMicrosecondArray::from(vec![Some(0), Some(0)]);
+        let native_timestamp = match native_timestamp_timezone {
+            Some(timezone) => native_timestamp.with_timezone(timezone),
+            None => native_timestamp,
+        };
+        let native_timestamp = Arc::new(native_timestamp);
+        let native_integer = Arc::new(Int32Array::from(vec![Some(7), Some(99)]));
+        let native_fields = vec![
+            ArrowField::new("physical_ts", native_timestamp.data_type().clone(), true),
+            ArrowField::new("physical_int", native_integer.data_type().clone(), true),
+        ];
+        let native = StructArray::try_new(
+            native_fields.into(),
+            vec![native_timestamp, native_integer],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap();
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("raw", raw.data_type().clone(), true),
+            ArrowField::new("native", native.data_type().clone(), true),
+        ]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(raw), Arc::new(native)]).unwrap()
+    }
+
+    #[test]
+    fn selective_partition_values_runtime_patches_and_falls_back_by_row() {
+        let batch =
+            selective_partition_values_batch("2024-01-15 12:30:45", "not an integer", Some("UTC"));
+        let schema = StructType::new_unchecked([
+            StructField::nullable("physical_ts", DataType::TIMESTAMP),
+            StructField::nullable("physical_int", DataType::INTEGER),
+        ]);
+        let expression = parsed_partition_values_expr(
+            col!("raw"),
+            Some(column_name!("native")),
+            &schema,
+            Some("America/Los_Angeles"),
+        );
+
+        let result =
+            evaluate_expression(&expression, &batch, Some(&DataType::from(schema))).unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let timestamps = result
+            .column_by_name("physical_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let integers = result
+            .column_by_name("physical_int")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            timestamps.values(),
+            &[1_705_350_645_000_000, 1_718_463_600_000_000]
+        );
+        assert_eq!(integers, &Int32Array::from(vec![Some(7), Some(8)]));
+        assert_eq!(result.null_count(), 0);
+    }
+
+    #[rstest]
+    #[case::no_reader_timezone(Some("UTC"), DataType::TIMESTAMP, None)]
+    #[case::no_zoned_timestamp(None, DataType::TIMESTAMP_NTZ, Some("America/Los_Angeles"))]
+    fn selective_partition_values_runtime_falls_back_without_timestamp_patch(
+        #[case] native_timestamp_timezone: Option<&str>,
+        #[case] partition_timestamp_type: DataType,
+        #[case] reader_timezone: Option<&str>,
+    ) {
+        let batch = selective_partition_values_batch(
+            "2024-01-15 12:30:45",
+            "not an integer",
+            native_timestamp_timezone,
+        );
+        let schema = StructType::new_unchecked([
+            StructField::nullable("physical_ts", partition_timestamp_type),
+            StructField::nullable("physical_int", DataType::INTEGER),
+        ]);
+        let expression = parsed_partition_values_expr(
+            col!("raw"),
+            Some(column_name!("native")),
+            &schema,
+            reader_timezone,
+        );
+
+        let result =
+            evaluate_expression(&expression, &batch, Some(&DataType::from(schema))).unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let timestamps = result
+            .column_by_name("physical_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let integers = result
+            .column_by_name("physical_int")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(timestamps.values(), &[0, 1_718_438_400_000_000]);
+        assert_eq!(integers, &Int32Array::from(vec![Some(7), Some(8)]));
+        assert_eq!(result.null_count(), 0);
+    }
+
+    #[test]
+    fn selective_partition_values_runtime_reports_malformed_timestamp() {
+        let batch = selective_partition_values_batch("not a timestamp", "7", Some("UTC"));
+        let schema = StructType::new_unchecked([
+            StructField::nullable("physical_ts", DataType::TIMESTAMP),
+            StructField::nullable("physical_int", DataType::INTEGER),
+        ]);
+        let expression = parsed_partition_values_expr(
+            col!("raw"),
+            Some(column_name!("native")),
+            &schema,
+            Some("America/Los_Angeles"),
+        );
+
+        assert!(matches!(
+            evaluate_expression(&expression, &batch, Some(&DataType::from(schema))),
+            Err(crate::Error::ParseError(..))
+        ));
+    }
+
+    #[test]
+    fn selective_partition_values_runtime_treats_empty_timestamp_as_null() {
+        let batch = selective_partition_values_batch("", "7", Some("UTC"));
+        let schema = StructType::new_unchecked([
+            StructField::nullable("physical_ts", DataType::TIMESTAMP),
+            StructField::nullable("physical_int", DataType::INTEGER),
+        ]);
+        let expression = parsed_partition_values_expr(
+            col!("raw"),
+            Some(column_name!("native")),
+            &schema,
+            Some("America/Los_Angeles"),
+        );
+
+        let result =
+            evaluate_expression(&expression, &batch, Some(&DataType::from(schema))).unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let timestamps = result
+            .column_by_name("physical_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let integers = result
+            .column_by_name("physical_int")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(timestamps.is_null(0));
+        assert_eq!(timestamps.value(1), 1_718_463_600_000_000);
+        assert_eq!(integers, &Int32Array::from(vec![Some(7), Some(8)]));
     }
 
     fn test_checkpoint_info() -> CheckpointReadInfo {

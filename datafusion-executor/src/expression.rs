@@ -183,13 +183,11 @@ fn cast_to_df_expr(cast_expr: &CastExpression, input_schema: &StructType) -> Del
     let source = value
         .get_type(&df_input_schema)
         .map_err(Error::generic_err)?;
-    let timezone_cast = cast_expr.options.timestamp_timezone().is_some()
-        && cast_expr.target == KernelDataType::TIMESTAMP
-        && matches!(
-            source,
-            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
-        );
-    if timezone_cast {
+    let source_is_string = matches!(
+        source,
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
+    );
+    if cast_expr.requires_kernel_evaluation(source_is_string) {
         let udf = KernelCastUdf::try_new(cast_expr.target.clone(), cast_expr.options.clone())?;
         return Ok(ScalarUDF::new_from_impl(udf).call(vec![value]));
     }
@@ -1539,6 +1537,89 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(timestamps.value(0), 1_718_469_000_000_000);
+    }
+
+    #[rstest]
+    #[case::timestamp(
+        "not a timestamp",
+        DataType::TIMESTAMP,
+        CastOptions::default()
+            .with_timestamp_timezone("America/Los_Angeles")
+            .with_invalid_input_error()
+    )]
+    #[case::integer(
+        "not an integer",
+        DataType::INTEGER,
+        CastOptions::default().with_invalid_input_error()
+    )]
+    fn cast_with_invalid_input_error_propagates_parse_failure(
+        #[case] raw: &str,
+        #[case] target: DataType,
+        #[case] options: CastOptions,
+    ) {
+        let input_schema =
+            StructType::try_new([StructField::nullable("s", DataType::STRING)]).unwrap();
+        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(StringArray::from(vec![Some(raw)]))],
+        )
+        .unwrap();
+        let logical = to_df_expr(
+            &KernelExpr::cast(col!("s"), target.clone(), options),
+            &input_schema,
+            Some(&target),
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+
+        let error = physical.evaluate(&batch).unwrap_err();
+        assert!(error.to_string().contains(raw), "{error}");
+    }
+
+    #[test]
+    fn strict_timestamp_empty_string_requires_explicit_null_semantics() {
+        let input_schema =
+            StructType::try_new([StructField::nullable("s", DataType::STRING)]).unwrap();
+        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(StringArray::from(vec![Some(""), None]))],
+        )
+        .unwrap();
+        let strict_options = CastOptions::default()
+            .with_timestamp_timezone("America/Los_Angeles")
+            .with_invalid_input_error();
+
+        let strict = to_df_expr(
+            &KernelExpr::cast(col!("s"), DataType::TIMESTAMP, strict_options.clone()),
+            &input_schema,
+            Some(&DataType::TIMESTAMP),
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema.clone()).unwrap();
+        let strict = create_physical_expr(&strict, &df_schema, &ExecutionProps::new()).unwrap();
+        assert!(strict.evaluate(&batch).is_err());
+
+        let partition = to_df_expr(
+            &KernelExpr::cast(
+                col!("s"),
+                DataType::TIMESTAMP,
+                strict_options.with_empty_string_as_null(),
+            ),
+            &input_schema,
+            Some(&DataType::TIMESTAMP),
+        )
+        .unwrap();
+        let partition =
+            create_physical_expr(&partition, &df_schema, &ExecutionProps::new()).unwrap();
+        let result = partition
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(result.null_count(), batch.num_rows());
     }
 
     // === ParseJson Shared Helpers ===

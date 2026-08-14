@@ -171,6 +171,10 @@ message CastOptions {
   // TIMESTAMP. An explicit offset in a value takes precedence; absence preserves the default UTC
   // behavior.
   optional string timestamp_timezone = 1;
+  // Whether invalid input fails evaluation instead of producing null.
+  bool invalid_input_error = 2;
+  // Whether empty string input evaluates to null, including when invalid input otherwise fails.
+  bool empty_string_as_null = 3;
 }
 
 message CastExpression {

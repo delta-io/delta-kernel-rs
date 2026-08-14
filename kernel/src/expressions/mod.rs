@@ -14,6 +14,7 @@ pub use self::column_names::{
     ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
+use crate::delta_kernel_derive::internal_api;
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
@@ -398,6 +399,12 @@ impl TimestampInterpretation {
 pub struct CastOptions {
     #[serde(flatten)]
     timestamp: TimestampInterpretation,
+    /// Whether invalid input should fail evaluation instead of producing null.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    invalid_input_error: bool,
+    /// Whether empty string input should evaluate to null.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    empty_string_as_null: bool,
 }
 
 impl CastOptions {
@@ -417,15 +424,40 @@ impl CastOptions {
         self.timestamp.timestamp_timezone()
     }
 
+    /// Report invalid input as an evaluation error instead of producing null.
+    ///
+    /// Intended for parsing contexts, such as Delta partition values, whose malformed values must
+    /// remain observable.
+    pub fn with_invalid_input_error(mut self) -> Self {
+        self.invalid_input_error = true;
+        self
+    }
+
+    /// Returns whether invalid input is reported as an evaluation error.
+    pub fn invalid_input_is_error(&self) -> bool {
+        self.invalid_input_error
+    }
+
+    /// Treat empty string input as null, including when invalid input otherwise produces an error.
+    pub fn with_empty_string_as_null(mut self) -> Self {
+        self.empty_string_as_null = true;
+        self
+    }
+
+    /// Returns whether empty string input evaluates to null.
+    pub fn empty_string_is_null(&self) -> bool {
+        self.empty_string_as_null
+    }
+
     fn is_default(&self) -> bool {
-        self.timestamp.is_default()
+        self.timestamp.is_default() && !self.invalid_input_error && !self.empty_string_as_null
     }
 }
 
-/// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
-/// value that cannot be represented in the target type evaluates to NULL rather than erroring.
-/// Offset-less strings cast to `TIMESTAMP` use the timezone in [`CastOptions`], or UTC when no
-/// timezone is configured.
+/// An expression that casts a child expression to a target type, following SQL `CAST` semantics by
+/// default: a value that cannot be represented in the target type evaluates to NULL. Callers may
+/// opt into errors for parsing contexts through [`CastOptions::with_invalid_input_error`].
+/// Offset-less strings cast to `TIMESTAMP` use the configured timezone, or UTC by default.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CastExpression {
     /// The expression whose value is cast.
@@ -780,6 +812,19 @@ impl MapToStructExpression {
 }
 
 impl CastExpression {
+    /// Returns whether this cast requires Kernel evaluation for the given source type.
+    ///
+    /// `source_is_string` must be true when the input is any supported string representation.
+    /// Kernel evaluation is required when an option changes native engine cast semantics.
+    #[internal_api]
+    pub(crate) fn requires_kernel_evaluation(&self, source_is_string: bool) -> bool {
+        self.options.invalid_input_is_error()
+            || (source_is_string && self.options.empty_string_is_null())
+            || (source_is_string
+                && self.target == DataType::TIMESTAMP
+                && self.options.timestamp_timezone().is_some())
+    }
+
     pub(crate) fn new(expr: impl Into<Expression>, target: DataType, options: CastOptions) -> Self {
         Self {
             expr: Box::new(expr.into()),
@@ -983,9 +1028,10 @@ impl Expression {
         Self::ElementAt(ElementAtExpression::new(map_expr, key_expr))
     }
 
-    /// Casts `expr` to `target` according to `options`, following SQL `CAST` semantics
-    /// (unrepresentable values become NULL). [`CastOptions::default`] retains the standard cast
-    /// behavior and interprets offset-less timestamps in UTC. See [`CastExpression`].
+    /// Casts `expr` to `target` according to `options`, following SQL `CAST` semantics.
+    /// Unrepresentable values become NULL by default; [`CastOptions::with_invalid_input_error`]
+    /// instead reports them as errors. [`CastOptions::default`] interprets offset-less timestamps
+    /// in UTC. See [`CastExpression`].
     pub fn cast(expr: impl Into<Expression>, target: DataType, options: CastOptions) -> Self {
         Self::Cast(CastExpression::new(expr, target, options))
     }
@@ -1283,12 +1329,19 @@ impl Display for Expression {
                 None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
             },
             ElementAt(e) => write!(f, "ELEMENT_AT({}, {})", e.map_expr, e.key_expr),
-            Cast(c) => match c.options.timestamp_timezone() {
-                Some(timezone) => {
-                    write!(f, "CAST({} AS {} USING \"{}\")", c.expr, c.target, timezone)
+            Cast(c) => {
+                write!(f, "CAST({} AS {}", c.expr, c.target)?;
+                if let Some(timezone) = c.options.timestamp_timezone() {
+                    write!(f, " USING \"{timezone}\"")?;
                 }
-                None => write!(f, "CAST({} AS {})", c.expr, c.target),
-            },
+                if c.options.invalid_input_is_error() {
+                    write!(f, " ERROR ON INVALID")?;
+                }
+                if c.options.empty_string_is_null() {
+                    write!(f, " EMPTY STRING AS NULL")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -1476,15 +1529,20 @@ mod tests {
         let cast = Expr::cast(
             col!("s"),
             DataType::TIMESTAMP,
-            CastOptions::default().with_timestamp_timezone("+12:45:30"),
+            CastOptions::default()
+                .with_timestamp_timezone("+12:45:30")
+                .with_invalid_input_error()
+                .with_empty_string_as_null(),
         );
         let Expr::Cast(cast_state) = &cast else {
             panic!("expected cast expression");
         };
         assert_eq!(cast_state.options.timestamp_timezone(), Some("+12:45:30"));
+        assert!(cast_state.options.invalid_input_is_error());
+        assert!(cast_state.options.empty_string_is_null());
         assert_eq!(
             format!("{cast}"),
-            "CAST(Column(s) AS timestamp USING \"+12:45:30\")"
+            "CAST(Column(s) AS timestamp USING \"+12:45:30\" ERROR ON INVALID EMPTY STRING AS NULL)"
         );
     }
 
@@ -1686,7 +1744,10 @@ mod tests {
         #[case::timestamp_timezone(Expression::cast(
             col!("part"),
             DataType::TIMESTAMP,
-            CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+            CastOptions::default()
+                .with_timestamp_timezone("America/Los_Angeles")
+                .with_invalid_input_error()
+                .with_empty_string_as_null(),
         ))]
         fn test_cast_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);

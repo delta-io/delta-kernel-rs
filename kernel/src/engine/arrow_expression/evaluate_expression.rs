@@ -10,7 +10,7 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
     AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::Parser;
@@ -18,7 +18,8 @@ use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, ne
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
-    and_kleene, can_cast_types, cast, is_not_null, is_null, not, or_kleene,
+    and_kleene, can_cast_types, cast, cast_with_options, filter_record_batch, is_not_null, is_null,
+    not, or_kleene, take, CastOptions as ArrowCastOptions,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
@@ -138,18 +139,7 @@ fn evaluate_struct_expression(
         .zip(output_schema.fields())
         .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())))
         .try_collect()?;
-    let output_fields: Vec<ArrowField> = output_cols
-        .iter()
-        .zip(output_schema.fields())
-        .map(|(output_col, output_field)| {
-            ArrowField::new(
-                output_field.name(),
-                output_col.data_type().clone(),
-                output_field.nullable, /* Use schema's nullability; Arrow will validate any
-                                        * mismatch */
-            )
-        })
-        .collect();
+    let output_fields = struct_output_fields(&output_cols, output_schema);
     let null_buffer = if let Some(predicate_expr) = nullability_predicate {
         let predicate_array = evaluate_expression(predicate_expr, batch, Some(&DataType::BOOLEAN))?;
         let bool_array = predicate_array
@@ -250,17 +240,7 @@ fn evaluate_struct_patch_expression(
     }
 
     // Build the final struct, preserving null bitmap for nested patches
-    let output_fields: Vec<ArrowField> = output_cols
-        .iter()
-        .zip(output_schema.fields())
-        .map(|(output_col, output_field)| {
-            ArrowField::new(
-                output_field.name(),
-                output_col.data_type().clone(),
-                output_col.is_nullable(),
-            )
-        })
-        .collect();
+    let output_fields = struct_output_fields(&output_cols, output_schema);
 
     // For nested patches, get the source struct's null bitmap to preserve null rows
     let source_null_buffer = source_array.as_ref().and_then(|arr| {
@@ -271,6 +251,20 @@ fn evaluate_struct_patch_expression(
 
     let data = StructArray::try_new(output_fields.into(), output_cols, source_null_buffer)?;
     Ok(Arc::new(data))
+}
+
+fn struct_output_fields(output_cols: &[ArrayRef], output_schema: &StructType) -> Vec<ArrowField> {
+    output_cols
+        .iter()
+        .zip(output_schema.fields())
+        .map(|(output_col, output_field)| {
+            ArrowField::new(
+                output_field.name(),
+                output_col.data_type().clone(),
+                output_field.nullable,
+            )
+        })
+        .collect()
 }
 
 /// Evaluates a kernel expression over a record batch
@@ -336,23 +330,7 @@ pub fn evaluate_expression(
                 exprs,
             }),
             result_type,
-        ) => {
-            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
-
-            for expr in exprs {
-                let array = evaluate_expression(expr, batch, result_type)?;
-                let null_count = array.null_count();
-                arrays.push(array);
-                // Short-circuit: if this array has no nulls, we can stop evaluating
-                // remaining expressions since no more values are needed.
-                if null_count == 0 {
-                    break;
-                }
-            }
-
-            // Coalesce accumulated arrays
-            Ok(coalesce_arrays(&arrays, result_type)?)
-        }
+        ) => evaluate_coalesce_expression(exprs, batch, result_type),
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
             evaluate_array_expression(exprs, batch, result_type)
         }
@@ -407,31 +385,68 @@ pub fn evaluate_expression(
             "ElementAt expression requires a STRING result type, but got {data_type:?}"
         ))),
         (Cast(c), result_type) => {
-            let input = evaluate_expression(&c.expr, batch, None)?;
+            let mut input = evaluate_expression(&c.expr, batch, None)?;
             let target = ArrowDataType::try_from_kernel(&c.target)?;
             let string_input = matches!(
                 input.data_type(),
                 ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
             );
-            let timestamp_timezone = c
-                .options
-                .timestamp_timezone()
-                .filter(|_| c.target == DataType::TIMESTAMP && string_input);
+            if string_input && c.options.empty_string_is_null() {
+                let strings = as_string_accessor(input.as_ref()).ok_or_else(|| {
+                    Error::generic(format!("expected string input, got {}", input.data_type()))
+                })?;
+                input = Arc::new(StringArray::from_iter((0..strings.len()).map(|index| {
+                    strings
+                        .is_valid(index)
+                        .then(|| strings.value(index))
+                        .filter(|value| !value.is_empty())
+                })));
+            }
+            let needs_zoned_parse = c.target == DataType::TIMESTAMP
+                && string_input
+                && c.requires_kernel_evaluation(string_input);
+            let timestamp_timezone =
+                needs_zoned_parse.then(|| c.options.timestamp_timezone().unwrap_or("UTC"));
             let output = if let Some(timestamp_timezone) = timestamp_timezone {
                 let timezone = TimestampTimezone::parse(timestamp_timezone)?;
                 let strings = as_string_accessor(input.as_ref()).ok_or_else(|| {
                     Error::generic(format!("expected string input, got {}", input.data_type()))
                 })?;
                 let values = (0..strings.len()).map(|index| {
-                    strings
-                        .is_valid(index)
-                        .then(|| strings.value(index))
-                        .and_then(|raw| timezone.parse_timestamp(raw))
+                    if !strings.is_valid(index) {
+                        return Ok(None);
+                    }
+                    let raw = strings.value(index);
+                    timezone
+                        .parse_timestamp(raw)
+                        .map(Some)
+                        .ok_or_else(|| Error::ParseError(raw.to_string(), DataType::TIMESTAMP))
                 });
-                Arc::new(TimestampMicrosecondArray::from_iter(values).with_timezone("UTC"))
-                    as ArrayRef
+                let values: Vec<Option<i64>> = if c.options.invalid_input_is_error() {
+                    values.collect::<DeltaResult<_>>()?
+                } else {
+                    values.map(|value| value.unwrap_or(None)).collect()
+                };
+                Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef
             } else if can_cast_types(input.data_type(), &target) {
-                cast(&input, &target)?
+                if c.options.invalid_input_is_error() {
+                    cast_with_options(
+                        input.as_ref(),
+                        &target,
+                        &ArrowCastOptions {
+                            safe: false,
+                            ..ArrowCastOptions::default()
+                        },
+                    )
+                    .map_err(|error| Error::ParseError(error.to_string(), c.target.clone()))?
+                } else {
+                    cast(&input, &target)?
+                }
+            } else if c.options.invalid_input_is_error() {
+                return Err(Error::ParseError(
+                    format!("cannot cast {} to {}", input.data_type(), c.target),
+                    c.target.clone(),
+                ));
             } else {
                 // Arrow errors rather than producing per-value nulls for an unsupported type pair.
                 // Degrade that case to an all-null column, matching SQL CAST null semantics.
@@ -441,6 +456,38 @@ pub fn evaluate_expression(
         }
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
+}
+
+fn evaluate_coalesce_expression(
+    exprs: &[Expression],
+    batch: &RecordBatch,
+    result_type: Option<&DataType>,
+) -> DeltaResult<ArrayRef> {
+    let Some((first, rest)) = exprs.split_first() else {
+        return Ok(coalesce_arrays(&[], result_type)?);
+    };
+    let mut output = evaluate_expression(first, batch, result_type)?;
+
+    for expr in rest {
+        if output.null_count() == 0 {
+            break;
+        }
+        let unresolved = is_null(output.as_ref())?;
+        let unresolved_batch = filter_record_batch(batch, &unresolved)?;
+        let fallback = evaluate_expression(expr, &unresolved_batch, result_type)?;
+        let mut fallback_index = 0u64;
+        let indices = UInt64Array::from_iter((0..output.len()).map(|row| {
+            output.is_null(row).then(|| {
+                let index = fallback_index;
+                fallback_index += 1;
+                index
+            })
+        }));
+        let fallback = take(fallback.as_ref(), &indices, None)?;
+        output = coalesce_arrays(&[output, fallback], result_type)?;
+    }
+
+    Ok(output)
 }
 
 /// Evaluate an `ARRAY(e0, e1, ..., eN-1)` constructor expression into an Arrow `ListArray`.
@@ -1865,6 +1912,32 @@ mod tests {
     }
 
     #[test]
+    fn test_coalesce_expression_evaluates_fallback_only_for_unresolved_rows() {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("resolved", ArrowDataType::Int32, true),
+            ArrowField::new("fallback", ArrowDataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None])),
+                Arc::new(StringArray::from(vec![Some("invalid"), Some("2")])),
+            ],
+        )
+        .unwrap();
+        let strict_fallback = Expr::cast(
+            col!("fallback"),
+            DataType::INTEGER,
+            CastOptions::default().with_invalid_input_error(),
+        );
+        let expression = Expr::coalesce([col!("resolved"), strict_fallback]);
+
+        let result = evaluate_expression(&expression, &batch, Some(&DataType::INTEGER)).unwrap();
+        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(result, &Int32Array::from(vec![Some(1), Some(2)]));
+    }
+
+    #[test]
     fn test_coalesce_expression_short_circuit_type_mismatch() {
         // Verify type validation works when short-circuiting
         let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
@@ -2976,6 +3049,37 @@ mod tests {
     }
 
     #[test]
+    fn test_struct_patch_preserves_output_schema_field_nullability() {
+        let source = StructArray::try_new(
+            vec![ArrowField::new("a", ArrowDataType::Int32, false)].into(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap();
+        let replacement = Int32Array::from(vec![Some(10), None]);
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("nested", source.data_type().clone(), true),
+            ArrowField::new("replacement", ArrowDataType::Int32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(source), Arc::new(replacement)],
+        )
+        .unwrap();
+        let expr = Expr::struct_patch(
+            ExpressionStructPatchBuilder::new_nested(["nested"]).replace("a", col!("replacement")),
+        )
+        .unwrap();
+        let output_schema = schema! { not_null "a": INTEGER };
+
+        let result =
+            evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(!result.fields()[0].is_nullable());
+        assert!(result.is_null(1));
+    }
+
+    #[test]
     fn test_map_to_struct_basic() {
         use crate::arrow::array::Date32Array;
 
@@ -3339,6 +3443,54 @@ mod tests {
             .unwrap(),
             None
         );
+
+        let strings = StringArray::from(vec![Some("not a timestamp")]);
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(strings)]).unwrap();
+        let strict = Expr::cast(
+            col!("s"),
+            DataType::TIMESTAMP,
+            CastOptions::default()
+                .with_timestamp_timezone("America/Los_Angeles")
+                .with_invalid_input_error(),
+        );
+        assert!(matches!(
+            evaluate_expression(&strict, &batch, Some(&DataType::TIMESTAMP)),
+            Err(Error::ParseError(..))
+        ));
+    }
+
+    #[rstest]
+    fn test_strict_timestamp_empty_string_requires_explicit_null_semantics(
+        #[values(ArrowDataType::Utf8, ArrowDataType::LargeUtf8, ArrowDataType::Utf8View)]
+        input_type: ArrowDataType,
+    ) {
+        let values: ArrayRef = match input_type {
+            ArrowDataType::Utf8 => Arc::new(StringArray::from(vec![Some(""), None])),
+            ArrowDataType::LargeUtf8 => Arc::new(LargeStringArray::from(vec![Some(""), None])),
+            ArrowDataType::Utf8View => Arc::new(StringViewArray::from(vec![Some(""), None])),
+            other => panic!("unexpected string representation: {other:?}"),
+        };
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", input_type, true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![values]).unwrap();
+        let strict_options = CastOptions::default()
+            .with_timestamp_timezone("America/Los_Angeles")
+            .with_invalid_input_error();
+        let strict = Expr::cast(col!("s"), DataType::TIMESTAMP, strict_options.clone());
+        assert!(matches!(
+            evaluate_expression(&strict, &batch, Some(&DataType::TIMESTAMP)),
+            Err(Error::ParseError(raw, DataType::Primitive(PrimitiveType::Timestamp)))
+                if raw.is_empty()
+        ));
+
+        let partition_cast = Expr::cast(
+            col!("s"),
+            DataType::TIMESTAMP,
+            strict_options.with_empty_string_as_null(),
+        );
+        let result =
+            evaluate_expression(&partition_cast, &batch, Some(&DataType::TIMESTAMP)).unwrap();
+        assert_eq!(result.null_count(), 2);
     }
 
     #[test]
@@ -3354,6 +3506,53 @@ mod tests {
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
         let values = result.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(values.value(0), 42);
+    }
+
+    #[test]
+    fn test_invalid_input_error_applies_to_all_cast_targets() {
+        let strings = StringArray::from(vec![Some("42"), Some("not an integer")]);
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(strings)]).unwrap();
+        let strict_integer = Expr::cast(
+            col!("s"),
+            DataType::INTEGER,
+            CastOptions::default().with_invalid_input_error(),
+        );
+        assert!(matches!(
+            evaluate_expression(&strict_integer, &batch, Some(&DataType::INTEGER)),
+            Err(Error::ParseError(
+                _,
+                DataType::Primitive(PrimitiveType::Integer)
+            ))
+        ));
+
+        let struct_type = DataType::from(schema! { nullable "value": STRING });
+        let unsupported = Expr::cast(
+            col!("s"),
+            struct_type.clone(),
+            CastOptions::default().with_invalid_input_error(),
+        );
+        assert!(matches!(
+            evaluate_expression(&unsupported, &batch, Some(&struct_type)),
+            Err(Error::ParseError(_, target)) if target == struct_type
+        ));
+    }
+
+    #[test]
+    fn test_invalid_input_error_accepts_valid_values() {
+        let strings = StringArray::from(vec![Some("42"), Some("7")]);
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(strings)]).unwrap();
+        let strict_integer = Expr::cast(
+            col!("s"),
+            DataType::INTEGER,
+            CastOptions::default().with_invalid_input_error(),
+        );
+
+        let result =
+            evaluate_expression(&strict_integer, &batch, Some(&DataType::INTEGER)).unwrap();
+        let values = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values, &Int32Array::from(vec![Some(42), Some(7)]));
     }
 
     #[test]

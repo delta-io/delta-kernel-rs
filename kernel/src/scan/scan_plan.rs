@@ -139,9 +139,9 @@ impl Scan {
     ///
     /// When the checkpoint lacks native parsed stats, `FROM_JSON(add.stats, physical_stats)`
     /// replaces `add.stats_parsed` above. Parsed partition values reuse the native struct when
-    /// possible and rebuild from the raw map when a reader timezone changes zoned timestamp
-    /// interpretation or no compatible native struct exists. A parsed field is omitted when its
-    /// schema is absent.
+    /// possible, selectively reparse zoned timestamps for a reader timezone, and rebuild from the
+    /// raw map when no compatible native struct exists. A parsed field is omitted when its schema
+    /// is absent.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.state_info.physical_stats_schema.as_ref();

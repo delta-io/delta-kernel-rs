@@ -443,6 +443,8 @@ impl From<&CastOptions> for proto_expr::CastOptions {
     fn from(options: &CastOptions) -> Self {
         Self {
             timestamp_timezone: options.timestamp_timezone().map(ToOwned::to_owned),
+            invalid_input_error: options.invalid_input_is_error(),
+            empty_string_as_null: options.empty_string_is_null(),
         }
     }
 }
@@ -1750,7 +1752,10 @@ mod tests {
         let proto_expr::expression::Kind::Cast(cast) = expr_kind_of(Expression::cast(
             lit("1"),
             DataType::TIMESTAMP,
-            CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+            CastOptions::default()
+                .with_timestamp_timezone("America/Los_Angeles")
+                .with_invalid_input_error()
+                .with_empty_string_as_null(),
         )) else {
             panic!("expected a cast expression");
         };
@@ -1760,6 +1765,9 @@ mod tests {
                 .and_then(|options| options.timestamp_timezone.as_deref()),
             Some("America/Los_Angeles")
         );
+        let options = cast.options.unwrap();
+        assert!(options.invalid_input_error);
+        assert!(options.empty_string_as_null);
     }
 
     #[test]

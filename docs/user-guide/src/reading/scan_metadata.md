@@ -293,9 +293,9 @@ transitions, ambiguous local times use the earlier instant, and nonexistent loca
 offset from before the transition.
 
 > [!TIP]
-> When the checkpoint already stores typed partition values, Kernel reads that column directly
-> unless a reader timezone requires zoned `TIMESTAMP` values to be reinterpreted. In that case,
-> Kernel reparses the raw partition map.
+> Kernel reuses compatible native checkpoint partition values. On each row, a null native struct
+> falls back to parsing the complete raw map, while zoned `TIMESTAMP` fields are selectively
+> reparsed in the reader timezone. Malformed raw values fail only when their row or field is parsed.
 
 ## Cancelling a scan
 

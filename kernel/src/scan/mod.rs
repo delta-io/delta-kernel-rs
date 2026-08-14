@@ -200,8 +200,8 @@ impl StatsOptions {
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
 /// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map. If a requested reader timezone changes
-/// zoned timestamp interpretation, Kernel reparses the complete string map.
+/// when present, otherwise from parsing the string map. A requested reader timezone selectively
+/// replaces zoned timestamp fields parsed from the raw map.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.

@@ -4,7 +4,7 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    ColumnName, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
+    CastOptions, ColumnName, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
     JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef,
     OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData,
     UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
@@ -265,8 +265,8 @@ pub struct EngineExpressionVisitor {
     ),
     /// Visits a node represented as unknown across FFI, belonging to `sibling_list_id`.
     ///
-    /// Casts use `cast_to_<target>`, or `cast_with_timestamp_timezone_to_<target>` when
-    /// configured.
+    /// Casts use `cast_to_<target>` with default options or `cast_with_options_to_<target>` when
+    /// any option is configured.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
 }
@@ -698,10 +698,10 @@ fn visit_expression_impl(
         // The FFI expression visitor has no ElementAt callback. Surface an explicit unknown node
         // so engines cannot silently interpret it as another expression.
         Expression::ElementAt(_) => visit_unknown(visitor, sibling_list_id, "element_at"),
-        Expression::Cast(cast) if cast.options.timestamp_timezone().is_some() => visit_unknown(
+        Expression::Cast(cast) if cast.options != CastOptions::default() => visit_unknown(
             visitor,
             sibling_list_id,
-            &format!("cast_with_timestamp_timezone_to_{}", cast.target),
+            &format!("cast_with_options_to_{}", cast.target),
         ),
         // TODO(#2975): Add a dedicated visitor callback for cast expressions.
         Expression::Cast(cast) => visit_unknown(
@@ -997,15 +997,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case::plain(None, "cast_to_timestamp")]
+    #[case::plain(CastOptions::default(), "cast_to_timestamp")]
     #[case::timezone(
-        Some("America/Los_Angeles"),
-        "cast_with_timestamp_timezone_to_timestamp"
+        CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        "cast_with_options_to_timestamp"
     )]
-    fn cast_visits_unknown(#[case] timezone: Option<&str>, #[case] expected_name: &str) {
-        let options = timezone.map_or_else(CastOptions::default, |timezone| {
-            CastOptions::default().with_timestamp_timezone(timezone)
-        });
+    #[case::strict(
+        CastOptions::default()
+            .with_timestamp_timezone("America/Los_Angeles")
+            .with_invalid_input_error(),
+        "cast_with_options_to_timestamp"
+    )]
+    #[case::empty_string(
+        CastOptions::default().with_empty_string_as_null(),
+        "cast_with_options_to_timestamp"
+    )]
+    fn cast_visits_unknown(#[case] options: CastOptions, #[case] expected_name: &str) {
         let expression = Expression::cast(
             Expression::column(["partitionValue"]),
             DataType::TIMESTAMP,
