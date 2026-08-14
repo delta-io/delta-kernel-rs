@@ -13,8 +13,6 @@ use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-// `Scalar` backs the derived `IntoStructData` conversions used by checkpoint serialization.
-// The `tests` module imports it separately for its own use.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1274,7 +1272,6 @@ impl IntoEngineData for CheckpointAction {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // Build the array elements in the order `CHECKPOINT_ACTION_ELEMENT_SCHEMA` declares.
         let checkpoint_metadata = CheckpointMetadata {
             version: self.version,
             tags: None,
@@ -1300,7 +1297,6 @@ impl IntoEngineData for CheckpointAction {
             elements.push(union_element(SIDECAR_NAME, element)?);
         }
 
-        // Derive the array element type from the schema static rather than rebuilding it.
         let DataType::Array(array_type) = CHECKPOINT_ACTION_FIELD.data_type() else {
             return Err(Error::generic(
                 "checkpoint action field must be an array type",

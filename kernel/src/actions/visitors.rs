@@ -728,8 +728,9 @@ impl RowVisitor for CheckpointVisitor {
                 let mut element_visitor = CheckpointElementVisitor::default();
                 elements.visit_with(&mut element_visitor)?;
                 self.checkpoint = Some(element_visitor.into_checkpoint_action()?);
-                // Like `MetadataVisitor`/`ProtocolVisitor`, this singleton visitor keeps the first
-                // match in the batch; callers feed batches newest-first with a fresh visitor.
+                // Keep the first checkpoint row found; this only extracts one action, it is not
+                // the RFC's checkpoint selection rule (MAX checkpointMetadata.version across
+                // commits, standalone checkpoints, and _last_checkpoint).
                 break;
             }
         }
@@ -936,8 +937,6 @@ fn visit_content_root_at<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Used only by the feature-gated checkpoint round-trip test below; gated to avoid an
-    // unused-import warning when the feature is off.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::actions::LOG_CHECKPOINT_SCHEMA;
     use crate::arrow::array::{BooleanArray, StringArray};
