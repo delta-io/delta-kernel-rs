@@ -44,7 +44,7 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::{collect_string_map, Transaction};
+use crate::transaction::{CommitInfoClientOptions, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler};
 
@@ -726,8 +726,7 @@ pub struct CreateTableTransactionBuilder {
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
     correlation_id: Option<Arc<str>>,
-    operation_parameters: HashMap<String, String>,
-    operation_metrics: Option<HashMap<String, String>>,
+    commit_info_options: CommitInfoClientOptions,
 }
 
 impl CreateTableTransactionBuilder {
@@ -743,8 +742,7 @@ impl CreateTableTransactionBuilder {
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
             correlation_id: None,
-            operation_parameters: HashMap::new(),
-            operation_metrics: None,
+            commit_info_options: CommitInfoClientOptions::new(),
         }
     }
 
@@ -839,29 +837,13 @@ impl CreateTableTransactionBuilder {
         self
     }
 
-    /// Set `CommitInfo.operationParameters` for the create-table commit.
+    /// Set the commit-info options for the create-table commit.
     ///
-    /// See [`Transaction::with_operation_parameters`].
-    pub fn with_operation_parameters<I, K, V>(mut self, operation_parameters: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.operation_parameters = collect_string_map(operation_parameters);
-        self
-    }
-
-    /// Set `CommitInfo.operationMetrics` for the create-table commit.
-    ///
-    /// See [`Transaction::with_operation_metrics`].
-    pub fn with_operation_metrics<I, K, V>(mut self, operation_metrics: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.operation_metrics = Some(collect_string_map(operation_metrics));
+    /// The operation is always `CREATE TABLE` and is not part of these options. When the options
+    /// omit engine info, the [`create_table`](super::super::create_table::create_table) value is
+    /// kept.
+    pub fn with_commit_info_options(mut self, options: CommitInfoClientOptions) -> Self {
+        self.commit_info_options = options;
         self
     }
 
@@ -987,18 +969,19 @@ impl CreateTableTransactionBuilder {
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
-        // Create Transaction<CreateTable> with the effective table configuration
-        let mut txn = Transaction::try_new_create_table(
+        // Fall back to the builder's engine info when the options omit it.
+        let mut commit_info_options = self.commit_info_options;
+        commit_info_options
+            .engine_info
+            .get_or_insert(self.engine_info);
+        Transaction::try_new_create_table(
             table_configuration,
-            self.engine_info,
+            commit_info_options,
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.correlation_id,
-        )?;
-        txn.operation_parameters = self.operation_parameters;
-        txn.operation_metrics = self.operation_metrics;
-        Ok(txn)
+        )
     }
 }
 

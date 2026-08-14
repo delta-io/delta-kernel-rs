@@ -850,13 +850,11 @@ pub(crate) struct CommitInfo {
     /// - The `inCommitTimestamp` field must always be present in CommitInfo.
     /// - The CommitInfo action must always be the first one in a commit.
     pub(crate) in_commit_timestamp: Option<i64>,
-    /// An arbitrary string that identifies the operation associated with this commit. This is
-    /// specified by the engine. Read: optional, write: required (that is, kernel always writes).
+    /// Operation for this commit, set by the engine. Read: optional; write: required (kernel
+    /// always writes).
     pub(crate) operation: Option<String>,
-    /// Map of arbitrary string key-value pairs that provide additional information about the
-    /// operation. This is specified by the engine via
-    /// [`Transaction::with_operation_parameters`](crate::transaction::Transaction::with_operation_parameters)
-    /// or the equivalent create-table / alter-table builder method.
+    /// Operation parameters set by the engine via
+    /// [`CommitInfoClientOptions::with_operation_parameters`](crate::transaction::CommitInfoClientOptions::with_operation_parameters).
     /// Defaults to an empty map when unset.
     pub(crate) operation_parameters: Option<HashMap<String, String>>,
     /// The version of the delta_kernel crate used to write this commit. The kernel will always
@@ -865,11 +863,9 @@ pub(crate) struct CommitInfo {
     pub(crate) kernel_version: Option<String>,
     /// Whether this commit is a blind append.
     pub(crate) is_blind_append: Option<bool>,
-    /// Optional map of stringified operation metrics (e.g. `numFiles`, `numOutputRows`). Specified
-    /// by the engine via
-    /// [`Transaction::with_operation_metrics`](crate::transaction::Transaction::with_operation_metrics)
-    /// or the equivalent create-table / alter-table builder method.
-    /// When unset, this field is written as null.
+    /// Operation metrics (e.g. `numFiles`, `numOutputRows`) set by the engine via
+    /// [`CommitInfoClientOptions::with_operation_metrics`](crate::transaction::CommitInfoClientOptions::with_operation_metrics).
+    /// Omitted from the commit when unset.
     pub(crate) operation_metrics: Option<HashMap<String, String>>,
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,

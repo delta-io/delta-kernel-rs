@@ -85,6 +85,103 @@ use stats_verifier::StatsColumnVerifier;
 use write_context::SharedWriteState;
 pub use write_context::WriteContext;
 
+/// Client-supplied fields for a transaction's `CommitInfo` action, and the structured entry point
+/// for populating it.
+///
+/// The typed setters cover the common provenance fields.
+/// [`with_additional_commit_info`](Self::with_additional_commit_info) adds arbitrary extra fields
+/// (including nested or non-string values) as [`EngineData`].
+///
+/// Fields that drive kernel behavior are not here. Kernel interprets `operation` (CRC
+/// incremental-safety) and blind-append status, so they are [`Transaction`] settings
+/// (`with_operation`, `with_blind_append`). Kernel-owned fields (timestamp, kernel version,
+/// transaction id) are set at commit time.
+///
+/// Not `Clone`/`PartialEq`: `additional_commit_info` holds opaque [`EngineData`].
+#[derive(Default)]
+pub struct CommitInfoClientOptions {
+    /// Always written; an unset value serializes as an empty map (`{}`).
+    pub(crate) operation_parameters: Option<HashMap<String, String>>,
+    /// Written only when set; an unset value is omitted from the commit.
+    pub(crate) operation_metrics: Option<HashMap<String, String>>,
+    pub(crate) engine_info: Option<String>,
+    /// Arbitrary extra `commitInfo` fields plus their schema, merged into the action at commit
+    /// time. Kernel-managed fields always win over a colliding engine field. See
+    /// [`with_additional_commit_info`](Self::with_additional_commit_info).
+    pub(crate) additional_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+}
+
+impl std::fmt::Debug for CommitInfoClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitInfoClientOptions")
+            .field("operation_parameters", &self.operation_parameters)
+            .field("operation_metrics", &self.operation_metrics)
+            .field("engine_info", &self.engine_info)
+            .field(
+                "additional_commit_info",
+                &self.additional_commit_info.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl CommitInfoClientOptions {
+    /// Create empty commit-info options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the operation parameters recorded in table history.
+    ///
+    /// Values must already be stringified. A later call replaces the complete map.
+    pub fn with_operation_parameters<I, K, V>(mut self, operation_parameters: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_parameters = Some(collect_string_map(operation_parameters));
+        self
+    }
+
+    /// Set the operation metrics recorded in table history.
+    ///
+    /// Values must already be stringified. A later call replaces the complete map. An explicitly
+    /// empty map is written as `{}`.
+    pub fn with_operation_metrics<I, K, V>(mut self, operation_metrics: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_metrics = Some(collect_string_map(operation_metrics));
+        self
+    }
+
+    /// Set the engine information recorded in table history.
+    pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
+        self.engine_info = Some(engine_info.into());
+        self
+    }
+
+    /// Add arbitrary extra fields to the `commitInfo` action, beyond the typed setters above.
+    ///
+    /// `additional_commit_info` holds the fields; `commit_info_schema` is their schema. Fields may
+    /// be nested structs, arrays, or non-string scalars. Kernel merges them, but kernel-managed
+    /// fields always win. Do not set `timestamp`, `inCommitTimestamp`, `operation`,
+    /// `operationParameters`, `operationMetrics`, `kernelVersion`, `isBlindAppend`, `engineInfo`,
+    /// or `txnId`; kernel overrides them. Prefer the typed setters where they apply. A later call
+    /// replaces the whole payload.
+    pub fn with_additional_commit_info(
+        mut self,
+        additional_commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.additional_commit_info = Some((additional_commit_info, commit_info_schema));
+        self
+    }
+}
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
@@ -190,10 +287,13 @@ impl SupportsDataFiles for CreateTable {}
 /// # Examples
 ///
 /// ```rust,ignore
-/// // create a transaction
-/// let mut txn = table.new_transaction(&engine)?;
-/// // stage table changes (right now only commit info)
-/// txn.commit_info(Box::new(ArrowEngineData::new(engine_commit_info)));
+/// // create a transaction, set its operation and the client commit-info payload
+/// let txn = snapshot
+///     .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+///     .with_operation("WRITE".to_string())
+///     .with_commit_info_options(
+///         CommitInfoClientOptions::new().with_operation_metrics([("numFiles", "1")]),
+///     );
 /// // commit! (consume the transaction)
 /// txn.commit(&engine)?;
 /// ```
@@ -216,13 +316,11 @@ pub struct Transaction<S = ExistingTable> {
     // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
+    // Operation recorded in the commitInfo action (e.g. "WRITE", "CREATE TABLE"). Kernel
+    // interprets it for CRC incremental-safety, so it is a transaction field, not a
+    // commit-info option.
     operation: Option<String>,
-    engine_info: Option<String>,
-    // Engine-provided CommitInfo.operationParameters. Always written (empty map when unset)
-    operation_parameters: HashMap<String, String>,
-    // Engine-provided CommitInfo.operationMetrics. Written as null when unset, hence Option.
-    operation_metrics: Option<HashMap<String, String>>,
-    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+    commit_info_options: CommitInfoClientOptions,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
@@ -275,7 +373,7 @@ impl<S> std::fmt::Debug for Transaction<S> {
         f.write_str(&format!(
             "Transaction {{ read_snapshot version: {}, engine_info: {} }}",
             version_info,
-            self.engine_info.is_some()
+            self.commit_info_options.engine_info.is_some()
         ))
     }
 }
@@ -451,12 +549,19 @@ impl<S> Transaction<S> {
             self.commit_timestamp,
             in_commit_timestamp,
             self.operation.clone(),
-            self.engine_info.clone(),
+            self.commit_info_options.engine_info.clone(),
             self.is_blind_append,
         );
-        kernel_commit_info.operation_parameters = Some(self.operation_parameters.clone());
-        kernel_commit_info.operation_metrics = self.operation_metrics.clone();
-        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
+        // operationParameters: always written (unset becomes `{}`). operationMetrics: written only
+        // when set.
+        kernel_commit_info.operation_parameters = Some(
+            self.commit_info_options
+                .operation_parameters
+                .clone()
+                .unwrap_or_default(),
+        );
+        kernel_commit_info.operation_metrics = self.commit_info_options.operation_metrics.clone();
+        let commit_info_action = self.build_commit_info_action(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions based on emit flags
         let (protocol_action, protocol) = if self.should_emit_protocol {
@@ -618,37 +723,23 @@ impl<S> Transaction<S> {
 
     /// Set the engine info field of this transaction's commit info action. This field is optional.
     pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
-        self.engine_info = Some(engine_info.into());
+        self.commit_info_options.engine_info = Some(engine_info.into());
         self
     }
 
-    /// Set `CommitInfo.operationParameters` for this transaction.
+    /// Add arbitrary caller-supplied fields to this transaction's `commitInfo` action.
     ///
-    /// Values should already be stringified the way table history expects (for example
-    /// `mode` -> `"Append"`, `partitionBy` -> `"[\"date\"]"`). Kernel writes this map as-is and
-    /// does not interpret or validate keys.
-    pub fn with_operation_parameters<I, K, V>(mut self, operation_parameters: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.operation_parameters = collect_string_map(operation_parameters);
-        self
-    }
-
-    /// Set `CommitInfo.operationMetrics` for this transaction.
-    ///
-    /// Values should already be stringified (for example `numFiles` -> `"1"`). Kernel writes this
-    /// map as-is and does not interpret or validate keys. When unset, `operationMetrics` is written
-    /// as null; an explicitly empty map is written as `{}`.
-    pub fn with_operation_metrics<I, K, V>(mut self, operation_metrics: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.operation_metrics = Some(collect_string_map(operation_metrics));
+    /// Convenience shortcut for [`CommitInfoClientOptions::with_additional_commit_info`]; see it
+    /// for the merge and kernel-override rules. Sets the same payload on this transaction's
+    /// options, so a later [`with_commit_info_options`](Self::with_commit_info_options) replaces
+    /// it.
+    pub fn with_additional_commit_info(
+        mut self,
+        additional_commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.commit_info_options.additional_commit_info =
+            Some((additional_commit_info, commit_info_schema));
         self
     }
 
@@ -657,28 +748,6 @@ impl<S> Transaction<S> {
     /// When unset, behavior is unchanged.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
         self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
-        self
-    }
-
-    /// Set the content of the commitInfo action for this transaction. Note that kernel will
-    /// _always_ write a commitInfo, this function simply allows engines to add their own data
-    /// into that action if they wish. Note that the following fields in `engine_commit_info`
-    /// will be overridden by kernel if they are set (meaning you should not set them):
-    /// - timestamp
-    /// - inCommitTimestamp
-    /// - operation
-    /// - operationParameters
-    /// - kernelVersion
-    /// - isBlindAppend
-    /// - operationMetrics
-    /// - engineInfo
-    /// - txnId
-    pub fn with_commit_info(
-        mut self,
-        engine_commit_info: Box<dyn EngineData>,
-        commit_info_schema: SchemaRef,
-    ) -> Self {
-        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
         self
     }
 
@@ -1852,10 +1921,11 @@ pub struct RetryableTransaction<S = ExistingTable> {
     pub error: Error,
 }
 
-/// Collect stringifiable key/value pairs into a `CommitInfo` string map. Shared by the
-/// `with_operation_parameters`/`with_operation_metrics` setters on `Transaction` and its builders.
-pub(crate) fn collect_string_map<I, K, V>(pairs: I) -> HashMap<String, String>
+/// Collect stringifiable key/value pairs into a string map. Shared by the
+/// `CommitInfoClientOptions` setters.
+pub(crate) fn collect_string_map<C, I, K, V>(pairs: I) -> C
 where
+    C: FromIterator<(String, String)>,
     I: IntoIterator<Item = (K, V)>,
     K: Into<String>,
     V: Into<String>,
@@ -3146,8 +3216,11 @@ mod tests {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot
             .transaction(Box::new(IoErrorCommitter), engine.as_ref())?
-            .with_operation_parameters([("mode", "Append")])
-            .with_operation_metrics([("numFiles", "1")]);
+            .with_commit_info_options(
+                CommitInfoClientOptions::new()
+                    .with_operation_parameters([("mode", "Append")])
+                    .with_operation_metrics([("numFiles", "1")]),
+            );
         add_dummy_file(&mut txn);
 
         let CommitResult::RetryableTransaction(retryable) = txn.commit(engine.as_ref())? else {
@@ -3155,30 +3228,60 @@ mod tests {
         };
 
         assert_eq!(
-            retryable.transaction.operation_parameters,
-            HashMap::from([("mode".to_string(), "Append".to_string())]),
+            retryable
+                .transaction
+                .commit_info_options
+                .operation_parameters,
+            Some(HashMap::from([("mode".to_string(), "Append".to_string())])),
             "operationParameters must survive a retryable commit failure"
         );
         assert_eq!(
-            retryable.transaction.operation_metrics,
+            retryable.transaction.commit_info_options.operation_metrics,
             Some(HashMap::from([("numFiles".to_string(), "1".to_string())])),
             "operationMetrics must survive a retryable commit failure"
         );
         Ok(())
     }
 
-    /// The with_operation_* setters replace the whole map (last call wins) and dedup duplicate
-    /// input keys (last value wins) via the shared collect_string_map helper.
+    /// A later setter call replaces the whole map; duplicate input keys keep the last value.
     #[test]
-    fn test_with_operation_parameters_replaces_and_dedups() -> DeltaResult<()> {
+    fn test_commit_info_options_replaces_and_dedups_operation_parameters() {
+        let options = CommitInfoClientOptions::new()
+            .with_operation_parameters([("a", "1"), ("a", "2")])
+            .with_operation_parameters([("b", "3")]);
+        assert_eq!(
+            options.operation_parameters,
+            Some(HashMap::from([("b".to_string(), "3".to_string())]))
+        );
+    }
+
+    /// `operation` is a first-class transaction setting, so it survives a later
+    /// `with_commit_info_options` (which replaces only the payload). `engine_info` lives in the
+    /// payload, so the same replace clears it unless a convenience setter follows.
+    #[test]
+    fn test_operation_survives_options_replace_but_engine_info_does_not() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+
+        // Replace the options after setting both: operation survives, engine_info is cleared.
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_operation("WRITE".to_string())
+            .with_engine_info("from-setter")
+            .with_commit_info_options(CommitInfoClientOptions::new());
+        assert_eq!(txn.operation.as_deref(), Some("WRITE"));
+        assert_eq!(txn.commit_info_options.engine_info, None);
+
+        // A convenience setter after the options override wins for engine_info.
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation_parameters([("a", "1"), ("a", "2")]) // duplicate key -> last wins
-            .with_operation_parameters([("b", "3")]); // second call -> replaces
+            .with_commit_info_options(
+                CommitInfoClientOptions::new().with_engine_info("from-options"),
+            )
+            .with_engine_info("from-setter");
         assert_eq!(
-            txn.operation_parameters,
-            HashMap::from([("b".to_string(), "3".to_string())])
+            txn.commit_info_options.engine_info.as_deref(),
+            Some("from-setter")
         );
         Ok(())
     }

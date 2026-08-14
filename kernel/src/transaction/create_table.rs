@@ -31,7 +31,6 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -43,7 +42,7 @@ use crate::expressions::ColumnName;
 use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
-use crate::transaction::{CreateTable, Transaction};
+use crate::transaction::{CommitInfoClientOptions, CreateTable, Transaction};
 use crate::utils::current_time_ms;
 use crate::DeltaResult;
 
@@ -141,7 +140,7 @@ impl CreateTableTransaction {
     /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
     pub(crate) fn try_new_create_table(
         effective_table_config: TableConfiguration,
-        engine_info: String,
+        commit_info_options: CommitInfoClientOptions,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
@@ -162,9 +161,7 @@ impl CreateTableTransaction {
             should_emit_metadata: true,
             committer,
             operation: Some("CREATE TABLE".to_string()),
-            engine_info: Some(engine_info),
-            operation_parameters: HashMap::new(),
-            operation_metrics: None,
+            commit_info_options,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
@@ -174,7 +171,6 @@ impl CreateTableTransaction {
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
-            engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,

@@ -16,6 +16,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::CommitInfoClientOptions;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
@@ -54,8 +55,8 @@ fn max_column_id(snap: &Snapshot) -> Option<i64> {
 // Add column tests
 // ============================================================================
 
-/// Engine-supplied operationParameters/operationMetrics set on the alter-table builder are
-/// written to the alter commit's CommitInfo.
+/// operationParameters/operationMetrics set on the alter-table builder reach the alter commit's
+/// CommitInfo. The operation stays `ALTER TABLE`.
 #[tokio::test]
 async fn alter_table_writes_operation_parameters_and_metrics(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -65,8 +66,11 @@ async fn alter_table_writes_operation_parameters_and_metrics(
 
     snapshot
         .alter_table()
-        .with_operation_parameters([("columnsAdded", "1")])
-        .with_operation_metrics([("numAddedColumns", "1")])
+        .with_commit_info_options(
+            CommitInfoClientOptions::new()
+                .with_operation_parameters([("columnsAdded", "1")])
+                .with_operation_metrics([("numAddedColumns", "1")]),
+        )
         .add_column(StructField::nullable("added", DataType::STRING))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -76,6 +80,7 @@ async fn alter_table_writes_operation_parameters_and_metrics(
     let commit_infos =
         read_actions_from_commit(&table_url, 1, "commitInfo").expect("failed to read commit");
     let ci = &commit_infos[0];
+    assert_eq!(ci["operation"], "ALTER TABLE");
     assert_eq!(
         ci["operationParameters"],
         serde_json::json!({"columnsAdded": "1"})

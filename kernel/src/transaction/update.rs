@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
-use super::Transaction;
+use super::{CommitInfoClientOptions, Transaction};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::committer::Committer;
@@ -94,9 +94,7 @@ impl Transaction {
             should_emit_metadata: false,
             committer,
             operation: None,
-            engine_info: None,
-            operation_parameters: HashMap::new(),
-            operation_metrics: None,
+            commit_info_options: CommitInfoClientOptions::new(),
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
@@ -106,7 +104,6 @@ impl Transaction {
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
-            engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,
@@ -118,6 +115,17 @@ impl Transaction {
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
+
+    /// Replace this transaction's commit-info options wholesale.
+    ///
+    /// Convenience setters (e.g. [`with_engine_info`]) called after this method override their
+    /// corresponding option.
+    ///
+    /// [`with_engine_info`]: Transaction::with_engine_info
+    pub fn with_commit_info_options(mut self, options: CommitInfoClientOptions) -> Self {
+        self.commit_info_options = options;
+        self
+    }
 
     /// Mark this transaction as a blind append.
     ///
