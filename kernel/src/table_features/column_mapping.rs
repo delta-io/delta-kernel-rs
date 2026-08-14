@@ -912,7 +912,7 @@ mod tests {
     use crate::schema::{DataType, MetadataValue, StructField, StructType};
     use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
-        make_test_tc, test_deep_nested_schema_missing_leaf_cm,
+        test_deep_nested_schema_missing_leaf_cm, TableConfigBuilder,
     };
     use crate::utils::FoldWithOption as _;
 
@@ -921,46 +921,55 @@ mod tests {
         let annotated = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
         let plain = create_schema(None, None, None, None);
         let cmm_id = HashMap::from([("delta.columnMapping.mode".to_string(), "id".to_string())]);
-        let no_props = HashMap::new();
+        let no_props: HashMap<String, String> = HashMap::new();
+
+        let mode_of = |schema: &StructType, protocol: &Protocol, props: &HashMap<_, _>| {
+            TableConfigBuilder::new()
+                .with_schema(schema.clone())
+                .with_protocol(protocol.clone())
+                .with_props(props.clone())
+                .build()
+                .column_mapping_mode()
+        };
 
         // v2 legacy + mode=id => Id (annotated schema required)
-        let tc = make_test_tc(
-            annotated.clone(),
-            Protocol::try_new_legacy(2, 5).unwrap(),
-            cmm_id.clone(),
-        )
-        .unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+        assert_eq!(
+            mode_of(&annotated, &protocol, &cmm_id),
+            ColumnMappingMode::Id
+        );
 
         // v2 legacy + no mode => None
-        let tc = make_test_tc(
-            plain.clone(),
-            Protocol::try_new_legacy(2, 5).unwrap(),
-            no_props.clone(),
-        )
-        .unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
 
         // v3 + empty features + mode=id => None (mode ignored without CM feature)
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
-        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(mode_of(&plain, &protocol, &cmm_id), ColumnMappingMode::None);
 
         // v3 + empty features + no mode => None
-        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
 
         // v3 + CM feature + mode=id => Id
         let protocol =
             Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
                 .unwrap();
-        let tc = make_test_tc(annotated.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
+        assert_eq!(
+            mode_of(&annotated, &protocol, &cmm_id),
+            ColumnMappingMode::Id
+        );
 
         // v3 + CM feature + no mode => None
-        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
 
         // v3 + DV feature (no CM) + mode=id => None (mode ignored)
         let protocol = Protocol::try_new_modern(
@@ -968,12 +977,13 @@ mod tests {
             [TableFeature::DeletionVectors],
         )
         .unwrap();
-        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(mode_of(&plain, &protocol, &cmm_id), ColumnMappingMode::None);
 
         // v3 + DV feature + no mode => None
-        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
 
         // v3 + DV + CM features + mode=id => Id
         let protocol = Protocol::try_new_modern(
@@ -981,12 +991,16 @@ mod tests {
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
         )
         .unwrap();
-        let tc = make_test_tc(annotated.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
+        assert_eq!(
+            mode_of(&annotated, &protocol, &cmm_id),
+            ColumnMappingMode::Id
+        );
 
         // v3 + DV + CM features + no mode => None
-        let tc = make_test_tc(plain.clone(), protocol, no_props).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
     }
 
     // Creates optional schema field annotations for column mapping id and physical name, as a

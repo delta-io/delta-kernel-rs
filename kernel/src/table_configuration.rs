@@ -937,19 +937,18 @@ mod test {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use url::Url;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{
-        column_name, schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType,
+        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType,
     };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::{
-        TableProperties, COLUMN_MAPPING_MODE, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
+        TableProperties, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
         ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
         ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
     };
@@ -957,116 +956,30 @@ mod test {
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
         test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
-        test_schema_with_map_and_column_mapping,
+        test_schema_with_map_and_column_mapping, TableConfigBuilder,
     };
     use crate::Error;
 
-    fn create_mock_table_config(
-        props_to_enable: &[(&str, &str)],
-        features: &[TableFeature],
-    ) -> TableConfiguration {
-        create_mock_table_config_with_version(
-            props_to_enable,
-            Some(features),
-            TABLE_FEATURES_MIN_READER_VERSION,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-        )
-    }
-
-    fn create_mock_table_config_with_version(
-        props_to_enable: &[(&str, &str)],
-        features_opt: Option<&[TableFeature]>,
-        min_reader_version: i32,
-        min_writer_version: i32,
-    ) -> TableConfiguration {
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0,
-            HashMap::from_iter(
-                props_to_enable
-                    .iter()
-                    .map(|(key, value)| (key.to_string(), value.to_string())),
-            ),
-        )
-        .unwrap();
-
-        let (reader_features_opt, writer_features_opt) = if let Some(features) = features_opt {
-            // This helper only handles known features. Unknown features would need
-            // explicit placement on reader vs writer lists.
-            assert!(
-                features
-                    .iter()
-                    .all(|f| f.feature_type() != FeatureType::Unknown),
-                "Test helper does not support unknown features"
-            );
-            let reader_features = features
-                .iter()
-                .filter(|f| f.feature_type() == FeatureType::ReaderWriter);
-            (
-                // Only add reader_features if reader >= 3 (non-legacy reader mode)
-                (min_reader_version >= TABLE_FEATURES_MIN_READER_VERSION)
-                    .then_some(reader_features),
-                // Only add writer_features if writer >= 7 (non-legacy writer mode)
-                (min_writer_version >= TABLE_FEATURES_MIN_WRITER_VERSION).then_some(features),
-            )
-        } else {
-            (None, None)
-        };
-
-        let protocol = Protocol::try_new(
-            min_reader_version,
-            min_writer_version,
-            reader_features_opt,
-            writer_features_opt,
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
-    }
-
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec!["missing".to_string()],
-            0,
-            HashMap::new(),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-
-        let result = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+        let result = TableConfigBuilder::new()
+            .with_partition_columns(["missing"])
+            .with_protocol_versions(1, 2)
+            .try_build();
 
         assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
     }
 
     #[test]
     fn table_configuration_rejects_duplicate_partition_columns() {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("value", DataType::INTEGER),
-            StructField::nullable("part", DataType::STRING),
-        ]));
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec!["part".to_string(), "part".to_string()],
-            0,
-            HashMap::new(),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-
-        let result = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+        let result = TableConfigBuilder::new()
+            .with_schema(schema! {
+                nullable "value": INTEGER,
+                nullable "part": STRING,
+            })
+            .with_partition_columns(["part", "part"])
+            .with_protocol_versions(1, 2)
+            .try_build();
 
         assert_result_error_with_message(result, "Duplicate partition column: 'part'");
     }
@@ -1075,23 +988,10 @@ mod test {
     fn dv_supported_not_enabled() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0,
-            HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_modern(
-            [TableFeature::DeletionVectors],
-            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config = TableConfigBuilder::new()
+            .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
+            .build();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(!table_config.is_feature_enabled(&TableFeature::DeletionVectors));
     }
@@ -1100,26 +1000,13 @@ mod test {
     fn dv_enabled() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0,
-            HashMap::from_iter([
-                (ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string()),
-                (ENABLE_DELETION_VECTORS.to_string(), "true".to_string()),
-            ]),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_modern(
-            [TableFeature::DeletionVectors],
-            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config = TableConfigBuilder::new()
+            .with_props([
+                (ENABLE_CHANGE_DATA_FEED, "true"),
+                (ENABLE_DELETION_VECTORS, "true"),
+            ])
+            .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
+            .build();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
     }
@@ -1132,12 +1019,14 @@ mod test {
         #[case] wv: i32,
         #[case] op: Operation,
     ) {
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol =
-            Protocol::new_unchecked(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST);
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config = TableConfigBuilder::new()
+            .with_protocol(Protocol::new_unchecked(
+                rv,
+                wv,
+                TableFeature::NO_LIST,
+                TableFeature::NO_LIST,
+            ))
+            .build();
         let expected = if rv < 1 {
             format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
         } else {
@@ -1154,55 +1043,59 @@ mod test {
         let cases = [
             (
                 // Writing to CDF-enabled table is supported for writes
-                create_mock_table_config(&[(ENABLE_CHANGE_DATA_FEED, "true")], &[ChangeDataFeed]),
+                TableConfigBuilder::new()
+                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+                    .with_features([ChangeDataFeed])
+                    .build(),
                 Ok(()),
             ),
             (
                 // Should succeed even if AppendOnly is supported but not enabled
-                create_mock_table_config(
-                    &[(ENABLE_CHANGE_DATA_FEED, "true")],
-                    &[ChangeDataFeed, AppendOnly],
-                ),
+                TableConfigBuilder::new()
+                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+                    .with_features([ChangeDataFeed, AppendOnly])
+                    .build(),
                 Ok(()),
             ),
             (
                 // Should succeed since AppendOnly is enabled
-                create_mock_table_config(
-                    &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
-                    &[ChangeDataFeed, AppendOnly],
-                ),
+                TableConfigBuilder::new()
+                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")])
+                    .with_features([ChangeDataFeed, AppendOnly])
+                    .build(),
                 Ok(()),
             ),
             (
                 // Writer version > 7 is not supported
-                create_mock_table_config_with_version(
-                    &[(ENABLE_CHANGE_DATA_FEED, "true")],
-                    None,
-                    1,
-                    8,
-                ),
+                TableConfigBuilder::new()
+                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+                    .with_protocol_versions(1, 8)
+                    .build(),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
             // Column mapping is now supported for writes.
             (
                 // CDF + column mapping: both supported, should succeed
-                create_mock_table_config(
-                    &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
-                    &[ChangeDataFeed, ColumnMapping, AppendOnly],
-                ),
+                TableConfigBuilder::new()
+                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")])
+                    .with_features([ChangeDataFeed, ColumnMapping, AppendOnly])
+                    .build(),
                 Ok(()),
             ),
             (
                 // Column mapping + AppendOnly, no CDF enabled: should succeed
-                create_mock_table_config(
-                    &[(APPEND_ONLY, "true")],
-                    &[ChangeDataFeed, ColumnMapping, AppendOnly],
-                ),
+                TableConfigBuilder::new()
+                    .with_props([(APPEND_ONLY, "true")])
+                    .with_features([ChangeDataFeed, ColumnMapping, AppendOnly])
+                    .build(),
                 Ok(()),
             ),
             (
                 // Should succeed since change data feed is not enabled
-                create_mock_table_config(&[(APPEND_ONLY, "true")], &[AppendOnly]),
+                TableConfigBuilder::new()
+                    .with_props([(APPEND_ONLY, "true")])
+                    .with_features([AppendOnly])
+                    .build(),
                 Ok(()),
             ),
         ];
@@ -1226,21 +1119,10 @@ mod test {
     fn ict_enabled_from_table_creation() {
         use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0, // Table creation version
-            HashMap::from_iter([(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string())]),
-        )
-        .unwrap();
-        let protocol =
-            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
-                .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config = TableConfigBuilder::new()
+            .with_props([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_features([TableFeature::InCommitTimestamp])
+            .build();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         // When ICT is enabled from table creation (version 0), it's perfectly normal
@@ -1258,31 +1140,14 @@ mod test {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0,
-            HashMap::from_iter([
-                (ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string()),
-                (
-                    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION.to_string(),
-                    "5".to_string(),
-                ),
-                (
-                    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP.to_string(),
-                    "100".to_string(),
-                ),
-            ]),
-        )
-        .unwrap();
-        let protocol =
-            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
-                .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config = TableConfigBuilder::new()
+            .with_props([
+                (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+                (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "5"),
+                (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "100"),
+            ])
+            .with_features([TableFeature::InCommitTimestamp])
+            .build();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         let info = table_config.in_commit_timestamp_enablement().unwrap();
@@ -1299,28 +1164,14 @@ mod test {
             ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0,
-            HashMap::from_iter([
-                (ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string()),
-                (
-                    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION.to_string(),
-                    "5".to_string(),
-                ),
+        let table_config = TableConfigBuilder::new()
+            .with_props([
+                (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+                (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "5"),
                 // Missing enablement timestamp
-            ]),
-        )
-        .unwrap();
-        let protocol =
-            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
-                .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+            ])
+            .with_features([TableFeature::InCommitTimestamp])
+            .build();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         assert!(matches!(
@@ -1330,13 +1181,9 @@ mod test {
     }
     #[test]
     fn ict_supported_and_not_enabled() {
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol =
-            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
-                .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config = TableConfigBuilder::new()
+            .with_features([TableFeature::InCommitTimestamp])
+            .build();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(!table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         let info = table_config.in_commit_timestamp_enablement().unwrap();
@@ -1344,11 +1191,11 @@ mod test {
     }
     #[test]
     fn fails_on_unsupported_feature() {
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new_modern(["unknown"], ["unknown"]).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let unknown = TableFeature::unknown("unknown");
+        let table_config = TableConfigBuilder::new()
+            .with_reader_features([&unknown])
+            .with_writer_features([&unknown])
+            .build();
         table_config
             .ensure_operation_supported(Operation::Scan)
             .expect_err("Unknown feature is not supported in kernel");
@@ -1357,26 +1204,13 @@ mod test {
     fn dv_not_supported() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0,
-            HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_modern(
-            [TableFeature::TimestampWithoutTimezone],
-            [
+        let table_config = TableConfigBuilder::new()
+            .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_features([
                 TableFeature::TimestampWithoutTimezone,
                 TableFeature::ChangeDataFeed,
-            ],
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+            ])
+            .build();
         assert!(!table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(!table_config.is_feature_enabled(&TableFeature::DeletionVectors));
     }
@@ -1385,23 +1219,10 @@ mod test {
     fn test_try_new_from() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0,
-            HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_modern(
-            [TableFeature::DeletionVectors],
-            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config = TableConfigBuilder::new()
+            .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
+            .build();
 
         let new_schema = schema_ref! { nullable "value": INTEGER };
         let new_metadata = Metadata::try_new(
@@ -1460,34 +1281,17 @@ mod test {
     #[test]
     fn test_timestamp_ntz_validation_integration() {
         // Schema with TIMESTAMP_NTZ column
-        let schema = schema_ref! { nullable "ts": TIMESTAMP_NTZ };
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let ntz_config = |features: &[TableFeature]| {
+            TableConfigBuilder::new()
+                .with_schema(schema! { nullable "ts": TIMESTAMP_NTZ })
+                .with_features(features)
+                .try_build()
+        };
 
-        let protocol_without_timestamp_ntz_features =
-            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
-
-        let protocol_with_timestamp_ntz_features = Protocol::try_new_modern(
-            [TableFeature::TimestampWithoutTimezone],
-            [TableFeature::TimestampWithoutTimezone],
-        )
-        .unwrap();
-
-        let table_root = Url::try_from("file:///").unwrap();
-
-        let result = TableConfiguration::try_new(
-            metadata.clone(),
-            protocol_without_timestamp_ntz_features,
-            table_root.clone(),
-            0,
-        );
+        let result = ntz_config(&[]);
         assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
 
-        let result = TableConfiguration::try_new(
-            metadata,
-            protocol_with_timestamp_ntz_features,
-            table_root,
-            0,
-        );
+        let result = ntz_config(&[TableFeature::TimestampWithoutTimezone]);
         assert!(
             result.is_ok(),
             "Should succeed when TIMESTAMP_NTZ is used with required features"
@@ -1496,12 +1300,6 @@ mod test {
 
     #[test]
     fn test_timestamp_ntz_legacy_alias_unblocks_read_and_write() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "ts",
-            DataType::TIMESTAMP_NTZ,
-        )]));
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-
         // Build the protocol from the legacy string alias to exercise the real read path.
         let protocol =
             Protocol::try_new_modern(["timestampWithoutTimezone"], ["timestampWithoutTimezone"])
@@ -1516,8 +1314,10 @@ mod test {
             Some([TableFeature::TimestampWithoutTimezone].as_slice())
         );
 
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config = TableConfigBuilder::new()
+            .with_schema(schema! { nullable "ts": TIMESTAMP_NTZ })
+            .with_protocol(protocol)
+            .build();
 
         table_config
             .ensure_operation_supported(Operation::Scan)
@@ -1530,28 +1330,17 @@ mod test {
     #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
-        let schema = schema_ref! { nullable "v": (DataType::unshredded_variant()) };
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let variant_config = |features: &[TableFeature]| {
+            TableConfigBuilder::new()
+                .with_schema(schema! { nullable "v": (DataType::unshredded_variant()) })
+                .with_features(features)
+                .try_build()
+        };
 
-        let protocol_without_variant_features =
-            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
-
-        let protocol_with_variant_features =
-            Protocol::try_new_modern([TableFeature::VariantType], [TableFeature::VariantType])
-                .unwrap();
-
-        let table_root = Url::try_from("file:///").unwrap();
-
-        let result: Result<TableConfiguration, Error> = TableConfiguration::try_new(
-            metadata.clone(),
-            protocol_without_variant_features,
-            table_root.clone(),
-            0,
-        );
+        let result = variant_config(&[]);
         assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
 
-        let result =
-            TableConfiguration::try_new(metadata, protocol_with_variant_features, table_root, 0);
+        let result = variant_config(&[TableFeature::VariantType]);
         assert!(
             result.is_ok(),
             "Should succeed when VARIANT is used with required features"
@@ -1568,30 +1357,20 @@ mod test {
     fn create_unknown_feature_config(
         shape: UnknownFeatureShape,
     ) -> (TableFeature, TableConfiguration) {
-        const UNKNOWN: &str = "futureFeature";
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema_ref! { nullable "value": INTEGER },
-            vec![],
-            0,
-            HashMap::new(),
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-
+        let unknown = TableFeature::unknown("futureFeature");
         let reader_features = match shape {
-            UnknownFeatureShape::ReaderWriter => vec![UNKNOWN],
+            UnknownFeatureShape::ReaderWriter => vec![unknown.clone()],
             _ => vec![],
         };
         let writer_features = match shape {
             UnknownFeatureShape::NotListed => vec![],
-            _ => vec![UNKNOWN],
+            _ => vec![unknown.clone()],
         };
-        let protocol = Protocol::try_new_modern(reader_features, writer_features).unwrap();
-
-        let tc = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        (TableFeature::unknown(UNKNOWN), tc)
+        let tc = TableConfigBuilder::new()
+            .with_reader_features(reader_features)
+            .with_writer_features(writer_features)
+            .build();
+        (unknown, tc)
     }
 
     #[rstest]
@@ -1645,30 +1424,42 @@ mod test {
         let feature = TableFeature::AppendOnly;
 
         // Test with legacy protocol writer v2 - should be supported
-        let config = create_mock_table_config_with_version(&[], None, 1, 2);
+        let config = TableConfigBuilder::new()
+            .with_protocol_versions(1, 2)
+            .build();
         assert!(config.is_feature_supported(&feature));
 
         // Test with legacy protocol writer v1 - should NOT be supported
-        let config = create_mock_table_config_with_version(&[], None, 1, 1);
+        let config = TableConfigBuilder::new()
+            .with_protocol_versions(1, 1)
+            .build();
         assert!(!config.is_feature_supported(&feature));
 
         // reader=2 (legacy), writer=7 (non-legacy) - feature in list, should be supported
-        let config =
-            create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::AppendOnly])
+            .with_protocol_versions(2, 7)
+            .build();
         assert!(config.is_feature_supported(&feature));
 
         // reader=2 (legacy), writer=7 (non-legacy) - feature NOT in list, should NOT be supported
         // Use ChangeDataFeed which is also a WriterOnly feature
-        let config =
-            create_mock_table_config_with_version(&[], Some(&[TableFeature::ChangeDataFeed]), 2, 7);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::ChangeDataFeed])
+            .with_protocol_versions(2, 7)
+            .build();
         assert!(!config.is_feature_supported(&feature));
 
         // Test with protocol reader=3, writer=7 (both non-legacy) - feature in list, should be
         // supported
-        let config = create_mock_table_config(&[], &[TableFeature::AppendOnly]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::AppendOnly])
+            .build();
         assert!(config.is_feature_supported(&feature));
 
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::DeletionVectors])
+            .build();
         assert!(!config.is_feature_supported(&feature));
     }
 
@@ -1677,23 +1468,31 @@ mod test {
         let feature = TableFeature::ColumnMapping;
 
         // Test with sufficient versions (legacy mode) - should be supported
-        let config = create_mock_table_config_with_version(&[], None, 2, 5);
+        let config = TableConfigBuilder::new()
+            .with_protocol_versions(2, 5)
+            .build();
         assert!(config.is_feature_supported(&feature));
 
         // Test with insufficient reader version - should NOT be supported
-        let config = create_mock_table_config_with_version(&[], None, 1, 5);
+        let config = TableConfigBuilder::new()
+            .with_protocol_versions(1, 5)
+            .build();
         assert!(!config.is_feature_supported(&feature));
 
         // Test with insufficient writer version - should NOT be supported
-        let config = create_mock_table_config_with_version(&[], None, 2, 4);
+        let config = TableConfigBuilder::new()
+            .with_protocol_versions(2, 4)
+            .build();
         assert!(!config.is_feature_supported(&feature));
 
         // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
         // ReaderWriter features CANNOT be enabled in this protocol state (protocol validation)
         // But we still need to test that the code correctly identifies them as NOT supported
         // Create a table with only WriterOnly features (e.g., AppendOnly)
-        let config =
-            create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::AppendOnly])
+            .with_protocol_versions(2, 7)
+            .build();
         // ColumnMapping (ReaderWriter) should NOT be supported because:
         // - reader=2 (legacy) checks version: 2 >= 2 (reader_supported = true)
         // - writer=7 (non-legacy) checks list: ColumnMapping not in writer_features
@@ -1702,11 +1501,15 @@ mod test {
         assert!(!config.is_feature_supported(&feature));
 
         // Test with non-legacy mode (3,7) - feature in list, should be supported
-        let config = create_mock_table_config(&[], &[TableFeature::ColumnMapping]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::ColumnMapping])
+            .build();
         assert!(config.is_feature_supported(&feature));
 
         // Test with non-legacy mode (3,7) - feature NOT in list, should NOT be supported
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::DeletionVectors])
+            .build();
         assert!(!config.is_feature_supported(&feature));
     }
 
@@ -1716,12 +1519,11 @@ mod test {
         // ColumnMapping is a legacy ReaderWriter feature whose minimum reader version (2) is met by
         // reader version 3, so it counts as reader-supported even though it is absent from
         // readerFeatures. It is in writerFeatures, so it is writer-supported too.
-        let config = create_mock_table_config_with_cm(
-            &[],
-            Some(ColumnMappingMode::Name),
-            &TableFeature::EMPTY_LIST,
-            &[TableFeature::ColumnMapping],
-        );
+        let config = TableConfigBuilder::new()
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_reader_features(TableFeature::EMPTY_LIST)
+            .with_writer_features([TableFeature::ColumnMapping])
+            .build();
         assert!(config.is_feature_supported(&TableFeature::ColumnMapping));
 
         // A non-legacy ReaderWriter feature in the same writer-only position has no legacy reader
@@ -1736,14 +1538,18 @@ mod test {
 
         // The conformant shape (ColumnMapping in both lists) is still reported supported: the
         // legacy-version fallback does not perturb the normal reader_features membership path.
-        let conformant = create_mock_table_config(&[], &[TableFeature::ColumnMapping]);
+        let conformant = TableConfigBuilder::new()
+            .with_features([TableFeature::ColumnMapping])
+            .build();
         assert!(conformant.is_feature_supported(&TableFeature::ColumnMapping));
     }
 
     #[test]
     fn test_column_mapping_absent_from_both_lists_is_unsupported() {
         // ColumnMapping in neither list must not be treated as supported: the writer half fails.
-        let config = create_mock_table_config(&[], &[TableFeature::AppendOnly]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::AppendOnly])
+            .build();
         assert!(!config.is_feature_supported(&TableFeature::ColumnMapping));
     }
 
@@ -1754,18 +1560,26 @@ mod test {
         let feature = TableFeature::AppendOnly;
 
         // Test when property check fails - should be supported but not enabled
-        let config = create_mock_table_config_with_version(&[], None, 1, 2);
+        let config = TableConfigBuilder::new()
+            .with_protocol_versions(1, 2)
+            .build();
         assert!(config.is_feature_supported(&feature));
         assert!(!config.is_feature_enabled(&feature));
 
         // Test when property check passes - should be both supported and enabled
-        let config = create_mock_table_config_with_version(&[(APPEND_ONLY, "true")], None, 1, 2);
+        let config = TableConfigBuilder::new()
+            .with_props([(APPEND_ONLY, "true")])
+            .with_protocol_versions(1, 2)
+            .build();
         assert!(config.is_feature_supported(&feature));
         assert!(config.is_feature_enabled(&feature));
 
         // Test when property is set but feature is not supported by protocol versions.
         // TODO: Reject this orphaned metadata
-        let config = create_mock_table_config_with_version(&[(APPEND_ONLY, "true")], None, 1, 1);
+        let config = TableConfigBuilder::new()
+            .with_props([(APPEND_ONLY, "true")])
+            .with_protocol_versions(1, 1)
+            .build();
         assert!(!config.is_feature_supported(&feature));
         assert!(!config.is_feature_enabled(&feature));
     }
@@ -1775,38 +1589,46 @@ mod test {
         let feature = TableFeature::V2Checkpoint;
 
         // Test when supported - should be both supported and enabled
-        let config = create_mock_table_config(&[], &[TableFeature::V2Checkpoint]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::V2Checkpoint])
+            .build();
         assert!(config.is_feature_supported(&feature));
         assert!(config.is_feature_enabled(&feature));
 
         // Test when not supported - should be neither supported nor enabled
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::DeletionVectors])
+            .build();
         assert!(!config.is_feature_supported(&feature));
         assert!(!config.is_feature_enabled(&feature));
     }
 
     #[test]
     fn test_ensure_operation_supported_reads() {
-        let config = create_mock_table_config(&[], &[]);
+        let config = TableConfigBuilder::new().build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
-        let config = create_mock_table_config(&[], &[TableFeature::V2Checkpoint]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::V2Checkpoint])
+            .build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
-        let config = create_mock_table_config_with_version(&[], None, 1, 2);
+        let config = TableConfigBuilder::new()
+            .with_protocol_versions(1, 2)
+            .build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
-        let config = create_mock_table_config_with_version(
-            &[],
-            Some(&[TableFeature::InCommitTimestamp]),
-            2,
-            7,
-        );
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::InCommitTimestamp])
+            .with_protocol_versions(2, 7)
+            .build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
         #[cfg(feature = "geo-type-in-dev")]
         {
-            let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+            let config = TableConfigBuilder::new()
+                .with_features([TableFeature::GeospatialType])
+                .build();
             assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
             assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
         }
@@ -1814,20 +1636,21 @@ mod test {
 
     #[test]
     fn test_ensure_operation_supported_writes() {
-        let config = create_mock_table_config(
-            &[],
-            &[
+        let config = TableConfigBuilder::new()
+            .with_features([
                 TableFeature::AppendOnly,
                 TableFeature::DeletionVectors,
                 TableFeature::DomainMetadata,
                 TableFeature::Invariants,
                 TableFeature::RowTracking,
-            ],
-        );
+            ])
+            .build();
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
         // Type Widening is not supported for writes
-        let config = create_mock_table_config(&[], &[TableFeature::TypeWidening]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::TypeWidening])
+            .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
             r#"Feature 'typeWidening' is not supported for writes"#,
@@ -1835,7 +1658,9 @@ mod test {
 
         #[cfg(feature = "geo-type-in-dev")]
         {
-            let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+            let config = TableConfigBuilder::new()
+                .with_features([TableFeature::GeospatialType])
+                .build();
             assert_result_error_with_message(
                 config.ensure_operation_supported(Operation::Write),
                 r#"Feature 'geospatial' is not supported for writes"#,
@@ -1849,7 +1674,9 @@ mod test {
     #[case::cdf(Operation::Cdf)]
     #[case::write(Operation::Write)]
     fn test_geospatial_not_supported_without_cargo_feature(#[case] operation: Operation) {
-        let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::GeospatialType])
+            .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(operation),
             "Feature 'geospatial' is not supported",
@@ -1858,13 +1685,9 @@ mod test {
 
     #[test]
     fn test_illegal_writer_feature_combination() {
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol =
-            Protocol::try_new_modern(TableFeature::EMPTY_LIST, vec![TableFeature::RowTracking])
-                .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::RowTracking])
+            .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
             "Feature 'rowTracking' requires 'domainMetadata' to be supported",
@@ -1873,15 +1696,9 @@ mod test {
 
     #[test]
     fn test_row_tracking_with_domain_metadata_requirement() {
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new_modern(
-            TableFeature::EMPTY_LIST,
-            vec![TableFeature::RowTracking, TableFeature::DomainMetadata],
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::RowTracking, TableFeature::DomainMetadata])
+            .build();
         assert!(
             config.ensure_operation_supported(Operation::Write).is_ok(),
             "RowTracking with DomainMetadata should be supported for writes"
@@ -1891,22 +1708,22 @@ mod test {
     #[test]
     fn test_catalog_managed_writes() {
         // CatalogManaged requires ICT to be supported and enabled
-        let config = create_mock_table_config(
-            &[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")],
-            &[
+        let config = TableConfigBuilder::new()
+            .with_props([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_features([
                 TableFeature::CatalogManaged,
                 TableFeature::InCommitTimestamp,
-            ],
-        );
+            ])
+            .build();
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
-        let config = create_mock_table_config(
-            &[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")],
-            &[
+        let config = TableConfigBuilder::new()
+            .with_props([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_features([
                 TableFeature::CatalogOwnedPreview,
                 TableFeature::InCommitTimestamp,
-            ],
-        );
+            ])
+            .build();
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
 
@@ -1924,7 +1741,7 @@ mod test {
         #[case] feature: TableFeature,
         #[case] expected_error: &str,
     ) {
-        let config = create_mock_table_config(&[], &[feature]);
+        let config = TableConfigBuilder::new().with_features([feature]).build();
         let result = config.ensure_operation_supported(Operation::Write);
         assert_result_error_with_message(result, expected_error);
     }
@@ -1960,59 +1777,15 @@ mod test {
         Arc::new(StructType::new_unchecked([field_a, field_b]))
     }
 
-    fn create_table_config_with_column_mapping(
-        schema: SchemaRef,
-        column_mapping_mode: &str,
-    ) -> TableConfiguration {
-        create_table_config_with_column_mapping_and_props(schema, column_mapping_mode, [])
-    }
-
-    fn create_table_config_with_column_mapping_and_props(
-        schema: SchemaRef,
-        column_mapping_mode: &str,
-        extra_props: impl IntoIterator<Item = (&'static str, &'static str)>,
-    ) -> TableConfiguration {
-        create_partitioned_table_config_with_column_mapping(
-            schema,
-            column_mapping_mode,
-            vec![], // partition_columns
-            extra_props,
-        )
-    }
-
-    fn create_partitioned_table_config_with_column_mapping(
-        schema: SchemaRef,
-        column_mapping_mode: &str,
-        partition_columns: Vec<String>,
-        extra_props: impl IntoIterator<Item = (&'static str, &'static str)>,
-    ) -> TableConfiguration {
-        let mut props: HashMap<String, String> = extra_props
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        props.insert(
-            COLUMN_MAPPING_MODE.to_string(),
-            column_mapping_mode.to_string(),
-        );
-
-        let metadata = Metadata::try_new(None, None, schema, partition_columns, 0, props).unwrap();
-
-        // Use reader version 2 which supports column mapping
-        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
-    }
-
     #[test]
     fn test_build_expected_stats_schemas_no_column_mapping() {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("col_a", DataType::LONG),
-            StructField::nullable("col_b", DataType::STRING),
-        ]));
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfigBuilder::new()
+            .with_schema(schema! {
+                nullable "col_a": LONG,
+                nullable "col_b": STRING,
+            })
+            .with_protocol_versions(1, 2)
+            .build();
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
 
@@ -2036,7 +1809,11 @@ mod test {
     fn test_build_expected_stats_schemas_with_column_mapping() {
         // With column mapping, physical schema should have physical names
         let schema = schema_with_column_mapping();
-        let config = create_table_config_with_column_mapping(schema, "name");
+        let config = TableConfigBuilder::new()
+            .with_schema(schema)
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_protocol_versions(2, 5)
+            .build();
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
 
@@ -2072,7 +1849,11 @@ mod test {
         use crate::schema::{ColumnMetadataKey, MetadataValue};
 
         let schema = schema_with_column_mapping();
-        let config = create_table_config_with_column_mapping(schema, "id");
+        let config = TableConfigBuilder::new()
+            .with_schema(schema)
+            .with_column_mapping(ColumnMappingMode::Id)
+            .with_protocol_versions(2, 5)
+            .build();
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
 
@@ -2166,12 +1947,12 @@ mod test {
 
     #[test]
     fn test_build_expected_stats_schemas_excludes_partition_columns() {
-        let config = create_partitioned_table_config_with_column_mapping(
-            partitioned_schema_with_column_mapping(),
-            "name",
-            vec!["part_a".to_string(), "part_b".to_string()],
-            [],
-        );
+        let config = TableConfigBuilder::new()
+            .with_schema(partitioned_schema_with_column_mapping())
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_partition_columns(["part_a", "part_b"])
+            .with_protocol_versions(2, 5)
+            .build();
 
         let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
@@ -2199,12 +1980,12 @@ mod test {
 
     #[test]
     fn test_partition_columns_are_logical_under_column_mapping() {
-        let config = create_partitioned_table_config_with_column_mapping(
-            partitioned_schema_with_column_mapping(),
-            "name",
-            vec!["part_a".to_string(), "part_b".to_string()],
-            [],
-        );
+        let config = TableConfigBuilder::new()
+            .with_schema(partitioned_schema_with_column_mapping())
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_partition_columns(["part_a", "part_b"])
+            .with_protocol_versions(2, 5)
+            .build();
 
         assert_eq!(config.logical_partition_columns(), ["part_a", "part_b"]);
         let partition_schema = config
@@ -2217,19 +1998,19 @@ mod test {
     }
 
     #[rstest]
-    #[case::none("none", ["part_a", "part_b"])]
-    #[case::name("name", ["phys_part_a", "phys_part_b"])]
-    #[case::id("id", ["phys_part_a", "phys_part_b"])]
+    #[case::none(ColumnMappingMode::None, ["part_a", "part_b"])]
+    #[case::name(ColumnMappingMode::Name, ["phys_part_a", "phys_part_b"])]
+    #[case::id(ColumnMappingMode::Id, ["phys_part_a", "phys_part_b"])]
     fn test_physical_partition_columns(
-        #[case] column_mapping_mode: &str,
+        #[case] column_mapping_mode: ColumnMappingMode,
         #[case] expected: [&str; 2],
     ) {
-        let config = create_partitioned_table_config_with_column_mapping(
-            partitioned_schema_with_column_mapping(),
-            column_mapping_mode,
-            vec!["part_a".to_string(), "part_b".to_string()],
-            [],
-        );
+        let config = TableConfigBuilder::new()
+            .with_schema(partitioned_schema_with_column_mapping())
+            .with_column_mapping(column_mapping_mode)
+            .with_partition_columns(["part_a", "part_b"])
+            .with_protocol_versions(2, 5)
+            .build();
 
         assert_eq!(
             config.physical_partition_columns().collect::<Vec<_>>(),
@@ -2239,12 +2020,12 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_excludes_partition_columns() {
-        let config = create_partitioned_table_config_with_column_mapping(
-            partitioned_schema_with_column_mapping(),
-            "name",
-            vec!["part_a".to_string(), "part_b".to_string()],
-            [],
-        );
+        let config = TableConfigBuilder::new()
+            .with_schema(partitioned_schema_with_column_mapping())
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_partition_columns(["part_a", "part_b"])
+            .with_protocol_versions(2, 5)
+            .build();
 
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(column_names, vec![column_name!("phys_data")]);
@@ -2257,23 +2038,15 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_excludes_partition_columns_no_column_mapping() {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("data_col", DataType::LONG),
-            StructField::nullable("part_a", DataType::STRING),
-            StructField::nullable("part_b", DataType::INTEGER),
-        ]));
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec!["part_a".to_string(), "part_b".to_string()],
-            0,
-            HashMap::new(),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfigBuilder::new()
+            .with_schema(schema! {
+                nullable "data_col": LONG,
+                nullable "part_a": STRING,
+                nullable "part_b": INTEGER,
+            })
+            .with_partition_columns(["part_a", "part_b"])
+            .with_protocol_versions(1, 2)
+            .build();
 
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(column_names, vec![column_name!("data_col")]);
@@ -2281,22 +2054,14 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_all_partition_columns_returns_empty() {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("part_a", DataType::STRING),
-            StructField::nullable("part_b", DataType::INTEGER),
-        ]));
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec!["part_a".to_string(), "part_b".to_string()],
-            0,
-            HashMap::new(),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfigBuilder::new()
+            .with_schema(schema! {
+                nullable "part_a": STRING,
+                nullable "part_b": INTEGER,
+            })
+            .with_partition_columns(["part_a", "part_b"])
+            .with_protocol_versions(1, 2)
+            .build();
 
         let column_names = config.physical_stats_column_names(None);
         assert!(column_names.is_empty());
@@ -2306,7 +2071,11 @@ mod test {
     fn test_physical_stats_column_names_returns_physical_names() {
         // physical_stats_column_names should return physical column names
         let schema = schema_with_column_mapping();
-        let config = create_table_config_with_column_mapping(schema, "name");
+        let config = TableConfigBuilder::new()
+            .with_schema(schema)
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_protocol_versions(2, 5)
+            .build();
 
         let column_names = config.physical_stats_column_names(None /* required_columns */);
 
@@ -2320,11 +2089,12 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_with_data_skipping_stats_columns() {
-        let config = create_table_config_with_column_mapping_and_props(
-            test_schema_nested_with_column_mapping(),
-            "name",
-            [("delta.dataSkippingStatsColumns", "id,info.name")],
-        );
+        let config = TableConfigBuilder::new()
+            .with_schema(test_schema_nested_with_column_mapping())
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_props([("delta.dataSkippingStatsColumns", "id,info.name")])
+            .with_protocol_versions(2, 5)
+            .build();
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(
             column_names,
@@ -2334,11 +2104,12 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_skips_nonexistent_data_skipping_stats_column() {
-        let config = create_table_config_with_column_mapping_and_props(
-            test_schema_nested_with_column_mapping(),
-            "name",
-            [("delta.dataSkippingStatsColumns", "id,nonexistent")],
-        );
+        let config = TableConfigBuilder::new()
+            .with_schema(test_schema_nested_with_column_mapping())
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_props([("delta.dataSkippingStatsColumns", "id,nonexistent")])
+            .with_protocol_versions(2, 5)
+            .build();
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(column_names, vec![column_name!("phys_id")],);
     }
@@ -2347,23 +2118,23 @@ mod test {
     // --- flat schema ---
     #[case::flat_none(
         test_schema_flat(),
-        "none",
+        ColumnMappingMode::None,
         vec![column_name!("id"), column_name!("name")],
     )]
     #[case::flat_name(
         test_schema_flat_with_column_mapping(),
-        "name",
+        ColumnMappingMode::Name,
         vec![column_name!("phys_id"), column_name!("phys_name")],
     )]
     #[case::flat_id(
         test_schema_flat_with_column_mapping(),
-        "id",
+        ColumnMappingMode::Id,
         vec![column_name!("phys_id"), column_name!("phys_name")],
     )]
     // --- nested schema (includes map/array inside struct as leaf columns) ---
     #[case::nested_none(
         test_schema_nested(),
-        "none",
+        ColumnMappingMode::None,
         vec![
             column_name!("id"),
             column_name!("info.name"),
@@ -2374,7 +2145,7 @@ mod test {
     )]
     #[case::nested_name(
         test_schema_nested_with_column_mapping(),
-        "name",
+        ColumnMappingMode::Name,
         vec![
             column_name!("phys_id"),
             column_name!("phys_info.phys_name"),
@@ -2385,7 +2156,7 @@ mod test {
     )]
     #[case::nested_id(
         test_schema_nested_with_column_mapping(),
-        "id",
+        ColumnMappingMode::Id,
         vec![
             column_name!("phys_id"),
             column_name!("phys_info.phys_name"),
@@ -2397,55 +2168,58 @@ mod test {
     // --- schema with map (included as leaf for nullCount stats) ---
     #[case::map_none(
         test_schema_with_map(),
-        "none",
+        ColumnMappingMode::None,
         vec![column_name!("id"), column_name!("entries"), column_name!("name")],
     )]
     #[case::map_name(
         test_schema_with_map_and_column_mapping(),
-        "name",
+        ColumnMappingMode::Name,
         vec![column_name!("phys_id"), column_name!("phys_entries"), column_name!("phys_name")],
     )]
     #[case::map_id(
         test_schema_with_map_and_column_mapping(),
-        "id",
+        ColumnMappingMode::Id,
         vec![column_name!("phys_id"), column_name!("phys_entries"), column_name!("phys_name")],
     )]
     // --- schema with array (included as leaf for nullCount stats) ---
     #[case::array_none(
         test_schema_with_array(),
-        "none",
+        ColumnMappingMode::None,
         vec![column_name!("id"), column_name!("items"), column_name!("name")],
     )]
     #[case::array_name(
         test_schema_with_array_and_column_mapping(),
-        "name",
+        ColumnMappingMode::Name,
         vec![column_name!("phys_id"), column_name!("phys_items"), column_name!("phys_name")],
     )]
     #[case::array_id(
         test_schema_with_array_and_column_mapping(),
-        "id",
+        ColumnMappingMode::Id,
         vec![column_name!("phys_id"), column_name!("phys_items"), column_name!("phys_name")],
     )]
     fn test_physical_stats_column_names_all_schemas(
         #[case] schema: SchemaRef,
-        #[case] mode: &str,
+        #[case] mode: ColumnMappingMode,
         #[case] expected_physical: Vec<ColumnName>,
     ) {
-        let config = create_table_config_with_column_mapping(schema, mode);
+        let config = TableConfigBuilder::new()
+            .with_schema(schema)
+            .with_column_mapping(mode)
+            .with_protocol_versions(2, 5)
+            .build();
         let physical_names = config.physical_stats_column_names(None);
         assert_eq!(
             physical_names, expected_physical,
-            "Incorrect physical column names for mode '{mode}'"
+            "Incorrect physical column names for mode '{mode:?}'"
         );
     }
 
     #[test]
     fn test_clustered_table_writes() {
         // ClusteredTable requires DomainMetadata to be supported
-        let config = create_mock_table_config(
-            &[],
-            &[TableFeature::ClusteredTable, TableFeature::DomainMetadata],
-        );
+        let config = TableConfigBuilder::new()
+            .with_features([TableFeature::ClusteredTable, TableFeature::DomainMetadata])
+            .build();
         assert!(
             config.ensure_operation_supported(Operation::Write).is_ok(),
             "ClusteredTable with DomainMetadata should be supported for writes"
@@ -2469,30 +2243,19 @@ mod test {
         // names equal logical names.
         // IcebergCompatV3 requires column mapping. This test bypasses that requirement for
         // convenience.
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("value", DataType::INTEGER),
-            StructField::nullable("pcol", DataType::STRING),
-        ]));
-        let props: HashMap<String, String> = extra_props
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let metadata =
-            Metadata::try_new(None, None, schema, vec!["pcol".to_string()], 0, props).unwrap();
-        let protocol = Protocol::try_new(
-            TABLE_FEATURES_MIN_READER_VERSION,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(Vec::<TableFeature>::new()),
-            Some(vec![
+        let config = TableConfigBuilder::new()
+            .with_schema(schema! {
+                nullable "value": INTEGER,
+                nullable "pcol": STRING,
+            })
+            .with_partition_columns(["pcol"])
+            .with_props(extra_props)
+            .with_features([
                 TableFeature::IcebergCompatV3,
                 TableFeature::RowTracking,
                 TableFeature::DomainMetadata,
-            ]),
-        )
-        .unwrap();
-        let config =
-            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
-                .unwrap();
+            ])
+            .build();
 
         let write_schema = config.physical_write_schema();
         // This is the final check: whether the partition column `pcol` is present in the
@@ -2506,28 +2269,16 @@ mod test {
         // Pins the invariant that `physical_write_schema()` strips void columns from the
         // returned schema (top level and nested), so callers receive a Parquet-writable
         // schema without needing to apply `strip_void_from_schema` themselves.
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("v", DataType::VOID),
-            StructField::nullable(
-                "s",
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("nested_void", DataType::VOID),
-                ]),
-            ),
-        ]));
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            TABLE_FEATURES_MIN_READER_VERSION,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(Vec::<TableFeature>::new()),
-            Some(Vec::<TableFeature>::new()),
-        )
-        .unwrap();
-        let config =
-            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
-                .unwrap();
+        let config = TableConfigBuilder::new()
+            .with_schema(schema! {
+                nullable "id": INTEGER,
+                nullable "v": VOID,
+                nullable "s": {
+                    nullable "a": INTEGER,
+                    nullable "nested_void": VOID,
+                },
+            })
+            .build();
 
         let write_schema = config.physical_write_schema();
 
@@ -2546,20 +2297,20 @@ mod test {
 
     #[test]
     fn test_iceberg_compat_v3_write_supported() {
-        let config = create_mock_table_config_with_cm(
-            &[
+        let config = TableConfigBuilder::new()
+            .with_props([
                 (ENABLE_ICEBERG_COMPAT_V3, "true"),
                 (ENABLE_ROW_TRACKING, "true"),
-            ],
-            Some(ColumnMappingMode::Name),
-            &[TableFeature::ColumnMapping],
-            &[
+            ])
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_reader_features([TableFeature::ColumnMapping])
+            .with_writer_features([
                 TableFeature::IcebergCompatV3,
                 TableFeature::ColumnMapping,
                 TableFeature::RowTracking,
                 TableFeature::DomainMetadata,
-            ],
-        );
+            ])
+            .build();
         config
             .ensure_operation_supported(Operation::Write)
             .expect("V3 write should be supported once kernel_support flips to Supported");
@@ -2576,17 +2327,17 @@ mod test {
         let extra = property_value
             .map(|v| vec![(ENABLE_ICEBERG_COMPAT_V3, v)])
             .unwrap_or_default();
-        let config = create_mock_table_config_with_cm(
-            &extra,
-            Some(ColumnMappingMode::Name),
-            &[TableFeature::ColumnMapping],
-            &[
+        let config = TableConfigBuilder::new()
+            .with_props(&extra)
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_reader_features([TableFeature::ColumnMapping])
+            .with_writer_features([
                 TableFeature::IcebergCompatV3,
                 TableFeature::ColumnMapping,
                 TableFeature::RowTracking,
                 TableFeature::DomainMetadata,
-            ],
-        );
+            ])
+            .build();
         assert_eq!(
             config.is_feature_enabled(&TableFeature::IcebergCompatV3),
             expected_enabled,
@@ -2709,8 +2460,12 @@ mod test {
         #[case] writer_features: Vec<TableFeature>,
         #[case] expected_error_substring: Option<&str>,
     ) {
-        let config =
-            create_mock_table_config_with_cm(props, cm_mode, &reader_features, &writer_features);
+        let config = TableConfigBuilder::new()
+            .with_props(props)
+            .with_column_mapping(cm_mode)
+            .with_reader_features(&reader_features)
+            .with_writer_features(&writer_features)
+            .build();
         let result = config.validate_feature_requirements(&TableFeature::IcebergCompatV3);
         match expected_error_substring {
             Some(msg) => assert_result_error_with_message(result, msg),
@@ -2786,8 +2541,12 @@ mod test {
             std::iter::once(TableFeature::AdaptiveMetadataPreview)
                 .chain(deps.iter().cloned())
                 .collect();
-        let config =
-            create_mock_table_config_with_cm(&props, cm_mode, &reader_features, &writer_features);
+        let config = TableConfigBuilder::new()
+            .with_props(&props)
+            .with_column_mapping(cm_mode)
+            .with_reader_features(&reader_features)
+            .with_writer_features(&writer_features)
+            .build();
         let result = config.validate_feature_requirements(&TableFeature::AdaptiveMetadataPreview);
         match expected_error_substring {
             Some(msg) => assert_result_error_with_message(result, msg),
@@ -2879,21 +2638,21 @@ mod test {
         };
         // V3 also requires Column mapping and RowTracking enabled; enable them unconditionally so
         // V3 cases reach the mutual-exclusion check.
-        let config = create_mock_table_config_with_cm(
-            &[
+        let config = TableConfigBuilder::new()
+            .with_props([
                 (conflicting_enable_property, "true"),
                 (ENABLE_ROW_TRACKING, "true"),
-            ],
-            Some(ColumnMappingMode::Name),
-            &[TableFeature::ColumnMapping],
-            &[
+            ])
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_reader_features([TableFeature::ColumnMapping])
+            .with_writer_features([
                 feature_to_enable.clone(),
                 conflicting_feature,
                 TableFeature::ColumnMapping,
                 TableFeature::RowTracking,
                 TableFeature::DomainMetadata,
-            ],
-        );
+            ])
+            .build();
         assert_result_error_with_message(
             config.validate_feature_requirements(&feature_to_enable),
             expected_error_substring,
@@ -2910,52 +2669,14 @@ mod test {
         #[case] props: &[(&str, &str)],
         #[case] expected_error_substring: Option<&str>,
     ) {
-        let config = create_mock_table_config(props, &[TableFeature::RowTracking]);
+        let config = TableConfigBuilder::new()
+            .with_props(props)
+            .with_features([TableFeature::RowTracking])
+            .build();
         let result = config.validate_feature_support_for_remove();
         match expected_error_substring {
             Some(msg) => assert_result_error_with_message(result, msg),
             None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
         }
-    }
-
-    /// Test helper: variant of `create_mock_table_config` that also takes an optional
-    /// column-mapping mode and requires the caller to provide reader and writer feature lists
-    /// explicitly. `name`/`id` modes need a column-mapping-annotated schema (otherwise
-    /// `TableConfiguration::try_new` rejects the metadata for missing per-field annotations);
-    /// this helper swaps the schema accordingly.
-    // TODO(#2491): Consolidate the `create_*_table_config*` helpers.
-    fn create_mock_table_config_with_cm(
-        extra_props: &[(&str, &str)],
-        cm_mode: Option<ColumnMappingMode>,
-        reader_features: &[TableFeature],
-        writer_features: &[TableFeature],
-    ) -> TableConfiguration {
-        let schema: SchemaRef = match cm_mode {
-            Some(ColumnMappingMode::Name | ColumnMappingMode::Id) => schema_with_column_mapping(),
-            _ => schema_ref! { nullable "value": INTEGER },
-        };
-        let mut props: HashMap<String, String> = extra_props
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        if let Some(mode) = cm_mode {
-            let mode_str = match mode {
-                ColumnMappingMode::Name => "name",
-                ColumnMappingMode::Id => "id",
-                ColumnMappingMode::None => "none",
-            };
-            props.insert(COLUMN_MAPPING_MODE.to_string(), mode_str.to_string());
-        }
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
-
-        let protocol = Protocol::try_new(
-            TABLE_FEATURES_MIN_READER_VERSION,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(reader_features.to_vec()),
-            Some(writer_features.to_vec()),
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
     }
 }

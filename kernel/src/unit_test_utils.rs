@@ -1,3 +1,5 @@
+use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -30,10 +32,15 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::path::ParsedLogPath;
-use crate::table_features::ColumnMappingMode;
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::{
+    ColumnMappingMode, FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION,
+};
+use crate::table_properties::COLUMN_MAPPING_MODE;
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef, Version};
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
 /// synthetic log-file listings in tests.
@@ -322,36 +329,209 @@ pub(crate) fn assert_schema_feature_validation(
     extra_err_schemas: &[&StructType],
     err_msg: &str,
 ) {
-    make_test_tc(schema_with.clone(), protocol_with.clone(), [])
-        .expect("feature present + supported");
-    make_test_tc(schema_without.clone(), protocol_without.clone(), [])
-        .expect("feature absent + unsupported");
-    make_test_tc(schema_without.clone(), protocol_with.clone(), [])
-        .expect("feature absent + supported");
-    assert_result_error_with_message(
-        make_test_tc(schema_with.clone(), protocol_without.clone(), []),
-        err_msg,
-    );
+    let try_build = |schema: &StructType, protocol: &Protocol| {
+        TableConfigBuilder::new()
+            .with_schema(schema.clone())
+            .with_protocol(protocol.clone())
+            .try_build()
+    };
+    try_build(schema_with, protocol_with).expect("feature present + supported");
+    try_build(schema_without, protocol_without).expect("feature absent + unsupported");
+    try_build(schema_without, protocol_with).expect("feature absent + supported");
+    assert_result_error_with_message(try_build(schema_with, protocol_without), err_msg);
     for schema in extra_err_schemas {
-        assert_result_error_with_message(
-            make_test_tc((*schema).clone(), protocol_without.clone(), []),
-            err_msg,
-        );
+        assert_result_error_with_message(try_build(schema, protocol_without), err_msg);
     }
 }
 
-/// Creates a [`TableConfiguration`] from a schema, protocol, and table properties.
-/// Useful for testing validators that need a TC.
-pub(crate) fn make_test_tc(
-    schema: StructType,
-    protocol: Protocol,
-    props: impl IntoIterator<Item = (String, String)>,
-) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
-    let schema = std::sync::Arc::new(schema);
-    let metadata =
-        Metadata::try_new(None, None, schema, vec![], 0, props.into_iter().collect()).unwrap();
-    let table_root = Url::try_from("file:///").unwrap();
-    crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
+// ==================== Mock TableConfiguration ====================
+
+/// Builds a mock [`TableConfiguration`] for unit tests.
+///
+/// Defaults to a flat `value: INTEGER` schema, no partition columns, no table properties, and a
+/// table-features protocol (reader 3, writer 7) listing no features, rooted at `file:///` at
+/// version 0. Every axis is overridable.
+pub(crate) struct TableConfigBuilder {
+    schema: Option<SchemaRef>,
+    partition_columns: Vec<String>,
+    props: HashMap<String, String>,
+    features: Vec<TableFeature>,
+    reader_features: Option<Vec<TableFeature>>,
+    writer_features: Option<Vec<TableFeature>>,
+    min_reader_version: i32,
+    min_writer_version: i32,
+    protocol: Option<Protocol>,
+    table_root: Url,
+    version: Version,
+}
+
+impl TableConfigBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            schema: None,
+            partition_columns: vec![],
+            props: HashMap::new(),
+            features: vec![],
+            reader_features: None,
+            writer_features: None,
+            min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+            min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
+            protocol: None,
+            table_root: Url::parse("file:///").unwrap(),
+            version: 0,
+        }
+    }
+
+    /// Sets the table schema, overriding both the flat default and the column-mapping default
+    /// regardless of the order in which the builder methods are called.
+    pub(crate) fn with_schema(mut self, schema: impl Into<SchemaRef>) -> Self {
+        self.schema = Some(schema.into());
+        self
+    }
+
+    pub(crate) fn with_partition_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl ToString>,
+    ) -> Self {
+        self.partition_columns = columns.into_iter().map(|c| c.to_string()).collect();
+        self
+    }
+
+    /// Adds table properties, keeping any previously set ones.
+    pub(crate) fn with_props<K: ToString, V: ToString>(
+        mut self,
+        props: impl IntoIterator<Item = impl Borrow<(K, V)>>,
+    ) -> Self {
+        self.props.extend(props.into_iter().map(|pair| {
+            let (key, value) = pair.borrow();
+            (key.to_string(), value.to_string())
+        }));
+        self
+    }
+
+    /// Sets the column-mapping mode property. `name`/`id` modes additionally swap in a
+    /// column-mapping-annotated schema unless [`Self::with_schema`] provides one -- without the
+    /// per-field annotations, `TableConfiguration::try_new` rejects the metadata.
+    pub(crate) fn with_column_mapping(self, mode: impl Into<Option<ColumnMappingMode>>) -> Self {
+        let Some(mode) = mode.into() else {
+            return self;
+        };
+        let mode = match mode {
+            ColumnMappingMode::None => "none",
+            ColumnMappingMode::Id => "id",
+            ColumnMappingMode::Name => "name",
+        };
+        self.with_props([(COLUMN_MAPPING_MODE, mode)])
+    }
+
+    /// Sets the features to place on the protocol, split across the reader and writer lists by
+    /// feature type. Unknown features must use [`Self::with_reader_features`] and
+    /// [`Self::with_writer_features`], which say explicitly where each feature lands.
+    pub(crate) fn with_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.features = features.into_iter().map(|f| f.borrow().clone()).collect();
+        assert!(
+            self.features
+                .iter()
+                .all(|f| f.feature_type() != FeatureType::Unknown),
+            "Use with_reader_features/with_writer_features for unknown features"
+        );
+        self
+    }
+
+    pub(crate) fn with_reader_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.reader_features = Some(features.into_iter().map(|f| f.borrow().clone()).collect());
+        self
+    }
+
+    pub(crate) fn with_writer_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.writer_features = Some(features.into_iter().map(|f| f.borrow().clone()).collect());
+        self
+    }
+
+    /// Sets the protocol's minimum reader and writer versions. Feature lists are only written to
+    /// the protocol when the corresponding version supports them.
+    pub(crate) fn with_protocol_versions(mut self, reader: i32, writer: i32) -> Self {
+        self.min_reader_version = reader;
+        self.min_writer_version = writer;
+        self
+    }
+
+    /// Uses `protocol` verbatim, ignoring any feature lists and versions set on the builder.
+    pub(crate) fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = Some(protocol);
+        self
+    }
+
+    pub(crate) fn with_table_root(mut self, table_root: impl AsRef<str>) -> Self {
+        self.table_root = Url::parse(table_root.as_ref()).unwrap();
+        self
+    }
+
+    pub(crate) fn with_version(mut self, version: Version) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Builds the [`TableConfiguration`], panicking if the configuration is invalid. Use
+    /// [`Self::try_build`] to assert on construction errors.
+    #[track_caller]
+    pub(crate) fn build(self) -> TableConfiguration {
+        self.try_build().unwrap()
+    }
+
+    pub(crate) fn try_build(self) -> DeltaResult<TableConfiguration> {
+        let cm_mode = self.column_mapping_mode();
+        let schema = self.schema.unwrap_or_else(|| match cm_mode {
+            ColumnMappingMode::Name | ColumnMappingMode::Id => {
+                test_schema_flat_with_column_mapping()
+            }
+            ColumnMappingMode::None => schema_ref! { nullable "value": INTEGER },
+        });
+        let metadata =
+            Metadata::try_new(None, None, schema, self.partition_columns, 0, self.props)?;
+
+        let protocol = match self.protocol {
+            Some(protocol) => protocol,
+            None => {
+                let reader_features = self.reader_features.unwrap_or_else(|| {
+                    self.features
+                        .iter()
+                        .filter(|f| f.feature_type() == FeatureType::ReaderWriter)
+                        .cloned()
+                        .collect()
+                });
+                let writer_features = self.writer_features.unwrap_or(self.features);
+                // The protocol permits feature lists if and only if the version is exactly the
+                // table-features version, so legacy versions drop them.
+                Protocol::try_new(
+                    self.min_reader_version,
+                    self.min_writer_version,
+                    (self.min_reader_version == TABLE_FEATURES_MIN_READER_VERSION)
+                        .then_some(reader_features),
+                    (self.min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION)
+                        .then_some(writer_features),
+                )?
+            }
+        };
+
+        TableConfiguration::try_new(metadata, protocol, self.table_root, self.version)
+    }
+
+    fn column_mapping_mode(&self) -> ColumnMappingMode {
+        self.props
+            .get(COLUMN_MAPPING_MODE)
+            .and_then(|mode| mode.parse().ok())
+            .unwrap_or(ColumnMappingMode::None)
+    }
 }
 
 // ==================== Test schema helpers ====================

@@ -24,8 +24,12 @@ use crate::table_changes::test_utils::{
 use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
-use crate::table_properties::{ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED};
-use crate::unit_test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+use crate::table_properties::{
+    ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
+};
+use crate::unit_test_utils::{
+    assert_result_error_with_message, Action, LocalMockTable, TableConfigBuilder,
+};
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
@@ -36,21 +40,14 @@ fn get_schema() -> SchemaRef {
 }
 
 fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
-    let metadata = Metadata::try_new(
-        None,
-        None,
-        get_schema(),
-        vec![],
-        0,
-        HashMap::from([
-            ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-            ("delta.columnMapping.mode".to_string(), "none".to_string()),
-        ]),
-    )
-    .unwrap();
-    // CDF requires min_writer_version = 4
-    let protocol = Protocol::try_new_legacy(1, 4).unwrap();
-    TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap()
+    TableConfigBuilder::new()
+        .with_schema(get_schema())
+        .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+        .with_column_mapping(ColumnMappingMode::None)
+        // CDF requires min_writer_version = 4
+        .with_protocol_versions(1, 4)
+        .with_table_root(table_root)
+        .build()
 }
 
 /// Helper to create a Metadata action with the given schema and configuration
@@ -1055,18 +1052,14 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("part", DataType::STRING),
     ]));
-    let metadata = Metadata::try_new(
-        None,
-        None,
-        logical_schema.clone(),
-        vec!["part".to_string()],
-        0,
-        HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
-    )
-    .unwrap();
-    let protocol = Protocol::try_new_legacy(1, 4).unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-    let table_config = TableConfiguration::try_new(metadata, protocol, table_root_url, 0).unwrap();
+    let table_config = TableConfigBuilder::new()
+        .with_schema(logical_schema.clone())
+        .with_partition_columns(["part"])
+        .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+        .with_protocol_versions(1, 4)
+        .with_table_root(table_root_url)
+        .build();
 
     let predicate = Predicate::binary(BinaryPredicateOp::Equal, col!("part"), lit("x"));
     let predicate =
