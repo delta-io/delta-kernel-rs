@@ -261,7 +261,7 @@ impl StagedRemoveFileModification {
     &[true, true, true],
     Some("path must not be empty"),
 )]
-#[case::unselected_missing_path(
+#[case::missing_path_unselected(
     StagedRemoveFileModification::modify_value("path", None, 2 /* modified_row_index */),
     &[true, true, false],
     None,
@@ -276,7 +276,7 @@ impl StagedRemoveFileModification {
     &[true, true, true],
     Some("missing required field 'size'"),
 )]
-#[case::unselected_missing_size(
+#[case::missing_size_unselected(
     StagedRemoveFileModification::modify_value("size", None, 2 /* modified_row_index */),
     &[true, true, false],
     None,
@@ -569,7 +569,11 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Verifies `extendedFileMetadata` when the required `size` is present.
+/// Verifies that `extendedFileMetadata` is true exactly when `size` and `partitionValues` are
+/// present; `tags` does not affect it.
+///
+/// `Transaction::remove_files` requires `size`, so only `partitionValues` may be missing from that
+/// pair.
 #[rstest::rstest]
 #[case::all_present(&[], true)]
 #[case::missing_partition_values(&[ExtendedMetadataField::PartitionValues], false)]
@@ -2052,7 +2056,9 @@ fn modify_staged_remove_file(
         StagedRemoveFileFieldValue::String(value) => {
             Arc::new(StringArray::from(vec![value])) as ArrayRef
         }
-        StagedRemoveFileFieldValue::Int64(value) => Arc::new(Int64Array::from(vec![value])) as ArrayRef,
+        StagedRemoveFileFieldValue::Int64(value) => {
+            Arc::new(Int64Array::from(vec![value])) as ArrayRef
+        }
     };
     let column = batch.column(field_index);
     let slices = [

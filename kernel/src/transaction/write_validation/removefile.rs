@@ -88,49 +88,65 @@ mod tests {
 
     #[rstest]
     #[case::valid_non_negative_sizes(
-        &[Some("dummy"), Some("dummy"), Some("dummy")],
+        &[
+            Some("dummy_path_1"),
+            Some("dummy_path_2"),
+            Some("dummy_path_3"),
+        ],
         &[Some(1), Some(0), Some(1)],
         &[true, true, true],
         None,
     )]
-    #[case::missing_selected_path(
-        &[None, Some("dummy"), Some("dummy")],
+    #[case::missing_path_selected(
+        &[None, Some("dummy_path_2"), Some("dummy_path_3")],
         &[Some(1), Some(1), Some(1)],
         &[true, true, true],
         Some("missing required field 'path'"),
     )]
-    #[case::empty_selected_path(
-        &[Some("dummy"), Some(""), Some("dummy")],
+    #[case::empty_path_selected(
+        &[Some("dummy_path_1"), Some(""), Some("dummy_path_3")],
         &[Some(1), Some(1), Some(1)],
         &[true, true, true],
         Some("path must not be empty"),
     )]
-    #[case::invalid_unselected_paths(
-        &[None, Some(""), Some("dummy")],
+    #[case::invalid_paths_unselected(
+        &[None, Some(""), Some("dummy_path_3")],
         &[Some(1), Some(1), Some(1)],
         &[false, false, true],
         None,
     )]
-    #[case::missing_selected_size(
-        &[Some("dummy"), Some("dummy"), Some("dummy")],
+    #[case::missing_size_selected(
+        &[
+            Some("dummy_path_1"),
+            Some("dummy_path_2"),
+            Some("dummy_path_3"),
+        ],
         &[Some(1), None, Some(1)],
         &[true, true, true],
         Some("missing required field 'size'"),
     )]
-    #[case::negative_selected_size(
-        &[Some("dummy"), Some("dummy"), Some("dummy")],
+    #[case::negative_size_selected(
+        &[
+            Some("dummy_path_1"),
+            Some("dummy_path_2"),
+            Some("dummy_path_3"),
+        ],
         &[Some(1), Some(1), Some(-1)],
         &[true, true, true],
         Some("size must be non-negative"),
     )]
-    #[case::invalid_unselected_sizes(
-        &[Some("dummy"), Some("dummy"), Some("dummy")],
+    #[case::invalid_sizes_unselected(
+        &[
+            Some("dummy_path_1"),
+            Some("dummy_path_2"),
+            Some("dummy_path_3"),
+        ],
         &[None, Some(-1), Some(1)],
         &[false, false, true],
         None,
     )]
     #[case::short_selection_vector_selects_trailing_invalid_row(
-        &[Some("dummy"), Some("dummy"), None],
+        &[Some("dummy_path_1"), Some("dummy_path_2"), None],
         &[Some(1), Some(1), Some(1)],
         &[false, false],
         Some("missing required field 'path'"),
