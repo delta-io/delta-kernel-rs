@@ -5,7 +5,8 @@ use datafusion::functions_nested::expr_fn::array_has;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{conjunction, disjunction};
 use datafusion::logical_expr::{binary_expr, lit, Expr as DFExpr, Operator};
-use delta_kernel::expressions::{null_lit, ArrayData as KernelArrayData, BinaryPredicate as KernelBinaryPredicate,
+use delta_kernel::expressions::{
+    null_lit, ArrayData as KernelArrayData, BinaryPredicate as KernelBinaryPredicate,
     BinaryPredicateOp as KernelBinaryPredicateOp, ColumnName as KernelColumnName,
     Expression as KernelExpression, JunctionPredicate as KernelJunctionPredicate,
     JunctionPredicateOp as KernelJunctionPredicateOp, Predicate as KernelPredicate,

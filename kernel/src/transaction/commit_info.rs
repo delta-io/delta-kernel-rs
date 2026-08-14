@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::Transaction;
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
-use crate::expressions::{lit, MapData, Scalar};
+use crate::expressions::{lit, null_lit, MapData, Scalar};
 use crate::schema::{schema_ref, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
@@ -24,14 +24,14 @@ fn commit_info_literal_exprs(
         ("operation", Arc::new(lit(commit_info.operation))),
         (
             "operationParameters",
-            Arc::new(lit(match commit_info.operation_parameters {
-                Some(map) => Scalar::Map(MapData::try_new(
+            Arc::new(match commit_info.operation_parameters {
+                Some(map) => lit(MapData::try_new(
                     op_params_map_type,
                     map.into_iter()
                         .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
                 )?),
-                None => Scalar::null(op_params_map_type),
-            })),
+                None => null_lit(op_params_map_type),
+            }),
         ),
         ("kernelVersion", Arc::new(lit(commit_info.kernel_version))),
         ("isBlindAppend", Arc::new(lit(commit_info.is_blind_append))),

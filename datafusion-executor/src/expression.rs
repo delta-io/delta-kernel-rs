@@ -17,7 +17,8 @@ use datafusion::logical_expr::{
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::parse_json;
-use delta_kernel::expressions::{null_lit, BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
+use delta_kernel::expressions::{
+    null_lit, BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
     Expression as KernelExpression, ExpressionRef, ExpressionStructPatch, MapToStructExpression,
     ParseJsonExpression, UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
