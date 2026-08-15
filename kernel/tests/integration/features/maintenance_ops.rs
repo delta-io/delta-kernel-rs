@@ -1,5 +1,6 @@
 //! Integration tests for table maintenance operations (checkpoint, checksum).
 
+use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
@@ -110,12 +111,87 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
 }
 
 #[rstest]
-#[case::reader_writer(&["futureFeature"], &["futureFeature"])]
-#[case::writer_only(&[], &["futureFeature"])]
+#[case::unknown_reader_writer_no_spec(&["futureFeature"], &["futureFeature"], None)]
+#[case::unknown_reader_writer_v1(
+    &["futureFeature"],
+    &["futureFeature"],
+    Some(CheckpointSpec::V1)
+)]
+#[case::unknown_reader_writer_v2(
+    &["v2Checkpoint", "futureFeature"],
+    &["v2Checkpoint", "futureFeature"],
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+)]
+#[case::unknown_reader_writer_v2_sidecar(
+    &["v2Checkpoint", "futureFeature"],
+    &["v2Checkpoint", "futureFeature"],
+    Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: None,
+    }))
+)]
+#[case::unknown_writer_only_no_spec(&[], &["futureFeature"], None)]
+#[case::unknown_writer_only_v1(&[], &["futureFeature"], Some(CheckpointSpec::V1))]
+#[case::unknown_writer_only_v2(
+    &["v2Checkpoint"],
+    &["v2Checkpoint", "futureFeature"],
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+)]
+#[case::unknown_writer_only_v2_sidecar(
+    &["v2Checkpoint"],
+    &["v2Checkpoint", "futureFeature"],
+    Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: None,
+    }))
+)]
+#[case::mixed_reader_writer_no_spec(
+    &["deletionVectors", "futureFeature"],
+    &["deletionVectors", "futureFeature"],
+    None
+)]
+#[case::mixed_reader_writer_v1(
+    &["deletionVectors", "futureFeature"],
+    &["deletionVectors", "futureFeature"],
+    Some(CheckpointSpec::V1)
+)]
+#[case::mixed_reader_writer_v2(
+    &["deletionVectors", "v2Checkpoint", "futureFeature"],
+    &["deletionVectors", "v2Checkpoint", "futureFeature"],
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+)]
+#[case::mixed_reader_writer_v2_sidecar(
+    &["deletionVectors", "v2Checkpoint", "futureFeature"],
+    &["deletionVectors", "v2Checkpoint", "futureFeature"],
+    Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: None,
+    }))
+)]
+#[case::mixed_writer_only_no_spec(
+    &["deletionVectors"],
+    &["deletionVectors", "futureFeature"],
+    None
+)]
+#[case::mixed_writer_only_v1(
+    &["deletionVectors"],
+    &["deletionVectors", "futureFeature"],
+    Some(CheckpointSpec::V1)
+)]
+#[case::mixed_writer_only_v2(
+    &["deletionVectors", "v2Checkpoint"],
+    &["deletionVectors", "v2Checkpoint", "futureFeature"],
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+)]
+#[case::mixed_writer_only_v2_sidecar(
+    &["deletionVectors", "v2Checkpoint"],
+    &["deletionVectors", "v2Checkpoint", "futureFeature"],
+    Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: None,
+    }))
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_writes_reject_unsupported_table_features(
     #[case] reader_features: &[&str],
     #[case] writer_features: &[&str],
+    #[case] checkpoint_spec: Option<CheckpointSpec>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -155,7 +231,9 @@ async fn maintenance_writes_reject_unsupported_table_features(
     add_commit(table_url.as_str(), &store, 0, commit).await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let checkpoint_result = snapshot.checkpoint(engine.as_ref(), None).map(|_| ());
+    let checkpoint_result = snapshot
+        .checkpoint(engine.as_ref(), checkpoint_spec.as_ref())
+        .map(|_| ());
     assert_result_error_with_message(checkpoint_result, "futureFeature");
 
     let checksum_result = snapshot.write_checksum(engine.as_ref()).map(|_| ());

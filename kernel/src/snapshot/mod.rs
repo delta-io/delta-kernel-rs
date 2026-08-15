@@ -911,7 +911,7 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// Returns an error if Kernel does not support reading or writing the table's protocol.
+    /// Returns an error if Kernel does not support reading or writing the table.
     pub fn create_checkpoint_writer(
         self: Arc<Self>,
         engine: &dyn Engine,
@@ -958,7 +958,7 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// - If Kernel does not support reading or writing the table's protocol.
+    /// - If Kernel does not support reading or writing the table.
     /// - [`Error::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if the
     ///   resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
     ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
