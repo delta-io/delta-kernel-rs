@@ -137,7 +137,8 @@ impl Scan {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.state_info.physical_stats_schema.as_ref();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
-        let source_physical_stats = shape.parsed_stats_schema.as_ref();
+        let source_physical_stats =
+            physical_stats.and_then(|schema| shape.compatible_stats_parsed_schema(schema));
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
@@ -661,9 +662,12 @@ mod tests {
     }
 
     fn shape(checkpoint_type: CheckpointType, parsed_stats: Option<SchemaRef>) -> CheckpointShape {
+        let leaf_checkpoint_schema = parsed_stats
+            .as_ref()
+            .map(|stats| parquet_read_schema(Some(stats), None).unwrap());
         CheckpointShape {
             checkpoint_type,
-            parsed_stats_schema: parsed_stats,
+            leaf_checkpoint_schema,
         }
     }
 
