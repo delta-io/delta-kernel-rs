@@ -25,7 +25,7 @@ use delta_kernel::expressions::{
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::{scan_row_schema, StatsOptions};
-use delta_kernel::schema::{schema_ref, DataType, MapType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, MapType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Error, Expression as Expr, Predicate as Pred, Snapshot};
@@ -1052,10 +1052,10 @@ async fn test_update_deletion_vectors_rejects_corrupted_scan_files(
 ) -> Result<(), Box<dyn std::error::Error>> {
     const BATCH_COUNT: usize = 3;
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("part", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "part": STRING,
+    };
     let (_store, engine, table_url, file_paths) = create_dv_table_with_files(
         "test_table",
         schema,
@@ -1217,10 +1217,10 @@ async fn test_update_deletion_vectors_multiple_files(
     // in a single call, creating proper Remove and Add actions for each file.
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
 
     // Setup: Create table with 3 files
     let file_names = &["file0.parquet", "file1.parquet", "file2.parquet"];
@@ -1349,10 +1349,10 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     #[case] target_indexes: &[usize],
     #[case] expect_mismatch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
 
     let file_names = &[
         "file0.parquet",
@@ -1945,10 +1945,10 @@ async fn test_remove_files_partitioned_with_parsed_columns(
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "country";
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("country", DataType::STRING),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "country": STRING,
+    };
     let data_schema = schema_ref! { nullable "id": INTEGER };
 
     // Local directory backing: `read_actions_from_commit` reads commit JSON off disk

@@ -377,7 +377,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
-    use delta_kernel::schema::{ArrayType, StructField};
+    use delta_kernel::schema::schema;
 
     use super::*;
     use crate::TryFromStringSlice;
@@ -517,23 +517,14 @@ mod tests {
 
     #[test]
     fn visit_schema_preserves_interval_fields() {
-        let schema = StructType::try_new(vec![
-            StructField::nullable("ym", DataType::INTERVAL_YEAR_MONTH),
-            StructField::not_null("dt", DataType::INTERVAL_DAY_TIME),
-            StructField::nullable(
-                "nested",
-                StructType::try_new(vec![StructField::nullable(
-                    "inner_ym",
-                    DataType::INTERVAL_YEAR_MONTH,
-                )])
-                .unwrap(),
-            ),
-            StructField::nullable(
-                "intervals",
-                ArrayType::new(DataType::INTERVAL_DAY_TIME, false),
-            ),
-        ])
-        .unwrap();
+        let schema = schema! {
+            nullable "ym": INTERVAL_YEAR_MONTH,
+            not_null "dt": INTERVAL_DAY_TIME,
+            nullable "nested": {
+                nullable "inner_ym": INTERVAL_YEAR_MONTH,
+            },
+            nullable "intervals": [ not_null INTERVAL_DAY_TIME ],
+        };
 
         let mut builder = TestSchemaBuilder::default();
         let mut visitor = test_visitor(&mut builder);

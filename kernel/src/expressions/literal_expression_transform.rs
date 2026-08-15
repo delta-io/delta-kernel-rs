@@ -155,7 +155,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{lit, ArrayData, MapData};
-    use crate::schema::{schema_ref, SchemaRef, StructField, StructType};
+    use crate::schema::{schema, schema_ref, SchemaRef, StructField};
     use crate::DataType as DeltaDataTypes;
 
     // helper to take values/schema to pass to `create_one` and assert the result = expected
@@ -282,7 +282,10 @@ mod tests {
         let field_b = StructField::new("b", DeltaDataTypes::INTEGER, test_schema.b_nullable);
         let field_x = StructField::new(
             "x",
-            StructType::new_unchecked([field_a.clone(), field_b.clone()]),
+            schema! {
+                (field_a.clone()),
+                (field_b.clone()),
+            },
             test_schema.x_nullable,
         );
         let schema = schema_ref! {

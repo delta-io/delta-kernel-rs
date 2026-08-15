@@ -911,7 +911,7 @@ mod tests {
     use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
     use delta_kernel::expressions::column_name;
     use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use delta_kernel::schema::StructField;
+    use delta_kernel::schema::schema;
     use test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -2754,11 +2754,10 @@ mod tests {
             Field::new("span", arrow_type.clone(), true),
             Field::new("n", DataType::Int64, true),
         ]));
-        let physical_schema = StructType::try_new([
-            StructField::nullable("span", interval_type),
-            StructField::nullable("n", KernelDataType::LONG),
-        ])
-        .unwrap();
+        let physical_schema = schema! {
+            nullable "span": (interval_type),
+            nullable "n": LONG,
+        };
         let mk = |spans: &[i64], ns: &[i64]| {
             let span: ArrayRef = match arrow_type {
                 DataType::Int32 => Arc::new(Int32Array::from(

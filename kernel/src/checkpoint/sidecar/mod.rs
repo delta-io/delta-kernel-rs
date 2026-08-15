@@ -8,7 +8,7 @@ use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
     col, null_lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,
 };
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{try_schema, DataType, SchemaRef, StructField};
 use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandler, ExpressionEvaluator, FileMeta,
     PredicateEvaluator,
@@ -178,8 +178,10 @@ impl SidecarSplitter {
                 "Checkpoint data schema '{REMOVE_NAME}' field must be nullable"
             )));
         }
-        let sidecar_output_schema: SchemaRef =
-            StructType::try_new([add_field.clone(), remove_field.clone()])?.into();
+        let sidecar_output_schema = Arc::new(try_schema! {
+            (add_field),
+            (remove_field),
+        }?);
 
         // Sidecar projector: select only add/remove columns.
         let file_action_projector = eval_handler.new_expression_evaluator(

@@ -192,8 +192,7 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_columns_not_found() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let schema = schema! { not_null "id": INTEGER };
         let columns = vec![column_name!("nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
@@ -236,8 +235,7 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_nested_intermediate_not_struct() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("flat_col", DataType::STRING, false)]);
+        let schema = schema! { not_null "flat_col": STRING };
 
         // Trying to traverse into a non-struct field should fail
         let columns = vec![column_name!("flat_col", "child")];
@@ -385,8 +383,7 @@ mod tests {
         #[case] column_names: Vec<&str>,
         #[case] expected_error: &str,
     ) {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let schema = schema! { not_null "id": INTEGER };
         let columns: Vec<ColumnName> = column_names
             .into_iter()
             .map(|s| ColumnName::new([s]))
@@ -402,8 +399,7 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_columns_empty_name_rejected() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let schema = schema! { not_null "id": INTEGER };
         // Create a ColumnName with empty path (can't easily express in rstest case)
         let columns: Vec<ColumnName> = vec![ColumnName::new(Vec::<String>::new())];
         let result = validate_clustering_columns(&schema, &columns);

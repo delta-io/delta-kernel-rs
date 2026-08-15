@@ -121,7 +121,7 @@ use crate::expressions::{
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
-use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField};
+use crate::schema::{lazy_schema_ref, schema, DataType, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
@@ -333,7 +333,7 @@ static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
 fn checkpoint_metadata_field() -> StructField {
     StructField::nullable(
         CHECKPOINT_METADATA_NAME,
-        DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
+        schema! { not_null "version": LONG },
     )
 }
 

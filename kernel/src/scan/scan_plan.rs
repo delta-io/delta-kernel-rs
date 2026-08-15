@@ -325,9 +325,7 @@ impl Scan {
         };
 
         let (add_schema, add_expr) = projection.build()?;
-        let schema = schema_ref! {
-            (StructField::nullable(ADD_NAME, add_schema.as_ref().clone()))
-        };
+        let schema = schema_ref! { nullable ADD_NAME: (add_schema.as_ref().clone()) };
         Ok((Arc::new(Expr::struct_from([add_expr])), schema))
     }
 }
@@ -347,16 +345,16 @@ fn sidecar_actions(
     const SIDECAR_FILE_MOD: &str = "modificationTime";
 
     static SIDECAR_FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-        not_null (FILE_PATH): STRING,
-        not_null (FILE_SIZE): LONG,
-        not_null (FILE_MOD): LONG,
-        nullable (DV): (DeletionVectorDescriptor::to_schema()),
-        nullable (VERSION): LONG,
+        not_null FILE_PATH: STRING,
+        not_null FILE_SIZE: LONG,
+        not_null FILE_MOD: LONG,
+        nullable DV: (DeletionVectorDescriptor::to_schema()),
+        nullable VERSION: LONG,
     };
 
     static SIDECAR_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
         (&SIDECAR_FIELD),
-        nullable (VERSION): LONG,
+        nullable VERSION: LONG,
     };
 
     let scan = match file_type {
@@ -399,7 +397,7 @@ fn json_read_schema(include_remove: bool) -> SchemaRef {
     schema_ref! {
         (&ADD_FIELD),
         ..(include_remove.then_some(&REMOVE_FIELD)),
-        nullable (VERSION): LONG,
+        nullable VERSION: LONG,
     }
 }
 
@@ -419,8 +417,8 @@ fn parquet_read_schema(
             ))
         });
     Ok(schema_ref! {
-        (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?)),
-        nullable (VERSION): LONG,
+        nullable ADD_NAME: (add_patch.build(&ADD_SCHEMA)?),
+        nullable VERSION: LONG,
     })
 }
 

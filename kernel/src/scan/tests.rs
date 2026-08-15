@@ -67,39 +67,40 @@ fn test_static_skipping() {
 
 #[test]
 fn test_physical_predicate() {
-    let logical_schema = StructType::new_unchecked(vec![
-        StructField::nullable("a", DataType::LONG),
-        StructField::nullable("b", DataType::LONG).with_metadata([(
+    let logical_schema = schema! {
+        nullable "a": LONG,
+        (StructField::nullable("b", DataType::LONG).with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_b",
-        )]),
-        StructField::nullable("phys_b", DataType::LONG).with_metadata([(
+        )])),
+        (StructField::nullable("phys_b", DataType::LONG).with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_c",
-        )]),
-        StructField::nullable(
+        )])),
+        (StructField::nullable(
             "nested",
-            StructType::new_unchecked(vec![
-                StructField::nullable("x", DataType::LONG),
-                StructField::nullable("y", DataType::LONG).with_metadata([(
+            schema! {
+                nullable "x": LONG,
+                (StructField::nullable("y", DataType::LONG).with_metadata([(
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     "phys_y",
-                )]),
-            ]),
-        ),
-        StructField::nullable(
+                )])),
+            },
+        )),
+        (StructField::nullable(
             "mapped",
-            StructType::new_unchecked(vec![StructField::nullable("n", DataType::LONG)
-                .with_metadata([(
+            schema! {
+                (StructField::nullable("n", DataType::LONG).with_metadata([(
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     "phys_n",
-                )])]),
+                )])),
+            },
         )
         .with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_mapped",
-        )]),
-    ]);
+        )])),
+    };
 
     // NOTE: We break several column mapping rules here because they don't matter for this
     // test. For example, we do not provide field ids, and not all columns have physical names.
@@ -215,10 +216,10 @@ fn test_physical_predicate() {
 #[rstest]
 #[case::without_column_mapping(
     // predicate: createdat > 500 AND value < 100, schema: createdAt, Value
-    StructType::new_unchecked(vec![
-        StructField::nullable("createdAt", DataType::LONG),
-        StructField::nullable("Value", DataType::LONG),
-    ]),
+    schema! {
+        nullable "createdAt": LONG,
+        nullable "Value": LONG,
+    },
     Pred::and(
         Pred::gt(col!("createdat"), lit(500i64)),
         Pred::lt(col!("value"), lit(100i64)),
@@ -237,16 +238,16 @@ fn test_physical_predicate() {
 )]
 #[case::with_column_mapping(
     // predicate: createdat > 500 AND value < 100, schema has physical name metadata
-    StructType::new_unchecked(vec![
-        StructField::nullable("createdAt", DataType::LONG).with_metadata([(
+    schema! {
+        (StructField::nullable("createdAt", DataType::LONG).with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_created",
-        )]),
-        StructField::nullable("Value", DataType::LONG).with_metadata([(
+        )])),
+        (StructField::nullable("Value", DataType::LONG).with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_value",
-        )]),
-    ]),
+        )])),
+    },
     Pred::and(
         Pred::gt(col!("createdat"), lit(500i64)),
         Pred::lt(col!("value"), lit(100i64)),
@@ -271,9 +272,7 @@ fn test_physical_predicate() {
 )]
 #[case::duplicate_column_different_casing(
     // predicate references same column with different casings: value > 5 AND VALUE < 10
-    StructType::new_unchecked(vec![
-        StructField::nullable("Value", DataType::LONG),
-    ]),
+    schema! { nullable "Value": LONG },
     Pred::and(
         Pred::gt(col!("value"), lit(5i64)),
         Pred::lt(col!("VALUE"), lit(10i64)),
@@ -289,10 +288,11 @@ fn test_physical_predicate() {
 )]
 #[case::nested_fields(
     // predicate references nested.fieldname but schema has Nested.FieldName
-    StructType::new_unchecked(vec![StructField::nullable(
-        "Nested",
-        StructType::new_unchecked(vec![StructField::nullable("FieldName", DataType::LONG)]),
-    )]),
+    schema! {
+        nullable "Nested": {
+            nullable "FieldName": LONG,
+        },
+    },
     column_pred!("nested.fieldname"),
     ColumnMappingMode::None,
     PhysicalPredicate::Some(
@@ -318,8 +318,7 @@ fn test_physical_predicate_case_insensitive(
 /// Unknown column still fails even with case-insensitive matching.
 #[test]
 fn test_physical_predicate_case_insensitive_unknown_column() {
-    let logical_schema =
-        StructType::new_unchecked(vec![StructField::nullable("createdAt", DataType::LONG)]);
+    let logical_schema = schema! { nullable "createdAt": LONG };
     let result = PhysicalPredicate::try_new(
         &column_pred!("nonexistent"),
         &logical_schema,

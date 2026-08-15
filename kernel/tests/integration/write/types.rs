@@ -15,7 +15,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::{Error as KernelError, Snapshot};
 use itertools::Itertools;
@@ -34,10 +34,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a table with TIMESTAMP_NTZ column
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "ts_ntz",
-        DataType::TIMESTAMP_NTZ,
-    )])?);
+    let schema = schema_ref! { nullable "ts_ntz": TIMESTAMP_NTZ };
 
     let (store, engine, table_location) = engine_store_setup("test_table_timestamp_ntz", None);
     let table_url = create_table(
@@ -124,10 +121,7 @@ async fn test_append_timestamp_stats_are_millisecond_truncated(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "ts",
-        DataType::TIMESTAMP,
-    )])?);
+    let schema = schema_ref! { nullable "ts": TIMESTAMP };
 
     let (store, engine, table_location) = engine_store_setup("test_table_timestamp_stats", None);
     let table_url = create_table(
@@ -205,18 +199,14 @@ async fn test_append_variant(
     }
 
     // create a table with VARIANT column
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("v", DataType::unshredded_variant()),
-        StructField::nullable("i", DataType::INTEGER),
-        StructField::nullable(
-            "nested",
-            // We flip the value and metadata fields in the actual parquet file for the test
-            StructType::try_new(vec![StructField::nullable(
-                "nested_v",
-                unshredded_variant_schema_flipped(),
-            )])?,
-        ),
-    ])?);
+    // We flip the value and metadata fields in the actual parquet file for the test.
+    let table_schema = schema_ref! {
+        nullable "v": unshredded_variant(),
+        nullable "i": INTEGER,
+        nullable "nested": {
+            nullable "nested_v": (unshredded_variant_schema_flipped()),
+        },
+    };
 
     let write_schema = table_schema.clone();
 
@@ -360,18 +350,13 @@ async fn test_append_variant(
     assert!(parsed_commits[1].get("add").is_some());
 
     // The scanned data will match the logical schema, not the physical one
-    let expected_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("v", DataType::unshredded_variant()),
-        StructField::nullable("i", DataType::INTEGER),
-        StructField::nullable(
-            "nested",
-            StructType::try_new(vec![StructField::nullable(
-                "nested_v",
-                DataType::unshredded_variant(),
-            )])
-            .unwrap(),
-        ),
-    ])?);
+    let expected_schema = schema_ref! {
+        nullable "v": unshredded_variant(),
+        nullable "i": INTEGER,
+        nullable "nested": {
+            nullable "nested_v": unshredded_variant(),
+        },
+    };
 
     // During the read, the flipped fields should be reordered into metadata, value.
     let variant_nested_v_array_expected = Arc::new(StructArray::try_new(
@@ -409,22 +394,18 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
-    let table_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "v",
-        DataType::unshredded_variant(),
-    )])?);
+    let table_schema = schema_ref! { nullable "v": unshredded_variant() };
 
     // The table will be attempted to be written in this form but be read into
     // STRUCT<metadata: BINARY, value: BINARY>. The read should fail because the default engine
     // currently does not support shredded reads.
-    let shredded_write_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "v",
-        DataType::try_struct_type([
-            StructField::new("metadata", DataType::BINARY, true),
-            StructField::new("value", DataType::BINARY, true),
-            StructField::new("typed_value", DataType::INTEGER, true),
-        ])?,
-    )])?);
+    let shredded_write_schema = schema_ref! {
+        nullable "v": {
+            nullable "metadata": BINARY,
+            nullable "value": BINARY,
+            nullable "typed_value": INTEGER,
+        },
+    };
 
     let tmp_test_dir = tempdir()?;
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
@@ -562,10 +543,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a table with a NOT NULL column.
-    let schema = Arc::new(StructType::try_new(vec![StructField::not_null(
-        "c",
-        data_type.clone(),
-    )])?);
+    let schema = schema_ref! { not_null "c": (data_type.clone()) };
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let _ = kernel_create_table(&table_path, schema.clone(), "test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -613,14 +591,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     Ok(())
 }
 
-// ---- Void type write-time validation tests ----
-//
-// The rstest cases below use `StructType::new_unchecked` for convenience; `StructType::try_new`
-// would also accept them, since it validates structural properties (field-name uniqueness,
-// metadata-column rules) and does not reject void placements. The validator
-// (`validate_schema_for_write`) is the kernel-internal write-time rejection point for void in
-// `Array`/`Map` and all-void structs, and it also protects schemas loaded from existing table
-// metadata (JSON-deserialized from the log) and any `new_unchecked` paths.
+// === Void type write-time validation tests ===
 
 /// Helper to create a table with a given schema and attempt a commit with dummy add_files.
 /// Returns the commit error (panics if commit succeeds).

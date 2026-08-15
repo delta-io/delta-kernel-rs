@@ -112,7 +112,7 @@ mod tests {
     use crate::arrow::datatypes::Schema;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::metrics::MetricEvent;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema_ref;
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     #[derive(Debug, Default)]
@@ -185,7 +185,7 @@ mod tests {
     }
 
     fn delta_schema() -> SchemaRef {
-        Arc::new(StructType::try_new([StructField::nullable("x", DataType::INTEGER)]).unwrap())
+        schema_ref! { nullable "x": INTEGER }
     }
 
     #[test]

@@ -89,7 +89,7 @@ impl<S> Transaction<S> {
                 // Delta log action format `{ "commitInfo": { merged fields... } }`, consistent
                 // with the None branch which uses `LOG_COMMIT_INFO_SCHEMA`.
                 let wrapped_expr = Expression::struct_from([patch]);
-                let wrapped_schema = schema_ref! { nullable (COMMIT_INFO_NAME): (output_schema) };
+                let wrapped_schema = schema_ref! { nullable COMMIT_INFO_NAME: (output_schema) };
                 let evaluator = engine.evaluation_handler().new_expression_evaluator(
                     engine_commit_info_schema.clone(),
                     Arc::new(wrapped_expr),

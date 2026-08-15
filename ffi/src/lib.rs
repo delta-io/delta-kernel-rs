@@ -1903,7 +1903,7 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStore as _, ObjectStoreExt as _};
-    use delta_kernel::schema::StructType;
+    use delta_kernel::schema::schema_ref;
     use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
@@ -2307,7 +2307,7 @@ mod tests {
         create_table(
             storage.clone(),
             Url::parse(table_root)?,
-            Arc::new(StructType::try_new([]).unwrap()),
+            schema_ref! {},
             &[],
             true,
             vec![],
@@ -2359,7 +2359,7 @@ mod tests {
         create_table(
             storage.clone(),
             Url::parse(table_root)?,
-            Arc::new(StructType::try_new([]).unwrap()),
+            schema_ref! {},
             &[],
             true,
             vec![],

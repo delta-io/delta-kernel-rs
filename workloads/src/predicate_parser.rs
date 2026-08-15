@@ -428,78 +428,57 @@ fn between_to_pred(
 mod tests {
     use delta_kernel::expressions::col;
     use delta_kernel::expressions::Scalar::*;
-    use delta_kernel::schema::{MapType, Schema, StructField, StructType};
+    use delta_kernel::schema::{schema, Schema};
     use rstest::rstest;
 
     use super::*;
 
     /// Test schema with columns for all test cases.
     fn test_schema() -> Schema {
-        Schema::new_unchecked(vec![
-            // Columns matching upstream tests
-            StructField::new("id", DataType::LONG, true),
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::LONG, true),
-            StructField::new("c", DataType::LONG, true),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("value", DataType::LONG, true),
-            StructField::new("flag", DataType::BOOLEAN, true),
-            StructField::new("partCol", DataType::LONG, true),
-            StructField::new("version_tag", DataType::STRING, true),
-            // Double columns for literal_types tests
-            StructField::new("c3", DataType::DOUBLE, true),
-            StructField::new("c4", DataType::DOUBLE, true),
-            StructField::new("val", DataType::DOUBLE, true),
-            StructField::new("cc9", DataType::BOOLEAN, true),
-            StructField::new("long_val", DataType::LONG, true),
-            // Columns for unsupported predicate tests (these trigger other errors first)
-            StructField::new("fruit", DataType::STRING, true),
-            StructField::new("cc8", DataType::STRING, true),
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("time_col", DataType::TIMESTAMP, true),
-            StructField::new("items", ArrayType::new(DataType::LONG, true), true),
-            // Nested struct for upstream tests
-            StructField::new(
-                "null_v_struct",
-                StructType::new_unchecked(vec![StructField::new("v", DataType::LONG, true)]),
-                true,
-            ),
-            // Nested structs for nested_columns tests (a.b, a.b.c, b.c.f.i, data.value)
-            StructField::new(
-                "data",
-                StructType::new_unchecked(vec![StructField::new("value", DataType::LONG, true)]),
-                true,
-            ),
-            // Additional typed columns for type-checking tests
-            StructField::new("int_col", DataType::INTEGER, true),
-            StructField::new("str_col", DataType::STRING, true),
-            StructField::new("long_col", DataType::LONG, true),
-            StructField::new("double_col", DataType::DOUBLE, true),
-            StructField::new("short_col", DataType::SHORT, true),
-            StructField::new("byte_col", DataType::BYTE, true),
-            StructField::new("float_col", DataType::FLOAT, true),
-            StructField::new("bool_col", DataType::BOOLEAN, true),
-            StructField::new("date_col", DataType::DATE, true),
-            StructField::new("ts_col", DataType::TIMESTAMP, true),
-            StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
-            // Struct type for nested tests
-            StructField::new(
-                "struct_col",
-                StructType::new_unchecked(vec![
-                    StructField::new("inner_int", DataType::INTEGER, true),
-                    StructField::new("inner_str", DataType::STRING, true),
-                ]),
-                true,
-            ),
-            // Array type
-            StructField::new("array_col", ArrayType::new(DataType::LONG, true), true),
-            // Map type
-            StructField::new(
-                "map_col",
-                MapType::new(DataType::STRING, DataType::LONG, true),
-                true,
-            ),
-        ])
+        schema! {
+            nullable "id": LONG,
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "c": LONG,
+            nullable "name": STRING,
+            nullable "value": LONG,
+            nullable "flag": BOOLEAN,
+            nullable "partCol": LONG,
+            nullable "version_tag": STRING,
+            nullable "c3": DOUBLE,
+            nullable "c4": DOUBLE,
+            nullable "val": DOUBLE,
+            nullable "cc9": BOOLEAN,
+            nullable "long_val": LONG,
+            nullable "fruit": STRING,
+            nullable "cc8": STRING,
+            nullable "s": STRING,
+            nullable "time_col": TIMESTAMP,
+            nullable "items": [ nullable LONG ],
+            nullable "null_v_struct": {
+                nullable "v": LONG,
+            },
+            nullable "data": {
+                nullable "value": LONG,
+            },
+            nullable "int_col": INTEGER,
+            nullable "str_col": STRING,
+            nullable "long_col": LONG,
+            nullable "double_col": DOUBLE,
+            nullable "short_col": SHORT,
+            nullable "byte_col": BYTE,
+            nullable "float_col": FLOAT,
+            nullable "bool_col": BOOLEAN,
+            nullable "date_col": DATE,
+            nullable "ts_col": TIMESTAMP,
+            nullable "ts_ntz_col": TIMESTAMP_NTZ,
+            nullable "struct_col": {
+                nullable "inner_int": INTEGER,
+                nullable "inner_str": STRING,
+            },
+            nullable "array_col": [ nullable LONG ],
+            nullable "map_col": { STRING => nullable LONG },
+        }
     }
 
     // Helper to build an IN predicate: `col IN (scalars...)`

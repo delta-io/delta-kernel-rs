@@ -14,7 +14,9 @@ mod variant;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+use delta_kernel::schema::{
+    schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -30,20 +32,20 @@ use test_utils::{assert_result_error_with_message, test_table_setup, test_table_
 /// Helper to create a simple two-column schema for tests.
 /// Shared with sub-modules.
 pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ])?))
+    Ok(schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    })
 }
 
 /// Helper to create a three-column schema for partition tests (id, date, value).
 /// Shared with sub-modules.
 pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("date", DataType::DATE),
-        StructField::nullable("value", DataType::STRING),
-    ])?))
+    Ok(schema_ref! {
+        nullable "id": INTEGER,
+        nullable "date": DATE,
+        nullable "value": STRING,
+    })
 }
 
 #[tokio::test]
@@ -51,13 +53,13 @@ async fn test_create_simple_table() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for an events table
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("event_id", DataType::LONG),
-        StructField::nullable("user_id", DataType::LONG),
-        StructField::nullable("event_type", DataType::STRING),
-        StructField::nullable("timestamp", DataType::TIMESTAMP),
-        StructField::nullable("properties", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "event_id": LONG,
+        nullable "user_id": LONG,
+        nullable "event_type": STRING,
+        nullable "timestamp": TIMESTAMP,
+        nullable "properties": STRING,
+    };
 
     // Create table using new API
     let _ = create_table(&table_path, schema.clone(), "DeltaKernel-RS/0.17.0")
@@ -159,13 +161,13 @@ async fn test_create_table_already_exists() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for a user profiles table
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("user_id", DataType::LONG),
-        StructField::nullable("username", DataType::STRING),
-        StructField::nullable("email", DataType::STRING),
-        StructField::nullable("created_at", DataType::TIMESTAMP),
-        StructField::nullable("is_active", DataType::BOOLEAN),
-    ])?);
+    let schema = schema_ref! {
+        nullable "user_id": LONG,
+        nullable "username": STRING,
+        nullable "email": STRING,
+        nullable "created_at": TIMESTAMP,
+        nullable "is_active": BOOLEAN,
+    };
 
     // Create table first time
     let _ = create_table(&table_path, schema.clone(), "UserManagementService/1.2.0")
@@ -187,7 +189,7 @@ async fn test_create_table_empty_schema_succeeds() -> DeltaResult<()> {
 
     // CREATE TABLE with no columns is a valid Delta operation; users may add columns
     // later via ALTER TABLE ADD COLUMN.
-    let schema = Arc::new(StructType::try_new(vec![])?);
+    let schema = schema_ref! {};
 
     create_table(&table_path, schema, "EmptySchemaApp/0.1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -216,7 +218,7 @@ async fn test_create_table_empty_schema_checkpoint_round_trip(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
-    let schema = Arc::new(StructType::try_new(vec![])?);
+    let schema = schema_ref! {};
     let mut builder = create_table(&table_path, schema, "EmptySchemaApp/0.1.0");
     if let Some(mode) = cm_mode {
         builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
@@ -254,7 +256,7 @@ async fn test_create_table_empty_schema_layout_errors(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![])?);
+    let schema = schema_ref! {};
     let result = create_table(&table_path, schema, "EmptySchemaApp/0.1.0")
         .with_data_layout(layout)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
@@ -265,22 +267,18 @@ async fn test_create_table_empty_schema_layout_errors(
 }
 
 fn top_level_non_null_schema() -> Arc<StructType> {
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ])
-        .expect("non-null top-level schema should be valid"),
-    )
+    schema_ref! {
+        not_null "id": INTEGER,
+        nullable "value": STRING,
+    }
 }
 
 fn nested_non_null_schema() -> Arc<StructType> {
-    let nested = StructType::try_new(vec![StructField::not_null("child", DataType::INTEGER)])
-        .expect("nested non-null schema should be valid");
-    Arc::new(
-        StructType::try_new(vec![StructField::nullable("nested", nested)])
-            .expect("top-level nested schema should be valid"),
-    )
+    schema_ref! {
+        nullable "nested": {
+            not_null "child": INTEGER,
+        },
+    }
 }
 
 /// CREATE TABLE with non-null columns succeeds and auto-enables the `invariants`
@@ -368,7 +366,7 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> DeltaResult<()
         ColumnMetadataKey::Invariants.as_ref().to_string(),
         MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
     );
-    let schema = Arc::new(StructType::try_new(vec![field])?);
+    let schema = schema_ref! { (field) };
 
     let result = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
@@ -383,10 +381,10 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("user_id", DataType::LONG),
-        StructField::nullable("action", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "user_id": LONG,
+        nullable "action": STRING,
+    };
 
     let engine_info = "AuditService/2.1.0";
 
@@ -503,13 +501,10 @@ fn create_test_create_table_txn() -> DeltaResult<(
     tempfile::TempDir,
 )> {
     let (tempdir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])
-        .expect("valid schema"),
-    );
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "name": STRING,
+    };
     let txn = create_table(&table_path, schema, "test_engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     Ok((engine, txn, tempdir))
@@ -680,10 +675,10 @@ fn test_create_table_with_enablement_property(
 fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("valid_col", DataType::INTEGER),
-        StructField::nullable("bad column", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "valid_col": INTEGER,
+        nullable "bad column": STRING,
+    };
 
     let mut builder = create_table(&table_path, schema, "Test/1.0");
     if cm_enabled {

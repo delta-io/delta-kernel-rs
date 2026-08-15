@@ -16,7 +16,7 @@ use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
+use crate::schema::{schema, schema_ref, DataType, SchemaRef, StructField};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_changes::test_utils::{
     row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
@@ -407,9 +407,7 @@ async fn row_tracking_unavailable_midstream_fails(#[case] properties: &[(&str, &
 }
 
 fn nested_id_type(value_type: DataType) -> DataType {
-    DataType::from(StructType::new_unchecked([StructField::nullable(
-        "value", value_type,
-    )]))
+    DataType::from(schema! { nullable "value": (value_type) })
 }
 
 #[rstest]
@@ -432,13 +430,11 @@ async fn row_tracking_schema_compatibility(
     #[case] expect_compatible: bool,
 ) {
     let schema = |id_type: DataType, has_year: bool| {
-        let fields = [
-            StructField::nullable("id", id_type),
-            StructField::nullable("value", DataType::STRING),
-        ]
-        .into_iter()
-        .chain(has_year.then(|| StructField::nullable("year", DataType::INTEGER)));
-        Arc::new(StructType::new_unchecked(fields))
+        schema_ref! {
+            nullable "id": (id_type),
+            nullable "value": STRING,
+            ..(has_year.then(|| StructField::nullable("year", DataType::INTEGER))),
+        }
     };
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
@@ -471,8 +467,11 @@ fn row_tracking_schema_compatibility_checks_nullability(
     #[case] read_nullable: bool,
     #[case] expected: bool,
 ) {
-    let schema =
-        |nullable| StructType::new_unchecked([StructField::new("id", DataType::INTEGER, nullable)]);
+    let schema = |nullable| {
+        schema! {
+            (StructField::new("id", DataType::INTEGER, nullable)),
+        }
+    };
     assert_eq!(
         CdfMode::RowTracking
             .schemas_compatible(&schema(candidate_nullable), &schema(read_nullable),),
@@ -487,11 +486,15 @@ fn row_tracking_schema_compatibility_requires_new_columns_to_be_nullable(
     #[case] new_column_nullable: bool,
     #[case] expected: bool,
 ) {
-    let candidate = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
-    let read_schema = StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::new("new_column", DataType::STRING, new_column_nullable),
-    ]);
+    let candidate = schema! { nullable "id": INTEGER };
+    let read_schema = schema! {
+        nullable "id": INTEGER,
+        (StructField::new(
+            "new_column",
+            DataType::STRING,
+            new_column_nullable,
+        )),
+    };
     assert_eq!(
         CdfMode::RowTracking.schemas_compatible(&candidate, &read_schema),
         expected

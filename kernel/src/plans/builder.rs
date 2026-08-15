@@ -652,7 +652,9 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{col, column_name, lit, Expression};
     use crate::plans::ir::nodes::FileType;
-    use crate::schema::{schema_ref, DataType, MetadataColumnSpec, StructField, StructType};
+    use crate::schema::{
+        schema, schema_ref, DataType, MetadataColumnSpec, StructField, StructType,
+    };
     use crate::FileMeta;
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
@@ -1189,16 +1191,17 @@ mod tests {
         let base_schema = dynamic_scan_input_schema();
         let metadata = StructField::new(
             "metadata",
-            StructType::new_unchecked([
-                StructField::not_null("path", DataType::STRING),
-                StructField::not_null("size", DataType::LONG),
-                StructField::not_null("filemod", DataType::LONG),
-            ]),
+            schema! {
+                not_null "path": STRING,
+                not_null "size": LONG,
+                not_null "filemod": LONG,
+            },
             parent_nullable,
         );
-        let input = Arc::new(StructType::new_unchecked(
-            base_schema.fields().cloned().chain([metadata]),
-        ));
+        let input = schema_ref! {
+            ..(base_schema.fields()),
+            (metadata),
+        };
         let mut columns = [
             column_name!("path"),
             column_name!("size"),
@@ -1233,16 +1236,14 @@ mod tests {
     ) {
         let metadata = StructField::new(
             "metadata",
-            StructType::new_unchecked([StructField::nullable(
-                "dv",
-                DeletionVectorDescriptor::to_schema(),
-            )]),
+            schema! { nullable "dv": (DeletionVectorDescriptor::to_schema()) },
             parent_nullable,
         );
         let base_schema = dynamic_scan_input_schema();
-        let input = Arc::new(StructType::new_unchecked(
-            base_schema.fields().cloned().chain([metadata]),
-        ));
+        let input = schema_ref! {
+            ..(base_schema.fields()),
+            (metadata),
+        };
 
         DynamicScan::try_new(
             &input,

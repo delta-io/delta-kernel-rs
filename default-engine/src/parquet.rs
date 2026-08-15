@@ -613,7 +613,7 @@ mod tests {
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
-        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema, schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
     use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
@@ -635,7 +635,7 @@ mod tests {
     use crate::DEFAULT_BATCH_SIZE;
 
     fn long_schema(name: &str) -> StructType {
-        StructType::new_unchecked([StructField::nullable(name, DataType::LONG)])
+        schema! { nullable (name): LONG }
     }
 
     /// Test `ObjectStore` that counts footer fetches. `get_opts` (footer range GETs) is counted;
@@ -1658,21 +1658,18 @@ mod tests {
         writer.close().unwrap();
 
         // Create kernel schema with DIFFERENT names but SAME field IDs
-        let kernel_schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::new("user_id", delta_kernel::schema::DataType::LONG, false)
+        let kernel_schema = schema_ref! {
+            (StructField::new("user_id", delta_kernel::schema::DataType::LONG, false)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(1),
-                    )]),
-                StructField::new("user_name", delta_kernel::schema::DataType::STRING, false)
+                    )])),
+            (StructField::new("user_name", delta_kernel::schema::DataType::STRING, false)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(2),
-                    )]),
-            ])
-            .unwrap(),
-        );
+                    )])),
+        };
 
         // Read using kernel schema with different column names
         let store = Arc::new(LocalFileSystem::new());

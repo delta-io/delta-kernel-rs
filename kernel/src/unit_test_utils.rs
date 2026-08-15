@@ -434,7 +434,9 @@ pub(crate) fn array_in_map_kernel_schema(
         ),
     )
     .with_metadata(metadata);
-    StructType::try_new(vec![array_in_map]).unwrap()
+    schema! {
+        (array_in_map),
+    }
 }
 
 /// Build an [`array_in_map_kernel_schema`] with `parquet.field.id` on the top-level field
@@ -577,9 +579,13 @@ fn build_arrow_input_with_stale_element_id() -> StructArray {
     let plain_inner = StructField::nullable("inner", complex_nested_inner_map_type());
     let plain_top = StructField::nullable(
         "top",
-        complex_nested_outer_map_type(StructType::try_new(vec![plain_inner]).unwrap()),
+        complex_nested_outer_map_type(schema! {
+            (plain_inner),
+        }),
     );
-    let plain_kernel_schema = StructType::try_new(vec![plain_top]).unwrap();
+    let plain_kernel_schema = schema! {
+        (plain_top),
+    };
     let plain_arrow_schema: ArrowSchema = (&plain_kernel_schema).try_into_arrow().unwrap();
 
     // Add stale `PARQUET:field_id` to the `top.key.element` field.
@@ -665,7 +671,9 @@ pub(crate) fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> S
         ]);
     let top_field = StructField::nullable(
         "top",
-        complex_nested_outer_map_type(StructType::try_new(vec![inner_field]).unwrap()),
+        complex_nested_outer_map_type(schema! {
+            (inner_field),
+        }),
     )
     .with_metadata([
         (
@@ -677,7 +685,9 @@ pub(crate) fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> S
             MetadataValue::Other(top_nested_ids),
         ),
     ]);
-    StructType::try_new(vec![top_field]).unwrap()
+    schema! {
+        (top_field),
+    }
 }
 
 /// Build the expected output Arrow schema for [`complex_nested_with_field_ids`].
@@ -757,10 +767,18 @@ pub(crate) fn test_schema_nested_with_column_mapping() -> SchemaRef {
         (cm_field("info", 2, "phys_info", schema! {
             (cm_field("name", 3, "phys_name", KernelDataType::STRING)),
             (cm_field("age", 4, "phys_age", KernelDataType::INTEGER)),
-            (cm_field("tags", 5, "phys_tags",
-                MapType::new(KernelDataType::STRING, KernelDataType::STRING, true))),
-            (cm_field("scores", 6, "phys_scores",
-                ArrayType::new(KernelDataType::INTEGER, true))),
+            (cm_field(
+                "tags",
+                5,
+                "phys_tags",
+                MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
+            )),
+            (cm_field(
+                "scores",
+                6,
+                "phys_scores",
+                ArrayType::new(KernelDataType::INTEGER, true),
+            )),
         })),
     }
 }
@@ -827,7 +845,9 @@ pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
         true,
     );
     let array_type = ArrayType::new(
-        schema! { (cm_field("mid_field", 2, "phys_mid_field", map_type)) },
+        schema! {
+            (cm_field("mid_field", 2, "phys_mid_field", map_type)),
+        },
         true,
     );
     schema! {
@@ -981,22 +1001,26 @@ pub(crate) mod column_mapping_physical_name_dedup_fixtures {
 
     /// Two fields with the same physical name at different physical paths should be accepted.
     pub(crate) fn same_phy_name_different_paths() -> StructType {
-        let nested = StructType::new_unchecked([cm_field("id", 3, "id", DataType::INTEGER)]);
-        StructType::new_unchecked([
-            cm_field("id", 1, "id", DataType::INTEGER),
-            cm_field("nested", 2, "nested", nested),
-        ])
+        let nested = schema! {
+            (cm_field("id", 3, "id", DataType::INTEGER)),
+        };
+        schema! {
+            (cm_field("id", 1, "id", DataType::INTEGER)),
+            (cm_field("nested", 2, "nested", nested)),
+        }
     }
 
     /// Two nested fields with same physical path should be rejected.
     pub(crate) fn deeply_nested_repeat_physical_paths() -> StructType {
-        let inner = StructType::new_unchecked([
-            cm_field("a", 2, "x", DataType::INTEGER),
-            cm_field("b", 3, "x", DataType::INTEGER),
-        ]);
+        let inner = schema! {
+            (cm_field("a", 2, "x", DataType::INTEGER)),
+            (cm_field("b", 3, "x", DataType::INTEGER)),
+        };
         let arr_of_struct = ArrayType::new(inner, true);
         let map_to_arr = MapType::new(DataType::STRING, arr_of_struct, true);
-        StructType::new_unchecked([cm_field("outer", 1, "outer", map_to_arr)])
+        schema! {
+            (cm_field("outer", 1, "outer", map_to_arr)),
+        }
     }
 
     /// Full logical paths of the two colliding fields in
@@ -1017,12 +1041,31 @@ pub(crate) mod column_mapping_physical_name_dedup_fixtures {
     /// Dedup must error at the shallower site and never report the deeper one.
     pub(crate) fn multiple_physical_name_collisions() -> StructType {
         schema! {
-            (cm_field("a", 1, "p", schema! { (cm_field("aa", 6, "aa", DataType::INTEGER)) })),
-            (cm_field("b", 2, "p", schema! { (cm_field("bb", 7, "bb", DataType::INTEGER)) })),
-            (cm_field("nested", 3, "nested", schema! {
-                (cm_field("x", 4, "q", DataType::INTEGER)),
-                (cm_field("y", 5, "q", DataType::INTEGER)),
-            })),
+            (cm_field(
+                "a",
+                1,
+                "p",
+                schema! {
+                    (cm_field("aa", 6, "aa", DataType::INTEGER)),
+                },
+            )),
+            (cm_field(
+                "b",
+                2,
+                "p",
+                schema! {
+                    (cm_field("bb", 7, "bb", DataType::INTEGER)),
+                },
+            )),
+            (cm_field(
+                "nested",
+                3,
+                "nested",
+                schema! {
+                    (cm_field("x", 4, "q", DataType::INTEGER)),
+                    (cm_field("y", 5, "q", DataType::INTEGER)),
+                },
+            )),
         }
     }
 

@@ -76,14 +76,10 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
 /// Discovery restores JSON stats when structured stats cannot satisfy the scan.
 pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let add_schema = Add::to_schema();
-    let fields_no_stats: Vec<_> = add_schema
-        .fields()
-        .filter(|f| f.name() != "stats")
-        .cloned()
-        .collect();
-    let add_no_stats = StructType::new_unchecked(fields_no_stats);
     schema_ref! {
-        nullable ADD_NAME: (add_no_stats),
+        nullable ADD_NAME: {
+            ..(add_schema.fields().filter(|f| f.name() != "stats")),
+        },
     }
 });
 

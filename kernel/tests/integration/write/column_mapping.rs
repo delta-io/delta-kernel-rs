@@ -16,7 +16,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{schema_ref, MetadataValue, StructType};
+use delta_kernel::schema::{schema, schema_ref, DataType, MetadataValue, StructField};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, FileMeta, Snapshot};
@@ -499,20 +499,16 @@ async fn test_read_and_append_tolerates_stale_column_mapping_when_disabled(
 
     // A `value` column carrying a stale physicalName + id, with no columnMapping feature in the
     // protocol and mode absent (so it resolves to None).
-    let stale_schema = schema_ref! {
+    let stale_schema = schema! {
         nullable "id": INTEGER,
-        nullable "value": INTEGER
-    };
-    let stale_schema = StructType::try_new([
-        stale_schema.field("id").unwrap().clone(),
-        stale_schema.field("value").unwrap().clone().add_metadata([
+        (StructField::nullable("value", DataType::INTEGER).add_metadata([
             ("delta.columnMapping.id", MetadataValue::Number(2)),
             (
                 "delta.columnMapping.physicalName",
                 MetadataValue::String("col-2f8a".to_string()),
             ),
-        ]),
-    ])?;
+        ])),
+    };
     let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?)?;
     // Create a v0 commit directly to bypass create_table validation (which would reject the
     // stale annotations on the write path).

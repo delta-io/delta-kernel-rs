@@ -107,7 +107,7 @@ mod tests {
 
     use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
     use delta_kernel::plans::proto::{operation as proto, schema as proto_schema};
-    use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
+    use delta_kernel::schema::{schema, DataType as KernelDataType};
     use delta_kernel::Error;
     use prost::Message;
     use url::Url;
@@ -291,9 +291,7 @@ mod tests {
 
     #[test]
     fn execute_op_parquet_footer_variant() {
-        let schema =
-            StructType::try_new(vec![StructField::nullable("id", KernelDataType::INTEGER)])
-                .unwrap();
+        let schema = schema! { nullable "id": INTEGER };
         let bytes = proto_schema::StructType::from(&schema).encode_to_vec();
         let schema_proto = unsafe { allocate_kernel_bytes(kernel_bytes_slice!(bytes)) };
         let footer = CParquetFooter { schema_proto };

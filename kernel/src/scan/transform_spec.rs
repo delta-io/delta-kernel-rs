@@ -233,7 +233,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{col, BinaryExpressionOp};
-    use crate::schema::{schema_ref, DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::{schema, schema_ref, DataType, PrimitiveType};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     // Tests for parse_partition_value function
@@ -362,7 +362,7 @@ mod tests {
     fn test_parse_partition_value_raw_invalid_type() {
         let result = parse_partition_value_raw(
             Some(&"value".to_string()),
-            &DataType::struct_type_unchecked(vec![]), // Non-primitive type
+            &DataType::from(schema! {}), // Non-primitive type
         );
         assert_result_error_with_message(result, "Unexpected partition column type");
     }
@@ -386,7 +386,7 @@ mod tests {
         let partition_values = HashMap::new(); // Missing required partition value
 
         // Create a minimal physical schema for test
-        let physical_schema = StructType::new_unchecked(vec![]);
+        let physical_schema = schema! {};
         let result = get_transform_expr(
             &transform_spec,
             partition_values,
@@ -411,10 +411,10 @@ mod tests {
         let metadata_values = HashMap::new();
 
         // Create a physical schema with the relevant columns
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("col1", DataType::STRING),
-            StructField::nullable("col2", DataType::LONG),
-        ]);
+        let physical_schema = schema! {
+            nullable "col1": STRING,
+            nullable "col2": LONG,
+        };
         let result = get_transform_expr(
             &transform_spec,
             metadata_values,
@@ -451,10 +451,10 @@ mod tests {
         }];
 
         // Physical schema contains change_type
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("_change_type", DataType::STRING),
-        ]);
+        let physical_schema = schema! {
+            nullable "id": STRING,
+            nullable "_change_type": STRING,
+        };
         let metadata_values = HashMap::new();
 
         let result = get_transform_expr(
@@ -494,8 +494,7 @@ mod tests {
         }];
 
         // Physical schema does not contain change_type
-        let physical_schema =
-            StructType::new_unchecked(vec![StructField::nullable("id", DataType::STRING)]);
+        let physical_schema = schema! { nullable "id": STRING };
         let mut metadata_values = HashMap::new();
         metadata_values.insert(
             1,
@@ -538,8 +537,7 @@ mod tests {
             insert_after: Some("id".to_string()),
         }];
 
-        let physical_schema =
-            StructType::new_unchecked(vec![StructField::nullable("id", DataType::STRING)]);
+        let physical_schema = schema! { nullable "id": STRING };
         let mut metadata_values = HashMap::new();
         metadata_values.insert(1, ("year".to_string(), Scalar::Integer(2024)));
 
@@ -576,8 +574,7 @@ mod tests {
         }];
 
         // Physical schema without _change_type (so it needs to come from metadata)
-        let physical_schema =
-            StructType::new_unchecked(vec![StructField::nullable("id", DataType::STRING)]);
+        let physical_schema = schema! { nullable "id": STRING };
 
         // Empty metadata values - missing required _change_type
         let metadata_values = HashMap::new();
@@ -600,10 +597,10 @@ mod tests {
         }];
 
         // Physical schema contains row index col, but no row-id col
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::not_null("row_index_col", DataType::LONG),
-        ]);
+        let physical_schema = schema! {
+            nullable "id": STRING,
+            not_null "row_index_col": LONG,
+        };
         let metadata_values = HashMap::new();
 
         let result = get_transform_expr(
@@ -641,10 +638,10 @@ mod tests {
         }];
 
         // Physical schema contains row index col, but no row-id col
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::not_null("row_index_col", DataType::LONG),
-        ]);
+        let physical_schema = schema! {
+            nullable "id": STRING,
+            not_null "row_index_col": LONG,
+        };
         let metadata_values = HashMap::new();
 
         assert_result_error_with_message(

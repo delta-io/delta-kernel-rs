@@ -1432,7 +1432,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::expressions::Scalar;
-    use crate::schema::{schema_ref, DataType, MapType, StructField};
+    use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
@@ -1636,10 +1636,8 @@ mod tests {
 
     fn nested_schema(depth: usize) -> StructType {
         (0..depth).fold(
-            StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)]),
-            |schema, depth| {
-                StructType::new_unchecked([StructField::nullable(format!("level_{depth}"), schema)])
-            },
+            schema! { nullable "leaf": INTEGER },
+            |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
         )
     }
 
@@ -1684,13 +1682,13 @@ mod tests {
     fn deletion_vector_field() -> StructField {
         StructField::nullable(
             "deletionVector",
-            DataType::struct_type_unchecked([
-                StructField::not_null("storageType", DataType::STRING),
-                StructField::not_null("pathOrInlineDv", DataType::STRING),
-                StructField::nullable("offset", DataType::INTEGER),
-                StructField::not_null("sizeInBytes", DataType::INTEGER),
-                StructField::not_null("cardinality", DataType::LONG),
-            ]),
+            schema! {
+                not_null "storageType": STRING,
+                not_null "pathOrInlineDv": STRING,
+                nullable "offset": INTEGER,
+                not_null "sizeInBytes": INTEGER,
+                not_null "cardinality": LONG,
+            },
         )
     }
 
@@ -1737,12 +1735,12 @@ mod tests {
     #[test]
     fn test_sidecar_schema() {
         let schema = Sidecar::to_schema();
-        let expected = StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("sizeInBytes", DataType::LONG),
-            StructField::not_null("modificationTime", DataType::LONG),
-            tags_field(),
-        ]);
+        let expected = schema! {
+            not_null "path": STRING,
+            not_null "sizeInBytes": LONG,
+            not_null "modificationTime": LONG,
+            (tags_field()),
+        };
         assert_eq!(schema, expected);
     }
 

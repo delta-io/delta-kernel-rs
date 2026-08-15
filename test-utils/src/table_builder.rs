@@ -1881,7 +1881,6 @@ pub(crate) fn default_schema() -> SchemaRef {
 mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
-    use delta_kernel::schema::StructField;
     use rstest::rstest;
 
     use super::*;
@@ -2366,11 +2365,12 @@ mod tests {
 
     #[test]
     fn test_nested_struct_schema_round_trip() -> DeltaResult<()> {
-        let inner = DataType::try_struct_type([StructField::nullable("a", DataType::LONG)])?;
-        let schema: SchemaRef = Arc::new(StructType::try_new([
-            StructField::nullable("id", DataType::LONG),
-            StructField::nullable("inner", inner),
-        ])?);
+        let schema = schema_ref! {
+            nullable "id": LONG,
+            nullable "inner": {
+                nullable "a": LONG,
+            },
+        };
         let table = TestTableBuilder::new()
             .with_schema(schema.clone())
             .build()?;

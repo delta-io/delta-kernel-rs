@@ -47,7 +47,7 @@ use url::Url;
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;
-use crate::schema::{DataType, Schema, StructField, StructType};
+use crate::schema::{try_schema, DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{Operation, TableFeature};
@@ -382,13 +382,10 @@ impl TableChanges {
             return Err(mode.boundary_schema_error(start_schema.as_ref(), end_schema.as_ref()));
         }
 
-        let schema = StructType::try_new(
-            end_snapshot
-                .schema()
-                .fields()
-                .cloned()
-                .chain(CDF_FIELDS.clone()),
-        )?;
+        let schema = try_schema! {
+            ..(end_schema.fields()),
+            ..(CDF_FIELDS.clone()),
+        }?;
 
         Ok(TableChanges {
             table_root,

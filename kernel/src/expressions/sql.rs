@@ -347,7 +347,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{DecimalData, Expression};
-    use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+    use crate::schema::{schema, ArrayType, DataType, DecimalType, MapType};
 
     fn date_days(year: i32, month: u32, day: u32) -> i32 {
         let nd = NaiveDate::from_ymd_opt(year, month, day)
@@ -764,19 +764,15 @@ mod tests {
     }
 
     fn struct_ty() -> DataType {
-        DataType::try_struct_type([StructField::nullable("a", DataType::INTEGER)]).unwrap()
+        DataType::from(schema! { nullable "a": INTEGER })
     }
 
     fn array_ty() -> DataType {
-        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true)))
+        DataType::from(ArrayType::new(DataType::INTEGER, true))
     }
 
     fn map_ty() -> DataType {
-        DataType::Map(Box::new(MapType::new(
-            DataType::STRING,
-            DataType::INTEGER,
-            true,
-        )))
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true))
     }
 
     #[rstest]

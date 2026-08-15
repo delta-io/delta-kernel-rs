@@ -569,9 +569,7 @@ mod tests {
     use crate::engine::test_utils::{struct_list_fixture_as, CollectNVisitor, ListFlavor};
     use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
     use crate::expressions::{column_name, ArrayData};
-    use crate::schema::{
-        schema_ref, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, StructField, StructType,
-    };
+    use crate::schema::{schema, schema_ref, ArrayType, ColumnName, ColumnNamesAndTypes, DataType};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
@@ -1852,8 +1850,7 @@ mod tests {
     impl RowVisitor for StructListVisitor {
         fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
             static NT: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-                let element =
-                    StructType::new_unchecked([StructField::not_null("n", DataType::INTEGER)]);
+                let element = schema! { not_null "n": INTEGER };
                 (
                     vec![ColumnName::new(["items"])],
                     vec![ArrayType::new(element, false).into()],
@@ -1927,8 +1924,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NT: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-                    let element =
-                        StructType::new_unchecked([StructField::not_null("n", DataType::INTEGER)]);
+                    let element = schema! { not_null "n": INTEGER };
                     (
                         vec![ColumnName::new(["items"])],
                         // contains_null = true

@@ -367,15 +367,17 @@ mod tests {
     }
 
     fn add_schema(with_partition_schema: bool) -> StructType {
-        let fields = [
-            Some(StructField::not_null("path", DataType::STRING)),
-            with_partition_schema.then(|| {
-                let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-                StructField::nullable(PARTITION_VALUES_FIELD, partition_values)
-            }),
-            Some(StructField::nullable(STATS_FIELD, DataType::STRING)),
-        ];
-        StructType::new_unchecked(fields.into_iter().flatten())
+        let partition_values = with_partition_schema.then(|| {
+            StructField::nullable(
+                PARTITION_VALUES_FIELD,
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            )
+        });
+        schema! {
+            not_null "path": STRING,
+            ..(partition_values),
+            nullable STATS_FIELD: STRING,
+        }
     }
 
     #[test]

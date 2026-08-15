@@ -35,7 +35,7 @@ use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::schema::types::SchemaDescriptor;
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+    schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
     PrimitiveType, Schema, SchemaRef, StructField, StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
@@ -531,11 +531,13 @@ fn get_indices(
                     // we just want to transparently recurse into lists, need to transform the
                     // kernel list data type into a schema
                     if let DataType::Array(array_type) = requested_field.data_type() {
-                        let requested_schema = StructType::new_unchecked([StructField::new(
-                            list_field.name().clone(), // so we find it in the inner call
-                            array_type.element_type.clone(),
-                            array_type.contains_null,
-                        )]);
+                        let requested_schema = schema! {
+                            (StructField::new(
+                                list_field.name().clone(), // so we find it in the inner call
+                                array_type.element_type.clone(),
+                                array_type.contains_null,
+                            )),
+                        };
                         let mask_before = mask_indices.len();
                         let (parquet_advance, mut children) = get_indices(
                             parquet_index + parquet_offset,
@@ -1686,14 +1688,11 @@ mod tests {
             );
         }
 
-        let requested_schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::STRING),
-                StructField::nullable("c", DataType::INTEGER),
-            ])
-            .unwrap(),
-        );
+        let requested_schema = schema_ref! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+            nullable "c": INTEGER,
+        };
         let input: Vec<&str> = vec![];
         let result = parse_json_impl(&StringArray::from(input), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
@@ -1728,9 +1727,7 @@ mod tests {
     #[test]
     fn test_parse_json_with_long_strings() {
         // See issue#1139: https://github.com/delta-io/delta-kernel-rs/issues/1139
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("long_val", DataType::STRING)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "long_val": STRING };
         let long_string = "a".repeat(1_000_000); // 1MB string
         let json_string = format!(r#"{{"long_val": "{long_string}"}}"#);
         let input: Vec<Option<&str>> = vec![Some(&json_string)];
@@ -1816,9 +1813,7 @@ mod tests {
     fn test_parse_json_impl_strict_leaf_errors_propagate() {
         // Type mismatches on strict (non-failure-prone) leaves still surface as batch-level
         // errors, so the expression-level caller can fall back to its all-null backstop.
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("a", DataType::LONG)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "a": LONG };
         let input: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
         assert!(parse_json_impl(&StringArray::from(input), schema).is_err());
     }
@@ -1833,9 +1828,7 @@ mod tests {
         inputs: &[&str],
         expected_null_rows: &[usize],
     ) {
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable(column_name, leaf_type)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable (column_name): (leaf_type) };
         let inputs: Vec<Option<&str>> = inputs.iter().copied().map(Some).collect();
         let batch = parse_json_impl(&StringArray::from(inputs.clone()), schema)
             .expect("parse_json_impl should not error on failure-prone leaf parse failures");
@@ -1904,15 +1897,12 @@ mod tests {
         // Single struct with mixed failure-prone and strict leaves. The bad EventTime on row 1
         // must not contaminate IngestTime / Price / UserId on the same row, nor any field on
         // rows 0 / 2. This is the per-cell isolation property end-to-end.
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("EventTime", DataType::TIMESTAMP),
-                StructField::nullable("IngestTime", DataType::TIMESTAMP),
-                StructField::nullable("Price", DataType::decimal(10, 2).unwrap()),
-                StructField::nullable("UserId", DataType::LONG),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "EventTime": TIMESTAMP,
+            nullable "IngestTime": TIMESTAMP,
+            nullable "Price": (DataType::decimal(10, 2).unwrap()),
+            nullable "UserId": LONG,
+        };
         let inputs: Vec<Option<&str>> = vec![
             Some(
                 r#"{"EventTime": "2024-01-01T00:00:00Z", "IngestTime": "2024-01-01T00:00:01Z", "Price": "10.50", "UserId": 1}"#,
@@ -1951,26 +1941,22 @@ mod tests {
         //     minValues: { EventTime: Timestamp, UserId: Long },
         //     maxValues: { EventTime: Timestamp, UserId: Long },
         //     tightBounds: Bool }
-        let null_count_struct = StructType::try_new(vec![
-            StructField::nullable("EventTime", DataType::LONG),
-            StructField::nullable("UserId", DataType::LONG),
-        ])
-        .unwrap();
-        let min_max_struct = StructType::try_new(vec![
-            StructField::nullable("EventTime", DataType::TIMESTAMP),
-            StructField::nullable("UserId", DataType::LONG),
-        ])
-        .unwrap();
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("numRecords", DataType::LONG),
-                StructField::nullable("nullCount", null_count_struct),
-                StructField::nullable("minValues", min_max_struct.clone()),
-                StructField::nullable("maxValues", min_max_struct),
-                StructField::nullable("tightBounds", DataType::BOOLEAN),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "numRecords": LONG,
+            nullable "nullCount": {
+                nullable "EventTime": LONG,
+                nullable "UserId": LONG,
+            },
+            nullable "minValues": {
+                nullable "EventTime": TIMESTAMP,
+                nullable "UserId": LONG,
+            },
+            nullable "maxValues": {
+                nullable "EventTime": TIMESTAMP,
+                nullable "UserId": LONG,
+            },
+            nullable "tightBounds": BOOLEAN,
+        };
 
         let inputs: Vec<Option<&str>> = vec![
             Some(
@@ -2017,13 +2003,10 @@ mod tests {
     fn test_parse_json_safe_cast_all_null_input() {
         // Every row decodes to `{}` (the unwrap_or default for `None`), so every output cell
         // is NULL and no error surfaces from the safe-cast pass.
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("ts", DataType::TIMESTAMP),
-                StructField::nullable("n", DataType::LONG),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "ts": TIMESTAMP,
+            nullable "n": LONG,
+        };
         let inputs: Vec<Option<&str>> = vec![None, None, None];
         let batch = parse_json_impl(&StringArray::from(inputs), schema).unwrap();
         assert_eq!(batch.num_rows(), 3);
@@ -2049,14 +2032,14 @@ mod tests {
     #[test]
     fn simple_mask_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2223,12 +2206,12 @@ mod tests {
     #[test]
     fn ensure_data_types_fails_correctly() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2244,12 +2227,12 @@ mod tests {
                 "Invalid argument error: Incorrect datatype. Expected integer, got Utf8",
             );
 
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2268,11 +2251,13 @@ mod tests {
     #[test]
     fn mask_with_map() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([StructField::not_null(
-                logical_name(0),
-                MapType::new(DataType::INTEGER, DataType::STRING, false),
-            )
-            .with_metadata(column_mapping_metadata(0, mode))])
+            let requested_schema = schema! {
+                (StructField::not_null(
+                    logical_name(0),
+                    MapType::new(DataType::INTEGER, DataType::STRING, false),
+                )
+                .with_metadata(column_mapping_metadata(0, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2299,14 +2284,14 @@ mod tests {
     #[test]
     fn simple_reorder_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2334,14 +2319,14 @@ mod tests {
     #[test]
     fn simple_nullable_field_missing() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2371,14 +2356,14 @@ mod tests {
 
     #[test]
     fn get_requested_indices_by_id_only() {
-        let requested_schema = StructType::new_unchecked([
-            StructField::not_null("i_logical", DataType::INTEGER)
-                .with_metadata(kernel_fid_and_name(1, "i_physical")),
-            StructField::nullable("s_logical", DataType::STRING)
-                .with_metadata(kernel_fid_and_name(2, "s_physical")),
-            StructField::nullable("i2_logical", DataType::INTEGER)
-                .with_metadata(kernel_fid_and_name(3, "i2_physical")),
-        ])
+        let requested_schema = schema! {
+            (StructField::not_null("i_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(1, "i_physical"))),
+            (StructField::nullable("s_logical", DataType::STRING)
+                .with_metadata(kernel_fid_and_name(2, "s_physical"))),
+            (StructField::nullable("i2_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(3, "i2_physical"))),
+        }
         .make_physical(ColumnMappingMode::Id)
         .unwrap()
         .into();
@@ -2405,14 +2390,14 @@ mod tests {
 
     #[test]
     fn get_requested_indices_by_id_falls_back_to_name() {
-        let requested_schema = StructType::new_unchecked([
-            StructField::not_null("i_logical", DataType::INTEGER)
-                .with_metadata(kernel_fid_and_name(1, "i_physical")),
-            StructField::nullable("s_logical", DataType::STRING)
-                .with_metadata(kernel_fid_and_name(2, "s_physical")),
-            StructField::nullable("i2_logical", DataType::INTEGER)
-                .with_metadata(kernel_fid_and_name(3, "i2_physical")),
-        ])
+        let requested_schema = schema! {
+            (StructField::not_null("i_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(1, "i_physical"))),
+            (StructField::nullable("s_logical", DataType::STRING)
+                .with_metadata(kernel_fid_and_name(2, "s_physical"))),
+            (StructField::nullable("i2_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(3, "i2_physical"))),
+        }
         .make_physical(ColumnMappingMode::Id)
         .unwrap()
         .into();
@@ -2462,11 +2447,14 @@ mod tests {
 
     #[test]
     fn test_match_parquet_fields_filters_metadata_columns() {
-        let kernel_schema = StructType::new_unchecked([
-            StructField::not_null("regular_field", DataType::INTEGER),
-            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
-            StructField::nullable("another_field", DataType::STRING),
-        ]);
+        let kernel_schema = schema! {
+            not_null "regular_field": INTEGER,
+            (StructField::create_metadata_column(
+                "row_index",
+                MetadataColumnSpec::RowIndex,
+            )),
+            nullable "another_field": STRING,
+        };
 
         let parquet_fields: ArrowFields = vec![
             ArrowField::new("regular_field", ArrowDataType::Int32, false),
@@ -2765,22 +2753,22 @@ mod tests {
     #[test]
     fn nested_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(3),
-                    StructType::new_unchecked([
-                        StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4, mode)),
-                        StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5, mode)),
-                    ]),
+                    schema! {
+                        (StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4, mode))),
+                        (StructField::not_null(logical_name(5), DataType::STRING)
+                            .with_metadata(column_mapping_metadata(5, mode))),
+                    },
                 )
-                .with_metadata(column_mapping_metadata(3, mode)),
-                StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(3, mode))),
+                (StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2803,22 +2791,22 @@ mod tests {
     #[test]
     fn nested_indices_reorder() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(
                     logical_name(3),
-                    StructType::new_unchecked([
-                        StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5, mode)),
-                        StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4, mode)),
-                    ]),
+                    schema! {
+                        (StructField::not_null(logical_name(5), DataType::STRING)
+                            .with_metadata(column_mapping_metadata(5, mode))),
+                        (StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4, mode))),
+                    },
                 )
-                .with_metadata(column_mapping_metadata(3, mode)),
-                StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(3, mode))),
+                (StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2842,21 +2830,20 @@ mod tests {
     #[test]
     fn nested_indices_mask_inner() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(3),
-                    StructType::new_unchecked([StructField::not_null(
-                        logical_name(4),
-                        DataType::INTEGER,
-                    )
-                    .with_metadata(column_mapping_metadata(4, mode))]),
+                    schema! {
+                        (StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4, mode))),
+                    },
                 )
-                .with_metadata(column_mapping_metadata(3, mode)),
-                StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(3, mode))),
+                (StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2920,14 +2907,14 @@ mod tests {
     #[test]
     fn simple_list_mask() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
-                    .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
+                    .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2963,11 +2950,10 @@ mod tests {
     #[test]
     fn list_skip_earlier_element() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([StructField::not_null(
-                logical_name(1),
-                ArrayType::new(DataType::INTEGER, false),
-            )
-            .with_metadata(column_mapping_metadata(1, mode))])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), ArrayType::new(DataType::INTEGER, false))
+                    .with_metadata(column_mapping_metadata(1, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2996,25 +2982,25 @@ mod tests {
     #[test]
     fn nested_indices_list() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::not_null(
                     logical_name(1),
                     ArrayType::new(
-                        StructType::new_unchecked([
-                            StructField::not_null(logical_name(3), DataType::INTEGER)
-                                .with_metadata(column_mapping_metadata(3, mode)),
-                            StructField::not_null(logical_name(4), DataType::STRING)
-                                .with_metadata(column_mapping_metadata(4, mode)),
-                        ]),
+                        schema! {
+                            (StructField::not_null(logical_name(3), DataType::INTEGER)
+                                .with_metadata(column_mapping_metadata(3, mode))),
+                            (StructField::not_null(logical_name(4), DataType::STRING)
+                                .with_metadata(column_mapping_metadata(4, mode))),
+                        },
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3061,12 +3047,12 @@ mod tests {
     #[test]
     fn nested_indices_unselected_list() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3106,24 +3092,23 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
-                        StructType::new_unchecked([StructField::not_null(
-                            logical_name(4),
-                            DataType::INTEGER,
-                        )
-                        .with_metadata(column_mapping_metadata(4, mode))]),
+                        schema! {
+                            (StructField::not_null(logical_name(4), DataType::INTEGER)
+                                .with_metadata(column_mapping_metadata(4, mode))),
+                        },
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3167,25 +3152,25 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner_reorder() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
-                        StructType::new_unchecked([
-                            StructField::not_null(logical_name(6), DataType::STRING)
-                                .with_metadata(column_mapping_metadata(6, mode)),
-                            StructField::not_null(logical_name(5), DataType::INTEGER)
-                                .with_metadata(column_mapping_metadata(5, mode)),
-                        ]),
+                        schema! {
+                            (StructField::not_null(logical_name(6), DataType::STRING)
+                                .with_metadata(column_mapping_metadata(6, mode))),
+                            (StructField::not_null(logical_name(5), DataType::INTEGER)
+                                .with_metadata(column_mapping_metadata(5, mode))),
+                        },
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3234,22 +3219,22 @@ mod tests {
     #[test]
     fn skipped_struct() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(2),
-                    StructType::new_unchecked([
-                        StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4, mode)),
-                        StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5, mode)),
-                    ]),
+                    schema! {
+                        (StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4, mode))),
+                        (StructField::not_null(logical_name(5), DataType::STRING)
+                            .with_metadata(column_mapping_metadata(5, mode))),
+                    },
                 )
-                .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3569,12 +3554,12 @@ mod tests {
     #[test]
     fn no_matches() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3826,40 +3811,40 @@ mod tests {
     /// correctly insert (or omit) the `_file` column at the position declared in the schema.
     #[rstest]
     #[case::no_file_path(JsonInsertCase {
-        schema: StructType::new_unchecked([
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::INTEGER),
-        ]),
+        schema: schema! {
+            not_null "a": INTEGER,
+            nullable "b": INTEGER,
+        },
         expected_json_names: &["a", "b"],
         expected_output_names: &["a", "b"],
         file_path_col: None,
     })]
     #[case::file_path_at_start(JsonInsertCase {
-        schema: StructType::new_unchecked([
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::INTEGER),
-        ]),
+        schema: schema! {
+            (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+            not_null "a": INTEGER,
+            nullable "b": INTEGER,
+        },
         expected_json_names: &["a", "b"],
         expected_output_names: &["_file", "a", "b"],
         file_path_col: Some(0),
     })]
     #[case::file_path_in_middle(JsonInsertCase {
-        schema: StructType::new_unchecked([
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-            StructField::nullable("b", DataType::INTEGER),
-        ]),
+        schema: schema! {
+            not_null "a": INTEGER,
+            (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+            nullable "b": INTEGER,
+        },
         expected_json_names: &["a", "b"],
         expected_output_names: &["a", "_file", "b"],
         file_path_col: Some(1),
     })]
     #[case::file_path_at_end(JsonInsertCase {
-        schema: StructType::new_unchecked([
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::INTEGER),
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-        ]),
+        schema: schema! {
+            not_null "a": INTEGER,
+            nullable "b": INTEGER,
+            (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+        },
         expected_json_names: &["a", "b"],
         expected_output_names: &["a", "b", "_file"],
         file_path_col: Some(2),
@@ -3915,10 +3900,13 @@ mod tests {
         // RowIndex is not supported for JSON reads. All metadata column specs are non-nullable,
         // so the Missing transform inserts a null array — reorder_struct_array errors because
         // the field is declared non-nullable.
-        let schema = StructType::new_unchecked([
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
-        ]);
+        let schema = schema! {
+            not_null "a": INTEGER,
+            (StructField::create_metadata_column(
+                "row_index",
+                MetadataColumnSpec::RowIndex,
+            )),
+        };
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "a",
             ArrowDataType::Int32,
@@ -3991,15 +3979,9 @@ mod tests {
         // When a struct exists in parquet but none of its children match the requested
         // schema, the struct should be treated as missing regardless of its nullability.
         let info_field = if struct_nullable {
-            StructField::nullable(
-                "info",
-                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
-            )
+            StructField::nullable("info", schema! { nullable "z": LONG })
         } else {
-            StructField::not_null(
-                "info",
-                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
-            )
+            StructField::not_null("info", schema! { nullable "z": LONG })
         };
         let requested_schema = schema_ref! {
             not_null "a": LONG,

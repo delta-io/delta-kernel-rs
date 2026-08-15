@@ -909,7 +909,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{column_name, ColumnName};
-    use crate::schema::{DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{schema, DataType, MetadataValue, StructField, StructType};
     use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         make_test_tc, test_deep_nested_schema_missing_leaf_cm,
@@ -1040,7 +1040,9 @@ mod tests {
             create_annotations(outer_id, outer_name)
         );
         println!("{schema}");
-        StructType::new_unchecked([serde_json::from_str(&schema).unwrap()])
+        schema! {
+            (serde_json::from_str::<StructField>(&schema).unwrap()),
+        }
     }
 
     #[test]
@@ -1150,13 +1152,10 @@ mod tests {
 
     #[test]
     fn test_annotation_validation_reaches_struct_fields_in_map_value() {
-        let unannotated =
-            StructType::new_unchecked([StructField::new("x", DataType::INTEGER, false)]);
-        let schema = StructType::new_unchecked([make_cm_field(
-            "b",
-            1,
-            MapType::new(DataType::STRING, unannotated, false),
-        )]);
+        let unannotated = schema! { not_null "x": INTEGER };
+        let schema = schema! {
+            (make_cm_field("b", 1, MapType::new(DataType::STRING, unannotated, false))),
+        };
         validate_schema_column_mapping(&schema, ColumnMappingMode::Id)
             .expect_err("missing annotation on struct field inside map value");
     }
@@ -1175,34 +1174,40 @@ mod tests {
         key: ColumnMetadataKey,
     ) {
         // Top-level field carrying only this key.
-        let top_level = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
-            .add_metadata([(key.as_ref(), MetadataValue::Number(1))])]);
+        let top_level = schema! {
+            (StructField::nullable("a", DataType::INTEGER)
+                .add_metadata([(key.as_ref(), MetadataValue::Number(1))])),
+        };
         assert!(schema_has_column_mapping_metadata(&top_level));
 
         // Same key on a nested struct leaf (clean top level).
-        let nested = StructType::new_unchecked([StructField::nullable(
-            "outer",
-            StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)
-                .add_metadata([(key.as_ref(), MetadataValue::Number(1))])]),
-        )]);
+        let nested = schema! {
+            (StructField::nullable(
+                "outer",
+                schema! {
+                    (StructField::nullable("leaf", DataType::INTEGER)
+                        .add_metadata([(key.as_ref(), MetadataValue::Number(1))])),
+                },
+            )),
+        };
         assert!(schema_has_column_mapping_metadata(&nested));
     }
 
     #[test]
     fn test_schema_has_column_mapping_metadata_edge_cases() {
         // Clean schema -> false.
-        let clean = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
+        let clean = schema! { nullable "a": INTEGER };
         assert!(!schema_has_column_mapping_metadata(&clean));
 
         // Detection is by key presence, not value type: a wrong-typed id still counts (it must, so
         // the stripper -- which removes by presence -- never leaves a key the detector deemed
         // absent).
-        let wrong_typed =
-            StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
-                .add_metadata([(
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::String("not-a-number".to_string()),
-                )])]);
+        let wrong_typed = schema! {
+            (StructField::nullable("a", DataType::INTEGER).add_metadata([(
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::String("not-a-number".to_string()),
+            )])),
+        };
         assert!(schema_has_column_mapping_metadata(&wrong_typed));
     }
 
@@ -1220,13 +1225,15 @@ mod tests {
             ),
             ("delta.identity.start", MetadataValue::Number(7)),
         ]);
-        let schema = StructType::new_unchecked([
-            annotated_top,
-            StructField::nullable(
+        let schema = schema! {
+            (annotated_top),
+            (StructField::nullable(
                 "outer",
-                StructType::new_unchecked([make_cm_field("leaf", 2, DataType::INTEGER)]),
-            ),
-        ]);
+                schema! {
+                    (make_cm_field("leaf", 2, DataType::INTEGER)),
+                },
+            )),
+        };
 
         let stripped = drop_column_mapping_metadata(&schema);
         assert!(!schema_has_column_mapping_metadata(&stripped));
@@ -1250,12 +1257,16 @@ mod tests {
     #[test]
     fn test_drop_column_mapping_metadata_strips_array_and_map_nested_leaves() {
         // Annotated struct leaves living inside an array element and a map value.
-        let elem = StructType::new_unchecked([make_cm_field("in_arr", 3, DataType::INTEGER)]);
-        let val = StructType::new_unchecked([make_cm_field("in_map", 4, DataType::INTEGER)]);
-        let schema = StructType::new_unchecked([
-            StructField::nullable("arr", ArrayType::new(elem, true)),
-            StructField::nullable("m", MapType::new(DataType::STRING, val, true)),
-        ]);
+        let elem = schema! {
+            (make_cm_field("in_arr", 3, DataType::INTEGER)),
+        };
+        let val = schema! {
+            (make_cm_field("in_map", 4, DataType::INTEGER)),
+        };
+        let schema = schema! {
+            nullable "arr": (ArrayType::new(elem, true)),
+            nullable "m": (MapType::new(DataType::STRING, val, true)),
+        };
         assert!(schema_has_column_mapping_metadata(&schema));
 
         let stripped = drop_column_mapping_metadata(&schema);
@@ -1266,8 +1277,10 @@ mod tests {
     fn test_strip_stray_column_mapping_metadata() {
         // Mode gating lives at the call sites; this helper only decides strip-vs-leave from the
         // current-vs-candidate comparison.
-        let clean = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
-        let annotated = StructType::new_unchecked([make_cm_field("a", 1, DataType::INTEGER)]);
+        let clean = schema! { nullable "a": INTEGER };
+        let annotated = schema! {
+            (make_cm_field("a", 1, DataType::INTEGER)),
+        };
 
         // CREATE (no prior schema) introducing annotations -> stripped.
         let stripped = strip_stray_column_mapping_metadata(false, &annotated)
@@ -1298,42 +1311,50 @@ mod tests {
     }
 
     fn cm_schema_same_level_duplicates() -> StructType {
-        StructType::new_unchecked([
-            make_cm_field("a", 1, DataType::INTEGER),
-            make_cm_field("b", 1, DataType::INTEGER),
-        ])
+        schema! {
+            (make_cm_field("a", 1, DataType::INTEGER)),
+            (make_cm_field("b", 1, DataType::INTEGER)),
+        }
     }
 
     fn cm_schema_nested_duplicates() -> StructType {
-        let nested = StructType::new_unchecked([
-            make_cm_field("x", 5, DataType::INTEGER),
-            make_cm_field("y", 5, DataType::INTEGER),
-        ]);
-        StructType::new_unchecked([make_cm_field("outer", 10, nested)])
+        let nested = schema! {
+            (make_cm_field("x", 5, DataType::INTEGER)),
+            (make_cm_field("y", 5, DataType::INTEGER)),
+        };
+        schema! {
+            (make_cm_field("outer", 10, nested)),
+        }
     }
 
     fn cm_schema_cross_level_duplicates() -> StructType {
-        let nested = StructType::new_unchecked([make_cm_field("inner", 1, DataType::INTEGER)]);
-        StructType::new_unchecked([
-            make_cm_field("a", 1, DataType::INTEGER),
-            make_cm_field("b", 2, nested),
-        ])
+        let nested = schema! {
+            (make_cm_field("inner", 1, DataType::INTEGER)),
+        };
+        schema! {
+            (make_cm_field("a", 1, DataType::INTEGER)),
+            (make_cm_field("b", 2, nested)),
+        }
     }
 
     fn cm_schema_array_duplicates() -> StructType {
-        let element = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
-        StructType::new_unchecked([
-            make_cm_field("a", 1, DataType::INTEGER),
-            make_cm_field("b", 2, ArrayType::new(element, false)),
-        ])
+        let element = schema! {
+            (make_cm_field("x", 1, DataType::INTEGER)),
+        };
+        schema! {
+            (make_cm_field("a", 1, DataType::INTEGER)),
+            (make_cm_field("b", 2, ArrayType::new(element, false))),
+        }
     }
 
     fn cm_schema_map_duplicates() -> StructType {
-        let value = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
-        StructType::new_unchecked([
-            make_cm_field("a", 1, DataType::INTEGER),
-            make_cm_field("b", 2, MapType::new(DataType::STRING, value, false)),
-        ])
+        let value = schema! {
+            (make_cm_field("x", 1, DataType::INTEGER)),
+        };
+        schema! {
+            (make_cm_field("a", 1, DataType::INTEGER)),
+            (make_cm_field("b", 2, MapType::new(DataType::STRING, value, false))),
+        }
     }
 
     #[rstest::rstest]
@@ -1474,28 +1495,31 @@ mod tests {
         let path = |segments: &[&str]| segments.iter().map(|s| s.to_string()).collect();
         match shape {
             SchemaShape::Flat => {
-                let schema = StructType::new_unchecked([
-                    StructField::nullable("unannotated_sibling", DataType::STRING),
-                    field_under_test,
-                ]);
+                let schema = schema! {
+                    nullable "unannotated_sibling": STRING,
+                    (field_under_test),
+                };
                 (schema, path(&[FIELD_UNDER_TEST]))
             }
             SchemaShape::NestedStruct => {
-                let inner = StructType::new_unchecked([field_under_test]);
-                let schema = StructType::new_unchecked([
-                    StructField::nullable("unannotated_sibling", DataType::STRING),
-                    StructField::nullable("outer", inner),
-                ]);
+                let inner = schema! {
+                    (field_under_test),
+                };
+                let schema = schema! {
+                    nullable "unannotated_sibling": STRING,
+                    nullable "outer": (inner),
+                };
                 (schema, path(&["outer", FIELD_UNDER_TEST]))
             }
             SchemaShape::DeeplyNestedStruct => {
-                let innermost = StructType::new_unchecked([field_under_test]);
-                let middle =
-                    StructType::new_unchecked([StructField::nullable("middle", innermost)]);
-                let schema = StructType::new_unchecked([
-                    StructField::nullable("unannotated_sibling", DataType::STRING),
-                    StructField::nullable("outer", middle),
-                ]);
+                let innermost = schema! {
+                    (field_under_test),
+                };
+                let middle = schema! { nullable "middle": (innermost) };
+                let schema = schema! {
+                    nullable "unannotated_sibling": STRING,
+                    nullable "outer": (middle),
+                };
                 (schema, path(&["outer", "middle", FIELD_UNDER_TEST]))
             }
         }
@@ -1722,7 +1746,9 @@ mod tests {
         #[case] preserved_physical_name: Option<&str>,
     ) {
         let field = make_field_under_test(None, preserved_physical_name);
-        let schema = StructType::new_unchecked([field]);
+        let schema = schema! {
+            (field),
+        };
 
         let mut max_id = i64::MAX;
         let err = assign_column_mapping_metadata(&schema, &mut max_id, false)
@@ -1798,7 +1824,10 @@ mod tests {
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                 MetadataValue::String("user-supplied".to_string()),
             )]);
-        let schema = StructType::new_unchecked([preserved, needs_allocation]);
+        let schema = schema! {
+            (preserved),
+            (needs_allocation),
+        };
 
         let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
         let err = assign_column_mapping_metadata(&schema, &mut max_id, false)
@@ -1813,15 +1842,15 @@ mod tests {
 
     #[test]
     fn test_assign_column_mapping_metadata_nested_struct() {
-        let inner = StructType::new_unchecked([
-            StructField::new("x", DataType::INTEGER, false),
-            StructField::new("y", DataType::STRING, true),
-        ]);
+        let inner = schema! {
+            not_null "x": INTEGER,
+            nullable "y": STRING,
+        };
 
-        let schema = StructType::new_unchecked([
-            StructField::new("a", DataType::INTEGER, false),
-            StructField::new("nested", inner, true),
-        ]);
+        let schema = schema! {
+            not_null "a": INTEGER,
+            nullable "nested": (inner),
+        };
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
@@ -1898,14 +1927,12 @@ mod tests {
         // Test: map<struct<k: int>, struct<v: int>>
         // Both key and value are structs that need column mapping metadata
 
-        let key_struct =
-            StructType::new_unchecked([StructField::new("k", DataType::INTEGER, false)]);
-        let value_struct =
-            StructType::new_unchecked([StructField::new("v", DataType::INTEGER, false)]);
+        let key_struct = schema! { not_null "k": INTEGER };
+        let value_struct = schema! { not_null "v": INTEGER };
 
         let map_type = MapType::new(key_struct, value_struct, true);
 
-        let schema = StructType::new_unchecked([StructField::new("my_map", map_type, true)]);
+        let schema = schema! { nullable "my_map": (map_type) };
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
@@ -1942,12 +1969,11 @@ mod tests {
     fn test_assign_column_mapping_metadata_array_with_struct_element() {
         // Test: array<struct<elem: int>>
 
-        let elem_struct =
-            StructType::new_unchecked([StructField::new("elem", DataType::INTEGER, false)]);
+        let elem_struct = schema! { not_null "elem": INTEGER };
 
         let array_type = ArrayType::new(elem_struct, true);
 
-        let schema = StructType::new_unchecked([StructField::new("my_array", array_type, true)]);
+        let schema = schema! { nullable "my_array": (array_type) };
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
@@ -1979,14 +2005,12 @@ mod tests {
     fn test_assign_column_mapping_metadata_double_nested_array() {
         // Test: array<array<struct<deep: int>>>
 
-        let deep_struct =
-            StructType::new_unchecked([StructField::new("deep", DataType::INTEGER, false)]);
+        let deep_struct = schema! { not_null "deep": INTEGER };
 
         let inner_array = ArrayType::new(deep_struct, true);
         let outer_array = ArrayType::new(inner_array, true);
 
-        let schema =
-            StructType::new_unchecked([StructField::new("nested_arrays", outer_array, true)]);
+        let schema = schema! { nullable "nested_arrays": (outer_array) };
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
@@ -2021,10 +2045,8 @@ mod tests {
         // Test: array<map<array<struct<k: int>>, array<struct<v: int>>>>
         // Deeply nested array-map-array-struct combination
 
-        let key_struct =
-            StructType::new_unchecked([StructField::new("k", DataType::INTEGER, false)]);
-        let value_struct =
-            StructType::new_unchecked([StructField::new("v", DataType::INTEGER, false)]);
+        let key_struct = schema! { not_null "k": INTEGER };
+        let value_struct = schema! { not_null "v": INTEGER };
 
         let key_array = ArrayType::new(key_struct, true);
         let value_array = ArrayType::new(value_struct, true);
@@ -2033,7 +2055,7 @@ mod tests {
 
         let outer_array = ArrayType::new(inner_map, true);
 
-        let schema = StructType::new_unchecked([StructField::new("cursed", outer_array, true)]);
+        let schema = schema! { nullable "cursed": (outer_array) };
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
@@ -2079,8 +2101,8 @@ mod tests {
 
     #[test]
     fn test_get_any_level_column_physical_name_success() {
-        let inner = StructType::new_unchecked([StructField::new("y", DataType::INTEGER, false)
-            .add_metadata([
+        let inner = schema! {
+            (StructField::new("y", DataType::INTEGER, false).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     MetadataValue::String("col-inner-y".to_string()),
@@ -2089,10 +2111,11 @@ mod tests {
                     ColumnMetadataKey::ColumnMappingId.as_ref(),
                     MetadataValue::Number(2),
                 ),
-            ])]);
+            ])),
+        };
 
-        let schema =
-            StructType::new_unchecked([StructField::new("a", inner, true).add_metadata([
+        let schema = schema! {
+            (StructField::new("a", inner, true).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     MetadataValue::String("col-outer-a".to_string()),
@@ -2101,7 +2124,8 @@ mod tests {
                     ColumnMetadataKey::ColumnMappingId.as_ref(),
                     MetadataValue::Number(1),
                 ),
-            ])]);
+            ])),
+        };
 
         // Top-level column
         let result = get_any_level_column_physical_name(
@@ -2136,7 +2160,7 @@ mod tests {
 
     #[test]
     fn test_get_any_level_column_physical_name_errors() {
-        let schema = StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)]);
+        let schema = schema! { not_null "a": INTEGER };
 
         // Non-existent top-level column
         let result = get_any_level_column_physical_name(
@@ -2181,9 +2205,11 @@ mod tests {
             )]);
         }
 
-        let inner = StructType::new_unchecked([inner_field]);
-        let schema =
-            StructType::new_unchecked([StructField::new("a", inner, true).add_metadata([
+        let inner = schema! {
+            (inner_field),
+        };
+        let schema = schema! {
+            (StructField::new("a", inner, true).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     MetadataValue::String("col-outer-a".to_string()),
@@ -2192,7 +2218,8 @@ mod tests {
                     ColumnMetadataKey::ColumnMappingId.as_ref(),
                     MetadataValue::Number(1),
                 ),
-            ])]);
+            ])),
+        };
 
         let err = get_any_level_column_physical_name(
             &schema,
@@ -2248,10 +2275,10 @@ mod tests {
 
     #[test]
     fn physical_to_logical_no_mapping() {
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
         let physical_col = column_name!("id");
         let (logical, data_type) = physical_to_logical_column_name_and_type(
             &schema,
@@ -2269,7 +2296,7 @@ mod tests {
             "delta.columnMapping.physicalName".to_string(),
             MetadataValue::String("col-abc-123".to_string()),
         )]);
-        let schema = StructType::new_unchecked(vec![field]);
+        let schema = schema! { (field) };
 
         let physical_col = ColumnName::new(["col-abc-123"]);
         let (logical, data_type) = physical_to_logical_column_name_and_type(
@@ -2284,8 +2311,7 @@ mod tests {
 
     #[test]
     fn physical_to_logical_not_found() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let schema = schema! { not_null "id": INTEGER };
         let physical_col = column_name!("nonexistent");
         let result = physical_to_logical_column_name_and_type(
             &schema,
@@ -2305,12 +2331,12 @@ mod tests {
             "delta.columnMapping.physicalName".to_string(),
             MetadataValue::String("col-inner-456".to_string()),
         )]);
-        let inner_struct = StructType::new_unchecked(vec![inner_field]);
+        let inner_struct = schema! { (inner_field) };
         let outer_field = StructField::new("address", inner_struct, true).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
             MetadataValue::String("col-outer-123".to_string()),
         )]);
-        let schema = StructType::new_unchecked(vec![outer_field]);
+        let schema = schema! { (outer_field) };
 
         let physical_col = ColumnName::new(["col-outer-123", "col-inner-456"]);
         let (logical, data_type) = physical_to_logical_column_name_and_type(
@@ -2325,8 +2351,7 @@ mod tests {
 
     #[test]
     fn physical_to_logical_non_struct_intermediate_errors() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let schema = schema! { not_null "id": INTEGER };
         let physical_col = column_name!("id.nested");
         let result = physical_to_logical_column_name_and_type(
             &schema,
@@ -2353,68 +2378,57 @@ mod tests {
 
     #[test]
     fn find_max_column_id_empty_schema_is_none() {
-        let schema =
-            StructType::try_new(vec![StructField::nullable("a", DataType::STRING)]).unwrap();
+        let schema = schema! { nullable "a": STRING };
         assert_eq!(find_max_column_id_in_schema(&schema), None);
     }
 
     #[test]
     fn find_max_column_id_top_level_only() {
-        let schema = StructType::try_new(vec![
-            field_with_id("a", DataType::STRING, 1),
-            field_with_id("b", DataType::INTEGER, 3),
-            field_with_id("c", DataType::STRING, 2),
-        ])
-        .unwrap();
+        let schema = schema! {
+            (field_with_id("a", DataType::STRING, 1)),
+            (field_with_id("b", DataType::INTEGER, 3)),
+            (field_with_id("c", DataType::STRING, 2)),
+        };
         assert_eq!(find_max_column_id_in_schema(&schema), Some(3));
     }
 
     #[test]
     fn find_max_column_id_nested_struct() {
-        let inner = DataType::from(
-            StructType::try_new(vec![
-                field_with_id("x", DataType::STRING, 7),
-                field_with_id("y", DataType::STRING, 5),
-            ])
-            .unwrap(),
-        );
-        let schema = StructType::try_new(vec![
-            field_with_id("outer", inner, 2),
-            field_with_id("sibling", DataType::STRING, 3),
-        ])
-        .unwrap();
+        let inner = schema! {
+            (field_with_id("x", DataType::STRING, 7)),
+            (field_with_id("y", DataType::STRING, 5)),
+        };
+        let schema = schema! {
+            (field_with_id("outer", inner, 2)),
+            (field_with_id("sibling", DataType::STRING, 3)),
+        };
         assert_eq!(find_max_column_id_in_schema(&schema), Some(7));
     }
 
     #[test]
     fn find_max_column_id_array_and_map_recurse_into_element_types() {
-        let array_elem_struct = DataType::from(ArrayType::new(
-            StructType::try_new(vec![field_with_id("deep", DataType::STRING, 42)]).unwrap(),
+        let array_elem_struct = ArrayType::new(
+            schema! { (field_with_id("deep", DataType::STRING, 42)) },
             true,
-        ));
-        let map_ty = DataType::from(MapType::new(
+        );
+        let map_ty = MapType::new(
             DataType::STRING,
-            StructType::try_new(vec![field_with_id("inside", DataType::STRING, 9)]).unwrap(),
+            schema! { (field_with_id("inside", DataType::STRING, 9)) },
             false,
-        ));
-        let schema = StructType::try_new(vec![
-            field_with_id("arr", array_elem_struct, 1),
-            field_with_id("m", map_ty, 2),
-        ])
-        .unwrap();
+        );
+        let schema = schema! {
+            (field_with_id("arr", array_elem_struct, 1)),
+            (field_with_id("m", map_ty, 2)),
+        };
         assert_eq!(find_max_column_id_in_schema(&schema), Some(42));
     }
 
     #[test]
     fn find_max_column_id_map_with_struct_key_recurses() {
-        let key_struct = DataType::from(
-            StructType::try_new(vec![field_with_id("key_id", DataType::INTEGER, 17)]).unwrap(),
-        );
-        let value_struct = DataType::from(
-            StructType::try_new(vec![field_with_id("val_id", DataType::INTEGER, 11)]).unwrap(),
-        );
-        let map_ty = DataType::from(MapType::new(key_struct, value_struct, false));
-        let schema = StructType::try_new(vec![field_with_id("m", map_ty, 1)]).unwrap();
+        let key_struct = schema! { (field_with_id("key_id", DataType::INTEGER, 17)) };
+        let value_struct = schema! { (field_with_id("val_id", DataType::INTEGER, 11)) };
+        let map_ty = MapType::new(key_struct, value_struct, false);
+        let schema = schema! { (field_with_id("m", map_ty, 1)) };
         // Max should come from the key struct's `key_id = 17`, beating value's 11 and
         // top-level's 1.
         assert_eq!(find_max_column_id_in_schema(&schema), Some(17));
@@ -2425,15 +2439,12 @@ mod tests {
     /// top-level `v=4`.
     #[test]
     fn find_max_column_id_variant_recurses_into_inner_fields() {
-        let variant = DataType::Variant(Box::new(
-            StructType::try_new(vec![
-                field_with_id("metadata", DataType::BINARY, 10),
-                field_with_id("value", DataType::BINARY, 20),
-                field_with_id("shred", DataType::STRING, 23),
-            ])
-            .unwrap(),
-        ));
-        let schema = StructType::try_new(vec![field_with_id("v", variant, 4)]).unwrap();
+        let variant = DataType::Variant(Box::new(schema! {
+            (field_with_id("metadata", DataType::BINARY, 10)),
+            (field_with_id("value", DataType::BINARY, 20)),
+            (field_with_id("shred", DataType::STRING, 23)),
+        }));
+        let schema = schema! { (field_with_id("v", variant, 4)) };
         assert_eq!(find_max_column_id_in_schema(&schema), Some(23));
     }
 
@@ -2455,7 +2466,7 @@ mod tests {
                 "m.value": 99,
             })),
         );
-        let schema = StructType::try_new(vec![field]).unwrap();
+        let schema = schema! { (field) };
         assert_eq!(find_max_column_id_in_schema(&schema), Some(99));
     }
 }
