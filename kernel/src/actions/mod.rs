@@ -192,6 +192,7 @@ fn checkpoint_action_field() -> impl IntoIterator<Item = &'static StructField> {
     }
 }
 
+#[cfg(any(test, feature = "internal-api"))]
 static COMMIT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&ADD_FIELD),
     (&REMOVE_FIELD),
@@ -250,6 +251,7 @@ pub(crate) static LOG_TXN_SCHEMA: LazyLock<SchemaRef> =
 pub(crate) static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> =
     lazy_schema_ref! { (&DOMAIN_METADATA_FIELD) };
 
+#[cfg(any(test, feature = "internal-api"))]
 #[internal_api]
 /// Gets the schema for all actions that can appear in commits
 /// logs.  This excludes actions that can only appear in checkpoints.
