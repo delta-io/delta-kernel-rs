@@ -855,7 +855,7 @@ mod tests {
     fn test_physical_name_validation() {
         // Test: Physical names present and unchanged - valid schema evolution (just a rename)
         let before = schema! {
-            (StructField::new("name", DataType::STRING, false).add_metadata([
+            (StructField::not_null("name", DataType::STRING).add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
@@ -864,7 +864,7 @@ mod tests {
             ])),
         };
         let after = schema! {
-            (StructField::new("full_name", DataType::STRING, false).add_metadata([
+            (StructField::not_null("full_name", DataType::STRING).add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
@@ -885,7 +885,7 @@ mod tests {
 
         // Test: Physical name changed - INVALID (returns error)
         let before = schema! {
-            (StructField::new("name", DataType::STRING, false).add_metadata([
+            (StructField::not_null("name", DataType::STRING).add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
@@ -894,7 +894,7 @@ mod tests {
             ])),
         };
         let after = schema! {
-            (StructField::new("name", DataType::STRING, false).add_metadata([
+            (StructField::not_null("name", DataType::STRING).add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
@@ -911,7 +911,7 @@ mod tests {
 
         // Test: Missing physical name in one schema - INVALID (returns error)
         let before = schema! {
-            (StructField::new("name", DataType::STRING, false).add_metadata([
+            (StructField::not_null("name", DataType::STRING).add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
@@ -920,7 +920,7 @@ mod tests {
             ])),
         };
         let after = schema! {
-            (StructField::new("name", DataType::STRING, false)
+            (StructField::not_null("name", DataType::STRING)
                 .add_metadata([("delta.columnMapping.id", MetadataValue::Number(1))])),
         };
 

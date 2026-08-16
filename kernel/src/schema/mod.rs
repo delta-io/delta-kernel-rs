@@ -1432,8 +1432,8 @@ impl<'a> IntoIterator for &'a StructType {
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
-///     StructField::new("name", DataType::STRING, false),
-///     StructField::new("age", DataType::INTEGER, true),
+///     StructField::not_null("name", DataType::STRING),
+///     StructField::nullable("age", DataType::INTEGER),
 /// ];
 /// let struct_type = StructType::try_new(fields)?;
 ///
@@ -1505,8 +1505,8 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
-///     StructField::new("name", DataType::STRING, false),
-///     StructField::new("age", DataType::INTEGER, true),
+///     StructField::not_null("name", DataType::STRING),
+///     StructField::nullable("age", DataType::INTEGER),
 /// ];
 /// let struct_type = StructType::try_new(fields)?;
 ///
@@ -3710,9 +3710,9 @@ mod tests {
     #[test]
     fn test_struct_type_iterator_basic() {
         let fields = vec![
-            StructField::new("field1", DataType::STRING, true),
-            StructField::new("field2", DataType::INTEGER, false),
-            StructField::new("field3", DataType::BOOLEAN, true),
+            StructField::nullable("field1", DataType::STRING),
+            StructField::not_null("field2", DataType::INTEGER),
+            StructField::nullable("field3", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields.clone());
 
@@ -3727,8 +3727,8 @@ mod tests {
     #[test]
     fn test_struct_type_into_iterator_owned() {
         let fields = vec![
-            StructField::new("a", DataType::STRING, true),
-            StructField::new("b", DataType::INTEGER, false),
+            StructField::nullable("a", DataType::STRING),
+            StructField::not_null("b", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3743,9 +3743,9 @@ mod tests {
     #[test]
     fn test_struct_type_into_iterator_references() {
         let fields = vec![
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new("y", DataType::FLOAT, false),
-            StructField::new("z", DataType::LONG, true),
+            StructField::nullable("x", DataType::DOUBLE),
+            StructField::not_null("y", DataType::FLOAT),
+            StructField::nullable("z", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3763,10 +3763,10 @@ mod tests {
     #[test]
     fn test_iterator_exact_size() {
         let fields = vec![
-            StructField::new("field1", DataType::STRING, true),
-            StructField::new("field2", DataType::INTEGER, false),
-            StructField::new("field3", DataType::BOOLEAN, true),
-            StructField::new("field4", DataType::DATE, true),
+            StructField::nullable("field1", DataType::STRING),
+            StructField::not_null("field2", DataType::INTEGER),
+            StructField::nullable("field3", DataType::BOOLEAN),
+            StructField::nullable("field4", DataType::DATE),
         ];
 
         // Test ExactSizeIterator for reference iterator
@@ -3787,7 +3787,7 @@ mod tests {
 
     #[test]
     fn test_iterator_with_metadata() {
-        let field_with_metadata = StructField::new("test_field", DataType::STRING, true)
+        let field_with_metadata = StructField::nullable("test_field", DataType::STRING)
             .with_metadata([("key1", MetadataValue::String("value1".to_string()))]);
 
         let struct_type = StructType::new_unchecked([field_with_metadata]);
@@ -3824,9 +3824,9 @@ mod tests {
     #[test]
     fn test_iterator_order_preservation() {
         let fields = vec![
-            StructField::new("zebra", DataType::STRING, true),
-            StructField::new("apple", DataType::INTEGER, false),
-            StructField::new("banana", DataType::BOOLEAN, true),
+            StructField::nullable("zebra", DataType::STRING),
+            StructField::not_null("apple", DataType::INTEGER),
+            StructField::nullable("banana", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3846,8 +3846,8 @@ mod tests {
     #[test]
     fn test_iterator_collect() {
         let original_fields = vec![
-            StructField::new("field1", DataType::STRING, true),
-            StructField::new("field2", DataType::INTEGER, false),
+            StructField::nullable("field1", DataType::STRING),
+            StructField::not_null("field2", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(original_fields.clone());
 
@@ -3867,10 +3867,10 @@ mod tests {
     #[test]
     fn test_iterator_functional_methods() {
         let fields = vec![
-            StructField::new("nullable_string", DataType::STRING, true),
-            StructField::new("required_int", DataType::INTEGER, false),
-            StructField::new("nullable_bool", DataType::BOOLEAN, true),
-            StructField::new("required_long", DataType::LONG, false),
+            StructField::nullable("nullable_string", DataType::STRING),
+            StructField::not_null("required_int", DataType::INTEGER),
+            StructField::nullable("nullable_bool", DataType::BOOLEAN),
+            StructField::not_null("required_long", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3901,10 +3901,10 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_ref() {
         let fields = vec![
-            StructField::new("first", DataType::STRING, true),
-            StructField::new("second", DataType::INTEGER, false),
-            StructField::new("third", DataType::BOOLEAN, true),
-            StructField::new("fourth", DataType::LONG, false),
+            StructField::nullable("first", DataType::STRING),
+            StructField::not_null("second", DataType::INTEGER),
+            StructField::nullable("third", DataType::BOOLEAN),
+            StructField::not_null("fourth", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3927,9 +3927,9 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_owned() {
         let fields = vec![
-            StructField::new("alpha", DataType::STRING, true),
-            StructField::new("beta", DataType::INTEGER, false),
-            StructField::new("gamma", DataType::BOOLEAN, true),
+            StructField::nullable("alpha", DataType::STRING),
+            StructField::not_null("beta", DataType::INTEGER),
+            StructField::nullable("gamma", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3953,9 +3953,9 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_collect_reverse() {
         let fields = vec![
-            StructField::new("one", DataType::STRING, true),
-            StructField::new("two", DataType::INTEGER, false),
-            StructField::new("three", DataType::BOOLEAN, true),
+            StructField::nullable("one", DataType::STRING),
+            StructField::not_null("two", DataType::INTEGER),
+            StructField::nullable("three", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3970,9 +3970,9 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_with_into_iter_ref() {
         let fields = vec![
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new("y", DataType::FLOAT, false),
-            StructField::new("z", DataType::LONG, true),
+            StructField::nullable("x", DataType::DOUBLE),
+            StructField::not_null("y", DataType::FLOAT),
+            StructField::nullable("z", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3992,8 +3992,8 @@ mod tests {
     #[test]
     fn test_fused_iterator_ref() {
         let fields = vec![
-            StructField::new("test1", DataType::STRING, true),
-            StructField::new("test2", DataType::INTEGER, false),
+            StructField::nullable("test1", DataType::STRING),
+            StructField::not_null("test2", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -4014,8 +4014,8 @@ mod tests {
     #[test]
     fn test_fused_iterator_owned() {
         let fields = vec![
-            StructField::new("item1", DataType::STRING, true),
-            StructField::new("item2", DataType::INTEGER, false),
+            StructField::nullable("item1", DataType::STRING),
+            StructField::not_null("item2", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -4035,7 +4035,7 @@ mod tests {
 
     #[test]
     fn test_fused_iterator_with_into_iter_ref() {
-        let fields = vec![StructField::new("field_a", DataType::BOOLEAN, true)];
+        let fields = vec![StructField::nullable("field_a", DataType::BOOLEAN)];
         let struct_type = StructType::new_unchecked(fields);
 
         // Verify that &StructType into_iter implements FusedIterator
@@ -4068,7 +4068,7 @@ mod tests {
 
     #[test]
     fn test_double_ended_iterator_single_element() {
-        let fields = vec![StructField::new("single", DataType::STRING, true)];
+        let fields = vec![StructField::nullable("single", DataType::STRING)];
         let struct_type = StructType::new_unchecked(fields);
 
         // Test DoubleEndedIterator with single element
@@ -4081,7 +4081,7 @@ mod tests {
 
         // Test getting single element from next_back()
         let struct_type =
-            StructType::new_unchecked([StructField::new("single2", DataType::INTEGER, false)]);
+            StructType::new_unchecked([StructField::not_null("single2", DataType::INTEGER)]);
         let mut iter = struct_type.into_iter();
 
         assert_eq!(iter.next_back().unwrap().name, "single2");
@@ -4559,8 +4559,8 @@ mod tests {
     #[test]
     fn test_builder_add_fields() {
         let schema = StructType::builder()
-            .add_field(StructField::new("id", DataType::INTEGER, false))
-            .add_field(StructField::new("name", DataType::STRING, true))
+            .add_field(StructField::not_null("id", DataType::INTEGER))
+            .add_field(StructField::nullable("name", DataType::STRING))
             .build()
             .unwrap();
 
@@ -4574,7 +4574,7 @@ mod tests {
         let base_schema = schema! { not_null "id": INTEGER };
 
         let extended_schema = StructTypeBuilder::from_schema(&base_schema)
-            .add_field(StructField::new("name", DataType::STRING, true))
+            .add_field(StructField::nullable("name", DataType::STRING))
             .build()
             .unwrap();
 

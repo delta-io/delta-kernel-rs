@@ -551,7 +551,7 @@ mod apply_schema_validation_tests {
     fn test_apply_schema_transforms_parquet_field_id_metadata() {
         let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
         let target_schema = schema! {
-            (StructField::new("a", DataType::INTEGER, false)
+            (StructField::not_null("a", DataType::INTEGER)
                 .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])),
         };
 
@@ -588,7 +588,7 @@ mod apply_schema_validation_tests {
     fn test_apply_schema_matching_field_ids_succeed() {
         let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
         let target_schema = schema! {
-            (StructField::new("a", DataType::INTEGER, false)
+            (StructField::not_null("a", DataType::INTEGER)
                 .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])),
         };
 
@@ -611,7 +611,7 @@ mod apply_schema_validation_tests {
     fn test_apply_schema_conflicting_field_ids_fail() {
         let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
         let target_schema = schema! {
-            (StructField::new("a", DataType::INTEGER, false)
+            (StructField::not_null("a", DataType::INTEGER)
                 .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])),
         };
 

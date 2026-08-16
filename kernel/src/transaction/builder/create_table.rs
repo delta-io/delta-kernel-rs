@@ -765,7 +765,7 @@ impl CreateTableTransactionBuilder {
     /// # use delta_kernel::schema::{StructType, DataType, StructField};
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
-    /// # let schema = Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)])?);
+    /// # let schema = Arc::new(StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)])?);
     /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
     ///     .with_table_properties([
     ///         ("myapp.version", "1.0"),
@@ -810,8 +810,8 @@ impl CreateTableTransactionBuilder {
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
     /// # let schema = Arc::new(StructType::try_new(vec![
-    /// #     StructField::new("id", DataType::INTEGER, true),
-    /// #     StructField::new("date", DataType::STRING, true),
+    /// #     StructField::nullable("id", DataType::INTEGER),
+    /// #     StructField::nullable("date", DataType::STRING),
     /// # ])?);
     /// // Clustered layout:
     /// let builder = create_table("/path/to/table", schema.clone(), "MyApp/1.0")

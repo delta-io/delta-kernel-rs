@@ -224,23 +224,21 @@ mod tests {
     }
 
     fn schema_top_level_dup() -> StructType {
-        let inner =
-            StructType::new_unchecked(vec![StructField::new("x", DataType::INTEGER, false)]);
+        let inner = StructType::new_unchecked(vec![StructField::not_null("x", DataType::INTEGER)]);
         StructType::new_unchecked(vec![
-            StructField::new("a", inner, false),
-            StructField::new("A", DataType::STRING, true),
+            StructField::not_null("a", inner),
+            StructField::nullable("A", DataType::STRING),
         ])
     }
 
     fn schema_array_dup() -> StructType {
         let inner = StructType::new_unchecked(vec![
-            StructField::new("x", DataType::INTEGER, false),
-            StructField::new("X", DataType::STRING, true),
+            StructField::not_null("x", DataType::INTEGER),
+            StructField::nullable("X", DataType::STRING),
         ]);
-        StructType::new_unchecked(vec![StructField::new(
+        StructType::new_unchecked(vec![StructField::not_null(
             "arr",
             ArrayType::new(inner, true),
-            false,
         )])
     }
 

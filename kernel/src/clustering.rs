@@ -365,7 +365,7 @@ mod tests {
     #[case::ten(10)]
     fn test_validate_clustering_column_count(#[case] num_columns: usize) {
         let schema = schema! {
-            ..((0..num_columns).map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, false)))
+            ..((0..num_columns).map(|i| StructField::not_null(format!("col{i}"), DataType::INTEGER)))
         };
 
         let columns: Vec<ColumnName> = (0..num_columns)

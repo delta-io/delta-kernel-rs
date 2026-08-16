@@ -1659,12 +1659,12 @@ mod tests {
 
         // Create kernel schema with DIFFERENT names but SAME field IDs
         let kernel_schema = schema_ref! {
-            (StructField::new("user_id", delta_kernel::schema::DataType::LONG, false)
+            (StructField::not_null("user_id", delta_kernel::schema::DataType::LONG)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(1),
                     )])),
-            (StructField::new("user_name", delta_kernel::schema::DataType::STRING, false)
+            (StructField::not_null("user_name", delta_kernel::schema::DataType::STRING)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(2),

@@ -1298,7 +1298,7 @@ mod tests {
     }
 
     fn make_cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {
-        StructField::new(name, data_type, false).with_metadata([
+        StructField::not_null(name, data_type).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
                 MetadataValue::Number(id),
@@ -2102,7 +2102,7 @@ mod tests {
     #[test]
     fn test_get_any_level_column_physical_name_success() {
         let inner = schema! {
-            (StructField::new("y", DataType::INTEGER, false).add_metadata([
+            (StructField::not_null("y", DataType::INTEGER).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     MetadataValue::String("col-inner-y".to_string()),
@@ -2115,7 +2115,7 @@ mod tests {
         };
 
         let schema = schema! {
-            (StructField::new("a", inner, true).add_metadata([
+            (StructField::nullable("a", inner).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     MetadataValue::String("col-outer-a".to_string()),
@@ -2191,7 +2191,7 @@ mod tests {
         #[case] has_id: bool,
         #[case] expected_err: &str,
     ) {
-        let mut inner_field = StructField::new("y", DataType::INTEGER, false);
+        let mut inner_field = StructField::not_null("y", DataType::INTEGER);
         if has_physical_name {
             inner_field = inner_field.add_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -2209,7 +2209,7 @@ mod tests {
             (inner_field),
         };
         let schema = schema! {
-            (StructField::new("a", inner, true).add_metadata([
+            (StructField::nullable("a", inner).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     MetadataValue::String("col-outer-a".to_string()),
@@ -2248,7 +2248,7 @@ mod tests {
         #[case] expected: Option<&str>,
     ) {
         let field =
-            StructField::new("a", DataType::INTEGER, true).fold_with(annotation, |field, value| {
+            StructField::nullable("a", DataType::INTEGER).fold_with(annotation, |field, value| {
                 field.add_metadata([(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), value)])
             });
         let result = expect_physical_name(&field);
@@ -2292,7 +2292,7 @@ mod tests {
 
     #[test]
     fn physical_to_logical_with_name_mapping() {
-        let field = StructField::new("user_id", DataType::INTEGER, false).with_metadata([(
+        let field = StructField::not_null("user_id", DataType::INTEGER).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
             MetadataValue::String("col-abc-123".to_string()),
         )]);
@@ -2327,12 +2327,12 @@ mod tests {
 
     #[test]
     fn physical_to_logical_nested_struct_with_mapping() {
-        let inner_field = StructField::new("city", DataType::STRING, true).with_metadata([(
+        let inner_field = StructField::nullable("city", DataType::STRING).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
             MetadataValue::String("col-inner-456".to_string()),
         )]);
         let inner_struct = schema! { (inner_field) };
-        let outer_field = StructField::new("address", inner_struct, true).with_metadata([(
+        let outer_field = StructField::nullable("address", inner_struct).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
             MetadataValue::String("col-outer-123".to_string()),
         )]);

@@ -33,7 +33,7 @@ pub fn nested_field_with_same_phy_path() -> StructType {
 
 /// `StructField` carrying both `delta.columnMapping.id` and `delta.columnMapping.physicalName`.
 pub fn cm_field(name: &str, id: i64, phys: &str, ty: impl Into<DataType>) -> StructField {
-    StructField::new(name, ty, true).with_metadata([
+    StructField::nullable(name, ty).with_metadata([
         (
             ColumnMetadataKey::ColumnMappingId.as_ref(),
             MetadataValue::Number(id),
@@ -47,7 +47,7 @@ pub fn cm_field(name: &str, id: i64, phys: &str, ty: impl Into<DataType>) -> Str
 
 /// `StructField` carrying only `delta.columnMapping.id` (physical name left to be filled).
 pub fn cm_field_id_only(name: &str, id: i64, ty: impl Into<DataType>) -> StructField {
-    StructField::new(name, ty, true).with_metadata([(
+    StructField::nullable(name, ty).with_metadata([(
         ColumnMetadataKey::ColumnMappingId.as_ref(),
         MetadataValue::Number(id),
     )])
@@ -55,7 +55,7 @@ pub fn cm_field_id_only(name: &str, id: i64, ty: impl Into<DataType>) -> StructF
 
 /// `StructField` carrying only `delta.columnMapping.physicalName` (id left to be allocated).
 pub fn cm_field_physical_name_only(name: &str, phys: &str, ty: impl Into<DataType>) -> StructField {
-    StructField::new(name, ty, true).with_metadata([(
+    StructField::nullable(name, ty).with_metadata([(
         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
         MetadataValue::String(phys.to_string()),
     )])

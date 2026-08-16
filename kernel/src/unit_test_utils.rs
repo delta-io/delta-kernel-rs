@@ -1070,7 +1070,7 @@ pub(crate) mod column_mapping_physical_name_dedup_fixtures {
     }
 
     fn cm_field(name: &str, id: i64, phys: &str, ty: impl Into<DataType>) -> StructField {
-        StructField::new(name, ty, true).with_metadata([
+        StructField::nullable(name, ty).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
                 MetadataValue::Number(id),
