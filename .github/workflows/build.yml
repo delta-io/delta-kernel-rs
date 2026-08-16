@@ -188,8 +188,6 @@ jobs:
       - name: lint without default features - packages which depend on kernel with features enabled
         run: cargo clippy-no-default-kernel-dependents
       - name: check without default features - kernel
-        env:
-          RUSTFLAGS: --cap-lints=warn
         run: cargo check-no-default-kernel
       - name: check without default features - default engine
         run: cargo check-no-default-engine

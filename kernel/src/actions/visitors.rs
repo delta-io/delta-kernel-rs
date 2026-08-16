@@ -105,6 +105,7 @@ pub(crate) struct AddVisitor {
     pub(crate) adds: Vec<Add>,
 }
 
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 impl AddVisitor {
     #[internal_api]
     fn visit_add<'a>(
@@ -178,6 +179,7 @@ pub(crate) struct RemoveVisitor {
     pub(crate) removes: Vec<Remove>,
 }
 
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 impl RemoveVisitor {
     #[internal_api]
     pub(crate) fn visit_remove<'a>(
@@ -254,6 +256,7 @@ pub(crate) struct CdcVisitor {
     pub(crate) cdcs: Vec<Cdc>,
 }
 
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 impl CdcVisitor {
     #[internal_api]
     pub(crate) fn visit_cdc<'a>(

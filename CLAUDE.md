@@ -41,9 +41,11 @@ cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps
 
-# Workspace no-default-features lint for crates that depend on kernel's Arrow APIs
-cargo clippy --workspace --no-default-features --features arrow \
-  --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+# Split no-default-features CI checks (cargo aliases from .cargo/config.toml)
+cargo clippy-no-default-kernel-dependents
+cargo check-no-default-kernel
+cargo check-no-default-engine
+cargo clippy-no-default-kernel-leaves
 
 # Quick pre-push check (mimics CI)
 cargo +nightly fmt \
