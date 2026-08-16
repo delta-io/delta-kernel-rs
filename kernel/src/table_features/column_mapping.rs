@@ -879,6 +879,7 @@ pub(crate) fn get_any_level_column_physical_name(
 ///
 /// Walks the schema once, matching each path component by `physical_name(mode)`, and returns the
 /// resolved logical [`ColumnName`] together with the data type of the final (leaf) field.
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 pub(crate) fn physical_to_logical_column_name_and_type(
     logical_schema: &StructType,
     physical_col: &ColumnName,

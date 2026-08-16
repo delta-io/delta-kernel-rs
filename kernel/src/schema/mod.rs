@@ -2013,6 +2013,7 @@ impl PrimitiveType {
     }
 
     /// Returns whether this is one of the ANSI interval primitive types.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn is_interval(&self) -> bool {
         matches!(self, Self::IntervalYearMonth | Self::IntervalDayTime)

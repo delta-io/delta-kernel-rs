@@ -551,6 +551,7 @@ impl Snapshot {
     ///
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_clustering_column_infos(
         &self,

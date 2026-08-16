@@ -49,6 +49,7 @@ pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
 /// Callers needing to correlate a clustering column with per-file statistics must use
 /// [`physical_column`]: stats are keyed on physical names.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 #[internal_api]
 pub(crate) struct ClusteringColumnInfo {
     /// The physical column reference as stored in the `delta.clustering` domain.
