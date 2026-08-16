@@ -228,8 +228,8 @@ fn evaluate_expression_impl(
 mod tests {
     use std::sync::Arc;
 
+    use delta_kernel::expressions::lit;
     use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::Expression;
 
     use super::{free_expression_evaluator, new_expression_evaluator};
     use crate::ffi_test_utils::ok_or_panic;
@@ -243,7 +243,7 @@ mod tests {
         let in_schema = Arc::new(
             StructType::try_new(vec![StructField::new("a", DataType::LONG, true)]).unwrap(),
         );
-        let expr = Expression::literal(1);
+        let expr = lit(1);
         let output_type: Handle<SharedSchema> = in_schema.clone().into();
         let in_schema_handle: Handle<SharedSchema> = in_schema.into();
         unsafe {

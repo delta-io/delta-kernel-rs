@@ -8,6 +8,7 @@
 //! as a JSON object with a `clusteringColumns` field containing an array of column paths,
 //! where each path is an array of field names (to handle nested columns).
 
+use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 
 use crate::actions::DomainMetadata;
@@ -37,6 +38,26 @@ struct ClusteringDomainMetadata {
 
 /// The domain name for clustering metadata.
 pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
+
+/// A resolved descriptor for one clustering column on a snapshot.
+///
+/// Pairs the physical column reference (as stored in the `delta.clustering` domain) with the
+/// logical reference resolved against the snapshot's schema, plus the data type at that path.
+/// The two references differ only when column mapping is enabled. Both are multi-part for
+/// nested-field clustering.
+///
+/// Callers needing to correlate a clustering column with per-file statistics must use
+/// [`physical_column`]: stats are keyed on physical names.
+#[derive(Debug, Clone, PartialEq)]
+#[internal_api]
+pub(crate) struct ClusteringColumnInfo {
+    /// The physical column reference as stored in the `delta.clustering` domain.
+    pub physical_column: ColumnName,
+    /// The logical column reference, resolved against the snapshot's schema.
+    pub logical_column: ColumnName,
+    /// The data type of the column at the resolved path.
+    pub data_type: DataType,
+}
 
 /// Validates clustering columns against the table schema.
 ///
@@ -129,6 +150,7 @@ pub(crate) fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<Column
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::column_name;
     use crate::schema::{schema, DataType, StructField};
 
     #[rstest::rstest]
@@ -164,7 +186,7 @@ mod tests {
             not_null "id": INTEGER,
             nullable "name": STRING,
         };
-        let columns = vec![ColumnName::new(["id"])];
+        let columns = vec![column_name!("id")];
         assert!(validate_clustering_columns(&schema, &columns).is_ok());
     }
 
@@ -172,7 +194,7 @@ mod tests {
     fn test_validate_clustering_columns_not_found() {
         let schema =
             StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
-        let columns = vec![ColumnName::new(["nonexistent"])];
+        let columns = vec![column_name!("nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
         assert!(result
@@ -195,7 +217,7 @@ mod tests {
         };
 
         // Nested leaf column with eligible type should succeed
-        let columns = vec![ColumnName::new(["user", "address", "city"])];
+        let columns = vec![column_name!("user.address.city")];
         assert!(validate_clustering_columns(&schema, &columns).is_ok());
     }
 
@@ -206,7 +228,7 @@ mod tests {
         };
 
         // Clustering on an entire struct (not a leaf primitive) should fail
-        let columns = vec![ColumnName::new(["parent"])];
+        let columns = vec![column_name!("parent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unsupported type"));
@@ -218,7 +240,7 @@ mod tests {
             StructType::new_unchecked(vec![StructField::new("flat_col", DataType::STRING, false)]);
 
         // Trying to traverse into a non-struct field should fail
-        let columns = vec![ColumnName::new(["flat_col", "child"])];
+        let columns = vec![column_name!("flat_col", "child")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
         assert!(result
@@ -234,7 +256,7 @@ mod tests {
         };
 
         // Nested field that doesn't exist should fail
-        let columns = vec![ColumnName::new(["parent", "nonexistent"])];
+        let columns = vec![column_name!("parent", "nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
         assert!(result
@@ -245,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_create_clustering_domain_metadata() {
-        let columns = vec![ColumnName::new(["col1"]), ColumnName::new(["col2"])];
+        let columns = vec![column_name!("col1"), column_name!("col2")];
         let dm = create_clustering_domain_metadata(&columns);
 
         assert_eq!(dm.domain(), CLUSTERING_DOMAIN_NAME);
@@ -259,9 +281,9 @@ mod tests {
     fn test_create_and_parse_roundtrip() {
         // Test that create and parse are inverses
         let original = vec![
-            ColumnName::new(["id"]),
-            ColumnName::new(["timestamp"]),
-            ColumnName::new(["region"]),
+            column_name!("id"),
+            column_name!("timestamp"),
+            column_name!("region"),
         ];
         let dm = create_clustering_domain_metadata(&original);
         let parsed = parse_clustering_columns(dm.configuration()).unwrap();

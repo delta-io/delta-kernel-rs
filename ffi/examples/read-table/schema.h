@@ -37,6 +37,7 @@ typedef struct
   char* type;
   bool is_nullable;
   uintptr_t children;
+  char* column_mapping_id;
 } SchemaItem;
 
 typedef struct SchemaItemList
@@ -66,6 +67,7 @@ SchemaItem* add_to_list(SchemaItemList* list, char* name, char* type, bool is_nu
   list->list[idx].name = name;
   list->list[idx].type = type;
   list->list[idx].is_nullable = is_nullable;
+  list->list[idx].column_mapping_id = NULL;
   list->len++;
   return &list->list[idx];
 }
@@ -87,6 +89,9 @@ void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int paren
     SchemaItem* item = &list->list[i];
     char* prefix = is_last ? "└" : "├";
     printf("%s─ %s: %s", prefix, item->name, item->type);
+    if (item->column_mapping_id) {
+      printf(" (column mapping id: %s)", item->column_mapping_id);
+    }
     if (strcmp(item->type, "array") == 0) {
       SchemaItemList child_list = builder->lists[item->children];
       if (child_list.len != 1) {
@@ -110,29 +115,28 @@ void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int paren
   }
 }
 
-void print_physical_name(const char *name, const CStringMap* metadata, SharedExternEngine* engine)
+// Read the column-mapping id back out of a field's typed metadata, across the FFI. Returns a
+// freshly-allocated string (owned by the caller) when the field carries `delta.columnMapping.id`,
+// or NULL when it does not. This exercises the typed metadata path end-to-end: the value crosses
+// as a `MetadataNumber`, and we assert that kind before rendering it.
+char* read_column_mapping_id(const CMetadataMap* metadata, SharedExternEngine* engine)
 {
-#ifdef VERBOSE
-  char* key_str = "delta.columnMapping.physicalName";
+  char* key_str = "delta.columnMapping.id";
   KernelStringSlice key = { key_str, strlen(key_str) };
-  ExternResultNullableCvoid res = get_from_string_map(metadata, key, allocate_string, engine);
+  CMetadataValueKind kind;
+  ExternResultNullableCvoid res = get_from_metadata_map(metadata, key, &kind, allocate_string, engine);
   if (res.tag != OkNullableCvoid) {
-    printf("Failed to get physical name\n");
     free_error((Error*)res.err);
-    return;
+    return NULL;
   }
   char* value = res.ok;
-  if (value) {
-    printf("Physical name of %s is %s\n", name, value);
+  if (value && kind != MetadataNumber) {
+    // The kernel types column-mapping ids as numbers; a different kind means the FFI lost the type.
+    printf("Unexpected kind %d for delta.columnMapping.id\n", (int)kind);
     free(value);
-  } else {
-    printf("No physical name\n");
+    return NULL;
   }
-#else
-  (void)name;
-  (void)metadata;
-  (void)engine;
-#endif
+  return value;
 }
 
 // declare all our visitor methods
@@ -159,15 +163,15 @@ void visit_struct(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
   PRINT_CHILD_VISIT("struct", name_ptr, sibling_list_id, "Children", child_list_id);
-  print_physical_name(name_ptr, metadata, builder->engine);
   SchemaItem* struct_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "struct", is_nullable);
   struct_item->children = child_list_id;
+  struct_item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
 }
 
 void visit_array(
@@ -175,15 +179,15 @@ void visit_array(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
-  print_physical_name(name_ptr, metadata, builder->engine);
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
   array_item->children = child_list_id;
+  array_item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
 }
 
 void visit_map(
@@ -191,15 +195,15 @@ void visit_map(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
-  print_physical_name(name_ptr, metadata, builder->engine);
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);
   map_item->children = child_list_id;
+  map_item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
 }
 
 void visit_decimal(
@@ -207,7 +211,7 @@ void visit_decimal(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   uint8_t precision,
   uint8_t scale)
 {
@@ -215,9 +219,9 @@ void visit_decimal(
   char* name_ptr = allocate_string(name);
   char* type = malloc(19 * sizeof(char));
   snprintf(type, 19, "decimal(%u)(%d)", precision, scale);
-  print_physical_name(name_ptr, metadata, builder->engine);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
-  add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
+  SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
+  item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
 }
 
 void visit_simple_type(
@@ -225,18 +229,18 @@ void visit_simple_type(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   char* type)
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
-  print_physical_name(name_ptr, metadata, builder->engine);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
-  add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
+  SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
+  item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
 }
 
 #define DEFINE_VISIT_SIMPLE_TYPE(typename)                                                                                                  \
-  void visit_##typename(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const CStringMap * metadata)\
+  void visit_##typename(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const CMetadataMap * metadata)\
   {                                                                                                                                         \
     visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, #typename);                                                       \
   }
@@ -254,6 +258,25 @@ DEFINE_VISIT_SIMPLE_TYPE(date)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp_ntz)
 DEFINE_VISIT_SIMPLE_TYPE(void)
+DEFINE_VISIT_SIMPLE_TYPE(variant)
+
+void visit_interval_year_month(void* data,
+                               uintptr_t sibling_list_id,
+                               struct KernelStringSlice name,
+                               bool is_nullable,
+                               const CMetadataMap * metadata)
+{
+  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "interval year to month");
+}
+
+void visit_interval_day_time(void* data,
+                             uintptr_t sibling_list_id,
+                             struct KernelStringSlice name,
+                             bool is_nullable,
+                             const CMetadataMap * metadata)
+{
+  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "interval day to second");
+}
 
 // free all the data in the builder and the builder itself
 void free_builder(SchemaBuilder* builder)
@@ -263,6 +286,7 @@ void free_builder(SchemaBuilder* builder)
     for (uint32_t j = 0; j < list->len; j++) {
       SchemaItem* item = list->list + j;
       free(item->name);
+      free(item->column_mapping_id); // NULL when the field carried no column-mapping id; free(NULL) is a no-op
       // don't free item->type, those are static strings
       if (!strncmp(item->type, "decimal", 7)) {
         // except decimal types, we malloc'd those :)
@@ -308,7 +332,10 @@ CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
     .visit_date = visit_date,
     .visit_timestamp = visit_timestamp,
     .visit_timestamp_ntz = visit_timestamp_ntz,
+    .visit_interval_year_month = visit_interval_year_month,
+    .visit_interval_day_time = visit_interval_day_time,
     .visit_void = visit_void,
+    .visit_variant = visit_variant,
   };
   SharedSchema* schema = logical_schema(snapshot);
   uintptr_t schema_list_id = visit_schema(schema, &visitor);

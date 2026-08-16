@@ -298,7 +298,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::Expression;
+    use crate::expressions::lit;
     use crate::schema::schema_ref;
 
     fn make_write_context(
@@ -322,7 +322,7 @@ mod tests {
         });
         WriteContext {
             shared,
-            logical_to_physical: Arc::new(Expression::literal(true)),
+            logical_to_physical: Arc::new(lit(true)),
             physical_partition_values: partition_values,
         }
     }

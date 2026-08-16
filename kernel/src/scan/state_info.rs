@@ -84,7 +84,7 @@ fn validate_metadata_columns<'a>(
     table_configuration: &'a TableConfiguration,
 ) -> DeltaResult<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
-    let partition_columns = table_configuration.partition_columns();
+    let partition_columns = table_configuration.logical_partition_columns();
     for metadata_column in logical_schema.metadata_columns() {
         // Ensure we don't have a metadata column with same name as a partition column
         if partition_columns.contains(metadata_column.name()) {
@@ -246,7 +246,7 @@ impl StateInfo {
         partition_values: &PartitionValuesOptions,
         classifier: C,
     ) -> DeltaResult<Self> {
-        let partition_columns = table_configuration.partition_columns();
+        let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_read_schema.num_fields());
         let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
@@ -478,10 +478,10 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::actions::{Metadata, Protocol, MAX_VALUES, MIN_VALUES};
-    use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate as Pred};
+    use crate::expressions::{col, column_name, lit, Predicate as Pred};
     use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
@@ -745,7 +745,7 @@ pub(crate) mod tests {
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
         let state_info = get_state_info(
             schema.clone(),
@@ -1022,7 +1022,7 @@ pub(crate) mod tests {
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1057,7 +1057,7 @@ pub(crate) mod tests {
             StructField::nullable("extra", DataType::LONG),
         ]));
 
-        let predicate = Arc::new(column_expr!("extra").gt(Expr::literal(5i64)));
+        let predicate = Arc::new(col!("extra").gt(lit(5i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1152,7 +1152,7 @@ pub(crate) mod tests {
             (cm_field("value", 3, "col-value-phys", DataType::LONG)),
         };
 
-        let predicate = Arc::new(column_expr!("date").lt(Expr::literal(100i32)));
+        let predicate = Arc::new(col!("date").lt(lit(100i32)));
 
         let state_info = get_state_info(
             schema,
@@ -1259,7 +1259,7 @@ pub(crate) mod tests {
 
         // Request col_a via stats_columns (logical), and reference col_b via predicate (logical).
         // Both must be translated to physical names in the output stats schema.
-        let predicate = Arc::new(column_expr!("col_b").gt(Expr::literal(5i64)));
+        let predicate = Arc::new(col!("col_b").gt(lit(5i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1358,8 +1358,7 @@ pub(crate) mod tests {
             vec![],
         )
         .unwrap();
-        let cols: HashSet<ColumnName> =
-            ["c0", "c1"].iter().map(|s| ColumnName::new([*s])).collect();
+        let cols = HashSet::from_iter([column_name!("c0"), column_name!("c1")]);
         assert_eq!(state_info.physical_stats_columns, cols);
     }
 
@@ -1368,7 +1367,7 @@ pub(crate) mod tests {
     #[test]
     fn predicate_on_past_cap_column_drops_stats_schema() {
         let schema = flat_long_schema(5);
-        let predicate = Arc::new(column_expr!("c4").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("c4").gt(lit(10i64)));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -1395,8 +1394,8 @@ pub(crate) mod tests {
     fn predicate_on_mixed_indexed_and_past_cap_keeps_indexed_only() {
         let schema = flat_long_schema(5);
         let predicate = Arc::new(Pred::and(
-            column_expr!("c0").gt(Expr::literal(10i64)),
-            column_expr!("c4").gt(Expr::literal(10i64)),
+            col!("c0").gt(lit(10i64)),
+            col!("c4").gt(lit(10i64)),
         ));
         let state_info = get_state_info(
             schema,
@@ -1446,7 +1445,7 @@ pub(crate) mod tests {
             ),
         ]));
         // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
-        let predicate = Arc::new(column_expr!("s.c").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -1460,7 +1459,7 @@ pub(crate) mod tests {
         assert!(!state_info.physical_stats_columns.is_empty());
         assert!(!state_info
             .physical_stats_columns
-            .contains(&ColumnName::new(["s", "c"])));
+            .contains(&column_name!("s.c")));
     }
 
     /// `delta.dataSkippingStatsColumns` selects exactly the listed leaves, regardless of
@@ -1505,8 +1504,8 @@ pub(crate) mod tests {
             ),
         ]));
         let predicate = Arc::new(Pred::and(
-            column_expr!("s.c").gt(Expr::literal(10i64)),
-            column_expr!("s.d").gt(Expr::literal(10i64)),
+            col!("s.c").gt(lit(10i64)),
+            col!("s.d").gt(lit(10i64)),
         ));
         let state_info = get_state_info(
             schema,
@@ -1571,10 +1570,7 @@ pub(crate) mod tests {
             vec![],
         )
         .unwrap();
-        let expected: HashSet<ColumnName> =
-            [ColumnName::new(["s", "c"]), ColumnName::new(["s", "d"])]
-                .into_iter()
-                .collect();
+        let expected = HashSet::from_iter([column_name!("s.c"), column_name!("s.d")]);
         assert_eq!(state_info.physical_stats_columns, expected);
     }
 

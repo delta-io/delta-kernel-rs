@@ -403,6 +403,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::expressions::column_name;
     use crate::schema::ArrayType;
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -951,9 +952,9 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["user", "name"]),
-                ColumnName::new(["user", "age"]),
+                column_name!("id"),
+                column_name!("user.name"),
+                column_name!("user.age"),
             ]
         );
     }
@@ -980,10 +981,7 @@ mod tests {
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Only first 2 columns should be included
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["a"]), ColumnName::new(["b"]),]
-        );
+        assert_eq!(columns, vec![column_name!("a"), column_name!("b"),]);
     }
 
     #[test]
@@ -1011,10 +1009,7 @@ mod tests {
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Only specified columns should be included (user.name and extra excluded)
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["id"]), ColumnName::new(["user", "age"]),]
-        );
+        assert_eq!(columns, vec![column_name!("id"), column_name!("user.age"),]);
     }
 
     #[test]
@@ -1042,11 +1037,11 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["tags"]),
-                ColumnName::new(["metadata"]),
-                ColumnName::new(["v"]),
-                ColumnName::new(["name"]),
+                column_name!("id"),
+                column_name!("tags"),
+                column_name!("metadata"),
+                column_name!("v"),
+                column_name!("name"),
             ]
         );
     }
@@ -1069,7 +1064,7 @@ mod tests {
         ]);
 
         // "c" is a clustering column, should be included even though limit is 1
-        let clustering_columns = vec![ColumnName::new(["c"])];
+        let clustering_columns = vec![column_name!("c")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1104,7 +1099,7 @@ mod tests {
             StructField::nullable("value", DataType::INTEGER),
         ]);
 
-        let columns = [ColumnName::new(["id"])];
+        let columns = [column_name!("id")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1158,7 +1153,7 @@ mod tests {
         ]);
 
         // "name" is outside the limit (limit is 1), and is only requested, not required
-        let columns = [ColumnName::new(["name"])];
+        let columns = [column_name!("name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1186,7 +1181,7 @@ mod tests {
             StructField::nullable("name", DataType::STRING),
         ]);
 
-        let columns = [ColumnName::new(["name"])];
+        let columns = [column_name!("name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1217,7 +1212,7 @@ mod tests {
             StructField::nullable("value", DataType::INTEGER),
         ]);
 
-        let columns = [ColumnName::new(["name"])];
+        let columns = [column_name!("name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1246,7 +1241,7 @@ mod tests {
             StructField::nullable("value", DataType::INTEGER),
         ]);
 
-        let columns = [ColumnName::new(["id"]), ColumnName::new(["name"])];
+        let columns = [column_name!("id"), column_name!("name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1281,7 +1276,7 @@ mod tests {
             StructField::nullable("user", user_struct),
         ]);
 
-        let columns = [ColumnName::new(["user", "name"])];
+        let columns = [column_name!("user.name")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),
@@ -1346,7 +1341,7 @@ mod tests {
             StructField::nullable("value", DataType::DOUBLE),
         ]);
 
-        let columns = [ColumnName::new(["id"]), ColumnName::new(["user", "age"])];
+        let columns = [column_name!("id"), column_name!("user.age")];
         let stats_schema = expected_stats_schema(
             &file_schema,
             &stats_config_from_table_properties(&properties),

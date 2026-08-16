@@ -108,6 +108,8 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
     logical_schema: SchemaRef,
+    /// Whether any field in the logical schema declares a column default.
+    has_column_with_default: bool,
     /// The subset of the logical schema that remains after excluding partition columns.
     logical_schema_without_partition_columns: SchemaRef,
     /// Physical schema for all columns (field names respect column mapping mode).
@@ -203,8 +205,9 @@ impl TableConfiguration {
             Arc::new(StructType::new_unchecked(fields))
         };
 
-        let table_config = Self {
+        let mut table_config = Self {
             logical_schema,
+            has_column_with_default: false,
             logical_schema_without_partition_columns,
             physical_schema,
             physical_data_schema_without_partition_columns,
@@ -222,8 +225,10 @@ impl TableConfiguration {
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
-        // default on a Variant column).
-        validate_column_defaults_metadata(&table_config.logical_schema)?;
+        // default on a Variant column) and retain whether the validated schema declares any column
+        // defaults.
+        table_config.has_column_with_default =
+            validate_column_defaults_metadata(&table_config.logical_schema)?;
         // Reject tables with geo-typed columns that don't declare the `geospatial` feature.
         #[cfg(feature = "geo-type-in-dev")]
         validate_geospatial_feature_support(&table_config)?;
@@ -376,24 +381,14 @@ impl TableConfiguration {
     /// and field types are the actual partition column data types with their original nullability.
     /// Returns `None` if the table has no partition columns.
     pub(crate) fn build_partition_values_parsed_schema(&self) -> Option<SchemaRef> {
-        let partition_columns = self.metadata().partition_columns();
-        if partition_columns.is_empty() {
+        if self.logical_partition_columns().is_empty() {
             return None;
         }
-        let logical_schema = self.logical_schema();
-        let column_mapping_mode = self.column_mapping_mode();
-        let partition_fields: Vec<StructField> = partition_columns
-            .iter()
-            .filter_map(|col_name| {
-                let field = logical_schema.field(col_name);
-                if field.is_none() {
-                    warn!("Partition column '{col_name}' not found in table schema");
-                }
-                field
-            })
-            .map(|field: &StructField| {
+        let partition_fields: Vec<StructField> = self
+            .physical_partition_fields()
+            .map(|(field, physical_name)| {
                 StructField::new(
-                    field.physical_name(column_mapping_mode).to_owned(),
+                    physical_name.to_owned(),
                     field.data_type().clone(),
                     field.is_nullable(),
                 )
@@ -497,6 +492,13 @@ impl TableConfiguration {
         &self.logical_schema
     }
 
+    /// Whether any field in the logical schema declares a column default.
+    ///
+    /// This includes nested fields and is independent of the `allowColumnDefaults` feature.
+    pub(crate) fn has_column_with_default(&self) -> bool {
+        self.has_column_with_default
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
@@ -557,10 +559,16 @@ impl TableConfiguration {
         self.column_mapping_mode
     }
 
-    /// The partition columns of this table (empty if non-partitioned)
+    /// The logical partition columns of this table (empty if unpartitioned).
     #[internal_api]
-    pub(crate) fn partition_columns(&self) -> &[String] {
+    pub(crate) fn logical_partition_columns(&self) -> &[String] {
         self.metadata().partition_columns()
+    }
+
+    /// The physical partition columns of this table (empty if unpartitioned).
+    pub(crate) fn physical_partition_columns(&self) -> impl Iterator<Item = String> + '_ {
+        self.physical_partition_fields()
+            .map(|(_, physical_name)| physical_name.to_owned())
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
@@ -573,6 +581,24 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn version(&self) -> Version {
         self.version
+    }
+
+    // TODO(#3020): Unify scan-state schema construction and write-context serialization to call
+    // this.
+    fn physical_partition_fields(&self) -> impl Iterator<Item = (&StructField, &str)> + '_ {
+        let column_mapping_mode = self.column_mapping_mode();
+        self.logical_partition_columns()
+            .iter()
+            .filter_map(move |name| {
+                // SAFETY: Construction already validates that every partition column exists in
+                // the schema. Keep this iterator infallible for a simpler return type, with a
+                // defensive warning if the invariant is violated.
+                let field = self.logical_schema.field(name);
+                if field.is_none() {
+                    warn!("Partition column '{name}' not found in table schema");
+                }
+                field.map(|field| (field, field.physical_name(column_mapping_mode)))
+            })
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
@@ -837,8 +863,13 @@ impl TableConfiguration {
                     // Legacy reader: protocol reader version meets minimum requirement
                     self.protocol.min_reader_version() >= min_reader_version
                 } else {
-                    // Table features reader: feature is in reader_features list
+                    // Reader-supported if the feature is in reader_features, or it is a legacy
+                    // ReaderWriter feature (only ColumnMapping) whose minimum reader version is
+                    // met. The second case stays compatible with tables a past delta-spark bug
+                    // created with ReaderWriter features in writerFeatures only, absent from
+                    // readerFeatures.
                     Self::has_feature(self.protocol.reader_features(), feature)
+                        || feature.is_valid_for_legacy_reader(self.protocol.min_reader_version())
                 };
 
                 let writer_supported = if self.is_legacy_writer_version() {
@@ -910,7 +941,9 @@ mod test {
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
-    use crate::schema::{schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{
+        column_name, schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType,
+    };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -920,7 +953,7 @@ mod test {
         ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
         ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
     };
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
         test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
@@ -1462,6 +1495,39 @@ mod test {
     }
 
     #[test]
+    fn test_timestamp_ntz_legacy_alias_unblocks_read_and_write() {
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "ts",
+            DataType::TIMESTAMP_NTZ,
+        )]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+
+        // Build the protocol from the legacy string alias to exercise the real read path.
+        let protocol =
+            Protocol::try_new_modern(["timestampWithoutTimezone"], ["timestampWithoutTimezone"])
+                .unwrap();
+
+        assert_eq!(
+            protocol.reader_features(),
+            Some([TableFeature::TimestampWithoutTimezone].as_slice())
+        );
+        assert_eq!(
+            protocol.writer_features(),
+            Some([TableFeature::TimestampWithoutTimezone].as_slice())
+        );
+
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        table_config
+            .ensure_operation_supported(Operation::Scan)
+            .unwrap();
+        table_config
+            .ensure_operation_supported(Operation::Write)
+            .unwrap();
+    }
+
+    #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
         let schema = schema_ref! { nullable "v": (DataType::unshredded_variant()) };
@@ -1642,6 +1708,43 @@ mod test {
         // Test with non-legacy mode (3,7) - feature NOT in list, should NOT be supported
         let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
         assert!(!config.is_feature_supported(&feature));
+    }
+
+    #[test]
+    fn test_is_feature_supported_orphaned_column_mapping() {
+        // A (3, 7) table with ColumnMapping in writerFeatures but missing from readerFeatures.
+        // ColumnMapping is a legacy ReaderWriter feature whose minimum reader version (2) is met by
+        // reader version 3, so it counts as reader-supported even though it is absent from
+        // readerFeatures. It is in writerFeatures, so it is writer-supported too.
+        let config = create_mock_table_config_with_cm(
+            &[],
+            Some(ColumnMappingMode::Name),
+            &TableFeature::EMPTY_LIST,
+            &[TableFeature::ColumnMapping],
+        );
+        assert!(config.is_feature_supported(&TableFeature::ColumnMapping));
+
+        // A non-legacy ReaderWriter feature in the same writer-only position has no legacy reader
+        // version to fall back on, so the protocol is rejected outright rather than tolerated.
+        assert!(Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(TableFeature::EMPTY_LIST),
+            Some(vec![TableFeature::DeletionVectors]),
+        )
+        .is_err());
+
+        // The conformant shape (ColumnMapping in both lists) is still reported supported: the
+        // legacy-version fallback does not perturb the normal reader_features membership path.
+        let conformant = create_mock_table_config(&[], &[TableFeature::ColumnMapping]);
+        assert!(conformant.is_feature_supported(&TableFeature::ColumnMapping));
+    }
+
+    #[test]
+    fn test_column_mapping_absent_from_both_lists_is_unsupported() {
+        // ColumnMapping in neither list must not be treated as supported: the writer half fails.
+        let config = create_mock_table_config(&[], &[TableFeature::AppendOnly]);
+        assert!(!config.is_feature_supported(&TableFeature::ColumnMapping));
     }
 
     #[test]
@@ -2103,7 +2206,7 @@ mod test {
             [],
         );
 
-        assert_eq!(config.partition_columns(), ["part_a", "part_b"]);
+        assert_eq!(config.logical_partition_columns(), ["part_a", "part_b"]);
         let partition_schema = config
             .build_partition_values_parsed_schema()
             .expect("partition schema should be present");
@@ -2111,6 +2214,27 @@ mod test {
         assert!(partition_schema.field("phys_part_b").is_some());
         assert!(partition_schema.field("part_a").is_none());
         assert!(partition_schema.field("part_b").is_none());
+    }
+
+    #[rstest]
+    #[case::none("none", ["part_a", "part_b"])]
+    #[case::name("name", ["phys_part_a", "phys_part_b"])]
+    #[case::id("id", ["phys_part_a", "phys_part_b"])]
+    fn test_physical_partition_columns(
+        #[case] column_mapping_mode: &str,
+        #[case] expected: [&str; 2],
+    ) {
+        let config = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            column_mapping_mode,
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
+
+        assert_eq!(
+            config.physical_partition_columns().collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
@@ -2123,15 +2247,12 @@ mod test {
         );
 
         let column_names = config.physical_stats_column_names(None);
-        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
+        assert_eq!(column_names, vec![column_name!("phys_data")]);
 
         // Also verify partition columns are excluded when passed as required columns
-        let required = [
-            ColumnName::new(["phys_part_a"]),
-            ColumnName::new(["phys_part_b"]),
-        ];
+        let required = [column_name!("phys_part_a"), column_name!("phys_part_b")];
         let column_names = config.physical_stats_column_names(Some(&required));
-        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
+        assert_eq!(column_names, vec![column_name!("phys_data")]);
     }
 
     #[test]
@@ -2155,7 +2276,7 @@ mod test {
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
         let column_names = config.physical_stats_column_names(None);
-        assert_eq!(column_names, vec![ColumnName::new(["data_col"])]);
+        assert_eq!(column_names, vec![column_name!("data_col")]);
     }
 
     #[test]
@@ -2192,10 +2313,7 @@ mod test {
         // Should return physical names, not logical names
         assert_eq!(
             column_names,
-            vec![
-                ColumnName::new(["phys_col_a"]),
-                ColumnName::new(["phys_col_b"]),
-            ],
+            vec![column_name!("phys_col_a"), column_name!("phys_col_b"),],
             "Expected physical column names, not logical names"
         );
     }
@@ -2210,10 +2328,7 @@ mod test {
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(
             column_names,
-            vec![
-                ColumnName::new(["phys_id"]),
-                ColumnName::new(["phys_info", "phys_name"]),
-            ],
+            vec![column_name!("phys_id"), column_name!("phys_info.phys_name"),],
         );
     }
 
@@ -2225,7 +2340,7 @@ mod test {
             [("delta.dataSkippingStatsColumns", "id,nonexistent")],
         );
         let column_names = config.physical_stats_column_names(None);
-        assert_eq!(column_names, vec![ColumnName::new(["phys_id"])],);
+        assert_eq!(column_names, vec![column_name!("phys_id")],);
     }
 
     #[rstest]
@@ -2233,83 +2348,83 @@ mod test {
     #[case::flat_none(
         test_schema_flat(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        vec![column_name!("id"), column_name!("name")],
     )]
     #[case::flat_name(
         test_schema_flat_with_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_name")],
     )]
     #[case::flat_id(
         test_schema_flat_with_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_name")],
     )]
     // --- nested schema (includes map/array inside struct as leaf columns) ---
     #[case::nested_none(
         test_schema_nested(),
         "none",
         vec![
-            ColumnName::new(["id"]),
-            ColumnName::new(["info", "name"]),
-            ColumnName::new(["info", "age"]),
-            ColumnName::new(["info", "tags"]),
-            ColumnName::new(["info", "scores"]),
+            column_name!("id"),
+            column_name!("info.name"),
+            column_name!("info.age"),
+            column_name!("info.tags"),
+            column_name!("info.scores"),
         ],
     )]
     #[case::nested_name(
         test_schema_nested_with_column_mapping(),
         "name",
         vec![
-            ColumnName::new(["phys_id"]),
-            ColumnName::new(["phys_info", "phys_name"]),
-            ColumnName::new(["phys_info", "phys_age"]),
-            ColumnName::new(["phys_info", "phys_tags"]),
-            ColumnName::new(["phys_info", "phys_scores"]),
+            column_name!("phys_id"),
+            column_name!("phys_info.phys_name"),
+            column_name!("phys_info.phys_age"),
+            column_name!("phys_info.phys_tags"),
+            column_name!("phys_info.phys_scores"),
         ],
     )]
     #[case::nested_id(
         test_schema_nested_with_column_mapping(),
         "id",
         vec![
-            ColumnName::new(["phys_id"]),
-            ColumnName::new(["phys_info", "phys_name"]),
-            ColumnName::new(["phys_info", "phys_age"]),
-            ColumnName::new(["phys_info", "phys_tags"]),
-            ColumnName::new(["phys_info", "phys_scores"]),
+            column_name!("phys_id"),
+            column_name!("phys_info.phys_name"),
+            column_name!("phys_info.phys_age"),
+            column_name!("phys_info.phys_tags"),
+            column_name!("phys_info.phys_scores"),
         ],
     )]
     // --- schema with map (included as leaf for nullCount stats) ---
     #[case::map_none(
         test_schema_with_map(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["entries"]), ColumnName::new(["name"])],
+        vec![column_name!("id"), column_name!("entries"), column_name!("name")],
     )]
     #[case::map_name(
         test_schema_with_map_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_entries"), column_name!("phys_name")],
     )]
     #[case::map_id(
         test_schema_with_map_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_entries"), column_name!("phys_name")],
     )]
     // --- schema with array (included as leaf for nullCount stats) ---
     #[case::array_none(
         test_schema_with_array(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["items"]), ColumnName::new(["name"])],
+        vec![column_name!("id"), column_name!("items"), column_name!("name")],
     )]
     #[case::array_name(
         test_schema_with_array_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_items"), column_name!("phys_name")],
     )]
     #[case::array_id(
         test_schema_with_array_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_items"), column_name!("phys_name")],
     )]
     fn test_physical_stats_column_names_all_schemas(
         #[case] schema: SchemaRef,

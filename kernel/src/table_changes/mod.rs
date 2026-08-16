@@ -9,7 +9,7 @@
 //! ```rust
 //! # use std::sync::Arc;
 //! # use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
-//! # use delta_kernel::expressions::{column_expr, Scalar};
+//! # use delta_kernel::expressions::{col, lit};
 //! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, Error, Engine};
 //! # use delta_kernel::table_changes::TableChanges;
 //! # let path = "./tests/data/table-with-cdf";
@@ -23,7 +23,7 @@
 //! let schema = table_changes
 //!     .schema()
 //!     .project(&["id", "_commit_version"])?;
-//! let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
+//! let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
 //!
 //! // Construct the table changes scan
 //! let table_changes_scan = table_changes
@@ -567,7 +567,7 @@ mod tests {
         COLUMN_MAPPING_MODE, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
         MATERIALIZED_ROW_ID_COLUMN_NAME,
     };
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, test_schema_flat_with_column_mapping, Action,
         LocalMockTable,
     };

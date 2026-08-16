@@ -8,10 +8,10 @@ use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 #[doc(hidden)]
-pub use self::column_names::__require_valid_simple_column_segment;
+pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
 pub use self::column_names::{
-    col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
-    joined_column_name, ColumnName,
+    col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
+    ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
@@ -47,6 +47,24 @@ pub fn lit(value: impl Into<Scalar>) -> Expression {
     Expression::literal(value)
 }
 
+/// Build a typed NULL [`Expression::Literal`].
+///
+/// Prefer this over `lit(Scalar::Null(...))`. Accepts anything convertible into a [`DataType`]
+/// (including container types like [`StructType`](crate::schema::StructType)), so callers can
+/// skip an explicit `DataType::from(...)` wrapper.
+///
+/// ```
+/// # use delta_kernel::expressions::{lit, null_lit, Scalar};
+/// # use delta_kernel::schema::DataType;
+/// assert_eq!(
+///     lit(Scalar::Null(DataType::LONG)),
+///     null_lit(DataType::LONG),
+/// );
+/// ```
+pub fn null_lit(data_type: impl Into<DataType>) -> Expression {
+    Expression::Literal(Scalar::null(data_type))
+}
+
 /// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are
 /// expressions, lowered into an [`ExpressionStructPatch`] that can be embedded in an
 /// [`Expression`].
@@ -59,54 +77,109 @@ pub type ExpressionStructPatchBuilder = crate::struct_patch::StructPatchBuilder<
 /// A unary predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum UnaryPredicateOp {
-    /// Unary Is Null
+    /// SQL `expr IS NULL`: `true` when the input is null and `false` otherwise, never null itself.
+    /// A wrapping `NOT` inverts it to `IS NOT NULL`.
     IsNull,
 }
 
 /// A binary predicate operator.
+///
+/// The ordering and equality comparisons follow SQL three-valued logic, so a NULL operand yields
+/// NULL rather than `false`. [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate
+/// NULL and always answer `true` or `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryPredicateOp {
-    /// Comparison Less Than
+    /// `left < right`.
     LessThan,
-    /// Comparison Greater Than
+    /// `left > right`.
     GreaterThan,
-    /// Comparison Equal
+    /// `left = right`.
     Equal,
-    /// Distinct
+    /// SQL `left IS DISTINCT FROM right`: null-safe inequality, treating NULL as an ordinary
+    /// value. `DISTINCT(1, 1)` and `DISTINCT(NULL, NULL)` are `false`; `DISTINCT(NULL, 1)` is
+    /// `true`.
     Distinct,
-    /// IN
+    /// SQL `left IN (elements)`: returns `false` when `left` is NULL. Otherwise, it returns `true`
+    /// when `left` equals any element and `false` when none match. NULL elements never match.
+    /// `left` must be a literal, and the elements are either a list-typed column or an
+    /// [`Expression::Literal`] holding a [`Scalar::Array`], never a list of expressions or a
+    /// subquery:
+    ///
+    /// ```sql
+    /// 2 IN (1, 2, 3)         -- literal elements
+    /// 2 IN (SELECT ...)      -- unsupported: no subquery form
+    /// col IN (1, 2, 3)       -- unsupported: the left operand must be a literal
+    /// ```
+    ///
+    /// Testing a literal against a list column is the shape data skipping uses, and it is the
+    /// reason the operands sit this way around rather than the more familiar
+    /// column-on-the-left form.
     In,
 }
 
 /// A unary expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryExpressionOp {
-    /// Convert struct data to JSON-encoded strings
+    /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
+    /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
+    /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
+    /// timestamps, whose sub-millisecond precision this operator discards (see below).
+    ///
+    /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
+    /// hex rather than base64, two digits per byte in the order the bytes appear, so
+    /// `{ b: 0xABCD, l: [1, 2], n: { z: 7 } }` becomes:
+    ///
+    /// ```text
+    /// {"b":"abcd","l":[1,2],"n":{"z":7}}
+    /// ```
+    ///
+    /// Timestamps must encode with exactly three fractional digits, truncated toward negative
+    /// infinity, because kernel writes `add.stats` with this operator and [Per-file Statistics]
+    /// truncates timestamp statistics down to milliseconds. TIMESTAMP takes a literal `Z` suffix
+    /// and TIMESTAMP_NTZ takes no offset, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
+    /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
+    /// prune files that hold matching rows.
+    ///
+    /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson,
 }
 
-/// A binary expression operator.
+/// A binary arithmetic operator over two numeric operands.
+///
+/// Both operands share a numeric type and the result takes that type. Kernel inserts no implicit
+/// casts, so widening a result (decimal precision or scale, for instance) needs an explicit
+/// [`Expression::cast`] to match a declared output type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryExpressionOp {
-    /// Arithmetic Plus
+    /// `left + right`.
     Plus,
-    /// Arithmetic Minus
+    /// `left - right`.
     Minus,
-    /// Arithmetic Multiply
+    /// `left * right`.
     Multiply,
-    /// Arithmetic Divide
+    /// `left / right`. A zero divisor never yields NULL.
+    ///
+    /// Integer operands divide truncating toward zero, and a zero divisor fails. Float operands
+    /// follow IEEE 754: `+/-inf` for a non-zero numerator, `NaN` for `0.0 / 0.0`. In a dialect
+    /// whose `/` is always fractional, the integer case is the other division operator:
+    ///
+    /// ```sql
+    /// 7 DIV 2      -- 3, this operator over integers
+    /// 7 / 2        -- 3.5, NOT this operator
+    /// ```
     Divide,
 }
 
 /// A variadic expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VariadicExpressionOp {
-    /// Collapse multiple values into one by taking the first non-null value
+    /// SQL `COALESCE(exprs...)`: the first non-null value, or null when every input is null. All
+    /// inputs share one type, which is also the result type. Requires at least one input.
     Coalesce,
-    /// Construct an Array by evaluating each input expression. For example, the expression
-    /// `Array(1, (1 + 2), col("my_int_col"))` evaluates to the array
-    /// `[1, 3, <my_int_col value>]` per row. All inputs must share the same element type.
-    /// Requires at least one element; the element type is inferred from the inputs.
+    /// SQL `ARRAY(exprs...)`: an array built by evaluating each input per row, so
+    /// `ARRAY(1, 1 + 2, my_int_col)` yields `[1, 3, <my_int_col value>]`. All inputs must share
+    /// the same element type. Requires at least one element; the element type is inferred from
+    /// the inputs.
     ///
     /// For static array literals whose elements are all compile-time constants, use
     /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
@@ -114,12 +187,17 @@ pub enum VariadicExpressionOp {
     Array,
 }
 
-/// A junction (AND/OR) predicate operator.
+/// A junction (AND/OR) predicate operator over N child predicates.
+///
+/// Both use SQL three-valued (Kleene) logic, treating a NULL child as unknown rather than false: a
+/// decisive child wins over a NULL sibling, so `AND` is `false` and `OR` is `true` despite the
+/// NULL, and only an undecided junction yields NULL. [`Predicate::junction`] folds an empty
+/// junction to its operator's identity, `true` for `AND` and `false` for `OR`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum JunctionPredicateOp {
-    /// Conjunction
+    /// SQL `a AND b AND ...`: true when every child is true.
     And,
-    /// Disjunction
+    /// SQL `a OR b OR ...`: true when any child is true.
     Or,
 }
 
@@ -269,9 +347,28 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
-/// An expression that parses a JSON string into a struct with the given schema.
-/// This is the inverse of `ToJson` - it converts a JSON-encoded string column into a
-/// struct column.
+/// An expression that parses a JSON string column into a struct column of `output_schema`, the
+/// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
+/// that operator discards.
+///
+/// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
+/// `add.stats` with this operator and data skipping reads null stats as "include the file". The
+/// required part is that it does not error; whether a given row comes back as a null struct or as a
+/// struct of null fields is unspecified, since data skipping treats the two alike.
+///
+/// An empty string is not valid JSON here, so it is unparseable. This operator does not share
+/// [`MapToStructExpression`]'s empty-string-to-NULL behavior. It is SQL `from_json(json_expr,
+/// output_schema)` in a dialect whose `from_json` is permissive rather than strict.
+///
+/// # Default engine behavior
+///
+/// `arrow-json`'s typed decoders reject a whole batch when one cell fails to parse. The default
+/// engine works around that for the leaf types that fail most often (timestamp, date, decimal) by
+/// decoding them as strings and safe-casting back, so a bad value in one of those degrades to a
+/// NULL for that field alone. Anything the workaround does not cover, namely structurally invalid
+/// JSON and a type mismatch on any other leaf, falls back to nulling the entire batch rather than
+/// the offending row. A NULL input decodes as `{}`, leaving every field NULL without disturbing the
+/// rest of the batch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
     /// The expression that evaluates to a STRING column containing JSON objects.
@@ -386,13 +483,26 @@ where
 pub enum Expression {
     /// A literal value.
     Literal(Scalar),
-    /// A column reference by name.
+    /// A column reference by name. A [`ColumnName`] is a path, so a multi-segment name like
+    /// `add.stats.numRecords` descends one nested struct field per segment, matching by name.
     Column(ColumnName),
     /// A predicate treated as a boolean expression
     Predicate(Box<Predicate>), // should this be Arc?
-    /// A struct computed from a Vec of expressions.
-    /// The optional nullability predicate, if provided and evaluates to false/null, makes the
-    /// entire struct null.
+    /// A struct computed from one expression per output field, in field order.
+    ///
+    /// Field names and nullability come from the surrounding output schema (the evaluator's
+    /// `result_type`, such as a [`Project`]'s target field), and each field expression's type is
+    /// validated against the schema, so building a struct takes both. The expression count must
+    /// equal the output field count.
+    ///
+    /// The optional nullability predicate says when to *keep* the struct: a row survives only
+    /// where it is true, and nulls entirely where it is false or null.
+    ///
+    /// ```sql
+    /// CASE WHEN keep_pred THEN struct(expr1, expr2, ...) END
+    /// ```
+    ///
+    /// [`Project`]: crate::plans::ir::nodes::Project
     Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
     /// A sparse patch of a struct. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
@@ -418,7 +528,9 @@ pub enum Expression {
     /// all rows -- almost certainly NOT what the query author intended. Use `Expression::Opaque`
     /// for expressions kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
-    /// Parse a JSON string expression into a struct with the given schema.
+    /// Parse a JSON string expression into a struct with the given schema. Unparseable input,
+    /// which includes an empty string, must yield NULL rather than error; see
+    /// [`ParseJsonExpression`].
     ParseJson(ParseJsonExpression),
     /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
     /// [`MapToStructExpression`] for how values are parsed.
@@ -552,7 +664,8 @@ impl ParseJsonExpression {
 /// the output struct column: a `key` -> `value` mapping in the map means the struct field named
 /// `key` receives `value`, parsed into the field's target type via [`PrimitiveType::parse_scalar`].
 /// An empty-string value is the exception (aligning with Spark): it casts to itself for string, to
-/// empty bytes for binary, and to null for every other type.
+/// empty bytes for binary, and to null for every other type. This empty-string rule is specific to
+/// this operator; [`ParseJsonExpression`] does not share it.
 ///
 /// - Missing keys produce null values
 /// - A value that cannot be parsed as its target field type returns [`Error::ParseError`]
@@ -604,11 +717,6 @@ impl Expression {
     /// Create a new expression for a literal value
     pub fn literal(value: impl Into<Scalar>) -> Self {
         Self::Literal(value.into())
-    }
-
-    /// Creates a NULL literal expression
-    pub const fn null_literal(data_type: DataType) -> Self {
-        Self::Literal(Scalar::Null(data_type))
     }
 
     /// Wraps a predicate as a boolean-valued expression
@@ -754,7 +862,9 @@ impl Expression {
     }
 
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
-    /// This is the inverse of `ToJson` - it converts a JSON-encoded string into a struct.
+    /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
+    /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
+    /// `ToJson` truncates it.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
@@ -775,6 +885,14 @@ impl Expression {
 }
 
 impl Predicate {
+    /// Literal boolean true.
+    pub const TRUE: Self = Self::literal(true);
+    /// Literal boolean false.
+    pub const FALSE: Self = Self::literal(false);
+    /// NULL boolean literal.
+    pub const NULL: Self =
+        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)));
+
     /// Returns a set of columns referenced by this predicate.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
@@ -783,18 +901,15 @@ impl Predicate {
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
-    pub fn column(field_names: impl CollectInto<ColumnName>) -> Predicate {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Self {
         Self::from_expr(ColumnName::new(field_names))
     }
 
-    /// Create a new literal boolean value
+    /// Create a boolean literal predicate from a runtime `bool`.
+    ///
+    /// Prefer [`Self::TRUE`] / [`Self::FALSE`] when the value is statically known.
     pub const fn literal(value: bool) -> Self {
         Self::BooleanExpression(Expression::Literal(Scalar::Boolean(value)))
-    }
-
-    /// Creates a NULL literal boolean value
-    pub const fn null_literal() -> Self {
-        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
     }
 
     /// Converts a boolean-valued expression into a predicate
@@ -811,12 +926,12 @@ impl Predicate {
     }
 
     /// Create a new predicate `self IS NULL`
-    pub fn is_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_null(expr: impl Into<Expression>) -> Self {
         Self::unary(UnaryPredicateOp::IsNull, expr)
     }
 
     /// Create a new predicate `self IS NOT NULL`
-    pub fn is_not_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_not_null(expr: impl Into<Expression>) -> Self {
         Self::not(Self::is_null(expr))
     }
 
@@ -907,8 +1022,8 @@ impl Predicate {
         let mut preds: Vec<_> = preds.into_iter().collect();
         match preds.len() {
             0 => match op {
-                JunctionPredicateOp::And => Self::literal(true),
-                JunctionPredicateOp::Or => Self::literal(false),
+                JunctionPredicateOp::And => Self::TRUE,
+                JunctionPredicateOp::Or => Self::FALSE,
             },
             // A junction of one predicate is just that predicate.
             1 => preds.remove(0),
@@ -1161,7 +1276,7 @@ mod tests {
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{column_expr, column_pred, DataType, Expression as Expr, Predicate as Pred};
+    use super::{col, column_pred, lit, DataType, Expression as Expr, Predicate as Pred};
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1173,21 +1288,21 @@ mod tests {
     #[test]
     fn test_expression_format() {
         let cases = [
-            (column_expr!("x"), "Column(x)"),
+            (col!("x"), "Column(x)"),
             (
-                (column_expr!("x") + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
+                (col!("x") + lit(4)) / lit(10) * lit(42),
                 "Column(x) + 4 / 10 * 42",
             ),
             (
-                Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
+                Expr::struct_from([col!("x"), lit(2), lit(10)]),
                 "Struct(Column(x), 2, 10)",
             ),
             (
-                Expr::array([column_expr!("x"), column_expr!("y"), Expr::literal(0)]),
+                Expr::array([col!("x"), col!("y"), lit(0)]),
                 "ARRAY(Column(x), Column(y), 0)",
             ),
             (
-                Expr::cast(column_expr!("x"), DataType::DATE),
+                Expr::cast(col!("x"), DataType::DATE),
                 "CAST(Column(x) AS date)",
             ),
         ];
@@ -1202,37 +1317,25 @@ mod tests {
     fn test_predicate_format() {
         let cases = [
             (column_pred!("x"), "Column(x)"),
-            (column_expr!("x").eq(Expr::literal(2)), "Column(x) = 2"),
+            (col!("x").eq(lit(2)), "Column(x) = 2"),
+            ((col!("x") - lit(4)).lt(lit(10)), "Column(x) - 4 < 10"),
             (
-                (column_expr!("x") - Expr::literal(4)).lt(Expr::literal(10)),
-                "Column(x) - 4 < 10",
-            ),
-            (
-                Pred::and(
-                    column_expr!("x").ge(Expr::literal(2)),
-                    column_expr!("x").le(Expr::literal(10)),
-                ),
+                Pred::and(col!("x").ge(lit(2)), col!("x").le(lit(10))),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10))",
             ),
             (
                 Pred::and_from([
-                    column_expr!("x").ge(Expr::literal(2)),
-                    column_expr!("x").le(Expr::literal(10)),
-                    column_expr!("x").le(Expr::literal(100)),
+                    col!("x").ge(lit(2)),
+                    col!("x").le(lit(10)),
+                    col!("x").le(lit(100)),
                 ]),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10), NOT(Column(x) > 100))",
             ),
             (
-                Pred::or(
-                    column_expr!("x").gt(Expr::literal(2)),
-                    column_expr!("x").lt(Expr::literal(10)),
-                ),
+                Pred::or(col!("x").gt(lit(2)), col!("x").lt(lit(10))),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (
-                column_expr!("x").eq(Expr::literal("foo")),
-                "Column(x) = 'foo'",
-            ),
+            (col!("x").eq(lit("foo")), "Column(x) = 'foo'"),
         ];
 
         for (pred, expected) in cases {
@@ -1249,11 +1352,11 @@ mod tests {
         use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            col, column_expr, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
+            col, column_name, lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
             Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
-        use crate::utils::test_utils::assert_result_error_with_message;
+        use crate::unit_test_utils::assert_result_error_with_message;
 
         // ==================== Expression::Literal Tests ====================
 
@@ -1262,22 +1365,22 @@ mod tests {
             // Test all primitive scalar types that have proper PartialEq
             let cases: Vec<Expression> = vec![
                 // Numeric types
-                Expression::literal(42i32),         // Integer
-                Expression::literal(9999999999i64), // Long
-                Expression::literal(123i16),        // Short
-                Expression::literal(42i8),          // Byte
-                Expression::literal(1.12345677_32), // Float
-                Expression::literal(1.12345667_64), // Double
+                lit(42i32),         // Integer
+                lit(9999999999i64), // Long
+                lit(123i16),        // Short
+                lit(42i8),          // Byte
+                lit(1.12345677_32), // Float
+                lit(1.12345667_64), // Double
                 // String and Boolean
-                Expression::literal("hello world"),
-                Expression::literal(true),
-                Expression::literal(false),
+                lit("hello world"),
+                lit(true),
+                lit(false),
                 // Temporal types
                 Expression::Literal(Scalar::Timestamp(1234567890000000)),
                 Expression::Literal(Scalar::TimestampNtz(1234567890000000)),
                 Expression::Literal(Scalar::Date(19000)),
                 // Binary
-                Expression::Literal(Scalar::Binary(vec![1, 2, 3, 4, 5])),
+                lit(vec![1u8, 2, 3, 4, 5]),
                 // Decimal
                 Expression::Literal(Scalar::Decimal(
                     DecimalData::try_new(12345i128, DecimalType::try_new(10, 2).unwrap()).unwrap(),
@@ -1294,9 +1397,9 @@ mod tests {
             // Test complex scalar types that need JSON comparison (partial_cmp returns None)
             let cases: Vec<Expression> = vec![
                 // Null with different types
-                Expression::null_literal(DataType::INTEGER),
-                Expression::null_literal(DataType::STRING),
-                Expression::null_literal(DataType::BOOLEAN),
+                null_lit(DataType::INTEGER),
+                null_lit(DataType::STRING),
+                null_lit(DataType::BOOLEAN),
                 // Array
                 Expression::Literal(Scalar::Array(
                     ArrayData::try_new(
@@ -1338,11 +1441,8 @@ mod tests {
 
         #[test]
         fn test_column_expressions_roundtrip() {
-            let cases: Vec<Expression> = vec![
-                column_expr!("my_column"),
-                Expression::column(["parent", "child"]),
-                Expression::column(["a", "b", "c", "d"]),
-            ];
+            let cases: Vec<Expression> =
+                vec![col!("my_column"), col!("parent.child"), col!("a.b.c.d")];
 
             for expr in &cases {
                 assert_roundtrip(expr);
@@ -1353,7 +1453,7 @@ mod tests {
         fn test_column_names_roundtrip() {
             let cases: Vec<ColumnName> = vec![
                 column_name!("simple"),
-                ColumnName::new(["a", "b", "c"]),
+                column_name!("a.b.c"),
                 ColumnName::default(),
             ];
 
@@ -1366,7 +1466,7 @@ mod tests {
 
         #[test]
         fn test_unary_expression_roundtrip() {
-            let expr = Expression::unary(UnaryExpressionOp::ToJson, column_expr!("data"));
+            let expr = Expression::unary(UnaryExpressionOp::ToJson, col!("data"));
             assert_roundtrip(&expr);
         }
 
@@ -1380,26 +1480,22 @@ mod tests {
             ];
 
             for op in ops {
-                let expr = Expression::binary(op, column_expr!("a"), Expression::literal(10));
+                let expr = Expression::binary(op, col!("a"), lit(10));
                 assert_roundtrip(&expr);
             }
         }
 
         #[test]
         fn test_variadic_expression_roundtrip() {
-            let expr = Expression::coalesce([
-                column_expr!("a"),
-                column_expr!("b"),
-                Expression::literal("default"),
-            ]);
+            let expr = Expression::coalesce([col!("a"), col!("b"), lit("default")]);
             assert_roundtrip(&expr);
         }
 
         #[rstest::rstest]
-        #[case::column(Expression::cast(column_expr!("part"), DataType::DATE))]
-        #[case::literal(Expression::cast(Expression::literal("2025-01-01"), DataType::DATE))]
+        #[case::column(Expression::cast(col!("part"), DataType::DATE))]
+        #[case::literal(Expression::cast(lit("2025-01-01"), DataType::DATE))]
         #[case::nested(Expression::cast(
-            Expression::cast(column_expr!("part"), DataType::STRING),
+            Expression::cast(col!("part"), DataType::STRING),
             DataType::INTEGER,
         ))]
         fn test_cast_expression_roundtrip(#[case] expr: Expression) {
@@ -1407,11 +1503,11 @@ mod tests {
         }
 
         #[rstest::rstest]
-        #[case::array_single(Expression::array([Expression::literal(7i32)]))]
+        #[case::array_single(Expression::array([lit(7i32)]))]
         #[case::array_mixed(Expression::array([
-            column_expr!("a"),
-            column_expr!("b"),
-            Expression::literal(42i64),
+            col!("a"),
+            col!("b"),
+            lit(42i64),
         ]))]
         fn test_array_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
@@ -1420,18 +1516,10 @@ mod tests {
         #[test]
         fn test_nested_arithmetic_expression_roundtrip() {
             // (a + b) * (c - d) / 2
-            let left = Expression::binary(
-                BinaryExpressionOp::Plus,
-                column_expr!("a"),
-                column_expr!("b"),
-            );
-            let right = Expression::binary(
-                BinaryExpressionOp::Minus,
-                column_expr!("c"),
-                column_expr!("d"),
-            );
+            let left = Expression::binary(BinaryExpressionOp::Plus, col!("a"), col!("b"));
+            let right = Expression::binary(BinaryExpressionOp::Minus, col!("c"), col!("d"));
             let mul = Expression::binary(BinaryExpressionOp::Multiply, left, right);
-            let expr = Expression::binary(BinaryExpressionOp::Divide, mul, Expression::literal(2));
+            let expr = Expression::binary(BinaryExpressionOp::Divide, mul, lit(2));
             assert_roundtrip(&expr);
         }
 
@@ -1440,9 +1528,9 @@ mod tests {
         #[test]
         fn test_struct_expression_roundtrip() {
             let expr = Expression::struct_from([
-                Arc::new(column_expr!("x")),
-                Arc::new(Expression::literal(42)),
-                Arc::new(Expression::literal("hello")),
+                Arc::new(col!("x")),
+                Arc::new(lit(42)),
+                Arc::new(lit("hello")),
             ]);
             assert_roundtrip(&expr);
         }
@@ -1482,7 +1570,7 @@ mod tests {
 
         #[test]
         fn test_expression_wrapping_predicate_roundtrip() {
-            let pred = Predicate::eq(column_expr!("x"), Expression::literal(10));
+            let pred = Predicate::eq(col!("x"), lit(10));
             let expr = Expression::from_pred(pred);
             assert_roundtrip(&expr);
         }
@@ -1496,8 +1584,8 @@ mod tests {
         #[test]
         fn test_map_to_struct_expression_roundtrip() {
             let cases: Vec<Expression> = vec![
-                Expression::map_to_struct(column_expr!("pv")),
-                Expression::map_to_struct(Expression::literal("ignored")),
+                Expression::map_to_struct(col!("pv")),
+                Expression::map_to_struct(lit("ignored")),
             ];
 
             for expr in &cases {
@@ -1511,22 +1599,19 @@ mod tests {
         fn test_predicate_basics_roundtrip() {
             let cases: Vec<Predicate> = vec![
                 // Boolean expression
-                Predicate::from_expr(column_expr!("is_active")),
+                Predicate::from_expr(col!("is_active")),
                 // Literals
-                Predicate::literal(true),
-                Predicate::literal(false),
+                Predicate::TRUE,
+                Predicate::FALSE,
                 // NOT
-                Predicate::not(Predicate::from_expr(column_expr!("x"))),
+                Predicate::not(Predicate::from_expr(col!("x"))),
                 // Nested NOT
-                Predicate::not(Predicate::not(Predicate::gt(
-                    column_expr!("x"),
-                    Expression::literal(5),
-                ))),
+                Predicate::not(Predicate::not(Predicate::gt(col!("x"), lit(5)))),
                 // Unknown
                 Predicate::unknown("some_unknown_predicate()"),
                 // Unary predicates
-                Predicate::is_null(column_expr!("nullable_col")),
-                Predicate::is_not_null(column_expr!("nullable_col")),
+                Predicate::is_null(col!("nullable_col")),
+                Predicate::is_not_null(col!("nullable_col")),
             ];
 
             for pred in &cases {
@@ -1536,20 +1621,19 @@ mod tests {
 
         #[test]
         fn test_predicate_null_literal_roundtrip() {
-            let pred = Predicate::null_literal();
-            assert_roundtrip(&pred);
+            assert_roundtrip(&Predicate::NULL);
         }
 
         #[test]
         fn test_predicate_comparisons_roundtrip() {
             let cases: Vec<Predicate> = vec![
-                Predicate::eq(column_expr!("x"), Expression::literal(42)),
-                Predicate::ne(column_expr!("status"), Expression::literal("active")),
-                Predicate::lt(column_expr!("age"), Expression::literal(18)),
-                Predicate::le(column_expr!("price"), Expression::literal(100)),
-                Predicate::gt(column_expr!("score"), Expression::literal(90)),
-                Predicate::ge(column_expr!("quantity"), Expression::literal(1)),
-                Predicate::distinct(column_expr!("a"), column_expr!("b")),
+                Predicate::eq(col!("x"), lit(42)),
+                Predicate::ne(col!("status"), lit("active")),
+                Predicate::lt(col!("age"), lit(18)),
+                Predicate::le(col!("price"), lit(100)),
+                Predicate::gt(col!("score"), lit(90)),
+                Predicate::ge(col!("quantity"), lit(1)),
+                Predicate::distinct(col!("a"), col!("b")),
             ];
 
             for pred in &cases {
@@ -1566,7 +1650,7 @@ mod tests {
             .unwrap();
             let pred = Predicate::binary(
                 BinaryPredicateOp::In,
-                column_expr!("x"),
+                col!("x"),
                 Expression::Literal(Scalar::Array(array_data)),
             );
             assert_roundtrip(&pred);
@@ -1577,33 +1661,33 @@ mod tests {
             let cases: Vec<Predicate> = vec![
                 // Simple AND
                 Predicate::and(
-                    Predicate::gt(column_expr!("x"), Expression::literal(0)),
-                    Predicate::lt(column_expr!("x"), Expression::literal(100)),
+                    Predicate::gt(col!("x"), lit(0)),
+                    Predicate::lt(col!("x"), lit(100)),
                 ),
                 // Simple OR
                 Predicate::or(
-                    Predicate::eq(column_expr!("status"), Expression::literal("active")),
-                    Predicate::eq(column_expr!("status"), Expression::literal("pending")),
+                    Predicate::eq(col!("status"), lit("active")),
+                    Predicate::eq(col!("status"), lit("pending")),
                 ),
                 // Multiple AND
                 Predicate::and_from([
-                    Predicate::gt(column_expr!("x"), Expression::literal(0)),
-                    Predicate::lt(column_expr!("x"), Expression::literal(100)),
-                    Predicate::is_not_null(column_expr!("x")),
+                    Predicate::gt(col!("x"), lit(0)),
+                    Predicate::lt(col!("x"), lit(100)),
+                    Predicate::is_not_null(col!("x")),
                 ]),
                 // Multiple OR
                 Predicate::or_from([
-                    Predicate::eq(column_expr!("type"), Expression::literal("A")),
-                    Predicate::eq(column_expr!("type"), Expression::literal("B")),
-                    Predicate::eq(column_expr!("type"), Expression::literal("C")),
+                    Predicate::eq(col!("type"), lit("A")),
+                    Predicate::eq(col!("type"), lit("B")),
+                    Predicate::eq(col!("type"), lit("C")),
                 ]),
                 // Nested: (a > 0 AND b < 100) OR (c = 'special')
                 Predicate::or(
                     Predicate::and(
-                        Predicate::gt(column_expr!("a"), Expression::literal(0)),
-                        Predicate::lt(column_expr!("b"), Expression::literal(100)),
+                        Predicate::gt(col!("a"), lit(0)),
+                        Predicate::lt(col!("b"), lit(100)),
                     ),
-                    Predicate::eq(column_expr!("c"), Expression::literal("special")),
+                    Predicate::eq(col!("c"), lit("special")),
                 ),
             ];
 
@@ -1617,30 +1701,18 @@ mod tests {
         #[test]
         fn test_deeply_nested_structures_roundtrip() {
             // COALESCE(a + b, c * d, 0) > 100
-            let add = Expression::binary(
-                BinaryExpressionOp::Plus,
-                column_expr!("a"),
-                column_expr!("b"),
-            );
-            let mul = Expression::binary(
-                BinaryExpressionOp::Multiply,
-                column_expr!("c"),
-                column_expr!("d"),
-            );
-            let coalesce = Expression::coalesce([add, mul, Expression::literal(0)]);
-            let pred = Predicate::gt(coalesce, Expression::literal(100));
+            let add = Expression::binary(BinaryExpressionOp::Plus, col!("a"), col!("b"));
+            let mul = Expression::binary(BinaryExpressionOp::Multiply, col!("c"), col!("d"));
+            let coalesce = Expression::coalesce([add, mul, lit(0)]);
+            let pred = Predicate::gt(coalesce, lit(100));
             assert_roundtrip(&pred);
 
             // Expression wrapping a predicate that references expressions
             let inner_pred = Predicate::and(
-                Predicate::eq(column_expr!("x"), Expression::literal(1)),
+                Predicate::eq(col!("x"), lit(1)),
                 Predicate::gt(
-                    Expression::binary(
-                        BinaryExpressionOp::Plus,
-                        column_expr!("y"),
-                        column_expr!("z"),
-                    ),
-                    Expression::literal(10),
+                    Expression::binary(BinaryExpressionOp::Plus, col!("y"), col!("z")),
+                    lit(10),
                 ),
             );
             let expr = Expression::from_pred(inner_pred);
@@ -1670,7 +1742,7 @@ mod tests {
                 }
             }
 
-            let expr = Expression::opaque(TestOpaqueExprOp, [Expression::literal(1)]);
+            let expr = Expression::opaque(TestOpaqueExprOp, [lit(1)]);
             let result = serde_json::to_string(&expr);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Expression");
         }
@@ -1718,7 +1790,7 @@ mod tests {
                 }
             }
 
-            let pred = Predicate::opaque(TestOpaquePredOp, [Expression::literal(1)]);
+            let pred = Predicate::opaque(TestOpaquePredOp, [lit(1)]);
             let result = serde_json::to_string(&pred);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
         }
@@ -1726,22 +1798,22 @@ mod tests {
 
     #[test]
     fn single_element_and_from_returns_unwrapped_predicate() {
-        let inner = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let inner = Pred::gt(col!("x"), lit(0));
         let result = Pred::and_from([inner.clone()]);
         assert_eq!(result, inner);
     }
 
     #[test]
     fn single_element_or_from_returns_unwrapped_predicate() {
-        let inner = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let inner = Pred::gt(col!("x"), lit(0));
         let result = Pred::or_from([inner.clone()]);
         assert_eq!(result, inner);
     }
 
     #[test]
     fn multi_element_and_from_returns_junction() {
-        let p1 = Pred::gt(column_expr!("x"), Expr::literal(0));
-        let p2 = Pred::lt(column_expr!("x"), Expr::literal(100));
+        let p1 = Pred::gt(col!("x"), lit(0));
+        let p2 = Pred::lt(col!("x"), lit(100));
         let result = Pred::and_from([p1.clone(), p2.clone()]);
         assert!(matches!(result, Pred::Junction(ref j) if j.preds.len() == 2));
         assert_eq!(result, Pred::and(p1, p2));
@@ -1750,12 +1822,12 @@ mod tests {
     #[test]
     fn empty_and_from_returns_identity_literal() {
         let result = Pred::and_from(std::iter::empty());
-        assert_eq!(result, Pred::literal(true));
+        assert_eq!(result, Pred::TRUE);
     }
 
     #[test]
     fn empty_or_from_returns_identity_literal() {
         let result = Pred::or_from(std::iter::empty());
-        assert_eq!(result, Pred::literal(false));
+        assert_eq!(result, Pred::FALSE);
     }
 }

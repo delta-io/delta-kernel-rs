@@ -1,37 +1,46 @@
 # unity-catalog-delta-rest-client
 
-An experimental/under-construction rust client for Unity Catalog. This crate is not intended for
-production use.
+> [!WARNING]
+> This crate is experimental and under construction. It is not intended for production use.
 
-## Example CLI
-This crate provides a command-line interface (CLI) to interact with Unity Catalog APIs, see
-`unity-catalog-delta-rest-client/examples/uc-cli.rs`.
+A Rust client for the Unity Catalog Delta APIs.
 
-```bash
-# set environment variables for UC url/token
-UC_WORKSPACE_URL=https://some.uc.org
-UC_TOKEN=your-token
+It provides two REST structs:
 
-# or set them in each command like
-cargo run --example uc-cli -- --workspace-url <url> --token <token> table catalog.schema.table
+- `UCClient`: concrete HTTP methods for the connector-driven endpoints: `load_table`, credential
+  vending, `/config`, table and staging-table creation, and metrics reporting.
+- `UCUpdateTableRestClient`: an implementation of the `UpdateTableClient` trait (from
+  `unity-catalog-delta-client-api`) against the `update_table` commit endpoint.
 
-# there are 3 operations:
-# 1. get table metadata
-cargo run --example uc-cli -- table catalog.schema.table
+## Example
 
-# 2. get commits for a table (automatically resolves table id and storage location)
-cargo run --example uc-cli -- commits catalog.schema.table
+```rust,no_run
+use unity_catalog_delta_client_api::Operation;
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 
-# or get commits with version range
-cargo run --example uc-cli -- commits catalog.schema.table \
-  --start-version 0 \
-  --end-version 10
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Configure against a UC workspace (URL + token + identity).
+    let config = ClientConfig::build("https://some.uc.org", "your-token")
+        .with_additional_user_agent([("MyEngine", "1.0.0"), ("MyConnector", "1.0.0")])
+        .build()?;
+    let client = UCClient::new(config)?;
 
-# 3. get temporary credentials
-cargo run --example uc-cli -- credentials \
-  --table-id "table-uuid" \
-  --operation READ
+    // Load a table by its three-part name. The response carries the table
+    // metadata and any inline (unpublished) commits.
+    let table = client.load_table("catalog", "schema", "table").await?;
+    println!("table id: {}", table.metadata.table_uuid);
+    println!("location: {}", table.metadata.location);
 
-# also can enable verbose logging
-cargo run --example uc-cli -- --verbose table catalog.schema.table
+    // Vend temporary storage credentials for reads.
+    let creds = client
+        .get_table_credentials("catalog", "schema", "table", Operation::Read)
+        .await?;
+    println!("vended {} credential(s)", creds.storage_credentials.len());
+
+    Ok(())
+}
 ```
+
+To coordinate commits (version >= 1), construct a `UCUpdateTableRestClient` and use it as the
+`UpdateTableClient` trait object; see the crate-level documentation for details.

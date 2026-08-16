@@ -13,7 +13,7 @@ use super::log_replay::TableChangesScanMetadata;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_expr, Expression};
+use crate::expressions::{col, lit, Expression};
 use crate::scan::state::DvInfo;
 use crate::schema::{
     ColumnName, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
@@ -454,28 +454,28 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
 pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64) -> Expression {
     Expression::struct_from([
         Expression::struct_from([
-            column_expr!("add.path"),
-            column_expr!("add.deletionVector"),
-            Expression::struct_from([column_expr!("add.partitionValues")]),
-            column_expr!("add.size"),
-            column_expr!("add.baseRowId"),
-            column_expr!("add.defaultRowCommitVersion"),
+            col!("add.path"),
+            col!("add.deletionVector"),
+            Expression::struct_from([col!("add.partitionValues")]),
+            col!("add.size"),
+            col!("add.baseRowId"),
+            col!("add.defaultRowCommitVersion"),
         ]),
         Expression::struct_from([
-            column_expr!("remove.path"),
-            column_expr!("remove.deletionVector"),
-            Expression::struct_from([column_expr!("remove.partitionValues")]),
-            column_expr!("remove.size"),
-            column_expr!("remove.baseRowId"),
-            column_expr!("remove.defaultRowCommitVersion"),
+            col!("remove.path"),
+            col!("remove.deletionVector"),
+            Expression::struct_from([col!("remove.partitionValues")]),
+            col!("remove.size"),
+            col!("remove.baseRowId"),
+            col!("remove.defaultRowCommitVersion"),
         ]),
         Expression::struct_from([
-            column_expr!("cdc.path"),
-            Expression::struct_from([column_expr!("cdc.partitionValues")]),
-            column_expr!("cdc.size"),
+            col!("cdc.path"),
+            Expression::struct_from([col!("cdc.partitionValues")]),
+            col!("cdc.size"),
         ]),
-        Expression::literal(commit_timestamp),
-        Expression::literal(commit_number),
+        lit(commit_timestamp),
+        lit(commit_number),
     ])
 }
 
@@ -501,7 +501,7 @@ mod tests {
     use crate::table_changes::CdfMode;
     use crate::table_configuration::TableConfiguration;
     use crate::table_properties::{COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED};
-    use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+    use crate::unit_test_utils::{assert_result_error_with_message, Action, LocalMockTable};
     use crate::Engine as _;
 
     fn row_tracking_add(

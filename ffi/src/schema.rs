@@ -3,7 +3,7 @@ use std::os::raw::c_void;
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 
 use crate::handle::Handle;
-use crate::scan::CStringMap;
+use crate::scan::CMetadataMap;
 use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
@@ -48,7 +48,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
         child_list_id: usize,
     ),
 
@@ -59,7 +59,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
         child_list_id: usize,
     ),
 
@@ -71,7 +71,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
         child_list_id: usize,
     ),
 
@@ -81,7 +81,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
         precision: u8,
         scale: u8,
     ),
@@ -92,7 +92,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `long` belonging to the list identified by `sibling_list_id`.
@@ -101,7 +101,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit an `integer` belonging to the list identified by `sibling_list_id`.
@@ -110,7 +110,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `short` belonging to the list identified by `sibling_list_id`.
@@ -119,7 +119,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `byte` belonging to the list identified by `sibling_list_id`.
@@ -128,7 +128,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `float` belonging to the list identified by `sibling_list_id`.
@@ -137,7 +137,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `double` belonging to the list identified by `sibling_list_id`.
@@ -146,7 +146,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `boolean` belonging to the list identified by `sibling_list_id`.
@@ -155,7 +155,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit `binary` belonging to the list identified by `sibling_list_id`.
@@ -164,7 +164,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `date` belonging to the list identified by `sibling_list_id`.
@@ -173,7 +173,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `timestamp` belonging to the list identified by `sibling_list_id`.
@@ -182,7 +182,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `timestamp` with no timezone belonging to the list identified by `sibling_list_id`.
@@ -191,7 +191,25 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
+    ),
+
+    /// Visit an `interval year to month` belonging to the list identified by `sibling_list_id`.
+    pub visit_interval_year_month: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CMetadataMap,
+    ),
+
+    /// Visit an `interval day to second` belonging to the list identified by `sibling_list_id`.
+    pub visit_interval_day_time: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `void` belonging to the list identified by `sibling_list_id`.
@@ -200,7 +218,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 
     /// Visit a `variant` belonging to the list identified by `sibling_list_id`.
@@ -209,7 +227,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
     ),
 }
 
@@ -239,7 +257,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
                 field.name(),
                 field.data_type(),
                 field.is_nullable(),
-                &field.metadata_with_string_values().into(),
+                &field.metadata().clone().into(),
                 visitor,
                 child_list_id,
             );
@@ -253,7 +271,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
         contains_null: bool,
     ) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, 1);
-        let metadata = CStringMap::default();
+        let metadata = CMetadataMap::default();
         visit_schema_item(
             "array_element",
             &at.element_type,
@@ -271,7 +289,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
         value_contains_null: bool,
     ) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, 2);
-        let metadata = CStringMap::default();
+        let metadata = CMetadataMap::default();
         visit_schema_item(
             "map_key",
             &mt.key_type,
@@ -296,7 +314,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
         name: &str,
         data_type: &DataType,
         is_nullable: bool,
-        metadata: &CStringMap,
+        metadata: &CMetadataMap,
         visitor: &EngineSchemaVisitor,
         sibling_list_id: usize,
     ) {
@@ -339,11 +357,9 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::DATE => call!(visit_date),
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
+            &DataType::INTERVAL_YEAR_MONTH => call!(visit_interval_year_month),
+            &DataType::INTERVAL_DAY_TIME => call!(visit_interval_day_time),
             &DataType::VOID => call!(visit_void),
-            &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
-                // TODO(#2811): add visit_interval_* callbacks; skipping silently drops the column
-                tracing::warn!("Skipping unsupported interval field '{name}' in FFI schema visit");
-            }
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(_))
             | DataType::Primitive(PrimitiveType::Geography(_)) => {
@@ -355,4 +371,215 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
     }
 
     visit_struct_fields(visitor, schema)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use delta_kernel::schema::{ArrayType, StructField};
+
+    use super::*;
+    use crate::TryFromStringSlice;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct VisitedField {
+        name: String,
+        data_type: &'static str,
+        is_nullable: bool,
+        children: Option<usize>,
+    }
+
+    #[derive(Default)]
+    struct TestSchemaBuilder {
+        lists: Vec<Vec<VisitedField>>,
+    }
+
+    extern "C" fn make_field_list(data: *mut c_void, reserve: usize) -> usize {
+        let builder = unsafe { &mut *(data as *mut TestSchemaBuilder) };
+        let list_id = builder.lists.len();
+        builder.lists.push(Vec::with_capacity(reserve));
+        list_id
+    }
+
+    fn add_field(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        data_type: &'static str,
+        children: Option<usize>,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestSchemaBuilder) };
+        builder.lists[sibling_list_id].push(VisitedField {
+            name: unsafe { String::try_from_slice(&name) }.unwrap(),
+            data_type,
+            is_nullable,
+            children,
+        });
+    }
+
+    macro_rules! visit_nested_type {
+        ($fn_name:ident, $type_name:expr) => {
+            extern "C" fn $fn_name(
+                data: *mut c_void,
+                sibling_list_id: usize,
+                name: KernelStringSlice,
+                is_nullable: bool,
+                _metadata: &CMetadataMap,
+                child_list_id: usize,
+            ) {
+                add_field(
+                    data,
+                    sibling_list_id,
+                    name,
+                    is_nullable,
+                    $type_name,
+                    Some(child_list_id),
+                );
+            }
+        };
+    }
+
+    visit_nested_type!(visit_struct, "struct");
+    visit_nested_type!(visit_array, "array");
+    visit_nested_type!(visit_map, "map");
+
+    extern "C" fn visit_decimal(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        _metadata: &CMetadataMap,
+        _precision: u8,
+        _scale: u8,
+    ) {
+        add_field(data, sibling_list_id, name, is_nullable, "decimal", None);
+    }
+
+    macro_rules! visit_simple_type {
+        ($fn_name:ident, $type_name:expr) => {
+            extern "C" fn $fn_name(
+                data: *mut c_void,
+                sibling_list_id: usize,
+                name: KernelStringSlice,
+                is_nullable: bool,
+                _metadata: &CMetadataMap,
+            ) {
+                add_field(data, sibling_list_id, name, is_nullable, $type_name, None);
+            }
+        };
+    }
+
+    visit_simple_type!(visit_string, "string");
+    visit_simple_type!(visit_long, "long");
+    visit_simple_type!(visit_integer, "integer");
+    visit_simple_type!(visit_short, "short");
+    visit_simple_type!(visit_byte, "byte");
+    visit_simple_type!(visit_float, "float");
+    visit_simple_type!(visit_double, "double");
+    visit_simple_type!(visit_boolean, "boolean");
+    visit_simple_type!(visit_binary, "binary");
+    visit_simple_type!(visit_date, "date");
+    visit_simple_type!(visit_timestamp, "timestamp");
+    visit_simple_type!(visit_timestamp_ntz, "timestamp_ntz");
+    visit_simple_type!(visit_interval_year_month, "interval year to month");
+    visit_simple_type!(visit_interval_day_time, "interval day to second");
+    visit_simple_type!(visit_void, "void");
+    visit_simple_type!(visit_variant, "variant");
+
+    fn test_visitor(builder: &mut TestSchemaBuilder) -> EngineSchemaVisitor {
+        EngineSchemaVisitor {
+            data: builder as *mut _ as *mut c_void,
+            make_field_list,
+            visit_struct,
+            visit_array,
+            visit_map,
+            visit_decimal,
+            visit_string,
+            visit_long,
+            visit_integer,
+            visit_short,
+            visit_byte,
+            visit_float,
+            visit_double,
+            visit_boolean,
+            visit_binary,
+            visit_date,
+            visit_timestamp,
+            visit_timestamp_ntz,
+            visit_interval_year_month,
+            visit_interval_day_time,
+            visit_void,
+            visit_variant,
+        }
+    }
+
+    #[test]
+    fn visit_schema_preserves_interval_fields() {
+        let schema = StructType::try_new(vec![
+            StructField::nullable("ym", DataType::INTERVAL_YEAR_MONTH),
+            StructField::not_null("dt", DataType::INTERVAL_DAY_TIME),
+            StructField::nullable(
+                "nested",
+                StructType::try_new(vec![StructField::nullable(
+                    "inner_ym",
+                    DataType::INTERVAL_YEAR_MONTH,
+                )])
+                .unwrap(),
+            ),
+            StructField::nullable(
+                "intervals",
+                ArrayType::new(DataType::INTERVAL_DAY_TIME, false),
+            ),
+        ])
+        .unwrap();
+
+        let mut builder = TestSchemaBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+        let top_level_id = visit_schema_impl(&schema, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(builder.lists[0].len(), 4);
+        assert_eq!(
+            builder.lists[0][0],
+            VisitedField {
+                name: "ym".to_string(),
+                data_type: "interval year to month",
+                is_nullable: true,
+                children: None,
+            }
+        );
+        assert_eq!(
+            builder.lists[0][1],
+            VisitedField {
+                name: "dt".to_string(),
+                data_type: "interval day to second",
+                is_nullable: false,
+                children: None,
+            }
+        );
+
+        let nested_child_list_id = builder.lists[0][2].children.unwrap();
+        assert_eq!(
+            builder.lists[nested_child_list_id][0],
+            VisitedField {
+                name: "inner_ym".to_string(),
+                data_type: "interval year to month",
+                is_nullable: true,
+                children: None,
+            }
+        );
+
+        let array_child_list_id = builder.lists[0][3].children.unwrap();
+        assert_eq!(
+            builder.lists[array_child_list_id][0],
+            VisitedField {
+                name: "array_element".to_string(),
+                data_type: "interval day to second",
+                is_nullable: false,
+                children: None,
+            }
+        );
+    }
 }

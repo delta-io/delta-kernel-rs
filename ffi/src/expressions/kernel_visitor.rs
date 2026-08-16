@@ -5,8 +5,8 @@ use std::sync::Arc;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
-    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
-    Scalar, UnaryPredicateOp,
+    lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
+    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
@@ -275,7 +275,7 @@ fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
     value: DeltaResult<String>,
 ) -> DeltaResult<usize> {
-    Ok(wrap_expression(state, Expression::literal(value?)))
+    Ok(wrap_expression(state, lit(value?)))
 }
 
 // We need to get parse.expand working to be able to macro everything below, see issue #255
@@ -284,7 +284,7 @@ pub extern "C" fn visit_expression_literal_int(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -292,7 +292,7 @@ pub extern "C" fn visit_expression_literal_long(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -300,7 +300,7 @@ pub extern "C" fn visit_expression_literal_short(
     state: &mut KernelExpressionVisitorState,
     value: i16,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -308,7 +308,7 @@ pub extern "C" fn visit_expression_literal_byte(
     state: &mut KernelExpressionVisitorState,
     value: i8,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -316,7 +316,7 @@ pub extern "C" fn visit_expression_literal_float(
     state: &mut KernelExpressionVisitorState,
     value: f32,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -324,7 +324,7 @@ pub extern "C" fn visit_expression_literal_double(
     state: &mut KernelExpressionVisitorState,
     value: f64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -332,7 +332,7 @@ pub extern "C" fn visit_expression_literal_bool(
     state: &mut KernelExpressionVisitorState,
     value: bool,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 /// visit a date literal expression 'value' (i32 representing days since unix epoch)
@@ -341,7 +341,7 @@ pub extern "C" fn visit_expression_literal_date(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::Date(value)))
+    wrap_expression(state, lit(Scalar::Date(value)))
 }
 
 /// visit a timestamp literal expression 'value' (i64 representing microseconds since unix epoch)
@@ -350,7 +350,7 @@ pub extern "C" fn visit_expression_literal_timestamp(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::Timestamp(value)))
+    wrap_expression(state, lit(Scalar::Timestamp(value)))
 }
 
 /// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix
@@ -360,7 +360,25 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::TimestampNtz(value)))
+    wrap_expression(state, lit(Scalar::TimestampNtz(value)))
+}
+
+/// Visit an interval year-month literal (signed month count).
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_interval_year_month(
+    state: &mut KernelExpressionVisitorState,
+    value: i32,
+) -> usize {
+    wrap_expression(state, lit(Scalar::IntervalYearMonth(value)))
+}
+
+/// Visit an interval day-time literal (signed microsecond count).
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_interval_day_time(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> usize {
+    wrap_expression(state, lit(Scalar::IntervalDayTime(value)))
 }
 
 /// visit a binary literal expression
@@ -374,7 +392,7 @@ pub unsafe extern "C" fn visit_expression_literal_binary(
     len: usize,
 ) -> usize {
     let bytes = std::slice::from_raw_parts(value, len);
-    wrap_expression(state, Expression::literal(Scalar::Binary(bytes.to_vec())))
+    wrap_expression(state, lit(bytes))
 }
 
 /// visit a decimal literal expression
@@ -406,15 +424,15 @@ fn visit_expression_literal_decimal_impl(
     // Reconstruct the i128 from two u64 parts
     let value = ((value_hi as i128) << 64) | (value_lo as i128);
     let decimal = Scalar::decimal(value, precision, scale)?;
-    Ok(wrap_expression(state, Expression::literal(decimal)))
+    Ok(wrap_expression(state, lit(decimal)))
 }
 
 /// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
 ///
-/// Primitive types use fixed discriminants 0-11. Decimal uses 12 and requires additional
-/// precision/scale parameters. Non-primitive types (struct, array, map, variant) use the
-/// [`NonPrimitive`](Self::NonPrimitive) sentinel -- these cannot be reconstructed from a type
-/// tag alone.
+/// Most primitive types use fixed discriminants 0-14. Decimal uses 12 and requires additional
+/// precision/scale parameters. Non-primitive types (struct, array, map, variant) and the `void`
+/// primitive use the [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be
+/// reconstructed from a type tag alone.
 ///
 /// NOTE: These values are part of the FFI contract. Changing existing discriminants is a breaking
 /// change.
@@ -450,9 +468,14 @@ pub(crate) enum NullTypeTag {
     /// WARNING: This variant MUST remain `= 12`. It is the only tag with special handling
     /// (precision/scale parameters), and C consumers key on the value `12` directly.
     Decimal = 12,
-    /// Sentinel for non-primitive null types (struct, array, map, variant). Emitted by the
-    /// kernel-to-engine visitor when the null's type is not a primitive. Engines that receive
-    /// this tag should use opaque expressions or a schema visitor to obtain full type details.
+    /// Null of type `interval year to month` (signed month count).
+    IntervalYearMonth = 13,
+    /// Null of type `interval day to second` (signed microsecond duration).
+    IntervalDayTime = 14,
+    /// Sentinel for non-primitive null types (struct, array, map, variant) and void. Emitted by
+    /// the kernel-to-engine visitor when the null's type cannot be reconstructed from a compact
+    /// tag. Engines that receive this tag should use opaque expressions or a schema visitor to
+    /// obtain full type details.
     ///
     /// Passing this tag to [`visit_expression_literal_null`] returns an error because the
     /// original complex type cannot be reconstructed from a tag alone.
@@ -477,6 +500,8 @@ impl TryFrom<u8> for NullTypeTag {
             10 => Ok(Self::Timestamp),
             11 => Ok(Self::TimestampNtz),
             12 => Ok(Self::Decimal),
+            13 => Ok(Self::IntervalYearMonth),
+            14 => Ok(Self::IntervalDayTime),
             255 => Ok(Self::NonPrimitive),
             other => Err(delta_kernel::Error::generic(format!(
                 "Unrecognized null type tag: {other}"
@@ -505,10 +530,8 @@ impl NullTypeTag {
                 PrimitiveType::Date => (Self::Date, 0, 0),
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
-                PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
-                    // No FFI null tag for intervals; the sentinel avoids a new discriminant
-                    (Self::NonPrimitive, 0, 0)
-                }
+                PrimitiveType::IntervalYearMonth => (Self::IntervalYearMonth, 0, 0),
+                PrimitiveType::IntervalDayTime => (Self::IntervalDayTime, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
                 // not expected to produce a void-typed literal null; if one ever reaches this
@@ -550,6 +573,8 @@ impl NullTypeTag {
             Self::Date => Ok(DataType::DATE),
             Self::Timestamp => Ok(DataType::TIMESTAMP),
             Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
+            Self::IntervalYearMonth => Ok(DataType::INTERVAL_YEAR_MONTH),
+            Self::IntervalDayTime => Ok(DataType::INTERVAL_DAY_TIME),
             Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
                 precision, scale,
             )?)),
@@ -592,10 +617,7 @@ fn visit_expression_literal_null_impl(
 ) -> DeltaResult<usize> {
     let tag = NullTypeTag::try_from(type_tag)?;
     let data_type = tag.to_data_type(precision, scale)?;
-    Ok(wrap_expression(
-        state,
-        Expression::literal(Scalar::Null(data_type)),
-    ))
+    Ok(wrap_expression(state, null_lit(data_type)))
 }
 
 #[no_mangle]
@@ -760,7 +782,7 @@ fn visit_predicate_opaque_impl(
         return Ok(0);
     }
     tracing::info!("opaque predicate `{name}`: no eval callbacks; kernel will not prune on it");
-    Ok(wrap_predicate(state, Predicate::null_literal()))
+    Ok(wrap_predicate(state, Predicate::NULL))
 }
 
 /// Build an opaque predicate over `FfiOpaquePredicateOp(name, callbacks)` and
@@ -816,7 +838,7 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{Expression, Scalar};
+    use delta_kernel::expressions::{col, lit, Scalar};
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
 
@@ -839,6 +861,8 @@ mod tests {
     #[case(DataType::DATE, NullTypeTag::Date, 0, 0)]
     #[case(DataType::TIMESTAMP, NullTypeTag::Timestamp, 0, 0)]
     #[case(DataType::TIMESTAMP_NTZ, NullTypeTag::TimestampNtz, 0, 0)]
+    #[case(DataType::INTERVAL_YEAR_MONTH, NullTypeTag::IntervalYearMonth, 0, 0)]
+    #[case(DataType::INTERVAL_DAY_TIME, NullTypeTag::IntervalDayTime, 0, 0)]
     fn from_data_type_primitive(
         #[case] dt: DataType,
         #[case] expected_tag: NullTypeTag,
@@ -906,6 +930,8 @@ mod tests {
     #[case(NullTypeTag::Date, DataType::DATE)]
     #[case(NullTypeTag::Timestamp, DataType::TIMESTAMP)]
     #[case(NullTypeTag::TimestampNtz, DataType::TIMESTAMP_NTZ)]
+    #[case(NullTypeTag::IntervalYearMonth, DataType::INTERVAL_YEAR_MONTH)]
+    #[case(NullTypeTag::IntervalDayTime, DataType::INTERVAL_DAY_TIME)]
     fn to_data_type_primitive(#[case] tag: NullTypeTag, #[case] expected: DataType) {
         assert_eq!(tag.to_data_type(0, 0).unwrap(), expected);
     }
@@ -952,13 +978,15 @@ mod tests {
     #[case(10, NullTypeTag::Timestamp)]
     #[case(11, NullTypeTag::TimestampNtz)]
     #[case(12, NullTypeTag::Decimal)]
+    #[case(13, NullTypeTag::IntervalYearMonth)]
+    #[case(14, NullTypeTag::IntervalDayTime)]
     #[case(255, NullTypeTag::NonPrimitive)]
     fn try_from_u8_valid(#[case] value: u8, #[case] expected: NullTypeTag) {
         assert_eq!(NullTypeTag::try_from(value).unwrap(), expected);
     }
 
     #[rstest]
-    #[case(13)]
+    #[case(15)]
     #[case(42)]
     #[case(254)]
     fn try_from_u8_invalid(#[case] value: u8) {
@@ -984,7 +1012,7 @@ mod tests {
     #[test]
     fn visit_null_unrecognized_tag_returns_error() {
         let mut state = KernelExpressionVisitorState::default();
-        assert!(visit_expression_literal_null_impl(&mut state, 13, 0, 0).is_err());
+        assert!(visit_expression_literal_null_impl(&mut state, 15, 0, 0).is_err());
     }
 
     #[test]
@@ -1010,13 +1038,15 @@ mod tests {
     #[case(DataType::DATE)]
     #[case(DataType::TIMESTAMP)]
     #[case(DataType::TIMESTAMP_NTZ)]
+    #[case(DataType::INTERVAL_YEAR_MONTH)]
+    #[case(DataType::INTERVAL_DAY_TIME)]
     fn null_type_round_trips_through_tag_encoding(#[case] data_type: DataType) {
         let (tag, precision, scale) = NullTypeTag::from_data_type(&data_type);
         let mut state = KernelExpressionVisitorState::default();
         let id =
             visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
-        assert_eq!(expr, Expression::literal(Scalar::Null(data_type)),);
+        assert_eq!(expr, null_lit(data_type),);
     }
 
     #[test]
@@ -1028,7 +1058,31 @@ mod tests {
         let id =
             visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
-        assert_eq!(expr, Expression::literal(Scalar::Null(dt)));
+        assert_eq!(expr, null_lit(dt));
+    }
+
+    #[rstest]
+    #[case(Scalar::IntervalYearMonth(17))]
+    #[case(Scalar::IntervalDayTime(1_234_567))]
+    #[case(Scalar::IntervalYearMonth(-13))]
+    #[case(Scalar::IntervalYearMonth(i32::MIN))]
+    #[case(Scalar::IntervalYearMonth(i32::MAX))]
+    #[case(Scalar::IntervalDayTime(-86_400_000_000))]
+    #[case(Scalar::IntervalDayTime(i64::MIN))]
+    #[case(Scalar::IntervalDayTime(i64::MAX))]
+    fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
+        let mut state = KernelExpressionVisitorState::default();
+        let id = match expected {
+            Scalar::IntervalYearMonth(value) => {
+                visit_expression_literal_interval_year_month(&mut state, value)
+            }
+            Scalar::IntervalDayTime(value) => {
+                visit_expression_literal_interval_day_time(&mut state, value)
+            }
+            _ => unreachable!(),
+        };
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(expr, lit(expected));
     }
 
     // ============================================================================
@@ -1083,8 +1137,8 @@ mod tests {
     }
 
     fn make_two_literal_ids(state: &mut KernelExpressionVisitorState) -> (usize, usize) {
-        let a = wrap_expression(state, Expression::literal(1i32));
-        let b = wrap_expression(state, Expression::literal(2i32));
+        let a = wrap_expression(state, lit(1i32));
+        let b = wrap_expression(state, lit(2i32));
         (a, b)
     }
 
@@ -1097,7 +1151,7 @@ mod tests {
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
         // No eval callbacks => NULL boolean literal, which abstains everywhere (even under NOT).
-        assert_eq!(pred, Predicate::null_literal());
+        assert_eq!(pred, Predicate::NULL);
         // Children are drained from the visitor state even though they're discarded.
         assert!(state.inflight_ids.is_empty());
     }
@@ -1137,7 +1191,7 @@ mod tests {
         let id = ok_or_panic(result);
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
-        assert_eq!(pred, Predicate::null_literal());
+        assert_eq!(pred, Predicate::NULL);
     }
 
     /// Drives `visit_predicate_opaque_with_eval` end to end: pass the callbacks struct by value,
@@ -1312,8 +1366,8 @@ mod tests {
 
         // Build the predicate through the FFI symbol, then extract the kernel `Predicate`.
         let mut state = KernelExpressionVisitorState::default();
-        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
-        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let col_id = wrap_expression(&mut state, col!("id"));
+        let target = wrap_expression(&mut state, lit(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
         let name = "IN_RANGE";
         let id = ok_or_panic(unsafe {
@@ -1441,8 +1495,8 @@ mod tests {
         unsafe extern "C" fn noop_free(_: *mut c_void) {}
 
         let mut state = KernelExpressionVisitorState::default();
-        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
-        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let col_id = wrap_expression(&mut state, col!("id"));
+        let target = wrap_expression(&mut state, lit(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
         let name = "IN_RANGE";
         let id = ok_or_panic(unsafe {

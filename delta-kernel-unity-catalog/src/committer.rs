@@ -1,13 +1,17 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 use delta_kernel::{
-    DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FilteredEngineData,
+    DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FileMeta, FilteredEngineData,
 };
 use tracing::{debug, info};
-use unity_catalog_delta_client_api::{Commit, CommitClient, CommitRequest};
+use unity_catalog_delta_client_api::{
+    Commit, DeltaTableRequirement, DeltaTableUpdate, TableIdentifier, UpdateTableClient,
+    UpdateTableRequest,
+};
 
 use crate::constants::{
     CATALOG_MANAGED_FEATURE, CLUSTERING_DOMAIN_NAME, ENABLE_IN_COMMIT_TIMESTAMPS,
@@ -27,29 +31,34 @@ macro_rules! require {
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
 ///
-/// For version 0 (table creation), the committer writes `000.json` directly to the published
-/// commit path. The caller (connector) is responsible for finalizing the table in UC via the
-/// create table API.
+/// Version 0 (table creation) writes the published commit directly to the delta log.
 ///
-/// For version >= 1, the committer writes a staged commit and calls the UC commit API to ratify it.
+/// For version >= 1, the committer writes a staged commit and calls the UC `update_table` API
+/// to ratify it.
 ///
 /// NOTE: this [`Committer`] requires a multi-threaded tokio runtime. That is, whatever
 /// implementation consumes the Committer to commit to the table, must call `commit` from within a
-/// muti-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
+/// multi-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
 /// but must ensure that the multi-threaded runtime is used.
 #[derive(Debug, Clone)]
-pub struct UCCommitter<C: CommitClient> {
-    commits_client: Arc<C>,
+pub struct UCCommitter<C: UpdateTableClient> {
+    update_table_client: Arc<C>,
     table_id: String,
+    table: TableIdentifier,
 }
 
-impl<C: CommitClient> UCCommitter<C> {
-    /// Create a new [UCCommitter] to commit via the `commits_client` to the specific table with the
-    /// given `table_id`.
-    pub fn new(commits_client: Arc<C>, table_id: impl Into<String>) -> Self {
+impl<C: UpdateTableClient> UCCommitter<C> {
+    /// Build a committer that issues commits for the UC-managed table `table` via
+    /// `update_table_client`.
+    pub fn new(
+        update_table_client: Arc<C>,
+        table_id: impl Into<String>,
+        table: TableIdentifier,
+    ) -> Self {
         UCCommitter {
-            commits_client,
+            update_table_client,
             table_id: table_id.into(),
+            table,
         }
     }
 
@@ -75,6 +84,7 @@ impl<C: CommitClient> UCCommitter<C> {
             Self::has_catalog_managed_feature(commit_metadata),
             errors::missing_feature(CATALOG_MANAGED_FEATURE)
         );
+        // UC mandates vacuumProtocolCheck for its catalog-managed tables.
         require!(
             commit_metadata.has_writer_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
                 && commit_metadata.has_reader_feature(VACUUM_PROTOCOL_CHECK_FEATURE),
@@ -140,12 +150,16 @@ impl<C: CommitClient> UCCommitter<C> {
             Box::new(actions),
             false,
         ) {
-            Ok(()) => {
+            Ok(written_size) => {
                 info!("wrote version 0 commit file for UC table creation");
-                let file_meta = engine.storage_handler().head(&published_commit_path)?;
+                let file_meta = FileMeta::new(
+                    published_commit_path,
+                    commit_metadata.in_commit_timestamp(),
+                    written_size,
+                );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(delta_kernel::Error::FileAlreadyExists(_)) => {
+            Err(DeltaError::FileAlreadyExists(_)) => {
                 info!("version 0 commit conflict: commit file already exists");
                 Ok(CommitResponse::Conflict { version: 0 })
             }
@@ -178,63 +192,72 @@ impl<C: CommitClient> UCCommitter<C> {
         let committed = engine.storage_handler().head(&staged_commit_path)?;
         debug!("wrote staged commit file: {:?}", committed);
 
-        let commit_req = CommitRequest::new(
-            self.table_id.clone(),
-            commit_metadata.table_root().as_str(),
-            Commit::new(
-                commit_metadata.version().try_into().map_err(|_| {
-                    DeltaError::generic("commit version does not fit into i64 for UC commit")
-                })?,
-                commit_metadata.in_commit_timestamp(),
-                staged_commit_path
-                    .path_segments()
-                    .ok_or_else(|| DeltaError::generic("staged commit contained no path segments"))?
-                    .next_back()
-                    .ok_or_else(|| {
-                        DeltaError::generic("staged commit segments next_back was empty")
-                    })?,
-                committed
-                    .size
-                    .try_into()
-                    .map_err(|_| DeltaError::generic("committed size does not fit into i64"))?,
-                committed.last_modified,
-            ),
-            commit_metadata
-                .max_published_version()
-                .map(|v| {
-                    v.try_into().map_err(|_| {
-                        DeltaError::Generic(format!(
-                            "Max published version {v} does not fit into i64 for UC commit"
-                        ))
-                    })
-                })
-                .transpose()?,
-        );
+        let mut updates = vec![DeltaTableUpdate::AddCommit {
+            commit: Commit {
+                version: u64_to_wire_i64(commit_metadata.version(), "commit version")?,
+                timestamp: commit_metadata.in_commit_timestamp(),
+                file_name: staged_commit_file_name(&staged_commit_path)?,
+                file_size: u64_to_wire_i64(committed.size, "committed size")?,
+                file_modification_timestamp: committed.last_modified,
+            },
+        }];
+        if let Some(max_pub) = commit_metadata.max_published_version() {
+            updates.push(DeltaTableUpdate::SetLatestBackfilledVersion {
+                latest_published_version: u64_to_wire_i64(max_pub, "max published version")?,
+            });
+        }
+        let update_req = UpdateTableRequest::new(
+            vec![DeltaTableRequirement::AssertTableUuid {
+                uuid: self.table_id.clone(),
+            }],
+            updates,
+        )
+        .map_err(|e| DeltaError::generic(format!("invalid UC update_table request: {e}")))?;
+        let target = self.table.clone();
+
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             DeltaError::generic("UCCommitter may only be used within a tokio runtime")
         })?;
-        tokio::task::block_in_place(|| {
-            handle.block_on(async move {
-                self.commits_client
-                    .commit(commit_req)
-                    .await
-                    .map_err(|e| DeltaError::Generic(format!("UC commit error: {e}")))
+        // `block_in_place` panics if the current runtime isn't multi-threaded. We can't check for
+        // that up front: `runtime_flavor()` can't tell a real single-threaded runtime (where this
+        // panics) apart from the FFI case (single-threaded on top of multi-threaded, where it's
+        // fine). So we let it run and catch the panic.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    self.update_table_client
+                        .update_table(&target, update_req)
+                        .await
+                })
             })
+        }))
+        .map_err(|panic| {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            DeltaError::generic(format!(
+                "UCCommitter commit panicked (requires a multi-threaded tokio runtime): {msg}"
+            ))
         })?;
-        Ok(CommitResponse::Committed {
-            file_meta: committed,
-        })
+        match result {
+            Ok(_) => Ok(CommitResponse::Committed {
+                file_meta: committed,
+            }),
+            // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
+            // transaction layer can rebase/retry, instead of collapsing every error to Generic.
+            Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
+        }
     }
 }
 
-impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
+impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     /// Commit the given `actions` to the delta table in UC.
     ///
-    /// For version 0 (table creation), writes `000.json` directly to the published commit path.
-    /// The connector is responsible for finalizing the table in UC via the create table API.
-    ///
-    /// For version >= 1, writes a staged commit then calls the UC commit API to ratify it.
-    /// Connectors should publish staged commits to the delta log immediately after writing.
+    /// For version 0 (table creation), the committer writes `000.json` directly to the published
+    /// commit path; the caller finalizes the table in UC via the create-table API. For version >=
+    /// 1, connectors should publish staged commits to the delta log immediately after writing;
     /// UC expects to be informed of the last known published version during commit.
     fn commit(
         &self,
@@ -271,25 +294,50 @@ impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
     }
 }
 
+/// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
+fn u64_to_wire_i64(value: u64, field: &str) -> DeltaResult<i64> {
+    value
+        .try_into()
+        .map_err(|_| DeltaError::generic(format!("{field} does not fit into i64 for UC commit")))
+}
+
+fn staged_commit_file_name(path: &url::Url) -> DeltaResult<String> {
+    path.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| DeltaError::generic("staged commit path has no file name"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs;
 
+    use delta_kernel::arrow::array::{Array, RecordBatch, StringArray};
     use delta_kernel::committer::{CatalogCommit, CommitMetadata};
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::local::LocalFileSystem;
-    use delta_kernel::Version;
+    use delta_kernel::{EngineData, FilteredEngineData, Version};
     use delta_kernel_default_engine::DefaultEngine;
     use unity_catalog_delta_client_api::error::Result;
 
     use super::*;
 
-    struct MockCommitsClient;
+    struct MockUpdateTableClient;
 
-    impl CommitClient for MockCommitsClient {
-        async fn commit(&self, _: CommitRequest) -> Result<()> {
+    impl UpdateTableClient for MockUpdateTableClient {
+        async fn update_table(&self, _: &TableIdentifier, _: UpdateTableRequest) -> Result<()> {
             unimplemented!()
         }
+    }
+
+    fn test_committer() -> UCCommitter<MockUpdateTableClient> {
+        UCCommitter::new(
+            Arc::new(MockUpdateTableClient),
+            "test-table-id",
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
+        )
     }
 
     /// Creates a valid catalog-managed CommitMetadata with all required UC features and properties.
@@ -318,15 +366,23 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 0);
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let action: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "test",
+                Arc::new(StringArray::from(vec!["value"])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let actions = Box::new(std::iter::once(Ok(
+            FilteredEngineData::with_all_rows_selected(action),
+        )));
 
         // Create the _delta_log directory
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
-        let result = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap();
+        let result = committer.commit(&engine, actions, commit_metadata).unwrap();
         match result {
             CommitResponse::Committed { file_meta } => {
                 assert!(
@@ -337,9 +393,10 @@ mod tests {
                     "expected published path for version 0, got: {}",
                     file_meta.location
                 );
-                // Verify the file was written to disk
                 let commit_path = tmp_dir.path().join("_delta_log/00000000000000000000.json");
-                assert!(commit_path.exists(), "000.json should exist on disk");
+                let stored_size = fs::metadata(&commit_path).unwrap().len();
+                assert!(file_meta.size > 0);
+                assert_eq!(file_meta.size, stored_size);
             }
             CommitResponse::Conflict { .. } => {
                 panic!("expected Committed for version 0, got Conflict")
@@ -351,7 +408,7 @@ mod tests {
     fn commit_version_0_conflict_when_file_exists() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
         // Pre-create the commit file to trigger a conflict
@@ -374,7 +431,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
@@ -403,7 +460,7 @@ mod tests {
             )]),
         )
         .unwrap();
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
@@ -432,7 +489,7 @@ mod tests {
             )]),
         )
         .unwrap();
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
@@ -451,7 +508,7 @@ mod tests {
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         // Version >= 1 but without catalogManaged feature (simulates downgrade attempt)
         let commit_metadata = CommitMetadata::new_unchecked(table_root, 1).unwrap();
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
         let err = committer
@@ -463,15 +520,33 @@ mod tests {
         );
     }
 
+    // A default `#[tokio::test]` is a current-thread runtime. `block_in_place` would panic there,
+    // so the committer must reject the flavor with an error instead.
+    #[tokio::test]
+    async fn commit_version_non_zero_rejects_current_thread_runtime() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata = catalog_managed_commit_metadata(table_root, 1);
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
+
+        let err = test_committer()
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("multi-threaded"),
+            "expected a multi-threaded-runtime error, got: {err}"
+        );
+    }
+
     #[test]
     fn commit_version_non_zero_rejects_protocol_change() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_protocol_change();
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
-        let err = committer
+        let err = test_committer()
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
             .unwrap_err();
         assert!(
@@ -485,10 +560,9 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_metadata_change();
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
-        let err = committer
+        let err = test_committer()
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
             .unwrap_err();
         assert!(
@@ -503,10 +577,9 @@ mod tests {
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata =
             catalog_managed_commit_metadata(table_root, 1).with_domain_change("delta.clustering");
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
-        let err = committer
+        let err = test_committer()
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
             .unwrap_err();
         assert!(
@@ -520,8 +593,12 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1);
-        // Committer initialized with a different table ID than what's in the metadata
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "different-table-id");
+        // Committer initialized with a different table ID than what's in the metadata.
+        let committer = UCCommitter::new(
+            Arc::new(MockUpdateTableClient),
+            "different-table-id",
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
+        );
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
         let err = committer
@@ -583,7 +660,11 @@ mod tests {
 
         // ===== WHEN =====
         let publish_metadata = PublishMetadata::try_new(12, catalog_commits).unwrap();
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "testUcTableId");
+        let committer = UCCommitter::new(
+            Arc::new(MockUpdateTableClient),
+            "testUcTableId",
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
+        );
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         committer.publish(&engine, publish_metadata).unwrap();
 

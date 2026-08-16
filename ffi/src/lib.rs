@@ -47,6 +47,8 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+mod alloc_stats;
+
 pub mod commit_range;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
@@ -368,6 +370,58 @@ mod private {
         len: usize,
     }
 
+    /// An owned byte buffer allocated by the kernel. Any time the engine receives a
+    /// `KernelOwnedBytes` as a return value from a kernel method, the engine owns the buffer and
+    /// must free it by calling [super::free_kernel_bytes] exactly once.
+    #[cfg(feature = "declarative-plans")]
+    #[repr(C)]
+    pub struct KernelOwnedBytes {
+        ptr: NonNull<u8>,
+        len: usize,
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl KernelOwnedBytes {
+        /// Converts this buffer back into a `Vec<u8>`.
+        ///
+        /// # Safety
+        ///
+        /// The buffer must have been originally created `From<Vec<u8>>`, and must not have already
+        /// been consumed by a previous call to this method.
+        pub unsafe fn into_vec(self) -> Vec<u8> {
+            if self.len == 0 {
+                Default::default()
+            } else {
+                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
+            }
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl From<Vec<u8>> for KernelOwnedBytes {
+        fn from(val: Vec<u8>) -> Self {
+            let len = val.len();
+            let boxed = val.into_boxed_slice();
+            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            // safety: Box::leak always returns a valid, non-null pointer
+            let ptr = unsafe { NonNull::new_unchecked(leaked_ptr) };
+            KernelOwnedBytes { ptr, len }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The engine assumes ownership of the buffer memory when kernel passes it a
+    /// [KernelOwnedBytes], but must only free it by calling [super::free_kernel_bytes]. Since the
+    /// global allocator is threadsafe, it doesn't matter which engine thread invokes that method.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Send for KernelOwnedBytes {}
+    /// # Safety
+    ///
+    /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Sync for KernelOwnedBytes {}
+
     impl KernelBoolSlice {
         /// Creates an empty slice.
         pub fn empty() -> KernelBoolSlice {
@@ -475,6 +529,8 @@ mod private {
         }
     }
 }
+#[cfg(feature = "declarative-plans")]
+pub use private::KernelOwnedBytes;
 pub use private::{KernelBoolSlice, KernelRowIndexArray};
 
 /// # Safety
@@ -492,6 +548,17 @@ pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
 #[no_mangle]
 pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
     let _ = slice.into_vec();
+}
+
+/// Free a [`KernelOwnedBytes`] buffer obtained from kernel.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid buffer, and must not use it again afterwards.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
+    let _ = unsafe { bytes.into_vec() };
 }
 
 // TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void
@@ -1537,7 +1604,10 @@ pub unsafe extern "C" fn snapshot_table_root(
 #[no_mangle]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot.table_configuration().partition_columns().len()
+    snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .len()
 }
 
 /// Get an iterator of the list of partition columns for this snapshot.
@@ -1550,7 +1620,10 @@ pub unsafe extern "C" fn get_partition_columns(
 ) -> Handle<StringSliceIterator> {
     let snapshot = unsafe { snapshot.as_ref() };
     // NOTE: Clippy doesn't like it, but we need to_vec+into_iter to decouple lifetimes
-    let partition_columns = snapshot.table_configuration().partition_columns().to_vec();
+    let partition_columns = snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .to_vec();
     let iter: Box<StringIter> = Box::new(partition_columns.into_iter());
     iter.into()
 }
@@ -2535,6 +2608,18 @@ mod tests {
         }),
         4
     )]
+    // Skipped under Miri: writes checkpoint parquet (minutes of safe work under the interpreter).
+    // Its unsafe (checkpoint_snapshot) is unconditional in `spec`, so the Some(V2WithSidecar) path
+    // adds no unsafe over test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error (runs
+    // under Miri); the checkpoint/free handles are covered by test_setting_multithread_executor.
+    // Sidecar-shape is safe kernel logic. Runs (all cases) under normal cargo test / nextest.
+    //
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_sidecar_shape(
         #[case] is_v2: bool,
@@ -2617,6 +2702,16 @@ mod tests {
     // the first checkpoint.)
     //
     // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. AlreadyExists/overwrite is safe kernel
+    // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2656,6 +2751,16 @@ mod tests {
     // `checkpoint_snapshot` returns `AlreadyExists` (same table version). Also validates the
     // `_delta_log/_last_checkpoint` content (version, numOfAddFiles, size, sizeInBytes), which
     // `test_checkpoint_snapshot_sidecar_shape` doesn't cover.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. _last_checkpoint content is safe kernel
+    // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_written_snapshot_is_usable(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2713,6 +2818,11 @@ mod tests {
     // Test checkpoint using FFI engine builder APIs with multithreaded executor.
     // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to
     // build engine without existing tokio runtime.
+    //
+    // Miri anchor for checkpoint FFI: covers the success-path checkpoint_snapshot -> Written
+    // handle -> free_snapshot that the skipped checkpoint tests share, and uniquely covers
+    // set_builder_with_multithreaded_executor (no other test calls it). Skipping it drops that
+    // coverage under Miri.
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {

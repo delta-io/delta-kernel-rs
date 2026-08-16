@@ -24,7 +24,7 @@ use crate::table_features::{
     StaleAnnotationPolicy,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::utils::require;
+use crate::utils::{require, CollectInto};
 use crate::{DeltaResult, Error};
 
 pub(crate) mod column_default;
@@ -716,15 +716,6 @@ impl StructField {
         &self.metadata
     }
 
-    /// Convert our metadata into a HashMap<String, String>. Note this copies all the data so can be
-    /// expensive for large metadata
-    pub fn metadata_with_string_values(&self) -> HashMap<String, String> {
-        self.metadata
-            .iter()
-            .map(|(key, val)| (key.clone(), val.to_string()))
-            .collect()
-    }
-
     /// Applies physical name and field ID mappings to this field.
     ///
     /// This function sets the field ID for the physical [`StructField`] only if the
@@ -1056,6 +1047,12 @@ impl StructType {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
         field.ok_or_else(|| Error::generic("Empty path"))
+    }
+
+    /// Checks whether this schema contains the field at the given column path.
+    pub fn contains_col(&self, col: impl CollectInto<ColumnName>) -> bool {
+        let col = col.collect_into();
+        self.field_at(&col).is_ok()
     }
 
     /// Visits all fields along the given column path.
@@ -1614,28 +1611,6 @@ pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
     NonNullFieldChecker.transform_struct(schema).is_err()
 }
 
-#[cfg(not(feature = "interval-type-in-dev"))]
-struct UsesIntervalType;
-
-#[cfg(not(feature = "interval-type-in-dev"))]
-impl<'a> SchemaTransform<'a> for UsesIntervalType {
-    transform_output_type!(|'a, T| Result<(), ()>);
-
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
-        if ptype.is_interval() {
-            Err(())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// Returns whether `schema` contains an ANSI interval type at any nesting level.
-#[cfg(not(feature = "interval-type-in-dev"))]
-pub(crate) fn schema_contains_interval_type(schema: &Schema) -> bool {
-    UsesIntervalType.transform_struct(schema).is_err()
-}
-
 /// Normalizes column name field names to match the casing in the schema.
 ///
 /// Walks each field name through the schema's struct hierarchy, replacing user-provided
@@ -2125,23 +2100,58 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
-fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
-    match s {
-        "interval year" | "interval month" | "interval year to month" => {
-            Some(PrimitiveType::IntervalYearMonth)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntervalField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntervalFieldRange {
+    pub(crate) start: IntervalField,
+    pub(crate) end: IntervalField,
+}
+
+impl IntervalFieldRange {
+    fn primitive_type(self) -> PrimitiveType {
+        match self.start {
+            IntervalField::Year | IntervalField::Month => PrimitiveType::IntervalYearMonth,
+            IntervalField::Day
+            | IntervalField::Hour
+            | IntervalField::Minute
+            | IntervalField::Second => PrimitiveType::IntervalDayTime,
         }
-        "interval day"
-        | "interval hour"
-        | "interval minute"
-        | "interval second"
-        | "interval day to hour"
-        | "interval day to minute"
-        | "interval day to second"
-        | "interval hour to minute"
-        | "interval hour to second"
-        | "interval minute to second" => Some(PrimitiveType::IntervalDayTime),
-        _ => None,
     }
+}
+
+pub(crate) fn parse_interval_type(s: &str) -> Option<IntervalFieldRange> {
+    use IntervalField::*;
+
+    let (start, end) = match s {
+        "interval year" => (Year, Year),
+        "interval month" => (Month, Month),
+        "interval year to month" => (Year, Month),
+        "interval day" => (Day, Day),
+        "interval hour" => (Hour, Hour),
+        "interval minute" => (Minute, Minute),
+        "interval second" => (Second, Second),
+        "interval day to hour" => (Day, Hour),
+        "interval day to minute" => (Day, Minute),
+        "interval day to second" => (Day, Second),
+        "interval hour to minute" => (Hour, Minute),
+        "interval hour to second" => (Hour, Second),
+        "interval minute to second" => (Minute, Second),
+        _ => return None,
+    };
+    Some(IntervalFieldRange { start, end })
+}
+
+fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
+    parse_interval_type(s).map(IntervalFieldRange::primitive_type)
 }
 
 // Custom Deserialize to provide clear error messages for unsupported types.
@@ -2417,6 +2427,17 @@ impl DataType {
     pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
     pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
     pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
+
+    /// Compact type name for diagnostics that must not expand nested schemas.
+    pub(crate) fn kind_name(&self) -> String {
+        match self {
+            Self::Primitive(primitive) => primitive.to_string(),
+            Self::Array(_) => "array".to_string(),
+            Self::Struct(_) => "struct".to_string(),
+            Self::Map(_) => "map".to_string(),
+            Self::Variant(_) => "variant".to_string(),
+        }
+    }
 
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
@@ -2697,7 +2718,7 @@ mod tests {
 
     use super::*;
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm,
     };
@@ -3708,64 +3729,6 @@ mod tests {
     #[case::variant_skipped(variant_only_schema(), false)]
     fn test_schema_contains_non_null_fields(#[case] schema: StructType, #[case] expected: bool) {
         assert_eq!(schema_contains_non_null_fields(&schema), expected);
-    }
-
-    #[cfg(not(feature = "interval-type-in-dev"))]
-    #[test]
-    fn test_schema_contains_interval_type() {
-        for interval in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
-            let schemas = [
-                (
-                    "top-level",
-                    StructType::new_unchecked([StructField::nullable("iv", interval.clone())]),
-                ),
-                (
-                    "nested struct",
-                    StructType::new_unchecked([StructField::nullable(
-                        "nested",
-                        StructType::new_unchecked([StructField::nullable(
-                            "inner_iv",
-                            interval.clone(),
-                        )]),
-                    )]),
-                ),
-                (
-                    "array element",
-                    StructType::new_unchecked([StructField::nullable(
-                        "array",
-                        ArrayType::new(interval.clone(), true),
-                    )]),
-                ),
-                (
-                    "map value",
-                    StructType::new_unchecked([StructField::nullable(
-                        "map",
-                        MapType::new(DataType::STRING, interval.clone(), true),
-                    )]),
-                ),
-                (
-                    "map key",
-                    StructType::new_unchecked([StructField::nullable(
-                        "map",
-                        MapType::new(interval.clone(), DataType::STRING, true),
-                    )]),
-                ),
-            ];
-
-            for (case, schema) in schemas {
-                assert!(
-                    schema_contains_interval_type(&schema),
-                    "expected {case} schema to contain {interval:?}"
-                );
-            }
-        }
-
-        for schema in [
-            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]),
-            variant_only_schema(),
-        ] {
-            assert!(!schema_contains_interval_type(&schema));
-        }
     }
 
     #[test]
@@ -4800,28 +4763,28 @@ mod tests {
         ]);
 
         // Mismatched casing -> normalized to schema
-        let cols = vec![ColumnName::new(["eventdate"])];
+        let cols = vec![column_name!("eventdate")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["EventDate"]
         );
 
         // Nested path -> each field name normalized
-        let cols = vec![ColumnName::new(["address", "city"])];
+        let cols = vec![column_name!("address.city")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["Address", "City"]
         );
 
         // Already matching -> unchanged
-        let cols = vec![ColumnName::new(["id"])];
+        let cols = vec![column_name!("id")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["id"]
         );
 
         // Unrecognized -> keeps original
-        let cols = vec![ColumnName::new(["nonexistent"])];
+        let cols = vec![column_name!("nonexistent")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["nonexistent"]

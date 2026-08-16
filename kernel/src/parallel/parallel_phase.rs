@@ -154,7 +154,7 @@ mod tests {
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::scan::{ScanBuilder, StatsOptions};
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
     use crate::utils::FoldWithOption as _;
@@ -752,8 +752,8 @@ mod tests {
         // Tests data skipping filtering based on column stats (min/max values)
         path: "v2-checkpoints-json-with-sidecars",
         predicate: Some({
-            use crate::expressions::{column_expr, Expression as Expr};
-            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
+            use crate::expressions::{col, lit, Expression as Expr};
+            Arc::new(Expr::gt(col!("id"), lit(20i64)))
         }),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
@@ -781,8 +781,8 @@ mod tests {
         // partition values -- those are correctly filtered since is_add=true for them.
         path: "basic_partitioned",
         predicate: Some({
-            use crate::expressions::{column_expr, Expression as Expr};
-            Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))
+            use crate::expressions::{col, lit, Expression as Expr};
+            Arc::new(Expr::eq(col!("letter"), lit("a")))
         }),
         expected_sequential_metrics: ExpectedMetrics {
             // Columnar filter prunes all 4 non-matching files (b, c, e, null) before the

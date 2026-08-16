@@ -1,7 +1,8 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
-use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
+pub(crate) use evaluate_expression::extract_column;
+use evaluate_expression::{evaluate_expression, evaluate_predicate};
 use itertools::Itertools;
 use tracing::debug;
 
@@ -99,6 +100,8 @@ impl Scalar {
                 // timezone was already set at builder construction time
                 append_val_n_as!(array::TimestampMicrosecondBuilder, *val)
             }
+            IntervalYearMonth(val) => append_val_n_as!(array::Int32Builder, *val),
+            IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, *val),
             Date(val) => append_val_n_as!(array::Date32Builder, *val),
             Binary(val) => append_val_as!(array::BinaryBuilder, val),
             // precision and scale were already set at builder construction time
@@ -213,11 +216,9 @@ impl Scalar {
                     "Variant is not supported as scalar yet.",
                 ));
             }
-            DataType::INTERVAL_YEAR_MONTH | DataType::INTERVAL_DAY_TIME => {
-                return Err(Error::unsupported(
-                    "Interval is not supported as scalar yet.",
-                ));
-            }
+            // Intervals are exposed as their physical integer (i32 months / i64 microseconds).
+            DataType::INTERVAL_YEAR_MONTH => append_nulls_as!(array::Int32Builder),
+            DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
                 return Err(Error::unsupported("Geo is not supported as scalar yet."));

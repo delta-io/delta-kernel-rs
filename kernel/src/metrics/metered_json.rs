@@ -10,7 +10,7 @@ use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
     CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator,
-    FileMeta, FilteredEngineData, JsonHandler, PredicateRef,
+    FileMeta, FileSize, FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn JsonHandler>` that emits a
@@ -96,7 +96,7 @@ impl JsonHandler for MeteredJsonHandler {
         path: &url::Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.inner.write_json_file(path, data, overwrite)
     }
 }
@@ -113,13 +113,14 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::metrics::MetricEvent;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     #[derive(Debug, Default)]
     struct StubJsonHandler {
         /// Set when the cancellation-aware read variant is invoked, so a test can assert the
         /// metered wrapper forwards to it (rather than the plain read).
         cancellation_read_called: std::sync::atomic::AtomicBool,
+        write_size: Option<FileSize>,
     }
 
     fn empty_batch() -> Box<dyn EngineData> {
@@ -163,8 +164,9 @@ mod tests {
             _path: &Url,
             _data: DeltaResultIterator<'_, FilteredEngineData>,
             _overwrite: bool,
-        ) -> DeltaResult<()> {
-            Ok(())
+        ) -> DeltaResult<FileSize> {
+            self.write_size
+                .ok_or_else(|| crate::Error::generic("StubJsonHandler does not support writes"))
         }
     }
 
@@ -282,6 +284,37 @@ mod tests {
         };
         assert_eq!(e.num_files, 0);
         assert_eq!(e.bytes_read, 0);
+    }
+
+    #[test]
+    fn write_json_file_forwards_size_without_emitting_metrics() {
+        let (reporter, _guard) = install_capture();
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler {
+            write_size: Some(42),
+            ..Default::default()
+        });
+        let handler = MeteredJsonHandler::new(inner);
+        let path = Url::parse("memory:///_delta_log/0.json").unwrap();
+
+        let written_size = handler
+            .write_json_file(&path, Box::new(std::iter::empty()), false)
+            .unwrap();
+
+        assert_eq!(written_size, 42);
+        assert!(reporter.events().is_empty());
+    }
+
+    #[test]
+    fn write_json_file_forwards_errors() {
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler::default());
+        let handler = MeteredJsonHandler::new(inner);
+        let path = Url::parse("memory:///_delta_log/0.json").unwrap();
+
+        let error = handler
+            .write_json_file(&path, Box::new(std::iter::empty()), false)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("does not support writes"));
     }
 
     #[test]

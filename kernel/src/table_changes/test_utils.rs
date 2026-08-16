@@ -13,7 +13,7 @@ use crate::table_properties::{
     ENABLE_ROW_TRACKING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
-use crate::utils::test_utils::Action;
+use crate::unit_test_utils::Action;
 
 pub(crate) const TEST_MATERIALIZED_ROW_ID_COLUMN_NAME: &str = "_row_id";
 pub(crate) const TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME: &str = "_row_commit_version";

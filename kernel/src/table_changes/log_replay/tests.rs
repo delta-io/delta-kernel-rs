@@ -11,7 +11,7 @@ use super::{
 };
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
+use crate::expressions::{col, lit, BinaryPredicateOp};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
@@ -25,7 +25,7 @@ use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::{ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED};
-use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+use crate::unit_test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
@@ -991,11 +991,7 @@ async fn data_skipping_filter() {
         .await;
 
     // Look for actions with id > 4
-    let predicate = Predicate::binary(
-        BinaryPredicateOp::GreaterThan,
-        column_expr!("id"),
-        Scalar::from(4),
-    );
+    let predicate = Predicate::binary(BinaryPredicateOp::GreaterThan, col!("id"), lit(4));
     let logical_schema = get_schema();
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
@@ -1072,11 +1068,7 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = TableConfiguration::try_new(metadata, protocol, table_root_url, 0).unwrap();
 
-    let predicate = Predicate::binary(
-        BinaryPredicateOp::Equal,
-        column_expr!("part"),
-        Scalar::from("x"),
-    );
+    let predicate = Predicate::binary(BinaryPredicateOp::Equal, col!("part"), lit("x"));
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
             Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
@@ -1132,11 +1124,7 @@ async fn data_skipping_filter_prunes_stats_but_keeps_removes() {
         .await;
 
     let logical_schema = get_schema();
-    let predicate = Predicate::binary(
-        BinaryPredicateOp::GreaterThan,
-        column_expr!("id"),
-        Scalar::from(4),
-    );
+    let predicate = Predicate::binary(BinaryPredicateOp::GreaterThan, col!("id"), lit(4));
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
             Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),

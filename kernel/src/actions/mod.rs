@@ -4,22 +4,24 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
+use delta_kernel_derive::{
+    internal_api, IntoEngineData, IntoStructData, ToSchema, TryFromStructData,
+};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{
-    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, DataType, MapType, SchemaRef,
-    StructField, StructType, ToSchema as _,
+    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, SchemaRef, StructField,
+    StructType, ToSchema as _,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{schema, ArrayType};
 use crate::table_features::{
-    FeatureType, TableFeature, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, TableFeature, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -109,8 +111,10 @@ pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
 #[internal_api]
 pub(crate) const STATS_PARSED: &str = "stats_parsed";
 
+pub(crate) static ADD_SCHEMA: LazyLock<StructType> = LazyLock::new(Add::to_schema);
+
 pub(crate) static ADD_FIELD: LazyLock<StructField> =
-    LazyLock::new(|| StructField::nullable(ADD_NAME, Add::to_schema()));
+    LazyLock::new(|| StructField::nullable(ADD_NAME, ADD_SCHEMA.clone()));
 pub(crate) static REMOVE_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(REMOVE_NAME, Remove::to_schema()));
 pub(crate) static METADATA_FIELD: LazyLock<StructField> =
@@ -276,7 +280,9 @@ pub(crate) fn as_log_add_schema(add_schema: SchemaRef) -> SchemaRef {
 }
 
 // Serde derives are needed for CRC file deserialization (see `crc::reader`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, TryFromStructData,
+)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Format {
@@ -292,23 +298,6 @@ impl Default for Format {
             provider: String::from("parquet"),
             options: HashMap::new(),
         }
-    }
-}
-
-impl TryFrom<Format> for Scalar {
-    type Error = Error;
-
-    fn try_from(format: Format) -> DeltaResult<Self> {
-        let provider = Scalar::from(format.provider);
-        let options = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            format.options,
-        )
-        .map(Scalar::Map)?;
-        Ok(Scalar::Struct(StructData::try_new(
-            Format::to_schema().into_fields().collect(),
-            vec![provider, options],
-        )?))
     }
 }
 
@@ -535,11 +524,11 @@ impl IntoEngineData for Metadata {
             self.name.into(),
             self.description.into(),
             self.format.provider.into(),
-            self.format.options.try_into()?,
+            self.format.options.into(),
             self.schema_string.into(),
-            self.partition_columns.try_into()?,
+            self.partition_columns.into(),
             self.created_time.into(),
-            self.configuration.try_into()?,
+            self.configuration.into(),
         ];
 
         engine.evaluation_handler().create_one(schema, &values)
@@ -549,7 +538,10 @@ impl IntoEngineData for Metadata {
 #[derive(
     Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
 )]
-#[serde(rename_all = "camelCase")]
+// Deserialization goes through `ProtocolRaw` so every serde entry point (e.g. CRC files) is
+// validated by `try_new`, like the JSON-replay path. Otherwise a CRC file could load a malformed
+// feature shape that log replay would reject.
+#[serde(rename_all = "camelCase", try_from = "ProtocolRaw")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
@@ -568,6 +560,31 @@ pub(crate) struct Protocol {
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
     writer_features: Option<Vec<TableFeature>>,
+}
+
+/// Raw, unvalidated form of [`Protocol`] that serde reads before validation. Deserialize-only
+/// (never serialized): `Protocol`'s `#[serde(try_from)]` converts it via [`Protocol::try_new`],
+/// so every deserialization is validated.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtocolRaw {
+    min_reader_version: i32,
+    min_writer_version: i32,
+    reader_features: Option<Vec<TableFeature>>,
+    writer_features: Option<Vec<TableFeature>>,
+}
+
+impl TryFrom<ProtocolRaw> for Protocol {
+    type Error = Error;
+
+    fn try_from(protocol: ProtocolRaw) -> DeltaResult<Self> {
+        Protocol::try_new(
+            protocol.min_reader_version,
+            protocol.min_writer_version,
+            protocol.reader_features,
+            protocol.writer_features,
+        )
+    }
 }
 
 /// Parse a list of feature identifiers into TableFeatures. Returns `None` for `None` input;
@@ -672,34 +689,63 @@ impl Protocol {
                 // Check all reader features are ReaderWriter and present in writer features.
                 // Unknown features are treated as potentially ReaderWriter for forward
                 // compatibility.
-                let check_r = reader_features.iter().all(|feature| {
-                    matches!(
+                if let Some(offending) = reader_features.iter().find(|feature| {
+                    !matches!(
                         feature.feature_type(),
                         FeatureType::ReaderWriter | FeatureType::Unknown
-                    ) && writer_features.contains(feature)
-                });
-                require!(
-                    check_r,
-                    Error::invalid_protocol(
-                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
-                    )
-                );
+                    ) || !writer_features.contains(*feature)
+                }) {
+                    return Err(Error::invalid_protocol(format!(
+                        "Reader features must contain only ReaderWriter features that are also \
+                         listed in writer features, but {offending:?} is not \
+                         (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
+                         minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version})"
+                    )));
+                }
 
-                // Check all writer features that are ReaderWriter must also be in reader features
+                // Every ReaderWriter feature in writerFeatures must also appear in readerFeatures.
                 // Unknown features are treated as potentially Writer-only for forward
                 // compatibility.
-                let check_w = writer_features
-                    .iter()
-                    .all(|feature| match feature.feature_type() {
-                        FeatureType::WriterOnly | FeatureType::Unknown => true,
-                        FeatureType::ReaderWriter => reader_features.contains(feature),
-                    });
-                require!(
-                    check_w,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
+                //
+                // Accept the legacy writer-list-only shape for delta-spark compatibility: a
+                // past delta-spark bug produced (3, 7) tables with ColumnMapping in writerFeatures
+                // only and an empty readerFeatures. Such tables still read correctly because the
+                // mode comes from writerFeatures, and rejecting them would break existing
+                // production tables. See #3110 to tighten this once such tables are migrated.
+                //
+                // Validate the whole writer list before warning: a non-legacy orphan rejects the
+                // protocol outright, so we must not emit an acceptance warning for a legacy orphan
+                // seen earlier in the list only to fail on a later one.
+                let mut legacy_orphans = Vec::new();
+                for feature in writer_features.iter() {
+                    let orphaned_reader_writer_feature = feature.feature_type()
+                        == FeatureType::ReaderWriter
+                        && !reader_features.contains(feature);
+                    if !orphaned_reader_writer_feature {
+                        continue;
+                    }
+                    if LEGACY_READER_FEATURES.contains(feature) {
+                        legacy_orphans.push(feature);
+                    } else {
+                        return Err(Error::invalid_protocol(format!(
+                            "Writer features must be Writer-only or also listed in reader features, \
+                             but ReaderWriter feature {feature:?} is listed in writerFeatures and \
+                             missing from readerFeatures \
+                             (readerFeatures={reader_features:?}, \
+                             writerFeatures={writer_features:?}, \
+                             minReaderVersion={min_reader_version}, \
+                             minWriterVersion={min_writer_version})"
+                        )));
+                    }
+                }
+                // Reached only once the whole writer list is known valid.
+                for feature in legacy_orphans {
+                    warn!(
+                        "ReaderWriter feature {feature:?} is listed in writerFeatures but \
+                         missing from readerFeatures at minReaderVersion={min_reader_version}; \
+                         treating it as reader-enabled (malformed protocol)"
+                    );
+                }
                 Ok(())
             }
             (None, None) => Ok(()),
@@ -708,22 +754,23 @@ impl Protocol {
                 // All other ReaderWriter features require explicit reader_features list (reader
                 // version 3). Unknown features are treated as potentially
                 // Writer-only for forward compatibility.
-                let is_valid = writer_features.iter().all(|feature| {
+                if let Some(offending) = writer_features.iter().find(|feature| {
                     match feature.feature_type() {
-                        FeatureType::WriterOnly | FeatureType::Unknown => true,
+                        FeatureType::WriterOnly | FeatureType::Unknown => false,
                         FeatureType::ReaderWriter => {
                             // ColumnMapping is allowed when reader version is 2 (implied support)
-                            min_reader_version == 2 && feature == &TableFeature::ColumnMapping
+                            !(min_reader_version == 2 && *feature == &TableFeature::ColumnMapping)
                         }
                     }
-                });
-
-                require!(
-                    is_valid,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
+                }) {
+                    return Err(Error::invalid_protocol(format!(
+                        "Writer features must be Writer-only or also listed in reader features, \
+                         but ReaderWriter feature {offending:?} is listed in writerFeatures with \
+                         no reader features present \
+                         (writerFeatures={writer_features:?}, minReaderVersion={min_reader_version}, \
+                         minWriterVersion={min_writer_version})"
+                    )));
+                }
                 Ok(())
             }
             (Some(_), None) => Err(Error::invalid_protocol(
@@ -1047,6 +1094,21 @@ impl SetTransaction {
             last_updated,
         }
     }
+
+    /// Whether this transaction is expired: `last_updated <= expiration_timestamp` with both
+    /// present. A `None` `last_updated` (no timestamp recorded) or a `None` `expiration_timestamp`
+    /// (no retention duration configured) never expires.
+    pub(crate) fn is_expired(&self, expiration_timestamp: Option<i64>) -> bool {
+        matches!(
+            (expiration_timestamp, self.last_updated),
+            (Some(exp_ts), Some(lu)) if lu <= exp_ts
+        )
+    }
+
+    /// This transaction's `version`, unless it is expired under `expiration_timestamp`.
+    pub(crate) fn non_expired_version(&self, expiration_timestamp: Option<i64>) -> Option<i64> {
+        (!self.is_expired(expiration_timestamp)).then_some(self.version)
+    }
 }
 
 /// Reference to a root of an adaptive metadata tree.
@@ -1360,7 +1422,6 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
-    use super::set_transaction::is_set_txn_expired;
     use super::*;
     use crate::arrow::array::{
         Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
@@ -1370,8 +1431,9 @@ mod tests {
     use crate::arrow::json::ReaderBuilder;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::expressions::Scalar;
     use crate::schema::{schema_ref, ArrayType, DataType, MapType, StructField};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
@@ -1445,14 +1507,16 @@ mod tests {
     #[case::last_updated_before_expiration(Some(2000), Some(1000), true)]
     #[case::last_updated_at_expiration(Some(1000), Some(1000), true)]
     #[case::last_updated_after_expiration(Some(2000), Some(3000), false)]
-    fn test_is_set_txn_expired(
+    fn test_set_transaction_expiration(
         #[case] expiration_timestamp: Option<i64>,
         #[case] last_updated: Option<i64>,
-        #[case] expected: bool,
+        #[case] expired: bool,
     ) {
+        let txn = SetTransaction::new("app".to_string(), 7, last_updated);
+        assert_eq!(txn.is_expired(expiration_timestamp), expired);
         assert_eq!(
-            is_set_txn_expired(expiration_timestamp, last_updated),
-            expected
+            txn.non_expired_version(expiration_timestamp),
+            (!expired).then_some(7)
         );
     }
 
@@ -1881,12 +1945,14 @@ mod tests {
 
         for (reader_features, writer_features, error_msg) in invalid_features {
             let res = Protocol::try_new_modern(reader_features, writer_features);
+            // The error message is enriched with the offending feature and the parsed
+            // feature lists, so match on a prefix rather than the whole string.
             assert!(
                 matches!(
                     &res,
-                    Err(Error::InvalidProtocol(error)) if error.to_string().eq(error_msg)
+                    Err(Error::InvalidProtocol(error)) if error.to_string().contains(error_msg)
                 ),
-                "Expected:\t{error_msg}\nBut got:{res:?}\n"
+                "Expected message containing:\t{error_msg}\nBut got:{res:?}\n"
             );
         }
     }
@@ -2156,33 +2222,37 @@ mod tests {
         assert_ne!(m1.id, m2.id);
     }
 
-    #[test]
-    fn test_format_try_from_scalar() {
-        let options = HashMap::from([
-            ("path".to_string(), "/delta/table".to_string()),
-            ("compressionType".to_string(), "snappy".to_string()),
-        ]);
+    #[rstest]
+    #[case::typical(HashMap::from([
+        ("path".to_string(), "/delta/table".to_string()),
+        ("compressionType".to_string(), "snappy".to_string()),
+    ]))]
+    #[case::empty(HashMap::new())]
+    #[case::special_characters(HashMap::from([
+        ("path".to_string(), "/path/with spaces".to_string()),
+        ("unicode".to_string(), "测试🎉".to_string()),
+        ("empty".to_string(), String::new()),
+    ]))]
+    fn test_format_scalar_round_trip(#[case] options: HashMap<String, String>) {
         let format = Format {
             provider: "parquet".to_string(),
-            options,
+            options: options.clone(),
         };
-        let scalar = Scalar::try_from(format).unwrap();
+        let scalar = Scalar::from(format.clone());
 
-        let Scalar::Struct(struct_data) = scalar else {
-            panic!("Expected struct scalar");
+        let Scalar::Struct(struct_data) = &scalar else {
+            panic!("Expected struct scalar, got {scalar}");
         };
-        assert_eq!(struct_data.fields()[0].name(), "provider");
-        assert_eq!(struct_data.fields()[1].name(), "options");
-
-        let Scalar::String(provider) = &struct_data.values()[0] else {
-            panic!("Expected string provider");
-        };
-        assert_eq!(provider, "parquet");
+        let field_names: Vec<_> = struct_data.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(field_names, ["provider", "options"]);
+        assert_eq!(struct_data.values()[0], Scalar::from("parquet"));
 
         let Scalar::Map(map_data) = &struct_data.values()[1] else {
             panic!("Expected map options");
         };
-        assert_eq!(map_data.pairs().len(), 2);
+        assert_eq!(map_data.pairs().len(), options.len());
+
+        assert_eq!(Format::try_from(scalar).unwrap(), format);
     }
 
     #[test]
@@ -2193,45 +2263,6 @@ mod tests {
             options: HashMap::new(),
         };
         assert_eq!(format, expected);
-    }
-
-    #[test]
-    fn test_format_empty_options() {
-        let format = Format {
-            provider: "parquet".to_string(),
-            options: HashMap::new(),
-        };
-        let scalar = Scalar::try_from(format).unwrap();
-
-        let Scalar::Struct(struct_data) = scalar else {
-            panic!("Expected struct");
-        };
-        let Scalar::Map(map_data) = &struct_data.values()[1] else {
-            panic!("Expected map");
-        };
-        assert!(map_data.pairs().is_empty());
-    }
-
-    #[test]
-    fn test_format_special_characters() {
-        let options = HashMap::from([
-            ("path".to_string(), "/path/with spaces".to_string()),
-            ("unicode".to_string(), "测试🎉".to_string()),
-            ("empty".to_string(), "".to_string()),
-        ]);
-        let format = Format {
-            provider: "custom".to_string(),
-            options,
-        };
-        let scalar = Scalar::try_from(format).unwrap();
-
-        let Scalar::Struct(struct_data) = scalar else {
-            panic!("Expected struct");
-        };
-        let Scalar::Map(map_data) = &struct_data.values()[1] else {
-            panic!("Expected map");
-        };
-        assert_eq!(map_data.pairs().len(), 3);
     }
 
     #[test]

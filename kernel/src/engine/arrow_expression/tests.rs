@@ -28,9 +28,9 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
-use crate::utils::test_utils::assert_result_error_with_message;
+use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
-use crate::utils::test_utils::{geography_type, geometry_type};
+use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::EvaluationHandlerExtension as _;
 
 #[test]
@@ -45,17 +45,9 @@ fn test_array_column() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let not_op = Pred::not(Pred::binary(
-        BinaryPredicateOp::In,
-        Expr::literal(5),
-        column_expr!("item"),
-    ));
+    let not_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(5), col!("item")));
 
-    let in_op = Pred::binary(
-        BinaryPredicateOp::In,
-        Expr::literal(5),
-        column_expr!("item"),
-    );
+    let in_op = Pred::binary(BinaryPredicateOp::In, lit(5), col!("item"));
 
     let result = evaluate_predicate(&not_op, &batch, false).unwrap();
     let expected_not_in = BooleanArray::from(vec![true, false, true]);
@@ -80,11 +72,7 @@ fn test_bad_right_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
 
-    let in_op = Pred::not(Pred::binary(
-        BinaryPredicateOp::In,
-        Expr::literal(5),
-        column_expr!("item"),
-    ));
+    let in_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(5), col!("item")));
 
     let in_result = evaluate_predicate(&in_op, &batch, false);
 
@@ -108,11 +96,7 @@ fn test_in_predicate_with_utf8view_list_column() {
     let list_array = ListArray::new(item_field, offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)]).unwrap();
 
-    let in_pred = Pred::binary(
-        BinaryPredicateOp::In,
-        Expr::literal("hello"),
-        column_expr!("items"),
-    );
+    let in_pred = Pred::binary(BinaryPredicateOp::In, lit("hello"), col!("items"));
 
     let expected = BooleanArray::from(vec![true, false, true]);
     assert_eq!(
@@ -137,16 +121,8 @@ fn test_in_predicate_with_list_view_column() {
     let list_view_array = ListViewArray::new(item_field, offsets, sizes, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_view_array)]).unwrap();
 
-    let in_op = Pred::binary(
-        BinaryPredicateOp::In,
-        Expr::literal(5),
-        column_expr!("items"),
-    );
-    let not_op = Pred::not(Pred::binary(
-        BinaryPredicateOp::In,
-        Expr::literal(5),
-        column_expr!("items"),
-    ));
+    let in_op = Pred::binary(BinaryPredicateOp::In, lit(5), col!("items"));
+    let not_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(5), col!("items")));
 
     let result = evaluate_predicate(&in_op, &batch, false).unwrap();
     let expected_in = BooleanArray::from(vec![false, true, false]);
@@ -168,17 +144,17 @@ fn test_in_predicate_with_list_view_column() {
 #[case::utf8view(
     Arc::new(StringViewArray::from(vec![None, Some("apple"), Some("hello"), Some("zebra")])) as ArrayRef,
     DataType::Utf8View,
-    Expr::literal("hello"),
+    lit("hello"),
 )]
 #[case::large_utf8(
     Arc::new(GenericStringArray::<i64>::from(vec![None, Some("apple"), Some("hello"), Some("zebra")])) as ArrayRef,
     DataType::LargeUtf8,
-    Expr::literal("hello"),
+    lit("hello"),
 )]
 #[case::binary_view(
     Arc::new(BinaryViewArray::from(vec![None, Some(b"apple".as_ref()), Some(b"hello"), Some(b"zebra")])) as ArrayRef,
     DataType::BinaryView,
-    Expr::literal(b"hello".as_ref()),
+    lit(b"hello".as_ref()),
 )]
 fn test_binary_predicate_with_view_types(
     #[case] array: ArrayRef,
@@ -187,7 +163,7 @@ fn test_binary_predicate_with_view_types(
 ) {
     let schema = Schema::new([Arc::new(Field::new("col", dtype, true))]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
-    let column = column_expr!("col");
+    let column = col!("col");
 
     let predicate_lt = column.clone().lt(lit.clone());
     let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
@@ -252,7 +228,7 @@ fn test_literal_type_array() {
 
     let not_in_op = Pred::not(Pred::binary(
         BinaryPredicateOp::In,
-        Expr::literal(5),
+        lit(5),
         Scalar::Array(
             ArrayData::try_new(
                 ArrayType::new(KernelDataType::INTEGER, false),
@@ -405,8 +381,8 @@ fn test_invalid_array_sides() {
 
     let in_op = Pred::not(Pred::binary(
         BinaryPredicateOp::In,
-        column_expr!("item"),
-        column_expr!("item"),
+        col!("item"),
+        col!("item"),
     ));
 
     let in_result = evaluate_predicate(&in_op, &batch, false);
@@ -428,15 +404,11 @@ fn test_str_arrays() {
 
     let str_not_op = Pred::not(Pred::binary(
         BinaryPredicateOp::In,
-        Expr::literal("bye"),
-        column_expr!("item"),
+        lit("bye"),
+        col!("item"),
     ));
 
-    let str_in_op = Pred::binary(
-        BinaryPredicateOp::In,
-        Expr::literal("hi"),
-        column_expr!("item"),
-    );
+    let str_in_op = Pred::binary(BinaryPredicateOp::In, lit("hi"), col!("item"));
 
     let result = evaluate_predicate(&str_in_op, &batch, false).unwrap();
     let in_expected = BooleanArray::from(vec![true, true, true]);
@@ -460,7 +432,7 @@ fn test_extract_column() {
     let values = Int32Array::from(vec![1, 2, 3]);
     let batch =
         RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values.clone())]).unwrap();
-    let column = column_expr!("a");
+    let column = col!("a");
 
     let results = evaluate_expression(&column, &batch, None).unwrap();
     assert_eq!(results.as_ref(), &values);
@@ -481,7 +453,7 @@ fn test_extract_column() {
         vec![Arc::new(struct_array.clone())],
     )
     .unwrap();
-    let column = column_expr!("b.a");
+    let column = col!("b.a");
     let results = evaluate_expression(&column, &batch, None).unwrap();
     assert_eq!(results.as_ref(), &values);
 }
@@ -491,25 +463,25 @@ fn test_binary_op_scalar() {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let values = Int32Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
-    let column = column_expr!("a");
+    let column = col!("a");
 
-    let expression = column.clone().add(Expr::literal(1));
+    let expression = column.clone().add(lit(1));
     let results = evaluate_expression(&expression, &batch, None).unwrap();
     let expected = Arc::new(Int32Array::from(vec![2, 3, 4]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = column.clone().sub(Expr::literal(1));
+    let expression = column.clone().sub(lit(1));
     let results = evaluate_expression(&expression, &batch, None).unwrap();
     let expected = Arc::new(Int32Array::from(vec![0, 1, 2]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = column.clone().mul(Expr::literal(2));
+    let expression = column.clone().mul(lit(2));
     let results = evaluate_expression(&expression, &batch, None).unwrap();
     let expected = Arc::new(Int32Array::from(vec![2, 4, 6]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
     // TODO handle type casting
-    let expression = column.div(Expr::literal(1));
+    let expression = column.div(lit(1));
     let results = evaluate_expression(&expression, &batch, None).unwrap();
     let expected = Arc::new(Int32Array::from(vec![1, 2, 3]));
     assert_eq!(results.as_ref(), expected.as_ref())
@@ -527,8 +499,8 @@ fn test_binary_op() {
         vec![Arc::new(values.clone()), Arc::new(values)],
     )
     .unwrap();
-    let column_a = column_expr!("a");
-    let column_b = column_expr!("b");
+    let column_a = col!("a");
+    let column_b = col!("b");
 
     let expression = column_a.clone().add(column_b.clone());
     let results = evaluate_expression(&expression, &batch, None).unwrap();
@@ -551,34 +523,34 @@ fn test_binary_cmp() {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let values = Int32Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
-    let column = column_expr!("a");
+    let column = col!("a");
 
-    let predicate_lt = column.clone().lt(Expr::literal(2));
+    let predicate_lt = column.clone().lt(lit(2));
     let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
     let expected_lt = BooleanArray::from(vec![true, false, false]);
     assert_eq!(results, expected_lt);
 
-    let predicate_le = column.clone().le(Expr::literal(2));
+    let predicate_le = column.clone().le(lit(2));
     let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
     let expected_le = BooleanArray::from(vec![true, true, false]);
     assert_eq!(results, expected_le);
 
-    let predicate_gt = column.clone().gt(Expr::literal(2));
+    let predicate_gt = column.clone().gt(lit(2));
     let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
     let expected_gt = BooleanArray::from(vec![false, false, true]);
     assert_eq!(results, expected_gt);
 
-    let predicate_ge = column.clone().ge(Expr::literal(2));
+    let predicate_ge = column.clone().ge(lit(2));
     let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
     let expected_ge = BooleanArray::from(vec![false, true, true]);
     assert_eq!(results, expected_ge);
 
-    let predicate_eq = column.clone().eq(Expr::literal(2));
+    let predicate_eq = column.clone().eq(lit(2));
     let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
     let expected_eq = BooleanArray::from(vec![false, true, false]);
     assert_eq!(results, expected_eq);
 
-    let predicate_ne = column.clone().ne(Expr::literal(2));
+    let predicate_ne = column.clone().ne(lit(2));
     let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
     let expected_ne = BooleanArray::from(vec![true, false, true]);
     assert_eq!(results, expected_ne);
@@ -629,7 +601,7 @@ fn test_logical() {
     let expected = BooleanArray::from(vec![t, f, f, f, n, f]);
     assert_eq!(results, expected);
 
-    let pred_and_lit = Pred::and(column_a.clone(), Pred::literal(true));
+    let pred_and_lit = Pred::and(column_a.clone(), Pred::TRUE);
     let results = evaluate_predicate(&pred_and_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
@@ -639,7 +611,7 @@ fn test_logical() {
     let expected = BooleanArray::from(vec![t, t, t, f, t, n]);
     assert_eq!(results, expected);
 
-    let pred_or_lit = Pred::or(column_a.clone(), Pred::literal(false));
+    let pred_or_lit = Pred::or(column_a.clone(), Pred::FALSE);
     let results = evaluate_predicate(&pred_or_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
@@ -760,8 +732,8 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
 
 #[test]
 fn test_opaque() {
-    let expr = Expr::arrow_opaque(OpaqueLessThanOp, [column_expr!("x"), Expr::literal(10)]);
-    let pred = Pred::arrow_opaque(OpaqueLessThanOp, [column_expr!("x"), Expr::literal(10)]);
+    let expr = Expr::arrow_opaque(OpaqueLessThanOp, [col!("x"), lit(10)]);
+    let pred = Pred::arrow_opaque(OpaqueLessThanOp, [col!("x"), lit(10)]);
 
     assert_eq!(
         format!("{expr:?}"),
@@ -1319,7 +1291,7 @@ fn test_evaluator_mixed_string_types_struct_expression() {
     let output_type = KernelDataType::from(StructType::new_unchecked(fields));
 
     let handler = ArrowEvaluationHandler;
-    let expression: ExpressionRef = Arc::new(column_expr!("st"));
+    let expression: ExpressionRef = Arc::new(col!("st"));
     handler
         .new_expression_evaluator(input_schema, expression, output_type)
         .unwrap()
@@ -1496,16 +1468,17 @@ fn test_void_scalar_to_array() {
     assert_eq!(*array.data_type(), DataType::Null);
 }
 
-// Unit test to ensure scalars reject interval types
+// Interval scalars materialize as their physical integer arrays (Int32 months / Int64 micros).
 #[rstest]
-#[case::year_month(KernelDataType::INTERVAL_YEAR_MONTH)]
-#[case::day_time(KernelDataType::INTERVAL_DAY_TIME)]
-fn test_interval_scalar_to_array_unsupported(#[case] interval_type: KernelDataType) {
-    let result = Scalar::Null(interval_type).to_array(1);
-    assert!(
-        matches!(result, Err(crate::error::Error::Unsupported(_))),
-        "expected Unsupported, got {result:?}"
-    );
+#[case::year_month(Scalar::IntervalYearMonth(30), DataType::Int32)]
+#[case::day_time(Scalar::IntervalDayTime(5), DataType::Int64)]
+fn test_interval_scalar_to_array(#[case] scalar: Scalar, #[case] arrow_type: DataType) {
+    let array = scalar.to_array(2).unwrap();
+    assert_eq!(array.len(), 2);
+    assert_eq!(*array.data_type(), arrow_type);
+
+    let nulls = Scalar::Null(scalar.data_type()).to_array(2).unwrap();
+    assert_eq!(*nulls.data_type(), arrow_type);
 }
 
 #[cfg(feature = "geo-type-in-dev")]
