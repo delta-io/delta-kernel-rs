@@ -406,7 +406,7 @@ impl<S> Transaction<S> {
                 Error::generic(
                     "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
                      This would require writing CDC files for DML operations, which is not yet supported. \
-                     Only use separate transactions when doing so preserves the required atomicity and CDF semantics: one to add files and another to remove files or update deletion vectors."
+                     Consider using separate transactions: one to add files, another to remove files or update deletion vectors."
                 )
             );
         }
