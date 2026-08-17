@@ -96,6 +96,7 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
+    use crate::schema::schema_ref;
     use crate::IntoEngineData;
 
     #[tokio::test]
@@ -139,7 +140,7 @@ mod tests {
         let committer = FileSystemCommitter::new();
         let log_root = LogRoot::new(table_root).unwrap();
         let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let schema = schema_ref! {};
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let action = metadata
             .clone()
@@ -187,7 +188,7 @@ mod tests {
 
         let committer = FileSystemCommitter::new();
         let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let schema = schema_ref! {};
         let metadata1 =
             Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let metadata2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();

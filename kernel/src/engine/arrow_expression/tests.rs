@@ -27,7 +27,9 @@ use crate::kernel_predicates::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
-use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
+use crate::schema::{
+    schema, schema_ref, ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
+};
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
@@ -277,14 +279,14 @@ fn test_literal_complex_type_array() {
         )
         .unwrap(),
     );
-    let struct_fields = vec![
-        StructField::nullable("scalar", KernelDataType::INTEGER),
-        StructField::nullable("list", array_type.clone()),
-        StructField::nullable("null_list", array_type.clone()),
-        StructField::nullable("map", map_type.clone()),
-        StructField::nullable("null_map", map_type.clone()),
-    ];
-    let struct_type = StructType::new_unchecked(struct_fields.clone());
+    let struct_type = schema! {
+        nullable "scalar": INTEGER,
+        nullable "list": (array_type.clone()),
+        nullable "null_list": (array_type.clone()),
+        nullable "map": (map_type.clone()),
+        nullable "null_map": (map_type.clone()),
+    };
+    let struct_fields = struct_type.fields().cloned().collect::<Vec<_>>();
     let struct_value = Scalar::Struct(
         crate::expressions::StructData::try_new(
             struct_fields.clone(),
@@ -768,16 +770,13 @@ fn test_opaque() {
 #[test]
 fn test_null_row() {
     // note that we _allow_ nested nulls, since the top-level struct can be NULL
-    let schema = Arc::new(StructType::new_unchecked(vec![
-        StructField::nullable(
-            "x",
-            StructType::new_unchecked([
-                StructField::nullable("a", KernelDataType::INTEGER),
-                StructField::not_null("b", KernelDataType::STRING),
-            ]),
-        ),
-        StructField::nullable("c", KernelDataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "x": {
+            nullable "a": INTEGER,
+            not_null "b": STRING,
+        },
+        nullable "c": STRING,
+    };
     let handler = ArrowEvaluationHandler;
     let result = handler.null_row(schema.clone()).unwrap();
     let expected = RecordBatch::try_new(
@@ -802,10 +801,9 @@ fn test_null_row() {
 
 #[test]
 fn test_null_row_err() {
-    let not_null_schema = Arc::new(StructType::new_unchecked(vec![StructField::not_null(
-        "a",
-        KernelDataType::STRING,
-    )]));
+    let not_null_schema = schema_ref! {
+        not_null "a": STRING,
+    };
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
         handler.null_row(not_null_schema),
@@ -829,12 +827,12 @@ fn test_create_one() {
         3.into(),
         Scalar::Null(KernelDataType::INTEGER),
     ];
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("a", KernelDataType::INTEGER),
-        StructField::nullable("b", KernelDataType::STRING),
-        StructField::not_null("c", KernelDataType::INTEGER),
-        StructField::nullable("d", KernelDataType::INTEGER),
-    ]));
+    let schema = schema_ref! {
+        nullable "a": INTEGER,
+        nullable "b": STRING,
+        not_null "c": INTEGER,
+        nullable "d": INTEGER,
+    };
 
     let expected_schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int32, true),
@@ -858,13 +856,12 @@ fn test_create_one() {
 #[test]
 fn test_create_one_nested() {
     let values: &[Scalar] = &[1.into(), 2.into()];
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-        "a",
-        KernelDataType::struct_type_unchecked([
-            StructField::nullable("b", KernelDataType::INTEGER),
-            StructField::not_null("c", KernelDataType::INTEGER),
-        ]),
-    )]));
+    let schema = schema_ref! {
+        not_null "a": {
+            nullable "b": INTEGER,
+            not_null "c": INTEGER,
+        },
+    };
     let expected_schema = Arc::new(Schema::new(vec![Field::new(
         "a",
         DataType::Struct(
@@ -896,13 +893,12 @@ fn test_create_one_nested() {
 #[test]
 fn test_create_one_nested_null() {
     let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-        "a",
-        KernelDataType::struct_type_unchecked([
-            StructField::nullable("b", KernelDataType::INTEGER),
-            StructField::not_null("c", KernelDataType::INTEGER),
-        ]),
-    )]));
+    let schema = schema_ref! {
+        not_null "a": {
+            nullable "b": INTEGER,
+            not_null "c": INTEGER,
+        },
+    };
     let expected_schema = Arc::new(Schema::new(vec![Field::new(
         "a",
         DataType::Struct(
@@ -935,10 +931,9 @@ fn test_create_one_nested_null() {
 fn test_create_one_mismatching_scalar_types() {
     // Scalar is a LONG but schema specifies INTEGER
     let values: &[Scalar] = &[Scalar::Long(10)];
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-        "version",
-        KernelDataType::INTEGER,
-    )]));
+    let schema = schema_ref! {
+        not_null "version": INTEGER,
+    };
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
         handler.create_one(schema, values),
@@ -954,13 +949,12 @@ fn test_create_one_not_null_struct() {
         Scalar::Null(KernelDataType::INTEGER),
         Scalar::Null(KernelDataType::INTEGER),
     ];
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-        "a",
-        KernelDataType::struct_type_unchecked([
-            StructField::not_null("b", KernelDataType::INTEGER),
-            StructField::nullable("c", KernelDataType::INTEGER),
-        ]),
-    )]));
+    let schema = schema_ref! {
+        not_null "a": {
+            not_null "b": INTEGER,
+            nullable "c": INTEGER,
+        },
+    };
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
         handler.create_one(schema, values),
@@ -975,10 +969,9 @@ fn test_create_one_top_level_null() {
     let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-        "col_1",
-        KernelDataType::INTEGER,
-    )]));
+    let schema = schema_ref! {
+        not_null "col_1": INTEGER,
+    };
     assert_result_error_with_message(
         handler.create_one(schema, values),
         "Column 'col_1' is declared as non-nullable but contains null values",
@@ -1055,10 +1048,10 @@ fn test_apply_schema_column_count_mismatch() {
     ]);
 
     // Create a schema with only 2 fields (mismatch)
-    let schema = KernelDataType::from(StructType::new_unchecked([
-        StructField::not_null("a", KernelDataType::INTEGER),
-        StructField::not_null("b", KernelDataType::INTEGER),
-    ]));
+    let schema = KernelDataType::from(schema! {
+        not_null "a": INTEGER,
+        not_null "b": INTEGER,
+    });
 
     let result = apply_schema(&struct_array, &schema);
 
@@ -1241,12 +1234,12 @@ fn make_mixed_string_batch() -> RecordBatch {
     .unwrap()
 }
 
-fn mixed_string_kernel_fields() -> [StructField; 3] {
-    [
-        StructField::nullable("s_utf8", KernelDataType::STRING),
-        StructField::nullable("s_large", KernelDataType::STRING),
-        StructField::nullable("s_view", KernelDataType::STRING),
-    ]
+fn mixed_string_kernel_schema() -> StructType {
+    schema! {
+        nullable "s_utf8": STRING,
+        nullable "s_large": STRING,
+        nullable "s_view": STRING,
+    }
 }
 
 /// Evaluator must succeed when a struct contains Utf8, LargeUtf8, and Utf8View columns in the
@@ -1255,9 +1248,9 @@ fn mixed_string_kernel_fields() -> [StructField; 3] {
 #[test]
 fn test_evaluator_mixed_string_types_identity_transform() {
     let engine_data = ArrowEngineData::new(make_mixed_string_batch());
-    let fields = mixed_string_kernel_fields();
-    let input_schema = Arc::new(StructType::new_unchecked(fields.clone()));
-    let output_type = KernelDataType::from(StructType::new_unchecked(fields));
+    let schema = mixed_string_kernel_schema();
+    let input_schema = Arc::new(schema.clone());
+    let output_type = KernelDataType::from(schema);
 
     let handler = ArrowEvaluationHandler;
     let expression: ExpressionRef =
@@ -1283,12 +1276,11 @@ fn test_evaluator_mixed_string_types_struct_expression() {
     .unwrap();
     let engine_data = ArrowEngineData::new(batch);
 
-    let fields = mixed_string_kernel_fields();
-    let input_schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-        "st",
-        KernelDataType::struct_type_unchecked(fields.clone()),
-    )]));
-    let output_type = KernelDataType::from(StructType::new_unchecked(fields));
+    let schema = mixed_string_kernel_schema();
+    let input_schema = schema_ref! {
+        not_null "st": (schema.clone()),
+    };
+    let output_type = KernelDataType::from(schema);
 
     let handler = ArrowEvaluationHandler;
     let expression: ExpressionRef = Arc::new(col!("st"));
@@ -1312,10 +1304,10 @@ fn test_create_many_multiple_rows() {
     let row1: &[Scalar] = &[1.into(), "A".into()];
     let row2: &[Scalar] = &[2.into(), "B".into()];
     let row3: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), "C".into()];
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", KernelDataType::INTEGER),
-        StructField::nullable("name", KernelDataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "name": STRING,
+    };
     let expected_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, true),
         Field::new("name", DataType::Utf8, true),
@@ -1333,10 +1325,10 @@ fn test_create_many_multiple_rows() {
 
 #[test]
 fn test_create_many_empty_rows_returns_zero_row_batch() {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("a", KernelDataType::INTEGER),
-        StructField::nullable("b", KernelDataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "a": INTEGER,
+        nullable "b": STRING,
+    };
     let handler = ArrowEvaluationHandler;
     let result = handler.create_many(schema.clone(), &[]).unwrap();
     assert_eq!(result.len(), 0);
@@ -1347,10 +1339,10 @@ fn test_create_many_empty_rows_returns_zero_row_batch() {
 
 #[test]
 fn test_create_many_wrong_field_count_returns_error() {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("a", KernelDataType::INTEGER),
-        StructField::nullable("b", KernelDataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "a": INTEGER,
+        nullable "b": STRING,
+    };
     // Row has 3 scalars but schema has 2 fields
     let bad_row: &[Scalar] = &[1.into(), "x".into(), 99.into()];
     let handler = ArrowEvaluationHandler;
@@ -1362,10 +1354,10 @@ fn test_create_many_wrong_field_count_returns_error() {
 
 #[test]
 fn test_create_many_wrong_field_type_returns_error() {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("a", KernelDataType::INTEGER),
-        StructField::nullable("b", KernelDataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "a": INTEGER,
+        nullable "b": STRING,
+    };
     // Row 1 passes a Long where an Integer is expected for field "a"
     let good_row: &[Scalar] = &[1.into(), "x".into()];
     let bad_row: &[Scalar] = &[1i64.into(), "y".into()];
@@ -1384,11 +1376,11 @@ fn test_create_many_single_row_matches_create_one() {
         "hello".into(),
         Scalar::Null(KernelDataType::INTEGER),
     ];
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("a", KernelDataType::INTEGER),
-        StructField::nullable("b", KernelDataType::STRING),
-        StructField::nullable("c", KernelDataType::INTEGER),
-    ]));
+    let schema = schema_ref! {
+        nullable "a": INTEGER,
+        nullable "b": STRING,
+        nullable "c": INTEGER,
+    };
     let handler = ArrowEvaluationHandler;
     let from_one = handler
         .create_one(schema.clone(), values)
@@ -1406,14 +1398,14 @@ fn test_create_many_single_row_matches_create_one() {
 #[test]
 fn test_create_many_nested_struct() {
     // Schema: outer { inner: Struct { x: INT, y: STRING }, flag: BOOLEAN }
-    let inner_type = KernelDataType::struct_type_unchecked([
-        StructField::nullable("x", KernelDataType::INTEGER),
-        StructField::nullable("y", KernelDataType::STRING),
-    ]);
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("inner", inner_type.clone()),
-        StructField::nullable("flag", KernelDataType::BOOLEAN),
-    ]));
+    let inner_type = KernelDataType::from(schema! {
+        nullable "x": INTEGER,
+        nullable "y": STRING,
+    });
+    let schema = schema_ref! {
+        nullable "inner": (inner_type.clone()),
+        nullable "flag": BOOLEAN,
+    };
 
     // Row 1: inner = Struct { x: 10, y: "hello" }, flag = true
     let row1: &[Scalar] = &[

@@ -15,7 +15,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::schema::{schema, schema_ref, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
@@ -879,13 +879,12 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
         ]
     }
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "info",
-            DataType::try_struct_type([StructField::nullable("name", DataType::STRING)])?,
-        ),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "info": {
+            nullable "name": STRING,
+        },
+    };
 
     let _ = create_table(table_path, schema.clone(), "Test/1.0")
         .with_table_properties([
@@ -1121,11 +1120,11 @@ async fn create_partitioned_stats_table<E: TaskExecutor>(
     table_url: &url::Url,
     engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("part_key", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "name": STRING,
+        nullable "part_key": STRING,
+    };
 
     let _ = create_table(table_path, schema.clone(), "Test/1.0")
         .with_table_properties([
@@ -1136,10 +1135,10 @@ async fn create_partitioned_stats_table<E: TaskExecutor>(
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    let data_schema = StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-    ])?;
+    let data_schema = schema! {
+        nullable "id": LONG,
+        nullable "name": STRING,
+    };
     let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(&data_schema)?);
 
     let batch1 = RecordBatch::try_new(
@@ -1567,14 +1566,11 @@ enum CrossFeature {
 /// region: string`. The `region` column is used as the partition column in the
 /// `Partitioned` variant; `id` is the clustering column in the `Clustered` variant.
 fn cross_feature_schema() -> Arc<StructType> {
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-            StructField::nullable("region", DataType::STRING),
-        ])
-        .unwrap(),
-    )
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+        nullable "region": STRING,
+    }
 }
 
 /// Creates a V2 table for the given `features` and writes 3 commits totaling 6 rows
@@ -1628,10 +1624,11 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
     // the partition value is supplied separately in `partition_values`.
     let partitioned = features.contains(&CrossFeature::Partitioned);
     let data_arrow_schema = if partitioned {
-        Arc::new(ArrowSchema::try_from_kernel(&StructType::try_new(vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ])?)?)
+        let data_schema = schema! {
+            nullable "id": INTEGER,
+            nullable "value": STRING,
+        };
+        Arc::new(ArrowSchema::try_from_kernel(&data_schema)?)
     } else {
         Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?)
     };

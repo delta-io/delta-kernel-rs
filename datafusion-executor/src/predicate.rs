@@ -6,7 +6,7 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{conjunction, disjunction};
 use datafusion::logical_expr::{binary_expr, lit, Expr as DFExpr, Operator};
 use delta_kernel::expressions::{
-    null_lit, ArrayData as KernelArrayData, BinaryPredicate as KernelBinaryPredicate,
+    ArrayData as KernelArrayData, BinaryPredicate as KernelBinaryPredicate,
     BinaryPredicateOp as KernelBinaryPredicateOp, ColumnName as KernelColumnName,
     Expression as KernelExpression, JunctionPredicate as KernelJunctionPredicate,
     JunctionPredicateOp as KernelJunctionPredicateOp, Predicate as KernelPredicate,
@@ -195,9 +195,10 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::expressions::{
-        col, lit, ArrayData as KernelArrayData, Expression as KernelExpr, Predicate as KernelPred,
+        col, lit, null_lit, ArrayData as KernelArrayData, Expression as KernelExpr,
+        Predicate as KernelPred,
     };
-    use delta_kernel::schema::{ArrayType, DataType, StructField};
+    use delta_kernel::schema::{schema, ArrayType, DataType};
     use rstest::rstest;
 
     use super::*;
@@ -207,13 +208,12 @@ mod tests {
     /// Columns these tests resolve against: top-level `a`, `b`, `c` (all `long`) and `list`
     /// (an array of nullable `long`, the right-hand side of a list-column `IN`).
     fn test_schema() -> StructType {
-        StructType::try_new([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-            StructField::nullable("c", DataType::LONG),
-            StructField::nullable("list", ArrayType::new(DataType::LONG, true)),
-        ])
-        .unwrap()
+        schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "c": LONG,
+            nullable "list": [ nullable LONG ],
+        }
     }
 
     /// Lowers a predicate and returns its DataFusion `Display` string.

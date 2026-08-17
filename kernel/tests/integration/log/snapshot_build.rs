@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::schema::{schema, schema_ref};
 use delta_kernel::snapshot::{
     CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, SnapshotBuilder,
 };
@@ -106,10 +106,8 @@ async fn setup_multi_version_table<E: TaskExecutor>(
 async fn deeply_nested_schema_snapshot_load_returns_schema_error(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deeply_nested_schema = (0..42).fold(
-        StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)]),
-        |schema, depth| {
-            StructType::new_unchecked([StructField::nullable(format!("level_{depth}"), schema)])
-        },
+        schema! { nullable "leaf": INTEGER },
+        |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
     );
     let (store, engine, table_url) = engine_store_setup("deeply_nested_schema", None);
     let commit = [

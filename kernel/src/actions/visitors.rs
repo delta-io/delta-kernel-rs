@@ -11,7 +11,9 @@ use super::deletion_vector::DeletionVectorDescriptor;
 use super::*;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_segment::DomainMetadataMap;
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Schema, StructField};
+use crate::schema::{
+    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
+};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -641,14 +643,11 @@ impl InCommitTimestampVisitor {
     #[allow(unused)]
     /// Get the schema that the visitor expects the data to have.
     pub(crate) fn schema() -> Arc<Schema> {
-        static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
-            let ict_type = StructField::new("inCommitTimestamp", DataType::LONG, true);
-            Arc::new(StructType::new_unchecked(vec![StructField::new(
-                COMMIT_INFO_NAME,
-                StructType::new_unchecked([ict_type]),
-                true,
-            )]))
-        });
+        static SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            nullable COMMIT_INFO_NAME: {
+                nullable "inCommitTimestamp": LONG,
+            },
+        };
         SCHEMA.clone()
     }
 }

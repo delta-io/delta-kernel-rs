@@ -792,8 +792,7 @@ mod tests {
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{
-        schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
-        StructType,
+        schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
@@ -978,10 +977,10 @@ mod tests {
         ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
     )]
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("string", DataType::STRING),
-        ])?);
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "string": STRING,
+        };
 
         // TODO: test with partitions
         let (_tmp_test_dir, tables) = setup_local_test_tables(schema, &[], "test_table").await?;
@@ -1163,11 +1162,11 @@ mod tests {
     async fn test_partitioned_append() -> Result<(), Box<dyn std::error::Error>> {
         // Partition column `part` is listed last in the schema; the physical write schema must
         // exclude it (CM=none, partition columns are not materialized).
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("string", DataType::STRING),
-            StructField::nullable("part", DataType::INTEGER),
-        ])?);
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "string": STRING,
+            nullable "part": INTEGER,
+        };
 
         let (_tmp_test_dir, tables) =
             setup_local_test_tables(schema, &["part"], "test_partitioned_table").await?;
@@ -1353,10 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn test_partitioned_write_context_rejects_unpartitioned_table(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "number",
-            DataType::INTEGER,
-        )])?);
+        let schema = schema_ref! { nullable "number": INTEGER };
         let tables = setup_test_tables(schema, &[], None, "test_unpartitioned").await?;
 
         for (table_url, _engine, store, _table_name) in tables {
@@ -1405,10 +1401,10 @@ mod tests {
     async fn test_visit_partition_values_surfaces_null() -> Result<(), Box<dyn std::error::Error>> {
         // A null partition value must surface across the visitor as `is_null = true` with an
         // empty value slice (the documented C contract).
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("part", DataType::INTEGER),
-        ])?);
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "part": INTEGER,
+        };
         let tables = setup_test_tables(schema, &["part"], None, "test_null_partition").await?;
 
         for (table_url, _engine, store, _table_name) in tables {
@@ -1461,11 +1457,11 @@ mod tests {
     {
         // Multiple partition columns must be visited in deterministic (sorted) key order,
         // regardless of insertion order or the underlying HashMap layout.
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("region", DataType::STRING),
-            StructField::nullable("year", DataType::INTEGER),
-        ])?);
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "region": STRING,
+            nullable "year": INTEGER,
+        };
         let tables =
             setup_test_tables(schema, &["year", "region"], None, "test_multi_partition").await?;
 
@@ -1552,7 +1548,7 @@ mod tests {
         name: &str,
     ) -> Result<(Url, Arc<DynObjectStore>, Handle<SharedExternEngine>), Box<dyn std::error::Error>>
     {
-        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
+        let schema = schema_ref! { nullable "id": INTEGER };
         let (store, _test_engine, table_location) = test_utils::engine_store_setup(name, None);
         let table_url = test_utils::create_table(
             store.clone(),
@@ -1706,7 +1702,7 @@ mod tests {
         let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
 
         // Create a table WITHOUT the domainMetadata writer feature (v1/v1 protocol)
-        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
+        let schema = schema_ref! { nullable "id": INTEGER };
         let (store, _test_engine, table_location) =
             test_utils::engine_store_setup("test_dm_no_feature", Some(&tmp_dir_url));
         let table_url = test_utils::create_table(
@@ -1786,10 +1782,10 @@ mod tests {
             OptionalValue::None
         }
 
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("string", DataType::STRING),
-        ]));
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "string": STRING,
+        };
 
         // Create a catalog-managed table so UCCommitter (a catalog committer) is allowed.
         let (store, _test_engine, table_location) =
@@ -2987,7 +2983,7 @@ mod tests {
 
         // Build a DV-enabled table; create_table sets delta.enableDeletionVectors for the
         // writer feature.
-        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
+        let schema = schema_ref! { nullable "id": INTEGER };
         let (store, _test_engine, table_location) =
             test_utils::engine_store_setup("test_dv_ffi", None);
         let table_url = test_utils::create_table(

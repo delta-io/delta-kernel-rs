@@ -863,7 +863,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use delta_kernel::expressions::{col, lit, Scalar};
-    use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
     use rstest::rstest;
 
     use super::*;
@@ -910,9 +910,7 @@ mod tests {
 
     #[test]
     fn from_data_type_non_primitive_produces_sentinel() {
-        let struct_type = DataType::from(
-            StructType::try_new(vec![StructField::not_null("a", DataType::INTEGER)]).unwrap(),
-        );
+        let struct_type = DataType::from(schema! { not_null "a": INTEGER });
         assert_eq!(
             NullTypeTag::from_data_type(&struct_type),
             (NullTypeTag::NonPrimitive, 0, 0)

@@ -1,0 +1,2 @@
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["geospatial"],"writerFeatures":["geospatial"]}}
+{"metaData":{"id":"table-with-geo","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"geom\",\"type\":\"geometry(OGC:CRS84)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"geog\",\"type\":\"geography(OGC:CRS84, spherical)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":0}}

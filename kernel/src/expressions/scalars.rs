@@ -1283,7 +1283,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{col, lit, BinaryPredicateOp};
-    use crate::schema::ToSchema as _;
+    use crate::schema::{schema, ToSchema as _};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::Predicate as Pred;
@@ -2282,10 +2282,10 @@ mod tests {
     fn derived_struct_conversion_checks_null_field_data_type() {
         // `Option::try_from` rejects a typed null whose data type does not match `T`.
         let address = StructData::from_values_unchecked(
-            StructType::new_unchecked([
-                StructField::not_null("city", DataType::STRING),
-                StructField::nullable("zip", DataType::STRING),
-            ]),
+            schema! {
+                not_null "city": STRING,
+                nullable "zip": STRING,
+            },
             vec![Scalar::from("NYC"), Scalar::null(DataType::STRING)],
         );
         assert_result_error_with_message(

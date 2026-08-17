@@ -979,7 +979,7 @@ mod tests {
     use crate::expressions::{column_name, ColumnName};
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
-        schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
@@ -1186,10 +1186,10 @@ mod tests {
         use crate::clustering::CLUSTERING_DOMAIN_NAME;
         use crate::expressions::column_name;
 
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]));
+        let schema = schema_ref! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1214,11 +1214,11 @@ mod tests {
     fn test_clustering_support_multiple_columns() {
         use crate::expressions::column_name;
 
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("date", DataType::STRING, true),
-            StructField::new("region", DataType::STRING, true),
-        ]));
+        let schema = schema_ref! {
+            not_null "id": INTEGER,
+            nullable "date": STRING,
+            nullable "region": STRING,
+        };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1267,14 +1267,13 @@ mod tests {
         use crate::clustering::CLUSTERING_DOMAIN_NAME;
         use crate::expressions::column_name;
 
-        let address_struct = StructType::new_unchecked(vec![
-            StructField::new("city", DataType::STRING, true),
-            StructField::new("zip", DataType::STRING, true),
-        ]);
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("address", address_struct, true),
-        ]));
+        let schema = schema_ref! {
+            not_null "id": INTEGER,
+            nullable "address": {
+                nullable "city": STRING,
+                nullable "zip": STRING,
+            },
+        };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1334,11 +1333,11 @@ mod tests {
         &[TableFeature::TimestampWithoutTimezone],
     )]
     #[case::both_variant_and_ntz(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("v", DataType::unshredded_variant(), true),
-            StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
-        ])),
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "v": unshredded_variant(),
+            nullable "ts": TIMESTAMP_NTZ,
+        },
         &[TableFeature::VariantType, TableFeature::TimestampWithoutTimezone],
     )]
     #[case::no_special_types(
@@ -1495,11 +1494,11 @@ mod tests {
     }
 
     fn multi_column_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("date", DataType::DATE, true),
-        ]))
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+            nullable "date": DATE,
+        }
     }
 
     struct DataLayoutExpectation {
@@ -1603,12 +1602,10 @@ mod tests {
 
     #[test]
     fn test_validate_partition_columns_nested_rejected() {
-        let address_struct =
-            StructType::new_unchecked(vec![StructField::new("city", DataType::STRING, true)]);
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("address", address_struct, true),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            nullable "address": { nullable "city": STRING },
+        };
 
         let columns = vec![column_name!("address.city")];
         let result = validate_partition_columns(&schema, &columns);
@@ -1622,7 +1619,7 @@ mod tests {
     #[rstest::rstest]
     #[case::struct_type(
         "struct_col",
-        DataType::from(StructType::new_unchecked(vec![StructField::new("inner", DataType::STRING, false)])),
+        DataType::from(schema! { not_null "inner": STRING }),
     )]
     #[case::array_type(
         "array_col",
@@ -1636,10 +1633,10 @@ mod tests {
         #[case] col_name: &str,
         #[case] data_type: DataType,
     ) {
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(col_name, data_type, false),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            not_null col_name: (data_type),
+        };
         let columns = vec![ColumnName::new([col_name])];
         let result = validate_partition_columns(&schema, &columns);
         assert!(result.is_err());
@@ -1653,13 +1650,10 @@ mod tests {
     fn test_validate_partition_columns_nested_interval_types_rejected(
         #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] data_type: DataType,
     ) {
-        let schema = StructType::new_unchecked([
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::not_null(
-                "nested",
-                StructType::new_unchecked([StructField::not_null("col", data_type)]),
-            ),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            not_null "nested": { not_null "col": (data_type) },
+        };
 
         let error = validate_partition_columns(&schema, &[column_name!("nested.col")])
             .expect_err("nested partition columns must be rejected")
@@ -1677,10 +1671,10 @@ mod tests {
     #[case::interval_year_month(DataType::INTERVAL_YEAR_MONTH)]
     #[case::interval_day_time(DataType::INTERVAL_DAY_TIME)]
     fn test_validate_partition_columns_primitive_types_accepted(#[case] data_type: DataType) {
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("col", data_type, false),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            not_null "col": (data_type),
+        };
         let columns = vec![column_name!("col")];
         assert!(validate_partition_columns(&schema, &columns).is_ok());
     }
@@ -1820,9 +1814,13 @@ mod tests {
         let complex = StripFieldMetadataTransform
             .transform_struct(&with_metadata)
             .into_owned();
-        let mut fields: Vec<StructField> = complex.fields().cloned().collect();
-        fields.push(StructField::nullable("region", DataType::STRING));
-        Arc::new(StructType::try_new(fields).unwrap())
+        Arc::new(
+            try_schema! {
+                ..(complex.fields()),
+                nullable "region": STRING,
+            }
+            .unwrap(),
+        )
     }
 
     /// V3 create-table flow with the same schema for minimum and maximum feature sets.

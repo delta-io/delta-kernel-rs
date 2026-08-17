@@ -633,10 +633,10 @@ pub(crate) mod tests {
     #[test]
     fn no_partition_columns() {
         // Test case: No partition columns, no column mapping
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
 
         let state_info = get_simple_state_info(schema.clone(), vec![]).unwrap();
 
@@ -654,11 +654,11 @@ pub(crate) mod tests {
     #[test]
     fn with_partition_columns() {
         // Test case: With partition columns
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("date", DataType::DATE), // Partition column
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "date": DATE, // Partition column
+            nullable "value": LONG,
+        };
 
         let state_info = get_simple_state_info(
             schema.clone(),
@@ -691,12 +691,12 @@ pub(crate) mod tests {
     #[test]
     fn multiple_partition_columns() {
         // Test case: Multiple partition columns interspersed with regular columns
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("col1", DataType::STRING),
-            StructField::nullable("part1", DataType::STRING), // Partition
-            StructField::nullable("col2", DataType::LONG),
-            StructField::nullable("part2", DataType::INTEGER), // Partition
-        ]));
+        let schema = schema_ref! {
+            nullable "col1": STRING,
+            nullable "part1": STRING, // Partition
+            nullable "col2": LONG,
+            nullable "part2": INTEGER, // Partition
+        };
 
         let state_info = get_simple_state_info(
             schema.clone(),
@@ -740,10 +740,10 @@ pub(crate) mod tests {
     #[test]
     fn with_predicate() {
         // Test case: With a valid predicate
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
 
         let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
@@ -770,11 +770,11 @@ pub(crate) mod tests {
     #[test]
     fn partition_at_beginning() {
         // Test case: Partition column at the beginning
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("date", DataType::DATE), // Partition column
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "date": DATE, // Partition column
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
 
         let state_info = get_simple_state_info(schema.clone(), vec!["date".to_string()]).unwrap();
 
@@ -956,10 +956,10 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_partition_column() {
-        let table_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("part_col", DataType::STRING),
-        ]));
+        let table_schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "part_col": STRING,
+        };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1017,10 +1017,10 @@ pub(crate) mod tests {
 
     #[test]
     fn stats_columns_with_predicate() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
 
         let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
@@ -1051,11 +1051,11 @@ pub(crate) mod tests {
     fn stats_columns_with_predicate_merges_columns() {
         // When specific stats_columns are requested alongside a predicate, the stats
         // schema should include both the requested columns and predicate-referenced columns.
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-            StructField::nullable("extra", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+            nullable "extra": LONG,
+        };
 
         let predicate = Arc::new(col!("extra").gt(lit(5i64)));
 
@@ -1100,10 +1100,10 @@ pub(crate) mod tests {
 
     #[test]
     fn non_empty_stats_columns_filters_schema() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1433,17 +1433,14 @@ pub(crate) mod tests {
     /// entire `s` struct, so a predicate on `s.c` produces no stats schema.
     #[test]
     fn predicate_on_nested_past_cap_leaf_drops_parent_struct() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-            StructField::nullable(
-                "s",
-                StructType::new_unchecked(vec![
-                    StructField::nullable("c", DataType::LONG),
-                    StructField::nullable("d", DataType::LONG),
-                ]),
-            ),
-        ]));
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
         // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
         let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
         let state_info = get_state_info(
@@ -1492,17 +1489,14 @@ pub(crate) mod tests {
     /// `minValues` / `maxValues` with `c` only.
     #[test]
     fn predicate_on_nested_mixed_keeps_intersection_under_parent_struct() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-            StructField::nullable(
-                "s",
-                StructType::new_unchecked(vec![
-                    StructField::nullable("c", DataType::LONG),
-                    StructField::nullable("d", DataType::LONG),
-                ]),
-            ),
-        ]));
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
         let predicate = Arc::new(Pred::and(
             col!("s.c").gt(lit(10i64)),
             col!("s.d").gt(lit(10i64)),
@@ -1551,16 +1545,13 @@ pub(crate) mod tests {
     /// `"s"` should produce `{ s.c, s.d }` (and exclude `a`, which is not in the list).
     #[test]
     fn stats_columns_admits_all_children_of_nested_parent_in_explicit_list() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable(
-                "s",
-                StructType::new_unchecked(vec![
-                    StructField::nullable("c", DataType::LONG),
-                    StructField::nullable("d", DataType::LONG),
-                ]),
-            ),
-        ]));
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
         let state_info = get_state_info(
             schema,
             vec![],

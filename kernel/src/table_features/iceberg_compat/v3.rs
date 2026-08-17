@@ -143,7 +143,7 @@ mod column_default_tests {
     use super::iceberg_compat_v3_column_defaults_validation;
     use crate::actions::{Metadata, Protocol};
     use crate::schema::ColumnMetadataKey::CurrentDefault;
-    use crate::schema::{ArrayType, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{schema, ArrayType, DataType, MetadataValue, StructField, StructType};
     use crate::table_configuration::TableConfiguration;
     use crate::table_features::TableFeature;
 
@@ -184,51 +184,50 @@ mod column_default_tests {
 
     #[rstest]
     #[case::primitive_literal(
-        StructType::try_new([field_with_default("a", DataType::INTEGER, "42")]).unwrap(),
+        schema! {
+            (field_with_default("a", DataType::INTEGER, "42")),
+        },
         "a",
         None
     )]
     #[case::primitive_null(
-        StructType::try_new([field_with_default("a", DataType::INTEGER, "NULL")]).unwrap(),
+        schema! {
+            (field_with_default("a", DataType::INTEGER, "NULL")),
+        },
         "a",
         None
     )]
     #[case::non_literal_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            DataType::TIMESTAMP,
-            "current_timestamp()"
-        )]).unwrap(),
+        schema! {
+            (field_with_default("a", DataType::TIMESTAMP, "current_timestamp()")),
+        },
         "a",
         Some("could not verify")
     )]
     #[case::null_on_non_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            ArrayType::new(DataType::INTEGER, true),
-            "NULL"
-        )]).unwrap(),
+        schema! {
+            (field_with_default("a", ArrayType::new(DataType::INTEGER, true), "NULL")),
+        },
         "a",
         None
     )]
     #[case::non_null_on_non_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            ArrayType::new(DataType::INTEGER, true),
-            "ARRAY(1)"
-        )]).unwrap(),
+        schema! {
+            (field_with_default("a", ArrayType::new(DataType::INTEGER, true), "ARRAY(1)")),
+        },
         "a",
         Some("could not verify")
     )]
     #[case::nested_non_literal(
-        StructType::try_new([StructField::nullable(
-            "s",
-            DataType::try_struct_type([field_with_default(
+        schema! {
+            nullable "s": {
+                (field_with_default(
                 "inner",
                 DataType::TIMESTAMP,
                 "current_timestamp()"
-            )]).unwrap(),
-        )]).unwrap(),
+                )),
+            },
+        },
         "s.inner",
         Some("could not verify")
     )]

@@ -40,8 +40,8 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
 use crate::schema::{
-    lazy_schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder, StructField,
-    StructType,
+    lazy_schema_ref, schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder,
+    StructField, StructType,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -433,6 +433,10 @@ impl<S> Transaction<S> {
             self.effective_table_config.physical_partition_columns(),
         )?
         .validate_filtered(&self.dv_matched_files)?;
+
+        // Validate required fields for RemoveFile.
+        write_validation::StagedDataValidator::staged_remove_file()
+            .validate_filtered(&self.remove_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
@@ -1394,8 +1398,7 @@ impl<S> Transaction<S> {
                 let commit_versions_array =
                     ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
 
-                let row_tracking_schema =
-                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![])))?;
+                let row_tracking_schema = with_row_tracking_cols(&schema_ref! {})?;
                 add_files_batch.append_columns(
                     row_tracking_schema,
                     vec![base_row_ids_array, commit_versions_array],
@@ -1848,7 +1851,7 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::scan::log_replay::PATH_NAME;
-    use crate::schema::{schema_ref, MapType};
+    use crate::schema::{schema, schema_ref, MapType};
     use crate::table_features::ColumnMappingMode;
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
@@ -2043,25 +2046,19 @@ mod tests {
             .with_engine_info("default engine");
 
         let schema = txn.add_files_schema();
-        let expected = StructType::new_unchecked(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null(
-                "partitionValues",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("modificationTime", DataType::LONG),
-            StructField::nullable(
-                "stats",
-                DataType::struct_type_unchecked(vec![
-                    StructField::nullable(NUM_RECORDS, DataType::LONG),
-                    StructField::nullable(NULL_COUNT, DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable(MIN_VALUES, DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable(MAX_VALUES, DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
-                ]),
-            ),
-        ]);
+        let expected = schema! {
+            not_null "path": STRING,
+            not_null "partitionValues": { STRING => nullable STRING },
+            not_null "size": LONG,
+            not_null "modificationTime": LONG,
+            nullable "stats": {
+                nullable NUM_RECORDS: LONG,
+                nullable NULL_COUNT: {},
+                nullable MIN_VALUES: {},
+                nullable MAX_VALUES: {},
+                nullable TIGHT_BOUNDS: BOOLEAN,
+            },
+        };
         assert_eq!(*schema, expected.into());
         Ok(())
     }
@@ -2182,14 +2179,10 @@ mod tests {
             .logical_schema()
             .contains("fresh_column"));
 
-        let mut evolved_fields: Vec<StructField> = txn
-            .effective_table_config
-            .logical_schema()
-            .fields()
-            .cloned()
-            .collect();
-        evolved_fields.push(StructField::nullable("fresh_column", DataType::INTEGER));
-        let evolved_schema = Arc::new(StructType::new_unchecked(evolved_fields));
+        let evolved_schema = schema_ref! {
+            ..(txn.effective_table_config.logical_schema().fields()),
+            nullable "fresh_column": INTEGER,
+        };
         let evolved_metadata = txn
             .effective_table_config
             .metadata()
@@ -2282,12 +2275,15 @@ mod tests {
 
         #[test]
         fn collects_present_defaults_and_skips_columns_without_one() {
-            let schema = StructType::try_new(vec![
-                field_with_default("parsable", DataType::INTEGER, "42"),
-                field_with_default("unparsable", DataType::TIMESTAMP, "current_timestamp()"),
-                StructField::nullable("no_default", DataType::STRING),
-            ])
-            .unwrap();
+            let schema = schema! {
+                (field_with_default("parsable", DataType::INTEGER, "42")),
+                (field_with_default(
+                    "unparsable",
+                    DataType::TIMESTAMP,
+                    "current_timestamp()",
+                )),
+                nullable "no_default": STRING,
+            };
             let txn = txn_with_schema(schema);
 
             let defaults = txn.top_level_column_defaults().unwrap();
@@ -2309,18 +2305,19 @@ mod tests {
 
         #[test]
         fn returns_empty_map_when_no_column_has_a_default() {
-            let schema = StructType::try_new(vec![
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::STRING),
-            ])
-            .unwrap();
+            let schema = schema! {
+                nullable "a": INTEGER,
+                nullable "b": STRING,
+            };
             let txn = txn_with_schema(schema);
             assert!(txn.top_level_column_defaults().unwrap().is_empty());
         }
 
         #[test]
         fn load_rejects_malformed_default() {
-            let schema = StructType::try_new(vec![field_with_invalid_default("c")]).unwrap();
+            let schema = schema! {
+                (field_with_invalid_default("c")),
+            };
 
             let err = try_table_config(&base_txn(), schema, [TableFeature::AllowColumnDefaults])
                 .expect_err("non-string CURRENT_DEFAULT must error at load")
@@ -2330,9 +2327,9 @@ mod tests {
 
         #[test]
         fn load_tolerates_default_present_but_feature_not_enabled() {
-            let schema =
-                StructType::try_new(vec![field_with_default("c", DataType::INTEGER, "42")])
-                    .unwrap();
+            let schema = schema! {
+                (field_with_default("c", DataType::INTEGER, "42")),
+            };
 
             // Orphaned column-default metadata (no `allowColumnDefaults` feature) is tolerated.
             let txn = txn_with_schema_and_writer_features(schema, []);
@@ -2484,15 +2481,15 @@ mod tests {
         let engine: Arc<dyn Engine> =
             Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
         // Logical order: [p1, p2, d1, v(void), p3, p4, d2]; partition cols = p1, p2, p3, p4.
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("p1", DataType::STRING),
-            StructField::nullable("p2", DataType::INTEGER),
-            StructField::nullable("d1", DataType::INTEGER),
-            StructField::nullable("v", DataType::VOID),
-            StructField::nullable("p3", DataType::STRING),
-            StructField::nullable("p4", DataType::INTEGER),
-            StructField::nullable("d2", DataType::INTEGER),
-        ])?);
+        let schema = schema_ref! {
+            nullable "p1": STRING,
+            nullable "p2": INTEGER,
+            nullable "d1": INTEGER,
+            nullable "v": VOID,
+            nullable "p3": STRING,
+            nullable "p4": INTEGER,
+            nullable "d2": INTEGER,
+        };
         let txn = create_table("memory:///t", schema, "DefaultEngine")
             .with_data_layout(DataLayout::partitioned(["p1", "p2", "p3", "p4"]))
             .with_table_properties([
@@ -3240,30 +3237,24 @@ mod tests {
 
     /// Creates test add file metadata with configurable stats for the "value" column.
     fn create_test_add_files(paths: Vec<&str>, stats: Vec<TestFileStats>) -> Box<dyn EngineData> {
-        let value_fields = vec![StructField::nullable("value", DataType::LONG)];
-        let value_struct_type = DataType::struct_type_unchecked(value_fields.clone());
-        let stats_type = DataType::struct_type_unchecked(vec![
-            StructField::nullable(NUM_RECORDS, DataType::LONG),
-            StructField::nullable(NULL_COUNT, value_struct_type.clone()),
-            StructField::nullable(MIN_VALUES, value_struct_type.clone()),
-            StructField::nullable(MAX_VALUES, value_struct_type.clone()),
-        ]);
-        let stats_fields = vec![
-            StructField::nullable(NUM_RECORDS, DataType::LONG),
-            StructField::nullable(NULL_COUNT, value_struct_type.clone()),
-            StructField::nullable(MIN_VALUES, value_struct_type.clone()),
-            StructField::nullable(MAX_VALUES, value_struct_type),
-        ];
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null(
-                "partitionValues",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("modificationTime", DataType::LONG),
-            StructField::nullable("stats", stats_type.clone()),
-        ]));
+        let value_schema = schema! { nullable "value": LONG };
+        let value_fields = value_schema.fields().cloned().collect::<Vec<_>>();
+        let value_struct_type = DataType::from(value_schema);
+        let stats_schema = schema! {
+            nullable NUM_RECORDS: LONG,
+            nullable NULL_COUNT: (value_struct_type.clone()),
+            nullable MIN_VALUES: (value_struct_type.clone()),
+            nullable MAX_VALUES: (value_struct_type.clone()),
+        };
+        let stats_fields = stats_schema.fields().cloned().collect::<Vec<_>>();
+        let stats_type = DataType::from(stats_schema);
+        let schema = schema_ref! {
+            not_null "path": STRING,
+            not_null "partitionValues": { STRING => nullable STRING },
+            not_null "size": LONG,
+            not_null "modificationTime": LONG,
+            nullable "stats": (stats_type.clone()),
+        };
 
         let empty_map = Scalar::Map(
             MapData::try_new(
@@ -3451,9 +3442,7 @@ mod tests {
         let engine = crate::engine::sync::SyncEngine::new_with_store(storage);
 
         // Create a non-catalog-managed table using a catalog committer
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![
-            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
-        ]));
+        let schema = schema_ref! { nullable "id": INTEGER };
         let committer = Box::new(MockCatalogCommitter);
         let err = create_table("memory:///", schema, "test-engine")
             .build(&engine, committer)

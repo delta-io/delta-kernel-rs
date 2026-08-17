@@ -361,7 +361,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema_ref;
     use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
     use crate::transaction::create_table::create_table;
     use crate::Predicate;
@@ -448,11 +448,10 @@ mod tests {
         // Check logical schema matches projection
         assert_eq!(
             *scan.logical_schema(),
-            StructType::new_unchecked([
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::not_null("_commit_version", DataType::LONG),
-            ])
-            .into()
+            schema_ref! {
+                nullable "id": INTEGER,
+                not_null "_commit_version": LONG,
+            }
         );
 
         // Check physical schema only has the regular field 'id' (no CDF metadata columns)
@@ -493,10 +492,10 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store);
 
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("part", DataType::STRING),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "part": STRING,
+        };
         create_table(url_str, schema, "DefaultEngine")
             .with_table_properties([("delta.enableChangeDataFeed", "true")])
             .build(&engine, Box::new(FileSystemCommitter::new()))

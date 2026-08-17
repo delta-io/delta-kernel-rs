@@ -150,14 +150,12 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use paste::paste;
     use Expression as Expr;
 
     use super::*;
     use crate::expressions::{lit, ArrayData, MapData};
-    use crate::schema::{schema_ref, SchemaRef, StructField, StructType};
+    use crate::schema::{schema, schema_ref, SchemaRef, StructField};
     use crate::DataType as DeltaDataTypes;
 
     // helper to take values/schema to pass to `create_one` and assert the result = expected
@@ -189,30 +187,29 @@ mod tests {
     #[test]
     fn test_create_one_missing_values() {
         let values = &[1.into()];
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
-            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
-        ]));
+        let schema = schema_ref! {
+            nullable "col_1": INTEGER,
+            nullable "col_2": INTEGER,
+        };
         assert_single_row_transform(values, schema, Err(()));
     }
 
     #[test]
     fn test_create_one_extra_values() {
         let values = &[1.into(), 2.into(), 3.into()];
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
-            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
-        ]));
+        let schema = schema_ref! {
+            nullable "col_1": INTEGER,
+            nullable "col_2": INTEGER,
+        };
         assert_single_row_transform(values, schema, Err(()));
     }
 
     #[test]
     fn test_create_one_incorrect_schema() {
         let values = &["a".into()];
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "col_1",
-            DeltaDataTypes::INTEGER,
-        )]));
+        let schema = schema_ref! {
+            nullable "col_1": INTEGER,
+        };
         assert_single_row_transform(values, schema, Err(()));
     }
 
@@ -247,10 +244,10 @@ mod tests {
             Scalar::Map(map_data.clone()),
             Scalar::Array(array_data.clone()),
         ];
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("map", map_type),
-            StructField::nullable("array", array_type),
-        ]));
+        let schema = schema_ref! {
+            nullable "map": (map_type),
+            nullable "array": (array_type),
+        };
         let expected = Expr::struct_from(vec![lit(map_data), lit(array_data)]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
@@ -285,10 +282,15 @@ mod tests {
         let field_b = StructField::new("b", DeltaDataTypes::INTEGER, test_schema.b_nullable);
         let field_x = StructField::new(
             "x",
-            StructType::new_unchecked([field_a.clone(), field_b.clone()]),
+            schema! {
+                (field_a.clone()),
+                (field_b.clone()),
+            },
             test_schema.x_nullable,
         );
-        let schema = Arc::new(StructType::new_unchecked([field_x.clone()]));
+        let schema = schema_ref! {
+            (field_x.clone()),
+        };
 
         let expected_result = match expected {
             Expected::Noop => {

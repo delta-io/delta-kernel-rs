@@ -1170,9 +1170,9 @@ fn test_partition_timestamp_column_no_adjustment() {
 fn test_interval_partition_columns_are_not_pruning_columns(
     #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
 ) {
-    let partition_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-        "period", interval,
-    )]));
+    let partition_schema = schema_ref! {
+        nullable "period": (interval),
+    };
     let (_, _, partition_columns) = DataSkippingFilter::build_unified_schema_and_expr(
         None,
         column_expr_ref!("stats_parsed"),

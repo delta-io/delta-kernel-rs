@@ -25,7 +25,7 @@ use delta_kernel::expressions::{
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema, schema_ref, DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Error, Snapshot, SnapshotRef};
@@ -284,13 +284,10 @@ async fn boundary_c1_prunes_all(
 // batch keep their stats and the predicate prunes them correctly.
 
 fn timestamp_stats_schema() -> SchemaRef {
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("EventTime", DataType::TIMESTAMP),
-            StructField::nullable("UserId", DataType::LONG),
-        ])
-        .unwrap(),
-    )
+    schema_ref! {
+        nullable "EventTime": TIMESTAMP,
+        nullable "UserId": LONG,
+    }
 }
 
 /// Creates a `timestamp_stats_schema` table and returns the pieces needed to inject raw commits:
@@ -699,10 +696,10 @@ async fn scan_with_replace_table_schema_change(
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
 
     // Commit 1 creates the table with a string partition column.
-    let old_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("part", DataType::STRING),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let old_schema = schema_ref! {
+        nullable "part": STRING,
+        nullable "value": STRING,
+    };
     create_table(&table_path, old_schema, "Test/1.0")
         .with_data_layout(DataLayout::partitioned(["part"]))
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
@@ -760,10 +757,10 @@ async fn scan_with_replace_table_schema_change(
     }
 
     // Commit 3 replaces the table metadata and removes the addFiles.
-    let replacement_schema = StructType::try_new(vec![
-        StructField::nullable("part", DataType::LONG),
-        StructField::nullable("value", DataType::LONG),
-    ])?;
+    let replacement_schema = schema! {
+        nullable "part": LONG,
+        nullable "value": LONG,
+    };
     let replacement = [
         json!({
             "commitInfo": {
@@ -959,10 +956,10 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     #[values(false, true)] use_parallel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("ts", DataType::TIMESTAMP),
-        StructField::nullable("v", DataType::LONG),
-    ])?);
+    let schema = schema_ref! {
+        nullable "ts": TIMESTAMP,
+        nullable "v": LONG,
+    };
     create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::partitioned(["ts"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1036,16 +1033,16 @@ async fn interval_partition_values_do_not_prune_files(
     #[values(false, true)] use_parallel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("period", interval),
-        StructField::nullable("v", DataType::LONG),
-    ])?);
+    let schema = schema_ref! {
+        nullable "period": (interval),
+        nullable "v": LONG,
+    };
     let mut snapshot = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::partitioned(["period"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
-    let data_schema = StructType::try_new([StructField::nullable("v", DataType::LONG)])?;
+    let data_schema = schema! { nullable "v": LONG };
     let batch = RecordBatch::try_new(
         Arc::new((&data_schema).try_into_arrow()?),
         vec![Arc::new(Int64Array::from(vec![1]))],
@@ -1135,10 +1132,7 @@ async fn all_null_files_pruned_regardless_of_source(
     #[values(false, true)] use_parallel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::LONG,
-    )])?);
+    let schema = schema_ref! { nullable "value": LONG };
     // For the struct-stats cases, also disable `writeStatsAsJson` so the checkpoint carries ONLY
     // `stats_parsed`. That forces the scan to read the pre-parsed struct (no JSON fallback),
     // genuinely validating that path. The JSON-stats case keeps the defaults

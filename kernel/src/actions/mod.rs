@@ -192,6 +192,7 @@ fn checkpoint_action_field() -> impl IntoIterator<Item = &'static StructField> {
     }
 }
 
+#[cfg(any(test, feature = "internal-api"))]
 static COMMIT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&ADD_FIELD),
     (&REMOVE_FIELD),
@@ -250,6 +251,7 @@ pub(crate) static LOG_TXN_SCHEMA: LazyLock<SchemaRef> =
 pub(crate) static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> =
     lazy_schema_ref! { (&DOMAIN_METADATA_FIELD) };
 
+#[cfg(any(test, feature = "internal-api"))]
 #[internal_api]
 /// Gets the schema for all actions that can appear in commits
 /// logs.  This excludes actions that can only appear in checkpoints.
@@ -1432,7 +1434,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::expressions::Scalar;
-    use crate::schema::{schema_ref, ArrayType, DataType, MapType, StructField};
+    use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
@@ -1526,31 +1528,21 @@ mod tests {
             .project(&[METADATA_NAME])
             .expect("Couldn't get metaData field");
 
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "metaData",
-            StructType::new_unchecked([
-                StructField::not_null("id", DataType::STRING),
-                StructField::nullable("name", DataType::STRING),
-                StructField::nullable("description", DataType::STRING),
-                StructField::not_null(
-                    "format",
-                    StructType::new_unchecked([
-                        StructField::not_null("provider", DataType::STRING),
-                        StructField::not_null(
-                            "options",
-                            MapType::new(DataType::STRING, DataType::STRING, false),
-                        ),
-                    ]),
-                ),
-                StructField::not_null("schemaString", DataType::STRING),
-                StructField::not_null("partitionColumns", ArrayType::new(DataType::STRING, false)),
-                StructField::nullable("createdTime", DataType::LONG),
-                StructField::not_null(
-                    "configuration",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
-                ),
-            ]),
-        )]));
+        let expected = schema_ref! {
+            nullable "metaData": {
+                not_null "id": STRING,
+                nullable "name": STRING,
+                nullable "description": STRING,
+                not_null "format": {
+                    not_null "provider": STRING,
+                    not_null "options": { STRING => not_null STRING },
+                },
+                not_null "schemaString": STRING,
+                not_null "partitionColumns": [ not_null STRING ],
+                nullable "createdTime": LONG,
+                not_null "configuration": { STRING => not_null STRING },
+            },
+        };
         assert_eq!(schema, expected);
     }
 
@@ -1646,10 +1638,8 @@ mod tests {
 
     fn nested_schema(depth: usize) -> StructType {
         (0..depth).fold(
-            StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)]),
-            |schema, depth| {
-                StructType::new_unchecked([StructField::nullable(format!("level_{depth}"), schema)])
-            },
+            schema! { nullable "leaf": INTEGER },
+            |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
         )
     }
 
@@ -1659,28 +1649,21 @@ mod tests {
             .project(&[ADD_NAME])
             .expect("Couldn't get add field");
 
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "add",
-            StructType::new_unchecked([
-                StructField::not_null("path", DataType::STRING),
-                StructField::not_null(
-                    "partitionValues",
-                    MapType::new(DataType::STRING, DataType::STRING, true),
-                ),
-                StructField::not_null("size", DataType::LONG),
-                StructField::not_null("modificationTime", DataType::LONG),
-                StructField::not_null("dataChange", DataType::BOOLEAN),
-                StructField::nullable("stats", DataType::STRING),
-                StructField::nullable(
-                    "tags",
-                    MapType::new(DataType::STRING, DataType::STRING, true),
-                ),
-                deletion_vector_field(),
-                StructField::nullable("baseRowId", DataType::LONG),
-                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-                StructField::nullable("clusteringProvider", DataType::STRING),
-            ]),
-        )]));
+        let expected = schema_ref! {
+            nullable "add": {
+                not_null "path": STRING,
+                not_null "partitionValues": { STRING => nullable STRING },
+                not_null "size": LONG,
+                not_null "modificationTime": LONG,
+                not_null "dataChange": BOOLEAN,
+                nullable "stats": STRING,
+                nullable "tags": { STRING => nullable STRING },
+                (deletion_vector_field()),
+                nullable "baseRowId": LONG,
+                nullable "defaultRowCommitVersion": LONG,
+                nullable "clusteringProvider": STRING,
+            },
+        };
         assert_eq!(schema, expected);
     }
 
@@ -1701,13 +1684,13 @@ mod tests {
     fn deletion_vector_field() -> StructField {
         StructField::nullable(
             "deletionVector",
-            DataType::struct_type_unchecked([
-                StructField::not_null("storageType", DataType::STRING),
-                StructField::not_null("pathOrInlineDv", DataType::STRING),
-                StructField::nullable("offset", DataType::INTEGER),
-                StructField::not_null("sizeInBytes", DataType::INTEGER),
-                StructField::not_null("cardinality", DataType::LONG),
-            ]),
+            schema! {
+                not_null "storageType": STRING,
+                not_null "pathOrInlineDv": STRING,
+                nullable "offset": INTEGER,
+                not_null "sizeInBytes": INTEGER,
+                not_null "cardinality": LONG,
+            },
         )
     }
 
@@ -1716,22 +1699,21 @@ mod tests {
         let schema = get_commit_schema()
             .project(&[REMOVE_NAME])
             .expect("Couldn't get remove field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "remove",
-            StructType::new_unchecked([
-                StructField::not_null("path", DataType::STRING),
-                StructField::nullable("deletionTimestamp", DataType::LONG),
-                StructField::not_null("dataChange", DataType::BOOLEAN),
-                StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
-                partition_values_field(),
-                StructField::nullable("size", DataType::LONG),
-                StructField::nullable("stats", DataType::STRING),
-                tags_field(),
-                deletion_vector_field(),
-                StructField::nullable("baseRowId", DataType::LONG),
-                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-            ]),
-        )]));
+        let expected = schema_ref! {
+            nullable "remove": {
+                not_null "path": STRING,
+                nullable "deletionTimestamp": LONG,
+                not_null "dataChange": BOOLEAN,
+                nullable "extendedFileMetadata": BOOLEAN,
+                (partition_values_field()),
+                nullable "size": LONG,
+                nullable "stats": STRING,
+                (tags_field()),
+                (deletion_vector_field()),
+                nullable "baseRowId": LONG,
+                nullable "defaultRowCommitVersion": LONG,
+            },
+        };
         assert_eq!(schema, expected);
     }
 
@@ -1740,31 +1722,27 @@ mod tests {
         let schema = get_commit_schema()
             .project(&[CDC_NAME])
             .expect("Couldn't get cdc field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "cdc",
-            StructType::new_unchecked([
-                StructField::not_null("path", DataType::STRING),
-                StructField::not_null(
-                    "partitionValues",
-                    MapType::new(DataType::STRING, DataType::STRING, true),
-                ),
-                StructField::not_null("size", DataType::LONG),
-                StructField::not_null("dataChange", DataType::BOOLEAN),
-                tags_field(),
-            ]),
-        )]));
+        let expected = schema_ref! {
+            nullable "cdc": {
+                not_null "path": STRING,
+                not_null "partitionValues": { STRING => nullable STRING },
+                not_null "size": LONG,
+                not_null "dataChange": BOOLEAN,
+                (tags_field()),
+            },
+        };
         assert_eq!(schema, expected);
     }
 
     #[test]
     fn test_sidecar_schema() {
         let schema = Sidecar::to_schema();
-        let expected = StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("sizeInBytes", DataType::LONG),
-            StructField::not_null("modificationTime", DataType::LONG),
-            tags_field(),
-        ]);
+        let expected = schema! {
+            not_null "path": STRING,
+            not_null "sizeInBytes": LONG,
+            not_null "modificationTime": LONG,
+            (tags_field()),
+        };
         assert_eq!(schema, expected);
     }
 
@@ -1773,13 +1751,12 @@ mod tests {
         let schema = get_all_actions_schema()
             .project(&[CHECKPOINT_METADATA_NAME])
             .expect("Couldn't get checkpointMetadata field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "checkpointMetadata",
-            StructType::new_unchecked([
-                StructField::not_null("version", DataType::LONG),
-                tags_field(),
-            ]),
-        )]));
+        let expected = schema_ref! {
+            nullable "checkpointMetadata": {
+                not_null "version": LONG,
+                (tags_field()),
+            },
+        };
         assert_eq!(schema, expected);
     }
 
@@ -1789,14 +1766,13 @@ mod tests {
             .project(&["txn"])
             .expect("Couldn't get transaction field");
 
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "txn",
-            StructType::new_unchecked([
-                StructField::not_null("appId", DataType::STRING),
-                StructField::not_null("version", DataType::LONG),
-                StructField::nullable("lastUpdated", DataType::LONG),
-            ]),
-        )]));
+        let expected = schema_ref! {
+            nullable "txn": {
+                not_null "appId": STRING,
+                not_null "version": LONG,
+                nullable "lastUpdated": LONG,
+            },
+        };
         assert_eq!(schema, expected);
     }
 
@@ -1806,22 +1782,18 @@ mod tests {
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
-        let expected = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "commitInfo",
-            StructType::new_unchecked(vec![
-                StructField::nullable("timestamp", DataType::LONG),
-                StructField::nullable("inCommitTimestamp", DataType::LONG),
-                StructField::nullable("operation", DataType::STRING),
-                StructField::nullable(
-                    "operationParameters",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
-                ),
-                StructField::nullable("kernelVersion", DataType::STRING),
-                StructField::nullable("isBlindAppend", DataType::BOOLEAN),
-                StructField::nullable("engineInfo", DataType::STRING),
-                StructField::nullable("txnId", DataType::STRING),
-            ]),
-        )]));
+        let expected = schema_ref! {
+            nullable "commitInfo": {
+                nullable "timestamp": LONG,
+                nullable "inCommitTimestamp": LONG,
+                nullable "operation": STRING,
+                nullable "operationParameters": { STRING => not_null STRING },
+                nullable "kernelVersion": STRING,
+                nullable "isBlindAppend": BOOLEAN,
+                nullable "engineInfo": STRING,
+                nullable "txnId": STRING,
+            },
+        };
         assert_eq!(schema, expected);
     }
 
@@ -1830,14 +1802,13 @@ mod tests {
         let schema = get_commit_schema()
             .project(&[DOMAIN_METADATA_NAME])
             .expect("Couldn't get domainMetadata field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "domainMetadata",
-            StructType::new_unchecked([
-                StructField::not_null("domain", DataType::STRING),
-                StructField::not_null("configuration", DataType::STRING),
-                StructField::not_null("removed", DataType::BOOLEAN),
-            ]),
-        )]));
+        let expected = schema_ref! {
+            nullable "domainMetadata": {
+                not_null "domain": STRING,
+                not_null "configuration": STRING,
+                not_null "removed": BOOLEAN,
+            },
+        };
         assert_eq!(schema, expected);
     }
 

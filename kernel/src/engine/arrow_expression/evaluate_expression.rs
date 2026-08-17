@@ -1201,11 +1201,11 @@ mod tests {
 
         // Test 1: Empty patch (identity) - should be exactly equal to input
         let patch = ExpressionStructPatchBuilder::new();
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::new("a", DataType::INTEGER, false),
-            StructField::new("b", DataType::INTEGER, false),
-            StructField::new("c", DataType::INTEGER, false),
-        ]);
+        let output_schema = schema! {
+            not_null "a": INTEGER,
+            not_null "b": INTEGER,
+            not_null "c": INTEGER,
+        };
 
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
@@ -1223,10 +1223,10 @@ mod tests {
         let nested_batch = create_nested_test_batch();
         let nested_patch = ExpressionStructPatchBuilder::new_nested(["nested"]);
 
-        let nested_output_schema = StructType::new_unchecked(vec![
-            StructField::new("x", DataType::INTEGER, false),
-            StructField::new("y", DataType::INTEGER, false),
-        ]);
+        let nested_output_schema = schema! {
+            not_null "x": INTEGER,
+            not_null "y": INTEGER,
+        };
 
         let expr_nested = Expr::struct_patch(nested_patch).unwrap();
         let result_nested = evaluate_expression(
@@ -1272,17 +1272,17 @@ mod tests {
             .insert_after("c", lit(99))
             .append(lit(7));
 
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::new("pre1", DataType::INTEGER, false), // prepend 1
-            StructField::new("pre2", DataType::INTEGER, false), // prepend 2
-            StructField::new("pre3", DataType::INTEGER, false), // prepend 3 (column c)
-            StructField::new("a", DataType::INTEGER, false),    // replaced with column b
-            StructField::new("c", DataType::INTEGER, false),    // passed through
-            StructField::new("after_c1", DataType::INTEGER, false), // first insertion after c
-            StructField::new("after_c2", DataType::INTEGER, false), // second insertion after c
-            StructField::new("after_c3", DataType::INTEGER, false), // third insertion after c
-            StructField::new("append1", DataType::INTEGER, false), // true append
-        ]);
+        let output_schema = schema! {
+            not_null "pre1": INTEGER,
+            not_null "pre2": INTEGER,
+            not_null "pre3": INTEGER,
+            not_null "a": INTEGER,
+            not_null "c": INTEGER,
+            not_null "after_c1": INTEGER,
+            not_null "after_c2": INTEGER,
+            not_null "after_c3": INTEGER,
+            not_null "append1": INTEGER,
+        };
 
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
@@ -1320,20 +1320,16 @@ mod tests {
             .insert_after("a", lit(42))
             .replace("a", col!("b"));
 
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::new("a", DataType::INTEGER, false),
-            StructField::new("after_a", DataType::INTEGER, false),
-            StructField::new("b", DataType::INTEGER, false),
-            StructField::new("c", DataType::INTEGER, false),
-        ]);
+        let output_schema = schema! {
+            not_null "a": INTEGER,
+            not_null "after_a": INTEGER,
+            not_null "b": INTEGER,
+            not_null "c": INTEGER,
+        };
 
         let expr = Expr::struct_patch(patch).unwrap();
-        let result = evaluate_expression(
-            &expr,
-            &batch,
-            Some(&DataType::Struct(Box::new(output_schema))),
-        )
-        .unwrap();
+        let result =
+            evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
 
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
         validate_i32_column(struct_result, 0, &[10, 20, 30]); // replacement column b
@@ -1349,10 +1345,10 @@ mod tests {
         // Test 1: Simple struct relocation (copy nested struct to top level unchanged)
         let copy_patch = ExpressionStructPatchBuilder::new_nested(["nested"]);
 
-        let copy_output_schema = StructType::new_unchecked(vec![
-            StructField::new("x", DataType::INTEGER, false),
-            StructField::new("y", DataType::INTEGER, false),
-        ]);
+        let copy_output_schema = schema! {
+            not_null "x": INTEGER,
+            not_null "y": INTEGER,
+        };
 
         let expr_copy = Expr::struct_patch(copy_patch).unwrap();
         let result_copy = evaluate_expression(
@@ -1383,11 +1379,11 @@ mod tests {
             .replace("x", lit(777))
             .insert_after("y", lit(555));
 
-        let modify_output_schema = StructType::new_unchecked(vec![
-            StructField::new("x", DataType::INTEGER, false), // replaced with literal 777
-            StructField::new("y", DataType::INTEGER, false), // passed through
-            StructField::new("new_field", DataType::INTEGER, false), // inserted after y
-        ]);
+        let modify_output_schema = schema! {
+            not_null "x": INTEGER,
+            not_null "y": INTEGER,
+            not_null "new_field": INTEGER,
+        };
 
         let expr_modify = Expr::struct_patch(modify_patch).unwrap();
         let result_modify = evaluate_expression(
@@ -1420,11 +1416,11 @@ mod tests {
 
         // Test unused replacement keys
         let patch = ExpressionStructPatchBuilder::new().replace("missing", lit(1));
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::not_null("b", DataType::INTEGER),
-            StructField::not_null("c", DataType::INTEGER),
-        ]);
+        let output_schema = schema! {
+            not_null "a": INTEGER,
+            not_null "b": INTEGER,
+            not_null "c": INTEGER,
+        };
 
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
@@ -1450,11 +1446,11 @@ mod tests {
         // Test column count mismatch -- too many output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
 
-        let wrong_output_schema = StructType::new_unchecked(vec![
-            StructField::not_null("a", DataType::INTEGER), // expects a field that was dropped
-            StructField::not_null("b", DataType::INTEGER),
-            StructField::not_null("c", DataType::INTEGER),
-        ]);
+        let wrong_output_schema = schema! {
+            not_null "a": INTEGER,
+            not_null "b": INTEGER,
+            not_null "c": INTEGER,
+        };
 
         let expr3 = Expr::struct_patch(drop_patch).unwrap();
         let result3 =
@@ -1468,8 +1464,7 @@ mod tests {
         // Test column count mismatch -- too few output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
 
-        let wrong_output_schema =
-            StructType::new_unchecked(vec![StructField::not_null("c", DataType::INTEGER)]);
+        let wrong_output_schema = schema! { not_null "c": INTEGER };
 
         let expr3 = Expr::struct_patch(drop_patch).unwrap();
         let result3 =
@@ -1494,20 +1489,17 @@ mod tests {
     #[test]
     fn test_replacement_occupies_field_position() {
         let batch = create_test_batch();
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::not_null("b", DataType::INTEGER),
-            StructField::not_null("c", DataType::INTEGER),
-        ]);
+        let output_schema = schema! {
+            not_null "a": INTEGER,
+            not_null "b": INTEGER,
+            not_null "c": INTEGER,
+        };
 
         let patch = ExpressionStructPatchBuilder::new().replace("a", lit(1));
         let expr = Expr::struct_patch(patch).unwrap();
-        let result = evaluate_expression(
-            &expr,
-            &batch,
-            Some(&DataType::Struct(Box::new(output_schema.clone()))),
-        )
-        .unwrap();
+        let result =
+            evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema.clone())))
+                .unwrap();
         let result = result.as_any().downcast_ref::<StructArray>().unwrap();
         validate_i32_column(result, 0, &[1, 1, 1]);
         validate_i32_column(result, 1, &[10, 20, 30]);
@@ -1518,10 +1510,10 @@ mod tests {
     fn test_drop_field_if_exists_present() {
         let batch = create_test_batch();
         let patch = ExpressionStructPatchBuilder::new().drop_if_exists("a");
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::not_null("b", DataType::INTEGER),
-            StructField::not_null("c", DataType::INTEGER),
-        ]);
+        let output_schema = schema! {
+            not_null "b": INTEGER,
+            not_null "c": INTEGER,
+        };
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
@@ -1534,11 +1526,11 @@ mod tests {
     fn test_drop_field_if_exists_missing() {
         let batch = create_test_batch();
         let patch = ExpressionStructPatchBuilder::new().drop_if_exists("nonexistent");
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::not_null("b", DataType::INTEGER),
-            StructField::not_null("c", DataType::INTEGER),
-        ]);
+        let output_schema = schema! {
+            not_null "a": INTEGER,
+            not_null "b": INTEGER,
+            not_null "c": INTEGER,
+        };
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
@@ -1552,11 +1544,11 @@ mod tests {
     fn test_drop_field_non_optional_missing_still_errors() {
         let batch = create_test_batch();
         let patch = ExpressionStructPatchBuilder::new().drop("nonexistent");
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::not_null("b", DataType::INTEGER),
-            StructField::not_null("c", DataType::INTEGER),
-        ]);
+        let output_schema = schema! {
+            not_null "a": INTEGER,
+            not_null "b": INTEGER,
+            not_null "c": INTEGER,
+        };
         let expr = Expr::struct_patch(patch).unwrap();
         let result = evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema)));
         assert!(result
@@ -1573,11 +1565,11 @@ mod tests {
             (
                 "too many schema fields",
                 Expr::struct_from([column_expr_ref!("a"), column_expr_ref!("b")]),
-                StructType::new_unchecked(vec![
-                    StructField::not_null("a", DataType::INTEGER),
-                    StructField::not_null("b", DataType::INTEGER),
-                    StructField::not_null("c", DataType::INTEGER),
-                ]),
+                schema! {
+                    not_null "a": INTEGER,
+                    not_null "b": INTEGER,
+                    not_null "c": INTEGER,
+                },
             ),
             (
                 "too few schema fields",
@@ -1586,10 +1578,10 @@ mod tests {
                     column_expr_ref!("b"),
                     column_expr_ref!("c"),
                 ]),
-                StructType::new_unchecked(vec![
-                    StructField::not_null("a", DataType::INTEGER),
-                    StructField::not_null("b", DataType::INTEGER),
-                ]),
+                schema! {
+                    not_null "a": INTEGER,
+                    not_null "b": INTEGER,
+                },
             ),
         ];
 
@@ -2182,9 +2174,7 @@ mod tests {
         )
         .unwrap();
 
-        let output_type = DataType::Struct(Box::new(StructType::new_unchecked(vec![
-            StructField::nullable("v", DataType::INTEGER),
-        ])));
+        let output_type = DataType::from(schema! { nullable "v": INTEGER });
         let expr = Expr::struct_with_nullability_from(
             [Arc::new(col!("v"))],
             Arc::new(Expr::from_pred(Pred::from_expr(col!("p")))),
@@ -2328,10 +2318,9 @@ mod tests {
         #[case] input: Vec<Option<&str>>,
         #[case] expected_null_count: usize,
     ) {
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "a",
-            DataType::LONG,
-        )]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+        };
         let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
         let batch = RecordBatch::try_new(
             Arc::new(schema),
@@ -2350,10 +2339,10 @@ mod tests {
         let batch = create_json_batch();
 
         // Define the output schema for parsing
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
 
         let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2427,10 +2416,10 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
 
         let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2563,10 +2552,10 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
 
         let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2604,10 +2593,10 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
 
         // Schema only asks for "a" and "b"
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
 
         let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2695,11 +2684,11 @@ mod tests {
         use crate::arrow::array::Date32Array;
 
         let batch = create_partition_map_batch();
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::nullable("region", DataType::STRING),
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("date", DataType::DATE),
-        ]);
+        let output_schema = schema! {
+            nullable "region": STRING,
+            nullable "id": INTEGER,
+            nullable "date": DATE,
+        };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(col!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
@@ -2775,8 +2764,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema =
-            StructType::new_unchecked(vec![StructField::nullable("region", DataType::STRING)]);
+        let output_schema = schema! { nullable "region": STRING };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(col!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
@@ -2829,8 +2817,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema =
-            StructType::new_unchecked(vec![StructField::nullable("ts", DataType::TIMESTAMP)]);
+        let output_schema = schema! { nullable "ts": TIMESTAMP };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(col!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
@@ -2911,10 +2898,10 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::new("region", DataType::STRING, false),
-            StructField::new("id", DataType::INTEGER, false),
-        ]);
+        let output_schema = schema! {
+            not_null "region": STRING,
+            not_null "id": INTEGER,
+        };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(col!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
@@ -2996,11 +2983,11 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::nullable("region", DataType::STRING),
-            StructField::nullable("blob", DataType::BINARY),
-            StructField::nullable("count", DataType::INTEGER),
-        ]);
+        let output_schema = schema! {
+            nullable "region": STRING,
+            nullable "blob": BINARY,
+            nullable "count": INTEGER,
+        };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(col!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
@@ -3049,10 +3036,10 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::nullable("d", DataType::DATE),
-            StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
-        ]);
+        let output_schema = schema! {
+            nullable "d": DATE,
+            nullable "ts": TIMESTAMP_NTZ,
+        };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(col!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
@@ -3173,10 +3160,10 @@ mod tests {
             ],
         )
         .unwrap();
-        let schema = DataType::from(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::INTEGER, true),
-            StructField::new("b", DataType::INTEGER, true),
-        ]));
+        let schema = DataType::from(schema! {
+            nullable "a": INTEGER,
+            nullable "b": INTEGER,
+        });
         let expr = Expr::struct_with_nullability_from(
             [column_expr_ref!("a"), column_expr_ref!("b")],
             column_expr_ref!("is_valid"),
@@ -3234,11 +3221,10 @@ mod tests {
             ],
         );
 
-        let logical_type = DataType::try_struct_type([
-            StructField::nullable("my_column", DataType::LONG),
-            StructField::nullable("other_column", DataType::LONG),
-        ])
-        .unwrap();
+        let logical_type = DataType::from(schema! {
+            nullable "my_column": LONG,
+            nullable "other_column": LONG,
+        });
 
         let expr = col!("stats");
         let result = evaluate_expression(&expr, &batch, Some(&logical_type));
@@ -3258,11 +3244,10 @@ mod tests {
             ],
         );
 
-        let logical_type = DataType::try_struct_type([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-        ])
-        .unwrap();
+        let logical_type = DataType::from(schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+        });
 
         let expr = col!("stats");
         let result = evaluate_expression(&expr, &batch, Some(&logical_type));
@@ -3282,11 +3267,10 @@ mod tests {
             ],
         );
 
-        let logical_type = DataType::try_struct_type([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-        ])
-        .unwrap();
+        let logical_type = DataType::from(schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+        });
 
         let expr = col!("stats");
         let result = evaluate_expression(&expr, &batch, Some(&logical_type));
@@ -3343,17 +3327,13 @@ mod tests {
         ]);
 
         // Output schema uses logical names (differs from physical names in the batch)
-        let output_type = DataType::try_struct_type([
-            StructField::nullable("path", DataType::STRING),
-            StructField::nullable(
-                "stats_parsed",
-                DataType::struct_type_unchecked([
-                    StructField::nullable("id", DataType::LONG),
-                    StructField::nullable("value", DataType::LONG),
-                ]),
-            ),
-        ])
-        .unwrap();
+        let output_type = DataType::from(schema! {
+            nullable "path": STRING,
+            nullable "stats_parsed": {
+                nullable "id": LONG,
+                nullable "value": LONG,
+            },
+        });
 
         let result = evaluate_expression(&expr, &batch, Some(&output_type));
         assert_result_error_with_message(result, "Missing Struct fields");
@@ -3522,10 +3502,10 @@ mod tests {
     // `expected` is indexed as `expected[row][element_in_list][field_in_struct]`.
     #[rstest]
     #[case::array_of_two_field_structs(
-        StructType::try_new([
-            StructField::not_null("x", DataType::INTEGER),
-            StructField::not_null("y", DataType::INTEGER),
-        ]).unwrap(),
+        schema! {
+            not_null "x": INTEGER,
+            not_null "y": INTEGER,
+        },
         Expr::array([
             Expr::struct_from([col!("a"), col!("b")]),
             Expr::struct_from([col!("b"), col!("c")]),
@@ -3537,7 +3517,7 @@ mod tests {
         ],
     )]
     #[case::coalesce_of_arrays_of_structs(
-        StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap(),
+        schema! { not_null "x": INTEGER },
         Expr::coalesce([
             Expr::array([
                 Expr::struct_from([col!("a")]),
@@ -3587,8 +3567,7 @@ mod tests {
         // guard operates on struct-level nulls only, so this must succeed and pass the
         // inner null through to the output.
         let batch = ab_batch_with_b_nulls();
-        let inner_field_schema =
-            StructType::try_new([StructField::nullable("value", DataType::INTEGER)]).unwrap();
+        let inner_field_schema = schema! { nullable "value": INTEGER };
         let array_ty = DataType::from(crate::schema::ArrayType::new(
             inner_field_schema,
             /* contains_null = */ false,

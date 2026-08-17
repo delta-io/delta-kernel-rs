@@ -796,11 +796,9 @@ impl TryFrom<proto_schema::DataType> for DataType {
             .ok_or_else(|| Error::schema("DataType proto missing kind"))?;
         let data_type = match kind {
             DataTypeKind::Primitive(primitive) => DataType::Primitive(primitive.try_into()?),
-            DataTypeKind::Array(array) => DataType::Array(Box::new((*array).try_into()?)),
-            DataTypeKind::Struct(struct_type) => {
-                DataType::Struct(Box::new(struct_type.try_into()?))
-            }
-            DataTypeKind::Map(map) => DataType::Map(Box::new((*map).try_into()?)),
+            DataTypeKind::Array(array) => DataType::from(ArrayType::try_from(*array)?),
+            DataTypeKind::Struct(struct_type) => DataType::from(StructType::try_from(struct_type)?),
+            DataTypeKind::Map(map) => DataType::from(MapType::try_from(*map)?),
             // Kernel does not support shredded variants, so always decode as unshredded.
             DataTypeKind::Variant(_) => DataType::unshredded_variant(),
         };
@@ -998,8 +996,8 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
-        StructField, StructType, ToSchema as _,
+        schema, schema_ref, ArrayType, DataType, DecimalType, MapType, MetadataValue,
+        PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1066,7 +1064,7 @@ mod tests {
     }
 
     fn sample_schema() -> SchemaRef {
-        Arc::new(StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap())
+        schema_ref! { nullable "id": INTEGER }
     }
 
     fn decode(op: &Operation) -> proto_op::Operation {
@@ -1218,13 +1216,10 @@ mod tests {
 
     #[test]
     fn from_plan() {
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::not_null("name", DataType::STRING),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            not_null "name": STRING,
+        };
         let plan = Plan {
             nodes: vec![
                 PlanNode {
@@ -1417,20 +1412,20 @@ mod tests {
     }
 
     fn sample_dynamic_scan_input_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("filemod", DataType::LONG),
-            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
-            StructField::nullable("c", DataType::INTEGER),
-        ]))
+        schema_ref! {
+            not_null "path": STRING,
+            not_null "size": LONG,
+            not_null "filemod": LONG,
+            nullable "dv": (DeletionVectorDescriptor::to_schema()),
+            nullable "c": INTEGER,
+        }
     }
 
     fn sample_dynamic_scan_output_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("c", DataType::INTEGER),
-        ]))
+        schema_ref! {
+            nullable "id": INTEGER,
+            nullable "c": INTEGER,
+        }
     }
 
     #[rstest]
@@ -2025,12 +2020,7 @@ mod tests {
     #[rstest]
     #[case(DataType::INTEGER, "primitive")]
     #[case(ArrayType::new(DataType::INTEGER, true).into(), "array")]
-    #[case(
-        StructType::try_new(vec![StructField::nullable("a", DataType::INTEGER)])
-            .unwrap()
-            .into(),
-        "struct"
-    )]
+    #[case(DataType::from(schema! { nullable "a": INTEGER }), "struct")]
     #[case(MapType::new(DataType::STRING, DataType::INTEGER, true).into(), "map")]
     #[case(DataType::unshredded_variant(), "variant")]
     fn from_data_type(#[case] value: DataType, #[case] expected: &str) {
@@ -2119,11 +2109,10 @@ mod tests {
 
     #[test]
     fn from_struct_type() {
-        let struct_type = StructType::try_new(vec![
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::not_null("b", DataType::STRING),
-        ])
-        .unwrap();
+        let struct_type = schema! {
+            nullable "a": INTEGER,
+            not_null "b": STRING,
+        };
         let proto = proto_schema::StructType::from(&struct_type);
         assert_eq!(proto.fields.len(), 2);
         assert!(proto.fields[0].nullable);
@@ -2277,10 +2266,10 @@ mod tests {
         MapType::new(DataType::STRING, DataType::LONG, true),
         true
     )))]
-    #[case(DataType::from(StructType::try_new(vec![
-        StructField::nullable("a", DataType::INTEGER),
-        StructField::not_null("b", DataType::STRING),
-    ]).unwrap()))]
+    #[case(DataType::from(schema! {
+        nullable "a": INTEGER,
+        not_null "b": STRING,
+    }))]
     fn round_trip_composite(#[case] data_type: DataType) {
         assert_data_type_round_trips(data_type);
     }
@@ -2298,26 +2287,15 @@ mod tests {
 
     #[test]
     fn round_trip_full_schema() {
-        let schema = StructType::try_new(vec![
-            StructField::nullable("id", DataType::LONG)
-                .with_metadata([("k", MetadataValue::Number(7))]),
-            StructField::not_null("name", DataType::STRING),
-            StructField::nullable("scores", ArrayType::new(DataType::INTEGER, true)),
-            StructField::nullable(
-                "attrs",
-                MapType::new(DataType::STRING, DataType::LONG, true),
-            ),
-            StructField::nullable(
-                "price",
-                DataType::Primitive(PrimitiveType::decimal(10, 2).unwrap()),
-            ),
-            StructField::nullable(
-                "nested",
-                StructType::try_new(vec![StructField::not_null("inner", DataType::BOOLEAN)])
-                    .unwrap(),
-            ),
-        ])
-        .unwrap();
+        let schema = schema! {
+            (StructField::nullable("id", DataType::LONG)
+                .with_metadata([("k", MetadataValue::Number(7))])),
+            not_null "name": STRING,
+            nullable "scores": [ nullable INTEGER ],
+            nullable "attrs": { STRING => nullable LONG },
+            nullable "price": (PrimitiveType::decimal(10, 2).unwrap()),
+            nullable "nested": { not_null "inner": BOOLEAN },
+        };
         assert_schema_round_trips(schema);
     }
 
@@ -2325,14 +2303,11 @@ mod tests {
     /// decodes to the canonical unshredded form rather than round-tripping its inner struct.
     #[test]
     fn variant_decodes_to_unshredded() {
-        let shredded = DataType::Variant(Box::new(
-            StructType::try_new(vec![
-                StructField::not_null("metadata", DataType::BINARY),
-                StructField::not_null("value", DataType::BINARY),
-                StructField::nullable("typed_value", DataType::INTEGER),
-            ])
-            .unwrap(),
-        ));
+        let shredded = DataType::Variant(Box::new(schema! {
+            not_null "metadata": BINARY,
+            not_null "value": BINARY,
+            nullable "typed_value": INTEGER,
+        }));
         let decoded = DataType::try_from(proto_schema::DataType::from(&shredded));
         assert_eq!(
             decoded.expect("decode succeeds"),

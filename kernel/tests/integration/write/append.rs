@@ -14,7 +14,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::schema::{schema, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -195,10 +195,10 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
     // create a simple partitioned table: one int column named 'number', partitioned by string
     // column named 'partition'
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("number", DataType::INTEGER),
-        StructField::nullable("partition", DataType::STRING),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "number": INTEGER,
+        nullable "partition": STRING,
+    };
     let data_schema = schema_ref! { nullable "number": INTEGER };
 
     for (table_url, engine, store, table_name) in
@@ -476,11 +476,11 @@ async fn commit_rejects_add_with_invalid_partition_keys(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("d", DataType::INTEGER),
-        StructField::nullable("p1", DataType::STRING),
-        StructField::nullable("p2", DataType::INTEGER),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "d": INTEGER,
+        nullable "p1": STRING,
+        nullable "p2": INTEGER,
+    };
     let (_tmp_dir, table_path, engine) = test_utils::test_table_setup_mt()?;
     let mut builder = create_table(&table_path, table_schema, "test/1.0")
         .with_data_layout(DataLayout::partitioned(["p1", "p2"]));
@@ -492,10 +492,8 @@ async fn commit_rejects_add_with_invalid_partition_keys(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
-    let data_schema: Arc<ArrowSchema> = Arc::new(
-        (&StructType::try_new(vec![StructField::nullable("d", DataType::INTEGER)])?)
-            .try_into_arrow()?,
-    );
+    let data_schema = schema! { nullable "d": INTEGER };
+    let data_schema: Arc<ArrowSchema> = Arc::new((&data_schema).try_into_arrow()?);
     let make_add = |txn: &Transaction, p1: &str, p2: i32| {
         let wc = txn.partitioned_write_context(HashMap::from([
             ("p1".to_string(), Scalar::String(p1.into())),

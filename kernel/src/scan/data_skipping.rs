@@ -19,7 +19,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
-use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
@@ -150,12 +150,9 @@ impl DataSkippingFilter {
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(col!("output").distinct(lit(false))));
-        static FILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "output",
-                DataType::BOOLEAN,
-            )]))
-        });
+        static FILTER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            nullable "output": BOOLEAN,
+        };
 
         let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
@@ -330,30 +327,24 @@ impl DataSkippingFilter {
             })
             .unwrap_or_default();
 
-        let stats_field =
-            |stats: &SchemaRef| StructField::nullable("stats_parsed", stats.as_ref().clone());
-        let partition_field =
-            |ps: &SchemaRef| StructField::nullable("partitionValues_parsed", ps.as_ref().clone());
-        let is_add_field = StructField::not_null("is_add", DataType::BOOLEAN);
-
         // Always include an `is_add` boolean (extracted by the caller-provided `is_add_expr`,
         // true for Add rows and false for Remove/non-file rows) so that predicates can guard
         // against filtering Remove rows: partition predicates and opaque-predicate rewrites are
         // wrapped with `OR(NOT is_add, ...)` (see `guard_for_removes`).
         let unified_schema = match (physical_stats_schema, physical_partition_schema) {
-            (Some(stats), Some(ps)) => Arc::new(StructType::new_unchecked([
-                stats_field(stats),
-                partition_field(ps),
-                is_add_field,
-            ])),
-            (Some(stats), None) => Arc::new(StructType::new_unchecked([
-                stats_field(stats),
-                is_add_field,
-            ])),
-            (None, Some(ps)) => Arc::new(StructType::new_unchecked([
-                partition_field(ps),
-                is_add_field,
-            ])),
+            (Some(stats), Some(ps)) => schema_ref! {
+                nullable "stats_parsed": (stats.as_ref().clone()),
+                nullable "partitionValues_parsed": (ps.as_ref().clone()),
+                not_null "is_add": BOOLEAN,
+            },
+            (Some(stats), None) => schema_ref! {
+                nullable "stats_parsed": (stats.as_ref().clone()),
+                not_null "is_add": BOOLEAN,
+            },
+            (None, Some(ps)) => schema_ref! {
+                nullable "partitionValues_parsed": (ps.as_ref().clone()),
+                not_null "is_add": BOOLEAN,
+            },
             (None, None) => return None,
         };
 

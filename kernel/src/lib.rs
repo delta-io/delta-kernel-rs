@@ -195,7 +195,7 @@ pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
-use schema::{StructField, StructType};
+use schema::{schema_ref, StructField};
 pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
@@ -546,10 +546,9 @@ trait EvaluationHandlerExtension: EvaluationHandler {
     // future)
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
         // just get a single int column (arbitrary)
-        let null_row_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "null_col",
-            DataType::INTEGER,
-        )]));
+        let null_row_schema = schema_ref! {
+            nullable "null_col": INTEGER,
+        };
         let null_row = self.null_row(null_row_schema.clone())?;
 
         // Convert schema and leaf values to an expression

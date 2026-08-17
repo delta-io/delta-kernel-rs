@@ -3,12 +3,12 @@
 //! [`Transaction`]: super::Transaction
 
 // TODO(#2869): Add the remaining write-side validations:
-// - Required fields for `txn.remove_files_metadata`
 // - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
 //   `txn.dv_matched_files`
 
 mod addfile;
 mod dv;
+mod removefile;
 mod utils;
 
 use crate::engine_data::{
@@ -61,7 +61,7 @@ impl StagedDataValidator {
 
     fn validate_rows<'a>(
         &mut self,
-        rows: impl Iterator<Item = usize>,
+        rows: impl IntoIterator<Item = usize>,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<()> {
         for row in rows {

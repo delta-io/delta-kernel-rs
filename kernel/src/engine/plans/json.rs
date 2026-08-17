@@ -94,7 +94,7 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{schema_ref, SchemaRef};
     use crate::{
         DeltaResult, Engine as _, EngineData, FileDataReadResultIterator, FileMeta,
         JsonHandler as _, ParquetHandler as _,
@@ -158,8 +158,7 @@ mod tests {
     #[test]
     fn test_read_json_files() {
         let (_temp, file_meta) = temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#, r#"{"x": 3}"#]);
-        let schema =
-            Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
+        let schema = schema_ref! { not_null "x": INTEGER };
 
         let mut iter = make_handler()
             .read_json_files(&[file_meta], schema, None)
@@ -183,7 +182,7 @@ mod tests {
     }
 
     fn test_schema() -> SchemaRef {
-        Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap())
+        schema_ref! { not_null "x": INTEGER }
     }
 
     /// No files -> an absent plan -> a zero-row result (no rows, no error), for either handler.
@@ -205,8 +204,7 @@ mod tests {
         .unwrap();
         let input: Box<dyn EngineData> = Box::new(ArrowEngineData::new(input_batch));
 
-        let output_schema =
-            Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
+        let output_schema = schema_ref! { not_null "x": INTEGER };
 
         let parsed = make_handler().parse_json(input, output_schema).unwrap();
         let record_batch: RecordBatch = ArrowEngineData::try_from_engine_data(parsed)

@@ -4,7 +4,7 @@
 //! [`cdf_scan_row_schema`]. You can convert engine data to this schema using the
 //! [`cdf_scan_row_expression`].
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -15,9 +15,7 @@ use crate::actions::visitors::visit_deletion_vector_at;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{col, lit, Expression};
 use crate::scan::state::DvInfo;
-use crate::schema::{
-    ColumnName, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
-};
+use crate::schema::{lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::utils::require;
 use crate::{DeltaResult, Error, RowVisitor};
 
@@ -404,48 +402,49 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
 
 /// Get the schema that scan rows (from [`TableChanges::scan_metadata`]) will be returned with.
 pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
-    static CDF_SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
-        let deletion_vector = StructType::new_unchecked([
-            StructField::nullable("storageType", DataType::STRING),
-            StructField::nullable("pathOrInlineDv", DataType::STRING),
-            StructField::nullable("offset", DataType::INTEGER),
-            StructField::nullable("sizeInBytes", DataType::INTEGER),
-            StructField::nullable("cardinality", DataType::LONG),
-        ]);
-        let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-        let file_constant_values =
-            StructType::new_unchecked([StructField::nullable("partitionValues", partition_values)]);
-
-        let add = StructType::new_unchecked([
-            StructField::nullable("path", DataType::STRING),
-            StructField::nullable("deletionVector", deletion_vector.clone()),
-            StructField::nullable("fileConstantValues", file_constant_values.clone()),
-            StructField::nullable("size", DataType::LONG),
-            StructField::nullable("baseRowId", DataType::LONG),
-            StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-        ]);
-        let remove = StructType::new_unchecked([
-            StructField::nullable("path", DataType::STRING),
-            StructField::nullable("deletionVector", deletion_vector),
-            StructField::nullable("fileConstantValues", file_constant_values.clone()),
-            StructField::nullable("size", DataType::LONG),
-            StructField::nullable("baseRowId", DataType::LONG),
-            StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-        ]);
-        let cdc = StructType::new_unchecked([
-            StructField::nullable("path", DataType::STRING),
-            StructField::nullable("fileConstantValues", file_constant_values),
-            StructField::nullable("size", DataType::LONG),
-        ]);
-
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("add", add),
-            StructField::nullable("remove", remove),
-            StructField::nullable("cdc", cdc),
-            StructField::not_null("timestamp", DataType::LONG),
-            StructField::not_null("commit_version", DataType::LONG),
-        ]))
-    });
+    static CDF_SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "deletionVector": {
+                nullable "storageType": STRING,
+                nullable "pathOrInlineDv": STRING,
+                nullable "offset": INTEGER,
+                nullable "sizeInBytes": INTEGER,
+                nullable "cardinality": LONG,
+            },
+            nullable "fileConstantValues": {
+                nullable "partitionValues": { STRING => nullable STRING },
+            },
+            nullable "size": LONG,
+            nullable "baseRowId": LONG,
+            nullable "defaultRowCommitVersion": LONG,
+        },
+        nullable "remove": {
+            nullable "path": STRING,
+            nullable "deletionVector": {
+                nullable "storageType": STRING,
+                nullable "pathOrInlineDv": STRING,
+                nullable "offset": INTEGER,
+                nullable "sizeInBytes": INTEGER,
+                nullable "cardinality": LONG,
+            },
+            nullable "fileConstantValues": {
+                nullable "partitionValues": { STRING => nullable STRING },
+            },
+            nullable "size": LONG,
+            nullable "baseRowId": LONG,
+            nullable "defaultRowCommitVersion": LONG,
+        },
+        nullable "cdc": {
+            nullable "path": STRING,
+            nullable "fileConstantValues": {
+                nullable "partitionValues": { STRING => nullable STRING },
+            },
+            nullable "size": LONG,
+        },
+        not_null "timestamp": LONG,
+        not_null "commit_version": LONG,
+    };
     CDF_SCAN_ROW_SCHEMA.clone()
 }
 
@@ -493,7 +492,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema_ref;
     use crate::table_changes::log_replay::{
         table_changes_action_iter, table_changes_action_iter_with_mode,
     };
@@ -551,10 +550,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let table_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ]));
+        let table_schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "value": STRING,
+        };
         let table_config = row_tracking_table_config(table_root, table_schema.clone());
         let scan_metadata = table_changes_action_iter_with_mode(
             engine,
@@ -650,10 +649,10 @@ mod tests {
         let log_segment =
             LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
                 .unwrap();
-        let table_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ]));
+        let table_schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "value": STRING,
+        };
 
         // Create a TableConfiguration for testing
         let metadata = Metadata::try_new(
