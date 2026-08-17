@@ -1377,6 +1377,7 @@ version = "0.26.0"
 dependencies = [
  "datafusion",
  "delta_kernel",
+ "itertools",
  "rstest",
  "tokio",
 ]

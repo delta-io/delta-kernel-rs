@@ -18,6 +18,7 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "default-engine-base",
 ] }
 datafusion = "54"
+itertools = "0.14"
 
 [dev-dependencies]
 rstest = "0.23"

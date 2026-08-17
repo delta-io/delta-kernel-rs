@@ -13,12 +13,12 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
-use datafusion::common::{Column as DFColumn, DataFusionError};
+use datafusion::common::DataFusionError;
 use datafusion::logical_expr::{
-    lit, EmptyRelation, Expr as DFExpr, Filter as DFFilter, LogicalPlan as DFLogicalPlan,
-    LogicalPlanBuilder,
+    col as df_col, lit as df_lit, EmptyRelation, Expr as DFExpr, Filter as DFFilter,
+    LogicalPlan as DFLogicalPlan, LogicalPlanBuilder,
 };
-use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
+use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
 use delta_kernel::expressions::Scalar as KernelScalar;
 use delta_kernel::plans::ir::nodes::{
     Filter as KernelFilter, Operator as KernelOperator, Values as KernelValues,
@@ -28,33 +28,33 @@ use delta_kernel::schema::StructType;
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
 
-/// Lowers one kernel [`Operator`](KernelOperator) over its already-lowered parents.
+/// Lowers one kernel [`Operator`](KernelOperator) over its already-lowered inputs.
 ///
 /// # Errors
-/// Returns an error if the operator has the wrong number of parents, has no DataFusion lowering
+/// Returns an error if the operator has the wrong number of inputs, has no DataFusion lowering
 /// yet, or if lowering its payload fails.
 pub(crate) fn lower_operator(
     op: &KernelOperator,
-    parents: &[Arc<DFLogicalPlan>],
+    inputs: &[Arc<DFLogicalPlan>],
 ) -> Result<DFLogicalPlan, DataFusionError> {
-    let parent_count_error = |expected: usize| {
+    let input_count_error = |expected: usize| {
         DataFusionError::Plan(format!(
-            "{op} expects {expected} parent(s), but received {}",
-            parents.len()
+            "{op} expects {expected} input(s), but received {}",
+            inputs.len()
         ))
     };
     match op {
         KernelOperator::Values(values) => {
-            let [] = parents else {
-                return Err(parent_count_error(0));
+            let [] = inputs else {
+                return Err(input_count_error(0));
             };
             lower_values(values)
         }
         KernelOperator::Filter(filter) => {
-            let [parent] = parents else {
-                return Err(parent_count_error(1));
+            let [input] = inputs else {
+                return Err(input_count_error(1));
             };
-            lower_filter(filter, parent)
+            lower_filter(filter, input)
         }
         // TODO: lower the remaining operators (scans, Project/Load/Aggregate, SemiJoin, UnionAll),
         // each in its own change.
@@ -65,15 +65,15 @@ pub(crate) fn lower_operator(
 }
 
 /// Lowers a [`Filter`](KernelFilter) node into a DataFusion [`Filter`](DFFilter) logical plan over
-/// its parent.
+/// its input.
 fn lower_filter(
     filter: &KernelFilter,
-    parent: &Arc<DFLogicalPlan>,
+    input: &Arc<DFLogicalPlan>,
 ) -> Result<DFLogicalPlan, DataFusionError> {
-    let input_schema = StructType::try_from_arrow(parent.schema().as_arrow())?;
+    let input_schema: StructType = input.schema().as_arrow().try_into_kernel()?;
     let predicate = to_df_predicate_expr(&filter.predicate, &input_schema)
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
-    let filter = DFFilter::try_new(predicate, Arc::clone(parent))?;
+    let filter = DFFilter::try_new(predicate, Arc::clone(input))?;
     Ok(DFLogicalPlan::Filter(filter))
 }
 
@@ -100,9 +100,11 @@ fn lower_values(values: &KernelValues) -> Result<DFLogicalPlan, DataFusionError>
     let rows: Result<Vec<Vec<DFExpr>>, DataFusionError> =
         values.rows.iter().map(|row| lower_row(row)).collect();
     // The builder assigns column1, column2, ...; restore the names declared by the kernel schema.
-    let field_aliases = df_schema.fields().iter().enumerate().map(|(index, field)| {
-        DFExpr::Column(DFColumn::from_name(format!("column{}", index + 1))).alias(field.name())
-    });
+    let field_aliases = df_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| df_col(format!("column{}", index + 1)).alias(field.name()));
     LogicalPlanBuilder::values_with_schema(rows?, &df_schema)?
         .project(field_aliases)?
         .build()
@@ -116,7 +118,7 @@ fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
     let lower_literal = |scalar| {
         let lowered =
             to_df_scalar(scalar).map_err(|err| DataFusionError::External(Box::new(err)))?;
-        Ok(lit(lowered))
+        Ok(df_lit(lowered))
     };
     row.iter().map(lower_literal).collect()
 }
@@ -127,11 +129,11 @@ mod tests {
     use datafusion::assert_batches_eq;
     use datafusion::prelude::SessionContext;
     use delta_kernel::expressions::{
-        col, ArrayData as KernelArrayData, BinaryPredicateOp as KernelBinaryPredicateOp,
+        col, lit, ArrayData as KernelArrayData, BinaryPredicateOp as KernelBinaryPredicateOp,
         JunctionPredicateOp as KernelJunctionPredicateOp, MapData as KernelMapData,
         Predicate as KernelPredicate, StructData as KernelStructData,
     };
-    use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use delta_kernel::schema::{schema, ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
 
     use super::*;
@@ -140,11 +142,10 @@ mod tests {
 
     /// A two-field schema: `a` long, `b` string.
     fn test_schema() -> StructType {
-        StructType::try_new([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::STRING),
-        ])
-        .unwrap()
+        schema! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        }
     }
 
     fn lower_values_node(
@@ -163,8 +164,8 @@ mod tests {
             .await
     }
 
-    /// An empty parent relation with `schema`.
-    fn parent_with_schema(schema: StructType) -> Arc<DFLogicalPlan> {
+    /// An empty input relation with `schema`.
+    fn input_with_schema(schema: StructType) -> Arc<DFLogicalPlan> {
         Arc::new(lower_values_node(schema, vec![]).unwrap())
     }
 
@@ -178,20 +179,20 @@ mod tests {
     }
 
     fn schema_for_row(names: &[&str], row: &[KernelScalar]) -> StructType {
-        StructType::try_new(
-            names
-                .iter()
-                .zip(row)
-                .map(|(name, scalar)| StructField::nullable(*name, scalar.data_type())),
-        )
-        .unwrap()
+        let fields = names
+            .iter()
+            .zip(row)
+            .map(|(name, scalar)| StructField::nullable(*name, scalar.data_type()));
+        schema! { ..(fields) }
     }
 
     fn nested_scalars() -> Vec<KernelScalar> {
-        let struct_fields = vec![
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::STRING),
-        ];
+        let struct_fields = schema! {
+            not_null "a": INTEGER,
+            nullable "b": STRING,
+        }
+        .into_fields()
+        .collect();
         let struct_scalar = KernelScalar::Struct(
             KernelStructData::try_new(
                 struct_fields,
@@ -345,13 +346,13 @@ mod tests {
     }
 
     #[test]
-    fn values_reject_a_parent() {
-        let parent = parent_with_schema(test_schema());
+    fn values_reject_an_input() {
+        let input = input_with_schema(test_schema());
         let op = KernelOperator::Values(KernelValues::new(test_schema(), vec![]));
-        let err = lower_operator(&op, std::slice::from_ref(&parent)).unwrap_err();
+        let err = lower_operator(&op, std::slice::from_ref(&input)).unwrap_err();
         assert!(
             err.to_string()
-                .contains("values expects 0 parent(s), but received 1"),
+                .contains("values expects 0 input(s), but received 1"),
             "{err}"
         );
     }
@@ -359,35 +360,35 @@ mod tests {
     // === Filter ===
 
     #[test]
-    fn filter_wraps_its_parent_and_inherits_schema() {
-        let parent = parent_with_schema(test_schema());
+    fn filter_wraps_its_input_and_inherits_schema() {
+        let input = input_with_schema(test_schema());
         let filter = KernelFilter {
             predicate: KernelPredicate::is_null(col!("a")).into(),
         };
         let lowered = lower_operator(
             &KernelOperator::Filter(filter),
-            std::slice::from_ref(&parent),
+            std::slice::from_ref(&input),
         )
         .unwrap();
 
         let DFLogicalPlan::Filter(filter) = &lowered else {
             panic!("expected Filter, got {lowered:?}");
         };
-        assert!(Arc::ptr_eq(&filter.input, &parent));
-        assert_eq!(lowered.schema(), parent.schema());
+        assert!(Arc::ptr_eq(&filter.input, &input));
+        assert_eq!(lowered.schema(), input.schema());
     }
 
     async fn execute_filter(
         rows: Vec<Vec<KernelScalar>>,
         predicate: KernelPredicate,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let parent = Arc::new(lower_values_node(test_schema(), rows)?);
+        let input = Arc::new(lower_values_node(test_schema(), rows)?);
         let filter = KernelFilter {
             predicate: predicate.into(),
         };
         execute(lower_operator(
             &KernelOperator::Filter(filter),
-            std::slice::from_ref(&parent),
+            std::slice::from_ref(&input),
         )?)
         .await
     }
@@ -400,15 +401,35 @@ mod tests {
         ]
     }
 
-    fn assert_comparison_rows(expected_rows: &[(i64, &str)], batches: &[RecordBatch]) {
-        const BORDER: &str = "+---+---+";
-        const HEADER: &str = "| a | b |";
-        let mut expected = vec![BORDER.to_owned(), HEADER.to_owned(), BORDER.to_owned()];
-        expected.extend(expected_rows.iter().map(|(a, b)| format!("| {a} | {b} |")));
-        expected.push(BORDER.to_owned());
-        let expected = expected.iter().map(String::as_str).collect::<Vec<_>>();
-        assert_batches_eq!(&expected, batches);
-    }
+    const X_ROW: &[&str] = &[
+        "+---+---+",
+        "| a | b |",
+        "+---+---+",
+        "| 1 | x |",
+        "+---+---+",
+    ];
+    const Y_ROW: &[&str] = &[
+        "+---+---+",
+        "| a | b |",
+        "+---+---+",
+        "| 5 | y |",
+        "+---+---+",
+    ];
+    const Z_ROW: &[&str] = &[
+        "+---+---+",
+        "| a | b |",
+        "+---+---+",
+        "| 9 | z |",
+        "+---+---+",
+    ];
+    const X_AND_Z_ROWS: &[&str] = &[
+        "+---+---+",
+        "| a | b |",
+        "+---+---+",
+        "| 1 | x |",
+        "| 9 | z |",
+        "+---+---+",
+    ];
 
     #[tokio::test]
     async fn filter_executes_is_null_predicate() {
@@ -435,57 +456,64 @@ mod tests {
     }
 
     #[rstest]
-    #[case::equal(KernelBinaryPredicateOp::Equal, &[(5, "y")])]
-    #[case::less_than(KernelBinaryPredicateOp::LessThan, &[(1, "x")])]
-    #[case::greater_than(KernelBinaryPredicateOp::GreaterThan, &[(9, "z")])]
-    #[case::distinct(KernelBinaryPredicateOp::Distinct, &[(1, "x"), (9, "z")])]
+    #[case::equal(KernelBinaryPredicateOp::Equal, Y_ROW)]
+    #[case::less_than(KernelBinaryPredicateOp::LessThan, X_ROW)]
+    #[case::greater_than(KernelBinaryPredicateOp::GreaterThan, Z_ROW)]
+    #[case::distinct(KernelBinaryPredicateOp::Distinct, X_AND_Z_ROWS)]
     #[tokio::test]
     async fn filter_executes_binary_predicate(
         #[case] op: KernelBinaryPredicateOp,
-        #[case] expected: &[(i64, &str)],
+        #[case] expected: &[&str],
     ) {
-        let predicate = KernelPredicate::binary(op, col!("a"), KernelScalar::Long(5));
+        let predicate = KernelPredicate::binary(op, col!("a"), lit(5i64));
         let batches = execute_filter(comparison_rows(), predicate).await.unwrap();
-        assert_comparison_rows(expected, &batches);
+        assert_batches_eq!(expected, &batches);
     }
 
     #[rstest]
-    #[case::and(KernelJunctionPredicateOp::And, &[(5, "y")])]
-    #[case::or(KernelJunctionPredicateOp::Or, &[(1, "x"), (9, "z")])]
+    #[case::and(KernelJunctionPredicateOp::And, Y_ROW)]
+    #[case::or(KernelJunctionPredicateOp::Or, X_AND_Z_ROWS)]
     #[tokio::test]
     async fn filter_executes_junction_predicate(
         #[case] op: KernelJunctionPredicateOp,
-        #[case] expected: &[(i64, &str)],
+        #[case] expected: &[&str],
     ) {
         let predicates = match op {
             KernelJunctionPredicateOp::And => [
-                KernelPredicate::gt(col!("a"), KernelScalar::Long(1)),
-                KernelPredicate::lt(col!("a"), KernelScalar::Long(9)),
+                KernelPredicate::gt(col!("a"), lit(1i64)),
+                KernelPredicate::lt(col!("a"), lit(9i64)),
             ],
             KernelJunctionPredicateOp::Or => [
-                KernelPredicate::lt(col!("a"), KernelScalar::Long(5)),
-                KernelPredicate::gt(col!("a"), KernelScalar::Long(5)),
+                KernelPredicate::lt(col!("a"), lit(5i64)),
+                KernelPredicate::gt(col!("a"), lit(5i64)),
             ],
         };
         let predicate = KernelPredicate::junction(op, predicates);
         let batches = execute_filter(comparison_rows(), predicate).await.unwrap();
-        assert_comparison_rows(expected, &batches);
+        assert_batches_eq!(expected, &batches);
+    }
+
+    #[tokio::test]
+    async fn filter_where_null_removes_all_rows() {
+        let batches = execute_filter(comparison_rows(), KernelPredicate::null_literal())
+            .await
+            .unwrap();
+        assert!(batches.is_empty());
     }
 
     #[rstest]
     #[case::missing(0)]
     #[case::extra(2)]
-    fn filter_rejects_wrong_parent_count(#[case] actual: usize) {
-        let parent = parent_with_schema(test_schema());
-        let parents = vec![parent; actual];
+    fn filter_rejects_wrong_input_count(#[case] actual: usize) {
+        let input = input_with_schema(test_schema());
+        let inputs = vec![input; actual];
         let op = KernelOperator::Filter(KernelFilter {
             predicate: KernelPredicate::is_null(col!("a")).into(),
         });
-        let err = lower_operator(&op, &parents).unwrap_err();
+        let err = lower_operator(&op, &inputs).unwrap_err();
         assert!(
-            err.to_string().contains(&format!(
-                "filter expects 1 parent(s), but received {actual}"
-            )),
+            err.to_string()
+                .contains(&format!("filter expects 1 input(s), but received {actual}")),
             "{err}"
         );
     }

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::LogicalPlan as DFLogicalPlan;
 use delta_kernel::plans::ir::plan::Plan as KernelPlan;
+use itertools::Itertools;
 
 use crate::operator::lower_operator;
 
@@ -30,24 +31,23 @@ pub(crate) fn to_df_plan(plan: &KernelPlan) -> Result<DFLogicalPlan, DataFusionE
     for (node_index, node) in plan.nodes.iter().enumerate() {
         let op = &node.op;
         let available = lowered.len();
-        let invalid_parent = |parent_index| {
+        let invalid_input = |input_index| {
             DataFusionError::Plan(format!(
-                "node {node_index} ({op}) references parent {parent_index}, but only {available} \
+                "node {node_index} ({op}) references input {input_index}, but only {available} \
                  prior node(s) are available"
             ))
         };
-        let parents: Result<Vec<_>, DataFusionError> = node
+        let inputs: Vec<_> = node
             .inputs
             .iter()
-            .map(|&parent_index| {
-                let Some(parent) = lowered.get(parent_index) else {
-                    return Err(invalid_parent(parent_index));
+            .map(|&input_index| {
+                let Some(input) = lowered.get(input_index) else {
+                    return Err(invalid_input(input_index));
                 };
-                Ok(Arc::clone(parent))
+                Ok(Arc::clone(input))
             })
-            .collect();
-        let parents = parents?;
-        lowered.push(Arc::new(lower_operator(op, &parents)?));
+            .try_collect()?;
+        lowered.push(Arc::new(lower_operator(op, &inputs)?));
     }
 
     // The terminal node is the last one: no other node consumes it, and its rows are the plan's
@@ -66,9 +66,10 @@ mod tests {
     use datafusion::assert_batches_eq;
     use datafusion::prelude::SessionContext;
     use delta_kernel::expressions::{col, Predicate as KernelPredicate, Scalar as KernelScalar};
-    use delta_kernel::plans::ir::nodes::{Filter as KernelFilter, Values as KernelValues};
+    use delta_kernel::plans::ir::nodes::Values as KernelValues;
     use delta_kernel::plans::ir::plan::PlanNode as KernelPlanNode;
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::schema::{schema, DataType, StructType};
+    use delta_kernel::PlanBuilder;
     use rstest::rstest;
 
     use super::*;
@@ -77,7 +78,7 @@ mod tests {
 
     /// A single-field `long` schema named `a`.
     fn test_schema() -> StructType {
-        StructType::try_new([StructField::nullable("a", DataType::LONG)]).unwrap()
+        schema! { nullable "a": LONG }
     }
 
     /// A `Values` node over [`test_schema`] holding `rows` one-column rows.
@@ -121,31 +122,29 @@ mod tests {
     #[case::self_reference(0)]
     #[case::forward_reference(1)]
     #[case::far_out_of_range(42)]
-    fn invalid_parent_reference_is_rejected(#[case] parent_index: usize) {
-        let node =
-            KernelPlanNode::new(KernelValues::new(test_schema(), vec![]), vec![parent_index]);
+    fn invalid_input_reference_is_rejected(#[case] input_index: usize) {
+        let node = KernelPlanNode::new(KernelValues::new(test_schema(), vec![]), vec![input_index]);
         let err = to_df_plan(&KernelPlan { nodes: vec![node] }).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("node 0 (values)"), "{message}");
         assert!(
-            message.contains(&format!("references parent {parent_index}")),
+            message.contains(&format!("references input {input_index}")),
             "{message}"
         );
         assert!(message.contains("0 prior node(s)"), "{message}");
     }
 
     #[tokio::test]
-    async fn filter_uses_its_declared_parent_index() {
-        let filter = KernelFilter {
-            predicate: KernelPredicate::is_null(col!("a")).into(),
-        };
-        let plan = KernelPlan {
-            nodes: vec![
-                values_node(vec![vec![KernelScalar::null(DataType::LONG)]]),
-                values_node(vec![vec![2i64.into()]]),
-                KernelPlanNode::new(filter, vec![0]),
-            ],
-        };
+    async fn filter_plan_executes() {
+        let plan = PlanBuilder::values(
+            Arc::new(test_schema()),
+            vec![vec![KernelScalar::null(DataType::LONG)], vec![2i64.into()]],
+        )
+        .unwrap()
+        .filter(KernelPredicate::is_null(col!("a")))
+        .unwrap()
+        .build()
+        .unwrap();
         let batches = execute(&plan).await.unwrap();
         assert_batches_eq!(&["+---+", "| a |", "+---+", "|   |", "+---+"], &batches);
     }
