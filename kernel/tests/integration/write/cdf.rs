@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::Int32Array;
+use delta_kernel::arrow::array::{Int32Array, Int64Array, StringArray, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -18,11 +18,11 @@ use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExe
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, create_add_files_metadata, create_table,
-    engine_store_setup, load_and_begin_transaction,
+    engine_store_setup, into_record_batch, load_and_begin_transaction,
 };
 use url::Url;
 
-use crate::common::write_utils::{get_scan_files, get_simple_int_schema};
+use crate::common::write_utils::{get_scan_files, get_simple_int_schema, resolve_struct_field};
 
 // Helper function to create a table with CDF enabled
 async fn create_cdf_table(
@@ -212,12 +212,11 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     let (data, selection_vector) = scan_metadata.scan_files.into_parts();
     txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
-    // This should fail with our new error message
     assert_result_error_with_message(
         txn.commit(engine.as_ref()),
         "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
          This would require writing CDC files for DML operations, which is not yet supported. \
-         Consider using separate transactions: one to add files, another to remove files."
+         Only use separate transactions when doing so preserves the required atomicity and CDF semantics: one to add files and another to remove files or update deletion vectors.",
     );
 
     Ok(())
@@ -245,7 +244,7 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     Some("Cannot add and remove data in the same transaction")
 )]
 #[tokio::test]
-async fn test_add_and_dv_update_respects_cdf_and_data_change(
+async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
     #[case] cdf_enabled: bool,
     #[case] data_change: bool,
     #[case] expected_error: Option<&str>,
@@ -291,7 +290,7 @@ async fn test_add_and_dv_update_respects_cdf_and_data_change(
             "new.parquet",
             100,   /* size */
             2_000, /* modification_time */
-            Some(3),
+            Some(1),
         )],
     )?;
     txn.add_files(new_file);
@@ -314,12 +313,31 @@ async fn test_add_and_dv_update_respects_cdf_and_data_change(
         assert_eq!(snapshot.version(), 1);
     } else {
         let snapshot = commit_result?.unwrap_post_commit_snapshot();
-        let active_files = get_scan_files(snapshot.clone(), &engine)?
-            .into_iter()
-            .map(|files| files.apply_selection_vector().map(|data| data.len()))
-            .sum::<Result<usize, _>>()?;
+        let mut active_files = 0;
+        let mut existing_dv = None;
+        for files in get_scan_files(snapshot.clone(), &engine)? {
+            let batch = into_record_batch(files.apply_selection_vector()?);
+            active_files += batch.num_rows();
+
+            let batch = StructArray::from(batch);
+            let paths: &StringArray = resolve_struct_field(&batch, &["path".into()]);
+            if let Some(row) = paths
+                .iter()
+                .position(|path| path == Some("existing.parquet"))
+            {
+                let dv_paths: &StringArray = resolve_struct_field(
+                    &batch,
+                    &["deletionVector".into(), "pathOrInlineDv".into()],
+                );
+                let cardinalities: &Int64Array =
+                    resolve_struct_field(&batch, &["deletionVector".into(), "cardinality".into()]);
+                existing_dv = Some((dv_paths.value(row).to_string(), cardinalities.value(row)));
+            }
+        }
+
         assert_eq!(snapshot.version(), 2);
         assert_eq!(active_files, 2);
+        assert_eq!(existing_dv, Some(("memory:///dv.bin".to_string(), 1)));
     }
 
     Ok(())

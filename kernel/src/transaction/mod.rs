@@ -400,15 +400,13 @@ impl<S> Transaction<S> {
         {
             let cdf_enabled = self
                 .effective_table_config
-                .table_properties()
-                .enable_change_data_feed
-                .unwrap_or(false);
+                .is_feature_enabled(&TableFeature::ChangeDataFeed);
             require!(
                 !cdf_enabled,
                 Error::generic(
                     "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
                      This would require writing CDC files for DML operations, which is not yet supported. \
-                     Consider using separate transactions: one to add files, another to remove files."
+                     Only use separate transactions when doing so preserves the required atomicity and CDF semantics: one to add files and another to remove files or update deletion vectors."
                 )
             );
         }
