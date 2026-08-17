@@ -238,9 +238,23 @@ impl CommitMetadata {
         self.protocol_metadata.new_protocol.is_some()
     }
 
+    /// The new protocol in this commit, when the commit has one.
+    ///
+    /// A commit with no protocol change returns `None`.
+    pub fn new_protocol(&self) -> Option<&Protocol> {
+        self.protocol_metadata.new_protocol.as_ref()
+    }
+
     /// Returns `true` if this commit changes the table's metadata.
     pub fn has_metadata_change(&self) -> bool {
         self.protocol_metadata.new_metadata.is_some()
+    }
+
+    /// The new table metadata in this commit, when the commit has one.
+    ///
+    /// A commit with no metadata change returns `None`.
+    pub fn new_metadata(&self) -> Option<&Metadata> {
+        self.protocol_metadata.new_metadata.as_ref()
     }
 
     /// Returns `true` if this commit includes a domain metadata change for the given domain name.

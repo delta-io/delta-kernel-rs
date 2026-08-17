@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::committer::Committer;
 use delta_kernel::DeltaResult;
 use delta_kernel_default_engine::executor::tokio::{
@@ -20,7 +21,7 @@ use unity_catalog_delta_client_api::{
 
 use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult as _};
 use crate::transaction::MutableCommitter;
-use crate::{ExclusiveRustString, NullableCvoid};
+use crate::{ExclusiveRustString, NullableCvoid, SharedMetadata, SharedProtocol};
 
 /// Data representing a commit.
 #[repr(C)]
@@ -39,10 +40,10 @@ pub struct CommitRequest {
     pub table_id: KernelStringSlice,
     pub commit_info: OptionalValue<Commit>,
     pub latest_backfilled_version: OptionalValue<i64>,
-    /// json serialized version of the metadata
-    pub metadata: OptionalValue<KernelStringSlice>,
-    /// json serialized version of the protocol
-    pub protocol: OptionalValue<KernelStringSlice>,
+    /// New table metadata. The callback owns this handle and must free it with `free_metadata`.
+    pub metadata: OptionalValue<Handle<SharedMetadata>>,
+    /// New table protocol. The callback owns this handle and must free it with `free_protocol`.
+    pub protocol: OptionalValue<Handle<SharedProtocol>>,
 }
 
 /// The callback that will be called when the client wants to commit. Return `None` on success, or
@@ -85,6 +86,28 @@ impl UpdateTableClient for FfiUCCommitClient {
 
         let latest_backfilled_version = request.latest_backfilled_version();
         let add_commit = request.staged_commit().cloned();
+        let metadata = request
+            .metadata()
+            .cloned()
+            .map(serde_json::from_value::<Metadata>)
+            .transpose()
+            .map_err(|e| {
+                unity_catalog_delta_client_api::Error::Generic(format!(
+                    "failed to decode metadata update for FFI UC commit client: {e}"
+                ))
+            })?
+            .map(|metadata| Arc::new(metadata).into());
+        let protocol = request
+            .protocol()
+            .cloned()
+            .map(serde_json::from_value::<Protocol>)
+            .transpose()
+            .map_err(|e| {
+                unity_catalog_delta_client_api::Error::Generic(format!(
+                    "failed to decode protocol update for FFI UC commit client: {e}"
+                ))
+            })?
+            .map(|protocol| Arc::new(protocol).into());
 
         // there is a subtle issue here where we need to ensure that the string we use to refer to
         // the commit_info.file_name stays in scope until _after_ the callback returns, so that the
@@ -97,8 +120,8 @@ impl UpdateTableClient for FfiUCCommitClient {
                 table_id: kernel_string_slice!(table_id),
                 commit_info,
                 latest_backfilled_version: latest_backfilled_version.into(),
-                metadata: None.into(),
-                protocol: None.into(),
+                metadata: metadata.into(),
+                protocol: protocol.into(),
             };
 
             match (self.commit_callback)(self.context, c_commit_request) {
@@ -279,12 +302,35 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::ffi_test_utils::{allocate_err, ok_or_panic};
-    use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
+    use crate::{
+        allocate_kernel_string, free_metadata, free_protocol, kernel_string_slice, visit_metadata,
+        visit_protocol, OptionalValue,
+    };
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(crate) struct ProtocolVisitState {
+        min_reader: i32,
+        min_writer: i32,
+        reader_features: Vec<String>,
+        writer_features: Vec<String>,
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(crate) struct MetadataVisitState {
+        id: Option<String>,
+        name: Option<String>,
+        description: Option<String>,
+        format_provider: Option<String>,
+        has_created_time: bool,
+        created_time_ms: i64,
+    }
 
     pub(crate) struct TestContext {
         pub(crate) commit_called: bool,
         pub(crate) last_commit_table_id: Option<String>,
         pub(crate) last_staged_filename: Option<String>,
+        pub(crate) last_metadata: Option<MetadataVisitState>,
+        pub(crate) last_protocol: Option<ProtocolVisitState>,
         pub(crate) should_fail_commit: bool,
     }
 
@@ -293,6 +339,8 @@ pub(crate) mod tests {
             commit_called: false,
             last_commit_table_id: None,
             last_staged_filename: None,
+            last_metadata: None,
+            last_protocol: None,
             should_fail_commit,
         });
         NonNull::new(Box::into_raw(context) as *mut c_void)
@@ -307,6 +355,75 @@ pub(crate) mod tests {
     // get the context without taking ownership
     pub(crate) fn cast_test_context<'a>(context: NullableCvoid) -> Option<&'a mut TestContext> {
         context.map(|ptr| unsafe { &mut *(ptr.as_ptr() as *mut TestContext) })
+    }
+
+    extern "C" fn protocol_version_cb(context: NullableCvoid, min_reader: i32, min_writer: i32) {
+        let state = unsafe { &mut *(context.unwrap().as_ptr() as *mut ProtocolVisitState) };
+        state.min_reader = min_reader;
+        state.min_writer = min_writer;
+    }
+
+    extern "C" fn protocol_feature_cb(
+        context: NullableCvoid,
+        is_reader: bool,
+        feature: KernelStringSlice,
+    ) {
+        let state = unsafe { &mut *(context.unwrap().as_ptr() as *mut ProtocolVisitState) };
+        let feature = unsafe { crate::TryFromStringSlice::try_from_slice(&feature).unwrap() };
+        if is_reader {
+            state.reader_features.push(feature);
+        } else {
+            state.writer_features.push(feature);
+        }
+    }
+
+    extern "C" fn metadata_visit_cb(
+        context: NullableCvoid,
+        id: KernelStringSlice,
+        name: OptionalValue<KernelStringSlice>,
+        description: OptionalValue<KernelStringSlice>,
+        format_provider: KernelStringSlice,
+        has_created_time: bool,
+        created_time_ms: i64,
+    ) {
+        let state = unsafe { &mut *(context.unwrap().as_ptr() as *mut MetadataVisitState) };
+        let string_from_slice =
+            |slice| unsafe { crate::TryFromStringSlice::try_from_slice(&slice).unwrap() };
+        state.id = Some(string_from_slice(id));
+        state.name = match name {
+            OptionalValue::Some(name) => Some(string_from_slice(name)),
+            OptionalValue::None => None,
+        };
+        state.description = match description {
+            OptionalValue::Some(description) => Some(string_from_slice(description)),
+            OptionalValue::None => None,
+        };
+        state.format_provider = Some(string_from_slice(format_provider));
+        state.has_created_time = has_created_time;
+        state.created_time_ms = created_time_ms;
+    }
+
+    fn collect_protocol(protocol: Handle<SharedProtocol>) -> ProtocolVisitState {
+        let mut state = ProtocolVisitState::default();
+        let context = NonNull::new(&mut state as *mut ProtocolVisitState as *mut c_void);
+        unsafe {
+            visit_protocol(
+                protocol.shallow_copy(),
+                context,
+                protocol_version_cb,
+                protocol_feature_cb,
+            )
+        };
+        unsafe { free_protocol(protocol) };
+        state
+    }
+
+    fn collect_metadata(metadata: Handle<SharedMetadata>) -> MetadataVisitState {
+        let mut state = MetadataVisitState::default();
+        let context = NonNull::new(&mut state as *mut MetadataVisitState as *mut c_void);
+        unsafe { visit_metadata(metadata.shallow_copy(), context, metadata_visit_cb) };
+        unsafe { free_metadata(metadata) };
+        state
     }
 
     #[no_mangle]
@@ -325,6 +442,12 @@ pub(crate) mod tests {
                 crate::TryFromStringSlice::try_from_slice(&commit_info.file_name).unwrap()
             };
             context.last_staged_filename = Some(file_name);
+        }
+        if let OptionalValue::Some(protocol) = request.protocol {
+            context.last_protocol = Some(collect_protocol(protocol));
+        }
+        if let OptionalValue::Some(metadata) = request.metadata {
+            context.last_metadata = Some(collect_metadata(metadata));
         }
         context.last_commit_table_id = Some(table_id.clone());
         if context.should_fail_commit {
@@ -361,15 +484,35 @@ pub(crate) mod tests {
             vec![ApiRequirement::AssertTableUuid {
                 uuid: "test_table_id".to_string(),
             }],
-            vec![ApiUpdate::AddCommit {
-                commit: ClientCommit {
-                    version: 10,
-                    timestamp: 2000000000,
-                    file_name: "_staged_commits/00000000000000000010.uuid.json".to_string(),
-                    file_size: 1024,
-                    file_modification_timestamp: 2000000100,
+            vec![
+                ApiUpdate::AddCommit {
+                    commit: ClientCommit {
+                        version: 10,
+                        timestamp: 2000000000,
+                        file_name: "_staged_commits/00000000000000000010.uuid.json".to_string(),
+                        file_size: 1024,
+                        file_modification_timestamp: 2000000100,
+                    },
                 },
-            }],
+                ApiUpdate::UpdateProtocol {
+                    protocol: serde_json::json!({
+                        "minReaderVersion": 3,
+                        "minWriterVersion": 7,
+                        "readerFeatures": ["catalogManaged"],
+                        "writerFeatures": ["catalogManaged", "inCommitTimestamp"],
+                    }),
+                },
+                ApiUpdate::UpdateMetadata {
+                    metadata: serde_json::json!({
+                        "id": "test-id",
+                        "format": {"provider": "parquet", "options": {}},
+                        "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                        "partitionColumns": [],
+                        "createdTime": 1234567890,
+                        "configuration": {"delta.enableInCommitTimestamps": "true"},
+                    }),
+                },
+            ],
         )
         .unwrap();
 
@@ -387,6 +530,20 @@ pub(crate) mod tests {
             context.last_staged_filename.unwrap(),
             "_staged_commits/00000000000000000010.uuid.json"
         );
+
+        let protocol = context.last_protocol.unwrap();
+        assert_eq!(protocol.min_reader, 3);
+        assert_eq!(protocol.min_writer, 7);
+        assert_eq!(protocol.reader_features, vec!["catalogManaged"]);
+        assert_eq!(
+            protocol.writer_features,
+            vec!["catalogManaged", "inCommitTimestamp"]
+        );
+
+        let metadata = context.last_metadata.unwrap();
+        assert_eq!(metadata.id.as_deref(), Some("test-id"));
+        assert_eq!(metadata.format_provider.as_deref(), Some("parquet"));
+        assert_eq!(metadata.created_time_ms, 1234567890);
 
         unsafe { free_uc_commit_client(client) };
     }

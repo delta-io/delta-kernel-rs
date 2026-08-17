@@ -1800,6 +1800,33 @@ pub unsafe extern "C" fn visit_metadata(
     );
 }
 
+/// Visit each metadata configuration (key/value pair) for the specified metadata handle by
+/// invoking the provided `visitor` callback once per entry.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid metadata handle, a valid `context` as an opaque
+/// pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata_configuration_from_metadata(
+    metadata: Handle<SharedMetadata>,
+    context: NullableCvoid,
+    visitor: extern "C" fn(
+        context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ),
+) {
+    let metadata = unsafe { metadata.as_ref() };
+    metadata.configuration().iter().for_each(|(key, value)| {
+        visitor(
+            context,
+            kernel_string_slice!(key),
+            kernel_string_slice!(value),
+        );
+    });
+}
+
 // === Snapshot-level computed property FFI ===
 
 type StringIter = dyn Iterator<Item = String> + Send;
@@ -2443,6 +2470,20 @@ mod tests {
 
         assert_eq!(collected, expected);
 
+        let metadata = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
+        let mut collected_from_metadata: HashMap<String, String> = HashMap::new();
+        let ctx = NonNull::new(&mut collected_from_metadata as *mut _ as *mut c_void);
+        unsafe {
+            visit_metadata_configuration_from_metadata(
+                metadata.shallow_copy(),
+                ctx,
+                collect_property,
+            )
+        };
+
+        assert_eq!(collected_from_metadata, expected);
+
+        unsafe { free_metadata(metadata) };
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
         Ok(())
