@@ -295,7 +295,6 @@ fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::Array;
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue as DFScalarValue;
@@ -1607,194 +1606,121 @@ mod tests {
         );
     }
 
-    /// Mixed-value input; the other cases contain only NULLs or no rows:
+    /// Exercises ungrouped aggregate NULL handling over mixed, all-NULL, and empty input.
+    ///
+    /// The mixed case gives the greatest qualifying key a NULL value, so `max_non_null_by` must
+    /// retain that NULL rather than skip it.
     ///
     /// ```text
-    /// value
-    /// ------
-    /// banana
-    /// cherry
-    /// NULL
-    /// apple
-    /// ```
-    ///
-    /// ```sql
-    /// SELECT min(value) AS min_value, max(value) AS max_value FROM input
-    /// ```
-    ///
-    /// ```text
-    /// case         | min_value | max_value
-    /// -------------+-----------+----------
-    /// mixed_values | apple     | cherry
-    /// all_null     | NULL      | NULL
-    /// no_rows      | NULL      | NULL
+    /// case         | min   | max    | sum  | count | count(*) | min_by | max_by
+    /// -------------+-------+--------+------+-------+----------+--------+-------
+    /// mixed_values | apple | cherry | 9    | 3     | 4        | apple  | NULL
+    /// all_null     | NULL  | NULL   | NULL | 0     | 2        | NULL   | NULL
+    /// no_rows      | NULL  | NULL   | NULL | 0     | 0        | NULL   | NULL
     /// ```
     #[rstest]
     #[case::mixed_values(
         vec![
-            vec!["banana".into()],
-            vec!["cherry".into()],
-            vec![KernelScalar::Null(DataType::STRING)],
-            vec!["apple".into()],
+            vec![
+                "banana".into(),
+                KernelScalar::Long(3),
+                "present".into(),
+                KernelScalar::Long(2),
+            ],
+            vec![
+                "cherry".into(),
+                KernelScalar::Null(DataType::LONG),
+                "present".into(),
+                KernelScalar::Long(3),
+            ],
+            vec![
+                KernelScalar::Null(DataType::STRING),
+                KernelScalar::Long(5),
+                "present".into(),
+                KernelScalar::Long(4),
+            ],
+            vec![
+                "apple".into(),
+                KernelScalar::Long(1),
+                "present".into(),
+                KernelScalar::Long(1),
+            ],
         ],
-        Some("apple"),
-        Some("cherry")
+        vec![
+            DFScalarValue::Utf8(Some("apple".into())),
+            DFScalarValue::Utf8(Some("cherry".into())),
+            DFScalarValue::Int64(Some(9)),
+            DFScalarValue::Int64(Some(3)),
+            DFScalarValue::Int64(Some(4)),
+            DFScalarValue::Utf8(Some("apple".into())),
+            DFScalarValue::Utf8(None),
+        ]
     )]
     #[case::all_null(
         vec![
-            vec![KernelScalar::Null(DataType::STRING)],
-            vec![KernelScalar::Null(DataType::STRING)],
+            vec![
+                KernelScalar::Null(DataType::STRING),
+                KernelScalar::Null(DataType::LONG),
+                "present".into(),
+                KernelScalar::Long(1),
+            ],
+            vec![
+                KernelScalar::Null(DataType::STRING),
+                KernelScalar::Null(DataType::LONG),
+                "present".into(),
+                KernelScalar::Long(2),
+            ],
         ],
-        None,
-        None
+        vec![
+            DFScalarValue::Utf8(None),
+            DFScalarValue::Utf8(None),
+            DFScalarValue::Int64(None),
+            DFScalarValue::Int64(Some(0)),
+            DFScalarValue::Int64(Some(2)),
+            DFScalarValue::Utf8(None),
+            DFScalarValue::Utf8(None),
+        ]
     )]
-    #[case::no_rows(vec![], None, None)]
+    #[case::no_rows(
+        vec![],
+        vec![
+            DFScalarValue::Utf8(None),
+            DFScalarValue::Utf8(None),
+            DFScalarValue::Int64(None),
+            DFScalarValue::Int64(Some(0)),
+            DFScalarValue::Int64(Some(0)),
+            DFScalarValue::Utf8(None),
+            DFScalarValue::Utf8(None),
+        ]
+    )]
     #[tokio::test]
-    async fn aggregate_executes_min_and_max_over_nullable_or_empty_values(
+    async fn aggregate_executes_ungrouped_functions(
         #[case] rows: Vec<Vec<KernelScalar>>,
-        #[case] expected_min: Option<&str>,
-        #[case] expected_max: Option<&str>,
+        #[case] expected: Vec<DFScalarValue>,
     ) {
         let input_schema = Arc::new(
-            StructType::try_new([StructField::nullable("value", DataType::STRING)]).unwrap(),
+            StructType::try_new([
+                StructField::nullable("value", DataType::STRING),
+                StructField::nullable("number", DataType::LONG),
+                StructField::nullable("sentinel", DataType::STRING),
+                StructField::nullable("key", DataType::LONG),
+            ])
+            .unwrap(),
         );
         let parent = Arc::new(lower_values_node(input_schema.as_ref().clone(), rows).unwrap());
         let aggregate = KernelAggregate::ungrouped(input_schema)
             .aggregate_as(KernelAgg::min(column_name!("value")), "min_value")
             .aggregate_as(KernelAgg::max(column_name!("value")), "max_value")
-            .build()
-            .unwrap();
-
-        let lowered = lower_operator(
-            &KernelOperator::Aggregate(aggregate),
-            std::slice::from_ref(&parent),
-        )
-        .unwrap();
-        let batches = execute(lowered).await.unwrap();
-        let expected_row = format!(
-            "| {:<9} | {:<9} |",
-            expected_min.unwrap_or_default(),
-            expected_max.unwrap_or_default()
-        );
-        assert_batches_eq!(
-            &[
-                "+-----------+-----------+",
-                "| min_value | max_value |",
-                "+-----------+-----------+",
-                expected_row.as_str(),
-                "+-----------+-----------+",
-            ],
-            &batches
-        );
-        assert_eq!(batches[0].column(0).is_null(0), expected_min.is_none());
-        assert_eq!(batches[0].column(1).is_null(0), expected_max.is_none());
-    }
-
-    /// Mixed-value input; the other cases contain only NULLs or no rows:
-    ///
-    /// ```text
-    /// value
-    /// -----
-    /// 3
-    /// NULL
-    /// 5
-    /// 1
-    /// ```
-    ///
-    /// ```sql
-    /// SELECT sum(value) AS sum_value,
-    ///        count(value) AS count_value,
-    ///        count(*) AS row_count
-    /// FROM input
-    /// ```
-    ///
-    /// ```text
-    /// case         | sum_value | count_value | row_count
-    /// -------------+-----------+-------------+----------
-    /// mixed_values | 9         | 3           | 4
-    /// all_null     | NULL      | 0           | 2
-    /// no_rows      | NULL      | 0           | 0
-    /// ```
-    #[rstest]
-    #[case::mixed_values(
-        vec![
-            vec![KernelScalar::Long(3)],
-            vec![KernelScalar::Null(DataType::LONG)],
-            vec![KernelScalar::Long(5)],
-            vec![KernelScalar::Long(1)],
-        ],
-        Some(9),
-        3,
-        4
-    )]
-    #[case::all_null(
-        vec![
-            vec![KernelScalar::Null(DataType::LONG)],
-            vec![KernelScalar::Null(DataType::LONG)],
-        ],
-        None,
-        0,
-        2
-    )]
-    #[case::no_rows(vec![], None, 0, 0)]
-    #[tokio::test]
-    async fn aggregate_executes_sum_count_and_count_star(
-        #[case] rows: Vec<Vec<KernelScalar>>,
-        #[case] expected_sum: Option<i64>,
-        #[case] expected_count: i64,
-        #[case] expected_row_count: i64,
-    ) {
-        let input_schema = Arc::new(
-            StructType::try_new([StructField::nullable("value", DataType::LONG)]).unwrap(),
-        );
-        let parent = Arc::new(lower_values_node(input_schema.as_ref().clone(), rows).unwrap());
-        let aggregate = KernelAggregate::ungrouped(input_schema)
-            .aggregate_as(KernelAgg::sum(column_name!("value")), "sum_value")
-            .aggregate_as(KernelAgg::count(column_name!("value")), "count_value")
+            .aggregate_as(KernelAgg::sum(column_name!("number")), "sum_value")
+            .aggregate_as(KernelAgg::count(column_name!("number")), "count_value")
             .aggregate_as(KernelAgg::count_star(), "row_count")
-            .build()
-            .unwrap();
-
-        let lowered = lower_operator(
-            &KernelOperator::Aggregate(aggregate),
-            std::slice::from_ref(&parent),
-        )
-        .unwrap();
-        let batches = execute(lowered).await.unwrap();
-        let expected_row = format!(
-            "| {:<9} | {expected_count:<11} | {expected_row_count:<9} |",
-            expected_sum
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-        );
-        assert_batches_eq!(
-            &[
-                "+-----------+-------------+-----------+",
-                "| sum_value | count_value | row_count |",
-                "+-----------+-------------+-----------+",
-                expected_row.as_str(),
-                "+-----------+-------------+-----------+",
-            ],
-            &batches
-        );
-        assert_eq!(batches[0].column(0).is_null(0), expected_sum.is_none());
-        assert!(!batches[0].column(1).is_null(0));
-        assert!(!batches[0].column(2).is_null(0));
-    }
-
-    #[tokio::test]
-    async fn aggregate_ungrouped_non_null_by_emits_nulls_for_empty_input() {
-        let input_schema = Arc::new(aggregate_input_schema());
-        let parent =
-            Arc::new(lower_values_node(input_schema.as_ref().clone(), Vec::new()).unwrap());
-        let aggregate = KernelAggregate::ungrouped(input_schema)
             .aggregate_as(
                 KernelAgg::min_non_null_by(
                     column_name!("value"),
                     column_name!("sentinel"),
                     column_name!("key"),
                 ),
-                "min_value",
+                "min_by_value",
             )
             .aggregate_as(
                 KernelAgg::max_non_null_by(
@@ -1802,7 +1728,7 @@ mod tests {
                     column_name!("sentinel"),
                     column_name!("key"),
                 ),
-                "max_value",
+                "max_by_value",
             )
             .build()
             .unwrap();
@@ -1812,19 +1738,27 @@ mod tests {
             std::slice::from_ref(&parent),
         )
         .unwrap();
-        let batches = execute(lowered).await.unwrap();
-        assert_batches_eq!(
-            &[
-                "+-----------+-----------+",
-                "| min_value | max_value |",
-                "+-----------+-----------+",
-                "|           |           |",
-                "+-----------+-----------+",
-            ],
-            &batches
+        assert_eq!(
+            output_names(&lowered),
+            vec![
+                "min_value",
+                "max_value",
+                "sum_value",
+                "count_value",
+                "row_count",
+                "min_by_value",
+                "max_by_value",
+            ]
         );
-        assert!(batches[0].column(0).is_null(0));
-        assert!(batches[0].column(1).is_null(0));
+        let batches = execute(lowered).await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        let actual = batches[0]
+            .columns()
+            .iter()
+            .map(|column| DFScalarValue::try_from_array(column.as_ref(), 0).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     /// Input:
