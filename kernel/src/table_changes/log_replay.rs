@@ -20,7 +20,7 @@ use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
-use crate::table_changes::CdfMode;
+use crate::table_changes::{ensure_partition_columns_unchanged, CdfMode};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
@@ -139,8 +139,8 @@ pub(crate) fn table_changes_action_iter_with_mode(
 ///     - Ensure that partition columns remain unchanged in both modes.
 ///     - Read the in-commit timestamp from `CommitInfo` when that feature is enabled.
 ///
-/// Note: We check the protocol, mode-specific table feature, and schema compatibility in phase 1
-/// in order to detect errors and fail early.
+/// Protocol and metadata compatibility checks run in phase 1 so errors are reported before scan
+/// file generation.
 ///
 /// Note: The reader feature [`ReaderFeatures::DeletionVectors`] controls whether the table is
 /// allowed to contain deletion vectors. [`TableProperties`].enable_deletion_vectors only
@@ -248,7 +248,7 @@ impl LogReplayScanner {
                         commit_file.version
                     )
                 );
-                mode.validate_partition_columns(
+                ensure_partition_columns_unchanged(
                     metadata.partition_columns(),
                     read_partition_columns,
                     commit_file.version,

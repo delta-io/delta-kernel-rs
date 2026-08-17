@@ -161,10 +161,10 @@ impl TableChangesScan {
             .ascending_commit_files
             .clone();
         // NOTE: This is a cheap arc clone
-        let physical_predicate = match self.state_info.physical_predicate.clone() {
-            PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
-            PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
-            PhysicalPredicate::None => None,
+        let (skip_all, physical_predicate) = match self.state_info.physical_predicate.clone() {
+            PhysicalPredicate::StaticSkipAll => (true, None),
+            PhysicalPredicate::Some(predicate, schema) => (false, Some((predicate, schema))),
+            PhysicalPredicate::None => (false, None),
         };
         let schema = self.table_changes.end_snapshot.schema();
         let it = table_changes_action_iter(
@@ -174,7 +174,7 @@ impl TableChangesScan {
             schema,
             physical_predicate,
         )?;
-        Ok(Some(it).into_iter().flatten())
+        Ok(it.filter(move |item| !skip_all || item.is_err()))
     }
 
     /// Get a shared reference to the logical [`Schema`] of the table changes scan.
