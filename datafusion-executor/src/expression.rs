@@ -213,22 +213,37 @@ pub(crate) fn struct_null_when_not(guard: DFExpr, body: DFExpr) -> DFExpr {
 }
 
 /// A struct expression's named values and optional row-level null guard.
-pub(crate) type StructColumns = (Vec<(String, DFExpr)>, Option<DFExpr>);
+pub(crate) struct StructColumns {
+    pairs: Vec<(String, DFExpr)>,
+    null_guard: Option<DFExpr>,
+}
 
-/// Packs a struct's `(name, value)` columns into one `named_struct` value, nulling the whole struct
-/// where `null_guard` is not true.
-fn pack_struct_value((pairs, null_guard): StructColumns) -> DFExpr {
-    // `named_struct` takes one flat arg list of alternating names and values:
-    // `[name1, value1, name2, value2, ...]`, hence two args per field.
-    let mut args = Vec::with_capacity(pairs.len() * 2);
-    for (name, value) in pairs {
-        args.push(lit(name));
-        args.push(value);
+impl StructColumns {
+    /// Packs the columns into one `named_struct` value, preserving the struct's null mask.
+    fn pack(self) -> DFExpr {
+        // `named_struct` takes one flat arg list of alternating names and values:
+        // `[name1, value1, name2, value2, ...]`, hence two args per field.
+        let mut args = Vec::with_capacity(self.pairs.len() * 2);
+        for (name, value) in self.pairs {
+            args.push(lit(name));
+            args.push(value);
+        }
+        let body = named_struct(args);
+        match self.null_guard {
+            Some(guard) => struct_null_when_not(guard, body),
+            None => body,
+        }
     }
-    let body = named_struct(args);
-    match null_guard {
-        Some(guard) => struct_null_when_not(guard, body),
-        None => body,
+
+    /// Returns flat output columns with the struct's null mask applied to each value.
+    pub(crate) fn into_guarded_columns(self) -> Vec<(String, DFExpr)> {
+        let Some(guard) = self.null_guard else {
+            return self.pairs;
+        };
+        self.pairs
+            .into_iter()
+            .map(|(name, value)| (name, struct_null_when_not(guard.clone(), value)))
+            .collect()
     }
 }
 
@@ -243,7 +258,7 @@ fn struct_to_df_expr(
 ) -> DeltaResult<DFExpr> {
     let target = require_struct_output(output_type, "Struct")?;
     let columns = struct_columns_from_fields(fields, nullability, input_schema, target)?;
-    Ok(pack_struct_value(columns))
+    Ok(columns.pack())
 }
 
 /// Builds the `(name, value)` columns of a struct constructor, taking field names and per-child
@@ -266,11 +281,10 @@ fn struct_columns_from_fields(
         let value = to_df_expr(child, input_schema, Some(field.data_type()))?;
         pairs.push((field.name().to_string(), value));
     }
-    let null_guard = match nullability {
-        Some(pred) => Some(to_df_expr(pred, input_schema, None)?),
-        None => None,
-    };
-    Ok((pairs, null_guard))
+    let null_guard = nullability
+        .map(|pred| to_df_expr(pred, input_schema, None))
+        .transpose()?;
+    Ok(StructColumns { pairs, null_guard })
 }
 
 /// Lowers a struct patch (a sparse edit of an input struct) to a `named_struct(..)` value. See
@@ -282,7 +296,7 @@ fn struct_patch_to_df_expr(
 ) -> DeltaResult<DFExpr> {
     let target = require_struct_output(output_type, "StructPatch")?;
     let columns = struct_columns_from_patch(patch, input_schema, target)?;
-    Ok(pack_struct_value(columns))
+    Ok(columns.pack())
 }
 
 /// Builds the `(name, value)` columns of a struct patch. Output field names come positionally from
@@ -315,34 +329,10 @@ fn struct_columns_from_patch(
     let mut output_fields = target.fields();
     let mut pairs: Vec<(String, DFExpr)> = Vec::with_capacity(target.num_fields());
 
-    let append_converted = |pairs: &mut Vec<(String, DFExpr)>,
-                            output_fields: &mut dyn Iterator<Item = &StructField>,
-                            expr: &KernelExpression|
-     -> DeltaResult<()> {
-        let field = output_fields.next().ok_or_else(|| {
-            Error::generic("StructPatch produced more fields than the output schema has")
-        })?;
-        let value = to_df_expr(expr, input_schema, Some(field.data_type()))?;
-        pairs.push((field.name().to_string(), value));
-        Ok(())
-    };
-    let append_existing = |pairs: &mut Vec<(String, DFExpr)>,
-                           output_fields: &mut dyn Iterator<Item = &StructField>,
-                           name: &str|
-     -> DeltaResult<()> {
-        let field = output_fields.next().ok_or_else(|| {
-            Error::generic("StructPatch produced more fields than the output schema has")
-        })?;
-        let value = match &source_expr {
-            Some(base) => get_field(base.clone(), name.to_string()),
-            None => DFExpr::Column(DFColumn::new_unqualified(name)),
-        };
-        pairs.push((field.name().to_string(), value));
-        Ok(())
-    };
-
     for expr in &patch.prepended_fields {
-        append_converted(&mut pairs, &mut output_fields, expr)?;
+        append_struct_patch_field(&mut pairs, &mut output_fields, |field| {
+            to_df_expr(expr, input_schema, Some(field.data_type()))
+        })?;
     }
 
     // Should only count required field patches (excluding optional) for missing input fields
@@ -353,14 +343,21 @@ fn struct_columns_from_patch(
         let field_patch = patch.field_patches.get(name);
 
         if field_patch.is_none_or(|fp| fp.keep_input) {
-            append_existing(&mut pairs, &mut output_fields, name)?;
+            append_struct_patch_field(&mut pairs, &mut output_fields, |_| {
+                Ok(match &source_expr {
+                    Some(base) => get_field(base.clone(), name.to_string()),
+                    None => DFExpr::Column(DFColumn::new_unqualified(name)),
+                })
+            })?;
         }
 
         let Some(field_patch) = field_patch else {
             continue;
         };
         for expr in &field_patch.insertions {
-            append_converted(&mut pairs, &mut output_fields, expr)?;
+            append_struct_patch_field(&mut pairs, &mut output_fields, |field| {
+                to_df_expr(expr, input_schema, Some(field.data_type()))
+            })?;
         }
         if !field_patch.optional {
             used_required_field_patches += 1;
@@ -379,7 +376,9 @@ fn struct_columns_from_patch(
     }
 
     for expr in &patch.appended_fields {
-        append_converted(&mut pairs, &mut output_fields, expr)?;
+        append_struct_patch_field(&mut pairs, &mut output_fields, |field| {
+            to_df_expr(expr, input_schema, Some(field.data_type()))
+        })?;
     }
 
     if output_fields.next().is_some() {
@@ -388,7 +387,20 @@ fn struct_columns_from_patch(
         ));
     }
 
-    Ok((pairs, null_guard))
+    Ok(StructColumns { pairs, null_guard })
+}
+
+fn append_struct_patch_field<'a>(
+    pairs: &mut Vec<(String, DFExpr)>,
+    output_fields: &mut impl Iterator<Item = &'a StructField>,
+    value: impl FnOnce(&StructField) -> DeltaResult<DFExpr>,
+) -> DeltaResult<()> {
+    let field = output_fields.next().ok_or_else(|| {
+        Error::generic("StructPatch produced more fields than the output schema has")
+    })?;
+    let value = value(field)?;
+    pairs.push((field.name().to_string(), value));
+    Ok(())
 }
 
 /// Lowers a `MapToStruct` (reshape a `Map<String, String>` into a struct by parsing each value into
