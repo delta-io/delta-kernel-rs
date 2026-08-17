@@ -126,8 +126,8 @@ fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::assert_batches_eq;
     use datafusion::prelude::SessionContext;
+    use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
     use delta_kernel::expressions::{
         col, lit, ArrayData as KernelArrayData, BinaryPredicateOp as KernelBinaryPredicateOp,
         JunctionPredicateOp as KernelJunctionPredicateOp, MapData as KernelMapData,
@@ -332,29 +332,31 @@ mod tests {
     }
 
     #[rstest]
-    #[case::too_few(vec![vec![1i64.into()]], "got 1 values in row 0 but expected 2")]
+    #[case::too_few(
+        vec![vec![1i64.into()]],
+        0,
+        "got 1 values in row 0 but expected 2"
+    )]
     #[case::too_many(
         vec![vec![1i64.into(), "x".into(), true.into()]],
+        0,
         "got 3 values in row 0 but expected 2"
     )]
-    fn values_reject_rows_with_the_wrong_width(
+    #[case::unexpected_input(
+        vec![],
+        1,
+        "values expects 0 input(s), but received 1"
+    )]
+    fn values_reject_wrong_row_width_or_input_count(
         #[case] rows: Vec<Vec<KernelScalar>>,
+        #[case] input_count: usize,
         #[case] expected: &str,
     ) {
-        let err = lower_values_node(test_schema(), rows).unwrap_err();
-        assert!(err.to_string().contains(expected), "{err}");
-    }
-
-    #[test]
-    fn values_reject_an_input() {
         let input = input_with_schema(test_schema());
-        let op = KernelOperator::Values(KernelValues::new(test_schema(), vec![]));
-        let err = lower_operator(&op, std::slice::from_ref(&input)).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("values expects 0 input(s), but received 1"),
-            "{err}"
-        );
+        let inputs = vec![input; input_count];
+        let op = KernelOperator::Values(KernelValues::new(test_schema(), rows));
+        let err = lower_operator(&op, &inputs).unwrap_err();
+        assert!(err.to_string().contains(expected), "{err}");
     }
 
     // === Filter ===
@@ -395,12 +397,21 @@ mod tests {
 
     fn comparison_rows() -> Vec<Vec<KernelScalar>> {
         vec![
+            vec![KernelScalar::null(DataType::LONG), "n".into()],
             vec![1i64.into(), "x".into()],
             vec![5i64.into(), "y".into()],
             vec![9i64.into(), "z".into()],
         ]
     }
 
+    const NO_ROWS: &[&str] = &[];
+    const NULL_ROW: &[&str] = &[
+        "+---+---+",
+        "| a | b |",
+        "+---+---+",
+        "|   | n |",
+        "+---+---+",
+    ];
     const X_ROW: &[&str] = &[
         "+---+---+",
         "| a | b |",
@@ -430,75 +441,66 @@ mod tests {
         "| 9 | z |",
         "+---+---+",
     ];
-
-    #[tokio::test]
-    async fn filter_executes_is_null_predicate() {
-        let batches = execute_filter(
-            vec![
-                vec![KernelScalar::null(DataType::LONG), "kept".into()],
-                vec![1i64.into(), "removed".into()],
-            ],
-            KernelPredicate::is_null(col!("a")),
-        )
-        .await
-        .unwrap();
-
-        assert_batches_eq!(
-            &[
-                "+---+------+",
-                "| a | b    |",
-                "+---+------+",
-                "|   | kept |",
-                "+---+------+",
-            ],
-            &batches
-        );
-    }
+    const NULL_X_AND_Z_ROWS: &[&str] = &[
+        "+---+---+",
+        "| a | b |",
+        "+---+---+",
+        "|   | n |",
+        "| 1 | x |",
+        "| 9 | z |",
+        "+---+---+",
+    ];
 
     #[rstest]
-    #[case::equal(KernelBinaryPredicateOp::Equal, Y_ROW)]
-    #[case::less_than(KernelBinaryPredicateOp::LessThan, X_ROW)]
-    #[case::greater_than(KernelBinaryPredicateOp::GreaterThan, Z_ROW)]
-    #[case::distinct(KernelBinaryPredicateOp::Distinct, X_AND_Z_ROWS)]
-    #[tokio::test]
-    async fn filter_executes_binary_predicate(
-        #[case] op: KernelBinaryPredicateOp,
-        #[case] expected: &[&str],
-    ) {
-        let predicate = KernelPredicate::binary(op, col!("a"), lit(5i64));
-        let batches = execute_filter(comparison_rows(), predicate).await.unwrap();
-        assert_batches_eq!(expected, &batches);
-    }
-
-    #[rstest]
-    #[case::and(KernelJunctionPredicateOp::And, Y_ROW)]
-    #[case::or(KernelJunctionPredicateOp::Or, X_AND_Z_ROWS)]
-    #[tokio::test]
-    async fn filter_executes_junction_predicate(
-        #[case] op: KernelJunctionPredicateOp,
-        #[case] expected: &[&str],
-    ) {
-        let predicates = match op {
-            KernelJunctionPredicateOp::And => [
+    #[case::is_null(KernelPredicate::is_null(col!("a")), NULL_ROW)]
+    #[case::equal(
+        KernelPredicate::binary(KernelBinaryPredicateOp::Equal, col!("a"), lit(5i64)),
+        Y_ROW
+    )]
+    #[case::less_than(
+        KernelPredicate::binary(KernelBinaryPredicateOp::LessThan, col!("a"), lit(5i64)),
+        X_ROW
+    )]
+    #[case::greater_than(
+        KernelPredicate::binary(KernelBinaryPredicateOp::GreaterThan, col!("a"), lit(5i64)),
+        Z_ROW
+    )]
+    #[case::distinct(
+        KernelPredicate::binary(KernelBinaryPredicateOp::Distinct, col!("a"), lit(5i64)),
+        NULL_X_AND_Z_ROWS
+    )]
+    #[case::and(
+        KernelPredicate::junction(
+            KernelJunctionPredicateOp::And,
+            [
                 KernelPredicate::gt(col!("a"), lit(1i64)),
                 KernelPredicate::lt(col!("a"), lit(9i64)),
             ],
-            KernelJunctionPredicateOp::Or => [
+        ),
+        Y_ROW
+    )]
+    #[case::or(
+        KernelPredicate::junction(
+            KernelJunctionPredicateOp::Or,
+            [
                 KernelPredicate::lt(col!("a"), lit(5i64)),
                 KernelPredicate::gt(col!("a"), lit(5i64)),
             ],
-        };
-        let predicate = KernelPredicate::junction(op, predicates);
-        let batches = execute_filter(comparison_rows(), predicate).await.unwrap();
-        assert_batches_eq!(expected, &batches);
-    }
-
+        ),
+        X_AND_Z_ROWS
+    )]
+    #[case::where_null(KernelPredicate::NULL, NO_ROWS)]
     #[tokio::test]
-    async fn filter_where_null_removes_all_rows() {
-        let batches = execute_filter(comparison_rows(), KernelPredicate::null_literal())
-            .await
-            .unwrap();
-        assert!(batches.is_empty());
+    async fn filter_executes_predicate(
+        #[case] predicate: KernelPredicate,
+        #[case] expected: &[&str],
+    ) {
+        let batches = execute_filter(comparison_rows(), predicate).await.unwrap();
+        if expected.is_empty() {
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        } else {
+            assert_batches_sorted_eq!(expected, &batches);
+        }
     }
 
     #[rstest]
