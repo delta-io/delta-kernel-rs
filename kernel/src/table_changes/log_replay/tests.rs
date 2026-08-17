@@ -28,7 +28,7 @@ use crate::table_properties::{
     ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, Action, LocalMockTable, TableConfigBuilder,
+    assert_result_error_with_message, Action, LocalMockTable, MockTableConfigurationBuilder,
 };
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
@@ -40,7 +40,7 @@ fn get_schema() -> SchemaRef {
 }
 
 fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
-    TableConfigBuilder::new()
+    MockTableConfigurationBuilder::new()
         .with_schema(get_schema())
         .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
         .with_column_mapping(ColumnMappingMode::None)
@@ -1056,7 +1056,7 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
         StructField::nullable("part", DataType::STRING),
     ]));
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-    let table_config = TableConfigBuilder::new()
+    let table_config = MockTableConfigurationBuilder::new()
         .with_schema(logical_schema.clone())
         .with_partition_columns(["part"])
         .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])

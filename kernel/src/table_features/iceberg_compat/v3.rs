@@ -142,7 +142,7 @@ mod column_default_tests {
     use crate::schema::{schema, ArrayType, DataType, MetadataValue, StructField, StructType};
     use crate::table_configuration::TableConfiguration;
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::TableConfigBuilder;
+    use crate::unit_test_utils::MockTableConfigurationBuilder;
 
     /// Builds a `TableConfiguration` carrying `schema` with `allowColumnDefaults` enabled, so
     /// the IcebergCompatV3 column-default validation can be driven directly. The config does not
@@ -150,7 +150,7 @@ mod column_default_tests {
     /// validation is invoked directly instead, and the end-to-end V3 path is covered by the
     /// integration tests.
     fn table_config_with_schema(schema: StructType) -> TableConfiguration {
-        TableConfigBuilder::new()
+        MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_features([TableFeature::AllowColumnDefaults])
             .with_table_root("file:///t/")

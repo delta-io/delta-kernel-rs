@@ -913,7 +913,7 @@ mod tests {
     use crate::schema::{schema, DataType, MetadataValue, StructField, StructType};
     use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
-        test_deep_nested_schema_missing_leaf_cm, TableConfigBuilder,
+        test_deep_nested_schema_missing_leaf_cm, MockTableConfigurationBuilder,
     };
     use crate::utils::FoldWithOption as _;
 
@@ -925,7 +925,7 @@ mod tests {
         let no_props: HashMap<String, String> = HashMap::new();
 
         let mode_of = |schema: &StructType, protocol: &Protocol, props: &HashMap<_, _>| {
-            TableConfigBuilder::new()
+            MockTableConfigurationBuilder::new()
                 .with_schema(schema.clone())
                 .with_protocol(protocol.clone())
                 .with_props(props.clone())

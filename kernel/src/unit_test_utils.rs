@@ -330,7 +330,7 @@ pub(crate) fn assert_schema_feature_validation(
     err_msg: &str,
 ) {
     let try_build = |schema: &StructType, protocol: &Protocol| {
-        TableConfigBuilder::new()
+        MockTableConfigurationBuilder::new()
             .with_schema(schema.clone())
             .with_protocol(protocol.clone())
             .try_build()
@@ -351,7 +351,7 @@ pub(crate) fn assert_schema_feature_validation(
 /// Defaults to a flat `value: INTEGER` schema, no partition columns, no table properties, and a
 /// table-features protocol (reader 3, writer 7) listing no features, rooted at `file:///` at
 /// version 0. Every axis is overridable.
-pub(crate) struct TableConfigBuilder {
+pub(crate) struct MockTableConfigurationBuilder {
     schema: Option<SchemaRef>,
     partition_columns: Vec<String>,
     props: HashMap<String, String>,
@@ -360,7 +360,7 @@ pub(crate) struct TableConfigBuilder {
     version: Version,
 }
 
-impl TableConfigBuilder {
+impl MockTableConfigurationBuilder {
     pub(crate) fn new() -> Self {
         Self {
             schema: None,

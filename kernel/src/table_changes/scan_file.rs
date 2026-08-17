@@ -501,7 +501,7 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, Action, LocalMockTable, TableConfigBuilder,
+        assert_result_error_with_message, Action, LocalMockTable, MockTableConfigurationBuilder,
     };
     use crate::Engine as _;
 
@@ -656,7 +656,7 @@ mod tests {
             nullable "value": STRING,
         };
 
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_schema(table_schema.clone())
             .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
             .with_column_mapping(ColumnMappingMode::None)

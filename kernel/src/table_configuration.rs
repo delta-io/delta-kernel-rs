@@ -955,13 +955,13 @@ mod test {
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
         test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
-        test_schema_with_map_and_column_mapping, TableConfigBuilder,
+        test_schema_with_map_and_column_mapping, MockTableConfigurationBuilder,
     };
     use crate::Error;
 
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
-        let result = TableConfigBuilder::new()
+        let result = MockTableConfigurationBuilder::new()
             .with_partition_columns(["missing"])
             .with_protocol_versions(1, 2)
             .try_build();
@@ -971,7 +971,7 @@ mod test {
 
     #[test]
     fn table_configuration_rejects_duplicate_partition_columns() {
-        let result = TableConfigBuilder::new()
+        let result = MockTableConfigurationBuilder::new()
             .with_schema(schema! {
                 nullable "value": INTEGER,
                 nullable "part": STRING,
@@ -987,7 +987,7 @@ mod test {
     fn dv_supported_not_enabled() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
             .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
             .build();
@@ -999,7 +999,7 @@ mod test {
     fn dv_enabled() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_props([
                 (ENABLE_CHANGE_DATA_FEED, "true"),
                 (ENABLE_DELETION_VECTORS, "true"),
@@ -1018,7 +1018,7 @@ mod test {
         #[case] wv: i32,
         #[case] op: Operation,
     ) {
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_protocol(Protocol::new_unchecked(
                 rv,
                 wv,
@@ -1042,7 +1042,7 @@ mod test {
         let cases = [
             (
                 // Writing to CDF-enabled table is supported for writes
-                TableConfigBuilder::new()
+                MockTableConfigurationBuilder::new()
                     .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
                     .with_features([ChangeDataFeed])
                     .build(),
@@ -1050,7 +1050,7 @@ mod test {
             ),
             (
                 // Should succeed even if AppendOnly is supported but not enabled
-                TableConfigBuilder::new()
+                MockTableConfigurationBuilder::new()
                     .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
                     .with_features([ChangeDataFeed, AppendOnly])
                     .build(),
@@ -1058,7 +1058,7 @@ mod test {
             ),
             (
                 // Should succeed since AppendOnly is enabled
-                TableConfigBuilder::new()
+                MockTableConfigurationBuilder::new()
                     .with_props([(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")])
                     .with_features([ChangeDataFeed, AppendOnly])
                     .build(),
@@ -1066,7 +1066,7 @@ mod test {
             ),
             (
                 // Writer version > 7 is not supported
-                TableConfigBuilder::new()
+                MockTableConfigurationBuilder::new()
                     .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
                     .with_protocol_versions(1, 8)
                     .build(),
@@ -1075,7 +1075,7 @@ mod test {
             // Column mapping is now supported for writes.
             (
                 // CDF + column mapping: both supported, should succeed
-                TableConfigBuilder::new()
+                MockTableConfigurationBuilder::new()
                     .with_props([(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")])
                     .with_features([ChangeDataFeed, ColumnMapping, AppendOnly])
                     .build(),
@@ -1083,7 +1083,7 @@ mod test {
             ),
             (
                 // Column mapping + AppendOnly, no CDF enabled: should succeed
-                TableConfigBuilder::new()
+                MockTableConfigurationBuilder::new()
                     .with_props([(APPEND_ONLY, "true")])
                     .with_features([ChangeDataFeed, ColumnMapping, AppendOnly])
                     .build(),
@@ -1091,7 +1091,7 @@ mod test {
             ),
             (
                 // Should succeed since change data feed is not enabled
-                TableConfigBuilder::new()
+                MockTableConfigurationBuilder::new()
                     .with_props([(APPEND_ONLY, "true")])
                     .with_features([AppendOnly])
                     .build(),
@@ -1118,7 +1118,7 @@ mod test {
     fn ict_enabled_from_table_creation() {
         use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_props([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
             .with_features([TableFeature::InCommitTimestamp])
             .build();
@@ -1139,7 +1139,7 @@ mod test {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_props([
                 (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
                 (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "5"),
@@ -1163,7 +1163,7 @@ mod test {
             ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_props([
                 (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
                 (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "5"),
@@ -1180,7 +1180,7 @@ mod test {
     }
     #[test]
     fn ict_supported_and_not_enabled() {
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::InCommitTimestamp])
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1191,7 +1191,7 @@ mod test {
     #[test]
     fn fails_on_unsupported_feature() {
         let unknown = TableFeature::unknown("unknown");
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_reader_features([&unknown])
             .with_writer_features([&unknown])
             .build();
@@ -1203,7 +1203,7 @@ mod test {
     fn dv_not_supported() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
             .with_features([
                 TableFeature::TimestampWithoutTimezone,
@@ -1218,7 +1218,7 @@ mod test {
     fn test_try_new_from() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
             .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
             .build();
@@ -1281,7 +1281,7 @@ mod test {
     fn test_timestamp_ntz_validation_integration() {
         // Schema with TIMESTAMP_NTZ column
         let ntz_config = |features: &[TableFeature]| {
-            TableConfigBuilder::new()
+            MockTableConfigurationBuilder::new()
                 .with_schema(schema! { nullable "ts": TIMESTAMP_NTZ })
                 .with_features(features)
                 .try_build()
@@ -1313,7 +1313,7 @@ mod test {
             Some([TableFeature::TimestampWithoutTimezone].as_slice())
         );
 
-        let table_config = TableConfigBuilder::new()
+        let table_config = MockTableConfigurationBuilder::new()
             .with_schema(schema! { nullable "ts": TIMESTAMP_NTZ })
             .with_protocol(protocol)
             .build();
@@ -1330,7 +1330,7 @@ mod test {
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
         let variant_config = |features: &[TableFeature]| {
-            TableConfigBuilder::new()
+            MockTableConfigurationBuilder::new()
                 .with_schema(schema! { nullable "v": (DataType::unshredded_variant()) })
                 .with_features(features)
                 .try_build()
@@ -1365,7 +1365,7 @@ mod test {
             UnknownFeatureShape::NotListed => vec![],
             _ => vec![unknown.clone()],
         };
-        let tc = TableConfigBuilder::new()
+        let tc = MockTableConfigurationBuilder::new()
             .with_reader_features(reader_features)
             .with_writer_features(writer_features)
             .build();
@@ -1423,19 +1423,19 @@ mod test {
         let feature = TableFeature::AppendOnly;
 
         // Test with legacy protocol writer v2 - should be supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_protocol_versions(1, 2)
             .build();
         assert!(config.is_feature_supported(&feature));
 
         // Test with legacy protocol writer v1 - should NOT be supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_protocol_versions(1, 1)
             .build();
         assert!(!config.is_feature_supported(&feature));
 
         // reader=2 (legacy), writer=7 (non-legacy) - feature in list, should be supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::AppendOnly])
             .with_protocol_versions(2, 7)
             .build();
@@ -1443,7 +1443,7 @@ mod test {
 
         // reader=2 (legacy), writer=7 (non-legacy) - feature NOT in list, should NOT be supported
         // Use ChangeDataFeed which is also a WriterOnly feature
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::ChangeDataFeed])
             .with_protocol_versions(2, 7)
             .build();
@@ -1451,12 +1451,12 @@ mod test {
 
         // Test with protocol reader=3, writer=7 (both non-legacy) - feature in list, should be
         // supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::AppendOnly])
             .build();
         assert!(config.is_feature_supported(&feature));
 
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::DeletionVectors])
             .build();
         assert!(!config.is_feature_supported(&feature));
@@ -1467,19 +1467,19 @@ mod test {
         let feature = TableFeature::ColumnMapping;
 
         // Test with sufficient versions (legacy mode) - should be supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_protocol_versions(2, 5)
             .build();
         assert!(config.is_feature_supported(&feature));
 
         // Test with insufficient reader version - should NOT be supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_protocol_versions(1, 5)
             .build();
         assert!(!config.is_feature_supported(&feature));
 
         // Test with insufficient writer version - should NOT be supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_protocol_versions(2, 4)
             .build();
         assert!(!config.is_feature_supported(&feature));
@@ -1488,7 +1488,7 @@ mod test {
         // ReaderWriter features CANNOT be enabled in this protocol state (protocol validation)
         // But we still need to test that the code correctly identifies them as NOT supported
         // Create a table with only WriterOnly features (e.g., AppendOnly)
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::AppendOnly])
             .with_protocol_versions(2, 7)
             .build();
@@ -1500,13 +1500,13 @@ mod test {
         assert!(!config.is_feature_supported(&feature));
 
         // Test with non-legacy mode (3,7) - feature in list, should be supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::ColumnMapping])
             .build();
         assert!(config.is_feature_supported(&feature));
 
         // Test with non-legacy mode (3,7) - feature NOT in list, should NOT be supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::DeletionVectors])
             .build();
         assert!(!config.is_feature_supported(&feature));
@@ -1518,7 +1518,7 @@ mod test {
         // ColumnMapping is a legacy ReaderWriter feature whose minimum reader version (2) is met by
         // reader version 3, so it counts as reader-supported even though it is absent from
         // readerFeatures. It is in writerFeatures, so it is writer-supported too.
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_flat_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
             .with_reader_features(TableFeature::EMPTY_LIST)
@@ -1538,7 +1538,7 @@ mod test {
 
         // The conformant shape (ColumnMapping in both lists) is still reported supported: the
         // legacy-version fallback does not perturb the normal reader_features membership path.
-        let conformant = TableConfigBuilder::new()
+        let conformant = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::ColumnMapping])
             .build();
         assert!(conformant.is_feature_supported(&TableFeature::ColumnMapping));
@@ -1547,7 +1547,7 @@ mod test {
     #[test]
     fn test_column_mapping_absent_from_both_lists_is_unsupported() {
         // ColumnMapping in neither list must not be treated as supported: the writer half fails.
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::AppendOnly])
             .build();
         assert!(!config.is_feature_supported(&TableFeature::ColumnMapping));
@@ -1560,14 +1560,14 @@ mod test {
         let feature = TableFeature::AppendOnly;
 
         // Test when property check fails - should be supported but not enabled
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_protocol_versions(1, 2)
             .build();
         assert!(config.is_feature_supported(&feature));
         assert!(!config.is_feature_enabled(&feature));
 
         // Test when property check passes - should be both supported and enabled
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_props([(APPEND_ONLY, "true")])
             .with_protocol_versions(1, 2)
             .build();
@@ -1576,7 +1576,7 @@ mod test {
 
         // Test when property is set but feature is not supported by protocol versions.
         // TODO: Reject this orphaned metadata
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_props([(APPEND_ONLY, "true")])
             .with_protocol_versions(1, 1)
             .build();
@@ -1589,14 +1589,14 @@ mod test {
         let feature = TableFeature::V2Checkpoint;
 
         // Test when supported - should be both supported and enabled
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::V2Checkpoint])
             .build();
         assert!(config.is_feature_supported(&feature));
         assert!(config.is_feature_enabled(&feature));
 
         // Test when not supported - should be neither supported nor enabled
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::DeletionVectors])
             .build();
         assert!(!config.is_feature_supported(&feature));
@@ -1605,20 +1605,20 @@ mod test {
 
     #[test]
     fn test_ensure_operation_supported_reads() {
-        let config = TableConfigBuilder::new().build();
+        let config = MockTableConfigurationBuilder::new().build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::V2Checkpoint])
             .build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_protocol_versions(1, 2)
             .build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::InCommitTimestamp])
             .with_protocol_versions(2, 7)
             .build();
@@ -1626,7 +1626,7 @@ mod test {
 
         #[cfg(feature = "geo-type-in-dev")]
         {
-            let config = TableConfigBuilder::new()
+            let config = MockTableConfigurationBuilder::new()
                 .with_features([TableFeature::GeospatialType])
                 .build();
             assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
@@ -1636,7 +1636,7 @@ mod test {
 
     #[test]
     fn test_ensure_operation_supported_writes() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([
                 TableFeature::AppendOnly,
                 TableFeature::DeletionVectors,
@@ -1648,7 +1648,7 @@ mod test {
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
         // Type Widening is not supported for writes
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::TypeWidening])
             .build();
         assert_result_error_with_message(
@@ -1658,7 +1658,7 @@ mod test {
 
         #[cfg(feature = "geo-type-in-dev")]
         {
-            let config = TableConfigBuilder::new()
+            let config = MockTableConfigurationBuilder::new()
                 .with_features([TableFeature::GeospatialType])
                 .build();
             assert_result_error_with_message(
@@ -1674,7 +1674,7 @@ mod test {
     #[case::cdf(Operation::Cdf)]
     #[case::write(Operation::Write)]
     fn test_geospatial_not_supported_without_cargo_feature(#[case] operation: Operation) {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::GeospatialType])
             .build();
         assert_result_error_with_message(
@@ -1685,7 +1685,7 @@ mod test {
 
     #[test]
     fn test_illegal_writer_feature_combination() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::RowTracking])
             .build();
         assert_result_error_with_message(
@@ -1696,7 +1696,7 @@ mod test {
 
     #[test]
     fn test_row_tracking_with_domain_metadata_requirement() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::RowTracking, TableFeature::DomainMetadata])
             .build();
         assert!(
@@ -1708,7 +1708,7 @@ mod test {
     #[test]
     fn test_catalog_managed_writes() {
         // CatalogManaged requires ICT to be supported and enabled
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_props([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
             .with_features([
                 TableFeature::CatalogManaged,
@@ -1717,7 +1717,7 @@ mod test {
             .build();
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_props([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
             .with_features([
                 TableFeature::CatalogOwnedPreview,
@@ -1741,7 +1741,7 @@ mod test {
         #[case] feature: TableFeature,
         #[case] expected_error: &str,
     ) {
-        let config = TableConfigBuilder::new().with_features([feature]).build();
+        let config = MockTableConfigurationBuilder::new().with_features([feature]).build();
         let result = config.ensure_operation_supported(Operation::Write);
         assert_result_error_with_message(result, expected_error);
     }
@@ -1791,7 +1791,7 @@ mod test {
 
     #[test]
     fn test_build_expected_stats_schemas_no_column_mapping() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(schema! {
                 nullable "col_a": LONG,
                 nullable "col_b": STRING,
@@ -1821,7 +1821,7 @@ mod test {
     fn test_build_expected_stats_schemas_with_column_mapping() {
         // With column mapping, physical schema should have physical names
         let schema = schema_with_column_mapping();
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_column_mapping(ColumnMappingMode::Name)
             .with_protocol_versions(2, 5)
@@ -1861,7 +1861,7 @@ mod test {
         use crate::schema::{ColumnMetadataKey, MetadataValue};
 
         let schema = schema_with_column_mapping();
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_column_mapping(ColumnMappingMode::Id)
             .with_protocol_versions(2, 5)
@@ -1963,7 +1963,7 @@ mod test {
 
     #[test]
     fn test_build_expected_stats_schemas_excludes_partition_columns() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
             .with_partition_columns(["part_a", "part_b"])
@@ -1996,7 +1996,7 @@ mod test {
 
     #[test]
     fn test_partition_columns_are_logical_under_column_mapping() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
             .with_partition_columns(["part_a", "part_b"])
@@ -2021,7 +2021,7 @@ mod test {
         #[case] column_mapping_mode: ColumnMappingMode,
         #[case] expected: [&str; 2],
     ) {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema_with_column_mapping())
             .with_column_mapping(column_mapping_mode)
             .with_partition_columns(["part_a", "part_b"])
@@ -2036,7 +2036,7 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_excludes_partition_columns() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
             .with_partition_columns(["part_a", "part_b"])
@@ -2054,7 +2054,7 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_excludes_partition_columns_no_column_mapping() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(schema! {
                 nullable "data_col": LONG,
                 nullable "part_a": STRING,
@@ -2070,7 +2070,7 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_all_partition_columns_returns_empty() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(schema! {
                 nullable "part_a": STRING,
                 nullable "part_b": INTEGER,
@@ -2087,7 +2087,7 @@ mod test {
     fn test_physical_stats_column_names_returns_physical_names() {
         // physical_stats_column_names should return physical column names
         let schema = schema_with_column_mapping();
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_column_mapping(ColumnMappingMode::Name)
             .with_protocol_versions(2, 5)
@@ -2105,7 +2105,7 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_with_data_skipping_stats_columns() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_nested_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
             .with_props([("delta.dataSkippingStatsColumns", "id,info.name")])
@@ -2120,7 +2120,7 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_skips_nonexistent_data_skipping_stats_column() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_nested_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
             .with_props([("delta.dataSkippingStatsColumns", "id,nonexistent")])
@@ -2218,7 +2218,7 @@ mod test {
         #[case] mode: ColumnMappingMode,
         #[case] expected_physical: Vec<ColumnName>,
     ) {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_column_mapping(mode)
             .with_protocol_versions(2, 5)
@@ -2233,7 +2233,7 @@ mod test {
     #[test]
     fn test_clustered_table_writes() {
         // ClusteredTable requires DomainMetadata to be supported
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_features([TableFeature::ClusteredTable, TableFeature::DomainMetadata])
             .build();
         assert!(
@@ -2259,7 +2259,7 @@ mod test {
         // names equal logical names.
         // IcebergCompatV3 requires column mapping. This test bypasses that requirement for
         // convenience.
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(schema! {
                 nullable "value": INTEGER,
                 nullable "pcol": STRING,
@@ -2285,7 +2285,7 @@ mod test {
         // Pins the invariant that `physical_write_schema()` strips void columns from the
         // returned schema (top level and nested), so callers receive a Parquet-writable
         // schema without needing to apply `strip_void_from_schema` themselves.
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(schema! {
                 nullable "id": INTEGER,
                 nullable "v": VOID,
@@ -2313,7 +2313,7 @@ mod test {
 
     #[test]
     fn test_iceberg_compat_v3_write_supported() {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_flat_with_column_mapping())
             .with_props([
                 (ENABLE_ICEBERG_COMPAT_V3, "true"),
@@ -2344,7 +2344,7 @@ mod test {
         let extra = property_value
             .map(|v| vec![(ENABLE_ICEBERG_COMPAT_V3, v)])
             .unwrap_or_default();
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_flat_with_column_mapping())
             .with_props(&extra)
             .with_column_mapping(ColumnMappingMode::Name)
@@ -2478,7 +2478,7 @@ mod test {
         #[case] writer_features: Vec<TableFeature>,
         #[case] expected_error_substring: Option<&str>,
     ) {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_for_column_mapping(cm_mode))
             .with_props(props)
             .with_column_mapping(cm_mode)
@@ -2560,7 +2560,7 @@ mod test {
             std::iter::once(TableFeature::AdaptiveMetadataPreview)
                 .chain(deps.iter().cloned())
                 .collect();
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_for_column_mapping(cm_mode))
             .with_props(&props)
             .with_column_mapping(cm_mode)
@@ -2658,7 +2658,7 @@ mod test {
         };
         // V3 also requires Column mapping and RowTracking enabled; enable them unconditionally so
         // V3 cases reach the mutual-exclusion check.
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_flat_with_column_mapping())
             .with_props([
                 (conflicting_enable_property, "true"),
@@ -2690,7 +2690,7 @@ mod test {
         #[case] props: &[(&str, &str)],
         #[case] expected_error_substring: Option<&str>,
     ) {
-        let config = TableConfigBuilder::new()
+        let config = MockTableConfigurationBuilder::new()
             .with_props(props)
             .with_features([TableFeature::RowTracking])
             .build();
