@@ -32,15 +32,15 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
-    CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
-    DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION,
-    DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
-    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-    ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
-    SET_TRANSACTION_RETENTION_DURATION,
+    TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
+    CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
+    COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
+    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
+    ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
+    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -124,6 +124,9 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     DELETED_FILE_RETENTION_DURATION,
     ENABLE_EXPIRED_LOG_CLEANUP,
     CHECKPOINT_INTERVAL,
+    // Checkpoint policy: stored for downstream engines. Kernel chooses the checkpoint format
+    // from the v2Checkpoint feature. Setting checkpointPolicy does not enable v2 checkpoints.
+    CHECKPOINT_POLICY,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -1119,6 +1122,7 @@ mod tests {
             ),
             (ENABLE_EXPIRED_LOG_CLEANUP.to_string(), "true".to_string()),
             (CHECKPOINT_INTERVAL.to_string(), "10".to_string()),
+            (CHECKPOINT_POLICY.to_string(), "v2".to_string()),
         ]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
         assert_eq!(
@@ -1136,6 +1140,10 @@ mod tests {
         assert_eq!(
             validated.properties.get(CHECKPOINT_INTERVAL),
             Some(&"10".to_string()),
+        );
+        assert_eq!(
+            validated.properties.get(CHECKPOINT_POLICY),
+            Some(&"v2".to_string()),
         );
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
