@@ -911,7 +911,8 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// Returns an error if Kernel does not support reading or writing the table.
+    /// Returns an error if Kernel does not support reading or writing the table, or if the
+    /// snapshot is not published.
     pub fn create_checkpoint_writer(
         self: Arc<Self>,
         engine: &dyn Engine,
