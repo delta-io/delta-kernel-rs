@@ -188,7 +188,7 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
     }))
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn maintenance_writes_reject_unsupported_table_features(
+async fn checkpoint_crc_writes_reject_unsupported_table_features(
     #[case] reader_features: &[&str],
     #[case] writer_features: &[&str],
     #[case] checkpoint_spec: Option<CheckpointSpec>,
