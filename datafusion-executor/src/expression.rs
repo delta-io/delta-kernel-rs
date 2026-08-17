@@ -117,7 +117,10 @@ pub(crate) fn to_df_struct_columns(
 /// Lowers a column reference to a nested field access, e.g. `a.b.c` becomes a single
 /// `get_field(col("a"), "b", "c")` call. The path is resolved against `input_schema` (via
 /// [`StructType::field_at`]) to fail fast, but the resolved field is otherwise unused.
-fn column_to_df_expr(name: &KernelColumnName, input_schema: &StructType) -> DeltaResult<DFExpr> {
+pub(crate) fn column_to_df_expr(
+    name: &KernelColumnName,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
     let _ = input_schema.field_at(name)?;
     let mut path = name.iter();
     let Some(root) = path.next() else {
