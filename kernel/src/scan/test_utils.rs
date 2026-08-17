@@ -23,7 +23,7 @@ fn parse_batch<S: AsRef<str>>(
     json: impl IntoIterator<Item = S>,
     output_schema: SchemaRef,
 ) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler::new(None);
+    let handler = SyncJsonHandler::new(None, None);
     let json_strings = StringArray::from_iter_values(json);
     let parsed = handler
         .parse_json(string_array_to_engine_data(json_strings), output_schema)

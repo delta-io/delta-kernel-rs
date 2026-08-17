@@ -53,22 +53,26 @@ pub(crate) struct SyncEngine {
 impl SyncEngine {
     /// Create a SyncEngine that reads from the local filesystem via [`LocalFileSystem`].
     pub(crate) fn new() -> Self {
-        Self::new_inner(None)
+        Self::new_inner(None, None)
     }
 
     /// Create a SyncEngine backed by `store`. All I/O is performed synchronously via
     /// [`futures::executor::block_on`]. See module docs for the deadlock caveat on
     /// reactor-dependent stores.
     pub(crate) fn new_with_store(store: Arc<DynObjectStore>) -> Self {
-        Self::new_inner(Some(store))
+        Self::new_inner(Some(store), None)
     }
 
-    fn new_inner(store: Option<Arc<DynObjectStore>>) -> Self {
+    pub(crate) fn new_with_batch_size(batch_size: usize) -> Self {
+        Self::new_inner(None, Some(batch_size))
+    }
+
+    fn new_inner(store: Option<Arc<DynObjectStore>>, batch_size: Option<usize>) -> Self {
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler::new(store.clone())),
             #[cfg(feature = "declarative-plans")]
             plan_executor: Arc::new(plan::SyncPlanExecutor::new(store.clone())),
-            json_handler: Arc::new(json::SyncJsonHandler::new(store.clone())),
+            json_handler: Arc::new(json::SyncJsonHandler::new(store.clone(), batch_size)),
             parquet_handler: Arc::new(parquet::SyncParquetHandler::new(store)),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
         }

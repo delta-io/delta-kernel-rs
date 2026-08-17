@@ -7,7 +7,7 @@ use super::COMPACTION_ACTIONS_SCHEMA;
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
 use crate::log_replay::LogReplayProcessor;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogLoadOptions, LogSegment};
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, SnapshotRef, Version};
@@ -110,12 +110,12 @@ impl LogCompactionWriter {
 
         // Create a log segment specifically for the compaction range
         // This ensures we only process commits in [start_version, end_version]
-        let compaction_log_segment = LogSegment::for_table_changes(
+        let compaction_log_segment = LogSegment::for_commit_range(
             engine.storage_handler().as_ref(),
             self.snapshot.log_segment().log_root.clone(),
             self.start_version,
             Some(self.end_version),
-            vec![],
+            LogLoadOptions::default(),
         )?;
 
         // Read actions from the version-filtered log segment

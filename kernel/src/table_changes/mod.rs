@@ -44,12 +44,12 @@ use scan::TableChangesScanBuilder;
 use scan_file::scan_metadata_to_scan_file;
 use url::Url;
 
-use crate::log_path::LogPath;
-use crate::log_segment::LogSegment;
+use crate::commit_range::CommitRange;
+use crate::log_segment::LogLoadOptions;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;
 use crate::schema::{DataType, Schema, StructField, StructType};
-use crate::snapshot::{Snapshot, SnapshotBuilder, SnapshotRef};
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{Operation, TableFeature};
 use crate::table_properties::{
@@ -86,51 +86,6 @@ pub(crate) enum TableChangesListingMode {
     /// post-image. Intermediate actions are omitted, but each surviving action still requires
     /// row-level reconciliation. Computing net changes buffers the full range.
     NetChanges,
-}
-
-/// Catalog metadata used while loading a table-changes range.
-#[derive(Debug, Clone, Default)]
-#[internal_api]
-pub(crate) struct TableChangesLoadOptions {
-    max_catalog_version: Option<Version>,
-    log_tail: Vec<LogPath>,
-}
-
-impl TableChangesLoadOptions {
-    /// Sets the highest table version ratified by the catalog.
-    ///
-    /// Range construction rejects this option for non-catalog-managed tables and rejects explicit
-    /// range versions above this limit.
-    #[internal_api]
-    pub(crate) fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {
-        self.max_catalog_version = Some(max_catalog_version);
-        self
-    }
-
-    /// Sets the catalog-provided log tail, including staged commits absent from the numbered log.
-    ///
-    /// Entries must form a contiguous ascending sequence. Staged commits require
-    /// [`Self::with_max_catalog_version`], and range construction validates the tail endpoint
-    /// against the requested version.
-    #[internal_api]
-    pub(crate) fn with_log_tail(mut self, log_tail: Vec<LogPath>) -> Self {
-        self.log_tail = log_tail;
-        self
-    }
-
-    fn configure_snapshot_builder(&self, mut builder: SnapshotBuilder) -> SnapshotBuilder {
-        if let Some(max_catalog_version) = self.max_catalog_version {
-            builder = builder.with_max_catalog_version(max_catalog_version);
-        }
-        if !self.log_tail.is_empty() {
-            builder = builder.with_log_tail(self.log_tail.clone());
-        }
-        builder
-    }
-
-    fn effective_end_version(&self, end_version: Option<Version>) -> Option<Version> {
-        end_version.or(self.max_catalog_version)
-    }
 }
 
 /// Identifies the table feature that must remain enabled across the change-feed range.
@@ -272,10 +227,9 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 /// - [Change Data Files](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#change-data-files).
 #[derive(Debug)]
 pub struct TableChanges {
-    pub(crate) log_segment: LogSegment,
+    commit_range: CommitRange,
     table_root: Url,
     end_snapshot: SnapshotRef,
-    start_version: Version,
     schema: Schema,
     start_table_config: TableConfiguration,
     // Both feed types share range loading and log replay. The mode is fixed at construction, and
@@ -311,7 +265,7 @@ impl TableChanges {
             start_version,
             end_version,
             CdfMode::ChangeDataFeed,
-            TableChangesLoadOptions::default(),
+            LogLoadOptions::default(),
         )
     }
 
@@ -319,8 +273,7 @@ impl TableChanges {
     ///
     /// This path requires `delta.enableRowTracking` and ignores `_change_data` files.
     /// [`TableChanges::scan_file_listing`] returns the `add` and `remove` actions whose data must
-    /// be reconciled by row ID. Catalog ratification and log-tail metadata from `load_options` are
-    /// applied while loading the range.
+    /// be reconciled by row ID.
     ///
     /// # Parameters
     ///
@@ -329,7 +282,8 @@ impl TableChanges {
     /// - `start_version`: First version in the change feed.
     /// - `end_version`: Optional inclusive end version. When omitted, the catalog maximum is used
     ///   if present; otherwise the newest version is used.
-    /// - `load_options`: Catalog ratification and log-tail metadata used to load the range.
+    /// - `load_options`: Catalog ratification and log-tail metadata used by both snapshots and the
+    ///   commit range.
     ///
     /// # Errors
     ///
@@ -344,7 +298,7 @@ impl TableChanges {
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
-        load_options: TableChangesLoadOptions,
+        load_options: LogLoadOptions,
     ) -> DeltaResult<Self> {
         Self::try_new_internal(
             table_root,
@@ -362,22 +316,19 @@ impl TableChanges {
         start_version: Version,
         end_version: Option<Version>,
         mode: CdfMode,
-        load_options: TableChangesLoadOptions,
+        load_options: LogLoadOptions,
     ) -> DeltaResult<Self> {
-        let log_root = table_root.join("_delta_log/")?;
-        let effective_end_version = load_options.effective_end_version(end_version);
-        let log_segment = LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
-            log_root,
-            start_version,
-            effective_end_version,
-            load_options.log_tail.clone(),
-        )?;
+        let commit_range_builder = CommitRange::builder_for(table_root.as_str(), start_version)
+            .with_log_load_options(load_options.clone());
+        let commit_range_builder = match end_version {
+            Some(end_version) => commit_range_builder.with_end_version(end_version),
+            None => commit_range_builder,
+        };
+        let commit_range = commit_range_builder.build(engine)?;
 
-        let start_snapshot = load_options
-            .configure_snapshot_builder(
-                Snapshot::builder_for(table_root.as_url().clone()).at_version(start_version),
-            )
+        let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
+            .at_version(start_version)
+            .with_log_load_options(load_options.clone())
             .build(engine)?;
         start_snapshot
             .table_configuration()
@@ -387,8 +338,8 @@ impl TableChanges {
             Some(version) => Snapshot::builder_from(start_snapshot.clone()).at_version(version),
             None => Snapshot::builder_from(start_snapshot.clone()),
         };
-        let end_snapshot = load_options
-            .configure_snapshot_builder(end_snapshot_builder)
+        let end_snapshot = end_snapshot_builder
+            .with_log_load_options(load_options)
             .build(engine)?;
         end_snapshot
             .table_configuration()
@@ -454,8 +405,7 @@ impl TableChanges {
         Ok(TableChanges {
             table_root,
             end_snapshot,
-            log_segment,
-            start_version,
+            commit_range,
             schema,
             start_table_config: start_snapshot.table_configuration().clone(),
             mode,
@@ -464,12 +414,12 @@ impl TableChanges {
 
     /// The start version of the `TableChanges`.
     pub fn start_version(&self) -> Version {
-        self.start_version
+        self.commit_range.start_version()
     }
     /// The end version (inclusive) of the [`TableChanges`]. If no `end_version` was specified in
     /// [`TableChanges::try_new`], this returns the newest version as of the call to `try_new`.
     pub fn end_version(&self) -> Version {
-        self.log_segment.end_version
+        self.commit_range.end_version()
     }
     /// The logical schema of the change data feed. For details on the shape of the schema, see
     /// [`TableChanges`].
@@ -583,7 +533,7 @@ impl TableChanges {
             ));
         }
 
-        let commits = self.log_segment.listed.ascending_commit_files.clone();
+        let commits = self.commit_range.commit_files().to_vec();
         let schema = self.end_snapshot.schema();
         let scan_metadata = table_changes_action_iter_with_mode(
             engine,
@@ -634,7 +584,7 @@ mod tests {
         assert_result_error_with_message, test_schema_flat_with_column_mapping, Action,
         LocalMockTable,
     };
-    use crate::{Engine, Error, FileMeta};
+    use crate::{Engine, Error, FileMeta, LogPath};
 
     fn listing_test_schema() -> Arc<StructType> {
         Arc::new(StructType::new_unchecked([
@@ -719,7 +669,7 @@ mod tests {
                 end_version.into(),
             )
             .unwrap();
-            assert_eq!(table_changes.start_version, start_version);
+            assert_eq!(table_changes.start_version(), start_version);
             assert_eq!(table_changes.end_version(), end_version);
         }
 
@@ -814,7 +764,7 @@ mod tests {
                 engine.as_ref(),
                 0,
                 Some(0),
-                TableChangesLoadOptions::default(),
+                LogLoadOptions::default(),
             ),
             missing_property,
         );
@@ -832,7 +782,7 @@ mod tests {
             engine.as_ref(),
             0,
             Some(1),
-            TableChangesLoadOptions::default(),
+            LogLoadOptions::default(),
         );
         assert!(
             matches!(&res, Err(Error::RowTrackingChangeFeedUnsupported(_))),
@@ -886,7 +836,7 @@ mod tests {
             engine.as_ref(),
             1,
             Some(2),
-            TableChangesLoadOptions::default(),
+            LogLoadOptions::default(),
         );
         assert!(
             matches!(&res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
@@ -932,7 +882,7 @@ mod tests {
                 engine.as_ref(),
                 0,
                 Some(1),
-                TableChangesLoadOptions::default(),
+                LogLoadOptions::default(),
             )
             .unwrap(),
         );
@@ -981,7 +931,7 @@ mod tests {
             };
             log_tail.push(LogPath::try_new(file_meta).unwrap());
         }
-        let options = TableChangesLoadOptions::default()
+        let options = LogLoadOptions::default()
             .with_max_catalog_version(2)
             .with_log_tail(log_tail);
 
@@ -1008,12 +958,57 @@ mod tests {
         assert_eq!(paths, HashSet::from(["path_0", "path_1", "path_2"]));
     }
 
+    #[tokio::test]
+    async fn catalog_managed_row_tracking_listing_rejects_metadata_that_disables_ict() {
+        let store = Arc::new(InMemory::new());
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store.clone()));
+        let table_root = Url::parse("memory:///").unwrap();
+        write_catalog_managed_row_tracking_base(store.as_ref(), &table_root).await;
+
+        for (version, ict_enabled) in [(1, false), (2, true)] {
+            let mut properties = row_tracking_properties();
+            properties.insert(
+                ENABLE_IN_COMMIT_TIMESTAMPS.to_string(),
+                ict_enabled.to_string(),
+            );
+            let metadata =
+                Metadata::try_new(None, None, listing_test_schema(), vec![], 0, properties)
+                    .unwrap();
+            add_commit(
+                &table_root,
+                store.as_ref(),
+                version,
+                serialize_actions([commit_info_action(version), Action::Metadata(metadata)]),
+            )
+            .await
+            .unwrap();
+        }
+
+        let table_changes = TableChanges::try_new_row_tracking_cdf_listing(
+            table_root,
+            engine.as_ref(),
+            0,
+            Some(2),
+            LogLoadOptions::default().with_max_catalog_version(2),
+        )
+        .unwrap();
+        let result = Arc::new(table_changes)
+            .scan_file_listing(engine, TableChangesListingMode::AllChanges)
+            .map(|_| ());
+        assert_result_error_with_message(
+            result,
+            "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled",
+        );
+    }
+
     #[rstest::rstest]
-    #[case::catalog_latest(None, Some(2), &["path_0", "path_1", "path_2"])]
-    #[case::explicit_end(Some(1), Some(1), &["path_0", "path_1"])]
-    #[case::explicit_end_above_catalog_maximum(Some(3), None, &[])]
+    #[case::catalog_latest(0, None, Some(2), &["path_0", "path_1", "path_2"])]
+    #[case::explicit_end(0, Some(1), Some(1), &["path_0", "path_1"])]
+    #[case::end_above_catalog_maximum(0, Some(3), None, &[])]
+    #[case::start_above_catalog_maximum(3, Some(3), None, &[])]
     #[tokio::test]
     async fn catalog_managed_row_tracking_listing_respects_version_bounds(
+        #[case] start_version: Version,
         #[case] end_version: Option<Version>,
         #[case] expected_end_version: Option<Version>,
         #[case] expected_paths: &[&str],
@@ -1022,7 +1017,7 @@ mod tests {
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store.clone()));
         let table_root = Url::parse("memory:///").unwrap();
         write_catalog_managed_row_tracking_base(store.as_ref(), &table_root).await;
-        for version in 1..=3 {
+        for version in 1..=2 {
             let body = serialize_actions([
                 commit_info_action(version),
                 row_tracking_add_action(&format!("path_{version}"), version),
@@ -1031,12 +1026,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let options = TableChangesLoadOptions::default().with_max_catalog_version(2);
+        let options = LogLoadOptions::default().with_max_catalog_version(2);
 
         let table_changes = TableChanges::try_new_row_tracking_cdf_listing(
             table_root,
             engine.as_ref(),
-            0,
+            start_version,
             end_version,
             options,
         );
@@ -1103,7 +1098,7 @@ mod tests {
                 engine.as_ref(),
                 0,
                 Some(0),
-                TableChangesLoadOptions::default(),
+                LogLoadOptions::default(),
             )
             .unwrap(),
         );
@@ -1221,7 +1216,7 @@ mod tests {
                 engine.as_ref(),
                 1,
                 Some(end_version),
-                TableChangesLoadOptions::default(),
+                LogLoadOptions::default(),
             )
             .unwrap(),
         );
@@ -1285,7 +1280,7 @@ mod tests {
             engine.as_ref(),
             0,
             Some(0),
-            TableChangesLoadOptions::default(),
+            LogLoadOptions::default(),
         )
         .unwrap();
         let res = table_changes.into_scan_builder().build();
@@ -1317,7 +1312,7 @@ mod tests {
                 engine.as_ref(),
                 0,
                 Some(0),
-                TableChangesLoadOptions::default(),
+                LogLoadOptions::default(),
             )
             .unwrap(),
         );

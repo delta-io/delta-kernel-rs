@@ -49,6 +49,148 @@ mod crc_tests;
 #[cfg(test)]
 mod tests;
 
+/// Catalog-aware inputs shared by snapshot and commit-range log loading.
+///
+/// A supplied log tail must be a contiguous ascending suffix ending at the caller-visible latest
+/// version. It replaces numbered commits from its first version onward. Staged commits require a
+/// maximum catalog-ratified version.
+#[derive(Debug, Clone, Default)]
+#[internal_api]
+pub(crate) struct LogLoadOptions {
+    max_catalog_version: Option<Version>,
+    log_tail: Vec<LogPath>,
+}
+
+impl LogLoadOptions {
+    pub(crate) fn new(max_catalog_version: Option<Version>, log_tail: Vec<LogPath>) -> Self {
+        Self {
+            max_catalog_version,
+            log_tail,
+        }
+    }
+
+    /// Sets the highest table version ratified by the catalog.
+    ///
+    /// Explicit range or snapshot versions must not exceed this limit.
+    #[internal_api]
+    pub(crate) fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {
+        self.max_catalog_version = Some(max_catalog_version);
+        self
+    }
+
+    /// Sets the catalog-provided log tail, including staged commits absent from the numbered log.
+    ///
+    /// Entries must be contiguous ascending commits ending at the caller-visible latest version.
+    /// With a catalog maximum, an unbounded load requires the tail to end exactly there; an
+    /// explicitly bounded load requires the tail to reach the requested version. Staged commits
+    /// require [`Self::with_max_catalog_version`].
+    #[internal_api]
+    pub(crate) fn with_log_tail(mut self, log_tail: Vec<LogPath>) -> Self {
+        self.log_tail = log_tail;
+        self
+    }
+
+    pub(crate) fn max_catalog_version(&self) -> Option<Version> {
+        self.max_catalog_version
+    }
+
+    pub(crate) fn log_tail(&self) -> &[LogPath] {
+        &self.log_tail
+    }
+
+    pub(crate) fn validate(&self, target_version: Option<Version>) -> DeltaResult<()> {
+        let log_tail: Vec<ParsedLogPath> = self.log_tail.iter().cloned().map(Into::into).collect();
+
+        for pair in log_tail.windows(2) {
+            require!(
+                pair[0]
+                    .version
+                    .checked_add(1)
+                    .is_some_and(|next| next == pair[1].version),
+                Error::LogTailVersionsNotContiguous {
+                    first_version: pair[0].version,
+                    second_version: pair[1].version,
+                }
+            );
+        }
+
+        let has_staged_commits = log_tail
+            .iter()
+            .any(|path| path.file_type == LogPathFileType::StagedCommit);
+        require!(
+            !has_staged_commits || self.max_catalog_version.is_some(),
+            Error::MaxCatalogVersion(
+                "Max catalog version is required when providing staged commits in the log tail. \
+                 Use with_max_catalog_version()."
+                    .to_string()
+            )
+        );
+
+        if let Some(target_version) = target_version {
+            self.validate_version(target_version)?;
+            if let Some(last) = log_tail.last() {
+                require!(
+                    last.version >= target_version,
+                    self.log_tail_ends_before_target_error(last.version, target_version)
+                );
+            }
+        } else if let (Some(max_catalog_version), Some(last)) =
+            (self.max_catalog_version, log_tail.last())
+        {
+            require!(
+                last.version == max_catalog_version,
+                Error::MaxCatalogVersion(format!(
+                    "Log tail version {} does not match max catalog version \
+                     {max_catalog_version}",
+                    last.version
+                ))
+            );
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn resolve_end_version(
+        &self,
+        start_version: Version,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Option<Version>> {
+        self.validate_version(start_version)?;
+        self.validate(end_version)?;
+        Ok(end_version.or(self.max_catalog_version))
+    }
+
+    fn validate_version(&self, version: Version) -> DeltaResult<()> {
+        if let Some(max_catalog_version) = self.max_catalog_version {
+            require!(
+                version <= max_catalog_version,
+                Error::MaxCatalogVersion(format!(
+                    "Requested version {version} exceeds max catalog version \
+                     {max_catalog_version}"
+                ))
+            );
+        }
+        Ok(())
+    }
+
+    fn log_tail_ends_before_target_error(
+        &self,
+        log_tail_version: Version,
+        target_version: Version,
+    ) -> Error {
+        match self.max_catalog_version {
+            Some(max_catalog_version) => Error::MaxCatalogVersion(format!(
+                "Log tail version {log_tail_version} is less than requested version \
+                 {target_version} for max catalog version {max_catalog_version}"
+            )),
+            None => Error::generic(format!(
+                "Log tail version {log_tail_version} is less than requested version \
+                 {target_version}"
+            )),
+        }
+    }
+}
+
 /// Information about checkpoint reading for data skipping optimization.
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.
@@ -105,8 +247,8 @@ pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<Actio
 ///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
 ///        version. Multi-part checkpoints must have all their parts.
 ///
-/// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`], and
-/// in `TableChanges` when built with [`LogSegment::for_table_changes`].
+/// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`] and by
+/// commit-range consumers through [`LogSegment::for_commit_range`].
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,24 +550,21 @@ impl LogSegment {
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
     }
 
-    /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
-    /// versions `start_version` and `end_version`: Its LogSegment is made of zero checkpoints
-    /// and all commits between versions `start_version` (inclusive) and `end_version`
-    /// (inclusive). If no `end_version` is specified it will be the most recent version by
-    /// default.
+    /// Constructs a checkpoint-free [`LogSegment`] over an inclusive commit range.
     ///
-    /// `log_tail` must contain a contiguous ascending sequence of commit paths. It takes
-    /// precedence over numbered commits at overlapping versions, and entries outside the selected
-    /// range are ignored.
+    /// `load_options.log_tail` must be a contiguous ascending suffix ending at the caller-visible
+    /// latest version. It replaces numbered commits from its first version onward; commits outside
+    /// the selected range are then excluded from the returned segment. When no explicit end is
+    /// supplied, the catalog maximum is used when present, otherwise the latest visible version.
     #[internal_api]
-    pub(crate) fn for_table_changes(
+    pub(crate) fn for_commit_range(
         storage: &dyn StorageHandler,
         log_root: Url,
         start_version: Version,
         end_version: impl Into<Option<Version>>,
-        log_tail: Vec<LogPath>,
+        load_options: LogLoadOptions,
     ) -> DeltaResult<Self> {
-        let end_version = end_version.into();
+        let end_version = load_options.resolve_end_version(start_version, end_version.into())?;
         if let Some(end_version) = end_version {
             if start_version > end_version {
                 return Err(Error::generic(
@@ -438,7 +577,7 @@ impl LogSegment {
         let listed_files = LogSegmentFiles::list_commits(
             storage,
             &log_root,
-            log_tail.into_iter().map(Into::into).collect(),
+            load_options.log_tail.into_iter().map(Into::into).collect(),
             Some(start_version),
             end_version,
         )?;

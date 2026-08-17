@@ -12,7 +12,7 @@ use super::{
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogLoadOptions, LogSegment};
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
@@ -156,12 +156,12 @@ fn get_segment(
 ) -> DeltaResult<Vec<ParsedLogPath>> {
     let table_root = url::Url::from_directory_path(path).unwrap();
     let log_root = table_root.join("_delta_log/")?;
-    let log_segment = LogSegment::for_table_changes(
+    let log_segment = LogSegment::for_commit_range(
         engine.storage_handler().as_ref(),
         log_root,
         start_version,
         end_version,
-        vec![],
+        LogLoadOptions::default(),
     )?;
     Ok(log_segment.listed.ascending_commit_files)
 }
@@ -218,6 +218,48 @@ async fn metadata_protocol() {
     let sv = result_to_sv(scan_batches);
     assert_eq!(sv, &[false, false]);
 }
+
+#[tokio::test]
+async fn metadata_and_protocol_in_separate_batches_are_applied_atomically() {
+    let engine = Arc::new(SyncEngine::new_with_batch_size(1));
+    let mut mock_table = LocalMockTable::new();
+    let end_schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+        StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
+    ]));
+    mock_table
+        .commit([
+            metadata_with_cdf(end_schema.clone()),
+            Action::Protocol(
+                Protocol::try_new_modern(
+                    [TableFeature::TimestampWithoutTimezone],
+                    [
+                        TableFeature::TimestampWithoutTimezone,
+                        TableFeature::ChangeDataFeed,
+                    ],
+                )
+                .unwrap(),
+            ),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+    let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root);
+    let result: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, end_schema, None)
+            .unwrap()
+            .try_collect();
+
+    assert!(
+        result.is_ok(),
+        "metadata and protocol must be applied as one commit"
+    );
+}
+
 #[tokio::test]
 async fn cdf_not_enabled() {
     let engine = Arc::new(SyncEngine::new());

@@ -5,10 +5,9 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use crate::log_path::LogPath;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogLoadOptions, LogSegment};
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{LogSegmentLoadType, MetricId, SnapshotLoadMetricContext};
-use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
@@ -172,6 +171,12 @@ impl SnapshotBuilder {
         self
     }
 
+    pub(crate) fn with_log_load_options(mut self, load_options: LogLoadOptions) -> Self {
+        self.max_catalog_version = load_options.max_catalog_version();
+        self.log_tail = load_options.log_tail().to_vec();
+        self
+    }
+
     /// Bound how many commits kernel will replay to advance a stale CRC to the target version.
     /// See [`IncrementalReplay`]. Defaults to [`IncrementalReplay::Disabled`].
     ///
@@ -252,10 +257,14 @@ impl SnapshotBuilder {
             load_type,
         };
 
-        let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
-
-        // Pre-build validations for catalog-managed tables
-        Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
+        let load_options = LogLoadOptions::new(max_catalog_version, log_tail);
+        load_options.validate(version)?;
+        let log_tail: Vec<_> = load_options
+            .log_tail()
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
 
         // Use time-travel version if set, otherwise fall back to max_catalog_version. Passing this
         // as the version to LogSegment::for_snapshot does NOT skip the _last_checkpoint hint --
@@ -321,76 +330,6 @@ impl SnapshotBuilder {
     // ============================================================================
 
     // ===== Catalog-managed Validations =====
-
-    /// Pre-build validations for catalog-managed table invariants.
-    fn validate_catalog_managed_build_inputs(
-        version: Option<Version>,
-        max_catalog_version: Option<Version>,
-        log_tail: &[crate::path::ParsedLogPath],
-    ) -> DeltaResult<()> {
-        // Log tail must be sorted ascending and contiguous (no gaps or duplicates)
-        for pair in log_tail.windows(2) {
-            require!(
-                pair[0].version + 1 == pair[1].version,
-                Error::LogTailVersionsNotContiguous {
-                    first_version: pair[0].version,
-                    second_version: pair[1].version,
-                }
-            );
-        }
-
-        // TODO: If inline commits (or any other catalog commits) are ever supported, change this
-        // method to check if there are any catalog commits.
-        let has_catalog_commits = log_tail
-            .iter()
-            .any(|p| p.file_type == LogPathFileType::StagedCommit);
-
-        // Staged commits require max_catalog_version
-        require!(
-            !has_catalog_commits || max_catalog_version.is_some(),
-            Error::MaxCatalogVersion(
-                "Max catalog version is required when providing staged commits in the log tail. \
-                 Use with_max_catalog_version()."
-                    .to_string()
-            )
-        );
-
-        // Time-travel version must not exceed max_catalog_version
-        if let (Some(ver), Some(max_cv)) = (version, max_catalog_version) {
-            require!(
-                ver <= max_cv,
-                Error::MaxCatalogVersion(format!(
-                    "Requested version {ver} exceeds max catalog version {max_cv}"
-                ))
-            );
-        }
-
-        // Log tail end version validation when max_catalog_version is set
-        if let (Some(max_cv), Some(last)) = (max_catalog_version, log_tail.last()) {
-            if let Some(ver) = version {
-                // With time-travel: last log_tail entry must be >= requested version
-                require!(
-                    last.version >= ver,
-                    Error::MaxCatalogVersion(format!(
-                        "Log tail version {} is less than requested version {ver} for max catalog \
-                         version {max_cv}",
-                        last.version
-                    ))
-                );
-            } else {
-                // Without time-travel: last log_tail entry must == max_catalog_version
-                require!(
-                    last.version == max_cv,
-                    Error::MaxCatalogVersion(format!(
-                        "Log tail version {} does not match max catalog version {max_cv}",
-                        last.version
-                    ))
-                );
-            }
-        }
-
-        Ok(())
-    }
 
     /// Post-build validation: catalog-managed tables must have max_catalog_version, and
     /// non-catalog-managed tables must not.
@@ -1041,6 +980,7 @@ mod tests {
         #[case::gap(vec![1, 3], vec![1, 3], 3)]
         #[case::duplicates(vec![1], vec![1, 1], 1)]
         #[case::unsorted(vec![1, 2], vec![2, 1], 2)]
+        #[case::overflow(vec![], vec![u64::MAX, 0], u64::MAX)]
         #[test_log::test(tokio::test)]
         async fn test_non_contiguous_log_tail_errors(
             #[case] commit_versions: Vec<u64>,

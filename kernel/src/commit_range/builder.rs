@@ -1,7 +1,7 @@
 use url::Url;
 
 use crate::commit_range::CommitRange;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogLoadOptions, LogSegment};
 use crate::path::ParsedLogPath;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -12,14 +12,13 @@ use crate::{DeltaResult, Engine, Error, Version};
 /// [`CommitRange::builder_from`] (snapshot-based). Supports configuring an end version
 /// and the commit ordering. [`Self::build`] performs delta-log listing and contiguity
 /// validation.
-// TODO(#2781): support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
-// `with_max_catalog_version(self, Version)`
 pub struct CommitRangeBuilder {
     table_root: String,
     start_version: Version,
     end_version: Option<Version>,
     snapshot: Option<SnapshotRef>,
     commit_ordering: CommitOrdering,
+    log_load_options: LogLoadOptions,
 }
 
 impl CommitRangeBuilder {
@@ -30,6 +29,7 @@ impl CommitRangeBuilder {
             end_version: None,
             snapshot: None,
             commit_ordering: CommitOrdering::AscendingOrder,
+            log_load_options: LogLoadOptions::default(),
         }
     }
 
@@ -40,6 +40,7 @@ impl CommitRangeBuilder {
             end_version: None,
             snapshot: Some(snapshot.clone()),
             commit_ordering: CommitOrdering::AscendingOrder,
+            log_load_options: LogLoadOptions::default(),
         }
     }
 
@@ -54,6 +55,11 @@ impl CommitRangeBuilder {
     /// [`CommitOrdering::AscendingOrder`].
     pub fn with_ordering(mut self, commit_ordering: CommitOrdering) -> Self {
         self.commit_ordering = commit_ordering;
+        self
+    }
+
+    pub(crate) fn with_log_load_options(mut self, log_load_options: LogLoadOptions) -> Self {
+        self.log_load_options = log_load_options;
         self
     }
 
@@ -72,12 +78,12 @@ impl CommitRangeBuilder {
 
         let log_segment = match &self.snapshot {
             Some(snapshot) => snapshot.log_segment().clone(),
-            None => LogSegment::for_table_changes(
+            None => LogSegment::for_commit_range(
                 engine.storage_handler().as_ref(),
                 log_root,
                 start_version,
                 end_version,
-                vec![],
+                self.log_load_options.clone(),
             )?,
         };
 

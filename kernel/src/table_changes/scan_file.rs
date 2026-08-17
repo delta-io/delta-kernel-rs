@@ -491,7 +491,7 @@ mod tests {
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
-    use crate::log_segment::LogSegment;
+    use crate::log_segment::{LogLoadOptions, LogSegment};
     use crate::scan::state::DvInfo;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::log_replay::{
@@ -544,12 +544,12 @@ mod tests {
         mock_table: &LocalMockTable,
     ) -> Vec<CdfScanFile> {
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let log_segment = LogSegment::for_table_changes(
+        let log_segment = LogSegment::for_commit_range(
             engine.storage_handler().as_ref(),
             table_root.join("_delta_log/").unwrap(),
             0,
             None,
-            vec![],
+            LogLoadOptions::default(),
         )
         .unwrap();
         let table_schema = Arc::new(StructType::new_unchecked([
@@ -648,12 +648,12 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let log_root = table_root.join("_delta_log/").unwrap();
-        let log_segment = LogSegment::for_table_changes(
+        let log_segment = LogSegment::for_commit_range(
             engine.storage_handler().as_ref(),
             log_root,
             0,
             None,
-            vec![],
+            LogLoadOptions::default(),
         )
         .unwrap();
         let table_schema = Arc::new(StructType::new_unchecked([
