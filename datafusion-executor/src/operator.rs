@@ -3,9 +3,9 @@
 //!
 //! DataFusion has no single "operator" type: each relational operator is its own `LogicalPlan`
 //! variant holding its inputs, so lowering an operator *is* building the plan node that wraps its
-//! already-lowered inputs. Most nodes are built through `LogicalPlanBuilder`, which validates as it
-//! goes (a filter predicate must be boolean, a projection's expression count must match its
-//! schema).
+//! already-lowered inputs. Each node uses its validating constructor: filters use
+//! [`DFFilter::try_new`], projections use [`DFProjection::try_new_with_schema`], aggregates use
+//! [`DFAggregate::try_new_with_schema`], and values use [`LogicalPlanBuilder`].
 //!
 //! This module lowers one operator at a time; the walk that feeds it each node's inputs is
 //! [`crate::plan`].
@@ -22,16 +22,14 @@ use datafusion::logical_expr::{
     LogicalPlanBuilder, Projection as DFProjection,
 };
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
-use delta_kernel::expressions::{
-    ColumnName as KernelColumnName, Expression as KernelExpression, Scalar as KernelScalar,
-};
+use delta_kernel::expressions::{ColumnName as KernelColumnName, Scalar as KernelScalar};
 use delta_kernel::plans::ir::nodes::{
     Agg as KernelAgg, Aggregate as KernelAggregate, Filter as KernelFilter,
     Operator as KernelOperator, Project as KernelProject, Values as KernelValues,
 };
 use delta_kernel::schema::StructType;
 
-use crate::expression::{to_df_expr, to_df_struct_columns};
+use crate::expression::{column_to_df_expr, to_df_struct_columns};
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
 
@@ -116,7 +114,11 @@ fn lower_project(
     Ok(DFLogicalPlan::Projection(projection))
 }
 
-/// Lowers an [`Aggregate`](KernelAggregate) to a DataFusion aggregate over its parent.
+/// Lowers an [`Aggregate`](KernelAggregate) to a DataFusion aggregate over its input.
+///
+/// Aggregate operands retain their types from the input because the kernel IR does not declare
+/// separate operand types. DataFusion applies any function-specific input coercion; the explicit
+/// casts here make group keys and aggregate results match the aggregate's declared output schema.
 fn lower_aggregate(
     aggregate: &KernelAggregate,
     input: &Arc<DFLogicalPlan>,
@@ -149,7 +151,7 @@ fn lower_aggregate(
         .iter()
         .zip(group_fields)
         .map(|(column, field)| {
-            let expr = column_to_df_expr(column, &input_schema)?;
+            let expr = lower_column(column, &input_schema)?;
             let target = field.data_type().try_into_arrow()?;
             let expr = expr
                 .cast_to(&target, input.schema())?
@@ -184,10 +186,10 @@ fn lower_aggregate(
 
 fn lower_agg(agg: &KernelAgg, input_schema: &StructType) -> Result<DFExpr, DataFusionError> {
     match agg {
-        KernelAgg::Min(value) => Ok(min(column_to_df_expr(value, input_schema)?)),
-        KernelAgg::Max(value) => Ok(max(column_to_df_expr(value, input_schema)?)),
-        KernelAgg::Sum(value) => Ok(sum(column_to_df_expr(value, input_schema)?)),
-        KernelAgg::Count(value) => Ok(count(column_to_df_expr(value, input_schema)?)),
+        KernelAgg::Min(value) => Ok(min(lower_column(value, input_schema)?)),
+        KernelAgg::Max(value) => Ok(max(lower_column(value, input_schema)?)),
+        KernelAgg::Sum(value) => Ok(sum(lower_column(value, input_schema)?)),
+        KernelAgg::Count(value) => Ok(count(lower_column(value, input_schema)?)),
         KernelAgg::CountStar => Ok(count(df_lit(1))),
         KernelAgg::MinNonNullBy(operands) => lower_non_null_by(
             &operands.value,
@@ -213,9 +215,9 @@ fn lower_non_null_by(
     input_schema: &StructType,
     ascending: bool,
 ) -> Result<DFExpr, DataFusionError> {
-    let value = column_to_df_expr(value, input_schema)?;
-    let null_sentinel = column_to_df_expr(null_sentinel, input_schema)?;
-    let key = column_to_df_expr(key, input_schema)?;
+    let value = lower_column(value, input_schema)?;
+    let null_sentinel = lower_column(null_sentinel, input_schema)?;
+    let key = lower_column(key, input_schema)?;
     let filter = null_sentinel.is_not_null().and(key.clone().is_not_null());
     let first_value = first_value_udaf().call(vec![value]);
     first_value
@@ -224,12 +226,11 @@ fn lower_non_null_by(
         .build()
 }
 
-fn column_to_df_expr(
+fn lower_column(
     column: &KernelColumnName,
     input_schema: &StructType,
 ) -> Result<DFExpr, DataFusionError> {
-    let column = KernelExpression::Column(column.clone());
-    to_df_expr(&column, input_schema, None)
+    column_to_df_expr(column, input_schema)
         .map_err(|error| DataFusionError::External(Box::new(error)))
 }
 
@@ -1433,7 +1434,7 @@ mod tests {
     #[case::max(KernelAgg::max(column_name!("value")), "max", df_col("value"), None)]
     #[case::sum(KernelAgg::sum(column_name!("key")), "sum", df_col("key"), None)]
     #[case::count(KernelAgg::count(column_name!("value")), "count", df_col("value"), None)]
-    #[case::count_star(KernelAgg::count_star(), "count", lit(1), None)]
+    #[case::count_star(KernelAgg::count_star(), "count", df_lit(1), None)]
     #[case::min_non_null_by(
         KernelAgg::min_non_null_by(
             column_name!("value"),
@@ -1515,7 +1516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_casts_output_to_declared_type() {
+    async fn aggregate_casts_result_not_operand_to_declared_type() {
         let input =
             StructType::try_new([StructField::nullable("value", DataType::INTEGER)]).unwrap();
         let parent =
@@ -1534,6 +1535,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_types(&lowered), [ArrowDataType::Int64]);
+        let DFLogicalPlan::Aggregate(aggregate) = &lowered else {
+            panic!("expected Aggregate, got {lowered:?}");
+        };
+        let [DFExpr::Alias(alias)] = aggregate.aggr_expr.as_slice() else {
+            panic!("expected one aliased aggregate expression");
+        };
+        let DFExpr::Cast(cast) = alias.expr.as_ref() else {
+            panic!(
+                "expected cast around aggregate result, got {:?}",
+                alias.expr
+            );
+        };
+        let DFExpr::AggregateFunction(function) = cast.expr.as_ref() else {
+            panic!("expected aggregate inside cast, got {:?}", cast.expr);
+        };
+        assert_eq!(function.params.args, [df_col("value")]);
+
         let batches = execute(lowered).await.unwrap();
         assert_batches_eq!(
             &[
@@ -1762,6 +1780,51 @@ mod tests {
         assert_eq!(batches[0].column(0).is_null(0), expected_sum.is_none());
         assert!(!batches[0].column(1).is_null(0));
         assert!(!batches[0].column(2).is_null(0));
+    }
+
+    #[tokio::test]
+    async fn aggregate_ungrouped_non_null_by_emits_nulls_for_empty_input() {
+        let input_schema = Arc::new(aggregate_input_schema());
+        let parent =
+            Arc::new(lower_values_node(input_schema.as_ref().clone(), Vec::new()).unwrap());
+        let aggregate = KernelAggregate::ungrouped(input_schema)
+            .aggregate_as(
+                KernelAgg::min_non_null_by(
+                    column_name!("value"),
+                    column_name!("sentinel"),
+                    column_name!("key"),
+                ),
+                "min_value",
+            )
+            .aggregate_as(
+                KernelAgg::max_non_null_by(
+                    column_name!("value"),
+                    column_name!("sentinel"),
+                    column_name!("key"),
+                ),
+                "max_value",
+            )
+            .build()
+            .unwrap();
+
+        let lowered = lower_operator(
+            &KernelOperator::Aggregate(aggregate),
+            std::slice::from_ref(&parent),
+        )
+        .unwrap();
+        let batches = execute(lowered).await.unwrap();
+        assert_batches_eq!(
+            &[
+                "+-----------+-----------+",
+                "| min_value | max_value |",
+                "+-----------+-----------+",
+                "|           |           |",
+                "+-----------+-----------+",
+            ],
+            &batches
+        );
+        assert!(batches[0].column(0).is_null(0));
+        assert!(batches[0].column(1).is_null(0));
     }
 
     /// Input:
