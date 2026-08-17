@@ -72,6 +72,7 @@ pub enum KernelError {
     LogHistoryError = 43,
     RowTrackingChangeFeedUnsupported = 44,
     CancelledError = 45,
+    ChangeDataFeedIncompatiblePartitionColumns = 46,
 }
 
 impl From<Error> for KernelError {
@@ -133,6 +134,9 @@ impl From<Error> for KernelError {
             Error::ChangeDataFeedIncompatibleSchema(_, _) => {
                 KernelError::ChangeDataFeedIncompatibleSchema
             }
+            Error::ChangeDataFeedIncompatiblePartitionColumns { .. } => {
+                KernelError::ChangeDataFeedIncompatiblePartitionColumns
+            }
             Error::InvalidCheckpoint(_) => KernelError::InvalidCheckpoint,
             Error::LiteralExpressionTransformError(_) => {
                 KernelError::LiteralExpressionTransformError
@@ -147,15 +151,32 @@ impl From<Error> for KernelError {
 
 #[cfg(test)]
 mod error_code_tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
-    fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
-        assert_eq!(
-            KernelError::from(Error::RowTrackingChangeFeedUnsupported(7)),
-            KernelError::RowTrackingChangeFeedUnsupported
-        );
-        assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
+    #[rstest]
+    #[case::row_tracking(
+        Error::RowTrackingChangeFeedUnsupported(7),
+        KernelError::RowTrackingChangeFeedUnsupported,
+        44
+    )]
+    #[case::partition_columns(
+        Error::ChangeDataFeedIncompatiblePartitionColumns {
+            expected: vec!["expected".to_owned()],
+            actual: vec!["actual".to_owned()],
+            version: 7,
+        },
+        KernelError::ChangeDataFeedIncompatiblePartitionColumns,
+        46
+    )]
+    fn kernel_error_has_stable_ffi_mapping(
+        #[case] error: Error,
+        #[case] expected: KernelError,
+        #[case] code: i32,
+    ) {
+        assert_eq!(KernelError::from(error), expected);
+        assert_eq!(expected as i32, code);
     }
 }
 
@@ -362,6 +383,7 @@ impl From<EngineExecError> for Error {
             | KernelError::ParseIntervalError
             | KernelError::ChangeDataFeedUnsupported
             | KernelError::ChangeDataFeedIncompatibleSchema
+            | KernelError::ChangeDataFeedIncompatiblePartitionColumns
             | KernelError::RowTrackingChangeFeedUnsupported
             | KernelError::LiteralExpressionTransformError
             | KernelError::LogHistoryError) => {
