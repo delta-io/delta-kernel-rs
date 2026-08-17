@@ -2282,6 +2282,14 @@ mod tests {
         StructData::try_new(fields, values).unwrap();
     }
 
+    #[rstest]
+    #[case::integer(Scalar::from(1i32))]
+    #[case::string(Scalar::from("s"))]
+    #[case::null_integer(Scalar::Null(DataType::INTEGER))]
+    fn with_nullable_container_values_leaves_non_map_scalars_unchanged(#[case] scalar: Scalar) {
+        assert_eq!(scalar.clone().with_nullable_container_values(), scalar);
+    }
+
     #[test]
     fn derived_struct_conversion_builds_nested_error_path_while_unwinding() {
         let address = StructData::from_values_unchecked(

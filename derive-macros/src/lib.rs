@@ -689,6 +689,23 @@ mod tests {
         Ok(tokens.to_string())
     }
 
+    #[rstest]
+    #[case::enum_input("enum E { A }")]
+    #[case::tuple_struct("struct S(i32);")]
+    #[case::unit_struct("struct S;")]
+    fn schema_fields_rejects_non_named_structs(#[case] input: &str) {
+        let input = syn::parse_str::<DeriveInput>(input).unwrap();
+        // This is the exact `Err` the `IntoStructData` derive forwards via
+        // `e.to_compile_error().into()`.
+        let err = schema_fields(&input.data, "IntoStructData", input.ident.span()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("IntoStructData can only be derived for structs with named fields"),
+            "found: {err}"
+        );
+        assert!(err.to_compile_error().to_string().contains("compile_error"));
+    }
+
     #[test]
     fn test_valid_field_id_parsing() {
         let input = r#"
