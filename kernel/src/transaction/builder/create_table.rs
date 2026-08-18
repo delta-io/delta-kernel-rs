@@ -32,7 +32,7 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
+    CheckpointPolicy, TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
     CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
     COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
     DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
@@ -124,8 +124,7 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     DELETED_FILE_RETENTION_DURATION,
     ENABLE_EXPIRED_LOG_CLEANUP,
     CHECKPOINT_INTERVAL,
-    // Checkpoint policy: stored for downstream engines. Kernel chooses the checkpoint format
-    // from the v2Checkpoint feature. Setting checkpointPolicy does not enable v2 checkpoints.
+    // Checkpoint policy: "v2" auto-enables the v2Checkpoint feature.
     CHECKPOINT_POLICY,
 ];
 
@@ -487,6 +486,18 @@ fn maybe_enable_ict_for_catalog_managed(
             .or_insert_with(|| "true".to_string());
     }
     Ok(())
+}
+
+fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTableProperties) {
+    let is_v2_policy = TableProperties::from(validated.properties.iter()).checkpoint_policy
+        == Some(CheckpointPolicy::V2);
+    if is_v2_policy {
+        add_feature_to_lists(
+            TableFeature::V2Checkpoint,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
 }
 
 /// Witness that all property-flipping passes which must run before column mapping is applied
@@ -933,6 +944,9 @@ impl CreateTableTransactionBuilder {
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
 
+        // Auto-enable v2Checkpoint when checkpointPolicy=v2
+        maybe_enable_v2_checkpoint_for_policy(&mut validated);
+
         // Set materialized row tracking column names when row tracking is enabled.
         maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
 
@@ -1122,7 +1136,6 @@ mod tests {
             ),
             (ENABLE_EXPIRED_LOG_CLEANUP.to_string(), "true".to_string()),
             (CHECKPOINT_INTERVAL.to_string(), "10".to_string()),
-            (CHECKPOINT_POLICY.to_string(), "v2".to_string()),
         ]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
         assert_eq!(
@@ -1141,12 +1154,38 @@ mod tests {
             validated.properties.get(CHECKPOINT_INTERVAL),
             Some(&"10".to_string()),
         );
-        assert_eq!(
-            validated.properties.get(CHECKPOINT_POLICY),
-            Some(&"v2".to_string()),
-        );
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::v2(&[(CHECKPOINT_POLICY, "v2")], true)]
+    #[case::classic(&[(CHECKPOINT_POLICY, "classic")], false)]
+    fn test_checkpoint_policy_feature_enablement(
+        #[case] properties: &[(&str, &str)],
+        #[case] expect_v2_checkpoint_feature: bool,
+    ) {
+        let properties: HashMap<String, String> = properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+
+        maybe_enable_v2_checkpoint_for_policy(&mut validated);
+
+        assert_eq!(
+            validated
+                .reader_features
+                .contains(&TableFeature::V2Checkpoint),
+            expect_v2_checkpoint_feature,
+        );
+        assert_eq!(
+            validated
+                .writer_features
+                .contains(&TableFeature::V2Checkpoint),
+            expect_v2_checkpoint_feature,
+        );
+        assert!(validated.properties.contains_key(CHECKPOINT_POLICY));
     }
 
     #[test]
