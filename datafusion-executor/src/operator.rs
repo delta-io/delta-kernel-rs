@@ -116,9 +116,10 @@ fn lower_project(
 
 /// Lowers an [`Aggregate`](KernelAggregate) to a DataFusion aggregate over its input.
 ///
-/// Aggregate operands retain their types from the input because the kernel IR does not declare
-/// separate operand types. DataFusion applies any function-specific input coercion; the explicit
-/// casts here make group keys and aggregate results match the aggregate's declared output schema.
+/// This lowering does not cast aggregate operands. It passes them using their input-schema types,
+/// and DataFusion's type-coercion analyzer inserts any casts required by each aggregate function's
+/// signature. The explicit casts here only make group keys and final aggregate results match the
+/// aggregate's declared output schema.
 fn lower_aggregate(
     aggregate: &KernelAggregate,
     input: &Arc<DFLogicalPlan>,
