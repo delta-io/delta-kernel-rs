@@ -325,11 +325,6 @@ where
 // Shared methods available on ALL transaction types
 // =============================================================================
 impl<S> Transaction<S> {
-    #[cfg(test)]
-    fn replace_effective_table_config(&mut self, table_config: TableConfiguration) {
-        self.effective_table_config = table_config;
-    }
-
     /// Consume the transaction and commit it to the table. The result is a result of
     /// [CommitResult] with the following semantics:
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
@@ -947,6 +942,11 @@ impl<S> Transaction<S> {
     /// [`stats_schema`]: Transaction::stats_schema
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
+    }
+
+    #[cfg(test)]
+    fn replace_effective_table_config(&mut self, table_config: TableConfiguration) {
+        self.effective_table_config = table_config;
     }
 }
 

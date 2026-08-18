@@ -226,11 +226,18 @@ impl WriteState {
 #[cfg(test)]
 mod tests {
     use std::num::NonZero;
+    use std::sync::Arc;
 
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue, StructField, StructType};
+    use crate::committer::FileSystemCommitter;
+    use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
+    use crate::schema::schema_ref;
+    use crate::transaction::create_table::create_table;
+    use crate::transaction::data_layout::DataLayout;
+    use crate::Engine;
 
     fn partitioned_write_state(
         column_mapping_mode: ColumnMappingMode,
@@ -238,51 +245,57 @@ mod tests {
         randomize_file_prefixes: bool,
         random_prefix_length: usize,
     ) -> Arc<WriteState> {
-        let year = StructField::not_null("year", DataType::INTEGER).with_metadata([
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::Number(1),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("phys_year".into()),
-            ),
-        ]);
-        let value = StructField::nullable("value", DataType::INTEGER).with_metadata([
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::Number(2),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("phys_value".into()),
-            ),
-        ]);
-        Arc::new(WriteState {
-            table_root: Url::parse("s3://bucket/table/").unwrap(),
-            full_logical_schema: Arc::new(StructType::new_unchecked([year, value])),
-            logical_schema: schema_ref! { nullable "value": INTEGER },
-            physical_schema: schema_ref! { nullable "value": INTEGER },
-            column_mapping_mode,
-            stats_columns: vec![ColumnName::new(["value"])],
-            logical_partition_columns: vec!["year".into()],
-            materialize_partition_columns,
-            randomize_file_prefixes,
-            random_prefix_length: NonZero::new(random_prefix_length).unwrap(),
-        })
+        let mut properties = HashMap::new();
+        if column_mapping_mode != ColumnMappingMode::None {
+            let column_mapping_mode = match column_mapping_mode {
+                ColumnMappingMode::None => "none",
+                ColumnMappingMode::Name => "name",
+                ColumnMappingMode::Id => "id",
+            };
+            properties.insert(
+                "delta.columnMapping.mode".to_string(),
+                column_mapping_mode.to_string(),
+            );
+        }
+        if materialize_partition_columns {
+            properties.insert(
+                "delta.feature.materializePartitionColumns".to_string(),
+                "supported".to_string(),
+            );
+        }
+
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let txn = create_table(
+            "memory:///table",
+            schema_ref! {
+                not_null "year": INTEGER,
+                nullable "value": INTEGER,
+            },
+            "test",
+        )
+        .with_data_layout(DataLayout::partitioned(["year"]))
+        .with_table_properties(properties)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap();
+
+        let mut write_state = txn.write_state().unwrap();
+        let state = Arc::get_mut(&mut write_state).unwrap();
+        state.randomize_file_prefixes = randomize_file_prefixes;
+        state.random_prefix_length = NonZero::new(random_prefix_length).unwrap();
+        write_state
     }
 
     #[rstest]
-    #[case::default(ColumnMappingMode::None, false, false, 2, "year", false)]
-    #[case::column_mapping(ColumnMappingMode::Name, false, false, 7, "phys_year", true)]
-    #[case::materialized_partition(ColumnMappingMode::None, true, false, 2, "year", false)]
-    #[case::randomized_prefix(ColumnMappingMode::None, false, true, 7, "year", true)]
+    #[case::default(ColumnMappingMode::None, false, false, 2, false)]
+    #[case::column_mapping(ColumnMappingMode::Name, false, false, 7, true)]
+    #[case::materialized_partition(ColumnMappingMode::None, true, false, 2, false)]
+    #[case::randomized_prefix(ColumnMappingMode::None, false, true, 7, true)]
     fn write_state_json_round_trip_preserves_worker_behavior(
         #[case] column_mapping_mode: ColumnMappingMode,
         #[case] materialize_partition_columns: bool,
         #[case] randomize_file_prefixes: bool,
         #[case] random_prefix_length: usize,
-        #[case] expected_partition_key: &str,
         #[case] expect_random_prefix: bool,
     ) {
         let original = partitioned_write_state(
@@ -327,6 +340,11 @@ mod tests {
             original_context.logical_to_physical()
         );
         assert_eq!(decoded_context.column_mapping_mode(), column_mapping_mode);
+        let expected_partition_key = original
+            .full_logical_schema
+            .field("year")
+            .unwrap()
+            .physical_name(column_mapping_mode);
         assert_eq!(
             decoded_context.physical_partition_values(),
             &HashMap::from([(expected_partition_key.into(), Some("2024".into()))])
