@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{DeltaResult, Error};
+use crate::{AsAny, DeltaResult, Error};
 
 /// A shared, thread-safe cancellation token. Held as an `Arc` because the lazy scan iterator and
 /// the engine reads it drives can outlive the builder call and run on other threads.
@@ -40,9 +40,38 @@ pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> DeltaResu
 /// Kernel and cancellation-aware engines only *consume* it: Kernel polls [`is_cancelled`] between
 /// action batches, while an async engine may await [`cancelled_future`] to wake blocked I/O.
 ///
+/// # Recovering the underlying token
+///
+/// The `Arc` kernel hands to each `*_with_cancellation` [`Engine`] method is the same one the
+/// caller supplied, so an engine that supplied its own implementation can downcast it back to the
+/// concrete type through [`AsAny`]. (Kernel may poll a composed or derived token internally; the
+/// guarantee is only about what the engine receives.) This lets an engine reach a native
+/// cancellation handle it wrapped, for code that cannot accept a Rust trait object.
+///
+/// Borrow with `as_ref().any_ref()`, or take an owned handle with [`AsAny::as_any`] -- see
+/// [`AsAny::any_ref`] for why the borrow must go through `as_ref()` first.
+///
+/// ```
+/// # use delta_kernel::cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
+/// # use delta_kernel::AsAny;
+/// # use std::sync::Arc;
+/// # struct MyToken;
+/// # impl CancellationToken for MyToken {
+/// #     fn is_cancelled(&self) -> bool { false }
+/// #     fn cancelled_future(&self) -> CancelledFuture<'_> { Box::pin(std::future::pending()) }
+/// # }
+/// # let token: CancellationTokenRef = Arc::new(MyToken);
+/// // In an engine's `read_*_with_cancellation`, given `token: CancellationTokenRef`:
+/// if let Some(mine) = token.as_ref().any_ref().downcast_ref::<MyToken>() {
+///     let _ = mine.is_cancelled(); // recovered the caller's concrete token
+/// }
+/// ```
+///
 /// [`is_cancelled`]: CancellationToken::is_cancelled
 /// [`cancelled_future`]: CancellationToken::cancelled_future
-pub trait CancellationToken: Send + Sync {
+/// [`Engine`]: crate::Engine
+/// [`AsAny`]: crate::AsAny
+pub trait CancellationToken: AsAny {
     /// Returns `true` once cancellation has been requested. Cheap, synchronous, and monotonic:
     /// once it returns `true` it must never return `false` again.
     fn is_cancelled(&self) -> bool;
@@ -204,5 +233,65 @@ mod tests {
         assert!(check_cancelled(None).is_ok());
         token.cancel();
         assert!(matches!(check_cancelled(Some(&ct)), Err(Error::Cancelled)));
+    }
+
+    /// A second token type, to check that a downcast discriminates rather than always succeeding.
+    #[derive(Default)]
+    struct OtherToken;
+
+    impl CancellationToken for OtherToken {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+        fn cancelled_future(&self) -> CancelledFuture<'_> {
+            Box::pin(ready(()))
+        }
+    }
+
+    // Downcasting an erased token recovers the original value, not a copy: cancelling through the
+    // recovered handle is observable through the erased one.
+    #[test]
+    fn downcast_recovers_the_same_token() {
+        let erased: CancellationTokenRef = Arc::new(TestToken::default());
+
+        let recovered = erased
+            .clone()
+            .as_any()
+            .downcast::<TestToken>()
+            .expect("erased token should downcast to its concrete type");
+        recovered.cancel();
+
+        assert!(erased.is_cancelled());
+    }
+
+    #[test]
+    fn downcast_to_the_wrong_type_fails() {
+        let erased: CancellationTokenRef = Arc::new(TestToken::default());
+        assert!(erased.clone().as_any().downcast::<OtherToken>().is_err());
+        assert!(erased
+            .as_ref()
+            .any_ref()
+            .downcast_ref::<OtherToken>()
+            .is_none());
+    }
+
+    // `Arc<dyn CancellationToken>` satisfies the blanket `AsAny` impl in its own right, so
+    // `arc.any_ref()` resolves to the *`Arc`* rather than the token inside it and downcasts to the
+    // concrete type fail. Borrowing goes through the trait object: `arc.as_ref().any_ref()`.
+    #[test]
+    fn any_ref_borrows_the_token_through_the_trait_object() {
+        let token = Arc::new(TestToken::default());
+        let erased: CancellationTokenRef = token.clone();
+
+        assert!(erased.any_ref().downcast_ref::<TestToken>().is_none());
+
+        let borrowed = erased
+            .as_ref()
+            .any_ref()
+            .downcast_ref::<TestToken>()
+            .expect("erased token should downcast to its concrete type");
+        assert!(!borrowed.is_cancelled());
+        token.cancel();
+        assert!(borrowed.is_cancelled());
     }
 }
