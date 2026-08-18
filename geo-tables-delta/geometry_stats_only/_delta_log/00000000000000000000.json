@@ -1,0 +1,4 @@
+{"commitInfo":{"timestamp":1776720409009,"engineInfo":"Kernel-4.2.0-SNAPSHOT/test-engine","operation":"CREATE TABLE","operationParameters":{"partitionBy":"[]"},"isBlindAppend":false,"txnId":"0c89e669-068f-4ba7-913a-e1e8bedc1fc8","operationMetrics":{}}}
+{"metaData":{"id":"9ae4ed2c-8cb4-409d-9e7e-bbe1a3fa8713","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"geom\",\"type\":\"geometry(OGC:CRS84)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"createdTime":1776720409007,"configuration":{}}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["geospatial"],"writerFeatures":["geospatial","appendOnly","invariants"]}}
+{"add":{"path":"part-0.parquet","partitionValues":{},"size":1000,"modificationTime":0,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"geom\":\"POINT (0.0 0.0)\"},\"maxValues\":{\"geom\":\"POINT (3.0 3.0)\"},\"nullCount\":{\"geom\":0}}"}}
