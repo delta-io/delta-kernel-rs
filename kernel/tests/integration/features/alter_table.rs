@@ -16,7 +16,6 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::SchemaPathSegment;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
@@ -458,7 +457,7 @@ async fn add_column_at_nested_struct_with_column_mapping(
     snapshot
         .alter_table()
         .add_column_at(
-            vec![SchemaPathSegment::Field("address".to_string())],
+            column_name!("address"),
             StructField::nullable("zip", DataType::STRING),
         )
         .build(engine.as_ref(), committer())?
