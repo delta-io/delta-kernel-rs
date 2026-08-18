@@ -10,26 +10,26 @@ use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
 use crate::{DeltaResult, Error};
 
-/// Column indices, matching the order in [`MANDATORY_ADD_FILE_COLUMNS`].
+/// Column indices, matching the order in [`ADD_FILE_COLUMNS_FOR_VALIDATION`].
 const PATH: usize = 0;
 const PARTITION_VALUES: usize = 1;
 const SIZE: usize = 2;
 const MODIFICATION_TIME: usize = 3;
 
-static MANDATORY_ADD_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+static ADD_FILE_COLUMNS_FOR_VALIDATION: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| mandatory_add_file_schema().leaves(None));
 
 impl<'a> StagedDataValidator<'a> {
     /// Creates a validator that validates every staged add-file row.
     pub(crate) fn staged_add_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
-        file_actions: &'a mut FileActionTracker,
+        existing_file_actions: &'a mut FileActionTracker,
     ) -> Self {
         StagedDataValidator::new(
-            &MANDATORY_ADD_FILE_COLUMNS,
-            vec![Box::new(AddFileRequiredFields {
+            &ADD_FILE_COLUMNS_FOR_VALIDATION,
+            vec![Box::new(AddFileFields {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
-                file_actions,
+                existing_file_actions,
             })],
         )
     }
@@ -44,12 +44,12 @@ impl<'a> StagedDataValidator<'a> {
 ///
 /// NOTE: Currently, Kernel doesn't require connectors to set dataChange for staged addFile.
 /// TODO(2869): Add intent-based validation for dataChange.
-pub(crate) struct AddFileRequiredFields<'a> {
+struct AddFileFields<'a> {
     physical_partition_columns: HashSet<String>,
-    file_actions: &'a mut FileActionTracker,
+    existing_file_actions: &'a mut FileActionTracker,
 }
 
-impl Validation for AddFileRequiredFields<'_> {
+impl Validation for AddFileFields<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?
@@ -79,7 +79,7 @@ impl Validation for AddFileRequiredFields<'_> {
             path,
             "modificationTime",
         )?;
-        self.file_actions.record_add(path, None)
+        self.existing_file_actions.record_add(path, None)
     }
 }
 
@@ -90,7 +90,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{Int64Array, StringArray};
+    use crate::arrow::array::Int64Array;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::column_name;
@@ -117,10 +117,10 @@ mod tests {
     }
 
     /// Guards the invariant that the column-index consts match the leaf order of
-    /// `MANDATORY_ADD_FILE_COLUMNS`.
+    /// `ADD_FILE_COLUMNS_FOR_VALIDATION`.
     #[test]
     fn column_indices_match_schema_order() {
-        let (names, _) = MANDATORY_ADD_FILE_COLUMNS.as_ref();
+        let (names, _) = ADD_FILE_COLUMNS_FOR_VALIDATION.as_ref();
         assert_eq!(names[PATH], column_name!("path"));
         assert_eq!(names[PARTITION_VALUES], column_name!("partitionValues"));
         assert_eq!(names[SIZE], column_name!("size"));
@@ -132,24 +132,34 @@ mod tests {
     }
 
     #[rstest]
-    #[case::same_batch(false)]
-    #[case::different_batches(true)]
-    fn duplicate_add_file_paths_rejected(#[case] different_batches: bool) {
-        let batches = if different_batches {
-            vec![
-                add_files_with_paths(&["same"]),
-                add_files_with_paths(&["same"]),
-            ]
+    #[case::same_batch(false, None)]
+    #[case::different_batches(true, None)]
+    #[case::different_dv_id(false, Some("existing-dv"))]
+    fn duplicate_add_file_paths_rejected(
+        #[case] different_batches: bool,
+        #[case] existing_dv_id: Option<&str>,
+    ) {
+        let batches = if existing_dv_id.is_some() {
+            vec![nullable_add_files(&["same"])]
+        } else if different_batches {
+            vec![nullable_add_files(&["same"]), nullable_add_files(&["same"])]
         } else {
-            vec![add_files_with_paths(&["same", "same"])]
+            vec![nullable_add_files(&["same", "same"])]
         };
         let adds: Vec<Box<dyn EngineData>> = batches
             .into_iter()
             .map(|batch| Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
             .collect();
+        let mut existing_file_actions = FileActionTracker::default();
+        if let Some(dv_id) = existing_dv_id {
+            existing_file_actions
+                .record_add("same", Some(dv_id.to_owned()))
+                .expect("first AddFile should be accepted");
+        }
 
         assert_result_error_with_message(
-            validate_add_files(&[] /* physical_partition_columns */, &adds),
+            StagedDataValidator::staged_add_file(std::iter::empty(), &mut existing_file_actions)
+                .validate(&adds),
             "multiple AddFile actions",
         );
     }
@@ -166,10 +176,15 @@ mod tests {
     ) {
         const BATCH_COUNT: usize = 3;
         const ROW_COUNT: usize = 3;
+        const PATHS: [[&str; ROW_COUNT]; BATCH_COUNT] = [
+            ["batch-0-row-0", "batch-0-row-1", "batch-0-row-2"],
+            ["batch-1-row-0", "batch-1-row-1", "batch-1-row-2"],
+            ["batch-2-row-0", "batch-2-row-1", "batch-2-row-2"],
+        ];
 
         let adds: Vec<Box<dyn EngineData>> = (0..BATCH_COUNT)
             .map(|batch_index| {
-                let batch = assign_unique_paths(nullable_add_files(ROW_COUNT), batch_index);
+                let batch = nullable_add_files(&PATHS[batch_index]);
                 let batch = if batch_index == invalid_batch {
                     set_field_as_null(&batch, field, invalid_row)
                 } else {
@@ -221,11 +236,7 @@ mod tests {
         #[case] modification_time: i64,
         #[case] expected_error: Option<&str>,
     ) {
-        let batch = replace_column(
-            &nullable_add_file(),
-            "path",
-            Arc::new(StringArray::from(vec![path])),
-        );
+        let batch = nullable_add_file(path);
         let batch = replace_column(&batch, "size", Arc::new(Int64Array::from(vec![size])));
         let batch = replace_column(
             &batch,
@@ -244,7 +255,10 @@ mod tests {
 
     #[test]
     fn partition_values_exact_match_ok() {
-        let batch = add_files_with_partition_values(&[&[("p1", Some("a")), ("p2", Some("b"))]]);
+        let batch = add_files_with_partition_values(
+            &["file-0"],
+            &[&[("p1", Some("a")), ("p2", Some("b"))]],
+        );
         validate_add_files(
             &["p1", "p2"], /* physical_partition_columns */
             &as_engine_data(batch),
@@ -254,7 +268,8 @@ mod tests {
 
     #[test]
     fn partition_value_null_still_counts_as_present() {
-        let batch = add_files_with_partition_values(&[&[("p1", Some("a")), ("p2", None)]]);
+        let batch =
+            add_files_with_partition_values(&["file-0"], &[&[("p1", Some("a")), ("p2", None)]]);
         validate_add_files(
             &["p1", "p2"], /* physical_partition_columns */
             &as_engine_data(batch),
@@ -303,6 +318,11 @@ mod tests {
     ) {
         const BATCH_COUNT: usize = 3;
         const ROW_COUNT: usize = 3;
+        const PATHS: [[&str; ROW_COUNT]; BATCH_COUNT] = [
+            ["batch-0-row-0", "batch-0-row-1", "batch-0-row-2"],
+            ["batch-1-row-0", "batch-1-row-1", "batch-1-row-2"],
+            ["batch-2-row-0", "batch-2-row-1", "batch-2-row-2"],
+        ];
 
         let adds: Vec<Box<dyn EngineData>> = (0..BATCH_COUNT)
             .map(|batch_index| {
@@ -310,10 +330,7 @@ mod tests {
                 if batch_index == invalid_batch {
                     partition_values[invalid_row] = invalid_partition_values;
                 }
-                let batch = assign_unique_paths(
-                    add_files_with_partition_values(&partition_values),
-                    batch_index,
-                );
+                let batch = add_files_with_partition_values(&PATHS[batch_index], &partition_values);
                 Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
             })
             .collect();
@@ -330,7 +347,7 @@ mod tests {
 
     #[test]
     fn unpartitioned_table_rejects_partition_values() {
-        let batch = add_files_with_partition_values(&[&[("stray", Some("x"))]]);
+        let batch = add_files_with_partition_values(&["file-0"], &[&[("stray", Some("x"))]]);
         assert_result_error_with_message(
             validate_add_files(
                 &[], /* physical_partition_columns */
@@ -338,20 +355,5 @@ mod tests {
             ),
             "partitionValues keys",
         );
-    }
-
-    fn assign_unique_paths(batch: RecordBatch, batch_index: usize) -> RecordBatch {
-        let paths: Vec<_> = (0..batch.num_rows())
-            .map(|row_index| format!("batch-{batch_index}-row-{row_index}"))
-            .collect();
-        replace_column(&batch, "path", Arc::new(StringArray::from(paths)))
-    }
-
-    fn add_files_with_paths(paths: &[&str]) -> RecordBatch {
-        replace_column(
-            &nullable_add_files(paths.len()),
-            "path",
-            Arc::new(StringArray::from(paths.to_vec())),
-        )
     }
 }

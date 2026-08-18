@@ -213,6 +213,225 @@ fn selected_scan_file_batch(
     Err(Error::generic("expected at least one scan file"))
 }
 
+#[rstest]
+#[case::duplicate(&["same.parquet", "same.parquet"], Some("multiple AddFile actions"))]
+#[case::distinct(&["first.parquet", "second.parquet"], None)]
+#[tokio::test]
+async fn commit_validates_add_file_path_uniqueness(
+    #[case] paths: &[&str],
+    #[case] expected_error: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    let (_store, engine, table_url, _) =
+        create_dv_table_with_files("add_path_uniqueness", schema, &[], &["existing.parquet"])
+            .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    let adds = create_add_files_metadata(
+        txn.add_files_schema(),
+        paths
+            .iter()
+            .map(|path| {
+                (
+                    *path,
+                    1, /* size */
+                    1, /* modification_time */
+                    Some(1),
+                )
+            })
+            .collect(),
+    )?;
+    txn.add_files(adds);
+
+    let result = txn.commit(engine.as_ref());
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        result?.unwrap_committed();
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::duplicate_selected(RemovePathCase {
+    duplicate_paths: true,
+    selection_vector: &[true, true],
+    expected_error: Some("multiple RemoveFile actions"),
+})]
+#[case::duplicate_implicitly_selected(RemovePathCase {
+    duplicate_paths: true,
+    selection_vector: &[true],
+    expected_error: Some("multiple RemoveFile actions"),
+})]
+#[case::duplicate_unselected(RemovePathCase {
+    duplicate_paths: true,
+    selection_vector: &[true, false],
+    expected_error: None,
+})]
+#[case::distinct_selected(RemovePathCase {
+    duplicate_paths: false,
+    selection_vector: &[true, true],
+    expected_error: None,
+})]
+#[tokio::test]
+async fn commit_validates_selected_remove_file_path_uniqueness(
+    #[case] case: RemovePathCase,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    let (_store, engine, table_url, _) = create_dv_table_with_files(
+        "remove_path_uniqueness",
+        schema,
+        &[],
+        &["file-0.parquet", "file-1.parquet"],
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+    let batches = scan_files
+        .into_iter()
+        .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let mut batch = concat_batches(&batches[0].schema(), &batches)?;
+    if case.duplicate_paths {
+        let path_index = batch.schema().index_of("path")?;
+        let duplicate_path = batch.column(path_index).as_string::<i32>().value(0);
+        let mut columns = batch.columns().to_vec();
+        columns[path_index] = replace_array_row(
+            &columns[path_index],
+            string_array(duplicate_path),
+            1, /* row_index */
+        );
+        batch = RecordBatch::try_new(batch.schema(), columns)?;
+    }
+    let removes = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(batch)),
+        case.selection_vector.to_vec(),
+    )?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.remove_files(removes);
+
+    let result = txn.commit(engine.as_ref());
+    if let Some(expected_error) = case.expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        result?.unwrap_committed();
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::duplicate_explicit(DvPathCase {
+    first_row: 0,
+    first_selection_vector: &[true, false],
+    second_row: 0,
+    second_selection_vector: &[true, false],
+    expected_error: Some("multiple RemoveFile actions"),
+})]
+#[case::duplicate_implicit_tail(DvPathCase {
+    first_row: 1,
+    first_selection_vector: &[false],
+    second_row: 1,
+    second_selection_vector: &[false],
+    expected_error: Some("multiple RemoveFile actions"),
+})]
+#[case::distinct(DvPathCase {
+    first_row: 0,
+    first_selection_vector: &[true, false],
+    second_row: 1,
+    second_selection_vector: &[false, true],
+    expected_error: None,
+})]
+#[tokio::test]
+async fn commit_validates_dv_update_path_uniqueness(
+    #[case] case: DvPathCase,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    let (_store, engine, table_url, _) = create_dv_table_with_files(
+        "dv_path_uniqueness",
+        schema,
+        &[],
+        &["file-0.parquet", "file-1.parquet"],
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+    let batches = scan_files
+        .into_iter()
+        .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let path_index = batch.schema().index_of("path")?;
+    let paths = batch
+        .column(path_index)
+        .as_string::<i32>()
+        .iter()
+        .map(|path| path.expect("scan path should be present").to_owned())
+        .collect::<Vec<_>>();
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+
+    let first_descriptor = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "first-dv.bin".to_string(),
+        offset: Some(0),
+        size_in_bytes: 1,
+        cardinality: 1,
+    };
+    txn.update_deletion_vectors(
+        HashMap::from([(paths[case.first_row].clone(), first_descriptor)]),
+        std::iter::once(Ok(FilteredEngineData::try_new(
+            Box::new(ArrowEngineData::new(batch.clone())),
+            case.first_selection_vector.to_vec(),
+        )?)),
+    )?;
+    let second_descriptor = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "second-dv.bin".to_string(),
+        offset: Some(0),
+        size_in_bytes: 1,
+        cardinality: 1,
+    };
+    txn.update_deletion_vectors(
+        HashMap::from([(paths[case.second_row].clone(), second_descriptor)]),
+        std::iter::once(Ok(FilteredEngineData::try_new(
+            Box::new(ArrowEngineData::new(batch)),
+            case.second_selection_vector.to_vec(),
+        )?)),
+    )?;
+
+    let result = txn.commit(engine.as_ref());
+    if let Some(expected_error) = case.expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        result?.unwrap_committed();
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RemovePathCase {
+    duplicate_paths: bool,
+    selection_vector: &'static [bool],
+    expected_error: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+struct DvPathCase {
+    first_row: usize,
+    first_selection_vector: &'static [bool],
+    second_row: usize,
+    second_selection_vector: &'static [bool],
+    expected_error: Option<&'static str>,
+}
+
 #[derive(Clone, Copy)]
 struct StagedRemoveFileModification {
     field: &'static str,

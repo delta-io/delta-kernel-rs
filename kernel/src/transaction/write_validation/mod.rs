@@ -147,76 +147,58 @@ mod tests {
     use crate::unit_test_utils::assert_result_error_with_message;
 
     #[rstest]
-    #[case::duplicate_add_different_dv(FileActionCase {
-        first: TestFileAction::Add,
-        first_path: "same",
-        first_dv_id: Some("dv-1"),
-        second: TestFileAction::Add,
-        second_path: "same",
-        second_dv_id: Some("dv-2"),
-        expected_error: Some("multiple AddFile actions"),
-    })]
-    #[case::duplicate_remove_different_dv(FileActionCase {
-        first: TestFileAction::Remove,
-        first_path: "same",
-        first_dv_id: Some("dv-1"),
-        second: TestFileAction::Remove,
-        second_path: "same",
-        second_dv_id: Some("dv-2"),
-        expected_error: Some("multiple RemoveFile actions"),
-    })]
-    #[case::add_remove_same_dv(FileActionCase {
-        first: TestFileAction::Add,
-        first_path: "same",
-        first_dv_id: Some("dv"),
-        second: TestFileAction::Remove,
-        second_path: "same",
-        second_dv_id: Some("dv"),
-        expected_error: Some("same deletion vector ID"),
-    })]
-    #[case::remove_add_same_dv(FileActionCase {
-        first: TestFileAction::Remove,
-        first_path: "same",
-        first_dv_id: None,
-        second: TestFileAction::Add,
-        second_path: "same",
-        second_dv_id: None,
-        expected_error: Some("same deletion vector ID"),
-    })]
-    #[case::add_remove_different_dv(FileActionCase {
-        first: TestFileAction::Add,
-        first_path: "same",
-        first_dv_id: Some("dv-1"),
-        second: TestFileAction::Remove,
-        second_path: "same",
-        second_dv_id: Some("dv-2"),
-        expected_error: None,
-    })]
-    #[case::same_dv_different_paths(FileActionCase {
-        first: TestFileAction::Add,
-        first_path: "first",
-        first_dv_id: Some("dv"),
-        second: TestFileAction::Add,
-        second_path: "second",
-        second_dv_id: Some("dv"),
-        expected_error: None,
-    })]
-    fn file_action_combinations_accepted_or_rejected(#[case] case: FileActionCase) {
+    #[case::duplicate_add_different_dv(
+        &[
+            FileActionCase::new(TestFileAction::Add, "same", Some("dv-1")),
+            FileActionCase::new(TestFileAction::Add, "same", Some("dv-2")),
+        ],
+        Some("multiple AddFile actions"),
+    )]
+    #[case::duplicate_remove_different_dv(
+        &[
+            FileActionCase::new(TestFileAction::Remove, "same", Some("dv-1")),
+            FileActionCase::new(TestFileAction::Remove, "same", Some("dv-2")),
+        ],
+        Some("multiple RemoveFile actions"),
+    )]
+    #[case::add_remove_same_dv(
+        &[
+            FileActionCase::new(TestFileAction::Add, "same", Some("dv")),
+            FileActionCase::new(TestFileAction::Remove, "same", Some("dv")),
+        ],
+        Some("same deletion vector ID"),
+    )]
+    #[case::remove_add_same_dv(
+        &[
+            FileActionCase::new(TestFileAction::Remove, "same", None),
+            FileActionCase::new(TestFileAction::Add, "same", None),
+        ],
+        Some("same deletion vector ID"),
+    )]
+    #[case::add_remove_different_dv(
+        &[
+            FileActionCase::new(TestFileAction::Add, "same", Some("dv-1")),
+            FileActionCase::new(TestFileAction::Remove, "same", Some("dv-2")),
+        ],
+        None,
+    )]
+    #[case::same_dv_different_paths(
+        &[
+            FileActionCase::new(TestFileAction::Add, "first", Some("dv")),
+            FileActionCase::new(TestFileAction::Add, "second", Some("dv")),
+        ],
+        None,
+    )]
+    fn file_action_combinations_accepted_or_rejected(
+        #[case] file_actions: &[FileActionCase],
+        #[case] expected_error: Option<&str>,
+    ) {
         let mut tracker = FileActionTracker::default();
-        case.first
-            .record(
-                &mut tracker,
-                case.first_path,
-                case.first_dv_id.map(str::to_owned),
-            )
-            .expect("first file action should be accepted");
-        let result = case.second.record(
-            &mut tracker,
-            case.second_path,
-            case.second_dv_id.map(str::to_owned),
-        );
+        let result = file_actions
+            .iter()
+            .try_for_each(|file_action| file_action.record(&mut tracker));
 
-        if let Some(expected_error) = case.expected_error {
+        if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
         } else {
             result.expect("valid file-action combination should be accepted");
@@ -243,13 +225,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
     struct FileActionCase {
-        first: TestFileAction,
-        first_path: &'static str,
-        first_dv_id: Option<&'static str>,
-        second: TestFileAction,
-        second_path: &'static str,
-        second_dv_id: Option<&'static str>,
-        expected_error: Option<&'static str>,
+        action_type: TestFileAction,
+        path: &'static str,
+        dv_id: Option<&'static str>,
+    }
+
+    impl FileActionCase {
+        const fn new(
+            action_type: TestFileAction,
+            path: &'static str,
+            dv_id: Option<&'static str>,
+        ) -> Self {
+            Self {
+                action_type,
+                path,
+                dv_id,
+            }
+        }
+
+        fn record(self, tracker: &mut FileActionTracker) -> DeltaResult<()> {
+            self.action_type
+                .record(tracker, self.path, self.dv_id.map(str::to_owned))
+        }
     }
 }

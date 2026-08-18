@@ -12,25 +12,25 @@ use crate::schema::ColumnNamesAndTypes;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-/// Column indices, matching the order in [`MANDATORY_REMOVE_FILE_COLUMNS`].
+/// Column indices, matching the order in [`REMOVE_FILE_COLUMNS_FOR_VALIDATION`].
 const PATH: usize = 0;
 const SIZE: usize = 1;
 const DELETION_VECTOR_STORAGE_TYPE: usize = 2;
+const DELETION_VECTOR_PATH_OR_INLINE_DV: usize = 3;
+const DELETION_VECTOR_OFFSET: usize = 4;
+const DELETION_VECTOR_NAME: &str = "deletionVector";
+const STORAGE_TYPE_NAME: &str = "storageType";
+const PATH_OR_INLINE_DV_NAME: &str = "pathOrInlineDv";
+const OFFSET_NAME: &str = "offset";
 
-const DELETION_VECTOR_COLUMN_NAMES: [&str; 3] = [
-    "deletionVector.storageType",
-    "deletionVector.pathOrInlineDv",
-    "deletionVector.offset",
-];
-
-static MANDATORY_REMOVE_FILE_COLUMNS: LazyLock<DeltaResult<ColumnNamesAndTypes>> =
+static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTypes>> =
     LazyLock::new(|| {
         let names = vec![
             column_name!(PATH_NAME),
             column_name!(SIZE_NAME),
-            column_name!("deletionVector.storageType"),
-            column_name!("deletionVector.pathOrInlineDv"),
-            column_name!("deletionVector.offset"),
+            column_name!(DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
+            column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
+            column_name!(DELETION_VECTOR_NAME, OFFSET_NAME),
         ];
         let types = names
             .iter()
@@ -44,15 +44,21 @@ static MANDATORY_REMOVE_FILE_COLUMNS: LazyLock<DeltaResult<ColumnNamesAndTypes>>
     });
 
 impl<'a> StagedDataValidator<'a> {
-    pub(crate) fn staged_remove_file(file_actions: &'a mut FileActionTracker) -> DeltaResult<Self> {
-        let columns = MANDATORY_REMOVE_FILE_COLUMNS.as_ref().map_err(|error| {
-            Error::internal_error(format!(
-                "RemoveFile validation columns must exist in the scan-row schema: {error}"
-            ))
-        })?;
+    pub(crate) fn staged_remove_file(
+        existing_file_actions: &'a mut FileActionTracker,
+    ) -> DeltaResult<Self> {
+        let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
+            .as_ref()
+            .map_err(|error| {
+                Error::internal_error(format!(
+                    "RemoveFile validation columns must exist in the scan-row schema: {error}"
+                ))
+            })?;
         Ok(StagedDataValidator::new(
             columns,
-            vec![Box::new(RemoveFileRequiredFields { file_actions })],
+            vec![Box::new(RemoveFileFields {
+                existing_file_actions,
+            })],
         ))
     }
 }
@@ -62,11 +68,11 @@ impl<'a> StagedDataValidator<'a> {
 ///
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
-struct RemoveFileRequiredFields<'a> {
-    file_actions: &'a mut FileActionTracker,
+struct RemoveFileFields<'a> {
+    existing_file_actions: &'a mut FileActionTracker,
 }
 
-impl Validation for RemoveFileRequiredFields<'_> {
+impl Validation for RemoveFileFields<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?
@@ -87,12 +93,11 @@ impl Validation for RemoveFileRequiredFields<'_> {
             ))
         );
         let dv_id = deletion_vector_unique_id(
-            row,
-            getters,
-            DELETION_VECTOR_STORAGE_TYPE,
-            DELETION_VECTOR_COLUMN_NAMES,
+            getters[DELETION_VECTOR_STORAGE_TYPE].get_opt(row, STORAGE_TYPE_NAME)?,
+            getters[DELETION_VECTOR_PATH_OR_INLINE_DV].get_opt(row, PATH_OR_INLINE_DV_NAME)?,
+            getters[DELETION_VECTOR_OFFSET].get_opt(row, OFFSET_NAME)?,
         )?;
-        self.file_actions.record_remove(path, dv_id)
+        self.existing_file_actions.record_remove(path, dv_id)
     }
 }
 
@@ -103,9 +108,12 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{new_null_array, ArrayRef, Int64Array, StringArray};
+    use crate::arrow::array::{
+        new_null_array, ArrayRef, Int32Array, Int64Array, StringArray, StructArray,
+    };
+    use crate::arrow::buffer::NullBuffer;
     use crate::arrow::compute::concat_batches;
-    use crate::arrow::datatypes::Schema as ArrowSchema;
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -115,7 +123,7 @@ mod tests {
 
     #[test]
     fn column_indices_match_schema_order() {
-        let columns = MANDATORY_REMOVE_FILE_COLUMNS
+        let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
             .expect("RemoveFile validation columns should exist in the scan-row schema");
         let (names, _) = columns.as_ref();
@@ -123,7 +131,7 @@ mod tests {
         assert_eq!(names[SIZE], ColumnName::new(["size"]));
         assert_eq!(
             names[DELETION_VECTOR_STORAGE_TYPE],
-            ColumnName::new(["deletionVector", "storageType"])
+            ColumnName::new([DELETION_VECTOR_NAME, STORAGE_TYPE_NAME])
         );
         assert_eq!(names.len(), 5);
     }
@@ -135,11 +143,7 @@ mod tests {
         #[case] selection_vector: &[bool],
         #[case] expected_error: Option<&str>,
     ) {
-        let batch = replace_column(
-            &nullable_staged_remove_files(2 /* row_count */),
-            PATH_NAME,
-            Arc::new(StringArray::from(vec!["same", "same"])),
-        );
+        let batch = nullable_staged_remove_files(&["same", "same"], &[Some("dv-1"), Some("dv-2")]);
         let removes = [FilteredEngineData::try_new(
             Box::new(ArrowEngineData::new(batch)),
             selection_vector.to_vec(),
@@ -227,7 +231,10 @@ mod tests {
         #[values(0, 1)] case_batch_index: usize,
     ) {
         let batch = replace_column(
-            &nullable_staged_remove_files(paths.len()),
+            &nullable_staged_remove_files(
+                &["valid-path-0", "valid-path-1", "valid-path-2"],
+                &[None, None, None],
+            ),
             "path",
             Arc::new(StringArray::from(paths.to_vec())),
         );
@@ -238,8 +245,8 @@ mod tests {
         )
         .expect("valid remove-file selection vector");
         let mut removes = vec![
-            all_rows_selected(nullable_staged_remove_file("default-path-0")),
-            all_rows_selected(nullable_staged_remove_file("default-path-1")),
+            all_rows_selected(nullable_staged_remove_file("default-path-0", None)),
+            all_rows_selected(nullable_staged_remove_file("default-path-1", None)),
         ];
         removes[case_batch_index] = remove;
         let result = validate_remove_files(&removes);
@@ -251,7 +258,7 @@ mod tests {
         }
     }
 
-    fn nullable_staged_remove_file(path: &str) -> RecordBatch {
+    fn nullable_staged_remove_file(path: &str, dv_id: Option<&str>) -> RecordBatch {
         let arrow_schema: ArrowSchema = scan_row_schema()
             .as_ref()
             .try_into_arrow()
@@ -262,6 +269,29 @@ mod tests {
             .map(|field| match field.name().as_str() {
                 "path" => Arc::new(StringArray::from(vec![path])) as ArrayRef,
                 "size" => Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                DELETION_VECTOR_NAME => {
+                    let ArrowDataType::Struct(fields) = field.data_type() else {
+                        panic!("deletionVector should be a struct");
+                    };
+                    let values = fields
+                        .iter()
+                        .map(|field| match field.name().as_str() {
+                            STORAGE_TYPE_NAME => Arc::new(StringArray::from(vec!["i"])) as ArrayRef,
+                            PATH_OR_INLINE_DV_NAME => {
+                                Arc::new(StringArray::from(vec![dv_id.unwrap_or("")])) as ArrayRef
+                            }
+                            OFFSET_NAME => Arc::new(Int32Array::from(vec![None])) as ArrayRef,
+                            "sizeInBytes" => Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                            "cardinality" => Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                            _ => panic!("unexpected deletionVector field '{}'", field.name()),
+                        })
+                        .collect();
+                    Arc::new(StructArray::new(
+                        fields.clone(),
+                        values,
+                        Some(NullBuffer::from(vec![dv_id.is_some()])),
+                    ))
+                }
                 _ => new_null_array(field.data_type(), 1 /* length */),
             })
             .collect();
@@ -270,10 +300,15 @@ mod tests {
             .expect("valid staged remove-file batch")
     }
 
-    fn nullable_staged_remove_files(row_count: usize) -> RecordBatch {
-        let batch = nullable_staged_remove_file("dummy");
-        concat_batches(&batch.schema(), &vec![batch; row_count])
-            .expect("failed to concatenate rows into a multi-row remove-file batch")
+    fn nullable_staged_remove_files(paths: &[&str], dv_ids: &[Option<&str>]) -> RecordBatch {
+        assert_eq!(paths.len(), dv_ids.len());
+        let batches: Vec<_> = paths
+            .iter()
+            .zip(dv_ids)
+            .map(|(path, dv_id)| nullable_staged_remove_file(path, *dv_id))
+            .collect();
+        concat_batches(&batches[0].schema(), &batches)
+            .expect("failed to concatenate remove-file rows")
     }
 
     fn all_rows_selected(batch: RecordBatch) -> FilteredEngineData {

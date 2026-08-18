@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::engine_data::{GetData, MapItem, TypedGetData as _};
+use crate::engine_data::MapItem;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -46,18 +46,17 @@ pub(super) fn validate_partition_keys(
     Ok(())
 }
 
-pub(super) fn deletion_vector_unique_id<'a>(
-    row: usize,
-    getters: &[&'a dyn GetData<'a>],
-    storage_type_column: usize,
-    column_names: [&str; 3],
+pub(super) fn deletion_vector_unique_id(
+    storage_type: Option<&str>,
+    path_or_inline_dv: Option<&str>,
+    offset: Option<i32>,
 ) -> DeltaResult<Option<String>> {
-    let storage_type: Option<&str> = getters[storage_type_column].get_opt(row, column_names[0])?;
     let Some(storage_type) = storage_type else {
         return Ok(None);
     };
-    let path_or_inline_dv: &str = getters[storage_type_column + 1].get(row, column_names[1])?;
-    let offset: Option<i32> = getters[storage_type_column + 2].get_opt(row, column_names[2])?;
+    let path_or_inline_dv = path_or_inline_dv.ok_or_else(|| {
+        Error::missing_data("DeletionVector is missing required field 'pathOrInlineDv'")
+    })?;
     Ok(Some(DeletionVectorDescriptor::unique_id_from_parts(
         storage_type,
         path_or_inline_dv,

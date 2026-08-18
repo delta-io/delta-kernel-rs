@@ -210,15 +210,18 @@ pub(crate) fn create_valid_add_file_batch(all_nullable: bool) -> RecordBatch {
 }
 
 /// Builds one valid add-file row with a fully nullable schema.
-pub(crate) fn nullable_add_file() -> RecordBatch {
-    create_valid_add_file_batch(true /* all_nullable */)
+pub(crate) fn nullable_add_file(path: &str) -> RecordBatch {
+    replace_column(
+        &create_valid_add_file_batch(true /* all_nullable */),
+        "path",
+        Arc::new(StringArray::from(vec![path])),
+    )
 }
 
-/// Builds `row_count` valid add-file rows with a fully nullable schema.
-pub(crate) fn nullable_add_files(row_count: usize) -> RecordBatch {
-    let batch = nullable_add_file();
-    concat_batches(&batch.schema(), &vec![batch; row_count])
-        .expect("failed to concatenate rows into a multi-row add-file batch")
+/// Builds valid add-file rows with a fully nullable schema.
+pub(crate) fn nullable_add_files(paths: &[&str]) -> RecordBatch {
+    let batches: Vec<_> = paths.iter().map(|path| nullable_add_file(path)).collect();
+    concat_batches(&batches[0].schema(), &batches).expect("failed to concatenate add-file rows")
 }
 
 pub(crate) fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
@@ -241,16 +244,19 @@ pub(crate) fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) ->
 
 /// Returns nullable add-file rows with `partitionValues` replaced by `partition_values`.
 pub(crate) fn add_files_with_partition_values(
+    paths: &[&str],
     partition_values: &[&[(&str, Option<&str>)]],
 ) -> RecordBatch {
-    let batches: Vec<_> = partition_values
+    assert_eq!(paths.len(), partition_values.len());
+    let batches: Vec<_> = paths
         .iter()
-        .map(|entries| {
+        .zip(partition_values)
+        .map(|(path, entries)| {
             let modifications: Vec<_> = entries
                 .iter()
                 .map(|(key, value)| AddFilePartitionKeyModify::Insert { key, value: *value })
                 .collect();
-            modify_add_file_partition_keys(nullable_add_file(), &modifications)
+            modify_add_file_partition_keys(nullable_add_file(path), &modifications)
         })
         .collect();
     concat_batches(&batches[0].schema(), &batches)
