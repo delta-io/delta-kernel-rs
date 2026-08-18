@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use super::utils::{validate_partition_keys, validate_required_field_exist};
-use super::{StagedDataValidator, Validation};
+use super::{FileActionTracker, StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
@@ -19,15 +19,17 @@ const MODIFICATION_TIME: usize = 3;
 static MANDATORY_ADD_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| mandatory_add_file_schema().leaves(None));
 
-impl StagedDataValidator {
+impl<'a> StagedDataValidator<'a> {
     /// Creates a validator that validates every staged add-file row.
     pub(crate) fn staged_add_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
+        file_actions: &'a mut FileActionTracker,
     ) -> Self {
         StagedDataValidator::new(
             &MANDATORY_ADD_FILE_COLUMNS,
             vec![Box::new(AddFileRequiredFields {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
+                file_actions,
             })],
         )
     }
@@ -42,11 +44,12 @@ impl StagedDataValidator {
 ///
 /// NOTE: Currently, Kernel doesn't require connectors to set dataChange for staged addFile.
 /// TODO(2869): Add intent-based validation for dataChange.
-pub(crate) struct AddFileRequiredFields {
+pub(crate) struct AddFileRequiredFields<'a> {
     physical_partition_columns: HashSet<String>,
+    file_actions: &'a mut FileActionTracker,
 }
 
-impl Validation for AddFileRequiredFields {
+impl Validation for AddFileRequiredFields<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?
@@ -76,8 +79,7 @@ impl Validation for AddFileRequiredFields {
             path,
             "modificationTime",
         )?;
-
-        Ok(())
+        self.file_actions.record_add(path, None)
     }
 }
 
@@ -98,10 +100,16 @@ mod tests {
     };
     use crate::EngineData;
 
-    fn add_file_validator(physical_partition_columns: &[&str]) -> StagedDataValidator {
+    fn validate_add_files(
+        physical_partition_columns: &[&str],
+        adds: &[Box<dyn EngineData>],
+    ) -> DeltaResult<()> {
+        let mut file_actions = FileActionTracker::default();
         StagedDataValidator::staged_add_file(
             physical_partition_columns.iter().map(|s| s.to_string()),
+            &mut file_actions,
         )
+        .validate(adds)
     }
 
     fn as_engine_data(batch: RecordBatch) -> [Box<dyn EngineData>; 1] {
@@ -124,6 +132,29 @@ mod tests {
     }
 
     #[rstest]
+    #[case::same_batch(false)]
+    #[case::different_batches(true)]
+    fn duplicate_add_file_paths_rejected(#[case] different_batches: bool) {
+        let batches = if different_batches {
+            vec![
+                add_files_with_paths(&["same"]),
+                add_files_with_paths(&["same"]),
+            ]
+        } else {
+            vec![add_files_with_paths(&["same", "same"])]
+        };
+        let adds: Vec<Box<dyn EngineData>> = batches
+            .into_iter()
+            .map(|batch| Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
+            .collect();
+
+        assert_result_error_with_message(
+            validate_add_files(&[] /* physical_partition_columns */, &adds),
+            "multiple AddFile actions",
+        );
+    }
+
+    #[rstest]
     #[case::path("path")]
     #[case::partition_values("partitionValues")]
     #[case::size("size")]
@@ -138,7 +169,7 @@ mod tests {
 
         let adds: Vec<Box<dyn EngineData>> = (0..BATCH_COUNT)
             .map(|batch_index| {
-                let batch = nullable_add_files(ROW_COUNT);
+                let batch = assign_unique_paths(nullable_add_files(ROW_COUNT), batch_index);
                 let batch = if batch_index == invalid_batch {
                     set_field_as_null(&batch, field, invalid_row)
                 } else {
@@ -148,7 +179,7 @@ mod tests {
             })
             .collect();
         assert_result_error_with_message(
-            add_file_validator(&[] /* physical_partition_columns */).validate(&adds),
+            validate_add_files(&[] /* physical_partition_columns */, &adds),
             &format!("missing required field '{field}'"),
         );
     }
@@ -202,7 +233,7 @@ mod tests {
             Arc::new(Int64Array::from(vec![modification_time])),
         );
         let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
-        let result = add_file_validator(&[] /* physical_partition_columns */).validate(&adds);
+        let result = validate_add_files(&[] /* physical_partition_columns */, &adds);
 
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
@@ -214,17 +245,21 @@ mod tests {
     #[test]
     fn partition_values_exact_match_ok() {
         let batch = add_files_with_partition_values(&[&[("p1", Some("a")), ("p2", Some("b"))]]);
-        add_file_validator(&["p1", "p2"] /* physical_partition_columns */)
-            .validate(&as_engine_data(batch))
-            .unwrap();
+        validate_add_files(
+            &["p1", "p2"], /* physical_partition_columns */
+            &as_engine_data(batch),
+        )
+        .unwrap();
     }
 
     #[test]
     fn partition_value_null_still_counts_as_present() {
         let batch = add_files_with_partition_values(&[&[("p1", Some("a")), ("p2", None)]]);
-        add_file_validator(&["p1", "p2"] /* physical_partition_columns */)
-            .validate(&as_engine_data(batch))
-            .unwrap();
+        validate_add_files(
+            &["p1", "p2"], /* physical_partition_columns */
+            &as_engine_data(batch),
+        )
+        .unwrap();
     }
 
     #[rstest]
@@ -275,12 +310,14 @@ mod tests {
                 if batch_index == invalid_batch {
                     partition_values[invalid_row] = invalid_partition_values;
                 }
-                let batch = add_files_with_partition_values(&partition_values);
+                let batch = assign_unique_paths(
+                    add_files_with_partition_values(&partition_values),
+                    batch_index,
+                );
                 Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
             })
             .collect();
-        let error = add_file_validator(physical_partition_columns)
-            .validate(&adds)
+        let error = validate_add_files(physical_partition_columns, &adds)
             .expect_err("invalid partition values should be rejected");
         let Error::InvalidPartitionValues(message) = error else {
             panic!("expected InvalidPartitionValues, got {error:?}");
@@ -295,9 +332,26 @@ mod tests {
     fn unpartitioned_table_rejects_partition_values() {
         let batch = add_files_with_partition_values(&[&[("stray", Some("x"))]]);
         assert_result_error_with_message(
-            add_file_validator(&[] /* physical_partition_columns */)
-                .validate(&as_engine_data(batch)),
+            validate_add_files(
+                &[], /* physical_partition_columns */
+                &as_engine_data(batch),
+            ),
             "partitionValues keys",
         );
+    }
+
+    fn assign_unique_paths(batch: RecordBatch, batch_index: usize) -> RecordBatch {
+        let paths: Vec<_> = (0..batch.num_rows())
+            .map(|row_index| format!("batch-{batch_index}-row-{row_index}"))
+            .collect();
+        replace_column(&batch, "path", Arc::new(StringArray::from(paths)))
+    }
+
+    fn add_files_with_paths(paths: &[&str]) -> RecordBatch {
+        replace_column(
+            &nullable_add_files(paths.len()),
+            "path",
+            Arc::new(StringArray::from(paths.to_vec())),
+        )
     }
 }

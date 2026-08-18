@@ -423,19 +423,20 @@ impl<S> Transaction<S> {
         // each stats column.
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
-        // Validate required fields for addFile.
+        let mut file_actions = write_validation::FileActionTracker::default();
         write_validation::StagedDataValidator::staged_add_file(
             self.effective_table_config.physical_partition_columns(),
+            &mut file_actions,
         )
         .validate(&self.add_files_metadata)?;
 
         write_validation::StagedDataValidator::staged_dv_matched_file(
             self.effective_table_config.physical_partition_columns(),
+            &mut file_actions,
         )?
         .validate_filtered(&self.dv_matched_files)?;
 
-        // Validate required fields for RemoveFile.
-        write_validation::StagedDataValidator::staged_remove_file()
+        write_validation::StagedDataValidator::staged_remove_file(&mut file_actions)?
             .validate_filtered(&self.remove_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions
