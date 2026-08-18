@@ -329,10 +329,34 @@ fn struct_columns_from_patch(
     let mut output_fields = target.fields();
     let mut pairs: Vec<(String, DFExpr)> = Vec::with_capacity(target.num_fields());
 
-    for expr in &patch.prepended_fields {
-        append_struct_patch_field(&mut pairs, &mut output_fields, |field| {
-            to_df_expr(expr, input_schema, Some(field.data_type()))
+    let append_converted = |pairs: &mut Vec<(String, DFExpr)>,
+                            output_fields: &mut dyn Iterator<Item = &StructField>,
+                            expr: &KernelExpression|
+     -> DeltaResult<()> {
+        let field = output_fields.next().ok_or_else(|| {
+            Error::generic("StructPatch produced more fields than the output schema has")
         })?;
+        let value = to_df_expr(expr, input_schema, Some(field.data_type()))?;
+        pairs.push((field.name().to_string(), value));
+        Ok(())
+    };
+    let append_existing = |pairs: &mut Vec<(String, DFExpr)>,
+                           output_fields: &mut dyn Iterator<Item = &StructField>,
+                           name: &str|
+     -> DeltaResult<()> {
+        let field = output_fields.next().ok_or_else(|| {
+            Error::generic("StructPatch produced more fields than the output schema has")
+        })?;
+        let value = match &source_expr {
+            Some(base) => get_field(base.clone(), name.to_string()),
+            None => DFExpr::Column(DFColumn::new_unqualified(name)),
+        };
+        pairs.push((field.name().to_string(), value));
+        Ok(())
+    };
+
+    for expr in &patch.prepended_fields {
+        append_converted(&mut pairs, &mut output_fields, expr)?;
     }
 
     // Should only count required field patches (excluding optional) for missing input fields
@@ -343,21 +367,14 @@ fn struct_columns_from_patch(
         let field_patch = patch.field_patches.get(name);
 
         if field_patch.is_none_or(|fp| fp.keep_input) {
-            append_struct_patch_field(&mut pairs, &mut output_fields, |_| {
-                Ok(match &source_expr {
-                    Some(base) => get_field(base.clone(), name.to_string()),
-                    None => DFExpr::Column(DFColumn::new_unqualified(name)),
-                })
-            })?;
+            append_existing(&mut pairs, &mut output_fields, name)?;
         }
 
         let Some(field_patch) = field_patch else {
             continue;
         };
         for expr in &field_patch.insertions {
-            append_struct_patch_field(&mut pairs, &mut output_fields, |field| {
-                to_df_expr(expr, input_schema, Some(field.data_type()))
-            })?;
+            append_converted(&mut pairs, &mut output_fields, expr)?;
         }
         if !field_patch.optional {
             used_required_field_patches += 1;
@@ -376,9 +393,7 @@ fn struct_columns_from_patch(
     }
 
     for expr in &patch.appended_fields {
-        append_struct_patch_field(&mut pairs, &mut output_fields, |field| {
-            to_df_expr(expr, input_schema, Some(field.data_type()))
-        })?;
+        append_converted(&mut pairs, &mut output_fields, expr)?;
     }
 
     if output_fields.next().is_some() {
@@ -388,19 +403,6 @@ fn struct_columns_from_patch(
     }
 
     Ok(StructColumns { pairs, null_guard })
-}
-
-fn append_struct_patch_field<'a>(
-    pairs: &mut Vec<(String, DFExpr)>,
-    output_fields: &mut impl Iterator<Item = &'a StructField>,
-    value: impl FnOnce(&StructField) -> DeltaResult<DFExpr>,
-) -> DeltaResult<()> {
-    let field = output_fields.next().ok_or_else(|| {
-        Error::generic("StructPatch produced more fields than the output schema has")
-    })?;
-    let value = value(field)?;
-    pairs.push((field.name().to_string(), value));
-    Ok(())
 }
 
 /// Lowers a `MapToStruct` (reshape a `Map<String, String>` into a struct by parsing each value into
