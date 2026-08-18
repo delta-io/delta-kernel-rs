@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
-use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use delta_kernel::{CancellationTokenRef, DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
@@ -192,8 +192,20 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        self.list_from_with_cancellation(path, None)
+    }
+
+    fn list_from_with_cancellation(
+        &self,
+        path: &Url,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         let future = list_from_impl(self.inner.clone(), path.clone());
-        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        let iter = super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
@@ -207,8 +219,20 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+        self.read_files_with_cancellation(files, None)
+    }
+
+    fn read_files_with_cancellation(
+        &self,
+        files: Vec<FileSlice>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
-        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        let iter = super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
@@ -556,5 +580,20 @@ mod tests {
             Err(Error::FileNotFound(_))
         ));
         handler.delete(&missing_url).unwrap();
+    }
+    // The cancellation-aware overrides feed the racing helper, so an already-cancelled token stops
+    // the operation instead of performing I/O. (The race itself is covered by the
+    // `stream_future_to_cancellable_iter` tests in `lib.rs`.)
+    #[test]
+    fn precancelled_token_short_circuits_list_and_read() {
+        let (tempdir, _store, handler) = setup_test();
+        let url = Url::from_directory_path(tempdir.path()).unwrap();
+        let token: CancellationTokenRef = Arc::new(test_utils::TestCancellationToken::cancelled());
+
+        let listed = handler.list_from_with_cancellation(&url, Some(token.clone()));
+        assert!(matches!(listed, Err(Error::Cancelled)));
+
+        let read = handler.read_files_with_cancellation(vec![(url, None)], Some(token));
+        assert!(matches!(read, Err(Error::Cancelled)));
     }
 }

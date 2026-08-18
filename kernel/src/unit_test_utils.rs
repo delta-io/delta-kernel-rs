@@ -1278,3 +1278,35 @@ pub(crate) fn geometry_type(crs: &str) -> KernelDataType {
 pub(crate) fn geography_type(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> KernelDataType {
     PrimitiveType::Geography(Box::new(GeographyType::try_new(crs, algorithm).unwrap())).into()
 }
+
+/// A [`CancellationToken`](crate::CancellationToken) for kernel unit tests, cancellable on demand.
+///
+/// `test_utils::TestCancellationToken` cannot be used here: it implements the trait against
+/// `test_utils`'s own `delta_kernel` dependency, a different crate instance than the
+/// crate-under-test, so its impl does not satisfy the crate-self trait in unit tests. Integration
+/// tests (which see one external `delta_kernel`) use the `test_utils` one instead.
+#[derive(Default)]
+pub(crate) struct TestCancellationToken(std::sync::atomic::AtomicBool);
+
+impl TestCancellationToken {
+    /// A token that is already cancelled.
+    pub(crate) fn cancelled() -> Self {
+        let token = Self::default();
+        token.cancel();
+        token
+    }
+
+    /// Request cancellation.
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl crate::cancellation::CancellationToken for TestCancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn cancelled_future(&self) -> crate::cancellation::CancelledFuture<'_> {
+        Box::pin(std::future::ready(()))
+    }
+}

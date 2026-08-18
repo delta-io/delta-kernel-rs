@@ -395,7 +395,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)?;
         log_segment.build_crc_from_base(&self.engine, base)
     }
 
@@ -407,7 +407,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)?;
         Ok(log_segment
             .pick_latest_base_crc(&self.engine, in_memory_base)
             .map(|c| c.version))
