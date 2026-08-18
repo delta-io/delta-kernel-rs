@@ -139,8 +139,8 @@ pub(crate) fn table_changes_action_iter_with_mode(
 ///     - Ensure that partition columns remain unchanged in both modes.
 ///     - Read the in-commit timestamp from `CommitInfo` when that feature is enabled.
 ///
-/// Protocol and metadata compatibility checks run in phase 1 so errors are reported before scan
-/// file generation.
+/// Note: We check the protocol, mode-specific table feature, schema compatibility, and partition
+/// columns in phase 1 in order to detect errors and fail early.
 ///
 /// Note: The reader feature [`ReaderFeatures::DeletionVectors`] controls whether the table is
 /// allowed to contain deletion vectors. [`TableProperties`].enable_deletion_vectors only
