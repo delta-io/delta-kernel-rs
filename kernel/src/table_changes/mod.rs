@@ -326,9 +326,24 @@ impl TableChanges {
             end_version,
         )?;
 
-        let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
-            .at_version(start_version)
-            .build(engine)?;
+        // File actions expose partition values as maps, and remove partition values are optional.
+        // Load the preceding table metadata to validate the ordered partition layout at the first
+        // change version.
+        let (start_snapshot, previous_snapshot) =
+            if let Some(previous_version) = start_version.checked_sub(1) {
+                let previous_snapshot = Snapshot::builder_for(table_root.as_url().clone())
+                    .at_version(previous_version)
+                    .build(engine)?;
+                let start_snapshot = Snapshot::builder_from(previous_snapshot.clone())
+                    .at_version(start_version)
+                    .build(engine)?;
+                (start_snapshot, Some(previous_snapshot))
+            } else {
+                let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
+                    .at_version(start_version)
+                    .build(engine)?;
+                (start_snapshot, None)
+            };
         start_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
@@ -403,17 +418,14 @@ impl TableChanges {
             read_partition_columns,
             start_snapshot.version(),
         )?;
-        if let Some(previous_version) = start_version.checked_sub(1) {
-            let previous_snapshot = Snapshot::builder_for(table_root.as_url().clone())
-                .at_version(previous_version)
-                .build(engine)?;
+        if let Some(previous_snapshot) = previous_snapshot {
             ensure_partition_columns_unchanged(
                 previous_snapshot
                     .table_configuration()
                     .metadata()
                     .partition_columns(),
                 read_partition_columns,
-                previous_version,
+                previous_snapshot.version(),
             )?;
         }
 
@@ -653,14 +665,22 @@ mod tests {
         .unwrap()
     }
 
-    fn mode_setup_actions(mode: CdfMode, schema: Arc<StructType>) -> [Action; 2] {
+    fn mode_setup_actions(
+        mode: CdfMode,
+        schema: Arc<StructType>,
+        partition_columns: &[&str],
+    ) -> [Action; 2] {
         let protocol = match mode {
             CdfMode::ChangeDataFeed => Protocol::try_new_legacy(1, 4).unwrap(),
             CdfMode::RowTracking => row_tracking_protocol(),
         };
         [
             Action::Protocol(protocol),
-            Action::Metadata(metadata_with_partition_columns(mode, schema, &[])),
+            Action::Metadata(metadata_with_partition_columns(
+                mode,
+                schema,
+                partition_columns,
+            )),
         ]
     }
 
@@ -868,22 +888,30 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::added(&[], &["id"])]
+    #[case::reordered(&["id", "value"], &["value", "id"])]
     #[tokio::test]
     async fn try_new_rejects_partition_column_change_at_range_boundary(
         #[values(CdfMode::ChangeDataFeed, CdfMode::RowTracking)] mode: CdfMode,
         #[values(0, 1)] start_version: Version,
+        #[case] initial_partition_columns: &[&str],
+        #[case] read_partition_columns: &[&str],
     ) {
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
         let schema = listing_test_schema();
         mock_table
-            .commit(mode_setup_actions(mode, Arc::clone(&schema)))
+            .commit(mode_setup_actions(
+                mode,
+                Arc::clone(&schema),
+                initial_partition_columns,
+            ))
             .await;
         mock_table
             .commit([Action::Metadata(metadata_with_partition_columns(
                 mode,
                 schema,
-                &["id"],
+                read_partition_columns,
             ))])
             .await;
 
@@ -899,7 +927,12 @@ mod tests {
                 Some(1),
             ),
         };
-        assert_incompatible_partition_columns(result, &["id"], &[], 0);
+        assert_incompatible_partition_columns(
+            result,
+            read_partition_columns,
+            initial_partition_columns,
+            0,
+        );
     }
 
     #[rstest::rstest]
@@ -907,7 +940,7 @@ mod tests {
     #[case::change_data_feed_false_predicate(CdfMode::ChangeDataFeed, true)]
     #[case::row_tracking(CdfMode::RowTracking, false)]
     #[tokio::test]
-    async fn scan_rejects_incompatible_intermediate_partition_columns(
+    async fn scan_handles_incompatible_intermediate_partition_columns(
         #[case] mode: CdfMode,
         #[case] false_predicate: bool,
     ) {
@@ -915,7 +948,7 @@ mod tests {
         let mut mock_table = LocalMockTable::new();
         let schema = listing_test_schema();
         mock_table
-            .commit(mode_setup_actions(mode, Arc::clone(&schema)))
+            .commit(mode_setup_actions(mode, Arc::clone(&schema), &[]))
             .await;
         mock_table
             .commit([Action::Metadata(metadata_with_partition_columns(
@@ -945,7 +978,11 @@ mod tests {
                 };
                 let scan = builder.build().unwrap();
                 let result: DeltaResult<Vec<_>> = scan.execute(engine).unwrap().try_collect();
-                assert_incompatible_partition_columns(result, &[], &["id"], 1);
+                if false_predicate {
+                    assert!(result.unwrap().is_empty());
+                } else {
+                    assert_incompatible_partition_columns(result, &[], &["id"], 1);
+                }
             }
             CdfMode::RowTracking => {
                 let table_changes = Arc::new(
