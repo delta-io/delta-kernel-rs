@@ -4,10 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{
-    DataType as ArrowDataType, FieldRef as ArrowFieldRef, Schema as ArrowSchema,
-    SchemaRef as ArrowSchemaRef,
-};
+use datafusion::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, ScalarValue as DFScalarValue};
 use datafusion::datasource::listing::{ListingTableUrl, PartitionedFile};
@@ -21,7 +18,6 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::{
     Expr as DFExpr, LogicalPlan as DFLogicalPlan, LogicalPlanBuilder, TableType,
 };
-use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
@@ -32,7 +28,7 @@ use delta_kernel::plans::ir::nodes::{
 use delta_kernel::schema::StructType as KernelStructType;
 use itertools::Itertools;
 
-use crate::parquet_expr_adapter::KernelParquetExprAdapterFactory;
+use crate::parquet_field_id::ParquetFieldIdAdapterFactory;
 use crate::scalar::to_df_scalar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,8 +58,8 @@ impl std::fmt::Debug for StaticFileProvider {
 /// Lowers a kernel [`ScanParquet`](KernelScanParquet) into a DataFusion
 /// [`LogicalPlan`](DFLogicalPlan) that reads exactly the files named by the scan node.
 ///
-/// The physical scan uses [`KernelParquetExprAdapterFactory`] to reconcile each checkpoint's
-/// physical schema with the schema requested by kernel.
+/// The physical scan uses [`ParquetFieldIdAdapterFactory`] to resolve per-file field identities
+/// and reconcile each file's physical schema with the schema requested by kernel.
 ///
 /// # Errors
 /// Returns an error if the schema or file locations cannot be represented by DataFusion.
@@ -99,7 +95,7 @@ fn lower_scan(
     schema: &KernelStructType,
 ) -> Result<DFLogicalPlan, DataFusionError> {
     let output_schema: ArrowSchemaRef = Arc::new(schema.try_into_arrow()?);
-    validate_scan_schema(format, schema, &output_schema)?;
+    validate_scan_schema(schema)?;
 
     let (table_schema, projection) =
         build_scan_table_schema_and_projection(&output_schema, file_constant_columns);
@@ -109,7 +105,7 @@ fn lower_scan(
         ScanFormat::Json => Arc::new(JsonSource::new(table_schema)),
     };
     let expr_adapter = (format == ScanFormat::Parquet)
-        .then(|| Arc::new(KernelParquetExprAdapterFactory) as Arc<dyn PhysicalExprAdapterFactory>);
+        .then(|| Arc::new(ParquetFieldIdAdapterFactory) as Arc<dyn PhysicalExprAdapterFactory>);
     let provider = StaticFileProvider {
         file_source,
         expr_adapter,
@@ -124,46 +120,14 @@ fn lower_scan(
     LogicalPlanBuilder::scan(table_name, source, Some(projection))?.build()
 }
 
-// TODO(#3167): support metadata columns and Parquet field-ID resolution.
-fn validate_scan_schema(
-    format: ScanFormat,
-    schema: &KernelStructType,
-    output_schema: &ArrowSchemaRef,
-) -> Result<(), DataFusionError> {
+fn validate_scan_schema(schema: &KernelStructType) -> Result<(), DataFusionError> {
     if let Some(field) = schema.metadata_columns().next() {
         return Err(DataFusionError::NotImplemented(format!(
             "scan metadata column `{}` is not supported by the DataFusion executor",
             field.name()
         )));
     }
-    if format == ScanFormat::Parquet {
-        if let Some(field_name) = parquet_field_id_name(output_schema.fields()) {
-            return Err(DataFusionError::NotImplemented(format!(
-                "Parquet field-ID resolution for `{}` is not supported by the DataFusion executor",
-                field_name
-            )));
-        }
-    }
     Ok(())
-}
-
-fn parquet_field_id_name(fields: &[ArrowFieldRef]) -> Option<String> {
-    fields.iter().find_map(|field| {
-        if field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY) {
-            return Some(field.name().clone());
-        }
-
-        match field.data_type() {
-            ArrowDataType::Struct(fields) => parquet_field_id_name(fields),
-            ArrowDataType::List(field)
-            | ArrowDataType::LargeList(field)
-            | ArrowDataType::FixedSizeList(field, _)
-            | ArrowDataType::ListView(field)
-            | ArrowDataType::LargeListView(field)
-            | ArrowDataType::Map(field, _) => parquet_field_id_name(std::slice::from_ref(field)),
-            _ => None,
-        }
-    })
 }
 
 #[async_trait]
@@ -290,16 +254,21 @@ fn file_constants(file: &KernelScanFile) -> Result<Vec<DFScalarValue>, DataFusio
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs::File;
     use std::io::Cursor;
 
-    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::arrow::array::{
+        Array, ArrayRef, Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+    };
+    use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use datafusion::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use datafusion::arrow::json::ReaderBuilder as JsonReaderBuilder;
     use datafusion::assert_batches_sorted_eq;
-    use datafusion::logical_expr::col as df_col;
+    use datafusion::functions::core::expr_fn::get_field;
+    use datafusion::logical_expr::{col as df_col, lit as df_lit};
     use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use datafusion::parquet::arrow::ArrowWriter;
     use datafusion::prelude::SessionContext;
@@ -308,8 +277,9 @@ mod tests {
     };
     use delta_kernel::plans::ir::nodes::Operator as KernelOperator;
     use delta_kernel::schema::{
-        ArrayType as KernelArrayType, DataType as KernelDataType, MapType as KernelMapType,
-        StructField as KernelStructField, StructType as KernelStructType,
+        ArrayType as KernelArrayType, ColumnMetadataKey, DataType as KernelDataType,
+        MapType as KernelMapType, MetadataColumnSpec, StructField as KernelStructField,
+        StructType as KernelStructType,
     };
     use delta_kernel::FileMeta as KernelFileMeta;
     use rstest::rstest;
@@ -393,14 +363,33 @@ mod tests {
             ],
         )
         .unwrap();
-        write_parquet_batch(path, &batch);
+        write_parquet_batch(path, batch);
     }
 
-    fn write_parquet_batch(path: &std::path::Path, batch: &RecordBatch) {
+    fn write_parquet_batch(path: &std::path::Path, batch: RecordBatch) {
         let mut writer =
             ArrowWriter::try_new(File::create(path).unwrap(), batch.schema(), None).unwrap();
-        writer.write(batch).unwrap();
+        writer.write(&batch).unwrap();
         writer.close().unwrap();
+    }
+
+    fn parquet_file(path: &std::path::Path) -> KernelScanFile {
+        KernelScanFile {
+            meta: KernelFileMeta {
+                location: format!("file://{}", path.display()).parse().unwrap(),
+                last_modified: 0,
+                size: std::fs::metadata(path).unwrap().len(),
+            },
+            file_constants: vec![],
+        }
+    }
+
+    fn arrow_field_id(id: i64) -> HashMap<String, String> {
+        HashMap::from([("PARQUET:field_id".to_string(), id.to_string())])
+    }
+
+    fn kernel_field_id(id: i64) -> [(String, i64); 1] {
+        [(ColumnMetadataKey::ParquetFieldId.as_ref().to_string(), id)]
     }
 
     fn write_json(path: &std::path::Path, ids: &[i64]) {
@@ -505,7 +494,7 @@ mod tests {
                     .next()
                     .unwrap()
                     .unwrap();
-                write_parquet_batch(&path, &batch);
+                write_parquet_batch(&path, batch);
                 let reader =
                     ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap();
                 Some(reader.schema().clone())
@@ -748,7 +737,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::clone(&physical_arrow_schema), vec![array]).unwrap();
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("array-map.parquet");
-        write_parquet_batch(&path, &batch);
+        write_parquet_batch(&path, batch);
 
         let requested_schema = KernelStructType::try_new([
             KernelStructField::not_null("partition", KernelDataType::STRING),
@@ -846,6 +835,393 @@ mod tests {
         assert!(error
             .to_string()
             .contains("expects 0 input(s), but received 1"));
+    }
+
+    #[test]
+    fn scan_rejects_metadata_columns() {
+        let schema = KernelStructType::try_new([KernelStructField::create_metadata_column(
+            "row_index",
+            MetadataColumnSpec::RowIndex,
+        )])
+        .unwrap();
+        let error = lower_test_scan(TestFormat::Json, vec![], schema).unwrap_err();
+        assert!(error.to_string().contains("metadata column `row_index`"));
+    }
+
+    #[tokio::test]
+    async fn parquet_scan_resolves_renamed_top_level_field_by_id_and_casts() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("renamed.parquet");
+        let physical_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "physical",
+            ArrowDataType::Int64,
+            false,
+        )
+        .with_metadata(arrow_field_id(1))]));
+        write_parquet_batch(
+            &path,
+            RecordBatch::try_new(
+                physical_schema,
+                vec![Arc::new(Int64Array::from(vec![7, 9]))],
+            )
+            .unwrap(),
+        );
+        let schema = KernelStructType::try_new([KernelStructField::not_null(
+            "logical",
+            KernelDataType::DOUBLE,
+        )
+        .add_metadata(kernel_field_id(1))])
+        .unwrap();
+        let plan = lower_parquet_scan(&KernelScanParquet {
+            files: vec![parquet_file(&path)],
+            file_constant_columns: vec![],
+            schema: Arc::new(schema),
+        })
+        .unwrap();
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_sorted_eq!(
+            [
+                "+---------+",
+                "| logical |",
+                "+---------+",
+                "| 7.0     |",
+                "| 9.0     |",
+                "+---------+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test]
+    async fn parquet_scan_resolves_nested_renames_for_projection_and_predicate() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("nested.parquet");
+        let physical_child = Arc::new(
+            ArrowField::new("child_physical", ArrowDataType::Int64, false)
+                .with_metadata(arrow_field_id(2)),
+        );
+        let physical_struct = StructArray::new(
+            vec![Arc::clone(&physical_child)].into(),
+            vec![Arc::new(Int64Array::from(vec![3, 7])) as ArrayRef],
+            None,
+        );
+        let physical_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "parent_physical",
+            ArrowDataType::Struct(vec![physical_child].into()),
+            false,
+        )
+        .with_metadata(arrow_field_id(1))]));
+        write_parquet_batch(
+            &path,
+            RecordBatch::try_new(physical_schema, vec![Arc::new(physical_struct)]).unwrap(),
+        );
+
+        let child = KernelStructField::not_null("child", KernelDataType::LONG)
+            .add_metadata(kernel_field_id(2));
+        let parent_type = KernelStructType::try_new([child]).unwrap();
+        let schema =
+            KernelStructType::try_new([
+                KernelStructField::not_null("parent", parent_type).add_metadata(kernel_field_id(1))
+            ])
+            .unwrap();
+        let scan = lower_parquet_scan(&KernelScanParquet {
+            files: vec![parquet_file(&path)],
+            file_constant_columns: vec![],
+            schema: Arc::new(schema),
+        })
+        .unwrap();
+        let plan = LogicalPlanBuilder::from(scan)
+            .filter(get_field(df_col("parent"), "child").gt(df_lit(5_i64)))
+            .unwrap()
+            .build()
+            .unwrap();
+        let context = SessionContext::new();
+        let dataframe = context.execute_logical_plan(plan).await.unwrap();
+        let batches = dataframe.collect().await.unwrap();
+        assert_batches_sorted_eq!(
+            [
+                "+------------+",
+                "| parent     |",
+                "+------------+",
+                "| {child: 7} |",
+                "+------------+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test]
+    async fn parquet_scan_resolves_different_physical_schemas_and_output_order() {
+        let directory = TempDir::new().unwrap();
+        let first_path = directory.path().join("first.parquet");
+        let first_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("left_first", ArrowDataType::Int64, false)
+                .with_metadata(arrow_field_id(1)),
+            ArrowField::new("right_first", ArrowDataType::Int64, false)
+                .with_metadata(arrow_field_id(2)),
+        ]));
+        write_parquet_batch(
+            &first_path,
+            RecordBatch::try_new(
+                first_schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1])),
+                    Arc::new(Int64Array::from(vec![10])),
+                ],
+            )
+            .unwrap(),
+        );
+
+        let second_path = directory.path().join("second.parquet");
+        let second_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("right_second", ArrowDataType::Int64, false)
+                .with_metadata(arrow_field_id(2)),
+            ArrowField::new("left_second", ArrowDataType::Int64, false)
+                .with_metadata(arrow_field_id(1)),
+        ]));
+        write_parquet_batch(
+            &second_path,
+            RecordBatch::try_new(
+                second_schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![20])),
+                    Arc::new(Int64Array::from(vec![2])),
+                ],
+            )
+            .unwrap(),
+        );
+
+        let schema = KernelStructType::try_new([
+            KernelStructField::not_null("right", KernelDataType::LONG)
+                .add_metadata(kernel_field_id(2)),
+            KernelStructField::not_null("left", KernelDataType::LONG)
+                .add_metadata(kernel_field_id(1)),
+        ])
+        .unwrap();
+        let plan = lower_parquet_scan(&KernelScanParquet {
+            files: vec![parquet_file(&first_path), parquet_file(&second_path)],
+            file_constant_columns: vec![],
+            schema: Arc::new(schema),
+        })
+        .unwrap();
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_sorted_eq!(
+            [
+                "+-------+------+",
+                "| right | left |",
+                "+-------+------+",
+                "| 10    | 1    |",
+                "| 20    | 2    |",
+                "+-------+------+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test]
+    async fn parquet_scan_adapts_list_of_struct_by_field_id() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("list_struct.parquet");
+        let physical_child = Arc::new(
+            ArrowField::new("child_physical", ArrowDataType::Int64, false)
+                .with_metadata(arrow_field_id(2)),
+        );
+        let values = StructArray::new(
+            vec![Arc::clone(&physical_child)].into(),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+            None,
+        );
+        let element = Arc::new(ArrowField::new(
+            "element",
+            ArrowDataType::Struct(vec![physical_child].into()),
+            false,
+        ));
+        let list = ListArray::try_new(
+            element,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+            Arc::new(values),
+            None,
+        )
+        .unwrap();
+        let physical_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "items_physical",
+            list.data_type().clone(),
+            false,
+        )
+        .with_metadata(arrow_field_id(1))]));
+        write_parquet_batch(
+            &path,
+            RecordBatch::try_new(physical_schema, vec![Arc::new(list)]).unwrap(),
+        );
+
+        let element_type = KernelStructType::try_new([
+            KernelStructField::not_null("child", KernelDataType::LONG)
+                .add_metadata(kernel_field_id(2)),
+            KernelStructField::nullable("added", KernelDataType::STRING),
+        ])
+        .unwrap();
+        let schema = KernelStructType::try_new([KernelStructField::not_null(
+            "items",
+            KernelArrayType::new(element_type, false),
+        )
+        .add_metadata(kernel_field_id(1))])
+        .unwrap();
+        let plan = lower_parquet_scan(&KernelScanParquet {
+            files: vec![parquet_file(&path)],
+            file_constant_columns: vec![],
+            schema: Arc::new(schema),
+        })
+        .unwrap();
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_sorted_eq!(
+            [
+                "+--------------------------------------------+",
+                "| items                                      |",
+                "+--------------------------------------------+",
+                "| [{child: 1, added: }, {child: 2, added: }] |",
+                "+--------------------------------------------+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test]
+    async fn parquet_scan_adapts_map_of_struct_by_field_id() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("map_struct.parquet");
+        let physical_child = Arc::new(
+            ArrowField::new("child_physical", ArrowDataType::Int64, false)
+                .with_metadata(arrow_field_id(2)),
+        );
+        let values = StructArray::new(
+            vec![Arc::clone(&physical_child)].into(),
+            vec![Arc::new(Int64Array::from(vec![7])) as ArrayRef],
+            None,
+        );
+        let key_field = Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false));
+        let value_field = Arc::new(ArrowField::new(
+            "value",
+            ArrowDataType::Struct(vec![physical_child].into()),
+            true,
+        ));
+        let entries_field = Arc::new(ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(vec![Arc::clone(&key_field), Arc::clone(&value_field)].into()),
+            false,
+        ));
+        let entries = StructArray::new(
+            vec![key_field, value_field].into(),
+            vec![Arc::new(StringArray::from(vec!["k"])), Arc::new(values)],
+            None,
+        );
+        let map = MapArray::try_new(
+            entries_field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1])),
+            entries,
+            None,
+            false,
+        )
+        .unwrap();
+        let physical_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "items_physical",
+            map.data_type().clone(),
+            false,
+        )
+        .with_metadata(arrow_field_id(1))]));
+        write_parquet_batch(
+            &path,
+            RecordBatch::try_new(physical_schema, vec![Arc::new(map)]).unwrap(),
+        );
+
+        let value_type = KernelStructType::try_new([
+            KernelStructField::not_null("child", KernelDataType::LONG)
+                .add_metadata(kernel_field_id(2)),
+            KernelStructField::nullable("added", KernelDataType::STRING),
+        ])
+        .unwrap();
+        let schema = KernelStructType::try_new([KernelStructField::not_null(
+            "items",
+            KernelMapType::new(KernelDataType::STRING, value_type, true),
+        )
+        .add_metadata(kernel_field_id(1))])
+        .unwrap();
+        let plan = lower_parquet_scan(&KernelScanParquet {
+            files: vec![parquet_file(&path)],
+            file_constant_columns: vec![],
+            schema: Arc::new(schema),
+        })
+        .unwrap();
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_sorted_eq!(
+            [
+                "+--------------------------+",
+                "| items                    |",
+                "+--------------------------+",
+                "| {k: {child: 7, added: }} |",
+                "+--------------------------+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test]
+    async fn parquet_scan_rejects_missing_non_nullable_field() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("missing.parquet");
+        write_parquet(&path, &[1]);
+        let schema = KernelStructType::try_new([
+            KernelStructField::not_null("id", KernelDataType::LONG),
+            KernelStructField::not_null("missing", KernelDataType::STRING),
+        ])
+        .unwrap();
+        let plan = lower_parquet_scan(&KernelScanParquet {
+            files: vec![parquet_file(&path)],
+            file_constant_columns: vec![],
+            schema: Arc::new(schema),
+        })
+        .unwrap();
+
+        let error = SessionContext::new()
+            .execute_logical_plan(plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Non-nullable column 'missing' is missing"),
+            "{error}"
+        );
     }
 
     #[test]

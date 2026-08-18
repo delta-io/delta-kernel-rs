@@ -13,9 +13,10 @@ use std::sync::Arc;
 use datafusion::execution::context::SessionContext;
 use delta_kernel::StorageHandler;
 
+mod arrow_utils;
 mod expression;
 mod operator;
-mod parquet_expr_adapter;
+mod parquet_field_id;
 mod plan;
 mod predicate;
 mod scalar;
