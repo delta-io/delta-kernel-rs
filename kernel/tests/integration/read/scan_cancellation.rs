@@ -2,13 +2,18 @@
 //! surface `Error::Cancelled` through the real Default Engine and can never be mistaken for a
 //! complete listing.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::{CancellationTokenRef, Error, Snapshot};
+use delta_kernel::schema::SchemaRef;
+use delta_kernel::{
+    CancellationToken as _, CancellationTokenRef, DeltaResult, Engine, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, FilteredEngineData, JsonHandler, ParquetHandler,
+    PredicateRef, Snapshot,
+};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
@@ -187,6 +192,227 @@ async fn precancelled_scan_over_checkpoint_yields_cancelled(
         .build()?;
 
     assert_cancelled(scan.scan_metadata(engine.as_ref()));
+    Ok(())
+}
+
+/// A [`JsonHandler`] that records the cancellation token handed to it, so a test can check what
+/// kernel actually passed down. Delegates the read itself to the real handler.
+struct TokenCapturingJsonHandler {
+    inner: Arc<dyn JsonHandler>,
+    seen: Mutex<Option<CancellationTokenRef>>,
+}
+
+impl JsonHandler for TokenCapturingJsonHandler {
+    fn parse_json(
+        &self,
+        json_strings: Box<dyn EngineData>,
+        output_schema: SchemaRef,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        self.inner.parse_json(json_strings, output_schema)
+    }
+
+    fn read_json_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.inner
+            .read_json_files(files, physical_schema, predicate)
+    }
+
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        *self.seen.lock().unwrap() = cancellation_token.clone();
+        self.inner.read_json_files_with_cancellation(
+            files,
+            physical_schema,
+            predicate,
+            cancellation_token,
+        )
+    }
+
+    fn write_json_file(
+        &self,
+        path: &url::Url,
+        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        overwrite: bool,
+    ) -> DeltaResult<u64> {
+        self.inner.write_json_file(path, data, overwrite)
+    }
+}
+
+/// A [`ParquetHandler`] counterpart to [`TokenCapturingJsonHandler`]: records the token handed to
+/// its cancellation-aware read and delegates everything to the real handler. Checkpoint/sidecar
+/// replay drives the parquet read path, which a JSON-only fixture never reaches.
+struct TokenCapturingParquetHandler {
+    inner: Arc<dyn ParquetHandler>,
+    seen: Mutex<Option<CancellationTokenRef>>,
+}
+
+impl ParquetHandler for TokenCapturingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.inner
+            .read_parquet_files(files, physical_schema, predicate)
+    }
+
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        // Keep the first token seen: a later empty-sidecar read must not clobber it.
+        let mut seen = self.seen.lock().unwrap();
+        if seen.is_none() {
+            seen.clone_from(&cancellation_token);
+        }
+        drop(seen);
+        self.inner.read_parquet_files_with_cancellation(
+            files,
+            physical_schema,
+            predicate,
+            cancellation_token,
+        )
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: url::Url,
+        data: FileDataReadResultIterator,
+    ) -> DeltaResult<()> {
+        self.inner.write_parquet_file(location, data)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<delta_kernel::ParquetFooter> {
+        self.inner.read_parquet_footer(file)
+    }
+}
+
+/// Swaps in a token-capturing JSON and/or Parquet handler, delegating every other handler to the
+/// real engine. A test installs whichever handler its fixture's read path exercises.
+struct TokenCapturingEngine {
+    inner: Arc<dyn Engine>,
+    json: Option<Arc<TokenCapturingJsonHandler>>,
+    parquet: Option<Arc<TokenCapturingParquetHandler>>,
+}
+
+impl Engine for TokenCapturingEngine {
+    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
+        self.inner.storage_handler()
+    }
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        match &self.json {
+            Some(json) => json.clone(),
+            None => self.inner.json_handler(),
+        }
+    }
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        match &self.parquet {
+            Some(parquet) => parquet.clone(),
+            None => self.inner.parquet_handler(),
+        }
+    }
+}
+
+/// Asserts the captured token is the exact `Arc` the caller supplied (identity), and therefore
+/// downcasts back to the caller's concrete type and observes cancellation through it.
+fn assert_token_recovered_by_identity(
+    seen: Option<CancellationTokenRef>,
+    token: Arc<TestCancellationToken>,
+) {
+    let seen = seen.expect("kernel should have passed the cancellation token to the handler");
+    // Same allocation, not an equivalent wrapper.
+    assert!(
+        Arc::ptr_eq(&(token.clone() as CancellationTokenRef), &seen),
+        "kernel must pass the caller's token through by identity"
+    );
+    let recovered = seen
+        .as_ref()
+        .any_ref()
+        .downcast_ref::<TestCancellationToken>()
+        .expect("token must downcast to the type the caller supplied");
+    assert!(!recovered.is_cancelled());
+    token.cancel();
+    assert!(recovered.is_cancelled());
+}
+
+// Pins the pass-through-identity guarantee on the JSON read path: the engine receives the very
+// `Arc` the caller supplied, not a wrapper, so it can downcast back to its own token type.
+#[tokio::test]
+async fn engine_receives_the_callers_token_by_identity_json(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, table_root) = json_only_table().await?;
+    let json = Arc::new(TokenCapturingJsonHandler {
+        inner: DefaultEngineBuilder::new(storage.clone())
+            .build()
+            .json_handler(),
+        seen: Mutex::new(None),
+    });
+    let engine = TokenCapturingEngine {
+        inner: Arc::new(DefaultEngineBuilder::new(storage).build()),
+        json: Some(json.clone()),
+        parquet: None,
+    };
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+
+    let token = Arc::new(TestCancellationToken::default());
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(token.clone() as CancellationTokenRef)
+        .build()?;
+    scan.scan_metadata(&engine)?.for_each(drop);
+
+    let seen = json.seen.lock().unwrap().clone();
+    assert_token_recovered_by_identity(seen, token);
+    Ok(())
+}
+
+// Same guarantee on the PARQUET read path, which the JSON-only fixture cannot reach. Checkpoint
+// replay threads the token through separate `.cloned()` call sites; a live (uncancelled) token lets
+// the read actually execute so the parquet handler observes it.
+#[tokio::test]
+async fn engine_receives_the_callers_token_by_identity_parquet(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_name = "with_checkpoint_no_last_checkpoint";
+    let url =
+        url::Url::from_directory_path(std::fs::canonicalize(format!("./tests/data/{table_name}"))?)
+            .unwrap();
+
+    let parquet = Arc::new(TokenCapturingParquetHandler {
+        inner: test_utils::create_default_engine(&url)?.parquet_handler(),
+        seen: Mutex::new(None),
+    });
+    let engine = TokenCapturingEngine {
+        inner: test_utils::create_default_engine(&url)?,
+        json: None,
+        parquet: Some(parquet.clone()),
+    };
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+
+    let token = Arc::new(TestCancellationToken::default());
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(token.clone() as CancellationTokenRef)
+        .build()?;
+    scan.scan_metadata(&engine)?.for_each(drop);
+
+    let seen = parquet.seen.lock().unwrap().clone();
+    assert_token_recovered_by_identity(seen, token);
     Ok(())
 }
 
