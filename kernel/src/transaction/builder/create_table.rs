@@ -32,7 +32,7 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    CheckpointPolicy, TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
+    TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
     CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
     COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
     DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
@@ -489,8 +489,10 @@ fn maybe_enable_ict_for_catalog_managed(
 }
 
 fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTableProperties) {
-    let is_v2_policy = TableProperties::from(validated.properties.iter()).checkpoint_policy
-        == Some(CheckpointPolicy::V2);
+    let is_v2_policy = validated
+        .properties
+        .get(CHECKPOINT_POLICY)
+        .is_some_and(|v| v == "v2");
     if is_v2_policy {
         add_feature_to_lists(
             TableFeature::V2Checkpoint,
