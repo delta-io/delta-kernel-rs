@@ -39,7 +39,9 @@ pub unsafe extern "C" fn get_unpartitioned_write_context(
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    write_context_impl(|| txn.unpartitioned_write_context()).into_extern_result(&engine)
+    txn.unpartitioned_write_context()
+        .map(|context| Arc::new(context).into())
+        .into_extern_result(&engine)
 }
 
 /// Gets the write context from a create-table transaction for an unpartitioned table.
@@ -57,7 +59,9 @@ pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    write_context_impl(|| txn.unpartitioned_write_context()).into_extern_result(&engine)
+    txn.unpartitioned_write_context()
+        .map(|context| Arc::new(context).into())
+        .into_extern_result(&engine)
 }
 
 /// Gets the write context from a transaction for a partitioned table, for the partition described
@@ -116,13 +120,8 @@ fn partitioned_write_context_impl(
     build: impl FnOnce(HashMap<String, Scalar>) -> DeltaResult<BoundWriteContext>,
     partition_values: PartitionValueMap,
 ) -> DeltaResult<Handle<SharedWriteContext>> {
-    write_context_impl(|| build(partition_values.inner))
-}
-
-fn write_context_impl(
-    build: impl FnOnce() -> DeltaResult<BoundWriteContext>,
-) -> DeltaResult<Handle<SharedWriteContext>> {
-    build().map(|context| Arc::new(context).into())
+    let context = build(partition_values.inner)?;
+    Ok(Arc::new(context).into())
 }
 
 #[no_mangle]

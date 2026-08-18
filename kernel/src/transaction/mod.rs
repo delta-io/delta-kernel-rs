@@ -1081,6 +1081,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// state is returned so a writer does not begin producing files for a table that kernel cannot
     /// write to safely.
     ///
+    /// The state captures the transaction configuration when this method is called. If the
+    /// transaction is subsequently modified, call this method again to capture the updated
+    /// configuration.
+    ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
     /// column defaults that the connector has not acknowledged.
     pub fn write_state(&self) -> DeltaResult<Arc<WriteState>> {
@@ -1088,7 +1092,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.ensure_column_defaults_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
-        // state must be derived on demand rather than cached on the transaction.
+        // state must be derived on demand rather than cached on the transaction. TODO(#3149):
+        // revisit caching if transaction construction becomes immutable.
         Ok(Arc::new(WriteState::new(
             &self.effective_table_config,
             self.stats_columns(),
@@ -1131,6 +1136,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// The returned [`BoundWriteContext`] also provides a [`write_dir`] that returns the correct
     /// target directory (Hive-style paths when column mapping is off, random prefix when on).
+    /// This convenience method is equivalent to creating a fresh [`WriteState`] and immediately
+    /// binding `partition_values`. When writing multiple partitions, call [`write_state`] once and
+    /// create every context from the returned shared state.
     ///
     /// Returns an error if the table is not partitioned (use
     /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead), or if the
@@ -1139,6 +1147,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// [`write_dir`]: BoundWriteContext::write_dir
     /// [`logical_to_physical`]: BoundWriteContext::logical_to_physical
+    /// [`write_state`]: Self::write_state
     pub fn partitioned_write_context(
         &self,
         partition_values: HashMap<String, Scalar>,
@@ -1148,6 +1157,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     }
 
     /// Creates a write context for writing data to an unpartitioned table.
+    ///
+    /// This convenience method is equivalent to creating a fresh [`WriteState`] and immediately
+    /// creating an unpartitioned context from it.
     ///
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead), or if the table

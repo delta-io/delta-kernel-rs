@@ -48,7 +48,7 @@ let mut txn = snapshot
     .with_operation("INSERT".to_string())
     .with_data_change(true);
 
-// Build the reusable state before iterating over partitions.
+// Build the write state before iterating over partitions.
 let write_state = txn.write_state()?;
 
 // Suppose you have data grouped by partition values already.
