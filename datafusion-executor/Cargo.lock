@@ -1378,6 +1378,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "delta_kernel",
+ "futures",
  "itertools",
  "rstest",
  "tempfile",

@@ -17,7 +17,6 @@ use crate::arrow::datatypes::{
 };
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
-use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField};
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
@@ -58,56 +57,40 @@ fn new_field_with_metadata(
     field
 }
 
-// A helper that is a wrapper over `transform_field_and_col`. This will take apart the passed struct
-// and use that method to transform each column and then put the struct back together. Target types
-// and names for each column should be passed in `target_types_and_names`. The number of elements in
-// the `target_types_and_names` iterator _must_ be the same as the number of columns in
-// `struct_array`. The transformation is ordinal. That is, the order of fields in `target_fields`
-// _must_ match the order of the columns in `struct_array`.
+// Rebuilds each column against the corresponding target field, then reassembles the struct. The
+// number and order of `target_fields` must match the columns in `struct_array`.
 fn transform_struct(
     struct_array: &StructArray,
     target_fields: impl Iterator<Item = impl Borrow<StructField>>,
 ) -> DeltaResult<StructArray> {
-    let (input_fields, arrow_cols, nulls) = struct_array.clone().into_parts();
+    let input_row_count = struct_array.len();
+    let (_, arrow_cols, nulls) = struct_array.clone().into_parts();
     let input_col_count = arrow_cols.len();
-    let result_iter = arrow_cols
-        .into_iter()
-        .zip(input_fields.iter())
-        .zip(target_fields)
-        .map(|((sa_col, input_field), target_field)| -> DeltaResult<_> {
-            let target_field = target_field.borrow();
-            let transformed_col = apply_schema_to_inner(
-                &sa_col,
-                target_field.data_type(),
-                Some(target_field),
-                &target_field.name,
-            )?;
-            let mut arrow_metadata = kernel_flat_parquet_id_to_arrow_metadata(target_field)?;
-            // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
-            // retained in Arrow; its content is processed by `apply_schema_to_list` /
-            // `apply_schema_to_map`.
-            arrow_metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
-            // If both the input field and the target field carry a field ID they must agree,
-            // otherwise we would silently overwrite one field ID with another.
-            if let (Some(input_id), Some(target_id)) = (
-                input_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-                arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
-            ) {
-                if input_id != target_id {
-                    return Err(Error::generic(format!(
-                        "Field '{}': input field ID {} conflicts with target field ID {}",
-                        target_field.name, input_id, target_id
-                    )));
-                }
-            }
-            let transformed_field = new_field_with_metadata(
-                &target_field.name,
-                transformed_col.data_type(),
-                target_field.nullable,
-                Some(arrow_metadata),
-            );
-            Ok((transformed_field, transformed_col))
-        });
+    let result_iter =
+        arrow_cols
+            .into_iter()
+            .zip(target_fields)
+            .map(|(sa_col, target_field)| -> DeltaResult<_> {
+                let target_field = target_field.borrow();
+                let transformed_col = apply_schema_to_inner(
+                    &sa_col,
+                    target_field.data_type(),
+                    Some(target_field),
+                    &target_field.name,
+                )?;
+                let mut arrow_metadata = kernel_flat_parquet_id_to_arrow_metadata(target_field)?;
+                // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
+                // retained in Arrow; its content is processed by `apply_schema_to_list` /
+                // `apply_schema_to_map`.
+                arrow_metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
+                let transformed_field = new_field_with_metadata(
+                    &target_field.name,
+                    transformed_col.data_type(),
+                    target_field.nullable,
+                    Some(arrow_metadata),
+                );
+                Ok((transformed_field, transformed_col))
+            });
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =
         result_iter.process_results(|iter| iter.unzip())?;
     if transformed_cols.len() != input_col_count {
@@ -116,10 +99,11 @@ fn transform_struct(
             transformed_cols.len()
         )));
     }
-    Ok(StructArray::try_new(
+    Ok(StructArray::try_new_with_length(
         transformed_fields.into(),
         transformed_cols,
         nulls,
+        input_row_count,
     )?)
 }
 
@@ -582,18 +566,23 @@ mod apply_schema_validation_tests {
         );
     }
 
-    /// Test that apply_schema succeeds when the input Arrow field already carries the same field
-    /// ID as the target kernel schema field (no conflict).
-    #[test]
-    fn test_apply_schema_matching_field_ids_succeed() {
+    #[rstest]
+    #[case::matching("42")]
+    #[case::different("99")]
+    fn test_apply_schema_uses_target_field_id(#[case] input_field_id: &str) {
         let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
         let target_schema = schema! {
             (StructField::new("a", DataType::INTEGER, false)
                 .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])),
         };
 
-        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false)
-            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())].into());
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(
+            [(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                input_field_id.to_string(),
+            )]
+            .into(),
+        );
         let input_array = StructArray::try_new(
             vec![arrow_field].into(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -601,32 +590,13 @@ mod apply_schema_validation_tests {
         )
         .unwrap();
 
-        let result = apply_schema_to_struct(&input_array, &target_schema);
-        assert!(result.is_ok(), "Matching field IDs should succeed");
-    }
-
-    /// Test that apply_schema fails when the input Arrow field already carries a *different* field
-    /// ID than the target kernel schema field.
-    #[test]
-    fn test_apply_schema_conflicting_field_ids_fail() {
-        let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
-        let target_schema = schema! {
-            (StructField::new("a", DataType::INTEGER, false)
-                .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])),
-        };
-
-        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false)
-            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "99".to_string())].into());
-        let input_array = StructArray::try_new(
-            vec![arrow_field].into(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-            None,
-        )
-        .unwrap();
-
-        assert_result_error_with_message(
-            apply_schema_to_struct(&input_array, &target_schema),
-            "conflicts with",
+        let result = apply_schema_to_struct(&input_array, &target_schema).unwrap();
+        assert_eq!(
+            result.fields()[0]
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("42")
         );
     }
 
