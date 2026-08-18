@@ -501,7 +501,8 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, Action, LocalMockTable, MockTableConfigurationBuilder,
+        assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
+        MockTableConfigurationBuilder,
     };
     use crate::Engine as _;
 
@@ -658,10 +659,10 @@ mod tests {
 
         let table_config = MockTableConfigurationBuilder::new()
             .with_schema(table_schema.clone())
-            .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
             .with_column_mapping(ColumnMappingMode::None)
             // CDF (enableChangeDataFeed) requires min_writer_version = 4
-            .with_protocol_versions(1, 4)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 4).build())
             .with_table_root(&table_root)
             .build();
 

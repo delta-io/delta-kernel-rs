@@ -586,14 +586,16 @@ mod tests {
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
-    use crate::unit_test_utils::{create_log_path, MockTableConfigurationBuilder};
+    use crate::unit_test_utils::{
+        create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
+    };
     use crate::Engine as _;
 
     fn mock_snapshot(log_segment: LogSegment) -> DeltaResult<Arc<Snapshot>> {
         let table_configuration = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema())
             .with_partition_columns(["p"])
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .with_table_root("memory:///")
             .try_build()?;
         Ok(Arc::new(Snapshot::new(log_segment, table_configuration)?))

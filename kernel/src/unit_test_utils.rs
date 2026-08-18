@@ -355,7 +355,7 @@ pub(crate) struct MockTableConfigurationBuilder {
     schema: Option<SchemaRef>,
     partition_columns: Vec<String>,
     props: HashMap<String, String>,
-    protocol: ProtocolSpec,
+    protocol: Protocol,
     table_root: Url,
     version: Version,
 }
@@ -366,7 +366,7 @@ impl MockTableConfigurationBuilder {
             schema: None,
             partition_columns: vec![],
             props: HashMap::new(),
-            protocol: ProtocolSpec::Default,
+            protocol: MockProtocolBuilder::new().build(),
             table_root: Url::parse("file:///").unwrap(),
             version: 0,
         }
@@ -387,7 +387,7 @@ impl MockTableConfigurationBuilder {
     }
 
     /// Adds table properties, keeping any previously set ones.
-    pub(crate) fn with_props<K: ToString, V: ToString>(
+    pub(crate) fn with_properties<K: ToString, V: ToString>(
         mut self,
         props: impl IntoIterator<Item = impl Borrow<(K, V)>>,
     ) -> Self {
@@ -411,87 +411,12 @@ impl MockTableConfigurationBuilder {
             ColumnMappingMode::Id => "id",
             ColumnMappingMode::Name => "name",
         };
-        self.with_props([(COLUMN_MAPPING_MODE, mode)])
-    }
-
-    /// Sets the features to place on the protocol, split across the reader and writer lists by
-    /// feature type. Unknown features must use [`Self::with_reader_features`] and
-    /// [`Self::with_writer_features`], which say explicitly where each feature lands.
-    ///
-    /// Panics if [`Self::with_protocol`] was already called.
-    pub(crate) fn with_features(
-        mut self,
-        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
-    ) -> Self {
-        let writer_features: Vec<_> = features
-            .into_iter()
-            .map(|feature| feature.borrow().clone())
-            .collect();
-        assert!(
-            writer_features
-                .iter()
-                .all(|f| f.feature_type() != FeatureType::Unknown),
-            "Use with_reader_features/with_writer_features for unknown features"
-        );
-        let reader_features = writer_features
-            .iter()
-            .filter(|feature| feature.feature_type() == FeatureType::ReaderWriter)
-            .cloned()
-            .collect();
-        let protocol = self.derived_protocol_mut();
-        protocol.reader_features = reader_features;
-        protocol.writer_features = writer_features;
-        self
-    }
-
-    /// Sets the protocol's reader features explicitly.
-    ///
-    /// Panics if [`Self::with_protocol`] was already called.
-    pub(crate) fn with_reader_features(
-        mut self,
-        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
-    ) -> Self {
-        self.derived_protocol_mut().reader_features = features
-            .into_iter()
-            .map(|feature| feature.borrow().clone())
-            .collect();
-        self
-    }
-
-    /// Sets the protocol's writer features explicitly.
-    ///
-    /// Panics if [`Self::with_protocol`] was already called.
-    pub(crate) fn with_writer_features(
-        mut self,
-        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
-    ) -> Self {
-        self.derived_protocol_mut().writer_features = features
-            .into_iter()
-            .map(|feature| feature.borrow().clone())
-            .collect();
-        self
-    }
-
-    /// Sets the protocol's minimum reader and writer versions. Feature lists are only written to
-    /// the protocol when the corresponding version supports them.
-    ///
-    /// Panics if [`Self::with_protocol`] was already called.
-    pub(crate) fn with_protocol_versions(mut self, reader: i32, writer: i32) -> Self {
-        let protocol = self.derived_protocol_mut();
-        protocol.min_reader_version = reader;
-        protocol.min_writer_version = writer;
-        self
+        self.with_properties([(COLUMN_MAPPING_MODE, mode)])
     }
 
     /// Uses `protocol` verbatim.
-    ///
-    /// Panics if derived protocol settings were already supplied.
     pub(crate) fn with_protocol(mut self, protocol: Protocol) -> Self {
-        assert!(
-            !matches!(self.protocol, ProtocolSpec::Derived(_)),
-            "Cannot combine with_protocol with derived protocol settings"
-        );
-        self.protocol = ProtocolSpec::Exact(protocol);
+        self.protocol = protocol;
         self
     }
 
@@ -519,62 +444,99 @@ impl MockTableConfigurationBuilder {
         let metadata =
             Metadata::try_new(None, None, schema, self.partition_columns, 0, self.props)?;
 
-        let protocol = match self.protocol {
-            ProtocolSpec::Default => DerivedProtocol::default().try_build()?,
-            ProtocolSpec::Derived(protocol) => protocol.try_build()?,
-            ProtocolSpec::Exact(protocol) => protocol,
-        };
-
-        TableConfiguration::try_new(metadata, protocol, self.table_root, self.version)
-    }
-
-    fn derived_protocol_mut(&mut self) -> &mut DerivedProtocol {
-        if matches!(self.protocol, ProtocolSpec::Default) {
-            self.protocol = ProtocolSpec::Derived(DerivedProtocol::default());
-        }
-        let ProtocolSpec::Derived(protocol) = &mut self.protocol else {
-            panic!("Cannot combine derived protocol settings with with_protocol");
-        };
-        protocol
+        TableConfiguration::try_new(metadata, self.protocol, self.table_root, self.version)
     }
 }
 
-enum ProtocolSpec {
-    Default,
-    Derived(DerivedProtocol),
-    Exact(Protocol),
-}
-
-struct DerivedProtocol {
+/// Builds a mock [`Protocol`] for unit tests.
+///
+/// Defaults to a table-features protocol (reader 3, writer 7) listing no features.
+pub(crate) struct MockProtocolBuilder {
     reader_features: Vec<TableFeature>,
     writer_features: Vec<TableFeature>,
-    min_reader_version: i32,
-    min_writer_version: i32,
+    reader_version: i32,
+    writer_version: i32,
 }
 
-impl DerivedProtocol {
-    fn try_build(self) -> DeltaResult<Protocol> {
-        // The protocol permits feature lists if and only if the version is exactly the
-        // table-features version, so legacy versions drop them.
-        Protocol::try_new(
-            self.min_reader_version,
-            self.min_writer_version,
-            (self.min_reader_version == TABLE_FEATURES_MIN_READER_VERSION)
-                .then_some(self.reader_features),
-            (self.min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION)
-                .then_some(self.writer_features),
-        )
-    }
-}
-
-impl Default for DerivedProtocol {
-    fn default() -> Self {
+impl MockProtocolBuilder {
+    pub(crate) fn new() -> Self {
         Self {
             reader_features: vec![],
             writer_features: vec![],
-            min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-            min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
+            reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+            writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
         }
+    }
+
+    /// Sets the protocol features, splitting them across the reader and writer lists by type.
+    pub(crate) fn with_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.writer_features = features
+            .into_iter()
+            .map(|feature| feature.borrow().clone())
+            .collect();
+        assert!(
+            self.writer_features
+                .iter()
+                .all(|feature| feature.feature_type() != FeatureType::Unknown),
+            "unknown features require explicit reader/writer feature lists"
+        );
+        self.reader_features = self
+            .writer_features
+            .iter()
+            .filter(|feature| feature.feature_type() == FeatureType::ReaderWriter)
+            .cloned()
+            .collect();
+        self
+    }
+
+    /// Sets the protocol's reader features explicitly.
+    pub(crate) fn with_reader_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.reader_features = features
+            .into_iter()
+            .map(|feature| feature.borrow().clone())
+            .collect();
+        self
+    }
+
+    /// Sets the protocol's writer features explicitly.
+    pub(crate) fn with_writer_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.writer_features = features
+            .into_iter()
+            .map(|feature| feature.borrow().clone())
+            .collect();
+        self
+    }
+
+    /// Sets the protocol's minimum reader and writer versions.
+    pub(crate) fn with_versions(mut self, reader: i32, writer: i32) -> Self {
+        self.reader_version = reader;
+        self.writer_version = writer;
+        self
+    }
+
+    /// Builds the protocol, panicking if it is invalid.
+    #[track_caller]
+    pub(crate) fn build(self) -> Protocol {
+        // The protocol permits feature lists if and only if the version is exactly the
+        // table-features version, so legacy versions drop them.
+        Protocol::try_new(
+            self.reader_version,
+            self.writer_version,
+            (self.reader_version == TABLE_FEATURES_MIN_READER_VERSION)
+                .then_some(self.reader_features),
+            (self.writer_version == TABLE_FEATURES_MIN_WRITER_VERSION)
+                .then_some(self.writer_features),
+        )
+        .unwrap()
     }
 }
 

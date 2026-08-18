@@ -928,7 +928,7 @@ mod tests {
             MockTableConfigurationBuilder::new()
                 .with_schema(schema.clone())
                 .with_protocol(protocol.clone())
-                .with_props(props.clone())
+                .with_properties(props.clone())
                 .build()
                 .column_mapping_mode()
         };

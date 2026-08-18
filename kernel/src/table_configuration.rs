@@ -940,7 +940,7 @@ mod test {
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{
-        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType,
+        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
     };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -955,7 +955,8 @@ mod test {
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
         test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
-        test_schema_with_map_and_column_mapping, MockTableConfigurationBuilder,
+        test_schema_with_map_and_column_mapping, MockProtocolBuilder,
+        MockTableConfigurationBuilder,
     };
     use crate::Error;
 
@@ -963,7 +964,7 @@ mod test {
     fn table_configuration_rejects_partition_column_missing_from_schema() {
         let result = MockTableConfigurationBuilder::new()
             .with_partition_columns(["missing"])
-            .with_protocol_versions(1, 2)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
         assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
@@ -977,7 +978,7 @@ mod test {
                 nullable "part": STRING,
             })
             .with_partition_columns(["part", "part"])
-            .with_protocol_versions(1, 2)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
         assert_result_error_with_message(result, "Duplicate partition column: 'part'");
@@ -988,8 +989,12 @@ mod test {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
         let table_config = MockTableConfigurationBuilder::new()
-            .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
-            .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
+            .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
+                    .build(),
+            )
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(!table_config.is_feature_enabled(&TableFeature::DeletionVectors));
@@ -1000,11 +1005,15 @@ mod test {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
         let table_config = MockTableConfigurationBuilder::new()
-            .with_props([
+            .with_properties([
                 (ENABLE_CHANGE_DATA_FEED, "true"),
                 (ENABLE_DELETION_VECTORS, "true"),
             ])
-            .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
+                    .build(),
+            )
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
@@ -1043,32 +1052,44 @@ mod test {
             (
                 // Writing to CDF-enabled table is supported for writes
                 MockTableConfigurationBuilder::new()
-                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
-                    .with_features([ChangeDataFeed])
+                    .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+                    .with_protocol(
+                        MockProtocolBuilder::new()
+                            .with_features([ChangeDataFeed])
+                            .build(),
+                    )
                     .build(),
                 Ok(()),
             ),
             (
                 // Should succeed even if AppendOnly is supported but not enabled
                 MockTableConfigurationBuilder::new()
-                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
-                    .with_features([ChangeDataFeed, AppendOnly])
+                    .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+                    .with_protocol(
+                        MockProtocolBuilder::new()
+                            .with_features([ChangeDataFeed, AppendOnly])
+                            .build(),
+                    )
                     .build(),
                 Ok(()),
             ),
             (
                 // Should succeed since AppendOnly is enabled
                 MockTableConfigurationBuilder::new()
-                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")])
-                    .with_features([ChangeDataFeed, AppendOnly])
+                    .with_properties([(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")])
+                    .with_protocol(
+                        MockProtocolBuilder::new()
+                            .with_features([ChangeDataFeed, AppendOnly])
+                            .build(),
+                    )
                     .build(),
                 Ok(()),
             ),
             (
                 // Writer version > 7 is not supported
                 MockTableConfigurationBuilder::new()
-                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
-                    .with_protocol_versions(1, 8)
+                    .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+                    .with_protocol(MockProtocolBuilder::new().with_versions(1, 8).build())
                     .build(),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
@@ -1076,24 +1097,36 @@ mod test {
             (
                 // CDF + column mapping: both supported, should succeed
                 MockTableConfigurationBuilder::new()
-                    .with_props([(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")])
-                    .with_features([ChangeDataFeed, ColumnMapping, AppendOnly])
+                    .with_properties([(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")])
+                    .with_protocol(
+                        MockProtocolBuilder::new()
+                            .with_features([ChangeDataFeed, ColumnMapping, AppendOnly])
+                            .build(),
+                    )
                     .build(),
                 Ok(()),
             ),
             (
                 // Column mapping + AppendOnly, no CDF enabled: should succeed
                 MockTableConfigurationBuilder::new()
-                    .with_props([(APPEND_ONLY, "true")])
-                    .with_features([ChangeDataFeed, ColumnMapping, AppendOnly])
+                    .with_properties([(APPEND_ONLY, "true")])
+                    .with_protocol(
+                        MockProtocolBuilder::new()
+                            .with_features([ChangeDataFeed, ColumnMapping, AppendOnly])
+                            .build(),
+                    )
                     .build(),
                 Ok(()),
             ),
             (
                 // Should succeed since change data feed is not enabled
                 MockTableConfigurationBuilder::new()
-                    .with_props([(APPEND_ONLY, "true")])
-                    .with_features([AppendOnly])
+                    .with_properties([(APPEND_ONLY, "true")])
+                    .with_protocol(
+                        MockProtocolBuilder::new()
+                            .with_features([AppendOnly])
+                            .build(),
+                    )
                     .build(),
                 Ok(()),
             ),
@@ -1119,8 +1152,12 @@ mod test {
         use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 
         let table_config = MockTableConfigurationBuilder::new()
-            .with_props([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
-            .with_features([TableFeature::InCommitTimestamp])
+            .with_properties([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::InCommitTimestamp])
+                    .build(),
+            )
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
@@ -1140,12 +1177,16 @@ mod test {
         };
 
         let table_config = MockTableConfigurationBuilder::new()
-            .with_props([
+            .with_properties([
                 (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
                 (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "5"),
                 (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "100"),
             ])
-            .with_features([TableFeature::InCommitTimestamp])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::InCommitTimestamp])
+                    .build(),
+            )
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
@@ -1164,12 +1205,16 @@ mod test {
         };
 
         let table_config = MockTableConfigurationBuilder::new()
-            .with_props([
+            .with_properties([
                 (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
                 (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "5"),
                 // Missing enablement timestamp
             ])
-            .with_features([TableFeature::InCommitTimestamp])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::InCommitTimestamp])
+                    .build(),
+            )
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
@@ -1181,7 +1226,11 @@ mod test {
     #[test]
     fn ict_supported_and_not_enabled() {
         let table_config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::InCommitTimestamp])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::InCommitTimestamp])
+                    .build(),
+            )
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(!table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
@@ -1192,8 +1241,12 @@ mod test {
     fn fails_on_unsupported_feature() {
         let unknown = TableFeature::unknown("unknown");
         let table_config = MockTableConfigurationBuilder::new()
-            .with_reader_features([&unknown])
-            .with_writer_features([&unknown])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features([&unknown])
+                    .with_writer_features([&unknown])
+                    .build(),
+            )
             .build();
         table_config
             .ensure_operation_supported(Operation::Scan)
@@ -1204,11 +1257,15 @@ mod test {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
         let table_config = MockTableConfigurationBuilder::new()
-            .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
-            .with_features([
-                TableFeature::TimestampWithoutTimezone,
-                TableFeature::ChangeDataFeed,
-            ])
+            .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::TimestampWithoutTimezone,
+                        TableFeature::ChangeDataFeed,
+                    ])
+                    .build(),
+            )
             .build();
         assert!(!table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(!table_config.is_feature_enabled(&TableFeature::DeletionVectors));
@@ -1219,8 +1276,12 @@ mod test {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
         let table_config = MockTableConfigurationBuilder::new()
-            .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
-            .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
+            .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed])
+                    .build(),
+            )
             .build();
 
         let new_schema = schema_ref! { nullable "value": INTEGER };
@@ -1283,7 +1344,7 @@ mod test {
         let ntz_config = |features: &[TableFeature]| {
             MockTableConfigurationBuilder::new()
                 .with_schema(schema! { nullable "ts": TIMESTAMP_NTZ })
-                .with_features(features)
+                .with_protocol(MockProtocolBuilder::new().with_features(features).build())
                 .try_build()
         };
 
@@ -1332,7 +1393,7 @@ mod test {
         let variant_config = |features: &[TableFeature]| {
             MockTableConfigurationBuilder::new()
                 .with_schema(schema! { nullable "v": (DataType::unshredded_variant()) })
-                .with_features(features)
+                .with_protocol(MockProtocolBuilder::new().with_features(features).build())
                 .try_build()
         };
 
@@ -1366,8 +1427,12 @@ mod test {
             _ => vec![unknown.clone()],
         };
         let tc = MockTableConfigurationBuilder::new()
-            .with_reader_features(reader_features)
-            .with_writer_features(writer_features)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features(reader_features)
+                    .with_writer_features(writer_features)
+                    .build(),
+            )
             .build();
         (unknown, tc)
     }
@@ -1424,40 +1489,56 @@ mod test {
 
         // Test with legacy protocol writer v2 - should be supported
         let config = MockTableConfigurationBuilder::new()
-            .with_protocol_versions(1, 2)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .build();
         assert!(config.is_feature_supported(&feature));
 
         // Test with legacy protocol writer v1 - should NOT be supported
         let config = MockTableConfigurationBuilder::new()
-            .with_protocol_versions(1, 1)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 1).build())
             .build();
         assert!(!config.is_feature_supported(&feature));
 
         // reader=2 (legacy), writer=7 (non-legacy) - feature in list, should be supported
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::AppendOnly])
-            .with_protocol_versions(2, 7)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AppendOnly])
+                    .with_versions(2, 7)
+                    .build(),
+            )
             .build();
         assert!(config.is_feature_supported(&feature));
 
         // reader=2 (legacy), writer=7 (non-legacy) - feature NOT in list, should NOT be supported
         // Use ChangeDataFeed which is also a WriterOnly feature
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::ChangeDataFeed])
-            .with_protocol_versions(2, 7)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::ChangeDataFeed])
+                    .with_versions(2, 7)
+                    .build(),
+            )
             .build();
         assert!(!config.is_feature_supported(&feature));
 
         // Test with protocol reader=3, writer=7 (both non-legacy) - feature in list, should be
         // supported
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::AppendOnly])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AppendOnly])
+                    .build(),
+            )
             .build();
         assert!(config.is_feature_supported(&feature));
 
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::DeletionVectors])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::DeletionVectors])
+                    .build(),
+            )
             .build();
         assert!(!config.is_feature_supported(&feature));
     }
@@ -1468,19 +1549,19 @@ mod test {
 
         // Test with sufficient versions (legacy mode) - should be supported
         let config = MockTableConfigurationBuilder::new()
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
         assert!(config.is_feature_supported(&feature));
 
         // Test with insufficient reader version - should NOT be supported
         let config = MockTableConfigurationBuilder::new()
-            .with_protocol_versions(1, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 5).build())
             .build();
         assert!(!config.is_feature_supported(&feature));
 
         // Test with insufficient writer version - should NOT be supported
         let config = MockTableConfigurationBuilder::new()
-            .with_protocol_versions(2, 4)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 4).build())
             .build();
         assert!(!config.is_feature_supported(&feature));
 
@@ -1489,8 +1570,12 @@ mod test {
         // But we still need to test that the code correctly identifies them as NOT supported
         // Create a table with only WriterOnly features (e.g., AppendOnly)
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::AppendOnly])
-            .with_protocol_versions(2, 7)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AppendOnly])
+                    .with_versions(2, 7)
+                    .build(),
+            )
             .build();
         // ColumnMapping (ReaderWriter) should NOT be supported because:
         // - reader=2 (legacy) checks version: 2 >= 2 (reader_supported = true)
@@ -1501,13 +1586,21 @@ mod test {
 
         // Test with non-legacy mode (3,7) - feature in list, should be supported
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::ColumnMapping])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::ColumnMapping])
+                    .build(),
+            )
             .build();
         assert!(config.is_feature_supported(&feature));
 
         // Test with non-legacy mode (3,7) - feature NOT in list, should NOT be supported
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::DeletionVectors])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::DeletionVectors])
+                    .build(),
+            )
             .build();
         assert!(!config.is_feature_supported(&feature));
     }
@@ -1521,8 +1614,12 @@ mod test {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_flat_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
-            .with_reader_features(TableFeature::EMPTY_LIST)
-            .with_writer_features([TableFeature::ColumnMapping])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features(TableFeature::EMPTY_LIST)
+                    .with_writer_features([TableFeature::ColumnMapping])
+                    .build(),
+            )
             .build();
         assert!(config.is_feature_supported(&TableFeature::ColumnMapping));
 
@@ -1539,7 +1636,11 @@ mod test {
         // The conformant shape (ColumnMapping in both lists) is still reported supported: the
         // legacy-version fallback does not perturb the normal reader_features membership path.
         let conformant = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::ColumnMapping])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::ColumnMapping])
+                    .build(),
+            )
             .build();
         assert!(conformant.is_feature_supported(&TableFeature::ColumnMapping));
     }
@@ -1548,7 +1649,11 @@ mod test {
     fn test_column_mapping_absent_from_both_lists_is_unsupported() {
         // ColumnMapping in neither list must not be treated as supported: the writer half fails.
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::AppendOnly])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AppendOnly])
+                    .build(),
+            )
             .build();
         assert!(!config.is_feature_supported(&TableFeature::ColumnMapping));
     }
@@ -1561,15 +1666,15 @@ mod test {
 
         // Test when property check fails - should be supported but not enabled
         let config = MockTableConfigurationBuilder::new()
-            .with_protocol_versions(1, 2)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .build();
         assert!(config.is_feature_supported(&feature));
         assert!(!config.is_feature_enabled(&feature));
 
         // Test when property check passes - should be both supported and enabled
         let config = MockTableConfigurationBuilder::new()
-            .with_props([(APPEND_ONLY, "true")])
-            .with_protocol_versions(1, 2)
+            .with_properties([(APPEND_ONLY, "true")])
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .build();
         assert!(config.is_feature_supported(&feature));
         assert!(config.is_feature_enabled(&feature));
@@ -1577,8 +1682,8 @@ mod test {
         // Test when property is set but feature is not supported by protocol versions.
         // TODO: Reject this orphaned metadata
         let config = MockTableConfigurationBuilder::new()
-            .with_props([(APPEND_ONLY, "true")])
-            .with_protocol_versions(1, 1)
+            .with_properties([(APPEND_ONLY, "true")])
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 1).build())
             .build();
         assert!(!config.is_feature_supported(&feature));
         assert!(!config.is_feature_enabled(&feature));
@@ -1590,14 +1695,22 @@ mod test {
 
         // Test when supported - should be both supported and enabled
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::V2Checkpoint])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::V2Checkpoint])
+                    .build(),
+            )
             .build();
         assert!(config.is_feature_supported(&feature));
         assert!(config.is_feature_enabled(&feature));
 
         // Test when not supported - should be neither supported nor enabled
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::DeletionVectors])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::DeletionVectors])
+                    .build(),
+            )
             .build();
         assert!(!config.is_feature_supported(&feature));
         assert!(!config.is_feature_enabled(&feature));
@@ -1609,25 +1722,37 @@ mod test {
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::V2Checkpoint])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::V2Checkpoint])
+                    .build(),
+            )
             .build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
         let config = MockTableConfigurationBuilder::new()
-            .with_protocol_versions(1, 2)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::InCommitTimestamp])
-            .with_protocol_versions(2, 7)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::InCommitTimestamp])
+                    .with_versions(2, 7)
+                    .build(),
+            )
             .build();
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
         #[cfg(feature = "geo-type-in-dev")]
         {
             let config = MockTableConfigurationBuilder::new()
-                .with_features([TableFeature::GeospatialType])
+                .with_protocol(
+                    MockProtocolBuilder::new()
+                        .with_features([TableFeature::GeospatialType])
+                        .build(),
+                )
                 .build();
             assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
             assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
@@ -1637,19 +1762,27 @@ mod test {
     #[test]
     fn test_ensure_operation_supported_writes() {
         let config = MockTableConfigurationBuilder::new()
-            .with_features([
-                TableFeature::AppendOnly,
-                TableFeature::DeletionVectors,
-                TableFeature::DomainMetadata,
-                TableFeature::Invariants,
-                TableFeature::RowTracking,
-            ])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::AppendOnly,
+                        TableFeature::DeletionVectors,
+                        TableFeature::DomainMetadata,
+                        TableFeature::Invariants,
+                        TableFeature::RowTracking,
+                    ])
+                    .build(),
+            )
             .build();
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
         // Type Widening is not supported for writes
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::TypeWidening])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::TypeWidening])
+                    .build(),
+            )
             .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
@@ -1659,7 +1792,11 @@ mod test {
         #[cfg(feature = "geo-type-in-dev")]
         {
             let config = MockTableConfigurationBuilder::new()
-                .with_features([TableFeature::GeospatialType])
+                .with_protocol(
+                    MockProtocolBuilder::new()
+                        .with_features([TableFeature::GeospatialType])
+                        .build(),
+                )
                 .build();
             assert_result_error_with_message(
                 config.ensure_operation_supported(Operation::Write),
@@ -1675,7 +1812,11 @@ mod test {
     #[case::write(Operation::Write)]
     fn test_geospatial_not_supported_without_cargo_feature(#[case] operation: Operation) {
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::GeospatialType])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::GeospatialType])
+                    .build(),
+            )
             .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(operation),
@@ -1686,7 +1827,11 @@ mod test {
     #[test]
     fn test_illegal_writer_feature_combination() {
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::RowTracking])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::RowTracking])
+                    .build(),
+            )
             .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
@@ -1697,7 +1842,11 @@ mod test {
     #[test]
     fn test_row_tracking_with_domain_metadata_requirement() {
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::RowTracking, TableFeature::DomainMetadata])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::RowTracking, TableFeature::DomainMetadata])
+                    .build(),
+            )
             .build();
         assert!(
             config.ensure_operation_supported(Operation::Write).is_ok(),
@@ -1709,20 +1858,28 @@ mod test {
     fn test_catalog_managed_writes() {
         // CatalogManaged requires ICT to be supported and enabled
         let config = MockTableConfigurationBuilder::new()
-            .with_props([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
-            .with_features([
-                TableFeature::CatalogManaged,
-                TableFeature::InCommitTimestamp,
-            ])
+            .with_properties([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::CatalogManaged,
+                        TableFeature::InCommitTimestamp,
+                    ])
+                    .build(),
+            )
             .build();
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
         let config = MockTableConfigurationBuilder::new()
-            .with_props([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
-            .with_features([
-                TableFeature::CatalogOwnedPreview,
-                TableFeature::InCommitTimestamp,
-            ])
+            .with_properties([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::CatalogOwnedPreview,
+                        TableFeature::InCommitTimestamp,
+                    ])
+                    .build(),
+            )
             .build();
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
@@ -1741,7 +1898,9 @@ mod test {
         #[case] feature: TableFeature,
         #[case] expected_error: &str,
     ) {
-        let config = MockTableConfigurationBuilder::new().with_features([feature]).build();
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(MockProtocolBuilder::new().with_features([feature]).build())
+            .build();
         let result = config.ensure_operation_supported(Operation::Write);
         assert_result_error_with_message(result, expected_error);
     }
@@ -1796,7 +1955,7 @@ mod test {
                 nullable "col_a": LONG,
                 nullable "col_b": STRING,
             })
-            .with_protocol_versions(1, 2)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .build();
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
@@ -1824,7 +1983,7 @@ mod test {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_column_mapping(ColumnMappingMode::Name)
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
@@ -1864,7 +2023,7 @@ mod test {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_column_mapping(ColumnMappingMode::Id)
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
@@ -1967,7 +2126,7 @@ mod test {
             .with_schema(partitioned_schema_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
             .with_partition_columns(["part_a", "part_b"])
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
 
         let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
@@ -2000,7 +2159,7 @@ mod test {
             .with_schema(partitioned_schema_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
             .with_partition_columns(["part_a", "part_b"])
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
 
         assert_eq!(config.logical_partition_columns(), ["part_a", "part_b"]);
@@ -2025,7 +2184,7 @@ mod test {
             .with_schema(partitioned_schema_with_column_mapping())
             .with_column_mapping(column_mapping_mode)
             .with_partition_columns(["part_a", "part_b"])
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
 
         assert_eq!(
@@ -2040,7 +2199,7 @@ mod test {
             .with_schema(partitioned_schema_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
             .with_partition_columns(["part_a", "part_b"])
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
 
         let column_names = config.physical_stats_column_names(None);
@@ -2061,7 +2220,7 @@ mod test {
                 nullable "part_b": INTEGER,
             })
             .with_partition_columns(["part_a", "part_b"])
-            .with_protocol_versions(1, 2)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .build();
 
         let column_names = config.physical_stats_column_names(None);
@@ -2076,7 +2235,7 @@ mod test {
                 nullable "part_b": INTEGER,
             })
             .with_partition_columns(["part_a", "part_b"])
-            .with_protocol_versions(1, 2)
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .build();
 
         let column_names = config.physical_stats_column_names(None);
@@ -2090,7 +2249,7 @@ mod test {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_column_mapping(ColumnMappingMode::Name)
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
 
         let column_names = config.physical_stats_column_names(None /* required_columns */);
@@ -2108,8 +2267,8 @@ mod test {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_nested_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
-            .with_props([("delta.dataSkippingStatsColumns", "id,info.name")])
-            .with_protocol_versions(2, 5)
+            .with_properties([("delta.dataSkippingStatsColumns", "id,info.name")])
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(
@@ -2123,8 +2282,8 @@ mod test {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_nested_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
-            .with_props([("delta.dataSkippingStatsColumns", "id,nonexistent")])
-            .with_protocol_versions(2, 5)
+            .with_properties([("delta.dataSkippingStatsColumns", "id,nonexistent")])
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(column_names, vec![column_name!("phys_id")],);
@@ -2221,7 +2380,7 @@ mod test {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_column_mapping(mode)
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
         let physical_names = config.physical_stats_column_names(None);
         assert_eq!(
@@ -2234,7 +2393,11 @@ mod test {
     fn test_clustered_table_writes() {
         // ClusteredTable requires DomainMetadata to be supported
         let config = MockTableConfigurationBuilder::new()
-            .with_features([TableFeature::ClusteredTable, TableFeature::DomainMetadata])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::ClusteredTable, TableFeature::DomainMetadata])
+                    .build(),
+            )
             .build();
         assert!(
             config.ensure_operation_supported(Operation::Write).is_ok(),
@@ -2265,12 +2428,16 @@ mod test {
                 nullable "pcol": STRING,
             })
             .with_partition_columns(["pcol"])
-            .with_props(extra_props)
-            .with_features([
-                TableFeature::IcebergCompatV3,
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ])
+            .with_properties(extra_props)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::IcebergCompatV3,
+                        TableFeature::RowTracking,
+                        TableFeature::DomainMetadata,
+                    ])
+                    .build(),
+            )
             .build();
 
         let write_schema = config.physical_write_schema();
@@ -2315,18 +2482,22 @@ mod test {
     fn test_iceberg_compat_v3_write_supported() {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_flat_with_column_mapping())
-            .with_props([
+            .with_properties([
                 (ENABLE_ICEBERG_COMPAT_V3, "true"),
                 (ENABLE_ROW_TRACKING, "true"),
             ])
             .with_column_mapping(ColumnMappingMode::Name)
-            .with_reader_features([TableFeature::ColumnMapping])
-            .with_writer_features([
-                TableFeature::IcebergCompatV3,
-                TableFeature::ColumnMapping,
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features([TableFeature::ColumnMapping])
+                    .with_writer_features([
+                        TableFeature::IcebergCompatV3,
+                        TableFeature::ColumnMapping,
+                        TableFeature::RowTracking,
+                        TableFeature::DomainMetadata,
+                    ])
+                    .build(),
+            )
             .build();
         config
             .ensure_operation_supported(Operation::Write)
@@ -2346,15 +2517,19 @@ mod test {
             .unwrap_or_default();
         let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_flat_with_column_mapping())
-            .with_props(&extra)
+            .with_properties(&extra)
             .with_column_mapping(ColumnMappingMode::Name)
-            .with_reader_features([TableFeature::ColumnMapping])
-            .with_writer_features([
-                TableFeature::IcebergCompatV3,
-                TableFeature::ColumnMapping,
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features([TableFeature::ColumnMapping])
+                    .with_writer_features([
+                        TableFeature::IcebergCompatV3,
+                        TableFeature::ColumnMapping,
+                        TableFeature::RowTracking,
+                        TableFeature::DomainMetadata,
+                    ])
+                    .build(),
+            )
             .build();
         assert_eq!(
             config.is_feature_enabled(&TableFeature::IcebergCompatV3),
@@ -2480,10 +2655,14 @@ mod test {
     ) {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_for_column_mapping(cm_mode))
-            .with_props(props)
+            .with_properties(props)
             .with_column_mapping(cm_mode)
-            .with_reader_features(&reader_features)
-            .with_writer_features(&writer_features)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features(&reader_features)
+                    .with_writer_features(&writer_features)
+                    .build(),
+            )
             .build();
         let result = config.validate_feature_requirements(&TableFeature::IcebergCompatV3);
         match expected_error_substring {
@@ -2562,10 +2741,14 @@ mod test {
                 .collect();
         let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_for_column_mapping(cm_mode))
-            .with_props(&props)
+            .with_properties(&props)
             .with_column_mapping(cm_mode)
-            .with_reader_features(&reader_features)
-            .with_writer_features(&writer_features)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features(&reader_features)
+                    .with_writer_features(&writer_features)
+                    .build(),
+            )
             .build();
         let result = config.validate_feature_requirements(&TableFeature::AdaptiveMetadataPreview);
         match expected_error_substring {
@@ -2660,19 +2843,23 @@ mod test {
         // V3 cases reach the mutual-exclusion check.
         let config = MockTableConfigurationBuilder::new()
             .with_schema(test_schema_flat_with_column_mapping())
-            .with_props([
+            .with_properties([
                 (conflicting_enable_property, "true"),
                 (ENABLE_ROW_TRACKING, "true"),
             ])
             .with_column_mapping(ColumnMappingMode::Name)
-            .with_reader_features([TableFeature::ColumnMapping])
-            .with_writer_features([
-                feature_to_enable.clone(),
-                conflicting_feature,
-                TableFeature::ColumnMapping,
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features([TableFeature::ColumnMapping])
+                    .with_writer_features([
+                        feature_to_enable.clone(),
+                        conflicting_feature,
+                        TableFeature::ColumnMapping,
+                        TableFeature::RowTracking,
+                        TableFeature::DomainMetadata,
+                    ])
+                    .build(),
+            )
             .build();
         assert_result_error_with_message(
             config.validate_feature_requirements(&feature_to_enable),
@@ -2691,8 +2878,12 @@ mod test {
         #[case] expected_error_substring: Option<&str>,
     ) {
         let config = MockTableConfigurationBuilder::new()
-            .with_props(props)
-            .with_features([TableFeature::RowTracking])
+            .with_properties(props)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::RowTracking])
+                    .build(),
+            )
             .build();
         let result = config.validate_feature_support_for_remove();
         match expected_error_substring {

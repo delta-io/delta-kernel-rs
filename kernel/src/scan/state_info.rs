@@ -480,7 +480,9 @@ pub(crate) mod tests {
     use crate::expressions::{col, column_name, lit, Predicate as Pred};
     use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::{assert_result_error_with_message, MockTableConfigurationBuilder};
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
+    };
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
@@ -546,12 +548,14 @@ pub(crate) mod tests {
         let builder = MockTableConfigurationBuilder::new()
             .with_schema(schema.clone())
             .with_partition_columns(partition_columns)
-            .with_props(metadata_configuration)
+            .with_properties(metadata_configuration)
             .with_table_root("s3://my-table")
             .with_version(1);
         let builder = match features.is_empty() {
-            true => builder.with_protocol_versions(2, 5),
-            false => builder.with_features(features),
+            true => builder.with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build()),
+            false => {
+                builder.with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            }
         };
         let table_configuration = builder.try_build()?;
 
@@ -942,7 +946,7 @@ pub(crate) mod tests {
                 nullable "part_col": STRING,
             })
             .with_partition_columns(["part_col"])
-            .with_protocol_versions(2, 5)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .with_table_root("s3://my-table")
             .with_version(1)
             .build();

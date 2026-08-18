@@ -28,7 +28,8 @@ use crate::table_properties::{
     ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, Action, LocalMockTable, MockTableConfigurationBuilder,
+    assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
+    MockTableConfigurationBuilder,
 };
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
@@ -42,10 +43,10 @@ fn get_schema() -> SchemaRef {
 fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
     MockTableConfigurationBuilder::new()
         .with_schema(get_schema())
-        .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
+        .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
         .with_column_mapping(ColumnMappingMode::None)
         // CDF requires min_writer_version = 4
-        .with_protocol_versions(1, 4)
+        .with_protocol(MockProtocolBuilder::new().with_versions(1, 4).build())
         .with_table_root(table_root)
         .build()
 }
@@ -1051,16 +1052,16 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
         .await;
 
     // Partitioned schema: `part` is the partition column, `id` a data column.
-    let logical_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("part", DataType::STRING),
-    ]));
+    let logical_schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "part": STRING,
+    };
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = MockTableConfigurationBuilder::new()
         .with_schema(logical_schema.clone())
         .with_partition_columns(["part"])
-        .with_props([(ENABLE_CHANGE_DATA_FEED, "true")])
-        .with_protocol_versions(1, 4)
+        .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+        .with_protocol(MockProtocolBuilder::new().with_versions(1, 4).build())
         .with_table_root(table_root_url)
         .build();
 
