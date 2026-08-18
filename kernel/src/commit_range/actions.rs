@@ -1,4 +1,3 @@
-use std::slice;
 use std::sync::LazyLock;
 
 use url::Url;
@@ -6,12 +5,14 @@ use url::Url;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::{Channel, Generator};
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{ensure_table_can_be_read, Operation};
-use crate::{DeltaResult, Engine, Error, FileDataReadResultIterator, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, Version};
 
 /// A Delta log action kind.
 ///
@@ -63,8 +64,8 @@ impl CommitAction {
     /// (`[protocol, metadata, commitInfo]`), overlays any `Protocol` / `Metadata` the commit
     /// carries onto the seed, validates that the kernel can read the resulting configuration,
     /// and resolves the commit timestamp.
-    pub(crate) fn try_new(
-        engine: &dyn Engine,
+    pub(crate) async fn try_new(
+        channel: &Channel,
         table_root: Url,
         log_path: ParsedLogPath,
         read_schema: SchemaRef,
@@ -80,7 +81,7 @@ impl CommitAction {
             metadata: seed_metadata,
             timestamp,
         };
-        let extracted_ict = this.read_commit_header(engine)?;
+        let extracted_ict = this.read_commit_header(channel).await?;
         // Build the effective table configuration once (when both protocol and metadata are
         // known) and reuse it for both validation and timestamp resolution.
         let table_config = match (&this.protocol, &this.metadata) {
@@ -126,33 +127,41 @@ impl CommitAction {
     /// Read the commit header projected to `[protocol, metadata, commitInfo]`, overlay any
     /// `Protocol` / `Metadata` the commit carries onto `self` (a `None` extraction does NOT clear
     /// the inherited value), and return the commit's `inCommitTimestamp` if present.
-    fn read_commit_header(&mut self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
-        let json_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&self.log_path.location),
-            HEADER_READ_SCHEMA.clone(),
-            None,
-        )?;
-
+    async fn read_commit_header(&mut self, channel: &Channel) -> DeltaResult<Option<i64>> {
+        let mut page = channel
+            .start_read_json(
+                vec![self.log_path.location.clone()],
+                HEADER_READ_SCHEMA.clone(),
+                None,
+            )
+            .await?;
         let mut extracted_protocol: Option<Protocol> = None;
         let mut extracted_metadata: Option<Metadata> = None;
         let mut ict_visitor = InCommitTimestampVisitor::default();
-        for (batch_index, batch_res) in json_iter.enumerate() {
-            let batch = batch_res?;
-            // The protocol requires commitInfo to be the first action when in-commit timestamps
-            // are enabled, so it lives in the first batch (the visitor inspects only its first
-            // row). Visiting only that batch matches the `table_changes` reference behavior.
-            if batch_index == 0 {
-                ict_visitor.visit_rows_of(batch.as_ref())?;
+        let mut batch_index = 0;
+        'pages: loop {
+            for batch in page.data {
+                // The protocol requires commitInfo to be the first action when in-commit timestamps
+                // are enabled, so it lives in the first batch (the visitor inspects only its first
+                // row). Visiting only that batch matches the `table_changes` reference behavior.
+                if batch_index == 0 {
+                    ict_visitor.visit_rows_of(batch.as_ref())?;
+                }
+                batch_index += 1;
+                if extracted_protocol.is_none() {
+                    extracted_protocol = Protocol::try_new_from_data(batch.as_ref())?;
+                }
+                if extracted_metadata.is_none() {
+                    extracted_metadata = Metadata::try_new_from_data(batch.as_ref())?;
+                }
+                if extracted_protocol.is_some() && extracted_metadata.is_some() {
+                    break 'pages;
+                }
             }
-            if extracted_protocol.is_none() {
-                extracted_protocol = Protocol::try_new_from_data(batch.as_ref())?;
-            }
-            if extracted_metadata.is_none() {
-                extracted_metadata = Metadata::try_new_from_data(batch.as_ref())?;
-            }
-            if extracted_protocol.is_some() && extracted_metadata.is_some() {
+            let Some(cursor) = page.next else {
                 break;
-            }
+            };
+            page = channel.continue_read_json(cursor).await?;
         }
 
         if extracted_protocol.is_some() {
@@ -218,10 +227,31 @@ impl CommitAction {
     /// Batches contain raw actions exactly as recorded in the commit JSON; no column-mapping
     /// translation is applied.
     pub fn get_actions(&self, engine: &dyn Engine) -> DeltaResult<FileDataReadResultIterator> {
-        engine.json_handler().read_json_files(
-            slice::from_ref(&self.log_path.location),
-            self.read_schema.clone(),
-            None,
-        )
+        let iterator = EngineConnector::new(engine).iterate_generator(self.start_get_actions())?;
+        Ok(Box::new(iterator))
+    }
+
+    /// Start a connector-driven generator over this commit's projected action batches.
+    ///
+    /// Returns the first generator state. Errors after suspension are returned by the
+    /// corresponding resume handle.
+    pub fn start_get_actions(&self) -> DeltaResult<Generator<Box<dyn EngineData>>> {
+        let files = vec![self.log_path.location.clone()];
+        let physical_schema = self.read_schema.clone();
+        Generator::start(async move |channel| {
+            let mut page = channel
+                .start_read_json(files, physical_schema, None)
+                .await?;
+            loop {
+                for batch in page.data {
+                    channel.yield_item(batch).await?;
+                }
+                let Some(cursor) = page.next else {
+                    break;
+                };
+                page = channel.continue_read_json(cursor).await?;
+            }
+            Ok(())
+        })
     }
 }

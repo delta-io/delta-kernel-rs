@@ -11,10 +11,11 @@ use serde_json::{json, Value};
 use test_utils::{assert_result_error_with_message, delta_path_for_version};
 use url::Url;
 
-use super::LogSegment;
+use super::for_snapshot_from_storage;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
+use crate::coroutine::engine::EngineConnector;
 use crate::crc::{
-    try_read_crc_file, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
+    try_read_crc_file_with_engine, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
 };
 use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
@@ -434,8 +435,11 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)?;
-        log_segment.build_crc_from_base(&self.engine, base)
+            for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
+        let base = base.clone();
+        EngineConnector::run_with(&self.engine, async move |channel| {
+            log_segment.build_crc_from_base(&channel, &base).await
+        })
     }
 
     /// Run `pick_latest_base_crc` against a directly-listed `LogSegment`, using `in_memory_base`.
@@ -446,15 +450,19 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)?;
-        Ok(log_segment
-            .pick_latest_base_crc(&self.engine, in_memory_base)
-            .map(|c| c.version))
+            for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
+        let in_memory_base = in_memory_base.cloned();
+        EngineConnector::run_with(&self.engine, async move |channel| {
+            Ok(log_segment
+                .pick_latest_base_crc(&channel, in_memory_base.as_ref())
+                .await
+                .map(|c| c.version))
+        })
     }
 
     /// Read the on-disk CRC at `version` from this test's log.
     fn read_crc_at(&self, version: u64) -> DeltaResult<Crc> {
-        try_read_crc_file(
+        try_read_crc_file_with_engine(
             &self.engine,
             &ParsedLogPath::create_parsed_crc(&self.url, version),
         )
@@ -528,7 +536,9 @@ impl BuiltCrcTest {
 
     fn assert_ict(&self, version: impl Into<Option<u64>>, expected_ict: Option<i64>) {
         let (snapshot, label) = self.snapshot_at(version.into());
-        let ict = snapshot.get_in_commit_timestamp(&self.engine).unwrap();
+        let ict = snapshot
+            .get_in_commit_timestamp_with_engine(&self.engine)
+            .unwrap();
         assert_eq!(ict, expected_ict, "ICT mismatch at {label}");
     }
 }
@@ -833,7 +843,7 @@ async fn test_ict_errors_when_crc_has_no_ict() {
         .await;
 
     let (snapshot, _) = setup.snapshot_at(None);
-    let result = snapshot.get_in_commit_timestamp(&setup.engine);
+    let result = snapshot.get_in_commit_timestamp_with_engine(&setup.engine);
 
     assert_result_error_with_message(
         result,

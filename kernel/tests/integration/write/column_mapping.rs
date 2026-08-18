@@ -8,7 +8,6 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
@@ -408,8 +407,8 @@ async fn test_same_phy_name_different_path(
     let logical_schema = Arc::new(fixtures::same_leaf_phy_name_under_different_parents());
     let snapshot = create_table(table_url.as_str(), logical_schema.clone(), "Test/1.0")
         .with_table_properties([("delta.columnMapping.mode", cm_mode)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
     // Build a RecordBatch matching the logical schema.

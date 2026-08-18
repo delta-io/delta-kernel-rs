@@ -59,6 +59,8 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::{Channel, Generator};
 use crate::path::ParsedLogPath;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
@@ -134,6 +136,20 @@ impl CommitRange {
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitAction>> + Send> {
+        EngineConnector::new(engine.as_ref())
+            .iterate_generator(self.start_commits(start_snapshot, actions))
+    }
+
+    /// Start a connector-driven generator over the commits in this range.
+    ///
+    /// `start_snapshot` and `actions` have the same validation and projection semantics as
+    /// [`Self::commits`]. Returns the first generator state; errors after suspension are returned
+    /// by the corresponding resume handle.
+    pub fn start_commits(
+        &self,
+        start_snapshot: Option<SnapshotRef>,
+        actions: &[DeltaAction],
+    ) -> DeltaResult<Generator<CommitAction>> {
         if actions.is_empty() {
             return Err(Error::generic("at least one DeltaAction must be requested"));
         }
@@ -169,24 +185,29 @@ impl CommitRange {
 
         let read_schema = Arc::new(StructType::try_new(actions.iter().map(action_to_field))?);
 
-        Ok(CommitActionsIterator {
-            engine,
+        let mut state = CommitActionsIterator {
             table_root: self.table_root.clone(),
             log_path_iter: self.commit_files.clone().into_iter(),
             commit_ordering: self.commit_ordering,
             read_schema,
             latest_protocol,
             latest_metadata,
+        };
+        Generator::start(async move |channel| {
+            while let Some(log_path) = state.log_path_iter.next() {
+                let commit = state.try_advance(&channel, log_path).await?;
+                channel.yield_item(commit).await?;
+            }
+            Ok(())
         })
     }
 }
 
-/// Iterator yielded by [`CommitRange::commits`]. Holds the iterator's accumulated
+/// State for the generator returned by [`CommitRange::start_commits`]. Holds the accumulated
 /// `latest_protocol` / `latest_metadata` and
 /// constructs a fresh [`CommitAction`] for each commit, running per-commit protocol
 /// validation before yielding.
 pub(crate) struct CommitActionsIterator {
-    engine: Arc<dyn Engine>,
     table_root: Url,
     log_path_iter: std::vec::IntoIter<ParsedLogPath>,
     commit_ordering: CommitOrdering,
@@ -204,16 +225,21 @@ impl CommitActionsIterator {
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(&mut self, log_path: ParsedLogPath) -> DeltaResult<CommitAction> {
+    async fn try_advance(
+        &mut self,
+        channel: &Channel,
+        log_path: ParsedLogPath,
+    ) -> DeltaResult<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
-            self.engine.as_ref(),
+            channel,
             self.table_root.clone(),
             log_path,
             self.read_schema.clone(),
             self.latest_protocol.clone(),
             self.latest_metadata.clone(),
         )
+        .await
         .map_err(|e| with_version_context(version, e))?;
 
         match self.commit_ordering {
@@ -238,15 +264,6 @@ fn with_version_context(version: Version, err: Error) -> Error {
         Error::Unsupported(msg) => Error::Unsupported(format!("commit v={version}: {msg}")),
         Error::InvalidProtocol(msg) => Error::InvalidProtocol(format!("commit v={version}: {msg}")),
         other => Error::generic(format!("commit v={version}: {other}")),
-    }
-}
-
-impl Iterator for CommitActionsIterator {
-    type Item = DeltaResult<CommitAction>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let log_path = self.log_path_iter.next()?;
-        Some(self.try_advance(log_path))
     }
 }
 

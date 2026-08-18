@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::row_tracking::RowTrackingDomainMetadata;
@@ -82,7 +81,7 @@ async fn test_create_table_with_row_tracking(
 
     let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([(key, value)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     if with_data {
         // Write one parquet file with 5 rows
@@ -103,7 +102,9 @@ async fn test_create_table_with_row_tracking(
         txn.add_files(add_files);
     }
 
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_committed();
     let snapshot = committed
         .post_commit_snapshot()
         .expect("should have snapshot");
@@ -123,7 +124,10 @@ async fn test_create_table_with_row_tracking(
     let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let expected_high_water_mark: i64 = if with_data { 4 } else { -1 };
     assert_eq!(
-        RowTrackingDomainMetadata::get_high_water_mark(&disk_snapshot, engine.as_ref())?,
+        RowTrackingDomainMetadata::get_high_water_mark_with_engine(
+            &disk_snapshot,
+            engine.as_ref()
+        )?,
         Some(expected_high_water_mark),
     );
 
@@ -198,7 +202,7 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
     let schema = super::simple_schema()?;
     let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([("delta.enableRowTracking", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     let arrow_schema: Arc<delta_kernel::arrow::datatypes::Schema> =
         Arc::new(schema.as_ref().try_into_arrow()?);
@@ -233,7 +237,9 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
     txn.add_files(adds1);
     txn.add_files(adds2);
 
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_committed();
     assert_eq!(committed.commit_version(), 0);
 
     let table_url = Url::from_directory_path(&table_path).expect("valid path");
@@ -253,7 +259,10 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
     // HWM should be 7 (IDs 0-2 from file 1, IDs 3-7 from file 2)
     let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        RowTrackingDomainMetadata::get_high_water_mark(&disk_snapshot, engine.as_ref())?,
+        RowTrackingDomainMetadata::get_high_water_mark_with_engine(
+            &disk_snapshot,
+            engine.as_ref()
+        )?,
         Some(7),
         "HWM should be 7 for 8 total rows (3 + 5) starting from -1"
     );
@@ -271,8 +280,8 @@ fn test_create_table_with_row_tracking_and_clustering() -> DeltaResult<()> {
     let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0")
         .with_table_properties([("delta.enableRowTracking", "true")])
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_committed();
 
     let snapshot = committed
@@ -323,7 +332,7 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
     let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([("delta.enableRowTracking", "true")])
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
     let batch = RecordBatch::try_new(
@@ -341,7 +350,9 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
         .await?;
     txn.add_files(add_files);
 
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_committed();
     let snapshot = committed
         .post_commit_snapshot()
         .expect("should have snapshot");
@@ -389,7 +400,10 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
     // High water mark should reflect the 5 written rows
     let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        RowTrackingDomainMetadata::get_high_water_mark(&disk_snapshot, engine.as_ref())?,
+        RowTrackingDomainMetadata::get_high_water_mark_with_engine(
+            &disk_snapshot,
+            engine.as_ref()
+        )?,
         Some(4),
         "5 rows -> high water mark = 4"
     );
@@ -408,8 +422,8 @@ async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() ->
     // Create empty table with feature signal only (no enablement property)
     let _ = create_table(&table_path, super::simple_schema()?, "Test/1.0")
         .with_table_properties([("delta.feature.rowTracking", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     let table_url = Url::from_directory_path(&table_path).expect("valid path");
 
@@ -418,7 +432,7 @@ async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() ->
         .at_version(0)
         .build(engine.as_ref())?;
     assert_eq!(
-        RowTrackingDomainMetadata::get_high_water_mark(&v0_snapshot, engine.as_ref())?,
+        RowTrackingDomainMetadata::get_high_water_mark_with_engine(&v0_snapshot, engine.as_ref())?,
         Some(-1),
         "Initial high water mark should be -1"
     );
@@ -448,7 +462,7 @@ async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() ->
     // High water mark after append: 3 rows starting from 0 -> high water mark = 2
     let v1_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        RowTrackingDomainMetadata::get_high_water_mark(&v1_snapshot, engine.as_ref())?,
+        RowTrackingDomainMetadata::get_high_water_mark_with_engine(&v1_snapshot, engine.as_ref())?,
         Some(2),
         "3 rows starting from 0 -> high water mark = 2"
     );

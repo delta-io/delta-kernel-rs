@@ -210,7 +210,7 @@ fn collect_projected_adds(
     engine: &dyn Engine,
 ) -> DeltaResult<(usize, Vec<String>)> {
     let actions = log_segment
-        .read_actions_with_projected_checkpoint_actions(
+        .read_actions_with_projected_checkpoint_actions_with_engine(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
@@ -328,11 +328,10 @@ async fn build_snapshot_with_uuid_checkpoint_parquet() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
-        None,
         None,
         None,
     )
@@ -366,11 +365,10 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
-        None,
         None,
         None,
     )
@@ -418,12 +416,11 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
         None,
     )
     .unwrap();
@@ -464,11 +461,10 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
-        None,
         None,
         None,
     )
@@ -513,12 +509,11 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
         None,
     )
     .unwrap();
@@ -566,12 +561,11 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
         None,
     )
     .unwrap();
@@ -619,12 +613,11 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
         None,
     );
     assert_result_error_with_message(
@@ -679,12 +672,11 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
         None,
     )
     .unwrap();
@@ -744,11 +736,10 @@ async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
-        None,
         None,
         None,
     )
@@ -800,12 +791,11 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
         None,
     )
     .unwrap();
@@ -841,11 +831,10 @@ async fn build_snapshot_without_checkpoints() {
     .await;
 
     ///////// Specify no checkpoint or end version /////////
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root.clone(),
         vec![], // log_tail
-        None,
         None,
         None,
     )
@@ -862,13 +851,12 @@ async fn build_snapshot_without_checkpoints() {
     assert_eq!(versions, expected_versions);
 
     ///////// Specify  only end version /////////
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         None,
         Some(2),
-        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -914,13 +902,12 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
-        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -962,13 +949,12 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
-        None,
     )
     .unwrap();
 
@@ -998,8 +984,7 @@ async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5), None)
-            .unwrap();
+        for_snapshot_from_storage(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -1026,8 +1011,7 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5), None)
-            .unwrap();
+        for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -1059,7 +1043,8 @@ async fn build_table_changes_with_commit_versions() {
     ///////// Specify start version and end version /////////
 
     let log_segment =
-        LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 2, 5).unwrap();
+        LogSegment::for_table_changes_with_storage(storage.as_ref(), log_root.clone(), 2, 5)
+            .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -1073,7 +1058,8 @@ async fn build_table_changes_with_commit_versions() {
 
     ///////// Start version and end version are the same /////////
     let log_segment =
-        LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, Some(0)).unwrap();
+        LogSegment::for_table_changes_with_storage(storage.as_ref(), log_root.clone(), 0, Some(0))
+            .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -1085,7 +1071,8 @@ async fn build_table_changes_with_commit_versions() {
     assert_eq!(commit_files[0].version, 0);
 
     ///////// Specify no start or end version /////////
-    let log_segment = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, None).unwrap();
+    let log_segment =
+        LogSegment::for_table_changes_with_storage(storage.as_ref(), log_root, 0, None).unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -1111,14 +1098,15 @@ async fn test_non_contiguous_log() {
     .await;
 
     let log_segment_res =
-        LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
+        LogSegment::for_table_changes_with_storage(storage.as_ref(), log_root.clone(), 0, None);
     assert!(matches!(log_segment_res, Err(Error::MissingVersion(1))));
 
     let log_segment_res =
-        LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
+        LogSegment::for_table_changes_with_storage(storage.as_ref(), log_root.clone(), 1, None);
     assert!(matches!(log_segment_res, Err(Error::MissingVersion(1))));
 
-    let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
+    let log_segment_res =
+        LogSegment::for_table_changes_with_storage(storage.as_ref(), log_root, 0, Some(1));
     assert!(matches!(log_segment_res, Err(Error::MissingVersion(1))));
 }
 
@@ -1133,7 +1121,8 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
         None,
     )
     .await;
-    let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0));
+    let log_segment_res =
+        LogSegment::for_table_changes_with_storage(storage.as_ref(), log_root, 1, Some(0));
     assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
 }
 
@@ -1338,7 +1327,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream_with_engine(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None, // meta_predicate
@@ -1412,7 +1401,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream_with_engine(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None, // meta_predicate
@@ -1478,7 +1467,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream_with_engine(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None, // meta_predicate
@@ -1741,7 +1730,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream_with_engine(
         &engine,
         v2_checkpoint_read_schema,
         None, // meta_predicate
@@ -1834,7 +1823,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream_with_engine(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None, // meta_predicate
@@ -1918,13 +1907,12 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
     let staged_commits_log_tail = staged_commit_log_paths(segment.staged_commit_versions);
-    LogSegment::for_snapshot_impl(
+    for_snapshot_from_storage(
         storage.as_ref(),
         log_root.clone(),
         staged_commits_log_tail,
         None,
         segment.version_to_load,
-        None,
     )
     .unwrap()
 }
@@ -1942,14 +1930,14 @@ async fn test_list_log_files_with_version() -> DeltaResult<()> {
         None,
     )
     .await;
-    let result = LogSegmentFiles::list(
+    let result = for_snapshot_from_storage(
         storage.as_ref(),
-        &log_root,
+        log_root,
         vec![], // log_tail
-        Some(0),
         None,
         None,
-    )?;
+    )?
+    .listed;
     let latest_crc = result.latest_crc_file.unwrap();
     assert_eq!(
         latest_crc.location.location.path(),
@@ -2352,11 +2340,10 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = for_snapshot_from_storage(
         engine.storage_handler().as_ref(),
         log_root.clone(),
         vec![],
-        None,
         None,
         None,
     )
@@ -3012,7 +2999,7 @@ async fn for_timestamp_conversion_cases(#[case] case: TimestampConversionCase) {
     );
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
-    let log_segment = LogSegment::for_timestamp_conversion(
+    let log_segment = LogSegment::for_timestamp_conversion_with_storage(
         storage.as_ref(),
         log_root.clone(),
         end_version,
@@ -3039,8 +3026,13 @@ async fn for_timestamp_conversion_no_commit_files() {
     )
     .await;
 
-    let res =
-        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
+    let res = LogSegment::for_timestamp_conversion_with_storage(
+        storage.as_ref(),
+        log_root.clone(),
+        0,
+        None,
+        vec![],
+    );
     assert!(matches!(res, Err(Error::EmptyLog)));
 }
 
@@ -3061,15 +3053,8 @@ async fn test_latest_commit_file_field_is_captured() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-        None,
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // The latest commit should be version 5
     assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 5);
@@ -3095,15 +3080,8 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-        None,
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // The latest commit should be version 4
     assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 4);
@@ -3123,15 +3101,8 @@ async fn test_latest_commit_file_with_no_commits() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-        None,
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // latest_commit_file should be None when there are no commits
     assert!(log_segment.listed.latest_commit_file.is_none());
@@ -3154,15 +3125,8 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-        None,
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // The latest commit should be version 1 (saved before filtering)
     assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 1);
@@ -3187,15 +3151,8 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-        None,
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // latest_commit_file should be None since there's no commit at the checkpoint version
     assert!(log_segment.listed.latest_commit_file.is_none());
@@ -3444,7 +3401,8 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 
     // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
     // version
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let (schema, sidecars) =
+        log_segment.get_file_actions_schema_and_sidecars_with_engine(&engine, None)?;
     let schema = schema.expect("V1 checkpoint should yield a file actions schema");
     if expect_hint_schema_used {
         assert_eq!(schema, hint_schema, "should use hint when versions match");
@@ -3509,7 +3467,8 @@ async fn test_get_file_actions_schema_v2_identity_filter(
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let (schema, sidecars) =
+        log_segment.get_file_actions_schema_and_sidecars_with_engine(&engine, None)?;
     let schema = schema.expect("leaf V2 checkpoint should yield a file actions schema");
     if identity_matches {
         assert_eq!(
@@ -3590,7 +3549,8 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let (schema, sidecars) =
+        log_segment.get_file_actions_schema_and_sidecars_with_engine(&engine, None)?;
     let schema = schema.expect("Multi-part V1 should return file actions schema");
 
     // Verify stats_parsed is detectable in the returned schema.
@@ -3869,7 +3829,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     )?;
     let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::LONG)]);
 
-    let checkpoint_result = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream_with_engine(
         &engine,
         CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone(),
         None, // meta_predicate
@@ -4471,7 +4431,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
 
     // Pass a partition schema to trigger partitionValues_parsed detection
     let partition_schema = schema! { nullable "id": INTEGER };
-    let checkpoint_result = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream_with_engine(
         &engine,
         read_schema,
         None, // meta_predicate
@@ -4536,9 +4496,9 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
 
     // Pass a partition schema — but the checkpoint doesn't have partitionValues_parsed
     let partition_schema = schema! { nullable "id": INTEGER };
-    let checkpoint_result = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream_with_engine(
         &engine,
-        read_schema.clone(),
+        read_schema,
         None,
         None,
         Some(&partition_schema),
@@ -4973,7 +4933,7 @@ async fn test_get_unpublished_catalog_commits() {
 
     assert_eq!(log_segment.listed.max_published_version, Some(2));
     let unpublished = log_segment.get_unpublished_catalog_commits().unwrap();
-    let versions: Vec<_> = unpublished.iter().map(|c| c.version()).collect();
+    let versions: Vec<_> = unpublished.iter().map(|c| c.version).collect();
     assert_eq!(versions, vec![3, 4]);
 }
 
@@ -5180,8 +5140,8 @@ fn test_combine_checkpoint_predicates(
 /// schema must match this behavior.
 ///
 /// This test reads JSON actions through `DefaultEngine` + `InMemory` store +
-/// `log_segment.read_actions()`, then re-validates the resulting Arrow `StructArray` with
-/// `StructArray::try_new`. Without the fix, non-nullable map value fields cause:
+/// `log_segment.read_actions_with_engine()`, then re-validates the resulting Arrow `StructArray`
+/// with `StructArray::try_new`. Without the fix, non-nullable map value fields cause:
 ///   "Found unmasked nulls for non-nullable StructArray field 'value'"
 #[rstest]
 // remove.partitionValues.month: null
@@ -5267,14 +5227,18 @@ async fn read_actions_with_null_map_values(
 
     // Build engine and read actions -- same as DeltaActionExtractor::get_actions.
     let engine = SyncEngine::new_with_store(store);
-    let log_segment =
-        LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, Some(0))
-            .unwrap();
+    let log_segment = LogSegment::for_table_changes_with_storage(
+        engine.storage_handler().as_ref(),
+        log_root,
+        0,
+        Some(0),
+    )
+    .unwrap();
 
     // Use all_actions_schema to cover sidecar and checkpointMetadata (checkpoint-only actions).
     let action_schema = get_all_actions_schema().clone();
     let action_batches = log_segment
-        .read_actions(&engine, action_schema)
+        .read_actions_with_engine(&engine, action_schema)
         .expect("read_actions should succeed");
 
     // Iterate batches and verify the map value field is nullable.
@@ -5353,7 +5317,8 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
     let log_segment = snapshot.log_segment();
 
     let schema = COMMIT_READ_SCHEMA.clone();
-    let commit_actions = log_segment.read_commit_actions(engine.as_ref(), schema, None)?;
+    let commit_actions =
+        log_segment.read_commit_actions_with_engine(engine.as_ref(), schema, None)?;
 
     let mut file_paths = vec![];
     for result in commit_actions {

@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::column_name;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::Snapshot;
@@ -45,8 +44,8 @@ async fn test_clustered_table_write_and_checkpoint(
         .with_data_layout(DataLayout::Clustered {
             columns: expected_clustering.clone(),
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     let snapshot = if use_fresh_snapshot {
         // Open a fresh snapshot (as if a different process is writing)
@@ -158,9 +157,9 @@ async fn test_clustered_table_write_all_null_clustering_column() {
         .with_data_layout(DataLayout::Clustered {
             columns: vec![column_name!("category"), column_name!("region_id")],
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap()
-        .commit(engine.as_ref())
+        .legacy_filesystem_commit(engine.as_ref())
         .unwrap();
 
     let snapshot = create_result

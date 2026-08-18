@@ -1,24 +1,22 @@
-//! The `committer` module provides a [`Committer`] trait which allows different implementations to
-//! define how to commit transactions to a catalog or filesystem. For catalog-managed tables, a
-//! [`Committer`] specific to the managing catalog should be provided. For non-catalog-managed
-//! tables, the [`FileSystemCommitter`] should be used to commit directly to the object store (via
-//! put-if-absent call to storage to atomically write new commit files).
+//! The `committer` module provides the Engine-based [`Committer`] compatibility API. For
+//! catalog-managed tables, a committer supplied by the managing catalog ratifies staged commits
+//! and publishes them to the Delta log. For non-catalog-managed tables, [`FileSystemCommitter`]
+//! atomically writes commits directly to object storage.
 //!
 //! By implementing the [`Committer`] trait, different catalogs can define what happens when the
 //! kernel needs to commit a transaction to a table. The goal terminal state of every
 //! [`Transaction`] is to be committed to the table. This means writing the changes (we call these
-//! actions) in the transaction as a new version of the table. The [`Committer`] trait exposes a
-//! single method, [`commit`] which takes an engine, an iterator of actions (as [`EngineData`]
-//! batches), and [`CommitMetadata`] (which includes critical commit metadata like the version to
-//! commit) to allow different catalogs to define what it means to 'commit' the actions to a table.
+//! actions) in the transaction as a new version of the table. Its [`commit`] method takes an
+//! engine, an iterator of actions (as [`EngineData`] batches), and [`CommitMetadata`] (which
+//! includes critical commit metadata like the version to commit) to allow different catalogs to
+//! define what it means to 'commit' the actions to a table.
 //! For some, this may mean writing staged commits to object storage and retaining an in-memory list
 //! (server side) of commits. For others, this may mean writing new (version, actions) tuples to a
 //! database.
 //!
-//! The implementation of [`commit`] must ensure that the actions are committed atomically to the
-//! table at the given version and either (1) persisted directly to object storage as published
-//! deltas as in non-catalog-managed tables or (2) persisted within the catalog and made available
-//! to readers during snapshot contstruction via the [`log_tail`] API.
+//! The legacy [`commit`] method owns the complete write. Coroutine-driven commits delegate a
+//! prepared [`Commit`] to the connector. Catalog workflows page its actions into a staged commit
+//! and ratify that commit through the catalog protocol.
 //!
 //! [`Transaction`]: crate::transaction::Transaction
 //! [`commit`]: crate::committer::Committer::commit
@@ -30,20 +28,26 @@ mod filesystem;
 mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
+use derive_more::Constructor;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::{DeltaResult, DeltaResultIterator, Engine, FilteredEngineData};
+use crate::coroutine::Generator;
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FilteredEngineData};
 
-/// A Committer is the system by which transactions are committed to a table. Transactions are
-/// effectively a collection of actions performed on the table at a specific version. The kernel
-/// exposes this trait so different catalogs can build their own commit implementations. For
-/// example, different catalogs may: commit directly to a database, commit to an object store, or
-/// use another system entirely.
+/// A prepared transaction whose actions are ready for a committer to persist.
+#[derive(Constructor)]
+pub struct Commit {
+    /// Metadata describing the target version and commit semantics.
+    pub metadata: CommitMetadata,
+    /// Commit actions in Delta log schema order.
+    pub actions: Generator<FilteredEngineData>,
+}
+
+/// Engine-based compatibility driver for committing and publishing transactions.
 ///
-/// Critically, a Committer must implement [`commit`] which takes an engine and an iterator of
-/// actions (as [`EngineData`] batches) to commit to the table at the given version
-/// ([`CommitMetadata::version`]).
+/// [`commit`] performs the complete legacy write. Coroutine-driven connectors receive a prepared
+/// [`Commit`] through the kernel request protocol instead.
 ///
 /// [`commit`]: Committer::commit
 /// [`EngineData`]: crate::EngineData
@@ -62,7 +66,7 @@ pub trait Committer: Send {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
 

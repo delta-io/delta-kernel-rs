@@ -1,6 +1,5 @@
 //! IcebergCompatV3 integration tests for the CreateTable API.
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
     schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, StructField,
 };
@@ -46,7 +45,7 @@ fn v3_create_table_rejects_incompatible_props(
 
     let err = create_table(&table_path, super::simple_schema()?, "Test/1.0")
         .with_table_properties(props)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -80,7 +79,7 @@ fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> Delta
 
     let err = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -110,7 +109,7 @@ fn v3_create_table_rejects_interval_column(
 
     let err = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -132,8 +131,8 @@ fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> DeltaResult<()> {
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.icebergCompatV3", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // 1. V3 is in writerFeatures (supported).

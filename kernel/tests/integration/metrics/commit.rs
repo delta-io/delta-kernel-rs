@@ -54,8 +54,8 @@ fn setup_empty_table() -> DeltaResult<(tempfile::TempDir, Url)> {
     let (temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?
+        .build(setup_engine.as_ref())?
+        .legacy_filesystem_commit(setup_engine.as_ref())?
         .unwrap_committed();
     Ok((temp_dir, table_url))
 }
@@ -132,7 +132,8 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
         txn.add_files(metadata);
     }
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_committed();
 
     let success = reporter.take_success();
     assert_eq!(success.num_add_files, 4);
@@ -148,9 +149,9 @@ async fn commit_success_carries_correlation_id() -> DeltaResult<()> {
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(setup_engine.as_ref())?
         .with_correlation_id("commit-req-1")
-        .commit(setup_engine.as_ref())?
+        .legacy_filesystem_commit(setup_engine.as_ref())?
         .unwrap_committed();
 
     let success = reporter.take_success();
@@ -180,8 +181,8 @@ async fn create_table_builder_carries_correlation_id(
         builder = builder.with_correlation_id(id);
     }
     builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_committed();
 
     let success = reporter.take_success();
@@ -205,8 +206,8 @@ async fn alter_table_builder_carries_correlation_id(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_committed();
 
     // Install the reporter after the create commit so the captured event is the alter commit.
@@ -222,8 +223,8 @@ async fn alter_table_builder_carries_correlation_id(
     }
     builder
         .add_column(StructField::nullable("extra", DataType::STRING))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build()?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_committed();
 
     let success = reporter.take_success();
@@ -336,7 +337,8 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count(
     let mut scan_files = get_scan_files(snapshot, engine.as_ref())?;
     let dv_map = sequential_dv_descriptors(&file_paths);
     txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_committed();
 
     let success = reporter.take_success();
     assert_eq!(success.num_dv_updates, 3);
@@ -372,7 +374,8 @@ async fn commit_dv_update_accumulates_file_count_across_calls(
         let dv_map = std::iter::once((path.clone(), all_descriptors[path].clone())).collect();
         txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
     }
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_committed();
 
     let success = reporter.take_success();
     assert_eq!(success.num_dv_updates, 2);

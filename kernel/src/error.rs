@@ -624,6 +624,12 @@ from_with_backtrace!(
     (std::io::Error, IOError)
 );
 
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(_error: std::sync::PoisonError<T>) -> Self {
+        Self::internal_error("poisoned mutex")
+    }
+}
+
 #[cfg(feature = "default-engine-base")]
 impl From<ArrowError> for Error {
     fn from(value: ArrowError) -> Self {

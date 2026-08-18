@@ -8,6 +8,8 @@ use tracing::{info, instrument};
 
 use crate::actions::{Metadata, Protocol};
 use crate::cancellation::CancellationTokenRef;
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::{Channel, Workflow};
 use crate::crc::Crc;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -107,12 +109,11 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
     /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
     correlation_id: Option<Arc<str>>,
-    /// Optional cooperative cancellation token supplied via
-    /// [`with_cancellation_token`](Self::with_cancellation_token). `None` means the build is not
-    /// cancellable.
+    /// Cancellation honored while [`Self::build`] drives the workflow through an [`Engine`].
     cancellation_token: Option<CancellationTokenRef>,
-    // Carries the zero-sized typestate that limits mode-specific methods at compile time.
-    mode: PhantomData<Mode>,
+    // Carries the zero-sized typestate that limits mode-specific methods at compile time without
+    // implying that the builder owns a `Mode`.
+    mode: PhantomData<fn() -> Mode>,
 }
 
 /// Builder for incrementally updating an existing [`Snapshot`].
@@ -358,16 +359,30 @@ impl<Mode> SnapshotBuilder<Mode> {
     // Terminal: build the Snapshot
     // ============================================================================
 
-    /// Create a new [`Snapshot`]. This returns a [`SnapshotRef`] (`Arc<Snapshot>`), perhaps
-    /// returning a reference to an existing snapshot if the request to build a new snapshot
-    /// matches the version of an existing snapshot.
+    /// Build a [`Snapshot`] by driving [`start`](Self::start) through `engine`.
+    ///
+    /// Returns a shared reference to the loaded snapshot. Errors from kernel or Engine handlers
+    /// abort the workflow.
+    pub fn build(mut self, engine: &dyn Engine) -> DeltaResult<SnapshotRef>
+    where
+        Mode: 'static,
+    {
+        let cancellation_token = self.cancellation_token.take();
+        EngineConnector::new(engine)
+            .with_cancellation_token(cancellation_token)
+            .drive_workflow(self.start())
+    }
+
+    /// Start a connector-driven workflow that produces a [`SnapshotRef`].
+    ///
+    /// The workflow may complete immediately or return an operation for the connector to execute
+    /// and resume.
+    ///
+    /// Returns an error if setup fails before the first connector operation. Errors encountered
+    /// after suspension are returned by the corresponding resume handle.
     ///
     /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
     /// [`MetricEvent::SnapshotBuildFailure`].
-    ///
-    /// # Parameters
-    ///
-    /// - `engine`: Implementation of [`Engine`] apis.
     ///
     /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
     /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
@@ -379,7 +394,14 @@ impl<Mode> SnapshotBuilder<Mode> {
         fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+    pub fn start(self) -> DeltaResult<Workflow<SnapshotRef>>
+    where
+        Mode: 'static,
+    {
+        Workflow::start(async move |channel| self.build_impl(&channel).await)
+    }
+
+    async fn build_impl(self, channel: &Channel) -> DeltaResult<SnapshotRef> {
         // Fold the context into the message string rather than passing structured fields: this
         // `info!` fires inside the `snap.build` metrics span, where any field the
         // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
@@ -407,7 +429,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             snapshot_hint,
             operation_id,
             correlation_id,
-            cancellation_token,
+            cancellation_token: _,
             mode: _,
         } = self;
 
@@ -445,21 +467,22 @@ impl<Mode> SnapshotBuilder<Mode> {
             if let Some(table_root) = table_root {
                 let table_url = try_parse_uri(table_root)?;
                 let log_segment = LogSegment::for_snapshot(
-                    engine.storage_handler().as_ref(),
+                    channel,
                     table_url.join("_delta_log/")?,
                     log_tail,
                     effective_version,
                     metric_context.clone(),
-                    cancellation_token.as_ref(),
-                )?;
+                )
+                .await?;
                 Snapshot::try_new_from_log_segment(
+                    channel,
                     table_url,
                     log_segment,
-                    engine,
                     metric_context,
                     incremental_replay,
                     built_as_latest,
                 )
+                .await
                 .map(Into::into)?
             } else {
                 let Some(existing_snapshot) = existing_snapshot else {
@@ -468,16 +491,16 @@ impl<Mode> SnapshotBuilder<Mode> {
                     ));
                 };
                 Snapshot::try_new_from(
+                    channel,
                     existing_snapshot,
                     log_tail,
-                    engine,
                     effective_version,
                     metric_context,
                     incremental_replay,
                     checkpoint_handling,
                     built_as_latest,
-                    cancellation_token.as_ref(),
-                )?
+                )
+                .await?
             }
         };
 

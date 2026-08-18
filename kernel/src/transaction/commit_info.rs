@@ -3,12 +3,17 @@ use std::sync::{Arc, LazyLock};
 
 use super::Transaction;
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
+#[cfg(test)]
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::Channel;
 use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, null_lit, MapData, Scalar};
-use crate::schema::{column_name, schema_ref, ColumnName, MapType, ToSchema};
+use crate::schema::{column_name, schema_ref, ColumnName, MapType, SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::require;
-use crate::{create_row, DataType, Engine, EngineData, Error, Expression, ExpressionRef};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DataType, EngineData, Error, Expression, ExpressionRef};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -66,12 +71,24 @@ fn string_map_literal_expr(
 }
 
 impl<S> Transaction<S> {
-    pub(super) fn generate_commit_info(
+    #[cfg(test)]
+    fn generate_commit_info_with_engine(
         &self,
         engine: &dyn Engine,
         kernel_commit_info: CommitInfo,
     ) -> Result<Box<dyn EngineData>, Error> {
-        match &self.engine_commit_info {
+        let engine_commit_info = self.engine_commit_info.clone();
+        EngineConnector::run_with(engine, async move |channel| {
+            Self::generate_commit_info(&channel, engine_commit_info, kernel_commit_info).await
+        })
+    }
+
+    pub(super) async fn generate_commit_info(
+        channel: &Channel,
+        engine_commit_info: Option<(Arc<dyn EngineData>, SchemaRef)>,
+        kernel_commit_info: CommitInfo,
+    ) -> Result<Box<dyn EngineData>, Error> {
+        match engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();
                 let mut commit_info = kernel_commit_info;
@@ -87,7 +104,7 @@ impl<S> Transaction<S> {
                 // Step 2: Build the output schema and expression patch together. Engine fields
                 // pass through first, overlapping kernel fields are replaced in place, and
                 // kernel-only fields are appended after the last engine field.
-                let mut patch = ProjectionStructPatchBuilder::new(engine_commit_info_schema);
+                let mut patch = ProjectionStructPatchBuilder::new(&engine_commit_info_schema);
                 for (field_name, expr_ref) in &literal_exprs {
                     let field = kernel_schema.field(*field_name).ok_or_else(|| {
                         Error::internal_error(format!(
@@ -115,14 +132,22 @@ impl<S> Transaction<S> {
                 // with the None branch which uses `LOG_COMMIT_INFO_SCHEMA`.
                 let wrapped_expr = Expression::struct_from([patch]);
                 let wrapped_schema = schema_ref! { nullable COMMIT_INFO_NAME: (output_schema) };
-                let evaluator = engine.evaluation_handler().new_expression_evaluator(
-                    engine_commit_info_schema.clone(),
-                    Arc::new(wrapped_expr),
-                    wrapped_schema.into(),
-                )?;
-                evaluator.evaluate(engine_commit_info.as_ref())
+                let evaluator = channel
+                    .create_expression_evaluator(
+                        engine_commit_info_schema,
+                        Arc::new(wrapped_expr),
+                        wrapped_schema.into(),
+                    )
+                    .await?;
+                channel
+                    .evaluate_expression(&evaluator, engine_commit_info)
+                    .await
             }
-            None => create_row(engine, LOG_COMMIT_INFO_SCHEMA.clone(), kernel_commit_info),
+            None => {
+                channel
+                    .create_row(LOG_COMMIT_INFO_SCHEMA.clone(), kernel_commit_info)
+                    .await
+            }
         }
     }
 }
@@ -184,7 +209,6 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
@@ -285,7 +309,7 @@ mod tests {
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(engine.as_ref())?
             .with_operation("WRITE".to_string())
             .fold_with(engine_commit_info, |txn, (data, schema)| {
                 txn.with_commit_info(data, schema)
@@ -312,7 +336,7 @@ mod tests {
     fn test_build_commit_info_none_branch() -> DeltaResult<()> {
         let (engine, txn) = make_txn(None)?;
         let result = ArrowEngineData::try_from_engine_data(
-            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+            txn.generate_commit_info_with_engine(engine.as_ref(), make_kernel_commit_info())?,
         )?;
         let ci = commit_info_struct(&result);
 
@@ -341,7 +365,7 @@ mod tests {
         let (engine, txn) = make_txn(Some((data, schema)))?;
 
         let result = ArrowEngineData::try_from_engine_data(
-            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+            txn.generate_commit_info_with_engine(engine.as_ref(), make_kernel_commit_info())?,
         )?;
         let commit_info = commit_info_struct(&result);
 
@@ -424,7 +448,7 @@ mod tests {
         let (engine, txn) = make_txn(Some((data, schema)))?;
 
         let result = ArrowEngineData::try_from_engine_data(
-            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+            txn.generate_commit_info_with_engine(engine.as_ref(), make_kernel_commit_info())?,
         )?;
         let commit_info = commit_info_struct(&result);
 
@@ -472,7 +496,7 @@ mod tests {
         let (engine, txn) = make_txn(Some((data, schema)))?;
 
         let result = ArrowEngineData::try_from_engine_data(
-            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+            txn.generate_commit_info_with_engine(engine.as_ref(), make_kernel_commit_info())?,
         )?;
         let ci = commit_info_struct(&result);
 
@@ -519,7 +543,7 @@ mod tests {
         let (engine, txn) = make_txn(Some((data, schema)))?;
 
         let result = ArrowEngineData::try_from_engine_data(
-            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+            txn.generate_commit_info_with_engine(engine.as_ref(), make_kernel_commit_info())?,
         )?;
         let ci = commit_info_struct(&result);
 
@@ -556,7 +580,7 @@ mod tests {
         )))?;
 
         let result = ArrowEngineData::try_from_engine_data(
-            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+            txn.generate_commit_info_with_engine(engine.as_ref(), make_kernel_commit_info())?,
         )?;
         let ci = commit_info_struct(&result);
 

@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
@@ -121,8 +120,8 @@ fn setup_clustered_table(
         .with_data_layout(DataLayout::Clustered {
             columns: clustering_cols,
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     let snapshot = set_table_properties(
         &table_path,

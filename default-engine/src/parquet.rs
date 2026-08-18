@@ -268,7 +268,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 }
 
 /// Internal async implementation of read_parquet_files
-async fn read_parquet_files_impl(
+pub(crate) async fn read_parquet_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
@@ -414,31 +414,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         file: &FileMeta,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> DeltaResult<ParquetFooter> {
-        let store = self.store.clone();
-        let location = file.location.clone();
-        let file_size = file.size;
-
-        let footer_future = async move {
-            let metadata = if location.is_presigned() {
-                let client = reqwest::Client::new();
-                let response =
-                    client.get(location.as_str()).send().await.map_err(|e| {
-                        Error::generic(format!("Failed to fetch presigned URL: {e}"))
-                    })?;
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {e}")))?;
-                ArrowReaderMetadata::load(&bytes, reader_options())?
-            } else {
-                let path = Path::from_url_path(location.path())?;
-                let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
-                ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
-            };
-
-            let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
-            Ok(ParquetFooter { schema })
-        };
+        let footer_future = read_parquet_footer_impl(self.store.clone(), file.clone());
 
         // Race the footer read against cancellation so a cancelled request stops promptly.
         match cancellation_token {
@@ -447,6 +423,36 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             None => self.task_executor.block_on(footer_future),
         }
     }
+}
+
+/// Read and decode the Parquet footer for `file` from `store`.
+///
+/// Returns an error when the object cannot be read or its footer is invalid.
+pub(crate) async fn read_parquet_footer_impl(
+    store: Arc<DynObjectStore>,
+    file: FileMeta,
+) -> DeltaResult<ParquetFooter> {
+    let location = file.location;
+    let metadata = if location.is_presigned() {
+        let client = reqwest::Client::new();
+        let response = client
+            .get(location.as_str())
+            .send()
+            .await
+            .map_err(|e| Error::generic(format!("Failed to fetch presigned URL: {e}")))?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::generic(format!("Failed to read response bytes: {e}")))?;
+        ArrowReaderMetadata::load(&bytes, reader_options())?
+    } else {
+        let path = Path::from_url_path(location.path())?;
+        let mut reader = ParquetObjectReader::new(store, path).with_file_size(file.size);
+        ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
+    };
+
+    let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
+    Ok(ParquetFooter { schema })
 }
 
 /// Opens a Parquet file and returns a stream of record batches

@@ -4,7 +4,6 @@ use delta_kernel::arrow::array::{AsArray, Int32Array};
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{Int32Type, Int64Type};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::schema::{schema_ref, MetadataColumnSpec};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
@@ -90,8 +89,8 @@ mod row_tracking_preservation {
             "Test/1.0",
         )
         .with_table_properties(test_case.create_table_properties().iter().copied())
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
         let snapshot = if test_case == CommitInfoTagTestCase::Suspended {
             set_table_properties(
@@ -129,8 +128,8 @@ mod row_tracking_preservation {
             "Test/1.0",
         )
         .with_table_properties([("delta.enableRowTracking", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_committed()
         .commit_version();
 
@@ -148,14 +147,14 @@ mod row_tracking_preservation {
             "Test/1.0",
         )
         .with_table_properties([("delta.enableRowTracking", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
         let commit_version = snapshot
             .alter_table()
             .add_column(StructField::nullable("added", DataType::INTEGER))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build()?
+            .legacy_filesystem_commit(engine.as_ref())?
             .unwrap_committed()
             .commit_version();
 
@@ -179,20 +178,20 @@ mod row_tracking_preservation {
             "Test/1.0",
         )
         .with_table_properties([("delta.enableRowTracking", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
         // === Commit with connector-provided CommitInfo ===
         let (connector_commit_info, connector_commit_info_schema) =
             test_case.connector_commit_info()?;
         let commit_version = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(engine.as_ref())?
             .with_commit_info(
                 Box::new(ArrowEngineData::new(connector_commit_info)),
                 connector_commit_info_schema,
             )
-            .commit(engine.as_ref())?
+            .legacy_filesystem_commit(engine.as_ref())?
             .unwrap_committed()
             .commit_version();
 
@@ -348,8 +347,8 @@ mod row_tracking_preservation {
         let table_url = Url::from_directory_path(&table_path).unwrap();
         kernel_create_table(table_path.as_str(), schema.clone(), "Test/1.0")
             .with_table_properties(test_case.create_table_properties().iter().copied())
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref())?
+            .legacy_filesystem_commit(engine.as_ref())?
             .unwrap_committed();
 
         let initial_snapshot = if test_case == RemoveTestCase::SuspendedUnacknowledged {
@@ -380,7 +379,7 @@ mod row_tracking_preservation {
             .unwrap()?
             .scan_files;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(engine.as_ref())?
             .with_data_change(true);
         txn.remove_files(scan_files);
         if test_case.acknowledges_preservation() {
@@ -389,9 +388,14 @@ mod row_tracking_preservation {
 
         // === Commit and verify the result ===
         if let Some(expected_error) = test_case.expects_error() {
-            assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
+            assert_result_error_with_message(
+                txn.legacy_filesystem_commit(engine.as_ref()),
+                expected_error,
+            );
         } else {
-            let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+            let snapshot = txn
+                .legacy_filesystem_commit(engine.as_ref())?
+                .unwrap_post_commit_snapshot();
             let scan = snapshot.scan_builder().build()?;
             let row_count: usize = read_scan(&scan, engine)?
                 .iter()
@@ -442,7 +446,7 @@ mod row_tracking_preservation {
 
         // === Verify the commit is rejected ===
         assert_result_error_with_message(
-            txn.commit(engine.as_ref()),
+            txn.legacy_filesystem_commit(engine.as_ref()),
             "Transaction::ack_row_tracking_preservation()",
         );
         Ok(())
@@ -470,8 +474,8 @@ mod row_tracking_preservation {
         let schema = schema_ref! { nullable "number": INTEGER };
         let snapshot = kernel_create_table(table_path.as_str(), schema, "Test/1.0")
             .with_table_properties(table_properties.iter().copied())
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref())?
+            .legacy_filesystem_commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
         let snapshot = insert_data(
             snapshot,
@@ -581,8 +585,8 @@ mod row_tracking_preservation {
             ("delta.enableDeletionVectors", "true"),
             ("delta.enableRowTracking", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
         let source_snapshot = insert_data(
             snapshot,
@@ -595,7 +599,7 @@ mod row_tracking_preservation {
         // === Delete rows 20 and 40 with a deletion vector ===
         let mut txn = source_snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(engine.as_ref())?
             .with_operation("DELETE".to_string());
         let write_context = txn.write_state()?.write_context_builder().build()?;
         let mut deletion_vector = KernelDeletionVector::new();
@@ -615,7 +619,9 @@ mod row_tracking_preservation {
                 .map(Ok),
         )?;
         txn.ack_row_tracking_preservation();
-        let deletion_vector_snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        let deletion_vector_snapshot = txn
+            .legacy_filesystem_commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
 
         // === Read and merge the surviving rows ===
         let survivor_batches = read_row_tracking_scan(
@@ -670,7 +676,7 @@ mod row_tracking_preservation {
     ) -> DeltaResult<Arc<Snapshot>> {
         let source_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(engine.as_ref())?
             .with_operation("OPTIMIZE".to_string())
             .with_data_change(false);
         let write_context = txn
@@ -690,7 +696,9 @@ mod row_tracking_preservation {
             txn.remove_files(files);
         }
         txn.ack_row_tracking_preservation();
-        Ok(txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot())
+        Ok(txn
+            .legacy_filesystem_commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot())
     }
 
     fn collect_checkpoint_row_tracking_metadata(
@@ -752,10 +760,10 @@ fn write_context_row_tracking_columns_respect_iceberg_compat_v3(
         "Test/1.0",
     )
     .with_table_properties(table_properties.iter().copied())
-    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-    .commit(engine.as_ref())?
+    .build(engine.as_ref())?
+    .legacy_filesystem_commit(engine.as_ref())?
     .unwrap_post_commit_snapshot();
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot.transaction(engine.as_ref())?;
     let result = txn
         .write_state()?
         .write_context_builder()
@@ -786,8 +794,8 @@ async fn write_context_maps_row_tracking_metadata_to_physical(
             ("delta.columnMapping.mode", column_mapping_mode),
             ("delta.enableRowTracking", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let snapshot = insert_data(
         snapshot,
@@ -830,9 +838,7 @@ async fn write_context_maps_row_tracking_metadata_to_physical(
     );
 
     // === Build the write context ===
-    let txn = source_snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = source_snapshot.clone().transaction(engine.as_ref())?;
     let write_context = txn
         .write_state()?
         .write_context_builder()

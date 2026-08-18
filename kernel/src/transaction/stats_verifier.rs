@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
-use crate::DeltaResult;
+use crate::{DeltaResult, EngineData};
 
 /// Verifies that add file statistics contain required columns.
 ///
@@ -37,7 +37,7 @@ impl StatsColumnVerifier {
     /// For each required column, extracts all three stat columns (nullCount, minValues,
     /// maxValues) in a single `visit_rows` call per batch.
     #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
+    pub fn verify(&self, add_files: &[impl AsRef<dyn EngineData>]) -> DeltaResult<()> {
         if self.required_columns.is_empty() {
             return Ok(());
         }
@@ -53,7 +53,7 @@ impl StatsColumnVerifier {
     /// every file. Extracts all three stat columns in a single `visit_rows` call per batch.
     fn verify_column(
         &self,
-        add_files: &[Box<dyn crate::EngineData>],
+        add_files: &[impl AsRef<dyn EngineData>],
         column: &ColumnName,
         data_type: &DataType,
     ) -> DeltaResult<()> {
@@ -78,7 +78,7 @@ impl StatsColumnVerifier {
                 missing_min: &mut missing_min,
                 missing_max: &mut missing_max,
             };
-            batch.visit_rows(&column_names, &mut visitor)?;
+            batch.as_ref().visit_rows(&column_names, &mut visitor)?;
         }
 
         if !missing_null_count.is_empty() {
@@ -301,14 +301,14 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
 #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
+pub fn verify_num_records_present(add_files: &[impl AsRef<dyn EngineData>]) -> DeltaResult<()> {
     let column_names = vec![column_name!("path"), column_name!("stats", NUM_RECORDS)];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
         let mut visitor = NumRecordsValidator {
             first_missing: &mut first_missing,
         };
-        batch.visit_rows(&column_names, &mut visitor)?;
+        batch.as_ref().visit_rows(&column_names, &mut visitor)?;
         if first_missing.is_some() {
             break;
         }

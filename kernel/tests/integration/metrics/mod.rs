@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -104,8 +103,8 @@ async fn setup_table_with_v1_checkpoint() -> DeltaResult<(
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let _ = create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?;
+        .build(setup_engine.as_ref())?
+        .legacy_filesystem_commit(setup_engine.as_ref())?;
 
     let snap0 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
     let committed = insert_data(

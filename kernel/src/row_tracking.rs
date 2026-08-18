@@ -7,6 +7,8 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 
 use crate::actions::{DomainMetadata, NUM_RECORDS};
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::Channel;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
@@ -46,6 +48,18 @@ impl RowTrackingDomainMetadata {
         Self::new(Self::MISSING_ROW_ID_HIGH_WATERMARK)
     }
 
+    /// Engine wrapper around [`Self::get_high_water_mark`].
+    pub fn get_high_water_mark_with_engine(
+        snapshot: &Snapshot,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        // TODO: Use Arc<Snapshot> to avoid this deep clone.
+        let snapshot = snapshot.clone();
+        EngineConnector::run_with(engine, async move |channel| {
+            Self::get_high_water_mark(&snapshot, &channel).await
+        })
+    }
+
     /// Retrieves the row ID high water mark from the [`Snapshot`]'s row tracking domain metadata.
     ///
     /// This method searches through the snapshot's log segment for domain metadata actions
@@ -62,12 +76,15 @@ impl RowTrackingDomainMetadata {
     /// This method will return an error if:
     /// - The domain metadata configuration cannot be read from the log segment
     /// - The domain metadata JSON cannot be deserialized into `RowTrackingDomainMetadata`
-    pub fn get_high_water_mark(
+    pub(crate) async fn get_high_water_mark(
         snapshot: &Snapshot,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<Option<i64>> {
+        // TODO: Use Arc<Snapshot> to avoid this deep clone.
+        let snapshot = snapshot.clone();
         Ok(snapshot
-            .get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+            .get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, channel)
+            .await?
             .map(|config| serde_json::from_str::<Self>(&config))
             .transpose()?
             .map(|metadata| metadata.row_id_high_water_mark))

@@ -1,9 +1,14 @@
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
+#[cfg(test)]
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::{Channel, GeneratorState};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, RowVisitor as _, Version};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, RowVisitor as _, Version};
 
 /// Resolves the latest `txn` action per application id via log replay, where the newest action in
 /// log order wins.
@@ -18,23 +23,51 @@ impl SetTransactionScanner {
     ///
     /// Note that each call to this function repeats log replay. Thus, if callers are interested
     /// in multiple app ids, use `get_all` (once) instead and probe the map returned.
-    pub(crate) fn get_one(
+    #[cfg(test)]
+    pub(crate) fn get_one_with_engine(
         log_segment: &LogSegment,
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<SetTransaction>> {
+        // TODO: Use Arc<LogSegment> to avoid this deep clone.
+        let log_segment = log_segment.clone();
+        let application_id = application_id.to_owned();
+        EngineConnector::run_with(engine, async move |channel| {
+            Self::get_one(&log_segment, &application_id, &channel).await
+        })
+    }
+
+    pub(crate) async fn get_one(
+        log_segment: &LogSegment,
+        application_id: &str,
+        channel: &Channel,
+    ) -> DeltaResult<Option<SetTransaction>> {
         let mut transactions =
-            scan_application_transactions(log_segment, Some(application_id), engine)?;
+            scan_application_transactions(log_segment, Some(application_id), channel).await?;
         Ok(transactions.remove(application_id))
     }
 
     /// Scan the Delta Log for the latest `txn` action of every application id.
     #[allow(unused)]
-    pub(crate) fn get_all(
+    #[cfg(test)]
+    pub(crate) fn get_all_with_engine(
         log_segment: &LogSegment,
         engine: &dyn Engine,
     ) -> DeltaResult<SetTransactionMap> {
-        scan_application_transactions(log_segment, None, engine)
+        // TODO: Use Arc<LogSegment> to avoid this deep clone.
+        let log_segment = log_segment.clone();
+        EngineConnector::run_with(engine, async move |channel| {
+            Self::get_all(&log_segment, &channel).await
+        })
+    }
+
+    /// Scan the Delta Log for the latest `txn` action of every application id.
+    #[allow(unused)]
+    pub(crate) async fn get_all(
+        log_segment: &LogSegment,
+        channel: &Channel,
+    ) -> DeltaResult<SetTransactionMap> {
+        scan_application_transactions(log_segment, None, channel).await
     }
 
     /// Fetch the latest `txn` action for `application_id`, rooted in an authoritative (`Complete`)
@@ -45,18 +78,19 @@ impl SetTransactionScanner {
     /// [`LogSegment::segment_after_version`]. When the tail holds a `txn` for `application_id`, its
     /// newest wins; otherwise the result is that id's entry in `base_active`, the value the CRC
     /// recorded at `base_version`.
-    pub(crate) fn get_one_rooted_in_crc(
+    pub(crate) async fn get_one_rooted_in_crc(
         log_segment: &LogSegment,
         application_id: &str,
         base_active: &SetTransactionMap,
         base_version: Version,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<Option<SetTransaction>> {
         let tail = Self::get_one(
             &log_segment.segment_after_version(base_version),
             application_id,
-            engine,
-        )?;
+            channel,
+        )
+        .await?;
         Ok(tail.or_else(|| base_active.get(application_id).cloned()))
     }
 }
@@ -64,16 +98,17 @@ impl SetTransactionScanner {
 /// Scan the entire log for all application ids but terminate early if a specific application id
 /// is provided
 // TODO: we could have this track _multiple_ application ids instead of only up to one.
-fn scan_application_transactions(
+async fn scan_application_transactions(
     log_segment: &LogSegment,
     application_id: Option<&str>,
-    engine: &dyn Engine,
+    channel: &Channel,
 ) -> DeltaResult<SetTransactionMap> {
     let mut visitor = SetTransactionVisitor::new(application_id.map(|s| s.to_owned()));
+    let mut replay = GeneratorState::Start(replay_for_app_ids(log_segment, channel).await?);
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
-    for maybe_data in replay_for_app_ids(log_segment, engine)? {
-        let txns = maybe_data?.actions;
+    while let Some(data) = replay.next(channel).await? {
+        let txns = data.actions;
         visitor.visit_rows_of(txns.as_ref())?;
         // if a specific id is requested and a transaction was found, then return
         if application_id.is_some() && !visitor.set_transactions.is_empty() {
@@ -85,11 +120,26 @@ fn scan_application_transactions(
 }
 
 // Factored out to facilitate testing
-fn replay_for_app_ids(
+async fn replay_for_app_ids(
+    log_segment: &LogSegment,
+    channel: &Channel,
+) -> DeltaResult<crate::coroutine::Generator<ActionsBatch>> {
+    log_segment
+        .read_actions(channel, LOG_TXN_SCHEMA.clone())
+        .await
+}
+
+#[cfg(test)]
+fn replay_for_app_ids_with_engine(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-    log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
+    let connector = EngineConnector::new(engine);
+    // TODO: Use Arc<LogSegment> to avoid this deep clone.
+    let log_segment = log_segment.clone();
+    let actions =
+        connector.run(async move |channel| replay_for_app_ids(&log_segment, &channel).await)?;
+    connector.iterate_generator(Ok(actions))
 }
 
 #[cfg(test)]
@@ -116,8 +166,8 @@ mod tests {
         let log_segment = snapshot.log_segment();
 
         (
-            SetTransactionScanner::get_all(log_segment, &engine).unwrap(),
-            SetTransactionScanner::get_one(log_segment, app_id, &engine).unwrap(),
+            SetTransactionScanner::get_all_with_engine(log_segment, &engine).unwrap(),
+            SetTransactionScanner::get_one_with_engine(log_segment, app_id, &engine).unwrap(),
         )
     }
 
@@ -166,7 +216,7 @@ mod tests {
         let log_segment = snapshot.log_segment();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
-        let data: Vec<_> = replay_for_app_ids(log_segment, &engine)
+        let data: Vec<_> = replay_for_app_ids_with_engine(log_segment, &engine)
             .unwrap()
             .try_collect()
             .unwrap();
@@ -183,7 +233,7 @@ mod tests {
         let log_segment = snapshot.log_segment();
 
         // The scanner returns every app_id regardless of `lastUpdated`; callers apply retention.
-        let all_txns = SetTransactionScanner::get_all(log_segment, &engine).unwrap();
+        let all_txns = SetTransactionScanner::get_all_with_engine(log_segment, &engine).unwrap();
         assert_eq!(all_txns.len(), 4);
     }
 

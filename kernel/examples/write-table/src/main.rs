@@ -10,7 +10,6 @@ use delta_kernel::arrow::array::{
     TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::util::pretty::print_batches;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
@@ -86,9 +85,8 @@ async fn try_main() -> DeltaResult<()> {
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
 
     // Write sample data to the table
-    let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction(committer, &engine)?
+        .transaction(&engine)?
         .with_operation("INSERT".to_string())
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);
@@ -99,6 +97,7 @@ async fn try_main() -> DeltaResult<()> {
 
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);
+    let mut txn = txn.into_legacy_filesystem();
 
     // Commit the transaction (in a simple retry loop)
     let mut retries = 0;
@@ -195,8 +194,8 @@ async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) 
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
     let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+        .build(engine)?
+        .legacy_filesystem_commit(engine)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())

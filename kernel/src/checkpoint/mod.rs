@@ -468,7 +468,7 @@ impl CheckpointWriter {
         let actions = self
             .snapshot
             .log_segment()
-            .read_actions(engine, self.read_schema.clone())?;
+            .read_actions_with_engine(engine, self.read_schema.clone())?;
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
@@ -733,7 +733,8 @@ impl CheckpointWriter {
         };
 
         // Get clustering columns so they are always included in stats per the Delta protocol.
-        let physical_clustering_columns = snapshot.get_physical_clustering_columns(engine)?;
+        let physical_clustering_columns =
+            snapshot.get_physical_clustering_columns_with_engine(engine)?;
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.

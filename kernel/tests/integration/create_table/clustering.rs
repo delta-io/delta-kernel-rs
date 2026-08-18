@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
@@ -62,7 +61,7 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Delta
         .with_data_layout(DataLayout::Clustered {
             columns: input_cols,
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     let stats_cols = txn.stats_columns();
     for col in &expected_cols {
@@ -72,12 +71,13 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Delta
         );
     }
 
-    let _ = txn.commit(engine.as_ref())?;
+    let _ = txn.legacy_filesystem_commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns =
+        snapshot.get_physical_clustering_columns_with_engine(engine.as_ref())?;
     assert_eq!(clustering_columns, Some(expected_cols));
 
     let table_configuration = snapshot.table_configuration();
@@ -109,8 +109,8 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     // Read back using kernel APIs and verify no duplicate features
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -132,7 +132,8 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
     );
 
     // Verify clustering columns via snapshot read path
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns =
+        snapshot.get_physical_clustering_columns_with_engine(engine.as_ref())?;
     assert_eq!(clustering_columns, Some(vec![column_name!("id")]));
 
     Ok(())
@@ -151,7 +152,7 @@ async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
     // Create clustered table on col5
     let txn = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::clustered(["col5"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     // Verify stats_columns includes the clustering column
     let stats_cols = txn.stats_columns();
@@ -176,7 +177,7 @@ async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
     // Create clustered table on col35 (position > 32)
     let txn = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::clustered(["col35"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     // Verify stats_columns includes the clustering column even beyond limit
     let stats_cols = txn.stats_columns();
@@ -212,7 +213,7 @@ async fn test_clustering_column_error(
         .with_data_layout(DataLayout::Clustered {
             columns: vec![ColumnName::new(col_path.iter().copied())],
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
 
     assert_result_error_with_message(result, expected_error);
 

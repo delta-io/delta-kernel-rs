@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::schema_ref;
@@ -31,8 +30,8 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
 
     // Create table and verify post_commit_snapshot
     let create_result = create_table_txn(table_url.as_str(), schema, env!("CARGO_PKG_VERSION"))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     let mut current_snapshot = match create_result {
         CommitResult::CommittedTransaction(committed) => {
@@ -59,7 +58,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
         let txn =
             begin_transaction(current_snapshot.clone(), engine.as_ref())?.with_engine_info("test");
 
-        match txn.commit(engine.as_ref())? {
+        match txn.legacy_filesystem_commit(engine.as_ref())? {
             CommitResult::CommittedTransaction(committed) => {
                 let post_snapshot = committed
                     .post_commit_snapshot()

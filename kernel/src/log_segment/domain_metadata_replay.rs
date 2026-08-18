@@ -11,9 +11,14 @@ use tracing::instrument;
 use super::LogSegment;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
+#[cfg(test)]
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::{Channel, GeneratorState};
 use crate::crc::merge_domain_metadata;
 use crate::log_replay::ActionsBatch;
-use crate::{DeltaResult, Engine, RowVisitor as _, Version};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, RowVisitor as _, Version};
 
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
@@ -24,14 +29,41 @@ impl LogSegment {
     ///
     /// Returns the latest domain metadata for each domain, accounting for tombstones
     /// (`removed=true`) — removed domain metadatas will _never_ be present in the returned map.
-    #[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
-    pub(crate) fn scan_domain_metadatas(
+    #[cfg(test)]
+    pub(crate) fn scan_domain_metadatas_with_engine(
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> DeltaResult<DomainMetadataMap> {
+        EngineConnector::run_with(engine, {
+            // TODO: Use Arc<LogSegment> to avoid this deep clone.
+            let log_segment = self.clone();
+            let domains = domains.map(|domains| {
+                domains
+                    .iter()
+                    .map(|domain| (*domain).to_owned())
+                    .collect::<HashSet<_>>()
+            });
+            async move |channel| {
+                let domains = domains
+                    .as_ref()
+                    .map(|domains| domains.iter().map(String::as_str).collect());
+                log_segment
+                    .scan_domain_metadatas(domains.as_ref(), &channel)
+                    .await
+            }
+        })
+    }
+
+    #[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
+    pub(crate) async fn scan_domain_metadatas(
+        &self,
+        domains: Option<&HashSet<&str>>,
+        channel: &Channel,
+    ) -> DeltaResult<DomainMetadataMap> {
         Ok(self
-            .visit_domain_metadatas(domains, engine)?
+            .visit_domain_metadatas(domains, channel)
+            .await?
             .into_domain_metadatas())
     }
 
@@ -45,16 +77,17 @@ impl LogSegment {
     /// A domain the tail never mentions falls back to `base_active`. `domains == None` answers all
     /// active domains; `Some(filter)` answers only the requested ones. Returned maps never contain
     /// tombstones.
-    pub(crate) fn scan_domain_metadatas_rooted_in_crc(
+    pub(crate) async fn scan_domain_metadatas_rooted_in_crc(
         &self,
         base_version: Version,
         base_active: &HashMap<String, DomainMetadata>,
         domains: Option<&HashSet<&str>>,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<DomainMetadataMap> {
         let tail = self
             .segment_after_version(base_version)
-            .scan_tail_including_tombstones(domains, engine)?;
+            .scan_tail_including_tombstones(domains, channel)
+            .await?;
         let reconciled = match domains {
             // Filtered: the newest tail action per requested domain wins; a tombstone settles the
             // answer as absent. Fall back to `base_active` only when the tail never mentions it.
@@ -79,13 +112,40 @@ impl LogSegment {
     /// Reverse-replay this segment for domain metadata, keeping tombstones. Terminates early once
     /// every requested domain is decided (a tombstone counts as decided). The CRC-rooted path keeps
     /// tombstones so a removal in a newer commit can suppress a domain the base holds.
-    fn scan_tail_including_tombstones(
+    #[cfg(test)]
+    fn scan_tail_including_tombstones_with_engine(
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> DeltaResult<DomainMetadataMap> {
+        EngineConnector::run_with(engine, {
+            // TODO: Use Arc<LogSegment> to avoid this deep clone.
+            let log_segment = self.clone();
+            let domains = domains.map(|domains| {
+                domains
+                    .iter()
+                    .map(|domain| (*domain).to_owned())
+                    .collect::<HashSet<_>>()
+            });
+            async move |channel| {
+                let domains = domains
+                    .as_ref()
+                    .map(|domains| domains.iter().map(String::as_str).collect());
+                log_segment
+                    .scan_tail_including_tombstones(domains.as_ref(), &channel)
+                    .await
+            }
+        })
+    }
+
+    async fn scan_tail_including_tombstones(
+        &self,
+        domains: Option<&HashSet<&str>>,
+        channel: &Channel,
+    ) -> DeltaResult<DomainMetadataMap> {
         Ok(self
-            .visit_domain_metadatas(domains, engine)?
+            .visit_domain_metadatas(domains, channel)
+            .await?
             .into_domain_metadatas_including_tombstones())
     }
 
@@ -94,10 +154,10 @@ impl LogSegment {
     /// the scan early once every requested domain is found; without one the whole segment is
     /// replayed. The caller chooses whether to keep or strip tombstones from the returned
     /// visitor.
-    fn visit_domain_metadatas(
+    async fn visit_domain_metadatas(
         &self,
         domains: Option<&HashSet<&str>>,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<DomainMetadataVisitor> {
         let domain_filter = domains.map(|set| {
             set.iter()
@@ -108,8 +168,9 @@ impl LogSegment {
         // If a specific set of domains is requested then we can terminate log replay early as
         // soon as all requested domains have been found. If all domains are requested then we
         // are forced to replay the entire log.
-        for actions in self.read_domain_metadata_batches(engine)? {
-            let domain_metadatas = actions?.actions;
+        let mut batches = GeneratorState::Start(self.read_domain_metadata_batches(channel).await?);
+        while let Some(actions) = batches.next(channel).await? {
+            let domain_metadatas = actions.actions;
             visitor.visit_rows_of(domain_metadatas.as_ref())?;
             // if all requested domains have been found, terminate early
             if visitor.filter_found() {
@@ -120,11 +181,25 @@ impl LogSegment {
     }
 
     /// Read action batches from the log, projecting rows to only contain domain metadata columns.
-    fn read_domain_metadata_batches(
+    async fn read_domain_metadata_batches(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<crate::coroutine::Generator<ActionsBatch>> {
+        self.read_actions(channel, LOG_DOMAIN_METADATA_SCHEMA.clone())
+            .await
+    }
+
+    #[cfg(test)]
+    fn read_domain_metadata_batches_with_engine(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
+        let connector = EngineConnector::new(engine);
+        // TODO: Use Arc<LogSegment> to avoid this deep clone.
+        let log_segment = self.clone();
+        let actions = connector
+            .run(async move |channel| log_segment.read_domain_metadata_batches(&channel).await)?;
+        connector.iterate_generator(Ok(actions))
     }
 }
 
@@ -136,7 +211,6 @@ mod tests {
     use url::Url;
 
     use crate::actions::visitors::DomainMetadataVisitor;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
@@ -164,20 +238,20 @@ mod tests {
             "test",
         )
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap()
         .with_domain_metadata("domainC".to_string(), "cfgC".to_string())
-        .commit(&engine)
+        .legacy_filesystem_commit(&engine)
         .unwrap();
 
         // Commit 1: add domainA and domainB via an existing-table transaction.
         let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
         let _ = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction(&engine)
             .unwrap()
             .with_domain_metadata("domainA".to_string(), "cfgA".to_string())
             .with_domain_metadata("domainB".to_string(), "cfgB".to_string())
-            .commit(&engine)
+            .legacy_filesystem_commit(&engine)
             .unwrap();
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
@@ -200,7 +274,7 @@ mod tests {
 
         // Sanity-check: the log has exactly 2 batches (one per commit).
         let total_batches = log_segment
-            .read_domain_metadata_batches(&engine)
+            .read_domain_metadata_batches_with_engine(&engine)
             .unwrap()
             .filter(|r| r.is_ok())
             .count();
@@ -214,7 +288,10 @@ mod tests {
         let filter = HashSet::from(["domainA".to_string(), "domainB".to_string()]);
         let mut visitor = DomainMetadataVisitor::new(Some(filter));
         let mut batches_consumed = 0;
-        for actions in log_segment.read_domain_metadata_batches(&engine).unwrap() {
+        for actions in log_segment
+            .read_domain_metadata_batches_with_engine(&engine)
+            .unwrap()
+        {
             batches_consumed += 1;
             visitor
                 .visit_rows_of(actions.unwrap().actions.as_ref())
@@ -250,7 +327,7 @@ mod tests {
         let (engine, snapshot) = build_two_commit_log();
         let result = snapshot
             .log_segment()
-            .scan_domain_metadatas(Some(&HashSet::from(["domainA"])), &engine)
+            .scan_domain_metadatas_with_engine(Some(&HashSet::from(["domainA"])), &engine)
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result["domainA"].configuration(), "cfgA");
@@ -261,7 +338,10 @@ mod tests {
         let (engine, snapshot) = build_two_commit_log();
         let result = snapshot
             .log_segment()
-            .scan_domain_metadatas(Some(&HashSet::from(["domainA", "domainC"])), &engine)
+            .scan_domain_metadatas_with_engine(
+                Some(&HashSet::from(["domainA", "domainC"])),
+                &engine,
+            )
             .unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result["domainA"].configuration(), "cfgA");
@@ -273,7 +353,7 @@ mod tests {
         let (engine, snapshot) = build_two_commit_log();
         let result = snapshot
             .log_segment()
-            .scan_domain_metadatas(None, &engine)
+            .scan_domain_metadatas_with_engine(None, &engine)
             .unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result["domainA"].configuration(), "cfgA");
@@ -291,7 +371,10 @@ mod tests {
         let filter = HashSet::from(["domainA".to_string(), "domainC".to_string()]);
         let mut visitor = DomainMetadataVisitor::new(Some(filter));
         let mut batches_consumed = 0;
-        for actions in log_segment.read_domain_metadata_batches(&engine).unwrap() {
+        for actions in log_segment
+            .read_domain_metadata_batches_with_engine(&engine)
+            .unwrap()
+        {
             batches_consumed += 1;
             visitor
                 .visit_rows_of(actions.unwrap().actions.as_ref())
@@ -315,10 +398,10 @@ mod tests {
         let (engine, snapshot) = build_two_commit_log();
         let table_root = snapshot.table_root().clone();
         let _ = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction(&engine)
             .unwrap()
             .with_domain_metadata_removed("domainA".to_string())
-            .commit(&engine)
+            .legacy_filesystem_commit(&engine)
             .unwrap();
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         (engine, snapshot)
@@ -330,7 +413,9 @@ mod tests {
         let log_segment = snapshot.log_segment();
 
         // scan_domain_metadatas strips the tombstone: "domainA" is gone.
-        let active = log_segment.scan_domain_metadatas(None, &engine).unwrap();
+        let active = log_segment
+            .scan_domain_metadatas_with_engine(None, &engine)
+            .unwrap();
         assert!(!active.contains_key("domainA"));
         assert!(active.contains_key("domainB"));
         assert!(active.contains_key("domainC"));
@@ -338,7 +423,7 @@ mod tests {
         // scan_tail_including_tombstones retains it as a tombstone so it can suppress a base
         // domain.
         let with_tombstones = log_segment
-            .scan_tail_including_tombstones(None, &engine)
+            .scan_tail_including_tombstones_with_engine(None, &engine)
             .unwrap();
         assert!(with_tombstones["domainA"].is_removed());
         assert!(!with_tombstones["domainB"].is_removed());

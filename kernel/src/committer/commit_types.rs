@@ -119,13 +119,12 @@ impl CommitProtocolMetadata {
 /// version, and protocol/metadata state of the table being committed to. Catalog committers can
 /// use the protocol and metadata getters to validate or inspect the commit.
 ///
-/// Note that this struct cannot be constructed. It is handed to the [`Committer`] (in the
-/// [`commit`] method) by the kernel when a transaction is being committed.
+/// Note that this struct cannot be constructed. Kernel hands it to the connector or legacy
+/// [`Committer`] when a transaction is being committed.
 ///
 /// See the [module-level documentation] for more details.
 ///
 /// [`Committer`]: super::Committer
-/// [`commit`]: super::Committer::commit
 /// [module-level documentation]: crate::committer
 #[derive(Debug)]
 pub struct CommitMetadata {

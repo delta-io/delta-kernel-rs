@@ -61,7 +61,7 @@ async fn write_data_to_table(
 
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
 
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.legacy_filesystem_commit(engine.as_ref())?;
     match result {
         CommitResult::CommittedTransaction(committed) => Ok(committed.commit_version()),
         _ => panic!("Transaction should be committed"),
@@ -130,7 +130,7 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
     txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
     // This should succeed - remove-only transactions are allowed with CDF
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.legacy_filesystem_commit(engine.as_ref())?;
     match result {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(committed.commit_version(), 2);
@@ -172,7 +172,7 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
     txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
     // This should succeed - mixed operations are allowed when dataChange=false
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.legacy_filesystem_commit(engine.as_ref())?;
     match result {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(committed.commit_version(), 2);
@@ -213,7 +213,7 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
     assert_result_error_with_message(
-        txn.commit(engine.as_ref()),
+        txn.legacy_filesystem_commit(engine.as_ref()),
         "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
          This would require writing CDC files for DML operations, which is not yet supported. \
          Consider using separate transactions: one to add files, another to remove files or update deletion vectors.",
@@ -281,7 +281,9 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
         )],
     )?;
     setup_txn.add_files(existing_file);
-    let snapshot = setup_txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    let snapshot = setup_txn
+        .legacy_filesystem_commit(&engine)?
+        .unwrap_post_commit_snapshot();
 
     let mut txn = begin_transaction(snapshot.clone(), &engine)?.with_data_change(data_change);
     let new_file = create_add_files_metadata(
@@ -306,7 +308,7 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
         get_scan_files(snapshot, &engine)?.into_iter().map(Ok),
     )?;
 
-    let commit_result = txn.commit(&engine);
+    let commit_result = txn.legacy_filesystem_commit(&engine);
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(commit_result, expected_error);
         let snapshot = Snapshot::builder_for(table_url).build(&engine)?;

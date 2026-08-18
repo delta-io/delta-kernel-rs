@@ -16,8 +16,10 @@
 //! let disk_props = get_required_properties_for_disk(&staging_info.table_id);
 //! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0")
 //!     .with_table_properties(disk_props)
-//!     .build(engine, committer);
-//! create_table_txn.commit(engine)?;
+//!     .build(engine)?;
+//! create_table_txn
+//      .into_legacy(committer)
+//      .commit(engine)?;
 //!
 //! // Step 3: Finalize table in UC
 //! let snapshot = /* load post-commit snapshot at version 0 */;
@@ -144,7 +146,7 @@ pub fn build_uc_create_table_request(
     let uc_recognized_domains = HashSet::from([CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME]);
     let mut domain_metadata: HashMap<String, serde_json::Value> = HashMap::new();
     for (domain, dm) in
-        snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
+        snapshot.get_domain_metadatas_internal_with_engine(engine, Some(&uc_recognized_domains))?
     {
         let value = serde_json::from_str(dm.configuration())
             .map_err(|e| Error::generic(format!("malformed {domain} domain metadata: {e}")))?;
@@ -216,9 +218,9 @@ mod tests {
         create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
             .with_data_layout(data_layout)
-            .build(engine, Box::new(TestCatalogCommitter))
+            .build(engine)
             .unwrap()
-            .commit(engine)
+            .legacy_commit(Box::new(TestCatalogCommitter), engine)
             .unwrap()
             .unwrap_committed();
         let snapshot = Snapshot::builder_for(table_path)
@@ -343,10 +345,10 @@ mod tests {
         );
         create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build(&engine)
             .unwrap()
             .with_domain_metadata("myApp.retention".to_string(), r#"{"days":30}"#.to_string())
-            .commit(&engine)
+            .legacy_commit(Box::new(TestCatalogCommitter), &engine)
             .unwrap()
             .unwrap_committed();
 
@@ -417,18 +419,18 @@ mod tests {
         let disk_props = get_required_properties_for_disk("test-table-id");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .legacy_commit(Box::new(TestCatalogCommitter), &engine)
             .unwrap();
         let v0_snapshot = Snapshot::builder_for(table_path)
             .with_max_catalog_version(0)
             .build(&engine)
             .unwrap();
         let result = v0_snapshot
-            .transaction(Box::new(TestCatalogCommitter), &engine)
+            .transaction(&engine)
             .unwrap()
-            .commit(&engine)
+            .legacy_commit(Box::new(TestCatalogCommitter), &engine)
             .unwrap();
         assert!(result.is_committed());
 

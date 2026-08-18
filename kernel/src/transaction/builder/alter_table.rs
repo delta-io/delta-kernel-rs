@@ -18,10 +18,10 @@
 //!
 //! ```ignore
 //! // Allowed: at least one op queued before build().
-//! snapshot.alter_table().add_column(field).build(engine, committer)?;
+//! snapshot.alter_table().add_column(field).build()?;
 //!
 //! // Not allowed: build() is not defined on Ready (no ops queued).
-//! snapshot.alter_table().build(engine, committer)?;  // compile error
+//! snapshot.alter_table().build()?;  // compile error
 //! ```
 
 use std::marker::PhantomData;
@@ -29,14 +29,13 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
-use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Error};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
 /// See [`Chainable`] for the operations available on this state.
@@ -181,11 +180,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
     ///   `timestampNtz` column without the `timestampNtz` feature)
-    pub fn build(
-        self,
-        _engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> DeltaResult<AlterTableTransaction> {
+    pub fn build(self) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
         // We don't support ALTER TABLE on tables with icebergCompatV3 enabled yet. See
         // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
@@ -211,7 +206,6 @@ impl AlterTableTransactionBuilder<Modifying> {
         AlterTableTransaction::try_new_alter_table(
             self.snapshot,
             evolved_table_config,
-            committer,
             self.correlation_id,
         )
     }

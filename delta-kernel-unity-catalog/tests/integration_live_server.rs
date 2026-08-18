@@ -201,9 +201,9 @@ async fn live_create_table() {
         .with_data_layout(DataLayout::Clustered {
             columns: vec![column_name!("name"), column_name!("address", "city")],
         })
-        .build(engine.as_ref(), committer)
+        .build(engine.as_ref())
         .expect("failed to build create-table transaction")
-        .commit(engine.as_ref())
+        .legacy_commit(committer, engine.as_ref())
         .expect("failed to commit create-table transaction")
         .unwrap_committed();
 
@@ -307,7 +307,7 @@ async fn live_create_table() {
 
     // Appending 3 rows to a row-tracking table assigns IDs 0..=2, advancing the mark from -1 to 2.
     let row_tracking = snapshot
-        .get_domain_metadata_internal("delta.rowTracking", engine.as_ref())
+        .get_domain_metadata_internal_with_engine("delta.rowTracking", engine.as_ref())
         .expect("failed to read delta.rowTracking domain metadata");
     assert_eq!(
         row_tracking.as_deref(),

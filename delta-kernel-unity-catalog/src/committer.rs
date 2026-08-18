@@ -4,10 +4,12 @@ use std::sync::Arc;
 use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
+use delta_kernel::coroutine::write::{FileWriteMode, WriteJsonFile};
+use delta_kernel::coroutine::{Cursor, Page, Resume, SinkRequest};
 use delta_kernel::{
-    DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FileMeta, FilteredEngineData,
+    DeltaResult, DeltaResultIteratorStatic, Engine, Error as DeltaError, FileMeta,
+    FilteredEngineData,
 };
-use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
     Commit, DeltaTableRequirement, DeltaTableUpdate, TableIdentifier, UpdateTableClient,
     UpdateTableRequest,
@@ -17,6 +19,7 @@ use crate::constants::{
     CATALOG_MANAGED_FEATURE, CLUSTERING_DOMAIN_NAME, ENABLE_IN_COMMIT_TIMESTAMPS,
     IN_COMMIT_TIMESTAMP_FEATURE, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE,
 };
+use crate::coroutine::{CommitActions, Request as WorkflowRequest, UpdateTable, Workflow};
 use crate::errors;
 
 /// Convenience macro: returns an error if a condition is not met.
@@ -47,6 +50,44 @@ pub struct UCCommitter<C: UpdateTableClient> {
     table: TableIdentifier,
 }
 
+/// Owned state for constructing a ratification request inside a static workflow.
+pub(crate) struct Ratifier {
+    table_id: String,
+    target: TableIdentifier,
+}
+
+impl Ratifier {
+    /// Build the catalog update for one staged commit.
+    pub(crate) fn operation(
+        &self,
+        commit_metadata: &CommitMetadata,
+        committed: &FileMeta,
+    ) -> DeltaResult<UpdateTable> {
+        let mut updates = vec![DeltaTableUpdate::AddCommit {
+            commit: Commit {
+                version: u64_to_wire_i64(commit_metadata.version(), "commit version")?,
+                timestamp: commit_metadata.in_commit_timestamp(),
+                file_name: staged_commit_file_name(&committed.location)?,
+                file_size: u64_to_wire_i64(committed.size, "committed size")?,
+                file_modification_timestamp: committed.last_modified,
+            },
+        }];
+        if let Some(max_pub) = commit_metadata.max_published_version() {
+            updates.push(DeltaTableUpdate::SetLatestBackfilledVersion {
+                latest_published_version: u64_to_wire_i64(max_pub, "max published version")?,
+            });
+        }
+        let request = UpdateTableRequest::new(
+            vec![DeltaTableRequirement::AssertTableUuid {
+                uuid: self.table_id.clone(),
+            }],
+            updates,
+        )
+        .map_err(|e| DeltaError::generic(format!("invalid UC update_table request: {e}")))?;
+        Ok(UpdateTable::new(self.target.clone(), request))
+    }
+}
+
 impl<C: UpdateTableClient> UCCommitter<C> {
     /// Build a committer that issues commits for the UC-managed table `table` via
     /// `update_table_client`.
@@ -71,7 +112,10 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Validates that protocol features and metadata properties are correct for a UC
     /// catalog-managed table.
-    fn validate_catalog_managed_state(&self, commit_metadata: &CommitMetadata) -> DeltaResult<()> {
+    pub(crate) fn validate_catalog_managed_state(
+        &self,
+        commit_metadata: &CommitMetadata,
+    ) -> DeltaResult<()> {
         require!(
             commit_metadata.commit_type() != CommitType::UpgradeToCatalogManaged,
             errors::upgrade_downgrade_unsupported("upgrade")
@@ -114,7 +158,9 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Validates that this commit does not include ALTER TABLE changes (protocol, metadata,
     /// or clustering column changes).
-    fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
+    pub(crate) fn validate_no_alter_table_changes(
+        commit_metadata: &CommitMetadata,
+    ) -> DeltaResult<()> {
         require!(
             !commit_metadata.has_protocol_change(),
             errors::alter_table_unsupported("protocol")
@@ -130,91 +176,36 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         Ok(())
     }
 
-    /// Commit version 0 (table creation). Validates that all required UC properties are present,
-    /// then writes the version 0 commit file directly to the published commit path.
-    fn commit_version_0(
-        &self,
-        engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
-        commit_metadata: &CommitMetadata,
-    ) -> DeltaResult<CommitResponse> {
-        debug_assert!(
-            commit_metadata.version() == 0,
-            "commit_version_0 called with version {}",
-            commit_metadata.version()
-        );
-        self.validate_catalog_managed_state(commit_metadata)?;
-        let published_commit_path = commit_metadata.published_commit_path()?;
-        match engine.json_handler().write_json_file(
-            &published_commit_path,
-            Box::new(actions),
-            false,
-        ) {
-            Ok(written_size) => {
-                info!("wrote version 0 commit file for UC table creation");
-                let file_meta = FileMeta::new(
-                    published_commit_path,
-                    commit_metadata.in_commit_timestamp(),
-                    written_size,
-                );
-                Ok(CommitResponse::Committed { file_meta })
-            }
-            Err(DeltaError::FileAlreadyExists(_)) => {
-                info!("version 0 commit conflict: commit file already exists");
-                Ok(CommitResponse::Conflict { version: 0 })
-            }
-            Err(e) => Err(e),
+    /// Clone the state needed to construct a ratification request.
+    pub(crate) fn ratifier(&self) -> Ratifier {
+        Ratifier {
+            table_id: self.table_id.clone(),
+            target: self.table.clone(),
         }
     }
 
-    /// Commit version >= 1. Validates catalog-managed status hasn't changed, writes a staged
-    /// commit file, and calls the UC commit API to ratify it.
-    fn commit_version_non_zero(
-        &self,
-        engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
-        commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse>
+    /// Execute one catalog table update through the configured client.
+    ///
+    /// A workflow driver serving [`Request::UpdateTable`](crate::coroutine::Request::UpdateTable)
+    /// calls this to apply the update and then resumes the workflow with the result. The connector
+    /// decides which requests to route here versus handling them itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog rejects the update or the client call fails.
+    pub async fn execute_update_table(&self, operation: UpdateTable) -> DeltaResult<()> {
+        self.update_table_client
+            .update_table(&operation.target, operation.request)
+            .await
+            // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
+            // transaction layer can rebase/retry, instead of collapsing every error to Generic.
+            .map_err(|err| DeltaError::Generic(format!("UC update_table error: {err}")))
+    }
+
+    fn execute_update_table_blocking(&self, operation: UpdateTable) -> DeltaResult<()>
     where
         C: 'static,
     {
-        debug_assert!(
-            commit_metadata.version() != 0,
-            "commit_version_non_zero called with version 0"
-        );
-        self.validate_catalog_managed_state(&commit_metadata)?;
-        Self::validate_no_alter_table_changes(&commit_metadata)?;
-        let staged_commit_path = commit_metadata.staged_commit_path()?;
-        engine
-            .json_handler()
-            .write_json_file(&staged_commit_path, Box::new(actions), false)?;
-
-        let committed = engine.storage_handler().head(&staged_commit_path)?;
-        debug!("wrote staged commit file: {:?}", committed);
-
-        let mut updates = vec![DeltaTableUpdate::AddCommit {
-            commit: Commit {
-                version: u64_to_wire_i64(commit_metadata.version(), "commit version")?,
-                timestamp: commit_metadata.in_commit_timestamp(),
-                file_name: staged_commit_file_name(&staged_commit_path)?,
-                file_size: u64_to_wire_i64(committed.size, "committed size")?,
-                file_modification_timestamp: committed.last_modified,
-            },
-        }];
-        if let Some(max_pub) = commit_metadata.max_published_version() {
-            updates.push(DeltaTableUpdate::SetLatestBackfilledVersion {
-                latest_published_version: u64_to_wire_i64(max_pub, "max published version")?,
-            });
-        }
-        let update_req = UpdateTableRequest::new(
-            vec![DeltaTableRequirement::AssertTableUuid {
-                uuid: self.table_id.clone(),
-            }],
-            updates,
-        )
-        .map_err(|e| DeltaError::generic(format!("invalid UC update_table request: {e}")))?;
-        let target = self.table.clone();
-
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             DeltaError::generic("UCCommitter may only be used within a tokio runtime")
         })?;
@@ -222,14 +213,8 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         // that up front: `runtime_flavor()` can't tell a real single-threaded runtime (where this
         // panics) apart from the FFI case (single-threaded on top of multi-threaded, where it's
         // fine). So we let it run and catch the panic.
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async move {
-                    self.update_table_client
-                        .update_table(&target, update_req)
-                        .await
-                })
-            })
+        catch_unwind(AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| handle.block_on(self.execute_update_table(operation)))
         }))
         .map_err(|panic| {
             let msg = panic
@@ -240,15 +225,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             DeltaError::generic(format!(
                 "UCCommitter commit panicked (requires a multi-threaded tokio runtime): {msg}"
             ))
-        })?;
-        match result {
-            Ok(_) => Ok(CommitResponse::Committed {
-                file_meta: committed,
-            }),
-            // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
-            // transaction layer can rebase/retry, instead of collapsing every error to Generic.
-            Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
-        }
+        })?
     }
 }
 
@@ -262,13 +239,11 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
-        if commit_metadata.version() == 0 {
-            return self.commit_version_0(engine, actions, &commit_metadata);
-        }
-        self.commit_version_non_zero(engine, actions, commit_metadata)
+        let actions = Cursor::new(actions);
+        legacy_drive_workflow(self, engine, self.start_commit(commit_metadata, actions))
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -276,22 +251,153 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     }
 
     fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
-        if publish_metadata.commits_to_publish().is_empty() {
-            return Ok(());
-        }
+        legacy_drive_workflow(self, engine, self.start_publish(publish_metadata))
+    }
+}
 
-        for catalog_commit in publish_metadata.commits_to_publish() {
-            let src = catalog_commit.location();
-            let dest = catalog_commit.published_location();
-            match engine.storage_handler().copy_atomic(src, dest) {
-                Ok(_) => (),
-                Err(DeltaError::FileAlreadyExists(_)) => (),
-                Err(e) => return Err(e),
+fn legacy_drive_workflow<C: UpdateTableClient + 'static, O: Send + 'static>(
+    committer: &UCCommitter<C>,
+    engine: &dyn Engine,
+    mut workflow: DeltaResult<Workflow<O>>,
+) -> DeltaResult<O> {
+    loop {
+        workflow = match workflow? {
+            Workflow::Done(output) => return Ok(output),
+            Workflow::Request(WorkflowRequest::ContinueActions(cursor, resume)) => {
+                resume(continue_legacy_actions(cursor))
+            }
+            Workflow::Request(WorkflowRequest::WriteJson(SinkRequest::Start(
+                operation,
+                resume,
+            ))) => drive_legacy_json_sink(engine, operation, resume),
+            Workflow::Request(WorkflowRequest::WriteJson(_)) => {
+                return Err(DeltaError::internal_error(
+                    "UC JSON sink workflow did not start with a Start request",
+                ));
+            }
+            Workflow::Request(WorkflowRequest::CopyAtomic(operation, resume)) => resume(
+                engine
+                    .storage_handler()
+                    .copy_atomic(&operation.source, &operation.destination),
+            ),
+            Workflow::Request(WorkflowRequest::UpdateTable(operation, resume)) => {
+                resume(committer.execute_update_table_blocking(operation))
+            }
+        };
+    }
+}
+
+fn continue_legacy_actions(cursor: Cursor<CommitActions>) -> DeltaResult<Page<CommitActions>> {
+    let mut actions: DeltaResultIteratorStatic<FilteredEngineData> = cursor.into_inner()?;
+    match actions.next().transpose()? {
+        Some(action) => Ok(Page::new(vec![action], Some(Cursor::new(actions)))),
+        None => Ok(Page::new(Vec::new(), None)),
+    }
+}
+
+enum LegacyJsonSinkState<O: Send + 'static> {
+    Start(Resume<Workflow<O>, Cursor<WriteJsonFile>>),
+    Write(
+        Cursor<WriteJsonFile>,
+        Resume<Workflow<O>, Cursor<WriteJsonFile>>,
+    ),
+    Finish(Resume<Workflow<O>, FileMeta>),
+}
+
+struct LegacyJsonSinkIterator<O: Send + 'static> {
+    state: Option<LegacyJsonSinkState<O>>,
+}
+
+impl<O: Send + 'static> LegacyJsonSinkIterator<O> {
+    fn finish(self, result: DeltaResult<FileMeta>) -> DeltaResult<Workflow<O>> {
+        match (self.state, result) {
+            (Some(LegacyJsonSinkState::Finish(resume)), result) => resume(result),
+            (Some(LegacyJsonSinkState::Start(resume)), Err(err)) => resume(Err(err)),
+            (Some(LegacyJsonSinkState::Write(_, resume)), Err(err)) => resume(Err(err)),
+            (None, Err(err)) => Err(err),
+            (Some(LegacyJsonSinkState::Start(_)), Ok(_))
+            | (Some(LegacyJsonSinkState::Write(_, _)), Ok(_))
+            | (None, Ok(_)) => Err(DeltaError::internal_error(
+                "JSON handler completed before the UC sink Finish request",
+            )),
+        }
+    }
+}
+
+impl<O: Send + 'static> Iterator for LegacyJsonSinkIterator<O> {
+    type Item = DeltaResult<FilteredEngineData>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let state = self.state.take()?;
+        let mut workflow = match state {
+            LegacyJsonSinkState::Start(resume) => resume(Ok(Cursor::new(()))),
+            LegacyJsonSinkState::Write(sink, resume) => resume(Ok(sink)),
+            LegacyJsonSinkState::Finish(resume) => {
+                self.state = Some(LegacyJsonSinkState::Finish(resume));
+                return None;
+            }
+        };
+
+        loop {
+            let next = match workflow {
+                Ok(next) => next,
+                Err(err) => return Some(Err(err)),
+            };
+            match next {
+                Workflow::Done(_) => {
+                    return Some(Err(DeltaError::internal_error(
+                        "UC workflow completed before the sink Finish request",
+                    )));
+                }
+                Workflow::Request(WorkflowRequest::ContinueActions(cursor, resume)) => {
+                    workflow = resume(continue_legacy_actions(cursor));
+                }
+                Workflow::Request(WorkflowRequest::WriteJson(SinkRequest::Write(
+                    sink,
+                    data,
+                    resume,
+                ))) => {
+                    self.state = Some(LegacyJsonSinkState::Write(sink, resume));
+                    return Some(Ok(data));
+                }
+                Workflow::Request(WorkflowRequest::WriteJson(SinkRequest::Finish(_, resume))) => {
+                    self.state = Some(LegacyJsonSinkState::Finish(resume));
+                    return None;
+                }
+                Workflow::Request(WorkflowRequest::WriteJson(SinkRequest::Start(..))) => {
+                    return Some(Err(DeltaError::internal_error(
+                        "UC workflow started a nested JSON sink",
+                    )));
+                }
+                Workflow::Request(WorkflowRequest::CopyAtomic(..)) => {
+                    return Some(Err(DeltaError::internal_error(
+                        "UC workflow requested CopyAtomic while a JSON sink was active",
+                    )));
+                }
+                Workflow::Request(WorkflowRequest::UpdateTable(..)) => {
+                    return Some(Err(DeltaError::internal_error(
+                        "UC workflow requested UpdateTable while a JSON sink was active",
+                    )));
+                }
             }
         }
-
-        Ok(())
     }
+}
+
+fn drive_legacy_json_sink<O: Send + 'static>(
+    engine: &dyn Engine,
+    operation: WriteJsonFile,
+    resume: Resume<Workflow<O>, Cursor<WriteJsonFile>>,
+) -> DeltaResult<Workflow<O>> {
+    let mut iterator = LegacyJsonSinkIterator {
+        state: Some(LegacyJsonSinkState::Start(resume)),
+    };
+    let overwrite = operation.mode == FileWriteMode::Overwrite;
+    let result = engine
+        .json_handler()
+        .write_json_file(&operation.url, Box::new(&mut iterator), overwrite)
+        .and_then(|_| engine.storage_handler().head(&operation.url));
+    iterator.finish(result)
 }
 
 /// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
@@ -647,8 +753,8 @@ mod tests {
         // Write staged commit files to disk
         fs::create_dir_all(&staged_dir).unwrap();
         for commit in &catalog_commits {
-            let path = commit.location().to_file_path().unwrap();
-            fs::write(&path, format!("version: {}", commit.version())).unwrap();
+            let path = commit.location.to_file_path().unwrap();
+            fs::write(&path, format!("version: {}", commit.version)).unwrap();
         }
 
         // Write 10.json file to disk (should be skipped, not error)
