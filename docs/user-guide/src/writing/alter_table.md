@@ -86,15 +86,13 @@ column by including it in the `RecordBatch` they pass to
 |------|-----|
 | The field name must not already exist (case-insensitive) | Delta column names are unique within a struct. |
 | The field must be nullable | Existing files do not contain the new column. They read back `NULL`, which would violate a `NOT NULL` constraint. |
-| The table must not have column mapping enabled | The current implementation supports add-column only on tables without column mapping. |
 | The table must support writes | Tables with unsupported writer features cannot be altered. |
 | The evolved schema must not require protocol features the table does not enable | For example, adding a `TIMESTAMP_NTZ` column to a table without the `timestampNtz` feature fails. |
+| Column mapping tables must be protocol-valid | When column mapping is enabled, Kernel assigns or preserves column-mapping IDs and physical names for the added column and updates `delta.columnMapping.maxColumnId`. |
 
 > [!NOTE]
-> The column-mapping limitation applies to add-column only. If your table uses
-> column mapping (`delta.columnMapping.mode = "name"` or `"id"`), you cannot
-> currently add a column through `alter_table()`. This restriction is expected
-> to be lifted as the alter-table framework grows.
+> `ALTER TABLE` is still rejected on tables with unsupported writer features, and
+> currently on tables with `icebergCompatV3` or `allowColumnDefaults` enabled.
 
 ## Chaining multiple operations
 
