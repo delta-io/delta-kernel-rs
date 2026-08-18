@@ -8,7 +8,10 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::{CancellationToken as _, CancellationTokenRef, Error, Snapshot};
+use delta_kernel::{
+    CancellationToken as _, CancellationTokenRef, DeltaResult, Engine, Error, FileMeta, FileSlice,
+    JsonHandler, ParquetHandler, Snapshot, StorageHandler,
+};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
@@ -276,6 +279,150 @@ async fn parallel_scan_metadata_errors_when_token_set() -> Result<(), Box<dyn st
     assert!(
         matches!(result, Err(Error::Unsupported(_))),
         "parallel_scan_metadata must reject a cancellation token"
+    );
+    Ok(())
+}
+
+// Building a snapshot with an already-cancelled token fails rather than returning a snapshot built
+// from a partial log listing.
+#[tokio::test]
+async fn precancelled_snapshot_build_yields_cancelled() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, table_root) = json_only_table().await?;
+    let engine = DefaultEngineBuilder::new(storage).build();
+
+    let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+    let result = Snapshot::builder_for(table_root)
+        .with_cancellation_token(token)
+        .build(&engine);
+
+    assert!(
+        matches!(result, Err(Error::Cancelled)),
+        "a cancelled snapshot build must surface Error::Cancelled"
+    );
+    Ok(())
+}
+
+// An uncancelled token leaves snapshot building unchanged, so the feature is opt-in and the token's
+// mere presence costs nothing.
+#[tokio::test]
+async fn snapshot_build_with_uncancelled_token_succeeds() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (storage, table_root) = json_only_table().await?;
+    let engine = DefaultEngineBuilder::new(storage).build();
+
+    let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
+    let with_token = Snapshot::builder_for(table_root)
+        .with_cancellation_token(token)
+        .build(&engine)?;
+    let without_token = Snapshot::builder_for(table_root).build(&engine)?;
+
+    assert_eq!(with_token.version(), without_token.version());
+    Ok(())
+}
+
+/// A storage decorator that cancels `token` when a listing begins, delegating everything else to
+/// the real handler. `_last_checkpoint` is read (via `read_files`) *before* the log listing, so
+/// this drives cancellation into the listing specifically -- the read has already succeeded by
+/// then.
+struct CancelOnListHandler {
+    inner: Arc<dyn StorageHandler>,
+    token: Arc<TestCancellationToken>,
+}
+
+impl StorageHandler for CancelOnListHandler {
+    fn list_from(
+        &self,
+        path: &url::Url,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        self.inner.list_from(path)
+    }
+
+    fn list_from_with_cancellation(
+        &self,
+        path: &url::Url,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        self.token.cancel();
+        self.inner
+            .list_from_with_cancellation(path, cancellation_token)
+    }
+
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        self.inner.read_files(files)
+    }
+
+    fn read_files_with_cancellation(
+        &self,
+        files: Vec<FileSlice>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        self.inner
+            .read_files_with_cancellation(files, cancellation_token)
+    }
+
+    fn put(&self, path: &url::Url, data: bytes::Bytes, overwrite: bool) -> DeltaResult<()> {
+        self.inner.put(path, data, overwrite)
+    }
+
+    fn copy_atomic(&self, src: &url::Url, dest: &url::Url) -> DeltaResult<()> {
+        self.inner.copy_atomic(src, dest)
+    }
+
+    fn head(&self, path: &url::Url) -> DeltaResult<FileMeta> {
+        self.inner.head(path)
+    }
+
+    fn delete(&self, path: &url::Url) -> DeltaResult<()> {
+        self.inner.delete(path)
+    }
+}
+
+/// Installs a [`CancelOnListHandler`] over the real engine's storage, delegating other handlers.
+struct CancelOnListEngine {
+    inner: Arc<dyn Engine>,
+    storage: Arc<CancelOnListHandler>,
+}
+
+impl Engine for CancelOnListEngine {
+    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.storage.clone()
+    }
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.inner.json_handler()
+    }
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.inner.parquet_handler()
+    }
+}
+
+// Cancellation reaches the log listing during a real `build()`, not only the pre-listing
+// `_last_checkpoint` read: the token is live when `try_read` runs (so that read succeeds) and flips
+// only once listing begins, so the `Err(Cancelled)` `build()` surfaces must come from the listing.
+// Guards the SnapshotBuilder -> listing token wiring against silent removal.
+#[tokio::test]
+async fn snapshot_build_cancelled_during_listing() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, table_root) = json_only_table().await?;
+    let token = Arc::new(TestCancellationToken::default());
+    let engine = CancelOnListEngine {
+        inner: Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+        storage: Arc::new(CancelOnListHandler {
+            inner: DefaultEngineBuilder::new(storage).build().storage_handler(),
+            token: token.clone(),
+        }),
+    };
+
+    let result = Snapshot::builder_for(table_root)
+        .with_cancellation_token(token.clone() as CancellationTokenRef)
+        .build(&engine);
+    assert!(
+        matches!(result, Err(Error::Cancelled)),
+        "cancellation during listing must surface from build()"
     );
     Ok(())
 }
