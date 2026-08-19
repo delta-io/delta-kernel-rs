@@ -6,12 +6,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use itertools::Itertools;
 use strum::Display;
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::error::add_scalar_path_context;
+use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
+use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error, FileMeta};
 
@@ -280,6 +282,37 @@ impl Values {
     }
 }
 
+/// Collect rows of `T` into a [`Values`] node.
+///
+/// Schema comes from [`ToSchema`]. Each row is converted via [`Into<StructData>`] and peeled into
+/// top-level field scalars (nested fields remain [`Scalar::Struct`]).
+impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let rows = iter.into_iter().map(|row| row.into().into_parts().1);
+        Self::new(Arc::new(T::to_schema()), rows.collect())
+    }
+}
+
+/// Inverse of [`FromIterator<T> for Values`]: rebuild each row as [`StructData`] and convert via
+/// [`TryFrom`].
+impl<T> TryFrom<Values> for Vec<T>
+where
+    T: TryFrom<StructData, Error = Error> + ToSchema,
+{
+    type Error = Error;
+
+    fn try_from(Values { schema, rows }: Values) -> DeltaResult<Self> {
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let schema = schema.as_ref().clone();
+                T::try_from(StructData::from_values_unchecked(schema, row))
+                    .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
+            })
+            .try_collect()
+    }
+}
+
 /// Projects the input through `expr` into rows of `schema`.
 ///
 /// `expr` must be a struct constructor or struct patch whose fields match `schema`. It is
@@ -301,12 +334,12 @@ impl Values {
 /// ```text
 /// Project {
 ///     expr: Expression::struct_from([
-///         col("id"),
-///         Expression::array([col("first"), col("last")]),
+///         col!("id"),
+///         Expression::array([col!("first"), col!("last")]),
 ///         Expression::struct_from([
-///             col("add.path"),
-///             col("add.size"),
-///             col("add.stats_parsed.numRecords"),
+///             col!("add.path"),
+///             col!("add.size"),
+///             col!("add.stats_parsed.numRecords"),
 ///         ]),
 ///     ]),
 ///     schema: {
@@ -1075,9 +1108,11 @@ pub struct UnionAll;
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData};
+
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{DataType, MetadataValue, StructField};
+    use crate::schema::{schema_ref, DataType, MetadataValue, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Builds a flat `LONG` schema from `(name, nullable)` pairs.
@@ -1104,11 +1139,11 @@ mod tests {
     #[test]
     fn output_fields_preserve_input_field_metadata() {
         let metadata = [("k", MetadataValue::Number(7))];
-        let input = Arc::new(StructType::new_unchecked([
-            StructField::not_null("g", DataType::LONG).with_metadata(metadata.clone()),
-            StructField::not_null("a", DataType::LONG).with_metadata(metadata.clone()),
-            StructField::not_null("s", DataType::LONG).with_metadata(metadata),
-        ]));
+        let input = schema_ref! {
+            (StructField::not_null("g", DataType::LONG).with_metadata(metadata.clone())),
+            (StructField::not_null("a", DataType::LONG).with_metadata(metadata.clone())),
+            (StructField::not_null("s", DataType::LONG).with_metadata(metadata)),
+        };
         let agg = Aggregate::group_by(input, [column_name!("g")])
             .max(column_name!("a"))
             .sum(column_name!("s"))
@@ -1228,5 +1263,76 @@ mod tests {
             )
             .build();
         assert_result_error_with_message(result, "missing");
+    }
+
+    #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
+    struct Address {
+        city: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
+    struct Person {
+        id: i32,
+        address: Address,
+    }
+
+    #[test]
+    fn values_from_iter_peels_top_level_and_keeps_nested_struct() {
+        let values = Values::from_iter([Person {
+            id: 1,
+            address: Address { city: "NYC".into() },
+        }]);
+
+        assert_eq!(
+            values
+                .schema
+                .fields()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            ["id", "address"]
+        );
+        assert_eq!(values.rows.len(), 1);
+        assert_eq!(values.rows[0].len(), 2);
+        assert_eq!(values.rows[0][0], Scalar::Integer(1));
+        let Scalar::Struct(address) = &values.rows[0][1] else {
+            panic!("expected nested Struct for address");
+        };
+        assert_eq!(address.values(), &[Scalar::String("NYC".into())]);
+    }
+
+    #[test]
+    fn values_from_iter_empty_still_carries_schema() {
+        let values: Values = std::iter::empty::<Person>().collect();
+        assert!(values.rows.is_empty());
+        assert_eq!(values.schema.num_fields(), 2);
+    }
+
+    #[test]
+    fn values_round_trips_through_vec() {
+        let people = vec![
+            Person {
+                id: 1,
+                address: Address { city: "NYC".into() },
+            },
+            Person {
+                id: 2,
+                address: Address { city: "SF".into() },
+            },
+        ];
+        let values = Values::from_iter(people.clone());
+        assert_eq!(Vec::<Person>::try_from(values).unwrap(), people);
+    }
+
+    #[test]
+    fn values_conversion_adds_row_index_to_error_path() {
+        let mut values = Values::from_iter([Person {
+            id: 1,
+            address: Address { city: "NYC".into() },
+        }]);
+        values.rows[0][0] = Scalar::from("not an integer");
+        assert_result_error_with_message(
+            Vec::<Person>::try_from(values),
+            "[0].id: expected i32, found string",
+        );
     }
 }

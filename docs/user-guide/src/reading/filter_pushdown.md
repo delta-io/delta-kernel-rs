@@ -299,7 +299,7 @@ To receive statistics for only a subset of columns, pass `StatsOptions::struct_c
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::expressions::ColumnName;
+# use delta_kernel::expressions::column_name;
 # use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
@@ -310,15 +310,18 @@ To receive statistics for only a subset of columns, pass `StatsOptions::struct_c
 let scan = snapshot
     .scan_builder()
     .with_stats(StatsOptions::struct_columns(vec![
-        ColumnName::new(["age"]),
-        ColumnName::new(["city"]),
+        column_name!("age"),
+        column_name!("city"),
     ]))
     .build()?;
 # Ok(())
 # }
 ```
 
-Only the named columns appear in `stats_parsed`.
+The named columns always appear in `stats_parsed`. When the scan also has a predicate,
+predicate-referenced columns may appear as well because Kernel can retain the statistics it uses
+for data skipping. Connectors should treat the named columns as a minimum projection and ignore
+additional columns they do not need.
 
 ### Choosing the right mode
 

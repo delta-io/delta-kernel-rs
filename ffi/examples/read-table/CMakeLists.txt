@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.12)
 project(read_table)
 option(PRINT_DATA "Print out the table data. Requires arrow-glib" ON)
 option(VERBOSE "Enable for more diagnostics messages." OFF)
+option(
+  GEO_TYPE_IN_DEV
+  "Register the geometry/geography schema test. Requires delta_kernel_ffi built with --features geo-type-in-dev."
+  OFF)
 add_executable(read_table read_table.c arrow.c ../common/kernel_utils.c)
 target_compile_definitions(read_table PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
 target_include_directories(read_table PUBLIC 
@@ -32,6 +36,9 @@ add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_p
 # `delta.columnMapping.id`, which the schema visitor reads back via get_from_metadata_map and
 # prints per field.
 add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
+if(GEO_TYPE_IN_DEV)
+  add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)
+endif()
 
 if(WIN32)
   set(CMAKE_C_FLAGS_DEBUG "/MT")

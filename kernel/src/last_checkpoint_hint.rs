@@ -238,7 +238,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
 
@@ -659,7 +659,7 @@ mod tests {
         assert_eq!(metadata.format_provider(), "parquet", "{table}: format");
         assert_eq!(
             metadata.parse_schema()?,
-            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+            schema! { nullable "id": LONG },
             "{table}: metadata schema"
         );
         assert!(

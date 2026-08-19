@@ -176,6 +176,7 @@ use delta_kernel::arrow::array::{
     MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::compute::concat;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
 };
@@ -195,7 +196,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
@@ -524,12 +525,14 @@ pub enum AddFilePartitionKeyModify<'a> {
     },
 }
 
-/// Applies `modifications` in order to a single-row add-file batch.
+/// Applies `modifications` in order to every `partitionValues` row in an add-file batch.
+///
+/// `Drop` removes every entry with the given key. `Insert` appends a new entry.
 ///
 /// # Panics
 ///
-/// Panics when `batch` does not have exactly one row with a string-keyed and string-valued
-/// `partitionValues` map, or when the modified batch cannot be constructed.
+/// Panics when `batch` does not contain a string-keyed and string-valued `partitionValues` map, or
+/// when the modified batch cannot be constructed.
 pub fn modify_add_file_partition_keys(
     batch: RecordBatch,
     modifications: &[AddFilePartitionKeyModify<'_>],
@@ -538,29 +541,11 @@ pub fn modify_add_file_partition_keys(
         return batch;
     }
 
-    assert_eq!(batch.num_rows(), 1, "add-file batch must contain one row");
     let index = batch
         .schema()
         .index_of("partitionValues")
         .expect("partitionValues field in add-file batch");
     let map = batch.column(index).as_map();
-    let entries = map.value(0);
-    let keys = entries.column(0).as_string::<i32>();
-    let values = entries.column(1).as_string::<i32>();
-    let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
-        .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
-        .collect();
-    for modification in modifications {
-        match *modification {
-            AddFilePartitionKeyModify::Drop { key } => {
-                partition_values.retain(|(existing_key, _)| *existing_key != key);
-            }
-            AddFilePartitionKeyModify::Insert { key, value } => {
-                partition_values.push((key, value));
-            }
-        }
-    }
-
     let (entry_field, ordered) = match map.data_type() {
         ArrowDataType::Map(entry_field, ordered) => (entry_field.clone(), *ordered),
         _ => unreachable!("partitionValues column must be a map"),
@@ -569,16 +554,34 @@ pub fn modify_add_file_partition_keys(
     let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
         .with_keys_field(key_field.clone())
         .with_values_field(value_field.clone());
-    for (key, value) in partition_values {
-        builder.keys().append_value(key);
-        match value {
-            Some(v) => builder.values().append_value(v),
-            None => builder.values().append_null(),
+    for row in 0..map.len() {
+        let entries = map.value(row);
+        let keys = entries.column(0).as_string::<i32>();
+        let values = entries.column(1).as_string::<i32>();
+        let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
+            .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
+            .collect();
+        for modification in modifications {
+            match *modification {
+                AddFilePartitionKeyModify::Drop { key } => {
+                    partition_values.retain(|(existing_key, _)| *existing_key != key);
+                }
+                AddFilePartitionKeyModify::Insert { key, value } => {
+                    partition_values.push((key, value));
+                }
+            }
         }
+        for (key, value) in partition_values {
+            builder.keys().append_value(key);
+            match value {
+                Some(value) => builder.values().append_value(value),
+                None => builder.values().append_null(),
+            }
+        }
+        builder
+            .append(true)
+            .expect("failed to append partition-values map row");
     }
-    builder
-        .append(true)
-        .expect("failed to append partition-values map row");
     let (_, offsets, entries, nulls, _) = builder.finish().into_parts();
     let new_map: ArrayRef = Arc::new(
         MapArray::try_new(entry_field, offsets, entries, nulls, ordered)
@@ -589,6 +592,27 @@ pub fn modify_add_file_partition_keys(
     columns[index] = new_map;
     RecordBatch::try_new(batch.schema(), columns)
         .expect("failed to rebuild add-file batch after modifying a partition key")
+}
+
+/// Replaces one row in an Arrow array with a one-row array of the same type.
+///
+/// # Panics
+///
+/// Panics if `replacement` does not contain exactly one row, `row` is out of bounds, or the arrays
+/// cannot be concatenated.
+pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -> ArrayRef {
+    assert_eq!(
+        replacement.len(),
+        1,
+        "replacement must contain exactly one row"
+    );
+    let slices = [
+        column.slice(0, row),
+        replacement,
+        column.slice(row + 1, column.len() - row - 1),
+    ];
+    let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
+    concat(&arrays).expect("replacement value must match the modified column type")
 }
 
 pub fn create_default_engine(
@@ -908,6 +932,55 @@ pub fn schema_with_column_defaults(
     Ok(Arc::new(StructType::try_new(augmented_fields)?))
 }
 
+/// Creates an empty test table using protocol version (3, 7).
+///
+/// # Parameters
+///
+/// - `schema`: The table schema.
+/// - `partition_columns`: The table's partition columns.
+/// - `local_directory`: The local table directory, or `None` for an in-memory table.
+/// - `table_base_name`: The table name prefix.
+///
+/// # Returns
+///
+/// The table URL, engine, object store, and table label.
+///
+/// # Errors
+///
+/// Returns an error if the table cannot be created.
+pub async fn setup_test_table_p37(
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    local_directory: Option<&Url>,
+    table_base_name: &str,
+) -> Result<
+    (
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<DynObjectStore>,
+        &'static str,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let table_name = format!("{table_base_name}_37");
+    let (store, engine, table_location) = engine_store_setup(table_name.as_str(), local_directory);
+    Ok((
+        create_table(
+            store.clone(),
+            table_location,
+            schema,
+            partition_columns,
+            true,
+            vec![],
+            vec![],
+        )
+        .await?,
+        engine,
+        store,
+        "test_table_37",
+    ))
+}
+
 /// Creates two empty test tables, one with 37 protocol and one with 11 protocol.  the tables will
 /// be named {table_base_name}_11 and {table_base_name}_37. The local_directory param can be set to
 /// write out the tables to the local filesystem, passing in None will create in-memory tables
@@ -926,27 +999,17 @@ pub async fn setup_test_tables(
     Box<dyn std::error::Error>,
 > {
     let table_name_11 = format!("{table_base_name}_11");
-    let table_name_37 = format!("{table_base_name}_37");
     let (store_11, engine_11, table_location_11) =
         engine_store_setup(table_name_11.as_str(), local_directory);
-    let (store_37, engine_37, table_location_37) =
-        engine_store_setup(table_name_37.as_str(), local_directory);
+    let table_37 = setup_test_table_p37(
+        schema.clone(),
+        partition_columns,
+        local_directory,
+        table_base_name,
+    )
+    .await?;
     Ok(vec![
-        (
-            create_table(
-                store_37.clone(),
-                table_location_37,
-                schema.clone(),
-                partition_columns,
-                true,
-                vec![],
-                vec![],
-            )
-            .await?,
-            engine_37,
-            store_37,
-            "test_table_37",
-        ),
+        table_37,
         (
             create_table(
                 store_11.clone(),
@@ -1072,11 +1135,12 @@ impl Committer for TestCatalogCommitter {
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         let path = commit_metadata.published_commit_path()?;
-        engine
-            .json_handler()
-            .write_json_file(&path, Box::new(actions), false)?;
+        let written_size =
+            engine
+                .json_handler()
+                .write_json_file(&path, Box::new(actions), false)?;
         Ok(CommitResponse::Committed {
-            file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), 0),
+            file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), written_size),
         })
     }
 
@@ -1120,20 +1184,17 @@ pub fn set_json_value(
 /// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag:
 /// string, value: int]`
 pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::nullable("row_number", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("score", DataType::DOUBLE),
-        StructField::nullable(
-            "address",
-            StructType::try_new(vec![
-                StructField::nullable("street", DataType::STRING),
-                StructField::nullable("city", DataType::STRING),
-            ])?,
-        ),
-        StructField::nullable("tag", DataType::STRING),
-        StructField::nullable("value", DataType::INTEGER),
-    ])?))
+    Ok(schema_ref! {
+        nullable "row_number": LONG,
+        nullable "name": STRING,
+        nullable "score": DOUBLE,
+        nullable "address": {
+            nullable "street": STRING,
+            nullable "city": STRING,
+        },
+        nullable "tag": STRING,
+        nullable "value": INTEGER,
+    })
 }
 
 /// Returns two [`RecordBatch`]es with hardcoded test data matching [`nested_schema`].
@@ -1205,32 +1266,30 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
 
 /// Schema with one column of the given type: `(id INT, col <dtype>)`.
 pub fn schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col": (dtype),
+    }
 }
 
 /// Schema with the given type nested inside a struct:
 /// `(id INT, nested STRUCT<inner <dtype>>)`.
 pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new(
-            "nested",
-            StructType::new_unchecked(vec![StructField::new("inner", dtype, true)]),
-            true,
-        ),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "nested": {
+            nullable "inner": (dtype),
+        },
+    }
 }
 
 /// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
 pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col1", dtype.clone(), true),
-        StructField::new("col2", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col1": (dtype.clone()),
+        nullable "col2": (dtype),
+    }
 }
 
 pub fn top_level_ntz_schema() -> SchemaRef {

@@ -9,8 +9,9 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
-    col, column_name, lit, BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef,
-    JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
+    col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
+    ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
+    Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -18,7 +19,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
-use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
@@ -149,12 +150,9 @@ impl DataSkippingFilter {
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(col!("output").distinct(lit(false))));
-        static FILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "output",
-                DataType::BOOLEAN,
-            )]))
-        });
+        static FILTER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            nullable "output": BOOLEAN,
+        };
 
         let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
@@ -329,30 +327,24 @@ impl DataSkippingFilter {
             })
             .unwrap_or_default();
 
-        let stats_field =
-            |stats: &SchemaRef| StructField::nullable("stats_parsed", stats.as_ref().clone());
-        let partition_field =
-            |ps: &SchemaRef| StructField::nullable("partitionValues_parsed", ps.as_ref().clone());
-        let is_add_field = StructField::not_null("is_add", DataType::BOOLEAN);
-
         // Always include an `is_add` boolean (extracted by the caller-provided `is_add_expr`,
         // true for Add rows and false for Remove/non-file rows) so that predicates can guard
         // against filtering Remove rows: partition predicates and opaque-predicate rewrites are
         // wrapped with `OR(NOT is_add, ...)` (see `guard_for_removes`).
         let unified_schema = match (physical_stats_schema, physical_partition_schema) {
-            (Some(stats), Some(ps)) => Arc::new(StructType::new_unchecked([
-                stats_field(stats),
-                partition_field(ps),
-                is_add_field,
-            ])),
-            (Some(stats), None) => Arc::new(StructType::new_unchecked([
-                stats_field(stats),
-                is_add_field,
-            ])),
-            (None, Some(ps)) => Arc::new(StructType::new_unchecked([
-                partition_field(ps),
-                is_add_field,
-            ])),
+            (Some(stats), Some(ps)) => schema_ref! {
+                nullable "stats_parsed": (stats.as_ref().clone()),
+                nullable "partitionValues_parsed": (ps.as_ref().clone()),
+                not_null "is_add": BOOLEAN,
+            },
+            (Some(stats), None) => schema_ref! {
+                nullable "stats_parsed": (stats.as_ref().clone()),
+                not_null "is_add": BOOLEAN,
+            },
+            (None, Some(ps)) => schema_ref! {
+                nullable "partitionValues_parsed": (ps.as_ref().clone()),
+                not_null "is_add": BOOLEAN,
+            },
             (None, None) => return None,
         };
 
@@ -515,7 +507,7 @@ fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
 /// The `partitionValues_parsed.<col>` reference holding a partition column's exact value, which
 /// serves as both its min and max stat. `col` is a top-level physical partition name.
 fn partition_value_expr(col: &ColumnName) -> Expr {
-    Expr::from(ColumnName::new([PARTITION_VALUES_PARSED_NAME]).join(col))
+    Expr::from(column_name!(PARTITION_VALUES_PARSED_NAME).join(col))
 }
 
 /// Whether a rewritten stat expression references `partitionValues_parsed`.
@@ -634,7 +626,7 @@ impl<'a> DataSkippingPredicateCreator<'a> {
     /// (op-computed verdicts bypass kernel's null-stats folding). The `is_add` column ensures
     /// non-Add rows always pass the filter.
     fn guard_for_removes(&self, pred: Pred) -> Pred {
-        Pred::or(Pred::not(Pred::from(column_name!("is_add"))), pred)
+        Pred::or(Pred::not(column_pred!("is_add")), pred)
     }
 }
 
@@ -714,7 +706,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         } else {
             let safe_to_skip = match inverted {
                 true => self.get_rowcount_stat()?, // all-null
-                false => Expr::literal(0i64),      // no-null
+                false => lit(0i64),                // no-null
             };
             Some(Pred::ne(self.get_nullcount_stat(col)?, safe_to_skip))
         }
@@ -894,7 +886,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
             return None; // IS NOT NULL: column vs column, can't prune (#1873)
         }
         let nullcount = self.get_nullcount_stat(col)?;
-        let comparison = Pred::ne(nullcount.clone(), Expr::literal(0i64));
+        let comparison = Pred::ne(nullcount.clone(), lit(0i64));
         Some(Pred::or(Pred::is_null(nullcount), comparison))
     }
 

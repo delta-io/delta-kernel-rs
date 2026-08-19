@@ -90,7 +90,7 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{schema_ref, SchemaRef};
     use crate::{Engine as _, EngineData, FileMeta, ParquetHandler as _};
 
     fn make_handler() -> PlanBasedParquetHandler {
@@ -119,9 +119,7 @@ mod tests {
             .unwrap();
 
         // Read it back to confirm the fallback actually wrote the rows.
-        let schema: SchemaRef = Arc::new(
-            StructType::try_new([StructField::nullable("value", DataType::LONG)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "value": LONG };
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
@@ -194,9 +192,7 @@ mod tests {
     /// No files -> an absent plan -> a zero-row result (no rows, no error).
     #[test]
     fn test_read_parquet_files_empty_is_empty() {
-        let schema: SchemaRef = Arc::new(
-            StructType::try_new([StructField::nullable("value", DataType::LONG)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "value": LONG };
         let rows: usize = make_handler()
             .read_parquet_files(&[], schema, None)
             .unwrap()

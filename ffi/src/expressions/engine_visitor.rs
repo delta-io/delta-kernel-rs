@@ -31,6 +31,12 @@ type VisitParseJsonFn = extern "C" fn(
     child_list_id: usize,
     output_schema: Handle<SharedSchema>,
 );
+type VisitColumnFn = extern "C" fn(
+    data: *mut c_void,
+    sibling_list_id: usize,
+    parts: *const KernelStringSlice,
+    parts_len: usize,
+);
 
 /// The [`EngineExpressionVisitor`] defines a visitor system to allow engines to build their own
 /// representation of a kernel expression or predicate.
@@ -210,9 +216,11 @@ pub struct EngineExpressionVisitor {
     /// `sibling_list_id`. The element expressions will be in a list identified by
     /// `child_list_id`.
     pub visit_array: VisitVariadicFn,
-    /// Visits the `column` belonging to the list identified by `sibling_list_id`.
-    pub visit_column:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    /// Visits a `column` belonging to the list identified by `sibling_list_id`.
+    ///
+    /// `parts` contains the ordered field-name parts of the column. Each part is valid only for
+    /// the duration of this callback.
+    pub visit_column: VisitColumnFn,
     /// Visits a `Struct` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expressions (fields) of the struct are in a list identified by `child_list_id`
     pub visit_struct_expr:
@@ -406,9 +414,18 @@ fn visit_expression_column(
     name: &ColumnName,
     sibling_list_id: usize,
 ) {
-    let name = name.to_string();
-    let name = kernel_string_slice!(name);
-    call!(visitor, visit_column, sibling_list_id, name);
+    let parts: Vec<_> = name
+        .path()
+        .iter()
+        .map(|part| kernel_string_slice!(part))
+        .collect();
+    call!(
+        visitor,
+        visit_column,
+        sibling_list_id,
+        parts.as_ptr(),
+        parts.len()
+    );
 }
 
 fn visit_expression_struct(
@@ -754,15 +771,26 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{Expression, Scalar};
+    use delta_kernel::expressions::{lit, Expression, Scalar};
     use rstest::rstest;
 
     use super::*;
+    use crate::TryFromStringSlice;
 
     #[derive(Debug, PartialEq, Eq)]
     enum LiteralEvent {
-        IntervalYearMonth { sibling_list_id: usize, value: i32 },
-        IntervalDayTime { sibling_list_id: usize, value: i64 },
+        IntervalYearMonth {
+            sibling_list_id: usize,
+            value: i32,
+        },
+        IntervalDayTime {
+            sibling_list_id: usize,
+            value: i64,
+        },
+        Column {
+            sibling_list_id: usize,
+            parts: Vec<String>,
+        },
     }
 
     #[derive(Default)]
@@ -802,6 +830,23 @@ mod tests {
         });
     }
 
+    extern "C" fn visit_column(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        parts: *const KernelStringSlice,
+        parts_len: usize,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let parts = unsafe { std::slice::from_raw_parts(parts, parts_len) }
+            .iter()
+            .map(|part| unsafe { String::try_from_slice(part).unwrap() })
+            .collect();
+        builder.events.push(LiteralEvent::Column {
+            sibling_list_id,
+            parts,
+        });
+    }
+
     macro_rules! ignore_fn {
         ($fn_name:ident $(, $arg_type:ty)*) => {
             extern "C" fn $fn_name(
@@ -828,7 +873,6 @@ mod tests {
     ignore_fn!(ignore_map_literal, usize, usize);
     ignore_fn!(ignore_null, u8, u8, u8);
     ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
-    ignore_fn!(ignore_column, KernelStringSlice);
     ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
     ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
     ignore_fn!(ignore_opaque_expr, Handle<SharedOpaqueExpressionOp>, usize);
@@ -875,47 +919,65 @@ mod tests {
             visit_divide: ignore_child_list,
             visit_coalesce: ignore_child_list,
             visit_array: ignore_child_list,
-            visit_column: ignore_column,
+            visit_column,
             visit_struct_expr: ignore_child_list,
             visit_struct_patch_expr: ignore_struct_patch,
             visit_field_patch: ignore_field_patch,
             visit_opaque_expr: ignore_opaque_expr,
             visit_opaque_pred: ignore_opaque_pred,
-            visit_unknown: ignore_column,
+            visit_unknown: ignore_string_slice,
         }
+    }
+
+    #[test]
+    fn visit_expression_column_uses_structured_parts() {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id =
+            visit_expression_internal(&Expression::column(["a", "b.c", "d"]), &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Column {
+                sibling_list_id: 0,
+                parts: vec!["a".to_string(), "b.c".to_string(), "d".to_string()],
+            }]
+        );
     }
 
     #[rstest]
     #[case(
-        Expression::literal(Scalar::IntervalYearMonth(26)),
+        lit(Scalar::IntervalYearMonth(26)),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: 26 }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalDayTime(987_654)),
+        lit(Scalar::IntervalDayTime(987_654)),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 987_654 }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalYearMonth(-13)),
+        lit(Scalar::IntervalYearMonth(-13)),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: -13 }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalYearMonth(i32::MIN)),
+        lit(Scalar::IntervalYearMonth(i32::MIN)),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MIN }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalYearMonth(i32::MAX)),
+        lit(Scalar::IntervalYearMonth(i32::MAX)),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MAX }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalDayTime(-86_400_000_000)),
+        lit(Scalar::IntervalDayTime(-86_400_000_000)),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: -86_400_000_000 }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalDayTime(i64::MIN)),
+        lit(Scalar::IntervalDayTime(i64::MIN)),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MIN }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalDayTime(i64::MAX)),
+        lit(Scalar::IntervalDayTime(i64::MAX)),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MAX }
     )]
     fn visit_expression_uses_interval_literal_callbacks(

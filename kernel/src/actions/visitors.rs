@@ -11,7 +11,9 @@ use super::deletion_vector::DeletionVectorDescriptor;
 use super::*;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_segment::DomainMetadataMap;
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Schema, StructField};
+use crate::schema::{
+    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
+};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -103,6 +105,7 @@ pub(crate) struct AddVisitor {
     pub(crate) adds: Vec<Add>,
 }
 
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 impl AddVisitor {
     #[internal_api]
     fn visit_add<'a>(
@@ -176,6 +179,7 @@ pub(crate) struct RemoveVisitor {
     pub(crate) removes: Vec<Remove>,
 }
 
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 impl RemoveVisitor {
     #[internal_api]
     pub(crate) fn visit_remove<'a>(
@@ -252,6 +256,7 @@ pub(crate) struct CdcVisitor {
     pub(crate) cdcs: Vec<Cdc>,
 }
 
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 impl CdcVisitor {
     #[internal_api]
     pub(crate) fn visit_cdc<'a>(
@@ -641,14 +646,11 @@ impl InCommitTimestampVisitor {
     #[allow(unused)]
     /// Get the schema that the visitor expects the data to have.
     pub(crate) fn schema() -> Arc<Schema> {
-        static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
-            let ict_type = StructField::new("inCommitTimestamp", DataType::LONG, true);
-            Arc::new(StructType::new_unchecked(vec![StructField::new(
-                COMMIT_INFO_NAME,
-                StructType::new_unchecked([ict_type]),
-                true,
-            )]))
-        });
+        static SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            nullable COMMIT_INFO_NAME: {
+                nullable "inCommitTimestamp": LONG,
+            },
+        };
         SCHEMA.clone()
     }
 }

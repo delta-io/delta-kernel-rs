@@ -47,7 +47,7 @@ use url::Url;
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;
-use crate::schema::{DataType, Schema, StructField, StructType};
+use crate::schema::{try_schema, DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{Operation, TableFeature};
@@ -66,12 +66,14 @@ mod scan_file;
 #[cfg(test)]
 mod test_utils;
 
+#[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
 #[internal_api]
 pub(crate) use scan_file::{TableChangesFileAction, TableChangesScanFile};
 
 /// Selects the history represented by [`TableChanges::scan_file_listing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 #[internal_api]
 pub(crate) enum TableChangesListingMode {
     /// Preserves each commit's file actions.
@@ -382,13 +384,10 @@ impl TableChanges {
             return Err(mode.boundary_schema_error(start_schema.as_ref(), end_schema.as_ref()));
         }
 
-        let schema = StructType::try_new(
-            end_snapshot
-                .schema()
-                .fields()
-                .cloned()
-                .chain(CDF_FIELDS.clone()),
-        )?;
+        let schema = try_schema! {
+            ..(end_schema.fields()),
+            ..(CDF_FIELDS.clone()),
+        }?;
 
         Ok(TableChanges {
             table_root,
@@ -555,7 +554,7 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::{Add, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, StructField, StructType};
     use crate::table_changes::test_utils::{
         row_tracking_properties, row_tracking_protocol, row_tracking_setup_actions,
         test_deletion_vector, TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
@@ -574,10 +573,10 @@ mod tests {
     use crate::{Engine, Error};
 
     fn listing_test_schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "id": INTEGER,
+            nullable "value": STRING,
+        }
     }
 
     #[test]
@@ -713,15 +712,15 @@ mod tests {
         // the per-commit one.
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
-        let start_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-            StructField::nullable("extra", DataType::INTEGER),
-        ]));
-        let end_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ]));
+        let start_schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "value": STRING,
+            nullable "extra": INTEGER,
+        };
+        let end_schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "value": STRING,
+        };
         let rt_config = row_tracking_properties();
 
         // v0: start schema + row tracking. v1: a data commit (no metadata) using the start schema.

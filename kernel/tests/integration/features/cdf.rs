@@ -7,7 +7,7 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{col, lit, Predicate as Pred};
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 use itertools::Itertools;
@@ -630,13 +630,10 @@ fn cdf_with_column_mapping_name_mode() -> Result<(), Box<dyn error::Error>> {
 /// file and returns zero rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Error>> {
-    let schema = Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("EventTime", DataType::TIMESTAMP),
-            StructField::nullable("UserId", DataType::LONG),
-        ])
-        .unwrap(),
-    );
+    let schema = schema_ref! {
+        nullable "EventTime": TIMESTAMP,
+        nullable "UserId": LONG,
+    };
 
     let tmp_dir = tempfile::tempdir()?;
     let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();

@@ -15,7 +15,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{ArrayType, DataType, MapType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::{Error as KernelError, Snapshot};
 use itertools::Itertools;
@@ -34,10 +34,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a table with TIMESTAMP_NTZ column
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "ts_ntz",
-        DataType::TIMESTAMP_NTZ,
-    )])?);
+    let schema = schema_ref! { nullable "ts_ntz": TIMESTAMP_NTZ };
 
     let (store, engine, table_location) = engine_store_setup("test_table_timestamp_ntz", None);
     let table_url = create_table(
@@ -124,10 +121,7 @@ async fn test_append_timestamp_stats_are_millisecond_truncated(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "ts",
-        DataType::TIMESTAMP,
-    )])?);
+    let schema = schema_ref! { nullable "ts": TIMESTAMP };
 
     let (store, engine, table_location) = engine_store_setup("test_table_timestamp_stats", None);
     let table_url = create_table(
@@ -205,18 +199,14 @@ async fn test_append_variant(
     }
 
     // create a table with VARIANT column
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("v", DataType::unshredded_variant()),
-        StructField::nullable("i", DataType::INTEGER),
-        StructField::nullable(
-            "nested",
-            // We flip the value and metadata fields in the actual parquet file for the test
-            StructType::try_new(vec![StructField::nullable(
-                "nested_v",
-                unshredded_variant_schema_flipped(),
-            )])?,
-        ),
-    ])?);
+    // We flip the value and metadata fields in the actual parquet file for the test.
+    let table_schema = schema_ref! {
+        nullable "v": unshredded_variant(),
+        nullable "i": INTEGER,
+        nullable "nested": {
+            nullable "nested_v": (unshredded_variant_schema_flipped()),
+        },
+    };
 
     let write_schema = table_schema.clone();
 
@@ -360,18 +350,13 @@ async fn test_append_variant(
     assert!(parsed_commits[1].get("add").is_some());
 
     // The scanned data will match the logical schema, not the physical one
-    let expected_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("v", DataType::unshredded_variant()),
-        StructField::nullable("i", DataType::INTEGER),
-        StructField::nullable(
-            "nested",
-            StructType::try_new(vec![StructField::nullable(
-                "nested_v",
-                DataType::unshredded_variant(),
-            )])
-            .unwrap(),
-        ),
-    ])?);
+    let expected_schema = schema_ref! {
+        nullable "v": unshredded_variant(),
+        nullable "i": INTEGER,
+        nullable "nested": {
+            nullable "nested_v": unshredded_variant(),
+        },
+    };
 
     // During the read, the flipped fields should be reordered into metadata, value.
     let variant_nested_v_array_expected = Arc::new(StructArray::try_new(
@@ -409,22 +394,18 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
-    let table_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "v",
-        DataType::unshredded_variant(),
-    )])?);
+    let table_schema = schema_ref! { nullable "v": unshredded_variant() };
 
     // The table will be attempted to be written in this form but be read into
     // STRUCT<metadata: BINARY, value: BINARY>. The read should fail because the default engine
     // currently does not support shredded reads.
-    let shredded_write_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "v",
-        DataType::try_struct_type([
-            StructField::new("metadata", DataType::BINARY, true),
-            StructField::new("value", DataType::BINARY, true),
-            StructField::new("typed_value", DataType::INTEGER, true),
-        ])?,
-    )])?);
+    let shredded_write_schema = schema_ref! {
+        nullable "v": {
+            nullable "metadata": BINARY,
+            nullable "value": BINARY,
+            nullable "typed_value": INTEGER,
+        },
+    };
 
     let tmp_test_dir = tempdir()?;
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
@@ -562,10 +543,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a table with a NOT NULL column.
-    let schema = Arc::new(StructType::try_new(vec![StructField::not_null(
-        "c",
-        data_type.clone(),
-    )])?);
+    let schema = schema_ref! { not_null "c": (data_type.clone()) };
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let _ = kernel_create_table(&table_path, schema.clone(), "test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -613,14 +591,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     Ok(())
 }
 
-// ---- Void type write-time validation tests ----
-//
-// The rstest cases below use `StructType::new_unchecked` for convenience; `StructType::try_new`
-// would also accept them, since it validates structural properties (field-name uniqueness,
-// metadata-column rules) and does not reject void placements. The validator
-// (`validate_schema_for_write`) is the kernel-internal write-time rejection point for void in
-// `Array`/`Map` and all-void structs, and it also protects schemas loaded from existing table
-// metadata (JSON-deserialized from the log) and any `new_unchecked` paths.
+// === Void type write-time validation tests ===
 
 /// Helper to create a table with a given schema and attempt a commit with dummy add_files.
 /// Returns the commit error (panics if commit succeeds).
@@ -649,112 +620,69 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
 
 #[rstest]
 #[case::void_array_element(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "arr",
-            ArrayType::new(DataType::VOID, true),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "arr": [ nullable VOID ],
+    },
     "array element type"
 )]
 #[case::void_map_value(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "m",
-            MapType::new(DataType::STRING, DataType::VOID, true),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "m": { STRING => nullable VOID },
+    },
     "map value type"
 )]
 #[case::void_map_key(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "m",
-            MapType::new(DataType::VOID, DataType::STRING, true),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "m": { VOID => nullable STRING },
+    },
     "map key type"
 )]
 #[case::void_in_struct_in_array(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "arr",
-            ArrayType::new(
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::VOID),
-                ]),
-                true,
-            ),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "arr": [ nullable {
+            nullable "a": INTEGER,
+            nullable "b": VOID,
+        } ],
+    },
     "Void type is not allowed inside"
 )]
 #[case::void_in_struct_in_map_value(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "m",
-            MapType::new(
-                DataType::STRING,
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::VOID),
-                ]),
-                true,
-            ),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "m": { STRING => nullable {
+            nullable "a": INTEGER,
+            nullable "b": VOID,
+        } },
+    },
     "Void type is not allowed inside"
 )]
 #[case::all_void_table(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("a", DataType::VOID),
-        StructField::nullable("b", DataType::VOID),
-    ])),
+    schema_ref! { nullable "a": VOID, nullable "b": VOID },
     "at least one non-void column"
 )]
 #[case::all_void_struct(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("x", DataType::VOID),
-                StructField::nullable("y", DataType::VOID),
-            ]),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "s": { nullable "x": VOID, nullable "y": VOID },
+    },
     "contains no non-void fields"
 )]
 // A zero-field top-level schema is an empty schema, rejected by the empty-schema
 // write gate (it has no columns at all, void or otherwise) rather than by void validation.
 #[case::empty_struct_top_level(
-    Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+    schema_ref! {},
     "empty schema"
 )]
 #[case::nested_empty_struct(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "s",
-            StructType::new_unchecked(Vec::<StructField>::new()),
-        ),
-    ])),
+    schema_ref! { nullable "id": INTEGER, nullable "s": {} },
     "contains no non-void fields"
 )]
 #[case::empty_struct_in_array(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "arr",
-            ArrayType::new(StructType::new_unchecked(Vec::<StructField>::new()), true),
-        ),
-    ])),
+    schema_ref! { nullable "id": INTEGER, nullable "arr": [ nullable {} ] },
     "struct nested in Array or Map must contain at least one non-void field"
 )]
 #[tokio::test]
@@ -780,30 +708,21 @@ async fn write_rejects_invalid_void_placement(
     "void_fail_fast_unpartitioned_array",
     vec![],
     HashMap::new(),
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
-    ])),
+    schema_ref! { nullable "id": INTEGER, nullable "arr": [ nullable VOID ] },
     "array element type",
 )]
 #[case::partitioned_void_array(
     "void_fail_fast_partitioned_array",
     vec!["id"],
     HashMap::from([("id".to_string(), Scalar::Integer(1))]),
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
-    ])),
+    schema_ref! { nullable "id": INTEGER, nullable "arr": [ nullable VOID ] },
     "array element type",
 )]
 #[case::unpartitioned_all_void(
     "void_fail_fast_unpartitioned_all_void",
     vec![],
     HashMap::new(),
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("a", DataType::VOID),
-        StructField::nullable("b", DataType::VOID),
-    ])),
+    schema_ref! { nullable "a": VOID, nullable "b": VOID },
     "at least one non-void column",
 )]
 #[tokio::test]
@@ -850,11 +769,11 @@ async fn write_context_creation_fails_fast_on_invalid_void_schema(
 #[tokio::test]
 async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dyn std::error::Error>>
 {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("v", DataType::VOID),
-        StructField::nullable("name", DataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "v": VOID,
+        nullable "name": STRING,
+    };
     let (store, engine, table_location) = engine_store_setup("void_physical_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);
@@ -886,10 +805,10 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
 #[tokio::test]
 async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dyn std::error::Error>>
 {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "arr": [ nullable VOID ],
+    };
     let (store, engine, table_location) = engine_store_setup("void_metadata_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);
@@ -913,16 +832,13 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
 #[tokio::test]
 async fn write_context_excludes_nested_void_from_physical_schema(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::VOID),
-            ]),
-        ),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "s": {
+            nullable "a": INTEGER,
+            nullable "b": VOID,
+        },
+    };
     let (store, engine, table_location) = engine_store_setup("void_nested_physical_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);
@@ -967,16 +883,13 @@ async fn write_context_excludes_nested_void_from_physical_schema(
 // matching the physical schema which has void stripped recursively.
 #[tokio::test]
 async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::VOID),
-            ]),
-        ),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "s": {
+            nullable "a": INTEGER,
+            nullable "b": VOID,
+        },
+    };
     let (store, engine, table_location) = engine_store_setup("void_nested_transform_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);
