@@ -1212,12 +1212,6 @@ pub(crate) struct CheckpointAction {
 }
 
 // === CheckpointAction -> EngineData ===
-//
-// `CheckpointAction` cannot use `#[derive(IntoEngineData)]`/`create_one`: its single `checkpoint`
-// column is an array whose elements are a union struct (one field per action kind), and
-// `create_one` only flattens to leaves. Instead we build the whole column as one non-flattened
-// `Scalar::Array` and materialize it via `create_many` (whose `Scalar::append_to` recurses through
-// Array/Struct/Null).
 
 /// Build the `sidecar` element payload: a [`Sidecar`] scalar prefixed with a `type` discriminator
 /// (`"txn"` or `"domainMetadata"`), matching [`CONTENT_SIDECAR_FIELD`].
@@ -1232,9 +1226,10 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> DeltaResult<Scal
     // `from_values_unchecked`, not `try_new`: `Sidecar::tags` carries
     // `#[allow_null_container_values]` so its schema field declares value-nullable maps, while
     // the derived `.into()` value is a non-nullable map -- a leaf-level mismatch `try_new`
-    // would reject. This is inert because the enclosing `union_element` still validates the
-    // composite against `CONTENT_SIDECAR_FIELD`, and materialization derives map nullability
-    // from the schema, not the scalar.
+    // would reject. This is inert because the enclosing `checkpoint_action_union_element` still
+    // validates the composite against `CONTENT_SIDECAR_FIELD`, and materialization derives map
+    // nullability from the schema, not the scalar. Tracked by delta-io/delta-kernel-rs#3136,
+    // which will let this use `try_new`.
     Ok(Scalar::Struct(StructData::from_values_unchecked(
         StructType::try_new(fields)?,
         values,
@@ -1244,7 +1239,7 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> DeltaResult<Scal
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
 /// type: the field named `field_name` holds `value`, every other field is a typed null.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn union_element(field_name: &str, value: Scalar) -> DeltaResult<Scalar> {
+fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> DeltaResult<Scalar> {
     let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
         fields.iter().any(|f| f.name() == field_name),
@@ -1265,6 +1260,11 @@ fn union_element(field_name: &str, value: Scalar) -> DeltaResult<Scalar> {
     Ok(Scalar::Struct(StructData::try_new(fields, values)?))
 }
 
+// `CheckpointAction` cannot use `#[derive(IntoEngineData)]`/`create_one`: its single `checkpoint`
+// column is an array whose elements are a union struct (one field per action kind), and
+// `create_one` only flattens to leaves. Instead we build the whole column as one non-flattened
+// `Scalar::Array` and materialize it via `create_many` (whose `Scalar::append_to` recurses through
+// Array/Struct/Null).
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl IntoEngineData for CheckpointAction {
     fn into_engine_data(
@@ -1278,32 +1278,34 @@ impl IntoEngineData for CheckpointAction {
             tags: None,
         };
         let mut elements = vec![
-            union_element(CHECKPOINT_METADATA_NAME, checkpoint_metadata.into())?,
-            union_element(CONTENT_ROOT_NAME, self.content_root.into())?,
-            union_element(PROTOCOL_NAME, self.protocol.into())?,
-            union_element(METADATA_NAME, self.metadata.into())?,
+            checkpoint_action_union_element(CHECKPOINT_METADATA_NAME, checkpoint_metadata.into())?,
+            checkpoint_action_union_element(CONTENT_ROOT_NAME, self.content_root.into())?,
+            checkpoint_action_union_element(PROTOCOL_NAME, self.protocol.into())?,
+            checkpoint_action_union_element(METADATA_NAME, self.metadata.into())?,
         ];
         for txn in self.transactions {
-            elements.push(union_element(SET_TRANSACTION_NAME, txn.into())?);
+            elements.push(checkpoint_action_union_element(
+                SET_TRANSACTION_NAME,
+                txn.into(),
+            )?);
         }
         for dm in self.domain_metadata {
-            elements.push(union_element(DOMAIN_METADATA_NAME, dm.into())?);
+            elements.push(checkpoint_action_union_element(
+                DOMAIN_METADATA_NAME,
+                dm.into(),
+            )?);
         }
         for sidecar in self.txn_sidecars {
             let element = content_sidecar_element(SET_TRANSACTION_NAME, sidecar)?;
-            elements.push(union_element(SIDECAR_NAME, element)?);
+            elements.push(checkpoint_action_union_element(SIDECAR_NAME, element)?);
         }
         for sidecar in self.domain_metadata_sidecars {
             let element = content_sidecar_element(DOMAIN_METADATA_NAME, sidecar)?;
-            elements.push(union_element(SIDECAR_NAME, element)?);
+            elements.push(checkpoint_action_union_element(SIDECAR_NAME, element)?);
         }
 
-        let DataType::Array(array_type) = CHECKPOINT_ACTION_FIELD.data_type() else {
-            return Err(Error::generic(
-                "checkpoint action field must be an array type",
-            ));
-        };
-        let array = Scalar::Array(ArrayData::try_new((**array_type).clone(), elements)?);
+        let array_type = ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false);
+        let array = Scalar::Array(ArrayData::try_new(array_type, elements)?);
         engine.evaluation_handler().create_many(schema, &[&[array]])
     }
 }

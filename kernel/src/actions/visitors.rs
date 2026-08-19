@@ -742,7 +742,8 @@ impl RowVisitor for CheckpointVisitor {
 /// element schema concatenates each variant's leaves in a fixed order, so a variant's leaves are
 /// always a contiguous slice of the getters.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-struct ElementRanges {
+#[derive(Default)]
+struct CheckpointElementRanges {
     checkpoint_metadata: std::ops::Range<usize>,
     content_root: std::ops::Range<usize>,
     protocol: std::ops::Range<usize>,
@@ -756,19 +757,10 @@ struct ElementRanges {
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-static ELEMENT_RANGES: LazyLock<ElementRanges> = LazyLock::new(|| {
+static CHECKPOINT_ELEMENT_RANGES: LazyLock<CheckpointElementRanges> = LazyLock::new(|| {
     // Walk CHECKPOINT_ACTION_ELEMENT_SCHEMA itself, sizing each range by that field's leaf count,
     // so the ranges cannot drift from the schema they index into.
-    let mut r = ElementRanges {
-        checkpoint_metadata: 0..0,
-        content_root: 0..0,
-        protocol: 0..0,
-        metadata: 0..0,
-        domain_metadata: 0..0,
-        txn: 0..0,
-        sidecar_type: 0,
-        sidecar: 0..0,
-    };
+    let mut r = CheckpointElementRanges::default();
     let mut next = 0;
     for field in CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields() {
         let leaf_count = match field.data_type() {
@@ -804,7 +796,7 @@ static ELEMENT_RANGES: LazyLock<ElementRanges> = LazyLock::new(|| {
             && !r.txn.is_empty()
             && r.sidecar_type > 0
             && !r.sidecar.is_empty(),
-        "ELEMENT_RANGES: a checkpoint element field name did not match a known variant \
+        "CHECKPOINT_ELEMENT_RANGES: a checkpoint element field name did not match a known variant \
          (schema/constant drift)"
     );
     r
@@ -862,7 +854,7 @@ impl RowVisitor for CheckpointElementVisitor {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        let r = &*ELEMENT_RANGES;
+        let r = &*CHECKPOINT_ELEMENT_RANGES;
         for i in 0..row_count {
             // Each element is a single-key tagged object, so at most one variant has a non-null
             // required leaf. Probe each variant's required leaf in turn to identify it. An element
