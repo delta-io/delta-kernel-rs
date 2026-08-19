@@ -2259,6 +2259,28 @@ mod tests {
     }
 
     #[test]
+    fn schema_add_whole_struct_column_is_persisted_on_commit() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+        let address_type = StructType::try_new(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("street", DataType::STRING),
+        ])?;
+        let snapshot = txn
+            .with_schema_changes(vec![SchemaOperation::add_column(
+                StructField::nullable("address", address_type.clone()),
+                ColumnName::new(Vec::<String>::new()),
+            )])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let schema = snapshot.schema();
+        let address = schema.field("address").unwrap();
+        assert!(address.is_nullable());
+        assert_eq!(address.data_type(), &DataType::from(address_type));
+        Ok(())
+    }
+
+    #[test]
     fn schema_changes_are_rejected_after_staging_data() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         add_dummy_file(&mut txn);
