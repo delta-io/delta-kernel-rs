@@ -11,9 +11,9 @@ use tracing_subscriber::Layer;
 
 use super::events::{
     storage_metric_from_attrs, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
-    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
-    ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
-    TransactionCommitSuccess, STORAGE_SPAN,
+    LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted,
+    ProtocolMetadataLoadSuccess, ScanMetadataCompleted, SetTransactionLoadSuccess,
+    SnapshotBuildSuccess, TransactionCommitSuccess, STORAGE_SPAN,
 };
 
 // ====================================================================
@@ -129,6 +129,11 @@ where
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
             )),
+            LastCheckpointReadCompleted::SPAN_NAME => {
+                Some(MetricEvent::LastCheckpointReadCompleted(
+                    LastCheckpointReadCompleted::from_attrs(attrs),
+                ))
+            }
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
             )),
@@ -298,6 +303,7 @@ mod tests {
     use std::io::Error;
     use std::sync::{Arc, Mutex};
 
+    use rstest::rstest;
     use test_utils::{ensure_metrics_compatible_global_subscriber, LogWriter};
     use tracing::field::Empty;
     use tracing::subscriber::with_default;
@@ -308,7 +314,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
+    use crate::metrics::{LastCheckpointReadOutcome, MetricEvent, WithMetricsReporterLayer as _};
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     /// Run `f` under a subscriber that layers the metrics layer over an fmt layer capturing to a
@@ -365,6 +371,33 @@ mod tests {
             logs.contains("Invalid field 'bogus' recorded on snap.build span"),
             "an unrecognized .record() field is a declared-field typo and must still warn; got: {logs}"
         );
+    }
+
+    #[rstest]
+    #[case::unset(None)]
+    #[case::empty(Some(""))]
+    #[case::unrecognized(Some("not_an_outcome"))]
+    fn last_checkpoint_unset_or_invalid_outcome_decodes_as_unknown(
+        #[case] recorded_outcome: Option<&str>,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!("last_checkpoint.read", report = Empty, outcome = Empty,);
+            if let Some(outcome) = recorded_outcome {
+                span.record("outcome", outcome);
+            }
+        }
+
+        let outcomes: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::LastCheckpointReadCompleted(event) => Some(event.outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes, [LastCheckpointReadOutcome::Unknown]);
     }
 
     // A log line whose field name collides with a real metric field must NOT overwrite the value a

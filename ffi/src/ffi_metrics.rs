@@ -111,6 +111,35 @@ impl From<kernel::LogSegmentLoadType> for LogSegmentLoadType {
     }
 }
 
+/// The outcome of an attempt to read and parse a `_last_checkpoint` hint.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum LastCheckpointReadOutcome {
+    /// The hint was present and parsed successfully.
+    Success,
+    /// The hint file was not present.
+    NotFound,
+    /// The hint file was empty or could not be decoded as a valid hint.
+    Invalid,
+    /// Reading the hint failed with an unexpected error.
+    Error,
+    /// The outcome was missing, unrecognized, or added by a newer Kernel version.
+    Unknown,
+}
+
+impl From<kernel::LastCheckpointReadOutcome> for LastCheckpointReadOutcome {
+    fn from(outcome: kernel::LastCheckpointReadOutcome) -> Self {
+        match outcome {
+            kernel::LastCheckpointReadOutcome::Success => Self::Success,
+            kernel::LastCheckpointReadOutcome::NotFound => Self::NotFound,
+            kernel::LastCheckpointReadOutcome::Invalid => Self::Invalid,
+            kernel::LastCheckpointReadOutcome::Error => Self::Error,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// A log segment was loaded.
 #[repr(C)]
 pub struct LogSegmentLoadSuccess {
@@ -257,6 +286,15 @@ pub struct CrcReadSuccess {
     pub duration_ns: u64,
 }
 
+/// An attempt to read and parse a `_last_checkpoint` hint completed.
+#[repr(C)]
+pub struct LastCheckpointReadCompleted {
+    /// How the read attempt completed.
+    pub outcome: LastCheckpointReadOutcome,
+    /// Wall-clock time spent locating, reading, and parsing the hint, in nanoseconds.
+    pub duration_ns: u64,
+}
+
 /// A `JsonHandler::read_json_files` call completed.
 #[repr(C)]
 pub struct JsonReadCompleted {
@@ -338,6 +376,7 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
+    LastCheckpointReadCompleted(LastCheckpointReadCompleted),
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -523,6 +562,13 @@ impl MetricEvent {
                 duration_ns: ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
+            K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                outcome,
+                duration,
+            }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+                outcome: (*outcome).into(),
+                duration_ns: ns(*duration),
+            }),
             K::JsonReadCompleted(kernel::JsonReadCompleted {
                 num_files,
                 bytes_read,
@@ -606,8 +652,49 @@ mod tests {
     use std::mem::discriminant;
     use std::time::Duration;
 
+    use rstest::rstest;
+
     use super::*;
     use crate::TryFromStringSlice;
+
+    #[rstest]
+    #[case::success(
+        kernel::LastCheckpointReadOutcome::Success,
+        LastCheckpointReadOutcome::Success
+    )]
+    #[case::not_found(
+        kernel::LastCheckpointReadOutcome::NotFound,
+        LastCheckpointReadOutcome::NotFound
+    )]
+    #[case::invalid(
+        kernel::LastCheckpointReadOutcome::Invalid,
+        LastCheckpointReadOutcome::Invalid
+    )]
+    #[case::error(
+        kernel::LastCheckpointReadOutcome::Error,
+        LastCheckpointReadOutcome::Error
+    )]
+    #[case::unknown(
+        kernel::LastCheckpointReadOutcome::Unknown,
+        LastCheckpointReadOutcome::Unknown
+    )]
+    fn from_kernel_last_checkpoint_read_completed_carries_outcome_and_duration(
+        #[case] kernel_outcome: kernel::LastCheckpointReadOutcome,
+        #[case] expected: LastCheckpointReadOutcome,
+    ) {
+        let event =
+            kernel::MetricEvent::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                outcome: kernel_outcome,
+                duration: Duration::from_nanos(17),
+            });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::LastCheckpointReadCompleted(e) = ffi else {
+                panic!("expected LastCheckpointReadCompleted");
+            };
+            assert_eq!(discriminant(&e.outcome), discriminant(&expected));
+            assert_eq!(e.duration_ns, 17);
+        });
+    }
 
     #[test]
     fn from_kernel_transaction_commit_success_carries_operation_and_id() {

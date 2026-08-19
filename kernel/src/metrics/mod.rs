@@ -85,8 +85,9 @@ use std::sync::Arc;
 
 pub use events::{
     emit_json_read_completed, emit_parquet_read_completed, CommitFailureReason, CrcReadSuccess,
-    DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess,
-    LogSegmentLoadType, MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LastCheckpointReadCompleted,
+    LastCheckpointReadOutcome, LogSegmentLoadFailure, LogSegmentLoadSuccess, LogSegmentLoadType,
+    MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
     ProtocolMetadataLoadSuccess, ProtocolMetadataSource, ScanMetadataCompleted, ScanType,
     SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess,
     SnapshotLoadMetricContext, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,

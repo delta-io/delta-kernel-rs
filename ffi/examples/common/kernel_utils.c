@@ -105,6 +105,18 @@ void print_load_type(LogSegmentLoadType lt) {
   }
 }
 
+// utility to print out a _last_checkpoint read outcome
+void print_last_checkpoint_read_outcome(LastCheckpointReadOutcome outcome) {
+  printf("  outcome:");
+  switch (outcome) {
+  case LastCheckpointReadOutcomeSuccess: printf(" Success,\n"); break;
+  case LastCheckpointReadOutcomeNotFound: printf(" NotFound,\n"); break;
+  case LastCheckpointReadOutcomeInvalid: printf(" Invalid,\n"); break;
+  case LastCheckpointReadOutcomeError: printf(" Error,\n"); break;
+  case LastCheckpointReadOutcomeUnknown: printf(" Unknown,\n"); break;
+  }
+}
+
 #define PM_START(name) printf("\nMetric " #name " {\n")
 #define PM_END printf("}\n\n");
 #define PM_ID(s, f) print_metric_id(#f, (s).f)
@@ -323,6 +335,14 @@ void print_metric(MetricEvent event) {
     PM_START(MetricEventStorageCopyCompleted);
     StorageCopyCompleted scc = event.storage_copy_completed;
     PM_U64(scc, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventLastCheckpointReadCompleted:
+    PM_START(LastCheckpointReadCompleted);
+    LastCheckpointReadCompleted lcrc = event.last_checkpoint_read_completed;
+    print_last_checkpoint_read_outcome(lcrc.outcome);
+    PM_U64(lcrc, duration_ns);
     PM_END;
     return;
 

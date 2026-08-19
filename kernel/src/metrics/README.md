@@ -19,14 +19,19 @@ span-based events reuse small per-field helpers like `MetricId::from_attrs`, eac
 
 ## Failure events
 
-Success and failure are two variants of one event. Emit the success span, then fire `error` on it
-(`#[instrument(err)]` does this on `Err`; an emit helper calls `tracing::info!(error = ...)`). The
-layer sees `error` and flips the event via `MetricEvent::into_failure`.
+Metrics represent failure in two ways:
+
+- Lifecycle metrics have paired success and failure variants. Emit the success span, then fire
+  `error` on it (`#[instrument(err)]` does this on `Err`; an emit helper calls
+  `tracing::info!(error = ...)`). The layer sees `error` and flips the event via
+  `MetricEvent::into_failure`.
+- Completed metrics carry an `outcome` field on one variant. They record the outcome before the
+  span closes and remain unchanged when `MetricEvent::into_failure` sees an error event.
 
 ## Adding an event
 
-1. Define the struct + `SPAN_NAME` in `events.rs`; add a `MetricEvent` variant and its
-   `into_failure` arm.
+1. Define the struct + `SPAN_NAME` in `events.rs`; add a `MetricEvent` variant and decide whether
+   its `into_failure` arm maps to a paired failure variant or preserves an outcome-bearing event.
 2. For emit, add an `emit_*` helper and a `from_attrs`; register the span name in `on_new_span`
    (`reporter.rs`).
 3. Make each label a strum enum (`serialize_all = "snake_case"`).
