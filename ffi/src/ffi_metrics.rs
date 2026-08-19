@@ -111,31 +111,28 @@ impl From<kernel::LogSegmentLoadType> for LogSegmentLoadType {
     }
 }
 
-/// The outcome of an attempt to read and parse a `_last_checkpoint` hint.
+/// Why an attempt to read `_last_checkpoint` did not produce a usable hint.
 ///
 /// cbindgen:prefix-with-name=true
 #[repr(C)]
-pub enum LastCheckpointReadOutcome {
-    /// The hint was present and parsed successfully.
-    Success,
+pub enum LastCheckpointReadFailureReason {
     /// The hint file was not present.
     NotFound,
     /// The hint file was empty or could not be decoded as a valid hint.
     Invalid,
     /// Reading the hint failed with an unexpected error.
     Error,
-    /// The outcome was missing, unrecognized, or added by a newer Kernel version.
+    /// The recorded failure reason was empty or unrecognized.
     Unknown,
 }
 
-impl From<kernel::LastCheckpointReadOutcome> for LastCheckpointReadOutcome {
-    fn from(outcome: kernel::LastCheckpointReadOutcome) -> Self {
-        match outcome {
-            kernel::LastCheckpointReadOutcome::Success => Self::Success,
-            kernel::LastCheckpointReadOutcome::NotFound => Self::NotFound,
-            kernel::LastCheckpointReadOutcome::Invalid => Self::Invalid,
-            kernel::LastCheckpointReadOutcome::Error => Self::Error,
-            _ => Self::Unknown,
+impl From<kernel::LastCheckpointReadFailureReason> for LastCheckpointReadFailureReason {
+    fn from(reason: kernel::LastCheckpointReadFailureReason) -> Self {
+        match reason {
+            kernel::LastCheckpointReadFailureReason::NotFound => Self::NotFound,
+            kernel::LastCheckpointReadFailureReason::Invalid => Self::Invalid,
+            kernel::LastCheckpointReadFailureReason::Error => Self::Error,
+            kernel::LastCheckpointReadFailureReason::Unknown => Self::Unknown,
         }
     }
 }
@@ -286,11 +283,18 @@ pub struct CrcReadSuccess {
     pub duration_ns: u64,
 }
 
-/// An attempt to read and parse a `_last_checkpoint` hint completed.
+/// A `_last_checkpoint` hint was read and parsed successfully.
 #[repr(C)]
-pub struct LastCheckpointReadCompleted {
-    /// How the read attempt completed.
-    pub outcome: LastCheckpointReadOutcome,
+pub struct LastCheckpointReadSuccess {
+    /// Wall-clock time spent locating, reading, and parsing the hint, in nanoseconds.
+    pub duration_ns: u64,
+}
+
+/// An attempt to read `_last_checkpoint` did not produce a usable hint.
+#[repr(C)]
+pub struct LastCheckpointReadFailure {
+    /// Why the read attempt did not produce a usable hint.
+    pub reason: LastCheckpointReadFailureReason,
     /// Wall-clock time spent locating, reading, and parsing the hint, in nanoseconds.
     pub duration_ns: u64,
 }
@@ -376,7 +380,8 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
-    LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    LastCheckpointReadSuccess(LastCheckpointReadSuccess),
+    LastCheckpointReadFailure(LastCheckpointReadFailure),
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -562,11 +567,16 @@ impl MetricEvent {
                 duration_ns: ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
-            K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
-                outcome,
+            K::LastCheckpointReadSuccess(kernel::LastCheckpointReadSuccess { duration }) => {
+                Self::LastCheckpointReadSuccess(LastCheckpointReadSuccess {
+                    duration_ns: ns(*duration),
+                })
+            }
+            K::LastCheckpointReadFailure(kernel::LastCheckpointReadFailure {
+                reason,
                 duration,
-            }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
-                outcome: (*outcome).into(),
+            }) => Self::LastCheckpointReadFailure(LastCheckpointReadFailure {
+                reason: (*reason).into(),
                 duration_ns: ns(*duration),
             }),
             K::JsonReadCompleted(kernel::JsonReadCompleted {
@@ -657,41 +667,51 @@ mod tests {
     use super::*;
     use crate::TryFromStringSlice;
 
-    #[rstest]
-    #[case::success(
-        kernel::LastCheckpointReadOutcome::Success,
-        LastCheckpointReadOutcome::Success
-    )]
-    #[case::not_found(
-        kernel::LastCheckpointReadOutcome::NotFound,
-        LastCheckpointReadOutcome::NotFound
-    )]
-    #[case::invalid(
-        kernel::LastCheckpointReadOutcome::Invalid,
-        LastCheckpointReadOutcome::Invalid
-    )]
-    #[case::error(
-        kernel::LastCheckpointReadOutcome::Error,
-        LastCheckpointReadOutcome::Error
-    )]
-    #[case::unknown(
-        kernel::LastCheckpointReadOutcome::Unknown,
-        LastCheckpointReadOutcome::Unknown
-    )]
-    fn from_kernel_last_checkpoint_read_completed_carries_outcome_and_duration(
-        #[case] kernel_outcome: kernel::LastCheckpointReadOutcome,
-        #[case] expected: LastCheckpointReadOutcome,
-    ) {
+    #[test]
+    fn from_kernel_last_checkpoint_read_success_carries_duration() {
         let event =
-            kernel::MetricEvent::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
-                outcome: kernel_outcome,
+            kernel::MetricEvent::LastCheckpointReadSuccess(kernel::LastCheckpointReadSuccess {
                 duration: Duration::from_nanos(17),
             });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::LastCheckpointReadCompleted(e) = ffi else {
-                panic!("expected LastCheckpointReadCompleted");
+            let MetricEvent::LastCheckpointReadSuccess(e) = ffi else {
+                panic!("expected LastCheckpointReadSuccess");
             };
-            assert_eq!(discriminant(&e.outcome), discriminant(&expected));
+            assert_eq!(e.duration_ns, 17);
+        });
+    }
+
+    #[rstest]
+    #[case::not_found(
+        kernel::LastCheckpointReadFailureReason::NotFound,
+        LastCheckpointReadFailureReason::NotFound
+    )]
+    #[case::invalid(
+        kernel::LastCheckpointReadFailureReason::Invalid,
+        LastCheckpointReadFailureReason::Invalid
+    )]
+    #[case::error(
+        kernel::LastCheckpointReadFailureReason::Error,
+        LastCheckpointReadFailureReason::Error
+    )]
+    #[case::unknown(
+        kernel::LastCheckpointReadFailureReason::Unknown,
+        LastCheckpointReadFailureReason::Unknown
+    )]
+    fn from_kernel_last_checkpoint_read_failure_carries_reason_and_duration(
+        #[case] kernel_reason: kernel::LastCheckpointReadFailureReason,
+        #[case] expected: LastCheckpointReadFailureReason,
+    ) {
+        let event =
+            kernel::MetricEvent::LastCheckpointReadFailure(kernel::LastCheckpointReadFailure {
+                reason: kernel_reason,
+                duration: Duration::from_nanos(17),
+            });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::LastCheckpointReadFailure(e) = ffi else {
+                panic!("expected LastCheckpointReadFailure");
+            };
+            assert_eq!(discriminant(&e.reason), discriminant(&expected));
             assert_eq!(e.duration_ns, 17);
         });
     }

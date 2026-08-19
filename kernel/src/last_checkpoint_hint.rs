@@ -11,8 +11,8 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use crate::metrics::events::LAST_CHECKPOINT_READ_COMPLETED_SPAN;
-use crate::metrics::LastCheckpointReadOutcome;
+use crate::metrics::events::LAST_CHECKPOINT_READ_SPAN;
+use crate::metrics::LastCheckpointReadFailureReason;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
@@ -194,46 +194,43 @@ impl LastCheckpointHint {
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
     #[instrument(
-        name = LAST_CHECKPOINT_READ_COMPLETED_SPAN,
+        name = LAST_CHECKPOINT_READ_SPAN,
         skip_all,
-        fields(report, outcome),
+        fields(report, failure_reason),
         err
     )]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
-        let file_path = Self::path(log_root).inspect_err(|_| {
-            record_read_outcome(LastCheckpointReadOutcome::Error);
-        })?;
+        let file_path = Self::path(log_root)?;
         let mut files = storage
             .read_files(vec![(file_path, None)])
-            .inspect_err(|_| record_read_outcome(LastCheckpointReadOutcome::Error))?;
+            .inspect_err(|err| {
+                if matches!(err, Error::FileNotFound(_)) {
+                    record_read_failure(LastCheckpointReadFailureReason::NotFound);
+                }
+            })?;
         match files.next() {
             Some(Ok(data)) => {
-                let result: Option<LastCheckpointHint> =
-                    Self::from_bytes_with_oversized_fields_dropped(&data)
-                        .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-                        .ok();
-                record_read_outcome(if result.is_some() {
-                    LastCheckpointReadOutcome::Success
-                } else {
-                    LastCheckpointReadOutcome::Invalid
-                });
+                let result = Self::from_bytes_with_oversized_fields_dropped(&data)
+                    .map(Some)
+                    .unwrap_or_else(|e| {
+                        record_read_failure(LastCheckpointReadFailureReason::Invalid);
+                        warn!("invalid _last_checkpoint JSON: {e}");
+                        None
+                    });
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
             Some(Err(Error::FileNotFound(_))) => {
-                record_read_outcome(LastCheckpointReadOutcome::NotFound);
+                record_read_failure(LastCheckpointReadFailureReason::NotFound);
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
-            Some(Err(err)) => {
-                record_read_outcome(LastCheckpointReadOutcome::Error);
-                Err(err)
-            }
+            Some(Err(err)) => Err(err),
             None => {
-                record_read_outcome(LastCheckpointReadOutcome::Invalid);
+                record_read_failure(LastCheckpointReadFailureReason::Invalid);
                 warn!("empty _last_checkpoint file");
                 Ok(None)
             }
@@ -255,8 +252,8 @@ impl LastCheckpointHint {
     }
 }
 
-fn record_read_outcome(outcome: LastCheckpointReadOutcome) {
-    tracing::Span::current().record("outcome", outcome.as_ref());
+fn record_read_failure(reason: LastCheckpointReadFailureReason) {
+    tracing::Span::current().record("failure_reason", reason.as_ref());
 }
 
 #[cfg(test)]
@@ -277,6 +274,7 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum ReadBehavior {
         TopLevelError,
+        TopLevelFileNotFound,
         IteratorError,
         EmptyIterator,
     }
@@ -298,6 +296,9 @@ mod tests {
         ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
             match self.0 {
                 ReadBehavior::TopLevelError => Err(Error::generic("top-level read failure")),
+                ReadBehavior::TopLevelFileNotFound => {
+                    Err(Error::file_not_found("_last_checkpoint"))
+                }
                 ReadBehavior::IteratorError => Ok(Box::new(std::iter::once(Err(Error::generic(
                     "iterator read failure",
                 ))))),
@@ -323,12 +324,29 @@ mod tests {
     }
 
     #[rstest]
-    #[case::top_level_error(ReadBehavior::TopLevelError, LastCheckpointReadOutcome::Error, true)]
-    #[case::iterator_error(ReadBehavior::IteratorError, LastCheckpointReadOutcome::Error, true)]
-    #[case::empty_iterator(ReadBehavior::EmptyIterator, LastCheckpointReadOutcome::Invalid, false)]
-    fn read_storage_branches_emit_one_completion(
+    #[case::top_level_error(
+        ReadBehavior::TopLevelError,
+        LastCheckpointReadFailureReason::Error,
+        true
+    )]
+    #[case::top_level_file_not_found(
+        ReadBehavior::TopLevelFileNotFound,
+        LastCheckpointReadFailureReason::NotFound,
+        true
+    )]
+    #[case::iterator_error(
+        ReadBehavior::IteratorError,
+        LastCheckpointReadFailureReason::Error,
+        true
+    )]
+    #[case::empty_iterator(
+        ReadBehavior::EmptyIterator,
+        LastCheckpointReadFailureReason::Invalid,
+        false
+    )]
+    fn read_storage_branches_emit_one_failure(
         #[case] behavior: ReadBehavior,
-        #[case] expected_outcome: LastCheckpointReadOutcome,
+        #[case] expected_reason: LastCheckpointReadFailureReason,
         #[case] expected_error: bool,
     ) {
         let reporter = Arc::new(CapturingReporter::default());
@@ -338,15 +356,15 @@ mod tests {
 
         let result = LastCheckpointHint::try_read(&storage, &log_root);
         assert_eq!(result.is_err(), expected_error);
-        let outcomes: Vec<_> = reporter
+        let reasons: Vec<_> = reporter
             .events()
             .into_iter()
             .filter_map(|event| match event {
-                MetricEvent::LastCheckpointReadCompleted(event) => Some(event.outcome),
+                MetricEvent::LastCheckpointReadFailure(event) => Some(event.reason),
                 _ => None,
             })
             .collect();
-        assert_eq!(outcomes, [expected_outcome]);
+        assert_eq!(reasons, [expected_reason]);
     }
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its

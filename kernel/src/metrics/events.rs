@@ -106,7 +106,8 @@ pub enum MetricEvent {
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
     CrcReadFailure,
-    LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    LastCheckpointReadSuccess(LastCheckpointReadSuccess),
+    LastCheckpointReadFailure(LastCheckpointReadFailure),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -125,7 +126,8 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
             Self::CrcReadSuccess(e) => e.set_duration(d),
-            Self::LastCheckpointReadCompleted(e) => e.set_duration(d),
+            Self::LastCheckpointReadSuccess(e) => e.set_duration(d),
+            Self::LastCheckpointReadFailure(e) => e.set_duration(d),
 
             // Emit-based success events set their duration as a creation attribute, so the
             // span-close hook must not overwrite it.
@@ -161,7 +163,9 @@ impl MetricEvent {
             Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
+            Self::LastCheckpointReadSuccess(_) | Self::LastCheckpointReadFailure(_) => {
+                Err(LastCheckpointReadSuccess::SPAN_NAME)
+            }
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -192,7 +196,9 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildSuccess(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
             Self::CrcReadSuccess(_) => Err(CrcReadSuccess::SPAN_NAME),
-            Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
+            Self::LastCheckpointReadSuccess(_) | Self::LastCheckpointReadFailure(_) => {
+                Err(LastCheckpointReadSuccess::SPAN_NAME)
+            }
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -211,27 +217,55 @@ impl MetricEvent {
         }
     }
 
+    pub(crate) fn record_str_warning(&self, name: &str, value: &str) -> Option<String> {
+        if name != "failure_reason" {
+            return None;
+        }
+        match self {
+            Self::TransactionCommitSuccess(_) => value
+                .parse::<CommitFailureReason>()
+                .err()
+                .map(|e| format!("Invalid failure_reason '{value}' on span: {e}. Using Error.")),
+            Self::LastCheckpointReadSuccess(_) if !value.is_empty() => value
+                .parse::<LastCheckpointReadFailureReason>()
+                .err()
+                .map(|e| {
+                    format!(
+                        "Invalid last checkpoint read failure reason '{value}': {e}. Using Unknown."
+                    )
+                }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
         if name == "failure_reason" {
-            if let Self::TransactionCommitSuccess(e) = self {
-                let operation_id = e.operation_id;
-                let table_type = e.table_type;
-                let correlation_id = e.correlation_id.take();
-                *self = Self::TransactionCommitFailure(TransactionCommitFailure {
-                    operation_id,
-                    table_type,
-                    correlation_id,
-                    reason: value.parse().unwrap_or_else(|e| {
-                        warn!("Invalid failure_reason '{value}' on span: {e}. Using Error.");
-                        CommitFailureReason::Error
-                    }),
-                });
+            match self {
+                Self::TransactionCommitSuccess(e) => {
+                    let operation_id = e.operation_id;
+                    let table_type = e.table_type;
+                    let correlation_id = e.correlation_id.take();
+                    *self = Self::TransactionCommitFailure(TransactionCommitFailure {
+                        operation_id,
+                        table_type,
+                        correlation_id,
+                        reason: value.parse().unwrap_or(CommitFailureReason::Error),
+                    });
+                }
+                Self::LastCheckpointReadSuccess(e) => {
+                    *self = Self::LastCheckpointReadFailure(
+                        e.to_failure(LastCheckpointReadFailureReason::parse_or_unknown(value)),
+                    );
+                }
+                _ => {}
             }
             return Ok(());
         }
         match self {
             Self::TransactionCommitSuccess(e) => e.record_str(name, value),
-            Self::LastCheckpointReadCompleted(e) => e.record_str(name, value),
+            Self::LastCheckpointReadSuccess(_) | Self::LastCheckpointReadFailure(_) => {
+                Err(LastCheckpointReadSuccess::SPAN_NAME)
+            }
             _ => Ok(()),
         }
     }
@@ -270,6 +304,9 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
             Self::CrcReadSuccess(_) => Self::CrcReadFailure,
+            Self::LastCheckpointReadSuccess(e) => Self::LastCheckpointReadFailure(
+                e.to_failure(LastCheckpointReadFailureReason::Error),
+            ),
             // Events with no failure form pass through unchanged.
             // Note: here we list explicitly so adding a lifecycle event without a failure mapping
             //       fails to compile.
@@ -280,7 +317,7 @@ impl MetricEvent {
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
             | Self::CrcReadFailure
-            | Self::LastCheckpointReadCompleted(_)
+            | Self::LastCheckpointReadFailure(_)
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
@@ -308,7 +345,8 @@ impl fmt::Display for MetricEvent {
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
             Self::CrcReadFailure => f.write_str("CrcReadFailure"),
-            Self::LastCheckpointReadCompleted(e) => e.fmt(f),
+            Self::LastCheckpointReadSuccess(e) => e.fmt(f),
+            Self::LastCheckpointReadFailure(e) => e.fmt(f),
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
@@ -1102,85 +1140,95 @@ impl fmt::Display for CrcReadSuccess {
 }
 
 // ====================================================================
-// LastCheckpointReadCompleted
+// LastCheckpointRead
 // ====================================================================
 
-pub(crate) const LAST_CHECKPOINT_READ_COMPLETED_SPAN: &str = "last_checkpoint.read";
+pub(crate) const LAST_CHECKPOINT_READ_SPAN: &str = "last_checkpoint.read";
 
-/// The outcome of an attempt to read and parse a `_last_checkpoint` hint.
+/// Why an attempt to read `_last_checkpoint` did not produce a usable hint.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
 )]
 #[strum(serialize_all = "snake_case")]
-#[non_exhaustive]
-pub enum LastCheckpointReadOutcome {
-    /// The hint was present and parsed successfully.
-    Success,
+pub enum LastCheckpointReadFailureReason {
     /// The hint file was not present.
     NotFound,
     /// The hint file was empty or could not be decoded as a valid hint.
     Invalid,
     /// Reading the hint failed with an unexpected error.
     Error,
-    /// Decode fell back here because the span's `outcome` field was unset or unrecognized.
-    /// Kernel never emits this deliberately.
+    /// The recorded failure reason was empty or unrecognized.
     #[default]
     Unknown,
 }
 
-impl LastCheckpointReadOutcome {
+impl LastCheckpointReadFailureReason {
     fn parse_or_unknown(s: &str) -> Self {
-        if s.is_empty() {
-            return Self::Unknown;
-        }
-        Self::from_str(s).unwrap_or_else(|e| {
-            warn!("Invalid last checkpoint read outcome '{s}': {e}. Using Unknown.");
-            Self::Unknown
-        })
+        Self::from_str(s).unwrap_or_default()
     }
 }
 
-/// An attempt to read and parse a `_last_checkpoint` hint completed.
+/// A `_last_checkpoint` hint was read and parsed successfully.
 ///
-/// Reporters can increment a read counter and record `duration` in a latency histogram, using
-/// `outcome` as the dimension for both instruments.
+/// Reporters can count this event and record [`Self::duration`] with the outcome `success`.
+/// Failed attempts use [`LastCheckpointReadFailure::reason`] as the outcome.
 #[derive(Debug, Clone)]
-pub struct LastCheckpointReadCompleted {
-    /// How the read attempt completed.
-    pub outcome: LastCheckpointReadOutcome,
+pub struct LastCheckpointReadSuccess {
     /// Wall-clock time spent locating, reading, and parsing the hint.
     pub duration: Duration,
 }
 
-impl LastCheckpointReadCompleted {
-    pub(crate) const SPAN_NAME: &'static str = LAST_CHECKPOINT_READ_COMPLETED_SPAN;
+impl LastCheckpointReadSuccess {
+    pub(crate) const SPAN_NAME: &'static str = LAST_CHECKPOINT_READ_SPAN;
 
     pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
         Self {
-            outcome: LastCheckpointReadOutcome::Unknown,
             duration: Duration::ZERO,
         }
-    }
-
-    pub(crate) fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
-        match name {
-            "outcome" => self.outcome = LastCheckpointReadOutcome::parse_or_unknown(value),
-            _ => return Err(Self::SPAN_NAME),
-        }
-        Ok(())
     }
 
     pub(crate) fn set_duration(&mut self, d: Duration) {
         self.duration = d;
     }
+
+    fn to_failure(&self, reason: LastCheckpointReadFailureReason) -> LastCheckpointReadFailure {
+        LastCheckpointReadFailure {
+            reason,
+            duration: self.duration,
+        }
+    }
 }
 
-impl fmt::Display for LastCheckpointReadCompleted {
+impl fmt::Display for LastCheckpointReadSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { outcome, duration } = self;
+        write!(f, "LastCheckpointReadSuccess(duration={:?})", self.duration)
+    }
+}
+
+/// An attempt to read `_last_checkpoint` did not produce a usable hint.
+///
+/// Reporters can count this event and record [`Self::duration`] with [`Self::reason`] as the
+/// outcome. Successful attempts use the outcome `success`.
+#[derive(Debug, Clone)]
+pub struct LastCheckpointReadFailure {
+    /// Why the read attempt did not produce a usable hint.
+    pub reason: LastCheckpointReadFailureReason,
+    /// Wall-clock time spent locating, reading, and parsing the hint.
+    pub duration: Duration,
+}
+
+impl LastCheckpointReadFailure {
+    pub(crate) fn set_duration(&mut self, d: Duration) {
+        self.duration = d;
+    }
+}
+
+impl fmt::Display for LastCheckpointReadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { reason, duration } = self;
         write!(
             f,
-            "LastCheckpointReadCompleted(outcome={outcome}, duration={duration:?})"
+            "LastCheckpointReadFailure(reason={reason}, duration={duration:?})"
         )
     }
 }
@@ -1923,28 +1971,73 @@ mod tests {
     }
 
     #[test]
-    fn last_checkpoint_completed_dispatches_fields_and_display() {
-        let mut event = MetricEvent::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
-            outcome: LastCheckpointReadOutcome::Success,
+    fn last_checkpoint_read_success_dispatches_fields_and_display() {
+        let mut event = MetricEvent::LastCheckpointReadSuccess(LastCheckpointReadSuccess {
             duration: Duration::from_nanos(17),
         });
 
         assert_eq!(
-            event.record_u64("outcome", 1),
-            Err(LastCheckpointReadCompleted::SPAN_NAME)
+            event.record_u64("failure_reason", 1),
+            Err(LastCheckpointReadSuccess::SPAN_NAME)
         );
         assert_eq!(
-            event.record_bool("outcome", true),
-            Err(LastCheckpointReadCompleted::SPAN_NAME)
+            event.record_bool("failure_reason", true),
+            Err(LastCheckpointReadSuccess::SPAN_NAME)
         );
         assert_eq!(
             event.record_str("unexpected", "value"),
-            Err(LastCheckpointReadCompleted::SPAN_NAME)
+            Err(LastCheckpointReadSuccess::SPAN_NAME)
         );
         assert_eq!(
             event.to_string(),
-            "LastCheckpointReadCompleted(outcome=success, duration=17ns)"
+            "LastCheckpointReadSuccess(duration=17ns)"
         );
+    }
+
+    #[rstest]
+    #[case::not_found("not_found", LastCheckpointReadFailureReason::NotFound)]
+    #[case::invalid("invalid", LastCheckpointReadFailureReason::Invalid)]
+    #[case::error("error", LastCheckpointReadFailureReason::Error)]
+    #[case::empty("", LastCheckpointReadFailureReason::Unknown)]
+    #[case::unrecognized("unrecognized", LastCheckpointReadFailureReason::Unknown)]
+    fn last_checkpoint_failure_reason_flips_success(
+        #[case] value: &str,
+        #[case] expected: LastCheckpointReadFailureReason,
+    ) {
+        let mut event = MetricEvent::LastCheckpointReadSuccess(LastCheckpointReadSuccess {
+            duration: Duration::from_nanos(17),
+        });
+
+        event.record_str("failure_reason", value).unwrap();
+
+        let MetricEvent::LastCheckpointReadFailure(failure) = event else {
+            panic!("expected LastCheckpointReadFailure");
+        };
+        assert_eq!(failure.reason, expected);
+        assert_eq!(failure.duration, Duration::from_nanos(17));
+        assert_eq!(
+            failure.to_string(),
+            format!("LastCheckpointReadFailure(reason={expected}, duration=17ns)")
+        );
+    }
+
+    #[rstest]
+    #[case::success(MetricEvent::LastCheckpointReadSuccess(LastCheckpointReadSuccess {
+        duration: Duration::ZERO,
+    }))]
+    #[case::failure(MetricEvent::LastCheckpointReadFailure(LastCheckpointReadFailure {
+        reason: LastCheckpointReadFailureReason::Invalid,
+        duration: Duration::ZERO,
+    }))]
+    fn last_checkpoint_read_span_close_sets_duration(#[case] mut event: MetricEvent) {
+        event.set_duration_if_applicable(Duration::from_nanos(17));
+
+        let duration = match event {
+            MetricEvent::LastCheckpointReadSuccess(event) => event.duration,
+            MetricEvent::LastCheckpointReadFailure(event) => event.duration,
+            _ => panic!("expected a last checkpoint read event"),
+        };
+        assert_eq!(duration, Duration::from_nanos(17));
     }
 
     #[rstest]

@@ -11,7 +11,7 @@ use tracing_subscriber::Layer;
 
 use super::events::{
     storage_metric_from_attrs, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
-    LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted,
+    LastCheckpointReadSuccess, LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted,
     ProtocolMetadataLoadSuccess, ScanMetadataCompleted, SetTransactionLoadSuccess,
     SnapshotBuildSuccess, TransactionCommitSuccess, STORAGE_SPAN,
 };
@@ -129,11 +129,9 @@ where
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
             )),
-            LastCheckpointReadCompleted::SPAN_NAME => {
-                Some(MetricEvent::LastCheckpointReadCompleted(
-                    LastCheckpointReadCompleted::from_attrs(attrs),
-                ))
-            }
+            LastCheckpointReadSuccess::SPAN_NAME => Some(MetricEvent::LastCheckpointReadSuccess(
+                LastCheckpointReadSuccess::from_attrs(attrs),
+            )),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
             )),
@@ -263,6 +261,9 @@ impl Visit for EventVisitor {
         let Some(event) = self.event.as_mut() else {
             return;
         };
+        if let Some(warning) = event.record_str_warning(field.name(), value) {
+            self.pending_warnings.push(warning);
+        }
         if let Err(span_name) = event.record_str(field.name(), value) {
             self.warn_invalid(field, span_name);
         }
@@ -314,7 +315,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-    use crate::metrics::{LastCheckpointReadOutcome, MetricEvent, WithMetricsReporterLayer as _};
+    use crate::metrics::{
+        LastCheckpointReadFailureReason, MetricEvent, WithMetricsReporterLayer as _,
+    };
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     /// Run `f` under a subscriber that layers the metrics layer over an fmt layer capturing to a
@@ -374,30 +377,29 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unset(None)]
-    #[case::empty(Some(""))]
-    #[case::unrecognized(Some("not_an_outcome"))]
-    fn last_checkpoint_unset_or_invalid_outcome_decodes_as_unknown(
-        #[case] recorded_outcome: Option<&str>,
-    ) {
+    #[case::empty("")]
+    #[case::unrecognized("not_a_reason")]
+    fn last_checkpoint_invalid_failure_reason_decodes_as_unknown(#[case] reason: &str) {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         {
-            let span = info_span!("last_checkpoint.read", report = Empty, outcome = Empty,);
-            if let Some(outcome) = recorded_outcome {
-                span.record("outcome", outcome);
-            }
+            let span = info_span!(
+                "last_checkpoint.read",
+                report = Empty,
+                failure_reason = Empty,
+            );
+            span.record("failure_reason", reason);
         }
 
-        let outcomes: Vec<_> = reporter
+        let reasons: Vec<_> = reporter
             .events()
             .into_iter()
             .filter_map(|event| match event {
-                MetricEvent::LastCheckpointReadCompleted(event) => Some(event.outcome),
+                MetricEvent::LastCheckpointReadFailure(event) => Some(event.reason),
                 _ => None,
             })
             .collect();
-        assert_eq!(outcomes, [LastCheckpointReadOutcome::Unknown]);
+        assert_eq!(reasons, [LastCheckpointReadFailureReason::Unknown]);
     }
 
     // A log line whose field name collides with a real metric field must NOT overwrite the value a

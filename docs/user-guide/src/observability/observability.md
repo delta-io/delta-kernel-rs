@@ -189,11 +189,13 @@ higher-level operations.
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
 | `CrcReadFailure` | none | A CRC file read or parse failed. The caller falls back to log replay. |
-| `LastCheckpointReadCompleted` | `outcome`, `duration` | One `_last_checkpoint` read attempt. Use `outcome` on both a read counter and latency histogram. |
+| `LastCheckpointReadSuccess` | `duration` | One `_last_checkpoint` hint was read and parsed successfully. |
+| `LastCheckpointReadFailure` | `reason`, `duration` | One `_last_checkpoint` read did not produce a usable hint. |
 
-`LastCheckpointReadOutcome` distinguishes a parsed hint (`Success`), an absent hint (`NotFound`),
-an empty or malformed hint (`Invalid`), and an unexpected storage or URL error (`Error`). `Unknown`
-is reserved for missing or unrecognized tracing span fields and is not emitted deliberately.
+For counters and latency histograms, use `success` as the outcome for
+`LastCheckpointReadSuccess`. For `LastCheckpointReadFailure`, use `reason.as_ref()`: `not_found`
+for an absent hint, `invalid` for an empty or malformed hint, or `error` for an unexpected storage
+or URL error. `unknown` means the recorded failure reason was empty or unrecognized.
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call

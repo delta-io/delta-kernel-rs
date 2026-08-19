@@ -1330,7 +1330,7 @@ mod tests {
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
-    use crate::metrics::{LastCheckpointReadOutcome, MetricEvent};
+    use crate::metrics::{LastCheckpointReadFailureReason, MetricEvent};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -1461,15 +1461,26 @@ mod tests {
         )
     }
 
-    fn assert_last_checkpoint_outcomes(
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ExpectedLastCheckpointRead {
+        Success,
+        Failure(LastCheckpointReadFailureReason),
+    }
+
+    fn assert_last_checkpoint_reads(
         reporter: &CapturingReporter,
-        expected: &[LastCheckpointReadOutcome],
+        expected: &[ExpectedLastCheckpointRead],
     ) {
         let actual: Vec<_> = reporter
             .events()
             .into_iter()
             .filter_map(|event| match event {
-                MetricEvent::LastCheckpointReadCompleted(event) => Some(event.outcome),
+                MetricEvent::LastCheckpointReadSuccess(_) => {
+                    Some(ExpectedLastCheckpointRead::Success)
+                }
+                MetricEvent::LastCheckpointReadFailure(event) => {
+                    Some(ExpectedLastCheckpointRead::Failure(event.reason))
+                }
                 _ => None,
             })
             .collect();
@@ -1529,11 +1540,16 @@ mod tests {
         let storage = engine.storage_handler();
         let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
-        assert_last_checkpoint_outcomes(&reporter, &[LastCheckpointReadOutcome::NotFound]);
+        assert_last_checkpoint_reads(
+            &reporter,
+            &[ExpectedLastCheckpointRead::Failure(
+                LastCheckpointReadFailureReason::NotFound,
+            )],
+        );
     }
 
     #[test]
-    fn invalid_last_checkpoint_log_root_emits_error_outcome() {
+    fn invalid_last_checkpoint_log_root_emits_error_failure() {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
@@ -1542,7 +1558,12 @@ mod tests {
         assert!(
             LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &log_root).is_err()
         );
-        assert_last_checkpoint_outcomes(&reporter, &[LastCheckpointReadOutcome::Error]);
+        assert_last_checkpoint_reads(
+            &reporter,
+            &[ExpectedLastCheckpointRead::Failure(
+                LastCheckpointReadFailureReason::Error,
+            )],
+        );
     }
 
     fn valid_last_checkpoint() -> (Vec<u8>, LastCheckpointHint) {
@@ -1606,7 +1627,12 @@ mod tests {
         let invalid =
             LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
         assert!(invalid.is_none());
-        assert_last_checkpoint_outcomes(&reporter, &[LastCheckpointReadOutcome::Invalid]);
+        assert_last_checkpoint_reads(
+            &reporter,
+            &[ExpectedLastCheckpointRead::Failure(
+                LastCheckpointReadFailureReason::Invalid,
+            )],
+        );
     }
 
     #[tokio::test]
@@ -1625,19 +1651,19 @@ mod tests {
                 "valid",
                 data,
                 Some(expected),
-                LastCheckpointReadOutcome::Success,
+                ExpectedLastCheckpointRead::Success,
             ),
             (
                 "invalid",
                 "invalid".as_bytes().to_vec(),
                 None,
-                LastCheckpointReadOutcome::Invalid,
+                ExpectedLastCheckpointRead::Failure(LastCheckpointReadFailureReason::Invalid),
             ),
             (
                 "valid_with_tags",
                 data_with_tags,
                 Some(expected_with_tags),
-                LastCheckpointReadOutcome::Success,
+                ExpectedLastCheckpointRead::Success,
             ),
         ];
 
@@ -1655,15 +1681,15 @@ mod tests {
 
         // Test reading all checkpoints from the in memory file system for cases where the data is
         // valid, invalid and valid with tags.
-        let mut expected_outcomes = vec![];
-        for (path_prefix, _, expected_result, expected_outcome) in test_cases {
+        let mut expected_reads = vec![];
+        for (path_prefix, _, expected_result, expected_read) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
             let result =
                 LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
-            expected_outcomes.push(expected_outcome);
+            expected_reads.push(expected_read);
         }
-        assert_last_checkpoint_outcomes(&reporter, &expected_outcomes);
+        assert_last_checkpoint_reads(&reporter, &expected_reads);
     }
 
     #[test_log::test]

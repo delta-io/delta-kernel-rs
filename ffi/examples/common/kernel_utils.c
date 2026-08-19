@@ -105,15 +105,13 @@ void print_load_type(LogSegmentLoadType lt) {
   }
 }
 
-// utility to print out a _last_checkpoint read outcome
-void print_last_checkpoint_read_outcome(LastCheckpointReadOutcome outcome) {
-  printf("  outcome:");
-  switch (outcome) {
-  case LastCheckpointReadOutcomeSuccess: printf(" Success,\n"); break;
-  case LastCheckpointReadOutcomeNotFound: printf(" NotFound,\n"); break;
-  case LastCheckpointReadOutcomeInvalid: printf(" Invalid,\n"); break;
-  case LastCheckpointReadOutcomeError: printf(" Error,\n"); break;
-  case LastCheckpointReadOutcomeUnknown: printf(" Unknown,\n"); break;
+void print_last_checkpoint_read_failure_reason(LastCheckpointReadFailureReason reason) {
+  printf("  reason:");
+  switch (reason) {
+  case LastCheckpointReadFailureReasonNotFound: printf(" NotFound,\n"); break;
+  case LastCheckpointReadFailureReasonInvalid: printf(" Invalid,\n"); break;
+  case LastCheckpointReadFailureReasonError: printf(" Error,\n"); break;
+  case LastCheckpointReadFailureReasonUnknown: printf(" Unknown,\n"); break;
   }
 }
 
@@ -338,11 +336,17 @@ void print_metric(MetricEvent event) {
     PM_END;
     return;
 
-  case MetricEventLastCheckpointReadCompleted:
-    PM_START(LastCheckpointReadCompleted);
-    LastCheckpointReadCompleted lcrc = event.last_checkpoint_read_completed;
-    print_last_checkpoint_read_outcome(lcrc.outcome);
-    PM_U64(lcrc, duration_ns);
+  case MetricEventLastCheckpointReadSuccess:
+    PM_START(LastCheckpointReadSuccess);
+    PM_U64(event.last_checkpoint_read_success, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventLastCheckpointReadFailure:
+    PM_START(LastCheckpointReadFailure);
+    LastCheckpointReadFailure lcrf = event.last_checkpoint_read_failure;
+    print_last_checkpoint_read_failure_reason(lcrf.reason);
+    PM_U64(lcrf, duration_ns);
     PM_END;
     return;
 
