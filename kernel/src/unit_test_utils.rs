@@ -6,7 +6,7 @@ use serde::Serialize;
 use tempfile::TempDir;
 use test_utils::{
     copy_directory, delta_path_for_version, load_test_data, modify_add_file_partition_keys,
-    replace_array_row, AddFilePartitionKeyModify,
+    replace_array_row, replace_column, AddFilePartitionKeyModify,
 };
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -218,18 +218,10 @@ pub(crate) fn nullable_add_file(path: &str) -> RecordBatch {
     )
 }
 
-/// Builds valid add-file rows with a fully nullable schema.
+/// Builds valid add-file rows with a fully nullable schema and specific paths.
 pub(crate) fn nullable_add_files(paths: &[&str]) -> RecordBatch {
     let batches: Vec<_> = paths.iter().map(|path| nullable_add_file(path)).collect();
     concat_batches(&batches[0].schema(), &batches).expect("failed to concatenate add-file rows")
-}
-
-pub(crate) fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
-    let schema = batch.schema();
-    let index = schema.index_of(field).expect("field in schema");
-    let mut columns = batch.columns().to_vec();
-    columns[index] = column;
-    RecordBatch::try_new(schema, columns).expect("failed to rebuild batch after replacing a column")
 }
 
 pub(crate) fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) -> RecordBatch {

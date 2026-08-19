@@ -88,6 +88,7 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
+    use test_utils::replace_column;
 
     use super::*;
     use crate::arrow::array::Int64Array;
@@ -96,7 +97,7 @@ mod tests {
     use crate::expressions::column_name;
     use crate::unit_test_utils::{
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_file,
-        nullable_add_files, replace_column, set_field_as_null,
+        nullable_add_files, set_field_as_null,
     };
     use crate::EngineData;
 

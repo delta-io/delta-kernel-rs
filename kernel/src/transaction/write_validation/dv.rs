@@ -36,7 +36,7 @@ const OFFSET_NAME: &str = "offset";
 
 static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTypes>> =
     LazyLock::new(|| {
-        let names = vec![
+        let mut names = vec![
             column_name!(PATH_NAME),
             column_name!(SIZE_NAME),
             column_name!(MODIFICATION_TIME_NAME),
@@ -44,13 +44,10 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesA
             column_name!(DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
             column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
             column_name!(DELETION_VECTOR_NAME, OFFSET_NAME),
-            column_name!(NEW_DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
-            column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
-            column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME),
         ];
         // Derive types from the canonical scan schema so this projection stays compatible with scan
         // metadata if those field definitions change.
-        let mut types = names[..NEW_DELETION_VECTOR_STORAGE_TYPE]
+        let mut types = names
             .iter()
             .map(|name| {
                 scan_row_schema()
@@ -59,10 +56,13 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesA
             })
             .collect::<DeltaResult<Vec<_>>>()?;
         // The transaction appends `newDeletionVector` after producing scan metadata, so it is
-        // absent from `scan_row_schema()`. Its leaves have the same types as the existing
-        // deletion vector.
-        let new_deletion_vector_types =
-            types[OLD_DELETION_VECTOR_STORAGE_TYPE..NEW_DELETION_VECTOR_STORAGE_TYPE].to_vec();
+        // absent from `scan_row_schema()`.
+        let new_deletion_vector_types = types[OLD_DELETION_VECTOR_STORAGE_TYPE..].to_vec();
+        names.extend([
+            column_name!(NEW_DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
+            column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
+            column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME),
+        ]);
         types.extend(new_deletion_vector_types);
         Ok((names, types).into())
     });
@@ -150,6 +150,7 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
+    use test_utils::replace_column;
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -167,7 +168,7 @@ mod tests {
     use crate::schema::ToSchema;
     use crate::unit_test_utils::{
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_files,
-        replace_column, set_field_as_null,
+        set_field_as_null,
     };
 
     fn make_staged_dv_from_addfile(
@@ -262,12 +263,34 @@ mod tests {
     fn duplicate_dv_update_paths_validate_selected_rows(
         #[case] selection_vector: &[bool],
         #[case] expected_error: Option<&str>,
+        #[values(false, true)] multiple_batches: bool,
     ) {
-        let batches = [make_staged_dv_from_addfile(
-            nullable_add_files(&["same", "same"]),
-            &["new-dv-0", "new-dv-1"],
-            selection_vector.to_vec(),
-        )];
+        let batches = if multiple_batches {
+            (0..2)
+                .map(|batch_index| {
+                    let row_selection = selection_vector
+                        .get(batch_index)
+                        .copied()
+                        .into_iter()
+                        .collect();
+                    make_staged_dv_from_addfile(
+                        nullable_add_files(&["same"]),
+                        &[if batch_index == 0 {
+                            "new-dv-0"
+                        } else {
+                            "new-dv-1"
+                        }],
+                        row_selection,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![make_staged_dv_from_addfile(
+                nullable_add_files(&["same", "same"]),
+                &["new-dv-0", "new-dv-1"],
+                selection_vector.to_vec(),
+            )]
+        };
         let mut file_actions = FileActionTracker::default();
         let result =
             StagedDataValidator::staged_dv_matched_file(std::iter::empty(), &mut file_actions)
@@ -380,11 +403,11 @@ mod tests {
         StructArray::new(
             dv_schema.fields().clone(),
             vec![
-                Arc::new(StringArray::from(vec!["i"; row_count])) as ArrayRef,
-                Arc::new(StringArray::from(dv_paths.to_vec())) as ArrayRef,
-                Arc::new(Int32Array::from(vec![None; row_count])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![1; row_count])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![0; row_count])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["i"; row_count])) as ArrayRef, // storageType
+                Arc::new(StringArray::from(dv_paths.to_vec())) as ArrayRef,    // pathOrInlineDv
+                Arc::new(Int32Array::from(vec![None; row_count])) as ArrayRef, // offset
+                Arc::new(Int32Array::from(vec![1; row_count])) as ArrayRef,    // sizeInBytes
+                Arc::new(Int64Array::from(vec![0; row_count])) as ArrayRef,    // cardinality
             ],
             None,
         )

@@ -106,6 +106,7 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
+    use test_utils::replace_column;
 
     use super::*;
     use crate::arrow::array::{
@@ -119,7 +120,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::ColumnName;
-    use crate::unit_test_utils::{assert_result_error_with_message, replace_column};
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
     fn column_indices_match_schema_order() {
