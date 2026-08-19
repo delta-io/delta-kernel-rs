@@ -15,6 +15,7 @@ use delta_kernel::StorageHandler;
 
 mod expression;
 mod operator;
+mod parquet_expr_adapter;
 mod plan;
 mod predicate;
 mod scalar;

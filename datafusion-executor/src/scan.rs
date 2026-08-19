@@ -22,6 +22,7 @@ use datafusion::logical_expr::{
     Expr as DFExpr, LogicalPlan as DFLogicalPlan, LogicalPlanBuilder, TableType,
 };
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
@@ -29,7 +30,9 @@ use delta_kernel::plans::ir::nodes::{
     ScanFile as KernelScanFile, ScanJson as KernelScanJson, ScanParquet as KernelScanParquet,
 };
 use delta_kernel::schema::StructType as KernelStructType;
+use itertools::Itertools;
 
+use crate::parquet_expr_adapter::KernelParquetExprAdapterFactory;
 use crate::scalar::to_df_scalar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,6 +43,7 @@ enum ScanFormat {
 
 struct StaticFileProvider {
     file_source: Arc<dyn FileSource>,
+    expr_adapter: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     store_url: Option<ObjectStoreUrl>,
     files: Vec<PartitionedFile>,
 }
@@ -48,12 +52,21 @@ impl std::fmt::Debug for StaticFileProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StaticFileProvider")
             .field("file_type", &self.file_source.file_type())
+            .field("expr_adapter", &self.expr_adapter)
             .field("store_url", &self.store_url)
             .field("files", &self.files)
             .finish()
     }
 }
 
+/// Lowers a kernel [`ScanParquet`](KernelScanParquet) into a DataFusion
+/// [`LogicalPlan`](DFLogicalPlan) that reads exactly the files named by the scan node.
+///
+/// The physical scan uses [`KernelParquetExprAdapterFactory`] to reconcile each checkpoint's
+/// physical schema with the schema requested by kernel.
+///
+/// # Errors
+/// Returns an error if the schema or file locations cannot be represented by DataFusion.
 pub(crate) fn lower_parquet_scan(
     scan: &KernelScanParquet,
 ) -> Result<DFLogicalPlan, DataFusionError> {
@@ -65,6 +78,11 @@ pub(crate) fn lower_parquet_scan(
     )
 }
 
+/// Lowers a kernel [`ScanJson`](KernelScanJson) into a DataFusion [`LogicalPlan`](DFLogicalPlan)
+/// that reads exactly the files named by the scan node.
+///
+/// # Errors
+/// Returns an error if the schema or file locations cannot be represented by DataFusion.
 pub(crate) fn lower_json_scan(scan: &KernelScanJson) -> Result<DFLogicalPlan, DataFusionError> {
     lower_scan(
         ScanFormat::Json,
@@ -90,8 +108,11 @@ fn lower_scan(
         ScanFormat::Parquet => Arc::new(ParquetSource::new(table_schema)),
         ScanFormat::Json => Arc::new(JsonSource::new(table_schema)),
     };
+    let expr_adapter = (format == ScanFormat::Parquet)
+        .then(|| Arc::new(KernelParquetExprAdapterFactory) as Arc<dyn PhysicalExprAdapterFactory>);
     let provider = StaticFileProvider {
         file_source,
+        expr_adapter,
         store_url,
         files,
     };
@@ -155,6 +176,7 @@ impl TableProvider for StaticFileProvider {
         let config = FileScanConfigBuilder::new(store_url.clone(), Arc::clone(&self.file_source))
             .with_file_group(FileGroup::new(self.files.clone()))
             .with_projection_indices(projection.cloned())?
+            .with_expr_adapter(self.expr_adapter.clone())
             .with_limit(limit)
             .with_partitioned_by_file_group(false)
             .build();
@@ -187,7 +209,7 @@ fn build_scan_table_schema_and_projection(
     file_constant_columns: &[String],
 ) -> (TableSchema, Vec<usize>) {
     // DataFusion models per-file constants as partition columns appended after physical file
-    // columns. The table-scan projection restores the kernel schema's arbitrary interleaving.
+    // columns. The table-scan projection restores the kernel schema's arbitrary indexing.
     let constant_positions: HashMap<&str, usize> = file_constant_columns
         .iter()
         .enumerate()
@@ -233,15 +255,15 @@ fn scan_files(
         let constants = file_constants(file)?;
         let location = ListingTableUrl::parse(file.meta.location.as_str())?;
         let file_store_url = location.object_store();
-        if let Some(store_url) = &store_url {
-            if store_url != &file_store_url {
+        match store_url.as_ref() {
+            Some(scan_store_url) if scan_store_url != &file_store_url => {
                 return Err(DataFusionError::Plan(format!(
-                    "scan files must use one object store, found `{store_url}` and \
+                    "scan files must use one object store, found `{scan_store_url}` and \
                      `{file_store_url}`"
                 )));
             }
-        } else {
-            store_url = Some(file_store_url);
+            None => store_url = Some(file_store_url),
+            _ => {}
         }
         let mut partitioned_file = PartitionedFile::new("", file.meta.size);
         partitioned_file.object_meta.location = location.prefix().clone();
@@ -253,39 +275,42 @@ fn scan_files(
 
 /// Converts a file's kernel constants into DataFusion partition values.
 ///
-/// The scan IR documents value count and type compatibility as producer invariants, but those
-/// constraints are not encoded in `ScanFile` itself. This also assumes a NULL constant only
-/// targets a nullable field, which the IR contract does not state separately. Callers that
-/// construct scan payload structs directly must uphold these constraints. Conversion remains
-/// fallible for scalar types that the DataFusion executor does not support.
+/// Kernel owns scan-node validation, so this lowering assumes the file-constant invariants on
+/// [`ScanFile`](KernelScanFile). Conversion remains fallible for scalar types that the DataFusion
+/// executor does not support.
 fn file_constants(file: &KernelScanFile) -> Result<Vec<DFScalarValue>, DataFusionError> {
     file.file_constants
         .iter()
         .map(|scalar| {
             to_df_scalar(scalar).map_err(|error| DataFusionError::External(Box::new(error)))
         })
-        .collect()
+        .try_collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs::File;
 
-    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::arrow::array::{
+        Array, AsArray, Int64Array, RecordBatch, StringArray as ArrowStringArray,
+    };
     use datafusion::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
+        Schema as ArrowSchema,
     };
     use datafusion::assert_batches_sorted_eq;
     use datafusion::logical_expr::col as df_col;
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use datafusion::parquet::arrow::ArrowWriter;
     use datafusion::prelude::SessionContext;
-    use delta_kernel::expressions::Scalar as KernelScalar;
+    use delta_kernel::actions::Add as KernelAdd;
+    use delta_kernel::expressions::{col, Expression as KernelExpression, Scalar as KernelScalar};
     use delta_kernel::plans::ir::nodes::Operator as KernelOperator;
     use delta_kernel::schema::{
         ColumnMetadataKey, DataType as KernelDataType, MetadataColumnSpec,
-        StructField as KernelStructField, StructType as KernelStructType,
+        StructField as KernelStructField, StructType as KernelStructType, ToSchema,
     };
-    use delta_kernel::FileMeta as KernelFileMeta;
+    use delta_kernel::{FileMeta as KernelFileMeta, PlanBuilder};
     use rstest::rstest;
     use tempfile::TempDir;
 
@@ -513,6 +538,103 @@ mod tests {
             ],
             &batches
         );
+    }
+
+    fn valid_add_paths(batch: &RecordBatch) -> Vec<String> {
+        let add = batch.column_by_name("add").unwrap().as_struct();
+        let paths: &ArrowStringArray = add.column_by_name("path").unwrap().as_string();
+        (0..batch.num_rows())
+            .filter(|&row| add.is_valid(row))
+            .map(|row| paths.value(row).to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn legacy_checkpoint_nullable_adds_match_new_json_adds() {
+        let log = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kernel/tests/data/with_checkpoint_no_last_checkpoint/_delta_log");
+        let checkpoint = log.join("00000000000000000002.checkpoint.parquet");
+        let commit = log.join("00000000000000000003.json");
+        let add_schema = KernelAdd::to_schema();
+        let required_add_fields: Vec<_> = add_schema
+            .fields()
+            .filter(|field| !field.is_nullable())
+            .map(|field| field.name().clone())
+            .collect();
+        let assert_required_nullability = |fields: &ArrowFields, nullable| {
+            for name in &required_add_fields {
+                let field = fields.find(name).unwrap().1;
+                assert_eq!(field.is_nullable(), nullable, "add.{name}");
+            }
+        };
+
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(File::open(&checkpoint).unwrap()).unwrap();
+        let physical_schema = reader.schema();
+        let ArrowDataType::Struct(physical_add_fields) =
+            physical_schema.field_with_name("add").unwrap().data_type()
+        else {
+            panic!("expected physical add field to be a struct")
+        };
+        assert_required_nullability(physical_add_fields, true);
+
+        let requested_schema = Arc::new(
+            KernelStructType::try_new([
+                KernelStructField::nullable("add", add_schema),
+                KernelStructField::not_null("version", KernelDataType::LONG),
+            ])
+            .unwrap(),
+        );
+        let scan_file = |path: &std::path::Path, version| {
+            let meta = KernelFileMeta {
+                location: format!("file://{}", path.display()).parse().unwrap(),
+                last_modified: 0,
+                size: std::fs::metadata(path).unwrap().len(),
+            };
+            KernelScanFile {
+                meta,
+                file_constants: vec![KernelScalar::Long(version)],
+            }
+        };
+        let scans = [
+            PlanBuilder::scan_parquet(
+                [scan_file(&checkpoint, 2)],
+                &["version"],
+                Arc::clone(&requested_schema),
+            )
+            .unwrap(),
+            PlanBuilder::scan_json(
+                [scan_file(&commit, 3)],
+                &["version"],
+                Arc::clone(&requested_schema),
+            )
+            .unwrap(),
+        ];
+        // Metadata replay projects each scan before unioning, removing scan qualifiers.
+        let inputs = scans.into_iter().map(|scan| {
+            scan.project(
+                KernelExpression::struct_from([col!("add"), col!("version")]),
+                Arc::clone(&requested_schema),
+            )
+            .unwrap()
+        });
+        let plan = PlanBuilder::union_all(inputs).unwrap().build().unwrap();
+
+        let df_plan = crate::plan::to_df_plan(&plan).unwrap();
+        let context = SessionContext::new();
+        let dataframe = context.execute_logical_plan(df_plan).await.unwrap();
+        let batches = dataframe.collect().await.unwrap();
+        let mut paths: Vec<_> = batches.iter().flat_map(valid_add_paths).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet",
+                "part-00000-a190be9e-e3df-439e-b366-06a863f51e99-c000.snappy.parquet",
+            ]
+        );
+        let add = batches[0].column_by_name("add").unwrap().as_struct();
+        assert_required_nullability(add.fields(), false);
     }
 
     #[rstest]
