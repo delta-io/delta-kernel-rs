@@ -3171,4 +3171,92 @@ mod tests {
         unsafe { free_engine(engine) };
         Ok(())
     }
+
+    /// The kernel's column-default acknowledgement gate, observed through the FFI: a write context
+    /// is only obtainable after [`transaction_ack_column_defaults`]. The column-default accessors
+    /// themselves are tested in [`crate::column_default`].
+    mod column_default_ack_gate {
+        use delta_kernel_ffi::column_default::{
+            transaction_ack_column_defaults, transaction_visit_top_level_column_defaults,
+            CColumnDefaultKind,
+        };
+
+        use super::*;
+
+        /// A table declaring three top-level defaults and enabling `allowColumnDefaults`.
+        const FIXTURE_WITH_DEFAULTS: &str = "../kernel/tests/data/table-with-column-defaults/";
+        /// A table with no column defaults, so no acknowledgement is required.
+        const FIXTURE_WITHOUT_DEFAULTS: &str = "../kernel/tests/data/table-with-dv-small/";
+
+        extern "C" fn ignore_default(
+            _engine_context: NullableCvoid,
+            _name: KernelStringSlice,
+            _raw_sql: KernelStringSlice,
+            _kind: CColumnDefaultKind,
+            _parsed_value: KernelStringSlice,
+        ) {
+        }
+
+        /// Open a transaction on the fixture at `table_path`, returning `(engine, txn)`.
+        fn transaction_on(
+            table_path: &str,
+        ) -> (Handle<SharedExternEngine>, Handle<ExclusiveTransaction>) {
+            let path = std::fs::canonicalize(table_path).unwrap();
+            let table_root = Url::from_directory_path(path).unwrap().to_string();
+            let engine = get_default_engine(&table_root);
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_root), engine.shallow_copy())
+            });
+            (engine, txn)
+        }
+
+        #[test]
+        fn write_context_is_blocked_until_the_defaults_are_acknowledged() {
+            let (engine, txn) = transaction_on(FIXTURE_WITH_DEFAULTS);
+
+            // Visiting the defaults must not implicitly acknowledge them.
+            let visited = ok_or_panic(unsafe {
+                transaction_visit_top_level_column_defaults(
+                    txn.shallow_copy(),
+                    engine.shallow_copy(),
+                    None,
+                    ignore_default,
+                )
+            });
+            assert_eq!(visited, 3);
+
+            assert_extern_result_error_with_message(
+                unsafe {
+                    get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+                },
+                KernelError::InvalidTransactionStateError,
+                Some(
+                    "Invalid transaction state: Writing data to a table with column defaults \
+                     requires calling Transaction::ack_column_defaults() first",
+                ),
+            );
+
+            unsafe { transaction_ack_column_defaults(txn.shallow_copy()) };
+            let write_context = ok_or_panic(unsafe {
+                get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+            });
+
+            unsafe { free_write_context(write_context) };
+            unsafe { free_transaction(txn) };
+            unsafe { free_engine(engine) };
+        }
+
+        #[test]
+        fn write_context_needs_no_acknowledgement_without_defaults() {
+            let (engine, txn) = transaction_on(FIXTURE_WITHOUT_DEFAULTS);
+
+            let write_context = ok_or_panic(unsafe {
+                get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+            });
+
+            unsafe { free_write_context(write_context) };
+            unsafe { free_transaction(txn) };
+            unsafe { free_engine(engine) };
+        }
+    }
 }

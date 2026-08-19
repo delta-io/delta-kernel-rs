@@ -1,0 +1,23 @@
+Reading table at ../../../../kernel/tests/data/table-with-column-defaults/
+version: 0
+
+Schema:
+├─ id: integer
+├─ status: string
+├─ ts: timestamp
+└─ amount: decimal(10)(2)
+
+Column defaults:
+  declared: yes
+  to materialize before writing:
+    amount: 4.95 [Literal] 4.95
+    status: 'pending' [Literal] pending
+    ts: current_timestamp() [NonLiteral]
+    (3 total)
+  by field:
+    id: (no default)
+    status: 'pending' [Literal] pending
+    ts: current_timestamp() [NonLiteral]
+    amount: 4.95 [Literal] 4.95
+
+[No data]
