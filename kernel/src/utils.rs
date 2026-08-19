@@ -161,6 +161,7 @@ pub(crate) trait FoldWithOption: Sized {
 
     /// Fallible [`fold_with`](Self::fold_with): applies `Result`-returning `f` to `self` if `opt`
     /// is [`Some`], otherwise returns `self` unchanged (wrapped in `Ok`).
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     fn try_fold_with<U, E>(
         self,
         opt: Option<U>,

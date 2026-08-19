@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::{DomainMetadata, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Snapshot};
 
@@ -113,7 +113,7 @@ impl RowVisitor for RowTrackingVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             (
-                vec![ColumnName::new(["stats", NUM_RECORDS])],
+                vec![column_name!("stats", NUM_RECORDS)],
                 vec![DataType::LONG],
             )
                 .into()
@@ -311,7 +311,7 @@ mod tests {
         let visitor = RowTrackingVisitor::new(Some(0), None);
         let (names, types) = visitor.selected_column_names_and_types();
 
-        assert_eq!(names, (vec![ColumnName::new(["stats", NUM_RECORDS])]));
+        assert_eq!(names, (vec![column_name!("stats", NUM_RECORDS)]));
         assert_eq!(types, vec![DataType::LONG]);
     }
 

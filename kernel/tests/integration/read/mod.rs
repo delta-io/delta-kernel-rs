@@ -15,8 +15,8 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{
-    col, column_pred, lit, Expression as Expr, ExpressionRef, Predicate as Pred, PredicateRef,
-    Scalar,
+    col, column_pred, lit, null_lit, Expression as Expr, ExpressionRef, Predicate as Pred,
+    PredicateRef, Scalar,
 };
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::object_store::memory::InMemory;
@@ -26,7 +26,7 @@ use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterPropertie
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::{Scan, StatsOptions};
-use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, MetadataColumnSpec, Schema, StructField};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -1378,7 +1378,7 @@ fn not_and_or_predicates(
     table_for_numbers(vec![1, 2, 4, 5, 6])
 )]
 #[case::distinct_null(
-    col!("number").distinct(Expr::null_literal(DataType::LONG)),
+    col!("number").distinct(null_lit(DataType::LONG)),
     table_for_numbers(vec![1, 2, 3, 4, 5, 6])
 )]
 #[case::not_distinct_value(
@@ -1386,7 +1386,7 @@ fn not_and_or_predicates(
     table_for_numbers(vec![3])
 )]
 #[case::not_distinct_null(
-    Pred::not(col!("number").distinct(Expr::null_literal(DataType::LONG))),
+    Pred::not(col!("number").distinct(null_lit(DataType::LONG))),
     table_for_numbers(vec![])
 )]
 #[case::gt_empty_struct(
@@ -1805,11 +1805,11 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Create a schema that includes a row index metadata column
-    let schema = Arc::new(StructType::try_new([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        (StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex)),
+        nullable "value": STRING,
+    };
 
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().with_schema(schema).build()?;
@@ -1898,11 +1898,11 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Create a schema that includes the file path metadata column
-    let schema = Arc::new(StructType::try_new([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+        nullable "value": STRING,
+    };
 
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().with_schema(schema).build()?;
@@ -2006,10 +2006,10 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
 
     for (column_name, metadata_spec, error_text) in test_cases {
         let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
-        let schema = Arc::new(StructType::try_new([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::create_metadata_column(column_name, metadata_spec),
-        ])?);
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            (StructField::create_metadata_column(column_name, metadata_spec)),
+        };
 
         let scan_err = snapshot
             .scan_builder()

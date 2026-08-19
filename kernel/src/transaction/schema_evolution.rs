@@ -306,11 +306,10 @@ mod tests {
     };
 
     fn simple_schema() -> StructType {
-        StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])
-        .unwrap()
+        schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        }
     }
 
     fn add_col(name: &str, nullable: bool) -> SchemaOperation {
@@ -326,8 +325,6 @@ mod tests {
     }
 
     fn add_struct_with_nested_leaf(name: &str, leaf_name: &str) -> SchemaOperation {
-        let inner =
-            StructType::try_new(vec![StructField::nullable(leaf_name, DataType::STRING)]).unwrap();
         SchemaOperation::AddColumn {
             path: ColumnName::new(Vec::<String>::new()),
             field: StructField::nullable(name, inner),
@@ -335,18 +332,13 @@ mod tests {
     }
 
     fn nested_schema() -> StructType {
-        StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable(
-                "address",
-                StructType::try_new(vec![
-                    StructField::not_null("city", DataType::STRING),
-                    StructField::nullable("zip", DataType::STRING),
-                ])
-                .unwrap(),
-            ),
-        ])
-        .unwrap()
+        schema! {
+            not_null "id": INTEGER,
+            nullable "address": {
+                not_null "city": STRING,
+                nullable "zip": STRING,
+            },
+        }
     }
 
     fn deeply_nested_required_schema() -> StructType {
@@ -628,11 +620,11 @@ mod tests {
 
     #[test]
     fn set_nullable_on_struct_itself_preserves_inner_fields() {
-        let schema = StructType::try_new(vec![StructField::not_null(
-            "address",
-            StructType::try_new(vec![StructField::not_null("city", DataType::STRING)]).unwrap(),
-        )])
-        .unwrap();
+        let schema = schema! {
+            not_null "address": {
+                not_null "city": STRING,
+            },
+        };
         let ops = vec![SchemaOperation::SetNullable {
             column: column_name!("address"),
         }];
@@ -661,6 +653,43 @@ mod tests {
         assert_eq!(result.schema.fields().count(), 3);
         assert!(result.schema.field("email").is_some());
         assert!(result.schema.field("id").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn set_nullable_nested_preserves_top_level_order() {
+        // SetNullable on a nested field within a middle top-level field must not reorder
+        // the top-level IndexMap.
+        let schema = schema! {
+            not_null "alpha": INTEGER,
+            nullable "beta": {
+                not_null "nested": STRING,
+            },
+            not_null "gamma": STRING,
+        };
+        let ops = vec![SchemaOperation::SetNullable {
+            column: column_name!("beta.nested"),
+        }];
+        let result = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap();
+        let names: Vec<&String> = result.schema.fields().map(|f| f.name()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    }
+
+    // === Column mapping tests ===
+
+    fn get_cm_id(field: &StructField) -> i64 {
+        field
+            .column_mapping_id()
+            .expect("field should have column mapping ID")
+    }
+
+    fn get_physical_name(field: &StructField) -> String {
+        match field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .expect("field should have physical name")
+        {
+            MetadataValue::String(s) => s.clone(),
+            other => panic!("expected String, got {other:?}"),
+        }
     }
 
     #[rstest]
@@ -761,13 +790,10 @@ mod tests {
     }
 
     fn struct_of_two_primitives() -> DataType {
-        DataType::from(
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::STRING),
-                StructField::nullable("b", DataType::STRING),
-            ])
-            .unwrap(),
-        )
+        DataType::from(schema! {
+            nullable "a": STRING,
+            nullable "b": STRING,
+        })
     }
 
     #[rstest]
@@ -828,7 +854,9 @@ mod tests {
     #[case::top_level(field_with_id_only("tainted", DataType::STRING, 99))]
     #[case::nested_in_struct(StructField::nullable(
         "outer",
-        StructType::try_new(vec![field_with_id_only("inner", DataType::STRING, 99)]).unwrap(),
+        schema! {
+            (field_with_id_only("inner", DataType::STRING, 99)),
+        },
     ))]
     fn add_column_with_preexisting_cm_metadata_is_preserved_under_cm(#[case] field: StructField) {
         let ops = vec![SchemaOperation::AddColumn {
@@ -917,7 +945,9 @@ mod tests {
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
             MetadataValue::Number(42),
         );
-        let schema = StructType::try_new(vec![existing]).unwrap();
+        let schema = schema! {
+            (existing),
+        };
         let ops = vec![SchemaOperation::AddColumn {
             path: ColumnName::new(Vec::<String>::new()),
             field: StructField::nullable("new", DataType::STRING),

@@ -551,6 +551,7 @@ impl Snapshot {
     ///
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_clustering_column_infos(
         &self,
@@ -2356,21 +2357,14 @@ mod tests {
 
         let storage = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(storage);
-        let schema = Arc::new(
-            crate::schema::StructType::try_new(vec![
-                crate::schema::StructField::nullable("id", DataType::INTEGER),
-                crate::schema::StructField::nullable("region", DataType::STRING),
-                crate::schema::StructField::nullable(
-                    "address",
-                    crate::schema::StructType::try_new(vec![
-                        crate::schema::StructField::nullable("city", DataType::STRING),
-                        crate::schema::StructField::nullable("zip", DataType::INTEGER),
-                    ])
-                    .unwrap(),
-                ),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "region": STRING,
+            nullable "address": {
+                nullable "city": STRING,
+                nullable "zip": INTEGER,
+            },
+        };
         let _ = create_table("memory:///", schema, "test")
             .fold_with(clustering_cols.as_ref(), |builder, cols| {
                 let columns = cols
@@ -2512,9 +2506,7 @@ mod tests {
             Snapshot::builder_for("memory:///").build(&engine).unwrap()
         }
 
-        let small_schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("a", DataType::INTEGER)]).unwrap(),
-        );
+        let small_schema = schema_ref! { nullable "a": INTEGER };
         let wide_schema = Arc::new(
             StructType::try_new(
                 (0..50)

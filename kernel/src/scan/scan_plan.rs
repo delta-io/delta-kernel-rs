@@ -17,7 +17,8 @@ use crate::actions::{
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, ColumnName, Expression as Expr, ExpressionRef, Predicate,
+    col, column_name, joined_column_expr, lit, null_lit, ColumnName, Expression as Expr,
+    ExpressionRef, Predicate,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
@@ -324,9 +325,7 @@ impl Scan {
         };
 
         let (add_schema, add_expr) = projection.build()?;
-        let schema = schema_ref! {
-            (StructField::nullable(ADD_NAME, add_schema.as_ref().clone()))
-        };
+        let schema = schema_ref! { nullable ADD_NAME: (add_schema.as_ref().clone()) };
         Ok((Arc::new(Expr::struct_from([add_expr])), schema))
     }
 }
@@ -346,16 +345,16 @@ fn sidecar_actions(
     const SIDECAR_FILE_MOD: &str = "modificationTime";
 
     static SIDECAR_FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-        not_null (FILE_PATH): STRING,
-        not_null (FILE_SIZE): LONG,
-        not_null (FILE_MOD): LONG,
-        nullable (DV): (DeletionVectorDescriptor::to_schema()),
-        nullable (VERSION): LONG,
+        not_null FILE_PATH: STRING,
+        not_null FILE_SIZE: LONG,
+        not_null FILE_MOD: LONG,
+        nullable DV: (DeletionVectorDescriptor::to_schema()),
+        nullable VERSION: LONG,
     };
 
     static SIDECAR_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
         (&SIDECAR_FIELD),
-        nullable (VERSION): LONG,
+        nullable VERSION: LONG,
     };
 
     let scan = match file_type {
@@ -369,7 +368,7 @@ fn sidecar_actions(
                 col!(SIDECAR_NAME, FILE_PATH),
                 col!(SIDECAR_NAME, SIDECAR_SIZE),
                 col!(SIDECAR_NAME, SIDECAR_FILE_MOD),
-                Expr::null_literal(DeletionVectorDescriptor::to_schema().into()),
+                null_lit(DeletionVectorDescriptor::to_schema()),
                 col!(VERSION),
             ]),
             SIDECAR_FILE_META_SCHEMA.clone(),
@@ -381,10 +380,10 @@ fn sidecar_actions(
         FileType::Parquet,
         log_root.join("_sidecars/")?,
         [VERSION],
-        ColumnName::new([FILE_PATH]),
-        ColumnName::new([FILE_SIZE]),
-        ColumnName::new([FILE_MOD]),
-        ColumnName::new([DV]),
+        column_name!(FILE_PATH),
+        column_name!(FILE_SIZE),
+        column_name!(FILE_MOD),
+        column_name!(DV),
     )?;
 
     sidecar_files.dynamic_scan(dynamic_scan)
@@ -398,7 +397,7 @@ fn json_read_schema(include_remove: bool) -> SchemaRef {
     schema_ref! {
         (&ADD_FIELD),
         ..(include_remove.then_some(&REMOVE_FIELD)),
-        nullable (VERSION): LONG,
+        nullable VERSION: LONG,
     }
 }
 
@@ -418,8 +417,8 @@ fn parquet_read_schema(
             ))
         });
     Ok(schema_ref! {
-        (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?)),
-        nullable (VERSION): LONG,
+        nullable ADD_NAME: (add_patch.build(&ADD_SCHEMA)?),
+        nullable VERSION: LONG,
     })
 }
 
@@ -562,7 +561,7 @@ fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
         &state.physical_stats_columns,
     )?;
     // A null skipping verdict means the available metadata cannot prove the file is skippable.
-    let skipping = Predicate::distinct(skipping, Expr::literal(false));
+    let skipping = Predicate::distinct(skipping, lit(false));
     let mut prefixer = MetadataSkippingColumnPrefixer;
     Some(prefixer.transform_pred(&skipping).into_owned())
 }
@@ -573,14 +572,10 @@ mod execution_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::lit;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
     use crate::object_store::memory::InMemory;
@@ -591,33 +586,26 @@ mod tests {
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
-    use crate::table_configuration::TableConfiguration;
-    use crate::unit_test_utils::create_log_path;
+    use crate::unit_test_utils::{
+        create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
+    };
     use crate::Engine as _;
 
     fn mock_snapshot(log_segment: LogSegment) -> DeltaResult<Arc<Snapshot>> {
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            partitioned_schema(),
-            vec!["p".to_string()],
-            0,
-            HashMap::new(),
-        )?;
-        let table_configuration = TableConfiguration::try_new(
-            metadata,
-            Protocol::try_new_legacy(2, 5)?,
-            Url::parse("memory:///")?,
-            0,
-        )?;
+        let table_configuration = MockTableConfigurationBuilder::new()
+            .with_schema(partitioned_schema())
+            .with_partition_columns(["p"])
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
+            .with_table_root("memory:///")
+            .try_build()?;
         Ok(Arc::new(Snapshot::new(log_segment, table_configuration)?))
     }
 
     fn partitioned_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("x", DataType::LONG),
-            StructField::nullable("p", DataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "x": LONG,
+            nullable "p": STRING,
+        }
     }
 
     fn log_root() -> Url {
@@ -893,7 +881,7 @@ mod tests {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?
             .scan_builder()
-            .with_predicate(Arc::new(Predicate::literal(false)))
+            .with_predicate(Arc::new(Predicate::FALSE))
             .build()?;
         assert_eq!(
             scan.state_info.physical_predicate,

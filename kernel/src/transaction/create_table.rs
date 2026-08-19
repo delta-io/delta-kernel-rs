@@ -15,7 +15,7 @@
 //! # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 //!
 //! let schema = Arc::new(StructType::try_new(vec![
-//!     StructField::new("id", DataType::INTEGER, true),
+//!     StructField::nullable("id", DataType::INTEGER),
 //! ])?);
 //!
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -73,7 +73,7 @@ use crate::DeltaResult;
 /// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 ///
 /// let schema = Arc::new(StructType::try_new(vec![
-///     StructField::new("id", DataType::INTEGER, true),
+///     StructField::nullable("id", DataType::INTEGER),
 /// ])?);
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -106,10 +106,10 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// use test_utils::delta_kernel_default_engine::storage::store_from_url;
 ///
 /// # fn main() -> delta_kernel::DeltaResult<()> {
-/// let schema = Arc::new(StructType::new_unchecked(vec![
-///     StructField::new("id", DataType::INTEGER, true),
-///     StructField::new("name", DataType::STRING, true),
-/// ]));
+/// let schema = Arc::new(StructType::try_new([
+///     StructField::nullable("id", DataType::INTEGER),
+///     StructField::nullable("name", DataType::STRING),
+/// ])?);
 ///
 /// let url = url::Url::parse("file:///tmp/my_table")?;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();

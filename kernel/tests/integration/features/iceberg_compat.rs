@@ -21,7 +21,8 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::parquet::basic::Type as ParquetPhysicalType;
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
+    StructField, StructType,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
@@ -53,29 +54,30 @@ async fn snapshot_blocked_when_v3_schema_has_legacy_nested_ids() {
         "data.value": 101,
         "data.value.element": 102,
     });
-    let schema = StructType::try_new(vec![StructField::nullable(
-        "data",
-        MapType::new(
-            DataType::INTEGER,
-            ArrayType::new(DataType::INTEGER, true),
-            true,
-        ),
-    )
-    .with_metadata([
-        (
-            ColumnMetadataKey::ColumnMappingId.as_ref(),
-            MetadataValue::from(1),
-        ),
-        (
-            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-            MetadataValue::from("col-1"),
-        ),
-        (
-            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-            MetadataValue::Other(nested_ids_legacy),
-        ),
-    ])])
-    .unwrap();
+    let schema = schema! {
+        (StructField::nullable(
+            "data",
+            MapType::new(
+                DataType::INTEGER,
+                ArrayType::new(DataType::INTEGER, true),
+                true,
+            ),
+        )
+        .with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::from(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::from("col-1"),
+            ),
+            (
+                ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
+                MetadataValue::Other(nested_ids_legacy),
+            ),
+        ])),
+    };
     let schema_string = serde_json::to_string(&schema).unwrap();
 
     let commit = [
@@ -356,57 +358,43 @@ fn make_default_engine_and_store() -> (Arc<InMemory>, Arc<DefaultEngine<TokioBac
 }
 
 fn simple_schema() -> Arc<StructType> {
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])
-        .unwrap(),
-    )
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "name": STRING,
+    }
 }
 
 /// Schema covering every Delta types(primitive, struct, map, array, variant)
 /// Including a deeply nested map<list<int>, struct<inner_map: map<list<int>, int>, n: int>> column.
 /// `region` is the partition column.
 fn nested_schema_with_all_delta_types() -> Arc<StructType> {
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("region", DataType::STRING),
-            StructField::nullable("int_col", DataType::INTEGER),
-            StructField::nullable("bool_col", DataType::BOOLEAN),
-            StructField::nullable("byte_col", DataType::BYTE),
-            StructField::nullable("short_col", DataType::SHORT),
-            StructField::nullable("long_col", DataType::LONG),
-            StructField::nullable("float_col", DataType::FLOAT),
-            StructField::nullable("double_col", DataType::DOUBLE),
-            StructField::nullable("decimal_col", DataType::decimal(10, 2).unwrap()),
-            StructField::nullable("string_col", DataType::STRING),
-            StructField::nullable("binary_col", DataType::BINARY),
-            StructField::nullable("date_col", DataType::DATE),
-            StructField::nullable("timestamp_col", DataType::TIMESTAMP),
-            StructField::nullable("timestamp_ntz_col", DataType::TIMESTAMP_NTZ),
-            StructField::nullable("variant_col", DataType::unshredded_variant()),
-            StructField::nullable("complex", complex_nested_data_type()),
-        ])
-        .unwrap(),
-    )
+    schema_ref! {
+        nullable "region": STRING,
+        nullable "int_col": INTEGER,
+        nullable "bool_col": BOOLEAN,
+        nullable "byte_col": BYTE,
+        nullable "short_col": SHORT,
+        nullable "long_col": LONG,
+        nullable "float_col": FLOAT,
+        nullable "double_col": DOUBLE,
+        nullable "decimal_col": (DataType::decimal(10, 2).unwrap()),
+        nullable "string_col": STRING,
+        nullable "binary_col": BINARY,
+        nullable "date_col": DATE,
+        nullable "timestamp_col": TIMESTAMP,
+        nullable "timestamp_ntz_col": TIMESTAMP_NTZ,
+        nullable "variant_col": (DataType::unshredded_variant()),
+        nullable "complex": (complex_nested_data_type()),
+    }
 }
 
 /// `map<list<int>, struct<inner_map: map<list<int>, int>, n: int>>`. A deeply nested
 /// type used to validate field-id propagation through every level of map/list/struct.
 fn complex_nested_data_type() -> DataType {
-    let inner_struct = StructType::try_new(vec![
-        StructField::nullable(
-            "inner_map",
-            MapType::new(
-                ArrayType::new(DataType::INTEGER, true),
-                DataType::INTEGER,
-                true,
-            ),
-        ),
-        StructField::nullable("n", DataType::INTEGER),
-    ])
-    .unwrap();
+    let inner_struct = schema! {
+        nullable "inner_map": { [ nullable INTEGER ] => nullable INTEGER },
+        nullable "n": INTEGER,
+    };
     DataType::from(MapType::new(
         ArrayType::new(DataType::INTEGER, true),
         inner_struct,

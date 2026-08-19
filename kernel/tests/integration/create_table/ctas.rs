@@ -11,7 +11,7 @@ use delta_kernel::actions::MIN_VALUES;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -111,7 +111,7 @@ fn verify_column_names_in_clustering_metadata(
         "Expected exactly one clustering column"
     );
     let stored_path = clustering_columns[0].path();
-    let col = ColumnName::new(["row_number"]);
+    let col = column_name!("row_number");
     let expected = get_any_level_column_physical_name(schema.as_ref(), &col, cm_mode)?.into_inner();
 
     assert_eq!(

@@ -11,7 +11,7 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -57,10 +57,10 @@ async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
 async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("value", DataType::STRING, true),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1813,10 +1813,10 @@ const LARGE_FILE_ROW_COUNT: i32 = (FIRST_BIN_BOUNDARY * 2 / APPROX_BYTES_PER_ROW
 #[tokio::test]
 async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("data", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "data": STRING,
+    };
 
     // ===== v0: empty table =====
     let committed = create_table(&table_path, schema, "test_engine")

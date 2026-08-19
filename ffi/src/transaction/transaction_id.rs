@@ -76,7 +76,7 @@ fn get_app_id_version_impl(
 mod tests {
     use std::sync::Arc;
 
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::schema::schema_ref;
     use delta_kernel::Snapshot;
     use test_utils::setup_test_tables;
 
@@ -89,9 +89,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         // create a simple table: one int column named 'number'
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "number": INTEGER };
 
         for (table_url, engine, store, _table_name) in
             setup_test_tables(schema, &[], None, "test_table").await?

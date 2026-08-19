@@ -148,7 +148,7 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::scan::{ScanBuilder, StatsOptions};
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, StructField, StructType};
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
@@ -186,10 +186,9 @@ mod tests {
 
     /// Creates a simple table schema for tests
     fn test_schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]))
+        schema_ref! {
+            nullable "value": INTEGER,
+        }
     }
 
     /// Creates a ScanLogReplayProcessor with a pre-populated HashMap.
