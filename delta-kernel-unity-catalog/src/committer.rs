@@ -612,6 +612,31 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_version_non_zero_omits_unchanged_protocol_and_metadata() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 1);
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log/_staged_commits")).unwrap();
+
+        let client = Arc::new(CapturingUpdateTableClient::default());
+        let committer = UCCommitter::new(
+            client.clone(),
+            "test-table-id",
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
+        );
+        let result = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap();
+        assert!(matches!(result, CommitResponse::Committed { .. }));
+
+        let request = client.request.lock().unwrap().clone().unwrap();
+        assert!(request.staged_commit().is_some());
+        assert_eq!(request.protocol(), None);
+        assert_eq!(request.metadata(), None);
+    }
+
     #[test]
     fn commit_version_non_zero_rejects_clustering_change() {
         let tmp_dir = tempfile::tempdir().unwrap();

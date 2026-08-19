@@ -1,9 +1,10 @@
-//! FFI hooks that enable constructing a UpdateTableClient.
+//! FFI hooks that enable constructing a Unity Catalog committer.
 
 use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::committer::Committer;
+use delta_kernel::snapshot::Snapshot;
 use delta_kernel::DeltaResult;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
@@ -12,7 +13,7 @@ use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_ffi::handle::Handle;
 use delta_kernel_ffi::{kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice};
 use delta_kernel_ffi_macros::handle_descriptor;
-use delta_kernel_unity_catalog::UCCommitter;
+use delta_kernel_unity_catalog::{build_uc_create_table_request, UCCommitter};
 use tracing::debug;
 use unity_catalog_delta_client_api::{
     Result as ApiResult, TableIdentifier, UpdateTableClient,
@@ -33,8 +34,7 @@ pub struct Commit {
     pub file_modification_timestamp: i64,
 }
 
-/// Request to commit a new version to the table. It must include either a `commit_info` or
-/// `latest_backfilled_version`.
+/// Request passed to the commit callback.
 #[repr(C)]
 pub struct CommitRequest {
     pub table_id: KernelStringSlice,
@@ -46,6 +46,20 @@ pub struct CommitRequest {
     pub protocol: OptionalValue<Handle<SharedProtocol>>,
 }
 
+/// Request passed to the create-table callback.
+///
+/// `request_json` is a serialized
+/// [`unity_catalog_delta_client_api::CreateTableRequest`] built from the committed version 0
+/// snapshot.
+#[repr(C)]
+pub struct CreateTableRequest {
+    pub table_id: KernelStringSlice,
+    pub catalog: KernelStringSlice,
+    pub schema: KernelStringSlice,
+    pub table_name: KernelStringSlice,
+    pub request_json: KernelStringSlice,
+}
+
 /// The callback that will be called when the client wants to commit. Return `None` on success, or
 /// `Some(error)` if an error occurred.
 // Note, it doesn't make sense to return an ExternResult here because that can't hold the string
@@ -55,9 +69,19 @@ pub type CCommit = extern "C" fn(
     request: CommitRequest,
 ) -> OptionalValue<Handle<ExclusiveRustString>>;
 
-pub struct FfiUCCommitClient {
+/// The callback that will be called after a successful version 0 table-creation commit.
+///
+/// Return `None` on success, or `Some(error)` if an error occurred.
+pub type CCreateTable = extern "C" fn(
     context: NullableCvoid,
+    request: CreateTableRequest,
+) -> OptionalValue<Handle<ExclusiveRustString>>;
+
+pub struct FfiUCCommitClient {
+    commit_context: NullableCvoid,
     commit_callback: CCommit,
+    create_table_context: NullableCvoid,
+    create_table_callback: Option<CCreateTable>,
 }
 
 // NullableCvoid is NOT `Send` by itself. Here we declare our struct to be Send as it's up to the
@@ -109,12 +133,8 @@ impl UpdateTableClient for FfiUCCommitClient {
             })?
             .map(|protocol| Arc::new(protocol).into());
 
-        // there is a subtle issue here where we need to ensure that the string we use to refer to
-        // the commit_info.file_name stays in scope until _after_ the callback returns, so that the
-        // KernelStringSlice remains valid. This means we can't get clever with
-        // request.commit_info.map to build an Option<Commit>. Rather we just use a closure to hold
-        // the common code and call it from a scope where the string remains valid until after the
-        // closure finishes
+        // Keep file_name alive until the callback returns. The KernelStringSlice in Commit borrows
+        // from it, so the AddCommit path needs its own scope.
         let send_request = |commit_info| -> ApiResult<()> {
             let c_commit_request = CommitRequest {
                 table_id: kernel_string_slice!(table_id),
@@ -124,7 +144,7 @@ impl UpdateTableClient for FfiUCCommitClient {
                 protocol: protocol.into(),
             };
 
-            match (self.commit_callback)(self.context, c_commit_request) {
+            match (self.commit_callback)(self.commit_context, c_commit_request) {
                 OptionalValue::Some(e) => {
                     let boxed_str = unsafe { e.into_inner() }; // get the string back into Box<String>
                     let s: String = *boxed_str; // move back onto the stack
@@ -169,8 +189,36 @@ pub unsafe extern "C" fn get_uc_commit_client(
     commit_callback: CCommit,
 ) -> Handle<SharedFfiUCCommitClient> {
     Arc::new(FfiUCCommitClient {
-        context,
+        commit_context: context,
         commit_callback,
+        create_table_context: None,
+        create_table_callback: None,
+    })
+    .into()
+}
+
+/// Get a commit client that will call the passed callbacks when it wants to make a commit or
+/// finalize table creation. The matching context will be passed back to each callback when called.
+///
+/// IMPORTANT: The pointers passed for the contexts MUST be thread-safe (i.e. be able to be sent
+/// between threads safely) and MUST remain valid for as long as the client is used. It is valid to
+/// pass NULL as either context.
+///
+/// # Safety
+///
+///  Caller is responsible for passing valid pointers for the callbacks and valid context pointers.
+#[no_mangle]
+pub unsafe extern "C" fn get_uc_commit_client_with_create_table(
+    commit_context: NullableCvoid,
+    commit_callback: CCommit,
+    create_table_context: NullableCvoid,
+    create_table_callback: CCreateTable,
+) -> Handle<SharedFfiUCCommitClient> {
+    Arc::new(FfiUCCommitClient {
+        commit_context,
+        commit_callback,
+        create_table_context,
+        create_table_callback: Some(create_table_callback),
     })
     .into()
 }
@@ -186,11 +234,57 @@ pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUC
 
 // we need our own struct here because we want to override the calls to enter the tokio runtime
 // before calling into the standard committer
-struct FfiUCCommitter<C: UpdateTableClient> {
-    inner: UCCommitter<C>,
+struct FfiUCCommitter {
+    inner: UCCommitter<FfiUCCommitClient>,
+    client: Arc<FfiUCCommitClient>,
+    table_id: String,
+    table: TableIdentifier,
 }
 
-impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
+impl FfiUCCommitter {
+    fn call_create_table_callback(
+        &self,
+        engine: &dyn delta_kernel::Engine,
+        table_root: &str,
+    ) -> DeltaResult<()> {
+        let Some(create_table_callback) = self.client.create_table_callback else {
+            return Ok(());
+        };
+
+        let snapshot = Snapshot::builder_for(table_root)
+            .at_version(0)
+            .with_max_catalog_version(0)
+            .build(engine)?;
+        let create_request = build_uc_create_table_request(&snapshot, engine, &self.table.table)?;
+        let request_json = serde_json::to_string(&create_request).map_err(|e| {
+            delta_kernel::Error::generic(format!(
+                "failed to serialize UC create_table request: {e}"
+            ))
+        })?;
+        let table_id = self.table_id.clone();
+        let catalog = self.table.catalog.clone();
+        let schema = self.table.schema.clone();
+        let table_name = self.table.table.clone();
+
+        let c_create_request = CreateTableRequest {
+            table_id: kernel_string_slice!(table_id),
+            catalog: kernel_string_slice!(catalog),
+            schema: kernel_string_slice!(schema),
+            table_name: kernel_string_slice!(table_name),
+            request_json: kernel_string_slice!(request_json),
+        };
+        match (create_table_callback)(self.client.create_table_context, c_create_request) {
+            OptionalValue::Some(e) => {
+                let boxed_str = unsafe { e.into_inner() };
+                let s: String = *boxed_str;
+                Err(delta_kernel::Error::generic(s))
+            }
+            OptionalValue::None => Ok(()),
+        }
+    }
+}
+
+impl Committer for FfiUCCommitter {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
@@ -199,6 +293,9 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
         >,
         commit_metadata: delta_kernel::committer::CommitMetadata,
     ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
+        let is_create_table = commit_metadata.version() == 0;
+        let table_root = commit_metadata.table_root().to_string();
+
         // We hold this guard until the end of the function so we stay in the tokio context until
         // we're done
         let _guard = engine
@@ -216,7 +313,13 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
                     "FFIUCCommitter can only be used with the default engine",
                 )
             })?;
-        self.inner.commit(engine, actions, commit_metadata)
+        let response = self.inner.commit(engine, actions, commit_metadata)?;
+        if is_create_table {
+            if let delta_kernel::committer::CommitResponse::Committed { .. } = &response {
+                self.call_create_table_callback(engine, &table_root)?;
+            }
+        }
+        Ok(response)
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -264,12 +367,12 @@ fn get_uc_committer_impl(
     let catalog_str: String = unsafe { TryFromStringSlice::try_from_slice(&catalog) }?;
     let schema_str: String = unsafe { TryFromStringSlice::try_from_slice(&schema) }?;
     let table_name_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_name) }?;
+    let table = TableIdentifier::new(catalog_str, schema_str, table_name_str);
     let committer: Box<dyn Committer> = Box::new(FfiUCCommitter {
-        inner: UCCommitter::new(
-            client,
-            table_id_str,
-            TableIdentifier::new(catalog_str, schema_str, table_name_str),
-        ),
+        inner: UCCommitter::new(client.clone(), table_id_str.clone(), table.clone()),
+        client,
+        table_id: table_id_str,
+        table,
     });
     Ok(committer.into())
 }
@@ -295,6 +398,11 @@ pub(crate) mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::schema::schema_ref;
+    use delta_kernel::transaction::create_table::create_table;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
+    use delta_kernel_unity_catalog::get_required_properties_for_disk;
     use unity_catalog_delta_client_api::{
         Commit as ClientCommit, DeltaTableRequirement as ApiRequirement,
         DeltaTableUpdate as ApiUpdate, Error as ApiError,
@@ -329,19 +437,42 @@ pub(crate) mod tests {
         pub(crate) commit_called: bool,
         pub(crate) last_commit_table_id: Option<String>,
         pub(crate) last_staged_filename: Option<String>,
+        pub(crate) last_latest_backfilled_version: Option<i64>,
         pub(crate) last_metadata: Option<MetadataVisitState>,
         pub(crate) last_protocol: Option<ProtocolVisitState>,
+        pub(crate) create_table_called: bool,
+        pub(crate) last_create_table_id: Option<String>,
+        pub(crate) last_create_catalog: Option<String>,
+        pub(crate) last_create_schema: Option<String>,
+        pub(crate) last_create_table_name: Option<String>,
+        pub(crate) last_create_request_json: Option<String>,
         pub(crate) should_fail_commit: bool,
+        pub(crate) should_fail_create_table: bool,
     }
 
     pub(crate) fn get_test_context(should_fail_commit: bool) -> NullableCvoid {
+        get_test_context_with_create_table_failure(should_fail_commit, false)
+    }
+
+    pub(crate) fn get_test_context_with_create_table_failure(
+        should_fail_commit: bool,
+        should_fail_create_table: bool,
+    ) -> NullableCvoid {
         let context = Box::new(TestContext {
             commit_called: false,
             last_commit_table_id: None,
             last_staged_filename: None,
+            last_latest_backfilled_version: None,
             last_metadata: None,
             last_protocol: None,
+            create_table_called: false,
+            last_create_table_id: None,
+            last_create_catalog: None,
+            last_create_schema: None,
+            last_create_table_name: None,
+            last_create_request_json: None,
             should_fail_commit,
+            should_fail_create_table,
         });
         NonNull::new(Box::into_raw(context) as *mut c_void)
     }
@@ -443,6 +574,10 @@ pub(crate) mod tests {
             };
             context.last_staged_filename = Some(file_name);
         }
+        context.last_latest_backfilled_version = match request.latest_backfilled_version {
+            OptionalValue::Some(version) => Some(version),
+            OptionalValue::None => None,
+        };
         if let OptionalValue::Some(protocol) = request.protocol {
             context.last_protocol = Some(collect_protocol(protocol));
         }
@@ -464,11 +599,57 @@ pub(crate) mod tests {
         }
     }
 
+    #[no_mangle]
+    extern "C" fn test_create_table_callback(
+        context: NullableCvoid,
+        request: CreateTableRequest,
+    ) -> OptionalValue<Handle<ExclusiveRustString>> {
+        let context = cast_test_context(context).unwrap();
+        let string_from_slice =
+            |slice| unsafe { crate::TryFromStringSlice::try_from_slice(&slice).unwrap() };
+
+        context.create_table_called = true;
+        context.last_create_table_id = Some(string_from_slice(request.table_id));
+        context.last_create_catalog = Some(string_from_slice(request.catalog));
+        context.last_create_schema = Some(string_from_slice(request.schema));
+        context.last_create_table_name = Some(string_from_slice(request.table_name));
+        context.last_create_request_json = Some(string_from_slice(request.request_json));
+
+        if context.should_fail_create_table {
+            let error_msg = "Test create-table failure";
+            let error_str = unsafe {
+                ok_or_panic(allocate_kernel_string(
+                    kernel_string_slice!(error_msg),
+                    allocate_err,
+                ))
+            };
+            OptionalValue::Some(error_str)
+        } else {
+            OptionalValue::None
+        }
+    }
+
     #[test]
     fn test_get_uc_commit_client() {
         let client = unsafe { get_uc_commit_client(None, test_commit_callback) };
 
         let _client_ref: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
+        unsafe { free_uc_commit_client(client) };
+    }
+
+    #[test]
+    fn test_get_uc_commit_client_with_create_table() {
+        let client = unsafe {
+            get_uc_commit_client_with_create_table(
+                None,
+                test_commit_callback,
+                None,
+                test_create_table_callback,
+            )
+        };
+
+        let client_ref: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
+        assert!(client_ref.create_table_callback.is_some());
         unsafe { free_uc_commit_client(client) };
     }
 
@@ -549,6 +730,41 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn test_ffi_uc_commit_client_commit_without_staged_commit() {
+        let context = get_test_context(false);
+        let client = unsafe { get_uc_commit_client(context, test_commit_callback) };
+        let client_arc: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
+
+        let request = ClientUpdateTableRequest::new(
+            vec![ApiRequirement::AssertTableUuid {
+                uuid: "test_table_id".to_string(),
+            }],
+            vec![ApiUpdate::SetLatestBackfilledVersion {
+                latest_published_version: 9,
+            }],
+        )
+        .unwrap();
+
+        let target = TableIdentifier::new("test_catalog", "test_schema", "test_table");
+        let result: ApiResult<()> = client_arc.update_table(&target, request).await;
+
+        assert!(result.is_ok());
+
+        let context = recover_test_context(context).unwrap();
+        assert!(context.commit_called);
+        assert_eq!(
+            context.last_commit_table_id.as_deref(),
+            Some("test_table_id")
+        );
+        assert_eq!(context.last_latest_backfilled_version, Some(9));
+        assert_eq!(context.last_staged_filename, None);
+        assert_eq!(context.last_protocol, None);
+        assert_eq!(context.last_metadata, None);
+
+        unsafe { free_uc_commit_client(client) };
+    }
+
+    #[tokio::test]
     async fn test_ffi_uc_commit_client_commit_failure() {
         let context = get_test_context(true);
 
@@ -590,6 +806,68 @@ pub(crate) mod tests {
         unsafe { free_uc_commit_client(client) };
     }
 
+    #[tokio::test]
+    async fn test_ffi_uc_commit_client_rejects_invalid_protocol_update() {
+        let context = get_test_context(false);
+        let client = unsafe { get_uc_commit_client(context, test_commit_callback) };
+        let client_arc: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
+
+        let request = ClientUpdateTableRequest::new(
+            vec![ApiRequirement::AssertTableUuid {
+                uuid: "test_table_id".to_string(),
+            }],
+            vec![ApiUpdate::UpdateProtocol {
+                protocol: serde_json::json!({"minReaderVersion": "bad"}),
+            }],
+        )
+        .unwrap();
+
+        let target = TableIdentifier::new("test_catalog", "test_schema", "test_table");
+        let error = client_arc.update_table(&target, request).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode protocol update"),
+            "expected protocol decode error, got: {error}"
+        );
+        let context = recover_test_context(context).unwrap();
+        assert!(!context.commit_called);
+
+        unsafe { free_uc_commit_client(client) };
+    }
+
+    #[tokio::test]
+    async fn test_ffi_uc_commit_client_rejects_invalid_metadata_update() {
+        let context = get_test_context(false);
+        let client = unsafe { get_uc_commit_client(context, test_commit_callback) };
+        let client_arc: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
+
+        let request = ClientUpdateTableRequest::new(
+            vec![ApiRequirement::AssertTableUuid {
+                uuid: "test_table_id".to_string(),
+            }],
+            vec![ApiUpdate::UpdateMetadata {
+                metadata: serde_json::json!({"id": "test-id"}),
+            }],
+        )
+        .unwrap();
+
+        let target = TableIdentifier::new("test_catalog", "test_schema", "test_table");
+        let error = client_arc.update_table(&target, request).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode metadata update"),
+            "expected metadata decode error, got: {error}"
+        );
+        let context = recover_test_context(context).unwrap();
+        assert!(!context.commit_called);
+
+        unsafe { free_uc_commit_client(client) };
+    }
+
     #[test]
     fn test_get_uc_committer() {
         let client = unsafe { get_uc_commit_client(None, test_commit_callback) };
@@ -613,5 +891,106 @@ pub(crate) mod tests {
             free_uc_commit_client(client);
             free_uc_committer(committer);
         }
+    }
+
+    #[tokio::test]
+    async fn test_ffi_uc_committer_invokes_create_table_callback_after_version_0_commit() {
+        let context = get_test_context(false);
+        let client = unsafe {
+            get_uc_commit_client_with_create_table(
+                context,
+                test_commit_callback,
+                context,
+                test_create_table_callback,
+            )
+        };
+        let client_arc: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
+        let table_id = "test-table-id";
+        let table = TableIdentifier::new("test_catalog", "test_schema", "test_table");
+        let committer: Box<dyn Committer> = Box::new(FfiUCCommitter {
+            inner: UCCommitter::new(client_arc.clone(), table_id, table.clone()),
+            client: client_arc,
+            table_id: table_id.to_string(),
+            table,
+        });
+
+        let storage = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(storage).build();
+        let table_path = "memory:///ffi_uc_create_success/";
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let disk_props = get_required_properties_for_disk(table_id);
+
+        create_table(table_path, schema, "Test/1.0")
+            .with_table_properties(disk_props)
+            .build(&engine, committer)
+            .unwrap()
+            .commit(&engine)
+            .unwrap()
+            .unwrap_committed();
+
+        let context = recover_test_context(context).unwrap();
+        assert!(!context.commit_called);
+        assert!(context.create_table_called);
+        assert_eq!(context.last_create_table_id.as_deref(), Some(table_id));
+        assert_eq!(context.last_create_catalog.as_deref(), Some("test_catalog"));
+        assert_eq!(context.last_create_schema.as_deref(), Some("test_schema"));
+        assert_eq!(
+            context.last_create_table_name.as_deref(),
+            Some("test_table")
+        );
+
+        let request_json = context.last_create_request_json.unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request_json).unwrap();
+        assert_eq!(request["name"], "test_table");
+        assert_eq!(request["location"], table_path);
+        assert!(request["last-commit-timestamp-ms"].is_i64());
+        assert_eq!(request["properties"]["io.unitycatalog.tableId"], table_id);
+
+        unsafe { free_uc_commit_client(client) };
+    }
+
+    #[tokio::test]
+    async fn test_ffi_uc_committer_propagates_create_table_callback_failure() {
+        let context = get_test_context_with_create_table_failure(false, true);
+        let client = unsafe {
+            get_uc_commit_client_with_create_table(
+                context,
+                test_commit_callback,
+                context,
+                test_create_table_callback,
+            )
+        };
+        let client_arc: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
+        let table_id = "test-table-id";
+        let table = TableIdentifier::new("test_catalog", "test_schema", "test_table");
+        let committer: Box<dyn Committer> = Box::new(FfiUCCommitter {
+            inner: UCCommitter::new(client_arc.clone(), table_id, table.clone()),
+            client: client_arc,
+            table_id: table_id.to_string(),
+            table,
+        });
+
+        let storage = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(storage).build();
+        let table_path = "memory:///ffi_uc_create_failure/";
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let disk_props = get_required_properties_for_disk(table_id);
+
+        let error = create_table(table_path, schema, "Test/1.0")
+            .with_table_properties(disk_props)
+            .build(&engine, committer)
+            .unwrap()
+            .commit(&engine)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Test create-table failure"),
+            "expected create-table callback error, got: {error}"
+        );
+
+        let context = recover_test_context(context).unwrap();
+        assert!(context.create_table_called);
+
+        unsafe { free_uc_commit_client(client) };
     }
 }

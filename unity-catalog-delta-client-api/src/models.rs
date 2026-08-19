@@ -113,8 +113,7 @@ impl UpdateTableRequest {
     /// # Errors
     ///
     /// Returns an error if a singleton entry appears more than once. The UC `updateTable` endpoint
-    /// accepts at most one each of `AssertTableUuid`, `AssertEtag`, `AddCommit`, and
-    /// `SetLatestBackfilledVersion`.
+    /// accepts at most one of each requirement or update type.
     pub fn new(
         requirements: Vec<DeltaTableRequirement>,
         updates: Vec<DeltaTableUpdate>,

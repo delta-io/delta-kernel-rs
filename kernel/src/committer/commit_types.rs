@@ -296,9 +296,8 @@ impl CommitMetadata {
         ))
     }
 
-    /// Marks this `CommitMetadata` as having a protocol change. Test-only.
-    ///
-    /// that changes the protocol.
+    /// Copies the effective protocol into `new_protocol` to simulate a protocol-changing commit.
+    /// Test-only.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_protocol_change(mut self) -> Self {
         let protocol = self.effective_protocol().ok().cloned();
@@ -306,10 +305,8 @@ impl CommitMetadata {
         self
     }
 
-    /// Marks this `CommitMetadata` as having a metadata change. Test-only.
-    ///
-    /// Copies the existing metadata into the `new_metadata` field to simulate an ALTER TABLE
-    /// that changes the metadata.
+    /// Copies the effective metadata into `new_metadata` to simulate a metadata-changing commit.
+    /// Test-only.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_metadata_change(mut self) -> Self {
         let metadata = self.effective_metadata().ok().cloned();
@@ -319,8 +316,7 @@ impl CommitMetadata {
 
     /// Adds a domain metadata change for the given domain name. Test-only.
     ///
-    /// Creates a synthetic domain metadata entry to simulate a domain metadata change
-    /// (e.g. clustering column change via ALTER TABLE CLUSTER BY).
+    /// Creates a synthetic domain metadata entry to simulate a domain metadata change.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_domain_change(mut self, domain: &str) -> Self {
         self.domain_metadata_changes
