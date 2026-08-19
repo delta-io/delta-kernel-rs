@@ -182,7 +182,8 @@ let file_metadata = engine
 txn.add_files(file_metadata);
 ```
 
-`unpartitioned_write_context()` creates a `WriteContext` with the target directory, schema, and stats configuration.
+`unpartitioned_write_context()` creates a `BoundWriteContext` with the target directory, schema,
+and stats configuration.
 `write_parquet` writes a Parquet file and returns metadata (path, size, stats) that the
 transaction needs. `add_files` registers that metadata with the transaction.
 

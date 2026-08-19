@@ -25,9 +25,9 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::{CommitResult, Transaction, WriteContext};
+use delta_kernel::transaction::{BoundWriteContext, CommitResult, Transaction};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
@@ -45,7 +45,7 @@ pub const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Single-column nullable `id: int` schema.
 pub fn get_simple_schema() -> SchemaRef {
-    Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap())
+    schema_ref! { nullable "id": INTEGER }
 }
 
 /// Builds a `RecordBatch` matching [`get_simple_schema`] from a vector of `id` values.
@@ -263,7 +263,7 @@ pub async fn write_data_and_check_result_and_stats(
 
 /// A simple schema with a single nullable INTEGER column named `number`.
 pub fn get_simple_int_schema() -> Arc<StructType> {
-    Arc::new(StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap())
+    schema_ref! { nullable "number": INTEGER }
 }
 
 /// Write a metadata-update commit that sets a table property on the existing table.
@@ -477,7 +477,7 @@ pub fn get_scan_files(
 /// Serialize a deletion vector, write it to the object store, and return its descriptor.
 pub async fn write_deletion_vector_to_store(
     store: &Arc<dyn ObjectStore>,
-    write_context: &WriteContext,
+    write_context: &BoundWriteContext,
     dv: KernelDeletionVector,
     prefix: &str,
 ) -> Result<DeletionVectorDescriptor, Box<dyn std::error::Error>> {

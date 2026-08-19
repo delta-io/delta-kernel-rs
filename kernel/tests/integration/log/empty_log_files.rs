@@ -6,19 +6,14 @@
 //! - 0-byte checkpoint files are skipped, falling back to an older checkpoint
 //! - 0-byte CRC files are skipped (CRC is optional)
 
-use std::sync::Arc;
-
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::Snapshot;
 use test_utils::{add_commit, compacted_log_path_for_versions, create_table, engine_store_setup};
 
-fn simple_schema() -> Arc<StructType> {
-    Arc::new(
-        StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)])
-            .expect("valid schema"),
-    )
+fn simple_schema() -> SchemaRef {
+    schema_ref! { nullable "id": INTEGER }
 }
 
 fn commit_with_add(file_name: &str, num_records: i64) -> String {

@@ -196,7 +196,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
@@ -932,6 +932,55 @@ pub fn schema_with_column_defaults(
     Ok(Arc::new(StructType::try_new(augmented_fields)?))
 }
 
+/// Creates an empty test table using protocol version (3, 7).
+///
+/// # Parameters
+///
+/// - `schema`: The table schema.
+/// - `partition_columns`: The table's partition columns.
+/// - `local_directory`: The local table directory, or `None` for an in-memory table.
+/// - `table_base_name`: The table name prefix.
+///
+/// # Returns
+///
+/// The table URL, engine, object store, and table label.
+///
+/// # Errors
+///
+/// Returns an error if the table cannot be created.
+pub async fn setup_test_table_p37(
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    local_directory: Option<&Url>,
+    table_base_name: &str,
+) -> Result<
+    (
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<DynObjectStore>,
+        &'static str,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let table_name = format!("{table_base_name}_37");
+    let (store, engine, table_location) = engine_store_setup(table_name.as_str(), local_directory);
+    Ok((
+        create_table(
+            store.clone(),
+            table_location,
+            schema,
+            partition_columns,
+            true,
+            vec![],
+            vec![],
+        )
+        .await?,
+        engine,
+        store,
+        "test_table_37",
+    ))
+}
+
 /// Creates two empty test tables, one with 37 protocol and one with 11 protocol.  the tables will
 /// be named {table_base_name}_11 and {table_base_name}_37. The local_directory param can be set to
 /// write out the tables to the local filesystem, passing in None will create in-memory tables
@@ -950,27 +999,17 @@ pub async fn setup_test_tables(
     Box<dyn std::error::Error>,
 > {
     let table_name_11 = format!("{table_base_name}_11");
-    let table_name_37 = format!("{table_base_name}_37");
     let (store_11, engine_11, table_location_11) =
         engine_store_setup(table_name_11.as_str(), local_directory);
-    let (store_37, engine_37, table_location_37) =
-        engine_store_setup(table_name_37.as_str(), local_directory);
+    let table_37 = setup_test_table_p37(
+        schema.clone(),
+        partition_columns,
+        local_directory,
+        table_base_name,
+    )
+    .await?;
     Ok(vec![
-        (
-            create_table(
-                store_37.clone(),
-                table_location_37,
-                schema.clone(),
-                partition_columns,
-                true,
-                vec![],
-                vec![],
-            )
-            .await?,
-            engine_37,
-            store_37,
-            "test_table_37",
-        ),
+        table_37,
         (
             create_table(
                 store_11.clone(),
@@ -1096,11 +1135,12 @@ impl Committer for TestCatalogCommitter {
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         let path = commit_metadata.published_commit_path()?;
-        engine
-            .json_handler()
-            .write_json_file(&path, Box::new(actions), false)?;
+        let written_size =
+            engine
+                .json_handler()
+                .write_json_file(&path, Box::new(actions), false)?;
         Ok(CommitResponse::Committed {
-            file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), 0),
+            file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), written_size),
         })
     }
 
@@ -1144,20 +1184,17 @@ pub fn set_json_value(
 /// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag:
 /// string, value: int]`
 pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::nullable("row_number", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("score", DataType::DOUBLE),
-        StructField::nullable(
-            "address",
-            StructType::try_new(vec![
-                StructField::nullable("street", DataType::STRING),
-                StructField::nullable("city", DataType::STRING),
-            ])?,
-        ),
-        StructField::nullable("tag", DataType::STRING),
-        StructField::nullable("value", DataType::INTEGER),
-    ])?))
+    Ok(schema_ref! {
+        nullable "row_number": LONG,
+        nullable "name": STRING,
+        nullable "score": DOUBLE,
+        nullable "address": {
+            nullable "street": STRING,
+            nullable "city": STRING,
+        },
+        nullable "tag": STRING,
+        nullable "value": INTEGER,
+    })
 }
 
 /// Returns two [`RecordBatch`]es with hardcoded test data matching [`nested_schema`].
@@ -1229,32 +1266,30 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
 
 /// Schema with one column of the given type: `(id INT, col <dtype>)`.
 pub fn schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col": (dtype),
+    }
 }
 
 /// Schema with the given type nested inside a struct:
 /// `(id INT, nested STRUCT<inner <dtype>>)`.
 pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new(
-            "nested",
-            StructType::new_unchecked(vec![StructField::new("inner", dtype, true)]),
-            true,
-        ),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "nested": {
+            nullable "inner": (dtype),
+        },
+    }
 }
 
 /// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
 pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col1", dtype.clone(), true),
-        StructField::new("col2", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col1": (dtype.clone()),
+        nullable "col2": (dtype),
+    }
 }
 
 pub fn top_level_ntz_schema() -> SchemaRef {

@@ -12,7 +12,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use itertools::Itertools;
@@ -143,10 +143,10 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a table schema with id and value columns
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
 
     // Setup table with deletion vector support
     let temp_dir = tempdir()?;

@@ -20,12 +20,14 @@ use crate::DeltaResult;
 /// For each required column, validates that `nullCount` is present (non-null) and that
 /// `minValues` and `maxValues` are present unless the column is all-null
 /// (`nullCount == numRecords`).
+#[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
 pub struct StatsColumnVerifier {
     required_columns: Vec<(ColumnName, DataType)>,
 }
 
 impl StatsColumnVerifier {
     /// Create a new verifier that checks statistics for the given required columns and types.
+    #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
     pub fn new(required_columns: Vec<(ColumnName, DataType)>) -> Self {
         Self { required_columns }
     }
@@ -34,6 +36,7 @@ impl StatsColumnVerifier {
     ///
     /// For each required column, extracts all three stat columns (nullCount, minValues,
     /// maxValues) in a single `visit_rows` call per batch.
+    #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
     pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
         if self.required_columns.is_empty() {
             return Ok(());
@@ -297,6 +300,7 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
+#[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
 pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
     let column_names = vec![column_name!("path"), column_name!("stats", NUM_RECORDS)];
     let mut first_missing: Option<String> = None;

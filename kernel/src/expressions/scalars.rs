@@ -705,6 +705,12 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+impl From<Vec<u8>> for Scalar {
+    fn from(b: Vec<u8>) -> Self {
+        Self::Binary(b)
+    }
+}
+
 impl From<bytes::Bytes> for Scalar {
     fn from(b: bytes::Bytes) -> Self {
         Self::Binary(b.into())
@@ -1277,7 +1283,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{col, lit, BinaryPredicateOp};
-    use crate::schema::ToSchema as _;
+    use crate::schema::{schema, ToSchema as _};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::Predicate as Pred;
@@ -1840,6 +1846,13 @@ mod tests {
             panic!("Expected Binary scalar");
         }
 
+        // Owned Vec moves into Binary without reallocation via slice.
+        let owned = vec![9u8, 8, 7];
+        let from_vec: Scalar = owned.into();
+        assert_eq!(from_vec, Scalar::Binary(vec![9, 8, 7]));
+        let from_slice: Scalar = [9u8, 8, 7].as_slice().into();
+        assert_eq!(from_slice, Scalar::Binary(vec![9, 8, 7]));
+
         // Test with empty bytes
         let empty_bytes = bytes::Bytes::new();
         let empty_scalar: Scalar = empty_bytes.into();
@@ -2269,10 +2282,10 @@ mod tests {
     fn derived_struct_conversion_checks_null_field_data_type() {
         // `Option::try_from` rejects a typed null whose data type does not match `T`.
         let address = StructData::from_values_unchecked(
-            StructType::new_unchecked([
-                StructField::not_null("city", DataType::STRING),
-                StructField::nullable("zip", DataType::STRING),
-            ]),
+            schema! {
+                not_null "city": STRING,
+                nullable "zip": STRING,
+            },
             vec![Scalar::from("NYC"), Scalar::null(DataType::STRING)],
         );
         assert_result_error_with_message(

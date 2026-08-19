@@ -502,7 +502,7 @@ mod tests {
     use crate::arrow::array::StructArray;
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::expressions::{column_name, StructData};
-    use crate::schema::{StructField, ToSchema as _};
+    use crate::schema::{schema, schema_ref, ToSchema as _};
 
     #[test]
     fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> DeltaResult<()> {
@@ -517,7 +517,7 @@ mod tests {
     }
 
     fn null_dv() -> Scalar {
-        Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema()))
+        Scalar::null(DeletionVectorDescriptor::to_schema())
     }
 
     fn present_dv() -> Scalar {
@@ -545,19 +545,19 @@ mod tests {
         last_modified: Scalar,
         dv: Scalar,
     ) -> DeltaResult<Vec<ScanFile>> {
-        let input_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("path", DataType::STRING),
-            StructField::nullable("size", DataType::LONG),
-            StructField::nullable("filemod", DataType::LONG),
-            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
-        ]));
+        let input_schema = schema_ref! {
+            nullable "path": STRING,
+            nullable "size": LONG,
+            nullable "filemod": LONG,
+            nullable "dv": (DeletionVectorDescriptor::to_schema()),
+        };
         let input = values_to_record_batch(Values::new(
             input_schema,
             vec![vec![path, size, last_modified, dv]],
         ))
         .unwrap();
         let dynamic_scan = DynamicScan {
-            schema: Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+            schema: schema_ref! {},
             file_type: FileType::Parquet,
             base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],
@@ -651,14 +651,15 @@ mod tests {
 
     #[test]
     fn dynamic_scan_treats_dv_under_null_ancestor_as_null() {
-        let dv_field = StructField::nullable("dv", DeletionVectorDescriptor::to_schema());
-        let metadata_type = StructType::new_unchecked([dv_field]);
-        let input_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("filemod", DataType::LONG),
-            StructField::nullable("metadata", metadata_type.clone()),
-        ]));
+        let metadata_type = schema! {
+            nullable "dv": (DeletionVectorDescriptor::to_schema()),
+        };
+        let input_schema = schema_ref! {
+            not_null "path": STRING,
+            not_null "size": LONG,
+            not_null "filemod": LONG,
+            nullable "metadata": (metadata_type.clone()),
+        };
         let metadata_schema: ArrowSchema = (&metadata_type).try_into_arrow().unwrap();
         let metadata = StructArray::new(
             metadata_schema.fields().clone(),
@@ -677,7 +678,7 @@ mod tests {
         )
         .unwrap();
         let dynamic_scan = DynamicScan {
-            schema: Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+            schema: schema_ref! {},
             file_type: FileType::Parquet,
             base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],

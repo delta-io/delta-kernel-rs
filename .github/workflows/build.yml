@@ -188,8 +188,6 @@ jobs:
       - name: lint without default features - packages which depend on kernel with features enabled
         run: cargo clippy-no-default-kernel-dependents
       - name: check without default features - kernel
-        env:
-          RUSTFLAGS: --cap-lints=warn
         run: cargo check-no-default-kernel
       - name: check without default features - default engine
         run: cargo check-no-default-engine
@@ -338,14 +336,14 @@ jobs:
           cargo build --locked
           popd
           pushd ffi
-          cargo build --locked --features default-engine-rustls,test-ffi,tracing,delta-kernel-unity-catalog
+          cargo build --locked --features default-engine-rustls,test-ffi,tracing,delta-kernel-unity-catalog,geo-type-in-dev
           popd
       - name: build and run read-table test
         run: |
           pushd ffi/examples/read-table
           mkdir build
           pushd build
-          cmake ..
+          cmake .. -DGEO_TYPE_IN_DEV=ON
           make
           make test
       - name: build and run visit-expression test

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
@@ -255,10 +255,10 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
 
     let client = Arc::new(InMemoryUpdateTableClient::new());
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("val", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "val": STRING,
+    };
 
     // v0 create: writes 000.json directly to storage, does not call the catalog.
     create_table(table_uri.as_str(), schema, "delta-kernel-uc-test")

@@ -495,28 +495,25 @@ mod tests {
     use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
-        col, lit, Expression as KernelExpr, ExpressionStructPatch, ExpressionStructPatchBuilder,
+        col, lit, null_lit, Expression as KernelExpr, ExpressionStructPatch,
+        ExpressionStructPatchBuilder,
     };
-    use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use delta_kernel::schema::{schema, schema_ref, ArrayType, DataType, MapType, StructType};
     use rstest::rstest;
 
     use super::*;
 
     /// Name-resolution scope for these tests: `a: { b: { c: long } }`, plus top-level `b` and `x`.
     fn test_schema() -> StructType {
-        StructType::try_new([
-            StructField::nullable(
-                "a",
-                StructType::try_new([StructField::nullable(
-                    "b",
-                    StructType::try_new([StructField::nullable("c", DataType::LONG)]).unwrap(),
-                )])
-                .unwrap(),
-            ),
-            StructField::nullable("b", DataType::LONG),
-            StructField::nullable("x", DataType::LONG),
-        ])
-        .unwrap()
+        schema! {
+            nullable "a": {
+                nullable "b": {
+                    nullable "c": LONG,
+                },
+            },
+            nullable "b": LONG,
+            nullable "x": LONG,
+        }
     }
 
     /// Lowers an expression against [`test_schema`] and renders it as a DataFusion `Display`
@@ -537,7 +534,7 @@ mod tests {
     #[case::i64(lit(42i64), "Int64(42)")]
     #[case::string(lit("abc"), "Utf8(\"abc\")")]
     #[case::boolean(lit(true), "Boolean(true)")]
-    #[case::null(KernelExpr::null_literal(DataType::LONG), "Int64(NULL)")]
+    #[case::null(null_lit(DataType::LONG), "Int64(NULL)")]
     fn literal_lowers_to_scalar(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
@@ -619,7 +616,7 @@ mod tests {
     fn nested_array_of_array_peels_element_type_at_each_level() {
         let inner = KernelExpr::array([KernelExpr::struct_from([col!("b")])]);
         let kernel = KernelExpr::array([inner]);
-        let leaf = StructType::try_new([StructField::nullable("p", DataType::LONG)]).unwrap();
+        let leaf = schema! { nullable "p": LONG };
         let target: DataType = ArrayType::new(ArrayType::new(leaf, true), true).into();
         assert_eq!(
             lower_typed(kernel, target),
@@ -664,11 +661,10 @@ mod tests {
 
     /// Output schema with names distinct from the input schema, proving names come from the target.
     fn pq_output_schema() -> StructType {
-        StructType::try_new([
-            StructField::nullable("p", DataType::LONG),
-            StructField::nullable("q", DataType::LONG),
-        ])
-        .unwrap()
+        schema! {
+            nullable "p": LONG,
+            nullable "q": LONG,
+        }
     }
 
     #[test]
@@ -684,8 +680,7 @@ mod tests {
     fn nested_struct_recurses_with_child_target_names() {
         let inner = KernelExpr::struct_from([col!("b"), lit(1i64)]);
         let kernel = KernelExpr::struct_from([inner]);
-        let target =
-            StructType::try_new([StructField::nullable("outer", pq_output_schema())]).unwrap();
+        let target = schema! { nullable "outer": (pq_output_schema()) };
         assert_eq!(
             lower_typed(kernel, target.into()),
             "named_struct(Utf8(\"outer\"), named_struct(Utf8(\"p\"), b, Utf8(\"q\"), Int64(1)))"
@@ -716,9 +711,7 @@ mod tests {
     #[test]
     fn struct_arity_mismatch_is_an_error() {
         let kernel = KernelExpr::struct_from([col!("b"), lit(1i64)]);
-        let target: DataType = StructType::try_new([StructField::nullable("p", DataType::LONG)])
-            .unwrap()
-            .into();
+        let target: DataType = schema! { nullable "p": LONG }.into();
         to_df_expr(&kernel, &test_schema(), Some(&target)).unwrap_err();
     }
 
@@ -740,11 +733,10 @@ mod tests {
     /// Input struct `{ a: long, b: long }` for patch tests: the whole input schema for a top-level
     /// patch, or the nested source struct for a nested one.
     fn ab_schema() -> StructType {
-        StructType::try_new([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-        ])
-        .unwrap()
+        schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+        }
     }
 
     /// Asserts `res` is an error whose message contains `message`.
@@ -781,7 +773,7 @@ mod tests {
             .drop("a")
             .build()
             .unwrap();
-        let target = StructType::try_new([StructField::nullable("q", DataType::LONG)]).unwrap();
+        let target = schema! { nullable "q": LONG };
         assert_eq!(
             lower_patch(patch, &ab_schema(), &target),
             "named_struct(Utf8(\"q\"), b)"
@@ -795,13 +787,12 @@ mod tests {
             .append(lit(9i64))
             .build()
             .unwrap();
-        let target = StructType::try_new([
-            StructField::nullable("first", DataType::LONG),
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-            StructField::nullable("last", DataType::LONG),
-        ])
-        .unwrap();
+        let target = schema! {
+            nullable "first": LONG,
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "last": LONG,
+        };
         assert_eq!(
             lower_patch(patch, &ab_schema(), &target),
             "named_struct(Utf8(\"first\"), Int64(0), Utf8(\"a\"), a, Utf8(\"b\"), b, \
@@ -815,12 +806,11 @@ mod tests {
             .insert_after("a", lit(5i64))
             .build()
             .unwrap();
-        let target = StructType::try_new([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("inserted", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-        ])
-        .unwrap();
+        let target = schema! {
+            nullable "a": LONG,
+            nullable "inserted": LONG,
+            nullable "b": LONG,
+        };
         assert_eq!(
             lower_patch(patch, &ab_schema(), &target),
             "named_struct(Utf8(\"a\"), a, Utf8(\"inserted\"), Int64(5), Utf8(\"b\"), b)"
@@ -830,7 +820,7 @@ mod tests {
     #[test]
     fn nested_patch_wraps_in_null_guard_case() {
         // Input schema: { s: { a: long, b: long } }. Patch replaces s.a with a literal.
-        let input = StructType::try_new([StructField::nullable("s", ab_schema())]).unwrap();
+        let input = schema! { nullable "s": (ab_schema()) };
         let patch = ExpressionStructPatchBuilder::new_nested(["s"])
             .replace("a", lit(7i64))
             .build()
@@ -846,12 +836,11 @@ mod tests {
     fn patch_too_many_output_fields_is_an_error() {
         // Empty patch passes 2 fields; target declares 3.
         let patch = ExpressionStructPatchBuilder::new().build().unwrap();
-        let target: DataType = StructType::try_new([
-            StructField::nullable("p", DataType::LONG),
-            StructField::nullable("q", DataType::LONG),
-            StructField::nullable("r", DataType::LONG),
-        ])
-        .unwrap()
+        let target: DataType = schema! {
+            nullable "p": LONG,
+            nullable "q": LONG,
+            nullable "r": LONG,
+        }
         .into();
         let expr = KernelExpr::struct_patch(patch).unwrap();
         assert_error_message(
@@ -864,9 +853,7 @@ mod tests {
     fn patch_too_few_output_fields_is_an_error() {
         // Empty patch passes 2 fields; target declares 1.
         let patch = ExpressionStructPatchBuilder::new().build().unwrap();
-        let target: DataType = StructType::try_new([StructField::nullable("p", DataType::LONG)])
-            .unwrap()
-            .into();
+        let target: DataType = schema! { nullable "p": LONG }.into();
         let expr = KernelExpr::struct_patch(patch).unwrap();
         assert_error_message(
             to_df_expr(&expr, &ab_schema(), Some(&target)),
@@ -898,7 +885,7 @@ mod tests {
             .replace("nonexistent", lit(1i64))
             .build()
             .unwrap(),
-        StructType::try_new([StructField::nullable("p", DataType::LONG)]).unwrap()
+        schema! { nullable "p": LONG }
     )]
     fn required_patch_on_missing_field_is_an_error(
         #[case] patch: ExpressionStructPatch,
@@ -937,19 +924,15 @@ mod tests {
             .append(middle)
             .build()
             .unwrap();
-        let target = StructType::try_new([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-            StructField::nullable(
-                "g",
-                StructType::try_new([StructField::nullable(
-                    "h",
-                    StructType::try_new([StructField::nullable("leaf", DataType::LONG)]).unwrap(),
-                )])
-                .unwrap(),
-            ),
-        ])
-        .unwrap();
+        let target = schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "g": {
+                nullable "h": {
+                    nullable "leaf": LONG,
+                },
+            },
+        };
         assert_eq!(
             lower_patch(patch, &ab_schema(), &target),
             "named_struct(Utf8(\"a\"), a, Utf8(\"b\"), b, Utf8(\"g\"), \
@@ -961,11 +944,7 @@ mod tests {
 
     /// Input schema for map tests: `{ pv: map<string, string> }`.
     fn pv_map_schema() -> StructType {
-        StructType::try_new([StructField::nullable(
-            "pv",
-            MapType::new(DataType::STRING, DataType::STRING, true),
-        )])
-        .unwrap()
+        schema! { nullable "pv": { STRING => nullable STRING } }
     }
 
     /// Lowers a `MapToStruct` over `pv` targeting `output_schema` and renders it as a `Display`
@@ -984,11 +963,10 @@ mod tests {
     /// than here.
     #[test]
     fn map_to_struct_lowers_to_named_struct_over_get_field() {
-        let target = StructType::try_new([
-            StructField::nullable("region", DataType::STRING),
-            StructField::nullable("id", DataType::INTEGER),
-        ])
-        .unwrap();
+        let target = schema! {
+            nullable "region": STRING,
+            nullable "id": INTEGER,
+        };
         let rendered = lower_map_to_struct(target);
         assert_eq!(
             rendered,
@@ -1014,7 +992,7 @@ mod tests {
         #[case] field_type: DataType,
         #[case] expected_value: &str,
     ) {
-        let target = StructType::try_new([StructField::nullable("f", field_type)]).unwrap();
+        let target = schema! { nullable "f": (field_type) };
         let expected =
             format!("CASE WHEN pv IS NOT NULL THEN named_struct(Utf8(\"f\"), {expected_value}) ELSE NULL END");
         assert_eq!(lower_map_to_struct(target), expected);
@@ -1025,9 +1003,9 @@ mod tests {
     #[rstest]
     #[case::no_target(None, "MapToStruct expression requires a struct output type")]
     #[case::non_primitive_field(
-        Some(DataType::from(
-            StructType::try_new([StructField::nullable("nested", pq_output_schema())]).unwrap()
-        )),
+        Some(DataType::from(schema! {
+            nullable "nested": (pq_output_schema()),
+        })),
         "MapToStruct only supports primitive target types, but field 'nested' is"
     )]
     fn map_to_struct_with_unsupported_target_is_an_error(
@@ -1045,15 +1023,14 @@ mod tests {
 
     /// Input schema for JSON tests: `{ j: string }`.
     fn json_input_schema() -> StructType {
-        StructType::try_new([StructField::nullable("j", DataType::STRING)]).unwrap()
+        schema! { nullable "j": STRING }
     }
 
     fn nested_parse_type() -> StructType {
-        StructType::try_new([
-            StructField::nullable("n", DataType::LONG),
-            StructField::nullable("s", DataType::STRING),
-        ])
-        .unwrap()
+        schema! {
+            nullable "n": LONG,
+            nullable "s": STRING,
+        }
     }
 
     /// Target parse schema `{ n: long, s: string }`.
@@ -1137,23 +1114,20 @@ mod tests {
     /// through kernel's stringify-then-safe-cast path. Asserts they all land typed to the target.
     #[test]
     fn parse_json_decodes_all_supported_primitive_types() {
-        let target: KernelSchemaRef = Arc::new(
-            StructType::try_new([
-                StructField::nullable("str", DataType::STRING),
-                StructField::nullable("long", DataType::LONG),
-                StructField::nullable("int", DataType::INTEGER),
-                StructField::nullable("short", DataType::SHORT),
-                StructField::nullable("byte", DataType::BYTE),
-                StructField::nullable("float", DataType::FLOAT),
-                StructField::nullable("double", DataType::DOUBLE),
-                StructField::nullable("bool", DataType::BOOLEAN),
-                StructField::nullable("date", DataType::DATE),
-                StructField::nullable("ts", DataType::TIMESTAMP),
-                StructField::nullable("ts_ntz", DataType::TIMESTAMP_NTZ),
-                StructField::nullable("dec", DataType::decimal(10, 2).unwrap()),
-            ])
-            .unwrap(),
-        );
+        let target: KernelSchemaRef = schema_ref! {
+            nullable "str": STRING,
+            nullable "long": LONG,
+            nullable "int": INTEGER,
+            nullable "short": SHORT,
+            nullable "byte": BYTE,
+            nullable "float": FLOAT,
+            nullable "double": DOUBLE,
+            nullable "bool": BOOLEAN,
+            nullable "date": DATE,
+            nullable "ts": TIMESTAMP,
+            nullable "ts_ntz": TIMESTAMP_NTZ,
+            nullable "dec": (DataType::decimal(10, 2).unwrap()),
+        };
         let row = r#"{
             "str": "a", "long": 1, "int": 2, "short": 3, "byte": 4,
             "float": 1.5, "double": 2.5, "bool": true, "date": "2024-01-02",
@@ -1208,31 +1182,17 @@ mod tests {
         "[[1, ], [2, 3]]"
     )]
     #[case::struct_of_structs(
-        DataType::from(
-            StructType::try_new([StructField::nullable("inner", nested_parse_type())]).unwrap()
-        ),
+        DataType::from(schema! { nullable "inner": (nested_parse_type()) }),
         r#"{"inner": {"n": 1, "s": "a"}}"#,
         "{inner: {n: 1, s: a}}"
     )]
     #[case::struct_of_arrays(
-        DataType::from(
-            StructType::try_new([StructField::nullable(
-                "items",
-                ArrayType::new(DataType::INTEGER, true),
-            )])
-            .unwrap()
-        ),
+        DataType::from(schema! { nullable "items": [ nullable INTEGER ] }),
         r#"{"items": [1, null, 3]}"#,
         "{items: [1, , 3]}"
     )]
     #[case::struct_of_maps(
-        DataType::from(
-            StructType::try_new([StructField::nullable(
-                "items",
-                MapType::new(DataType::STRING, DataType::LONG, true),
-            )])
-            .unwrap()
-        ),
+        DataType::from(schema! { nullable "items": { STRING => nullable LONG } }),
         r#"{"items": {"x": 1, "y": null}}"#,
         "{items: {x: 1, y: }}"
     )]
@@ -1264,8 +1224,7 @@ mod tests {
         #[case] json_value: &str,
         #[case] expected_value: &str,
     ) {
-        let target: KernelSchemaRef =
-            Arc::new(StructType::try_new([StructField::nullable("value", field_type)]).unwrap());
+        let target: KernelSchemaRef = schema_ref! { nullable "value": (field_type) };
         let row = format!(r#"{{"value": {json_value}}}"#);
         let batch = eval_parse_json_batch(target.clone(), vec![Some(row.as_str())]);
         assert_matches_target(&batch, &target);
@@ -1289,8 +1248,7 @@ mod tests {
     /// unsupported through this path rather than silently mis-decoding.
     #[test]
     fn parse_json_binary_leaf_is_unsupported_and_yields_all_null_struct() {
-        let target: KernelSchemaRef =
-            Arc::new(StructType::try_new([StructField::nullable("b", DataType::BINARY)]).unwrap());
+        let target: KernelSchemaRef = schema_ref! { nullable "b": BINARY };
         let out = eval_parse_json(target, vec![Some(r#"{"b": "aGk="}"#)]);
         assert_eq!(out.len(), 1);
         assert!(out.column(0).is_null(0));
@@ -1348,12 +1306,7 @@ mod tests {
         #[case] left: DataType,
         #[case] right: DataType,
     ) {
-        let udf = |dt: DataType| {
-            ParseJsonUdf::try_new(Arc::new(
-                StructType::try_new([StructField::nullable("a", dt)]).unwrap(),
-            ))
-            .unwrap()
-        };
+        let udf = |dt: DataType| ParseJsonUdf::try_new(schema_ref! { nullable "a": (dt) }).unwrap();
         let (left, right) = (udf(left), udf(right));
         assert_eq!(
             left.return_type, right.return_type,

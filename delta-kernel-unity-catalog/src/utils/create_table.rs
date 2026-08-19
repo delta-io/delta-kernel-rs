@@ -194,7 +194,7 @@ mod tests {
 
     use delta_kernel::expressions::column_name;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
+    use delta_kernel::schema::{schema_ref, SchemaRef};
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
@@ -248,13 +248,10 @@ mod tests {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_create_req/";
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::new("id", DataType::INTEGER, true),
-                StructField::new("region", DataType::STRING, true),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "region": STRING,
+        };
 
         let disk_props = get_required_properties_for_disk("test-table-id-456");
         let req = create_v0_and_build_request(
@@ -414,9 +411,7 @@ mod tests {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_create_req_version/";
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "id": INTEGER };
 
         // Create a table (version 0) and append (version 1).
         let disk_props = get_required_properties_for_disk("test-table-id");

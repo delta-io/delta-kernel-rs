@@ -1112,7 +1112,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{DataType, MetadataValue, StructField};
+    use crate::schema::{schema_ref, DataType, MetadataValue, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Builds a flat `LONG` schema from `(name, nullable)` pairs.
@@ -1139,11 +1139,11 @@ mod tests {
     #[test]
     fn output_fields_preserve_input_field_metadata() {
         let metadata = [("k", MetadataValue::Number(7))];
-        let input = Arc::new(StructType::new_unchecked([
-            StructField::not_null("g", DataType::LONG).with_metadata(metadata.clone()),
-            StructField::not_null("a", DataType::LONG).with_metadata(metadata.clone()),
-            StructField::not_null("s", DataType::LONG).with_metadata(metadata),
-        ]));
+        let input = schema_ref! {
+            (StructField::not_null("g", DataType::LONG).with_metadata(metadata.clone())),
+            (StructField::not_null("a", DataType::LONG).with_metadata(metadata.clone())),
+            (StructField::not_null("s", DataType::LONG).with_metadata(metadata)),
+        };
         let agg = Aggregate::group_by(input, [column_name!("g")])
             .max(column_name!("a"))
             .sum(column_name!("s"))

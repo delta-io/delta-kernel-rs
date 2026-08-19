@@ -11,7 +11,7 @@ use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::column_name;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -33,14 +33,11 @@ async fn test_clustered_table_write_and_checkpoint(
     #[case] use_fresh_snapshot: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = Arc::new(
-        StructType::try_new(vec![
-            StructField::new("id", DataType::INTEGER, true),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("city", DataType::STRING, true),
-        ])
-        .unwrap(),
-    );
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "name": STRING,
+        nullable "city": STRING,
+    };
     let expected_clustering = vec![column_name!("id"), column_name!("city")];
 
     // Create table clustered on "id" and "city"
@@ -151,13 +148,10 @@ async fn test_clustered_table_write_and_checkpoint(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_clustered_table_write_all_null_clustering_column() {
     let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
-    let schema = Arc::new(
-        StructType::try_new(vec![
-            StructField::new("category", DataType::STRING, true),
-            StructField::new("region_id", DataType::INTEGER, true),
-        ])
-        .unwrap(),
-    );
+    let schema = schema_ref! {
+        nullable "category": STRING,
+        nullable "region_id": INTEGER,
+    };
 
     // Create table clustered on "category" and "region_id"
     let create_result = create_table(&table_path, schema, "Test/1.0")

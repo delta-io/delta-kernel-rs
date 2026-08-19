@@ -44,8 +44,8 @@ use std::borrow::Cow;
 // - K-prefix: Kernel types (KExpr, KPred, KBinOp, KPredOp)
 // - P-prefix: Parser/sqlparser types (PExpr, PBinOp, PUnaryOp, PVal)
 use delta_kernel::expressions::{
-    ArrayData, BinaryExpressionOp as KBinOp, BinaryPredicateOp as KPredOp, ColumnName,
-    Expression as KExpr, Predicate as KPred, Scalar,
+    lit, null_lit, ArrayData, BinaryExpressionOp as KBinOp, BinaryPredicateOp as KPredOp,
+    ColumnName, Expression as KExpr, Predicate as KPred, Scalar,
 };
 use delta_kernel::schema::{ArrayType, DataType, PrimitiveType, Schema};
 use itertools::Itertools as _;
@@ -89,8 +89,8 @@ fn preprocess_timestamp_ntz(input: &str) -> Cow<'_, str> {
 /// # Example
 /// ```ignore
 /// let schema = Schema::try_new(vec![
-///     StructField::new("id", DataType::LONG, false),
-///     StructField::new("name", DataType::STRING, false),
+///     StructField::not_null("id", DataType::LONG),
+///     StructField::not_null("name", DataType::STRING),
 /// ])?;
 /// let pred = parse_predicate("id < 500 AND name = 'alice'", &schema).unwrap();
 /// ```
@@ -129,7 +129,7 @@ fn synthesize_expr(schema: &Schema, expr: &PExpr) -> Option<(KExpr, DataType)> {
             Some((expr, ty))
         }
         PExpr::Value(v) => match &v.value {
-            PVal::Boolean(b) => Some((Scalar::Boolean(*b).into(), DataType::BOOLEAN)),
+            PVal::Boolean(b) => Some((lit(*b), DataType::BOOLEAN)),
             _ => None, // Numeric, string, null need type context
         },
         // Typed literals need type context from the other side of comparison
@@ -189,7 +189,7 @@ fn check_expr(
                     format!("Typed literal cannot be used for type: {expected_ty:?}").into(),
                 );
             };
-            Ok(prim.parse_scalar(s).map_err(|e| e.to_string())?.into())
+            Ok(lit(prim.parse_scalar(s).map_err(|e| e.to_string())?))
         }
         PExpr::Nested(inner) => check_expr(schema, expected_ty, inner),
         _ => {
@@ -225,20 +225,20 @@ fn check_literal(
         ) => {
             let raw = format!("{}{n}", if is_negative { "-" } else { "" });
             let scalar = prim.parse_scalar(&raw).map_err(|e| e.to_string())?;
-            Ok(scalar.into())
+            Ok(lit(scalar))
         }
 
         // String literals - use parse_scalar (handles String, Date, Timestamp, etc.)
         (DataType::Primitive(prim), PVal::SingleQuotedString(s) | PVal::DoubleQuotedString(s)) => {
             let scalar = prim.parse_scalar(s).map_err(|e| e.to_string())?;
-            Ok(scalar.into())
+            Ok(lit(scalar))
         }
 
         // Boolean literals
-        (DataType::Primitive(Boolean), PVal::Boolean(b)) => Ok(Scalar::Boolean(*b).into()),
+        (DataType::Primitive(Boolean), PVal::Boolean(b)) => Ok(lit(*b)),
 
         // NULL can be any type
-        (ty, PVal::Null) => Ok(Scalar::Null(ty.clone()).into()),
+        (ty, PVal::Null) => Ok(null_lit(ty.clone())),
 
         // Type mismatches
         (expected, actual) => Err(format!(
@@ -402,11 +402,7 @@ fn in_list_to_pred(
     // Check if any scalar is null to determine array nullability
     let contains_null = scalars.iter().any(|s| s.is_null());
     let array_data = ArrayData::try_new(ArrayType::new(col_ty, contains_null), scalars)?;
-    let pred = KPred::binary(
-        KPredOp::In,
-        col_expr,
-        KExpr::literal(Scalar::Array(array_data)),
-    );
+    let pred = KPred::binary(KPredOp::In, col_expr, lit(array_data));
     Ok(if negated { KPred::not(pred) } else { pred })
 }
 
@@ -432,78 +428,57 @@ fn between_to_pred(
 mod tests {
     use delta_kernel::expressions::col;
     use delta_kernel::expressions::Scalar::*;
-    use delta_kernel::schema::{MapType, Schema, StructField, StructType};
+    use delta_kernel::schema::{schema, Schema};
     use rstest::rstest;
 
     use super::*;
 
     /// Test schema with columns for all test cases.
     fn test_schema() -> Schema {
-        Schema::new_unchecked(vec![
-            // Columns matching upstream tests
-            StructField::new("id", DataType::LONG, true),
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::LONG, true),
-            StructField::new("c", DataType::LONG, true),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("value", DataType::LONG, true),
-            StructField::new("flag", DataType::BOOLEAN, true),
-            StructField::new("partCol", DataType::LONG, true),
-            StructField::new("version_tag", DataType::STRING, true),
-            // Double columns for literal_types tests
-            StructField::new("c3", DataType::DOUBLE, true),
-            StructField::new("c4", DataType::DOUBLE, true),
-            StructField::new("val", DataType::DOUBLE, true),
-            StructField::new("cc9", DataType::BOOLEAN, true),
-            StructField::new("long_val", DataType::LONG, true),
-            // Columns for unsupported predicate tests (these trigger other errors first)
-            StructField::new("fruit", DataType::STRING, true),
-            StructField::new("cc8", DataType::STRING, true),
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("time_col", DataType::TIMESTAMP, true),
-            StructField::new("items", ArrayType::new(DataType::LONG, true), true),
-            // Nested struct for upstream tests
-            StructField::new(
-                "null_v_struct",
-                StructType::new_unchecked(vec![StructField::new("v", DataType::LONG, true)]),
-                true,
-            ),
-            // Nested structs for nested_columns tests (a.b, a.b.c, b.c.f.i, data.value)
-            StructField::new(
-                "data",
-                StructType::new_unchecked(vec![StructField::new("value", DataType::LONG, true)]),
-                true,
-            ),
-            // Additional typed columns for type-checking tests
-            StructField::new("int_col", DataType::INTEGER, true),
-            StructField::new("str_col", DataType::STRING, true),
-            StructField::new("long_col", DataType::LONG, true),
-            StructField::new("double_col", DataType::DOUBLE, true),
-            StructField::new("short_col", DataType::SHORT, true),
-            StructField::new("byte_col", DataType::BYTE, true),
-            StructField::new("float_col", DataType::FLOAT, true),
-            StructField::new("bool_col", DataType::BOOLEAN, true),
-            StructField::new("date_col", DataType::DATE, true),
-            StructField::new("ts_col", DataType::TIMESTAMP, true),
-            StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
-            // Struct type for nested tests
-            StructField::new(
-                "struct_col",
-                StructType::new_unchecked(vec![
-                    StructField::new("inner_int", DataType::INTEGER, true),
-                    StructField::new("inner_str", DataType::STRING, true),
-                ]),
-                true,
-            ),
-            // Array type
-            StructField::new("array_col", ArrayType::new(DataType::LONG, true), true),
-            // Map type
-            StructField::new(
-                "map_col",
-                MapType::new(DataType::STRING, DataType::LONG, true),
-                true,
-            ),
-        ])
+        schema! {
+            nullable "id": LONG,
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "c": LONG,
+            nullable "name": STRING,
+            nullable "value": LONG,
+            nullable "flag": BOOLEAN,
+            nullable "partCol": LONG,
+            nullable "version_tag": STRING,
+            nullable "c3": DOUBLE,
+            nullable "c4": DOUBLE,
+            nullable "val": DOUBLE,
+            nullable "cc9": BOOLEAN,
+            nullable "long_val": LONG,
+            nullable "fruit": STRING,
+            nullable "cc8": STRING,
+            nullable "s": STRING,
+            nullable "time_col": TIMESTAMP,
+            nullable "items": [ nullable LONG ],
+            nullable "null_v_struct": {
+                nullable "v": LONG,
+            },
+            nullable "data": {
+                nullable "value": LONG,
+            },
+            nullable "int_col": INTEGER,
+            nullable "str_col": STRING,
+            nullable "long_col": LONG,
+            nullable "double_col": DOUBLE,
+            nullable "short_col": SHORT,
+            nullable "byte_col": BYTE,
+            nullable "float_col": FLOAT,
+            nullable "bool_col": BOOLEAN,
+            nullable "date_col": DATE,
+            nullable "ts_col": TIMESTAMP,
+            nullable "ts_ntz_col": TIMESTAMP_NTZ,
+            nullable "struct_col": {
+                nullable "inner_int": INTEGER,
+                nullable "inner_str": STRING,
+            },
+            nullable "array_col": [ nullable LONG ],
+            nullable "map_col": { STRING => nullable LONG },
+        }
     }
 
     // Helper to build an IN predicate: `col IN (scalars...)`
@@ -514,7 +489,7 @@ mod tests {
             .map(|s| s.data_type())
             .unwrap_or(DataType::LONG);
         let array = ArrayData::try_new(ArrayType::new(element_type, false), scalars).unwrap();
-        KPred::binary(KPredOp::In, col, KExpr::literal(Array(array)))
+        KPred::binary(KPredOp::In, col, lit(Array(array)))
     }
 
     // -- Comparisons --
@@ -850,11 +825,7 @@ mod tests {
             vec![Long(1), Long(2), Null(DataType::LONG)],
         )
         .unwrap();
-        let expected = KPred::binary(
-            KPredOp::In,
-            col!("a"),
-            KExpr::literal(Scalar::Array(expected_array)),
-        );
+        let expected = KPred::binary(KPredOp::In, col!("a"), lit(expected_array));
         assert_eq!(pred, expected);
     }
 

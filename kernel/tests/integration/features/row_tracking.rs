@@ -10,7 +10,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
-use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, MetadataColumnSpec, SchemaRef};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
@@ -133,10 +133,7 @@ async fn setup_number_table_with_features(
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
     Arc<DynObjectStore>,
 )> {
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "number": INTEGER };
     let (table_url, engine, store) = create_row_tracking_table_with_features(
         tmp_dir,
         name,
@@ -443,10 +440,10 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "name": STRING,
+    };
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_three_transactions", schema.clone()).await?;
@@ -768,10 +765,7 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "number": INTEGER };
 
     // Create a table without row tracking
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path())

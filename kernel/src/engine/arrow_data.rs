@@ -569,9 +569,7 @@ mod tests {
     use crate::engine::test_utils::{struct_list_fixture_as, CollectNVisitor, ListFlavor};
     use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
     use crate::expressions::{column_name, ArrayData};
-    use crate::schema::{
-        schema_ref, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, StructField, StructType,
-    };
+    use crate::schema::{schema, schema_ref, ArrayType, ColumnName, ColumnNamesAndTypes, DataType};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
@@ -647,10 +645,10 @@ mod tests {
         ];
 
         // Create schema for the new columns
-        let new_schema = Arc::new(StructType::new_unchecked([
-            StructField::new("age", DataType::INTEGER, true),
-            StructField::new("active", DataType::BOOLEAN, false),
-        ]));
+        let new_schema = schema_ref! {
+            nullable "age": INTEGER,
+            not_null "active": BOOLEAN,
+        };
 
         // Test the append_columns method
         let arrow_data = arrow_data.append_columns(new_schema, new_columns)?;
@@ -733,10 +731,10 @@ mod tests {
             vec![Some("Alice".to_string()), Some("Bob".to_string())],
         )?];
 
-        let new_schema = Arc::new(StructType::new_unchecked([
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("email", DataType::STRING, true), // Extra field in schema
-        ]));
+        let new_schema = schema_ref! {
+            nullable "name": STRING,
+            nullable "email": STRING, // Extra field in schema
+        };
 
         let result = arrow_data.append_columns(new_schema, new_columns);
         assert_result_error_with_message(
@@ -793,7 +791,7 @@ mod tests {
 
         // Create empty schema and columns
         let new_columns = vec![];
-        let new_schema = Arc::new(StructType::new_unchecked([]));
+        let new_schema = schema_ref! {};
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -830,10 +828,10 @@ mod tests {
             )?,
         ];
 
-        let new_schema = Arc::new(StructType::new_unchecked([
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("age", DataType::INTEGER, true),
-        ]));
+        let new_schema = schema_ref! {
+            nullable "name": STRING,
+            nullable "age": INTEGER,
+        };
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -872,11 +870,11 @@ mod tests {
             ArrayData::try_new(ArrayType::new(DataType::BOOLEAN, false), vec![true, false])?,
         ];
 
-        let new_schema = Arc::new(StructType::new_unchecked([
-            StructField::new("big_number", DataType::LONG, false),
-            StructField::new("pi", DataType::DOUBLE, true),
-            StructField::new("flag", DataType::BOOLEAN, false),
-        ]));
+        let new_schema = schema_ref! {
+            not_null "big_number": LONG,
+            nullable "pi": DOUBLE,
+            not_null "flag": BOOLEAN,
+        };
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -1852,8 +1850,7 @@ mod tests {
     impl RowVisitor for StructListVisitor {
         fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
             static NT: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-                let element =
-                    StructType::new_unchecked([StructField::not_null("n", DataType::INTEGER)]);
+                let element = schema! { not_null "n": INTEGER };
                 (
                     vec![ColumnName::new(["items"])],
                     vec![ArrayType::new(element, false).into()],
@@ -1927,8 +1924,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NT: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-                    let element =
-                        StructType::new_unchecked([StructField::not_null("n", DataType::INTEGER)]);
+                    let element = schema! { not_null "n": INTEGER };
                     (
                         vec![ColumnName::new(["items"])],
                         // contains_null = true

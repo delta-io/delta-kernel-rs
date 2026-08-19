@@ -1,13 +1,13 @@
 //! Commit metadata types for the committer module.
 
 use std::collections::HashMap;
-#[cfg(any(test, feature = "test-utils"))]
-use std::sync::Arc;
 
 use url::Url;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::path::LogRoot;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::schema::schema_ref;
 use crate::{DeltaResult, Version};
 
 /// The type of commit operation being performed. This communicates to the committer whether this
@@ -269,7 +269,7 @@ impl CommitMetadata {
     ) -> DeltaResult<Self> {
         let log_root = crate::path::LogRoot::new(table_root)?;
         let protocol = Protocol::try_new_modern(reader_features, writer_features)?;
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let schema = schema_ref! {};
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, configuration)?;
         Ok(Self::new(
             log_root,
@@ -332,8 +332,6 @@ pub enum CommitResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use url::Url;
 
     use super::*;
@@ -347,7 +345,7 @@ mod tests {
         let ts = 1234;
         let max_published_version = Some(42);
         let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let schema = schema_ref! {};
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let commit_metadata = CommitMetadata::new(

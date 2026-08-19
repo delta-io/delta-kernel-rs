@@ -1,3 +1,5 @@
+use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -30,10 +32,15 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::path::ParsedLogPath;
-use crate::table_features::ColumnMappingMode;
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::{
+    ColumnMappingMode, FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION,
+};
+use crate::table_properties::COLUMN_MAPPING_MODE;
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef, Version};
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
 /// synthetic log-file listings in tests.
@@ -337,36 +344,215 @@ pub(crate) fn assert_schema_feature_validation(
     extra_err_schemas: &[&StructType],
     err_msg: &str,
 ) {
-    make_test_tc(schema_with.clone(), protocol_with.clone(), [])
-        .expect("feature present + supported");
-    make_test_tc(schema_without.clone(), protocol_without.clone(), [])
-        .expect("feature absent + unsupported");
-    make_test_tc(schema_without.clone(), protocol_with.clone(), [])
-        .expect("feature absent + supported");
-    assert_result_error_with_message(
-        make_test_tc(schema_with.clone(), protocol_without.clone(), []),
-        err_msg,
-    );
+    let try_build = |schema: &StructType, protocol: &Protocol| {
+        MockTableConfigurationBuilder::new()
+            .with_schema(schema.clone())
+            .with_protocol(protocol.clone())
+            .try_build()
+    };
+    try_build(schema_with, protocol_with).expect("feature present + supported");
+    try_build(schema_without, protocol_without).expect("feature absent + unsupported");
+    try_build(schema_without, protocol_with).expect("feature absent + supported");
+    assert_result_error_with_message(try_build(schema_with, protocol_without), err_msg);
     for schema in extra_err_schemas {
-        assert_result_error_with_message(
-            make_test_tc((*schema).clone(), protocol_without.clone(), []),
-            err_msg,
-        );
+        assert_result_error_with_message(try_build(schema, protocol_without), err_msg);
     }
 }
 
-/// Creates a [`TableConfiguration`] from a schema, protocol, and table properties.
-/// Useful for testing validators that need a TC.
-pub(crate) fn make_test_tc(
-    schema: StructType,
+// ==================== Mock TableConfiguration ====================
+
+/// Builds a mock [`TableConfiguration`] for unit tests.
+///
+/// Defaults to a flat `value: INTEGER` schema, no partition columns, no table properties, and a
+/// table-features protocol (reader 3, writer 7) listing no features, rooted at `file:///` at
+/// version 0. Every axis is overridable.
+pub(crate) struct MockTableConfigurationBuilder {
+    schema: Option<SchemaRef>,
+    partition_columns: Vec<String>,
+    props: HashMap<String, String>,
     protocol: Protocol,
-    props: impl IntoIterator<Item = (String, String)>,
-) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
-    let schema = std::sync::Arc::new(schema);
-    let metadata =
-        Metadata::try_new(None, None, schema, vec![], 0, props.into_iter().collect()).unwrap();
-    let table_root = Url::try_from("file:///").unwrap();
-    crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
+    table_root: Url,
+    version: Version,
+}
+
+impl MockTableConfigurationBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            schema: None,
+            partition_columns: vec![],
+            props: HashMap::new(),
+            protocol: MockProtocolBuilder::new().build(),
+            table_root: Url::parse("file:///").unwrap(),
+            version: 0,
+        }
+    }
+
+    /// Sets the table schema, overriding the flat default.
+    pub(crate) fn with_schema(mut self, schema: impl Into<SchemaRef>) -> Self {
+        self.schema = Some(schema.into());
+        self
+    }
+
+    pub(crate) fn with_partition_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl ToString>,
+    ) -> Self {
+        self.partition_columns = columns.into_iter().map(|c| c.to_string()).collect();
+        self
+    }
+
+    /// Adds table properties, keeping any previously set ones.
+    pub(crate) fn with_properties<K: ToString, V: ToString>(
+        mut self,
+        props: impl IntoIterator<Item = impl Borrow<(K, V)>>,
+    ) -> Self {
+        self.props.extend(props.into_iter().map(|pair| {
+            let (key, value) = pair.borrow();
+            (key.to_string(), value.to_string())
+        }));
+        self
+    }
+
+    /// Sets the column-mapping mode property.
+    ///
+    /// Callers using `name` or `id` must provide a schema with column-mapping metadata through
+    /// [`Self::with_schema`].
+    pub(crate) fn with_column_mapping(self, mode: impl Into<Option<ColumnMappingMode>>) -> Self {
+        let Some(mode) = mode.into() else {
+            return self;
+        };
+        let mode = match mode {
+            ColumnMappingMode::None => "none",
+            ColumnMappingMode::Id => "id",
+            ColumnMappingMode::Name => "name",
+        };
+        self.with_properties([(COLUMN_MAPPING_MODE, mode)])
+    }
+
+    /// Uses `protocol` verbatim.
+    pub(crate) fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    pub(crate) fn with_table_root(mut self, table_root: impl AsRef<str>) -> Self {
+        self.table_root = Url::parse(table_root.as_ref()).unwrap();
+        self
+    }
+
+    pub(crate) fn with_version(mut self, version: Version) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Builds the [`TableConfiguration`], panicking if the configuration is invalid. Use
+    /// [`Self::try_build`] to assert on construction errors.
+    #[track_caller]
+    pub(crate) fn build(self) -> TableConfiguration {
+        self.try_build().unwrap()
+    }
+
+    pub(crate) fn try_build(self) -> DeltaResult<TableConfiguration> {
+        let schema = self
+            .schema
+            .unwrap_or_else(|| schema_ref! { nullable "value": INTEGER });
+        let metadata =
+            Metadata::try_new(None, None, schema, self.partition_columns, 0, self.props)?;
+
+        TableConfiguration::try_new(metadata, self.protocol, self.table_root, self.version)
+    }
+}
+
+/// Builds a mock [`Protocol`] for unit tests.
+///
+/// Defaults to a table-features protocol (reader 3, writer 7) listing no features.
+pub(crate) struct MockProtocolBuilder {
+    reader_features: Vec<TableFeature>,
+    writer_features: Vec<TableFeature>,
+    reader_version: i32,
+    writer_version: i32,
+}
+
+impl MockProtocolBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            reader_features: vec![],
+            writer_features: vec![],
+            reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+            writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
+        }
+    }
+
+    /// Sets the protocol features, splitting them across the reader and writer lists by type.
+    pub(crate) fn with_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.writer_features = features
+            .into_iter()
+            .map(|feature| feature.borrow().clone())
+            .collect();
+        assert!(
+            self.writer_features
+                .iter()
+                .all(|feature| feature.feature_type() != FeatureType::Unknown),
+            "unknown features require explicit reader/writer feature lists"
+        );
+        self.reader_features = self
+            .writer_features
+            .iter()
+            .filter(|feature| feature.feature_type() == FeatureType::ReaderWriter)
+            .cloned()
+            .collect();
+        self
+    }
+
+    /// Sets the protocol's reader features explicitly.
+    pub(crate) fn with_reader_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.reader_features = features
+            .into_iter()
+            .map(|feature| feature.borrow().clone())
+            .collect();
+        self
+    }
+
+    /// Sets the protocol's writer features explicitly.
+    pub(crate) fn with_writer_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.writer_features = features
+            .into_iter()
+            .map(|feature| feature.borrow().clone())
+            .collect();
+        self
+    }
+
+    /// Sets the protocol's minimum reader and writer versions.
+    pub(crate) fn with_versions(mut self, reader: i32, writer: i32) -> Self {
+        self.reader_version = reader;
+        self.writer_version = writer;
+        self
+    }
+
+    /// Builds the protocol, panicking if it is invalid.
+    #[track_caller]
+    pub(crate) fn build(self) -> Protocol {
+        // The protocol permits feature lists if and only if the version is exactly the
+        // table-features version, so legacy versions drop them.
+        Protocol::try_new(
+            self.reader_version,
+            self.writer_version,
+            (self.reader_version == TABLE_FEATURES_MIN_READER_VERSION)
+                .then_some(self.reader_features),
+            (self.writer_version == TABLE_FEATURES_MIN_WRITER_VERSION)
+                .then_some(self.writer_features),
+        )
+        .unwrap()
+    }
 }
 
 // ==================== Test schema helpers ====================
@@ -449,7 +635,9 @@ pub(crate) fn array_in_map_kernel_schema(
         ),
     )
     .with_metadata(metadata);
-    StructType::try_new(vec![array_in_map]).unwrap()
+    schema! {
+        (array_in_map),
+    }
 }
 
 /// Build an [`array_in_map_kernel_schema`] with `parquet.field.id` on the top-level field
@@ -592,9 +780,13 @@ fn build_arrow_input_with_stale_element_id() -> StructArray {
     let plain_inner = StructField::nullable("inner", complex_nested_inner_map_type());
     let plain_top = StructField::nullable(
         "top",
-        complex_nested_outer_map_type(StructType::try_new(vec![plain_inner]).unwrap()),
+        complex_nested_outer_map_type(schema! {
+            (plain_inner),
+        }),
     );
-    let plain_kernel_schema = StructType::try_new(vec![plain_top]).unwrap();
+    let plain_kernel_schema = schema! {
+        (plain_top),
+    };
     let plain_arrow_schema: ArrowSchema = (&plain_kernel_schema).try_into_arrow().unwrap();
 
     // Add stale `PARQUET:field_id` to the `top.key.element` field.
@@ -680,7 +872,9 @@ pub(crate) fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> S
         ]);
     let top_field = StructField::nullable(
         "top",
-        complex_nested_outer_map_type(StructType::try_new(vec![inner_field]).unwrap()),
+        complex_nested_outer_map_type(schema! {
+            (inner_field),
+        }),
     )
     .with_metadata([
         (
@@ -692,7 +886,9 @@ pub(crate) fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> S
             MetadataValue::Other(top_nested_ids),
         ),
     ]);
-    StructType::try_new(vec![top_field]).unwrap()
+    schema! {
+        (top_field),
+    }
 }
 
 /// Build the expected output Arrow schema for [`complex_nested_with_field_ids`].
@@ -772,10 +968,18 @@ pub(crate) fn test_schema_nested_with_column_mapping() -> SchemaRef {
         (cm_field("info", 2, "phys_info", schema! {
             (cm_field("name", 3, "phys_name", KernelDataType::STRING)),
             (cm_field("age", 4, "phys_age", KernelDataType::INTEGER)),
-            (cm_field("tags", 5, "phys_tags",
-                MapType::new(KernelDataType::STRING, KernelDataType::STRING, true))),
-            (cm_field("scores", 6, "phys_scores",
-                ArrayType::new(KernelDataType::INTEGER, true))),
+            (cm_field(
+                "tags",
+                5,
+                "phys_tags",
+                MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
+            )),
+            (cm_field(
+                "scores",
+                6,
+                "phys_scores",
+                ArrayType::new(KernelDataType::INTEGER, true),
+            )),
         })),
     }
 }
@@ -842,7 +1046,9 @@ pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
         true,
     );
     let array_type = ArrayType::new(
-        schema! { (cm_field("mid_field", 2, "phys_mid_field", map_type)) },
+        schema! {
+            (cm_field("mid_field", 2, "phys_mid_field", map_type)),
+        },
         true,
     );
     schema! {
@@ -996,22 +1202,26 @@ pub(crate) mod column_mapping_physical_name_dedup_fixtures {
 
     /// Two fields with the same physical name at different physical paths should be accepted.
     pub(crate) fn same_phy_name_different_paths() -> StructType {
-        let nested = StructType::new_unchecked([cm_field("id", 3, "id", DataType::INTEGER)]);
-        StructType::new_unchecked([
-            cm_field("id", 1, "id", DataType::INTEGER),
-            cm_field("nested", 2, "nested", nested),
-        ])
+        let nested = schema! {
+            (cm_field("id", 3, "id", DataType::INTEGER)),
+        };
+        schema! {
+            (cm_field("id", 1, "id", DataType::INTEGER)),
+            (cm_field("nested", 2, "nested", nested)),
+        }
     }
 
     /// Two nested fields with same physical path should be rejected.
     pub(crate) fn deeply_nested_repeat_physical_paths() -> StructType {
-        let inner = StructType::new_unchecked([
-            cm_field("a", 2, "x", DataType::INTEGER),
-            cm_field("b", 3, "x", DataType::INTEGER),
-        ]);
+        let inner = schema! {
+            (cm_field("a", 2, "x", DataType::INTEGER)),
+            (cm_field("b", 3, "x", DataType::INTEGER)),
+        };
         let arr_of_struct = ArrayType::new(inner, true);
         let map_to_arr = MapType::new(DataType::STRING, arr_of_struct, true);
-        StructType::new_unchecked([cm_field("outer", 1, "outer", map_to_arr)])
+        schema! {
+            (cm_field("outer", 1, "outer", map_to_arr)),
+        }
     }
 
     /// Full logical paths of the two colliding fields in
@@ -1032,17 +1242,36 @@ pub(crate) mod column_mapping_physical_name_dedup_fixtures {
     /// Dedup must error at the shallower site and never report the deeper one.
     pub(crate) fn multiple_physical_name_collisions() -> StructType {
         schema! {
-            (cm_field("a", 1, "p", schema! { (cm_field("aa", 6, "aa", DataType::INTEGER)) })),
-            (cm_field("b", 2, "p", schema! { (cm_field("bb", 7, "bb", DataType::INTEGER)) })),
-            (cm_field("nested", 3, "nested", schema! {
-                (cm_field("x", 4, "q", DataType::INTEGER)),
-                (cm_field("y", 5, "q", DataType::INTEGER)),
-            })),
+            (cm_field(
+                "a",
+                1,
+                "p",
+                schema! {
+                    (cm_field("aa", 6, "aa", DataType::INTEGER)),
+                },
+            )),
+            (cm_field(
+                "b",
+                2,
+                "p",
+                schema! {
+                    (cm_field("bb", 7, "bb", DataType::INTEGER)),
+                },
+            )),
+            (cm_field(
+                "nested",
+                3,
+                "nested",
+                schema! {
+                    (cm_field("x", 4, "q", DataType::INTEGER)),
+                    (cm_field("y", 5, "q", DataType::INTEGER)),
+                },
+            )),
         }
     }
 
     fn cm_field(name: &str, id: i64, phys: &str, ty: impl Into<DataType>) -> StructField {
-        StructField::new(name, ty, true).with_metadata([
+        StructField::nullable(name, ty).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
                 MetadataValue::Number(id),

@@ -15,7 +15,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema, schema_ref, DataType, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -156,14 +156,14 @@ async fn test_write_partitioned_interval_roundtrip(
     )]
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("value", DataType::INTEGER),
-        StructField::nullable("period", interval),
-    ])?);
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "period": (interval),
+    };
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot =
         create_interval_partitioned_table(&table_path, engine.as_ref(), schema, cm_mode, false)?;
-    let data_schema = StructType::try_new([StructField::nullable("value", DataType::INTEGER)])?;
+    let data_schema = schema! { nullable "value": INTEGER };
     let batch = RecordBatch::try_new(
         Arc::new((&data_schema).try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![7]))],
@@ -223,16 +223,16 @@ async fn test_materialized_partitioned_interval_roundtrip(
     )]
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("value", DataType::INTEGER),
-        StructField::nullable("period", interval),
-    ])?);
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "period": (interval),
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot =
         create_interval_partitioned_table(&table_path, engine.as_ref(), schema, cm_mode, true)?;
 
-    let data_schema = StructType::try_new(vec![StructField::nullable("value", DataType::INTEGER)])?;
+    let data_schema = schema! { nullable "value": INTEGER };
     let batch = RecordBatch::try_new(
         Arc::new((&data_schema).try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![7]))],
@@ -418,13 +418,10 @@ async fn test_write_partitioned_path_encodes_special_chars(
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ===== Step 1: Create a single-STRING-partition table and write one row. =====
-    let schema = Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("value", DataType::INTEGER),
-            StructField::nullable("p", DataType::STRING),
-        ])
-        .unwrap(),
-    );
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "p": STRING,
+    };
     let (_tmp_dir, table_path, snapshot, engine) = setup_and_write(
         schema,
         &["p"],
@@ -513,25 +510,22 @@ async fn test_write_partitioned_path_encodes_special_chars(
 // ==============================================================================
 
 fn all_types_schema() -> Arc<StructType> {
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("value", DataType::INTEGER),
-            StructField::nullable("p_string", DataType::STRING),
-            StructField::nullable("p_int", DataType::INTEGER),
-            StructField::nullable("p_long", DataType::LONG),
-            StructField::nullable("p_short", DataType::SHORT),
-            StructField::nullable("p_byte", DataType::BYTE),
-            StructField::nullable("p_float", DataType::FLOAT),
-            StructField::nullable("p_double", DataType::DOUBLE),
-            StructField::nullable("p_boolean", DataType::BOOLEAN),
-            StructField::nullable("p_date", DataType::DATE),
-            StructField::nullable("p_timestamp", DataType::TIMESTAMP),
-            StructField::nullable("p_decimal", DataType::decimal(10, 2).unwrap()),
-            StructField::nullable("p_binary", DataType::BINARY),
-            StructField::nullable("p_timestamp_ntz", DataType::TIMESTAMP_NTZ),
-        ])
-        .unwrap(),
-    )
+    schema_ref! {
+        nullable "value": INTEGER,
+        nullable "p_string": STRING,
+        nullable "p_int": INTEGER,
+        nullable "p_long": LONG,
+        nullable "p_short": SHORT,
+        nullable "p_byte": BYTE,
+        nullable "p_float": FLOAT,
+        nullable "p_double": DOUBLE,
+        nullable "p_boolean": BOOLEAN,
+        nullable "p_date": DATE,
+        nullable "p_timestamp": TIMESTAMP,
+        nullable "p_decimal": (DataType::decimal(10, 2).unwrap()),
+        nullable "p_binary": BINARY,
+        nullable "p_timestamp_ntz": TIMESTAMP_NTZ,
+    }
 }
 
 const PARTITION_COLS: &[&str] = &[
@@ -995,10 +989,10 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "partition";
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("number", DataType::INTEGER),
-        StructField::nullable(partition_col, DataType::STRING),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "number": INTEGER,
+        nullable (partition_col): STRING,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let _ = create_table(&table_path, table_schema.clone(), "test/1.0")
@@ -1011,10 +1005,7 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         .with_engine_info("default engine");
 
     // Data batch must not contain the partition column.
-    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let data_schema = schema_ref! { nullable "number": INTEGER };
     let arrow_schema = Arc::new(data_schema.as_ref().try_into_arrow()?);
     let batch = RecordBatch::try_new(
         arrow_schema,
@@ -1070,12 +1061,12 @@ async fn test_materialize_partition_columns_e2e(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cm = cm_mode_str(cm_mode);
     // Partition columns p1, p2 sit in the middle of the data columns.
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("d1", DataType::INTEGER),
-        StructField::nullable("p1", DataType::STRING),
-        StructField::nullable("p2", DataType::INTEGER),
-        StructField::nullable("d2", DataType::INTEGER),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "d1": INTEGER,
+        nullable "p1": STRING,
+        nullable "p2": INTEGER,
+        nullable "d2": INTEGER,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let _ = create_table(&table_path, table_schema, "test/1.0")
@@ -1089,10 +1080,10 @@ async fn test_materialize_partition_columns_e2e(
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // Data schema excludes partition columns.
-    let kernel_data_schema = StructType::try_new(vec![
-        StructField::nullable("d1", DataType::INTEGER),
-        StructField::nullable("d2", DataType::INTEGER),
-    ])?;
+    let kernel_data_schema = schema! {
+        nullable "d1": INTEGER,
+        nullable "d2": INTEGER,
+    };
     let arrow_data_schema: Arc<ArrowSchema> = Arc::new((&kernel_data_schema).try_into_arrow()?);
     let make_batch = |d1: Vec<i32>, d2: Vec<i32>| {
         RecordBatch::try_new(
@@ -1198,7 +1189,7 @@ async fn test_materialize_all_primitive_partition_types() -> Result<(), Box<dyn 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // Data schema excludes partition columns.
-    let data_schema = StructType::try_new(vec![StructField::nullable("value", DataType::INTEGER)])?;
+    let data_schema = schema! { nullable "value": INTEGER };
     let batch = RecordBatch::try_new(
         Arc::new((&data_schema).try_into_arrow()?),
         vec![normal_arrow_columns()[0].clone()],
@@ -1242,10 +1233,10 @@ async fn test_input_data_with_partition_column_errors(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cm = cm_mode_str(cm_mode);
     let partition_col = "partition";
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("number", DataType::INTEGER),
-        StructField::nullable(partition_col, DataType::STRING),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "number": INTEGER,
+        nullable (partition_col): STRING,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut properties = vec![("delta.columnMapping.mode", cm)];
@@ -1339,10 +1330,10 @@ async fn test_partition_null_validation(
     let (value, expected_err) = case;
 
     // Schema: a nullable data column + a NOT NULL string partition column.
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("value", DataType::INTEGER),
-        StructField::not_null("p", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        not_null "p": STRING,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut properties = vec![("delta.columnMapping.mode", cm_mode_str(cm_mode))];
@@ -1394,11 +1385,11 @@ async fn test_partition_null_validation_mixed_nullability(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("value", DataType::INTEGER),
-        StructField::not_null("p_required", DataType::STRING),
-        StructField::nullable("p_optional", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        not_null "p_required": STRING,
+        nullable "p_optional": STRING,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_partitioned_table(

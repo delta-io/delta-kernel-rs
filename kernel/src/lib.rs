@@ -1,12 +1,11 @@
 //! # Delta Kernel
 //!
 //! Delta-kernel-rs is an experimental [Delta](https://github.com/delta-io/delta/) implementation
-//! focused on interoperability with a wide range of query engines. It supports reads and
-//! (experimental) writes (only blind appends in the write path currently). This library defines a
-//! number of traits which must be implemented to provide a working delta implementation. They are
-//! detailed below. There is a provided "default engine" that implements all these traits and can
-//! be used to ease integration work. See [`DefaultEngine`](engine/default/index.html) for more
-//! information.
+//! focused on interoperability with a wide range of query engines. It supports table reads, table
+//! creation, appends, file removals, deletion-vector updates, and limited schema evolution. This
+//! library defines the traits that connectors implement to provide I/O and expression evaluation.
+//! The [`delta_kernel_default_engine`](https://docs.rs/delta_kernel_default_engine) crate provides
+//! a ready-to-use implementation based on Arrow, `object_store`, and Tokio.
 //!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
@@ -26,15 +25,13 @@
 //! # Engine trait
 //!
 //! The [`Engine`] trait allows connectors to bring their own implementation of functionality such
-//! as reading parquet files, listing files in a file system, parsing a JSON string etc. This
-//! trait exposes methods to get sub-engines which expose the core functionalities customizable by
-//! connectors.
+//! as reading and writing Parquet and JSON files, listing files in storage, and evaluating
+//! expressions. It exposes handler traits for each capability.
 //!
 //! ## Expression handling
 //!
-//! Expression handling is done via the [`EvaluationHandler`], which in turn allows the creation of
-//! [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
-//! and allow evaluation of that predicate for a specific batch of data.
+//! [`EvaluationHandler`] creates an [`ExpressionEvaluator`] for an [`Expression`] or a
+//! [`PredicateEvaluator`] for a [`Predicate`]. Each evaluator can process multiple data batches.
 //!
 //! ## File system interactions
 //!
@@ -45,10 +42,9 @@
 //!
 //! ## Reading log and data files
 //!
-//! Delta Kernel requires the capability to read and write json files and read parquet files, which
-//! is exposed via the [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files,
-//! connectors are asked to provide the context information they require to execute the actual
-//! operation. This is done by invoking methods on the [`StorageHandler`] trait.
+//! Delta Kernel requires the capability to read and write JSON and Parquet files, exposed via the
+//! [`JsonHandler`] and [`ParquetHandler`] respectively. Their read methods receive the context
+//! needed to execute the operation.
 
 #![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_cfg))]
 #![warn(
@@ -147,7 +143,7 @@ pub mod utils;
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::{try_parse_uri, CollectInto};
+pub use utils::{try_parse_uri, CollectInto, FoldWithOption};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -199,7 +195,7 @@ pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
-use schema::{StructField, StructType};
+use schema::{schema_ref, StructField};
 pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
@@ -550,10 +546,9 @@ trait EvaluationHandlerExtension: EvaluationHandler {
     // future)
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
         // just get a single int column (arbitrary)
-        let null_row_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "null_col",
-            DataType::INTEGER,
-        )]));
+        let null_row_schema = schema_ref! {
+            nullable "null_col": INTEGER,
+        };
         let null_row = self.null_row(null_row_schema.clone())?;
 
         // Convert schema and leaf values to an expression
@@ -751,12 +746,21 @@ pub trait JsonHandler: AsAny {
     /// - `data` - Iterator of [`FilteredEngineData`] to write to the JSON file
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
+    ///
+    /// # Returns
+    ///
+    /// The exact number of serialized bytes written to the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FileAlreadyExists`] when `overwrite` is false and the destination exists,
+    /// or another error when serialization or storage fails.
     fn write_json_file(
         &self,
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<FileSize>;
 }
 
 /// Reserved field IDs for metadata columns in Delta tables.
@@ -1067,11 +1071,10 @@ pub trait ParquetHandler: AsAny {
     }
 }
 
-/// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide
-/// to the Delta Kernel in order to read the Delta table.
+/// The `Engine` trait encapsulates the functionality an engine or connector provides to operate
+/// on Delta tables.
 ///
-/// Engines/Connectors are expected to pass an implementation of this trait when reading a Delta
-/// table.
+/// Connectors pass an implementation of this trait to Delta Kernel operations.
 pub trait Engine: AsAny {
     /// Get the connector provided [`EvaluationHandler`].
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;

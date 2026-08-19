@@ -284,8 +284,13 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       break;
     }
     case Column: {
-      char* column_name = ref.ref;
-      printf("Column(%s)\n", column_name);
+      struct Column* column = ref.ref;
+      printf("Column(");
+      for (size_t i = 0; i < column->len; i++) {
+        printf("%s", i > 0 ? ", " : "");
+        fwrite(column->parts[i].ptr, sizeof(char), column->parts[i].len, stdout);
+      }
+      printf(")\n");
       break;
     }
     case MapToStruct: {

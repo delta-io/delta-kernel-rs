@@ -32,15 +32,15 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
-    CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
-    DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION,
-    DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
-    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-    ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
-    SET_TRANSACTION_RETENTION_DURATION,
+    CheckpointPolicy, TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
+    CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
+    COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
+    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
+    ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
+    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -124,6 +124,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     DELETED_FILE_RETENTION_DURATION,
     ENABLE_EXPIRED_LOG_CLEANUP,
     CHECKPOINT_INTERVAL,
+    // Checkpoint policy: "v2" auto-enables the v2Checkpoint feature.
+    CHECKPOINT_POLICY,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -486,6 +488,21 @@ fn maybe_enable_ict_for_catalog_managed(
     Ok(())
 }
 
+fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTableProperties) {
+    let is_v2_policy = validated
+        .properties
+        .get(CHECKPOINT_POLICY)
+        .and_then(|v| CheckpointPolicy::try_from(v.as_str()).ok())
+        == Some(CheckpointPolicy::V2);
+    if is_v2_policy {
+        add_feature_to_lists(
+            TableFeature::V2Checkpoint,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
 /// Witness that all property-flipping passes which must run before column mapping is applied
 /// have completed.
 #[must_use]
@@ -765,7 +782,7 @@ impl CreateTableTransactionBuilder {
     /// # use delta_kernel::schema::{StructType, DataType, StructField};
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
-    /// # let schema = Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)])?);
+    /// # let schema = Arc::new(StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)])?);
     /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
     ///     .with_table_properties([
     ///         ("myapp.version", "1.0"),
@@ -810,8 +827,8 @@ impl CreateTableTransactionBuilder {
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
     /// # let schema = Arc::new(StructType::try_new(vec![
-    /// #     StructField::new("id", DataType::INTEGER, true),
-    /// #     StructField::new("date", DataType::STRING, true),
+    /// #     StructField::nullable("id", DataType::INTEGER),
+    /// #     StructField::nullable("date", DataType::STRING),
     /// # ])?);
     /// // Clustered layout:
     /// let builder = create_table("/path/to/table", schema.clone(), "MyApp/1.0")
@@ -930,6 +947,9 @@ impl CreateTableTransactionBuilder {
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
 
+        // Auto-enable v2Checkpoint when checkpointPolicy=v2
+        maybe_enable_v2_checkpoint_for_policy(&mut validated);
+
         // Set materialized row tracking column names when row tracking is enabled.
         maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
 
@@ -979,7 +999,7 @@ mod tests {
     use crate::expressions::{column_name, ColumnName};
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
-        schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
@@ -1141,6 +1161,36 @@ mod tests {
         assert!(validated.writer_features.is_empty());
     }
 
+    #[rstest::rstest]
+    #[case::v2(&[(CHECKPOINT_POLICY, "v2")], true)]
+    #[case::classic(&[(CHECKPOINT_POLICY, "classic")], false)]
+    fn test_checkpoint_policy_feature_enablement(
+        #[case] properties: &[(&str, &str)],
+        #[case] expect_v2_checkpoint_feature: bool,
+    ) {
+        let properties: HashMap<String, String> = properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+
+        maybe_enable_v2_checkpoint_for_policy(&mut validated);
+
+        assert_eq!(
+            validated
+                .reader_features
+                .contains(&TableFeature::V2Checkpoint),
+            expect_v2_checkpoint_feature,
+        );
+        assert_eq!(
+            validated
+                .writer_features
+                .contains(&TableFeature::V2Checkpoint),
+            expect_v2_checkpoint_feature,
+        );
+        assert!(validated.properties.contains_key(CHECKPOINT_POLICY));
+    }
+
     #[test]
     fn test_validate_unsupported_properties() {
         // Delta properties not on allow list are rejected
@@ -1186,10 +1236,10 @@ mod tests {
         use crate::clustering::CLUSTERING_DOMAIN_NAME;
         use crate::expressions::column_name;
 
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]));
+        let schema = schema_ref! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1214,11 +1264,11 @@ mod tests {
     fn test_clustering_support_multiple_columns() {
         use crate::expressions::column_name;
 
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("date", DataType::STRING, true),
-            StructField::new("region", DataType::STRING, true),
-        ]));
+        let schema = schema_ref! {
+            not_null "id": INTEGER,
+            nullable "date": STRING,
+            nullable "region": STRING,
+        };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1267,14 +1317,13 @@ mod tests {
         use crate::clustering::CLUSTERING_DOMAIN_NAME;
         use crate::expressions::column_name;
 
-        let address_struct = StructType::new_unchecked(vec![
-            StructField::new("city", DataType::STRING, true),
-            StructField::new("zip", DataType::STRING, true),
-        ]);
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("address", address_struct, true),
-        ]));
+        let schema = schema_ref! {
+            not_null "id": INTEGER,
+            nullable "address": {
+                nullable "city": STRING,
+                nullable "zip": STRING,
+            },
+        };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1334,11 +1383,11 @@ mod tests {
         &[TableFeature::TimestampWithoutTimezone],
     )]
     #[case::both_variant_and_ntz(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("v", DataType::unshredded_variant(), true),
-            StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
-        ])),
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "v": unshredded_variant(),
+            nullable "ts": TIMESTAMP_NTZ,
+        },
         &[TableFeature::VariantType, TableFeature::TimestampWithoutTimezone],
     )]
     #[case::no_special_types(
@@ -1495,11 +1544,11 @@ mod tests {
     }
 
     fn multi_column_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("date", DataType::DATE, true),
-        ]))
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+            nullable "date": DATE,
+        }
     }
 
     struct DataLayoutExpectation {
@@ -1603,12 +1652,10 @@ mod tests {
 
     #[test]
     fn test_validate_partition_columns_nested_rejected() {
-        let address_struct =
-            StructType::new_unchecked(vec![StructField::new("city", DataType::STRING, true)]);
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("address", address_struct, true),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            nullable "address": { nullable "city": STRING },
+        };
 
         let columns = vec![column_name!("address.city")];
         let result = validate_partition_columns(&schema, &columns);
@@ -1622,7 +1669,7 @@ mod tests {
     #[rstest::rstest]
     #[case::struct_type(
         "struct_col",
-        DataType::from(StructType::new_unchecked(vec![StructField::new("inner", DataType::STRING, false)])),
+        DataType::from(schema! { not_null "inner": STRING }),
     )]
     #[case::array_type(
         "array_col",
@@ -1636,10 +1683,10 @@ mod tests {
         #[case] col_name: &str,
         #[case] data_type: DataType,
     ) {
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(col_name, data_type, false),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            not_null col_name: (data_type),
+        };
         let columns = vec![ColumnName::new([col_name])];
         let result = validate_partition_columns(&schema, &columns);
         assert!(result.is_err());
@@ -1653,13 +1700,10 @@ mod tests {
     fn test_validate_partition_columns_nested_interval_types_rejected(
         #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] data_type: DataType,
     ) {
-        let schema = StructType::new_unchecked([
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::not_null(
-                "nested",
-                StructType::new_unchecked([StructField::not_null("col", data_type)]),
-            ),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            not_null "nested": { not_null "col": (data_type) },
+        };
 
         let error = validate_partition_columns(&schema, &[column_name!("nested.col")])
             .expect_err("nested partition columns must be rejected")
@@ -1677,10 +1721,10 @@ mod tests {
     #[case::interval_year_month(DataType::INTERVAL_YEAR_MONTH)]
     #[case::interval_day_time(DataType::INTERVAL_DAY_TIME)]
     fn test_validate_partition_columns_primitive_types_accepted(#[case] data_type: DataType) {
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("col", data_type, false),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            not_null "col": (data_type),
+        };
         let columns = vec![column_name!("col")];
         assert!(validate_partition_columns(&schema, &columns).is_ok());
     }
@@ -1820,9 +1864,13 @@ mod tests {
         let complex = StripFieldMetadataTransform
             .transform_struct(&with_metadata)
             .into_owned();
-        let mut fields: Vec<StructField> = complex.fields().cloned().collect();
-        fields.push(StructField::nullable("region", DataType::STRING));
-        Arc::new(StructType::try_new(fields).unwrap())
+        Arc::new(
+            try_schema! {
+                ..(complex.fields()),
+                nullable "region": STRING,
+            }
+            .unwrap(),
+        )
     }
 
     /// V3 create-table flow with the same schema for minimum and maximum feature sets.

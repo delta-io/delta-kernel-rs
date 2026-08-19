@@ -25,7 +25,7 @@ use crate::log_replay::HasSelectionVector;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
-use crate::schema::{schema_ref, DataType as KernelDataType, StructField, StructType};
+use crate::schema::{schema_ref, DataType as KernelDataType, StructField};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::Action;
@@ -1004,12 +1004,11 @@ pub(super) fn create_metadata_with_stats_config_and_partitions(
         Metadata::try_new(
             Some("test-table".into()),
             None,
-            StructType::new_unchecked([
-                StructField::nullable("id", KernelDataType::LONG),
-                StructField::nullable("name", KernelDataType::STRING),
-                StructField::nullable("category", KernelDataType::STRING),
-            ])
-            .into(),
+            schema_ref! {
+                nullable "id": LONG,
+                nullable "name": STRING,
+                nullable "category": STRING,
+            },
             partition_columns,
             0,
             config,
@@ -1269,10 +1268,10 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
     ]);
 
     // Version 0: schema WITHOUT __CHAR_VARCHAR_TYPE_STRING + add with stats
-    let schema_v0 = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", KernelDataType::LONG),
-        StructField::nullable("name", KernelDataType::STRING),
-    ]));
+    let schema_v0 = schema_ref! {
+        nullable "id": LONG,
+        nullable "name": STRING,
+    };
     write_commit_to_store(
         &store,
         vec![
@@ -1308,13 +1307,13 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
         .checkpoint(&engine, None)?;
 
     // Version 1: new metadata WITH __CHAR_VARCHAR_TYPE_STRING on the "name" field
-    let schema_v1 = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", KernelDataType::LONG),
-        StructField::nullable("name", KernelDataType::STRING).with_metadata([(
-            "__CHAR_VARCHAR_TYPE_STRING",
-            crate::schema::MetadataValue::String("varchar(255)".to_string()),
-        )]),
-    ]));
+    let schema_v1 = schema_ref! {
+        nullable "id": LONG,
+        (StructField::nullable("name", KernelDataType::STRING).with_metadata([(
+                "__CHAR_VARCHAR_TYPE_STRING",
+                crate::schema::MetadataValue::String("varchar(255)".to_string()),
+            )])),
+    };
     write_commit_to_store(
         &store,
         vec![Action::Metadata(

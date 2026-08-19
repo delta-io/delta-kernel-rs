@@ -195,9 +195,10 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::expressions::{
-        col, lit, ArrayData as KernelArrayData, Expression as KernelExpr, Predicate as KernelPred,
+        col, lit, null_lit, ArrayData as KernelArrayData, Expression as KernelExpr,
+        Predicate as KernelPred,
     };
-    use delta_kernel::schema::{ArrayType, DataType, StructField};
+    use delta_kernel::schema::{schema, ArrayType, DataType};
     use rstest::rstest;
 
     use super::*;
@@ -207,13 +208,12 @@ mod tests {
     /// Columns these tests resolve against: top-level `a`, `b`, `c` (all `long`) and `list`
     /// (an array of nullable `long`, the right-hand side of a list-column `IN`).
     fn test_schema() -> StructType {
-        StructType::try_new([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-            StructField::nullable("c", DataType::LONG),
-            StructField::nullable("list", ArrayType::new(DataType::LONG, true)),
-        ])
-        .unwrap()
+        schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "c": LONG,
+            nullable "list": [ nullable LONG ],
+        }
     }
 
     /// Lowers a predicate and returns its DataFusion `Display` string.
@@ -258,7 +258,7 @@ mod tests {
         let elements: Vec<KernelScalar> = values.into_iter().map(KernelScalar::Long).collect();
         let array =
             KernelArrayData::try_new(ArrayType::new(DataType::LONG, false), elements).unwrap();
-        KernelExpr::literal(KernelScalar::Array(array))
+        lit(KernelScalar::Array(array))
     }
 
     /// A literal `Scalar::Array` of longs where `None` becomes a null element.
@@ -272,7 +272,7 @@ mod tests {
             .collect();
         let array =
             KernelArrayData::try_new(ArrayType::new(DataType::LONG, true), elements).unwrap();
-        KernelExpr::literal(KernelScalar::Array(array))
+        lit(KernelScalar::Array(array))
     }
 
     // === Tests ===
@@ -307,7 +307,7 @@ mod tests {
     #[case::null_needle_in_list(
         KernelPred::binary(
             KernelBinaryPredicateOp::In,
-            KernelExpr::null_literal(DataType::LONG),
+            null_lit(DataType::LONG),
             long_array([1, 2]),
         ),
         "Int64(NULL) IN ([Int64(1), Int64(2)]) IS TRUE"
@@ -408,8 +408,8 @@ mod tests {
         let in_pred = KernelPred::binary(
             KernelBinaryPredicateOp::In,
             match needle {
-                Some(n) => KernelExpr::literal(n),
-                None => KernelExpr::null_literal(DataType::LONG),
+                Some(n) => lit(n),
+                None => null_lit(DataType::LONG),
             },
             nullable_long_array(elements.to_vec()),
         );
@@ -437,8 +437,8 @@ mod tests {
         let in_pred = KernelPred::binary(
             KernelBinaryPredicateOp::In,
             match needle {
-                Some(n) => KernelExpr::literal(n),
-                None => KernelExpr::null_literal(DataType::LONG),
+                Some(n) => lit(n),
+                None => null_lit(DataType::LONG),
             },
             col!("list"),
         );

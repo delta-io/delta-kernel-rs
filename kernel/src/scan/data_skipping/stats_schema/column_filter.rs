@@ -246,7 +246,7 @@ impl<'col> StatsColumnFilter<'col> {
 mod tests {
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::StructType;
+    use crate::schema::{schema, StructType};
     use crate::table_properties::TableProperties;
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {
@@ -267,11 +267,11 @@ mod tests {
 
     /// Standard 3-column schema for required column tests: a (LONG), b (STRING), c (INTEGER)
     fn abc_schema() -> StructType {
-        StructType::new_unchecked([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::STRING),
-            StructField::nullable("c", DataType::INTEGER),
-        ])
+        schema! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+            nullable "c": INTEGER,
+        }
     }
 
     /// Helper to run column collection and return results
@@ -361,28 +361,24 @@ mod tests {
         // Required column is deeply nested: user.address.city
         let required_cols = vec![column_name!("user.address.city")];
 
-        let address_struct = StructType::new_unchecked([
-            StructField::nullable("street", DataType::STRING),
-            StructField::nullable("city", DataType::STRING), // required column
-            StructField::nullable("zip", DataType::STRING),
-        ]);
-        let user_struct = StructType::new_unchecked([
-            StructField::nullable("name", DataType::STRING),
-            StructField::nullable("address", address_struct),
-        ]);
-        let other_struct = StructType::new_unchecked([
-            StructField::nullable("foo", DataType::STRING),
-            StructField::nullable("bar", DataType::STRING),
-        ]);
-
-        let schema = StructType::new_unchecked([
-            StructField::nullable("id", DataType::LONG),
-            StructField::nullable("name", DataType::STRING),
-            StructField::nullable("user", user_struct),
-            StructField::nullable("other", other_struct),
-            StructField::nullable("extra1", DataType::STRING),
-            StructField::nullable("extra2", DataType::STRING),
-        ]);
+        let schema = schema! {
+            nullable "id": LONG,
+            nullable "name": STRING,
+            nullable "user": {
+                nullable "name": STRING,
+                nullable "address": {
+                    nullable "street": STRING,
+                    nullable "city": STRING,
+                    nullable "zip": STRING,
+                },
+            },
+            nullable "other": {
+                nullable "foo": STRING,
+                nullable "bar": STRING,
+            },
+            nullable "extra1": STRING,
+            nullable "extra2": STRING,
+        };
 
         let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
 

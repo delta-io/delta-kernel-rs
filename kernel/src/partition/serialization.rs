@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn test_non_null_struct_returns_error() {
         let data = StructData::try_new(
-            vec![StructField::new("x", DataType::INTEGER, true)],
+            vec![StructField::nullable("x", DataType::INTEGER)],
             vec![Scalar::Integer(1)],
         )
         .unwrap();

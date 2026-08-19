@@ -154,50 +154,45 @@ mod tests {
 
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-        StructType,
+        schema, ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
 
     // === Schema builders for test cases ===
 
     fn simple_schema() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
+        schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        }
     }
 
     fn schema_with_underscores() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::new("col_1", DataType::INTEGER, false),
-            StructField::new("_private", DataType::STRING, true),
-            StructField::new("CamelCase123", DataType::LONG, false),
-        ])
+        schema! {
+            not_null "col_1": INTEGER,
+            nullable "_private": STRING,
+            not_null "CamelCase123": LONG,
+        }
     }
 
     fn schema_with_special_chars() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::new("my column", DataType::INTEGER, false),
-            StructField::new("col;name", DataType::STRING, true),
-        ])
+        schema! {
+            not_null "my column": INTEGER,
+            nullable "col;name": STRING,
+        }
     }
 
     fn schema_with_dot() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::new("a.b", DataType::INTEGER, false),
-            StructField::new("c", DataType::STRING, true),
-        ])
+        schema! {
+            not_null "a.b": INTEGER,
+            nullable "c": STRING,
+        }
     }
 
     fn schema_different_struct_children() -> StructType {
-        let inner_a =
-            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]);
-        let inner_b =
-            StructType::new_unchecked(vec![StructField::new("CHILD", DataType::STRING, true)]);
-        StructType::new_unchecked(vec![
-            StructField::new("a", inner_a, false),
-            StructField::new("b", inner_b, false),
-        ])
+        schema! {
+            not_null "a": { not_null "child": INTEGER },
+            not_null "b": { nullable "CHILD": STRING },
+        }
     }
 
     fn schema_with_space() -> StructType {
@@ -229,32 +224,30 @@ mod tests {
     }
 
     fn schema_top_level_dup() -> StructType {
-        let inner =
-            StructType::new_unchecked(vec![StructField::new("x", DataType::INTEGER, false)]);
+        let inner = StructType::new_unchecked(vec![StructField::not_null("x", DataType::INTEGER)]);
         StructType::new_unchecked(vec![
-            StructField::new("a", inner, false),
-            StructField::new("A", DataType::STRING, true),
+            StructField::not_null("a", inner),
+            StructField::nullable("A", DataType::STRING),
         ])
     }
 
     fn schema_array_dup() -> StructType {
         let inner = StructType::new_unchecked(vec![
-            StructField::new("x", DataType::INTEGER, false),
-            StructField::new("X", DataType::STRING, true),
+            StructField::not_null("x", DataType::INTEGER),
+            StructField::nullable("X", DataType::STRING),
         ]);
-        StructType::new_unchecked(vec![StructField::new(
+        StructType::new_unchecked(vec![StructField::not_null(
             "arr",
             ArrayType::new(inner, true),
-            false,
         )])
     }
 
     fn schema_multi_bad() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::new("good", DataType::INTEGER, false),
-            StructField::new("bad column", DataType::STRING, true),
-            StructField::new("col;name", DataType::LONG, false),
-        ])
+        schema! {
+            not_null "good": INTEGER,
+            nullable "bad column": STRING,
+            not_null "col;name": LONG,
+        }
     }
 
     // === Helpers for building invariants metadata ===
@@ -275,36 +268,34 @@ mod tests {
     }
 
     fn schema_top_level_invariant() -> StructType {
-        StructType::new_unchecked(vec![
-            field_with_invariant("x", DataType::INTEGER, true),
-            StructField::new("y", DataType::INTEGER, true),
-        ])
+        schema! {
+            (field_with_invariant("x", DataType::INTEGER, true)),
+            nullable "y": INTEGER,
+        }
     }
 
     fn schema_nested_invariant() -> StructType {
-        let inner =
-            StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
-        StructType::new_unchecked(vec![StructField::new("parent", inner, true)])
+        schema! {
+            nullable "parent": {
+                (field_with_invariant("child", DataType::INTEGER, true)),
+            },
+        }
     }
 
     fn schema_array_nested_invariant() -> StructType {
-        let inner =
-            StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
-        StructType::new_unchecked(vec![StructField::new(
-            "arr",
-            ArrayType::new(inner, true),
-            true,
-        )])
+        schema! {
+            nullable "arr": [ nullable {
+                (field_with_invariant("child", DataType::INTEGER, true)),
+            } ],
+        }
     }
 
     fn schema_map_nested_invariant() -> StructType {
-        let inner =
-            StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
-        StructType::new_unchecked(vec![StructField::new(
-            "map",
-            MapType::new(DataType::STRING, inner, true),
-            true,
-        )])
+        schema! {
+            nullable "map": { STRING => nullable {
+                (field_with_invariant("child", DataType::INTEGER, true)),
+            } },
+        }
     }
 
     // === Valid schemas ===
@@ -315,9 +306,9 @@ mod tests {
     #[case::special_chars_with_cm(schema_with_special_chars(), ColumnMappingMode::Name)]
     #[case::dot_in_name_with_cm(schema_with_dot(), ColumnMappingMode::Name)]
     #[case::different_struct_children(schema_different_struct_children(), ColumnMappingMode::None)]
-    #[case::empty_no_cm(StructType::new_unchecked(vec![]), ColumnMappingMode::None)]
-    #[case::empty_cm_name(StructType::new_unchecked(vec![]), ColumnMappingMode::Name)]
-    #[case::empty_cm_id(StructType::new_unchecked(vec![]), ColumnMappingMode::Id)]
+    #[case::empty_no_cm(schema! {}, ColumnMappingMode::None)]
+    #[case::empty_cm_name(schema! {}, ColumnMappingMode::Name)]
+    #[case::empty_cm_id(schema! {}, ColumnMappingMode::Id)]
     fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
         assert!(validate_schema(&schema, cm).is_ok());
     }
