@@ -610,7 +610,6 @@ impl ObjectStore for RestObjectStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let prefix = prefix.map(|p| p.as_ref().to_string()).unwrap_or_default();
-        // Both `list` and `list_with_offset` recurse; only `list_with_delimiter` is non-recursive.
         self.list_paginated(prefix, None, None, true)
     }
 
@@ -631,7 +630,7 @@ impl ObjectStore for RestObjectStore {
                 raw.to_string()
             }
         };
-        self.list_paginated(prefix, Some(offset_str), Some(offset.clone()), true)
+        self.list_paginated(prefix, Some(offset_str), Some(offset.clone()), false)
     }
 
     fn delete_stream(
