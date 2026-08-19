@@ -129,6 +129,9 @@ fn lower_project(
 /// a NULL key, the corresponding probe row is retained by a left semi join and excluded by a left
 /// anti join.
 ///
+/// Join keys with different types follow DataFusion's equality coercion. This can differ from
+/// `SyncPlanExecutor`, which compares type-specific Arrow row encodings without coercion.
+///
 /// # Errors
 /// Returns an error if the key counts differ, a key cannot be lowered, or DataFusion rejects the
 /// join.
@@ -172,8 +175,7 @@ fn lower_semi_join(
         NullEquality::NullEqualsNull,
         false,
     )?;
-    // Left semi and anti joins output only probe columns, so retain the probe schema. DataFusion
-    // validates and coerces join-key types during logical-plan analysis before physical execution.
+    // Left semi and anti joins output only probe columns, so retain the probe schema.
     join.schema = Arc::clone(probe.schema());
 
     Ok(DFLogicalPlan::Join(join))
@@ -198,7 +200,7 @@ fn lower_union_all(
     let schemas_match = inputs
         .iter()
         .skip(1)
-        .all(|input| input.schema() == first.schema());
+        .all(|input| input.schema().as_arrow() == first.schema().as_arrow());
     if !schemas_match {
         return Err(DataFusionError::Plan(
             "union_all requires all inputs to have the same schema".to_string(),
@@ -206,9 +208,7 @@ fn lower_union_all(
     }
 
     let union_inputs = inputs.iter().map(Arc::clone).collect();
-    let mut union = DFUnion::try_new(union_inputs)?;
-    // All input schemas agree, so retain the first one.
-    union.schema = Arc::clone(first.schema());
+    let union = DFUnion::try_new(union_inputs)?;
 
     Ok(DFLogicalPlan::Union(union))
 }
@@ -452,6 +452,16 @@ mod tests {
             .iter()
             .map(|field| field.data_type().clone())
             .collect()
+    }
+
+    fn qualified_input_with_schema(schema: StructType, qualifier: &str) -> Arc<DFLogicalPlan> {
+        Arc::new(
+            LogicalPlanBuilder::from(input_with_schema(schema))
+                .alias(qualifier)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
     }
 
     // === Values ===
@@ -2075,8 +2085,8 @@ mod tests {
     fn test_semi_join(inverted: bool) -> KernelSemiJoin {
         KernelSemiJoin {
             inverted,
-            probe_keys: vec![column_name!("a")],
-            build_keys: vec![column_name!("a")],
+            probe_keys: vec![column_name!("a"), column_name!("b")],
+            build_keys: vec![column_name!("a"), column_name!("b")],
         }
     }
 
@@ -2122,7 +2132,10 @@ mod tests {
         assert_eq!(join.join_constraint, JoinConstraint::On);
         assert_eq!(join.null_equality, NullEquality::NullEqualsNull);
         assert!(!join.null_aware);
-        assert_eq!(join.on, [(df_col("a"), df_col("a"))]);
+        assert_eq!(
+            join.on,
+            [(df_col("a"), df_col("a")), (df_col("b"), df_col("b")),]
+        );
         assert_eq!(join.schema.as_ref(), probe.schema().as_ref());
     }
 
@@ -2219,6 +2232,105 @@ mod tests {
             inverted,
             probe_keys: vec![column_name!("p")],
             build_keys: vec![column_name!("b")],
+        };
+
+        let lowered = lower_operator(
+            &KernelOperator::SemiJoin(semi_join),
+            &[Arc::clone(&probe), Arc::clone(&build)],
+        )
+        .unwrap();
+        let batches = execute(lowered).await.unwrap();
+        assert_batches_sorted_eq!(expected, &batches);
+    }
+
+    /// Inputs and expected outputs (row order is unspecified):
+    ///
+    /// ```text
+    /// probe                    build
+    /// p    | q    | v          b    | c
+    /// -----+------+---------   -----+-----
+    /// NULL | null | null-key   NULL | null
+    /// 1    | x    | one        1    | x
+    /// 2    | x    | cross      2    | y
+    /// 2    | y    | two
+    ///
+    /// semi output              anti output
+    /// p    | q    | v          p | q | v
+    /// -----+------+---------   --+---+------
+    /// NULL | null | null-key   2 | x | cross
+    /// 1    | x    | one
+    /// 2    | y    | two
+    /// ```
+    #[rstest]
+    #[case::semi(
+        false,
+        &[
+            "+---+------+----------+",
+            "| p | q    | v        |",
+            "+---+------+----------+",
+            "|   | null | null-key |",
+            "| 1 | x    | one      |",
+            "| 2 | y    | two      |",
+            "+---+------+----------+",
+        ]
+    )]
+    #[case::anti(
+        true,
+        &[
+            "+---+---+-------+",
+            "| p | q | v     |",
+            "+---+---+-------+",
+            "| 2 | x | cross |",
+            "+---+---+-------+",
+        ]
+    )]
+    #[tokio::test]
+    async fn semi_join_executes_multiple_keys_with_nulls_equal(
+        #[case] inverted: bool,
+        #[case] expected: &[&str],
+    ) {
+        let probe_schema = StructType::try_new([
+            StructField::nullable("p", DataType::LONG),
+            StructField::nullable("q", DataType::STRING),
+            StructField::nullable("v", DataType::STRING),
+        ])
+        .unwrap();
+        let build_schema = StructType::try_new([
+            StructField::nullable("b", DataType::LONG),
+            StructField::nullable("c", DataType::STRING),
+        ])
+        .unwrap();
+        let probe = Arc::new(
+            lower_values_node(
+                probe_schema,
+                vec![
+                    vec![
+                        KernelScalar::null(DataType::LONG),
+                        "null".into(),
+                        "null-key".into(),
+                    ],
+                    vec![1i64.into(), "x".into(), "one".into()],
+                    vec![2i64.into(), "x".into(), "cross".into()],
+                    vec![2i64.into(), "y".into(), "two".into()],
+                ],
+            )
+            .unwrap(),
+        );
+        let build = Arc::new(
+            lower_values_node(
+                build_schema,
+                vec![
+                    vec![KernelScalar::null(DataType::LONG), "null".into()],
+                    vec![1i64.into(), "x".into()],
+                    vec![2i64.into(), "y".into()],
+                ],
+            )
+            .unwrap(),
+        );
+        let semi_join = KernelSemiJoin {
+            inverted,
+            probe_keys: vec![column_name!("p"), column_name!("q")],
+            build_keys: vec![column_name!("b"), column_name!("c")],
         };
 
         let lowered = lower_operator(
@@ -2342,17 +2454,26 @@ mod tests {
     }
 
     #[test]
-    fn union_all_lowers_all_inputs_with_declared_schema() {
-        let first = input_with_schema(test_schema());
-        let second = input_with_schema(test_schema());
-        let third = input_with_schema(test_schema());
+    fn union_all_lowers_differently_qualified_inputs_to_unqualified_schema() {
+        let first = qualified_input_with_schema(test_schema(), "scan_json");
+        let second = qualified_input_with_schema(test_schema(), "scan_parquet");
+        let third = qualified_input_with_schema(test_schema(), "another_scan");
         let lowered = lower_operator(
             &KernelOperator::UnionAll(KernelUnionAll),
             &[Arc::clone(&first), Arc::clone(&second), Arc::clone(&third)],
         )
         .unwrap();
 
-        assert_eq!(lowered.schema(), first.schema());
+        assert_ne!(first.schema(), second.schema());
+        assert_eq!(first.schema().as_arrow(), second.schema().as_arrow());
+        assert!(
+            lowered
+                .schema()
+                .iter()
+                .all(|(qualifier, _)| qualifier.is_none()),
+            "union output must be unqualified"
+        );
+        assert_eq!(lowered.schema().as_arrow(), first.schema().as_arrow());
         let DFLogicalPlan::Union(union) = &lowered else {
             panic!("expected Union, got {lowered:?}");
         };
@@ -2360,7 +2481,6 @@ mod tests {
         assert!(Arc::ptr_eq(&union.inputs[0], &first));
         assert!(Arc::ptr_eq(&union.inputs[1], &second));
         assert!(Arc::ptr_eq(&union.inputs[2], &third));
-        assert_eq!(union.schema.as_ref(), first.schema().as_ref());
     }
 
     /// Inputs and expected output (row order is unspecified):
