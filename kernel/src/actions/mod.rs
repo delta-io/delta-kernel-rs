@@ -2960,6 +2960,25 @@ mod tests {
         Ok(())
     }
 
+    // The `contentRoot.version <= checkpointMetadata.version` invariant is enforced on the
+    // serialize path too, not just when parsing. `content_root_version_too_high` in visitors.rs
+    // covers the parse-path guard; this covers the `validate()` call inside `into_engine_data`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_into_engine_data_rejects_invalid_content_root_version() {
+        let base = sample_checkpoint_action();
+        let action = CheckpointAction {
+            content_root: ContentRoot {
+                version: base.version + 1,
+                ..base.content_root
+            },
+            ..sample_checkpoint_action()
+        };
+        let engine = ExprEngine::new();
+        let result = action.into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine);
+        assert_result_error_with_message(result, "exceeds checkpointMetadata.version");
+    }
+
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_checkpoint_action_wire_format() -> DeltaResult<()> {

@@ -1165,6 +1165,14 @@ mod tests {
         checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
         checkpoint_elements::METADATA,
     ], "checkpoint action is missing required `protocol` element")]
+    #[case::missing_content_root(&[
+        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::PROTOCOL,
+        checkpoint_elements::METADATA,
+    ], "checkpoint action is missing required `contentRoot` element")]
+    #[case::missing_metadata(&[
+        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
+        checkpoint_elements::PROTOCOL,
+    ], "checkpoint action is missing required `metaData` element")]
     // Empty `checkpoint: []` array -> the first required element checked (checkpointMetadata) is
     // reported missing.
     #[case::empty_array(&[], "checkpoint action is missing required `checkpointMetadata` element")]
