@@ -134,7 +134,7 @@ impl Transaction {
         self
     }
 
-    /// Applies schema changes in order before staging data-file actions.
+    /// Stages schema changes to be applied to be applied in this transaction.
     ///
     /// # Errors
     ///

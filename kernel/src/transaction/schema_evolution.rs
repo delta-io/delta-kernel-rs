@@ -248,6 +248,10 @@ pub(super) fn evolve_table_config(
     let schema = Arc::unwrap_or_clone(table_config.logical_schema());
     let column_mapping_mode = table_config.column_mapping_mode();
     let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+    // Whether the pre-alter schema already carried column-mapping metadata -- the only fact the
+    // strip below needs from it. Captured as a bool (not a clone) before
+    // `apply_schema_operations` consumes `schema` by value. Short-circuits outside
+    // `None` mode, where no strip fires.
     let current_has_cm = column_mapping_mode == ColumnMappingMode::None
         && schema_has_column_mapping_metadata(&schema);
     let SchemaEvolutionResult {
@@ -259,20 +263,33 @@ pub(super) fn evolve_table_config(
         column_mapping_mode,
         current_max_column_id,
     )?;
+
+    // Only in `None` mode: if this ALTER introduced column-mapping annotations into a table
+    // that was clean before it, strip them; residual annotations already present on the
+    // table are left in place (see `strip_stray_column_mapping_metadata`).
     let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
         strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
             .map_or(evolved_schema, Arc::new)
     } else {
         evolved_schema
     };
+
     let evolved_metadata = table_config
         .metadata()
         .clone()
         .with_schema(evolved_schema.clone())?
-        .fold_with(new_max_column_id, |metadata, id| {
-            metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+        .fold_with(new_max_column_id, |evolved_metadata, id| {
+            evolved_metadata
+                .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
         });
-    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
+
+    // Validates the evolved metadata against the protocol.
+    let evolved_table_config = TableConfiguration::try_new_with_schema(
+        table_config,
+        evolved_metadata,
+        evolved_schema,
+    )?;
+    Ok(evolved_table_config)
 }
 
 #[cfg(test)]

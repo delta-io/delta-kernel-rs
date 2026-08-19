@@ -2208,17 +2208,84 @@ mod tests {
 
         let snapshot = txn
             .with_schema_changes(vec![
-                fresh_column_operation(),
                 SchemaOperation::add_column(
-                    StructField::nullable("second_column", DataType::STRING),
+                    StructField::nullable("first_column", DataType::INTEGER),
                     ColumnName::new(Vec::<String>::new()),
-                ),
+                )
             ])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert!(snapshot.schema().contains("fresh_column"));
+
+        // A second transaction starts from the committed schema, so its own change must land on
+        // top of the first one rather than replacing or re-applying it.
+        let snapshot = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_schema_changes(vec![SchemaOperation::add_column(
+                StructField::nullable("second_column", DataType::STRING),
+                ColumnName::new(Vec::<String>::new()),
+            )])?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
 
         assert!(snapshot.schema().contains("fresh_column"));
         assert!(snapshot.schema().contains("second_column"));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_set_nullable_is_persisted_on_commit() -> DeltaResult<()> {
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+        ])?);
+        let snapshot = create_table("memory:///set_nullable", schema, "test")
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert!(!snapshot.schema().field("id").unwrap().is_nullable());
+
+        let snapshot = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_schema_changes(vec![SchemaOperation::set_nullable(column_name!("id"))])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        assert!(snapshot.schema().field("id").unwrap().is_nullable());
+        assert!(snapshot.schema().field("name").unwrap().is_nullable());
+        Ok(())
+    }
+
+    #[test]
+    fn schema_add_struct_then_nested_field_is_persisted_on_commit() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+        let snapshot = txn
+            .with_schema_changes(vec![
+                SchemaOperation::add_column(
+                    StructField::nullable("address", StructType::try_new(vec![])?),
+                    ColumnName::new(Vec::<String>::new()),
+                ),
+                SchemaOperation::add_column(
+                    StructField::nullable("city", DataType::STRING),
+                    column_name!("address"),
+                ),
+            ])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let schema = snapshot.schema();
+        let address = schema.field("address").unwrap();
+        let DataType::Struct(inner) = address.data_type() else {
+            panic!(
+                "expected address to be a struct, got {:?}",
+                address.data_type()
+            );
+        };
+        let city = inner.field("city").expect("city nested under address");
+        assert_eq!(city.data_type(), &DataType::STRING);
+        assert!(city.is_nullable());
         Ok(())
     }
 
