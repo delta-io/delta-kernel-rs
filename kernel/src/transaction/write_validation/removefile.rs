@@ -143,13 +143,32 @@ mod tests {
     fn duplicate_remove_paths_validate_selected_rows(
         #[case] selection_vector: &[bool],
         #[case] expected_error: Option<&str>,
+        #[values(false, true)] multiple_batches: bool,
     ) {
-        let batch = nullable_staged_remove_files(&["same", "same"], &[Some("dv-1"), Some("dv-2")]);
-        let removes = [FilteredEngineData::try_new(
-            Box::new(ArrowEngineData::new(batch)),
-            selection_vector.to_vec(),
-        )
-        .expect("valid remove-file selection vector")];
+        let removes = if multiple_batches {
+            selection_vector
+                .iter()
+                .zip(["dv-1", "dv-2"])
+                .map(|(&selected, dv_id)| {
+                    FilteredEngineData::try_new(
+                        Box::new(ArrowEngineData::new(nullable_staged_remove_file(
+                            "same",
+                            Some(dv_id),
+                        ))),
+                        vec![selected],
+                    )
+                    .expect("selection vector length should match staged RemoveFile row count")
+                })
+                .collect()
+        } else {
+            let batch =
+                nullable_staged_remove_files(&["same", "same"], &[Some("dv-1"), Some("dv-2")]);
+            vec![FilteredEngineData::try_new(
+                Box::new(ArrowEngineData::new(batch)),
+                selection_vector.to_vec(),
+            )
+            .expect("selection vector length should match staged RemoveFile row count")]
+        };
         let result = validate_remove_files(&removes);
 
         if let Some(expected_error) = expected_error {
@@ -244,7 +263,7 @@ mod tests {
             Box::new(ArrowEngineData::new(batch)),
             selection_vector.to_vec(),
         )
-        .expect("valid remove-file selection vector");
+        .expect("selection vector length should match staged RemoveFile row count");
         let mut removes = vec![
             all_rows_selected(nullable_staged_remove_file("default-path-0", None)),
             all_rows_selected(nullable_staged_remove_file("default-path-1", None)),

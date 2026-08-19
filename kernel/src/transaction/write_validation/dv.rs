@@ -12,9 +12,8 @@ use crate::expressions::column_name;
 use crate::scan::log_replay::{
     FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
-use crate::scan::scan_row_schema;
 use crate::schema::ColumnNamesAndTypes;
-use crate::transaction::update::NEW_DELETION_VECTOR_NAME;
+use crate::transaction::update::{intermediate_dv_schema, NEW_DELETION_VECTOR_NAME};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -36,7 +35,7 @@ const OFFSET_NAME: &str = "offset";
 
 static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTypes>> =
     LazyLock::new(|| {
-        let mut names = vec![
+        let names = vec![
             column_name!(PATH_NAME),
             column_name!(SIZE_NAME),
             column_name!(MODIFICATION_TIME_NAME),
@@ -44,26 +43,18 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesA
             column_name!(DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
             column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
             column_name!(DELETION_VECTOR_NAME, OFFSET_NAME),
+            column_name!(NEW_DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
+            column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
+            column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME),
         ];
-        // Derive types from the canonical scan schema so this projection stays compatible with scan
-        // metadata if those field definitions change.
-        let mut types = names
+        let types = names
             .iter()
             .map(|name| {
-                scan_row_schema()
+                intermediate_dv_schema()
                     .field_at(name)
                     .map(|field| field.data_type().clone())
             })
             .collect::<DeltaResult<Vec<_>>>()?;
-        // The transaction appends `newDeletionVector` after producing scan metadata, so it is
-        // absent from `scan_row_schema()`.
-        let new_deletion_vector_types = types[OLD_DELETION_VECTOR_STORAGE_TYPE..].to_vec();
-        names.extend([
-            column_name!(NEW_DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
-            column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
-            column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME),
-        ]);
-        types.extend(new_deletion_vector_types);
         Ok((names, types).into())
     });
 
@@ -123,7 +114,7 @@ impl Validation for DvMatchedFileFields<'_> {
 impl<'a> StagedDataValidator<'a> {
     /// Creates a validator for selected rows staged for deletion-vector updates.
     ///
-    /// Errors if the required columns are absent from the scan-row schema.
+    /// Errors if the required columns are absent from the intermediate DV schema.
     pub(crate) fn staged_dv_matched_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
         existing_file_actions: &'a mut FileActionTracker,
@@ -132,7 +123,7 @@ impl<'a> StagedDataValidator<'a> {
             .as_ref()
             .map_err(|error| {
                 Error::internal_error(format!(
-                    "DV validation columns must exist in the scan-row schema: {error}"
+                    "DV validation columns must exist in the intermediate DV schema: {error}"
                 ))
             })?;
         Ok(StagedDataValidator::new(
@@ -165,6 +156,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::column_name;
+    use crate::scan::scan_row_schema;
     use crate::schema::ToSchema;
     use crate::unit_test_utils::{
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_files,
@@ -233,7 +225,7 @@ mod tests {
     fn column_indices_match_schema_order() {
         let columns = DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
-            .expect("DV validation columns should exist in the scan-row schema");
+            .expect("DV validation columns should exist in the intermediate DV schema");
         let (names, _) = columns.as_ref();
         assert_eq!(names[PATH], column_name!(PATH_NAME));
         assert_eq!(names[SIZE], column_name!(SIZE_NAME));
@@ -294,7 +286,7 @@ mod tests {
         let mut file_actions = FileActionTracker::default();
         let result =
             StagedDataValidator::staged_dv_matched_file(std::iter::empty(), &mut file_actions)
-                .expect("DV validator should use the scan-row schema")
+                .expect("DV validator should use the intermediate DV schema")
                 .validate_filtered(&batches);
 
         if let Some(expected_error) = expected_error {
@@ -320,7 +312,7 @@ mod tests {
         )];
         let mut file_actions = FileActionTracker::default();
         StagedDataValidator::staged_dv_matched_file(std::iter::empty(), &mut file_actions)
-            .expect("DV validator should use the scan-row schema")
+            .expect("DV validator should use the intermediate DV schema")
             .validate_filtered(&batches)
             .expect("protocol-valid boundary value should be accepted");
     }
@@ -355,7 +347,7 @@ mod tests {
         let mut file_actions = FileActionTracker::default();
         assert_result_error_with_message(
             StagedDataValidator::staged_dv_matched_file(std::iter::empty(), &mut file_actions)
-                .expect("DV validator should use the scan-row schema")
+                .expect("DV validator should use the intermediate DV schema")
                 .validate_filtered(&batches),
             field,
         );
@@ -386,7 +378,7 @@ mod tests {
             ["p1".to_string(), "p2".to_string()],
             &mut file_actions,
         )
-        .expect("DV validator should use the scan-row schema")
+        .expect("DV validator should use the intermediate DV schema")
         .validate_filtered(&batches);
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
