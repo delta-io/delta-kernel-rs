@@ -1203,12 +1203,13 @@ async fn file_meta_timestamp() {
     let file_meta_ts = commit.location.last_modified;
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let read_table_config = table_config.clone();
     let scanner = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
         commit,
         &get_schema(),
-        &[],
+        &read_table_config,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1492,12 +1493,13 @@ async fn test_timestamp_with_ict_enabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let read_table_config = table_config.clone();
     let scanner = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
         commit,
         &get_schema(),
-        &[],
+        &read_table_config,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1544,12 +1546,13 @@ async fn test_timestamp_with_ict_disabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let read_table_config = table_config.clone();
     let scanner = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
         commit.clone(),
         &get_schema(),
-        &[],
+        &read_table_config,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1603,12 +1606,13 @@ async fn test_timestamp_with_commit_info_not_first() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let read_table_config = table_config.clone();
     let result = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
         commit,
         &get_schema(),
-        &[],
+        &read_table_config,
         CdfMode::ChangeDataFeed,
     );
 

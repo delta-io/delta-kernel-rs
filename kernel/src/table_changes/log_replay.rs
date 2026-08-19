@@ -20,7 +20,7 @@ use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
-use crate::table_changes::{ensure_partition_columns_unchanged, CdfMode};
+use crate::table_changes::{ensure_partition_columns_compatible, CdfMode};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
@@ -49,6 +49,7 @@ pub(crate) struct TableChangesScanMetadata {
 ///
 /// Note: The [`ParsedLogPath`]s in the `commit_files` iterator must be ordered, contiguous
 /// (JSON) commit files.
+#[cfg(test)]
 pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
@@ -56,10 +57,30 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    // The data-reading (`execute`) path always uses change-data-file semantics.
-    table_changes_action_iter_with_mode(
+    table_changes_action_iter_with_read_configuration(
         engine,
         start_table_configuration,
+        start_table_configuration,
+        commit_files,
+        table_schema,
+        physical_predicate,
+    )
+}
+
+/// Replays change-data-file actions using the supplied range-end table configuration.
+pub(crate) fn table_changes_action_iter_with_read_configuration(
+    engine: Arc<dyn Engine>,
+    start_table_configuration: &TableConfiguration,
+    read_table_configuration: &TableConfiguration,
+    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    table_schema: SchemaRef,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    // The data-reading (`execute`) path always uses change-data-file semantics.
+    table_changes_action_iter_with_mode_and_read_configuration(
+        engine,
+        start_table_configuration,
+        read_table_configuration,
         commit_files,
         table_schema,
         physical_predicate,
@@ -72,9 +93,31 @@ pub(crate) fn table_changes_action_iter(
 /// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
 /// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from
 /// row lineage in the data files referenced by `add` and `remove` actions.
+#[cfg(test)]
 pub(crate) fn table_changes_action_iter_with_mode(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
+    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    table_schema: SchemaRef,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    mode: CdfMode,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    table_changes_action_iter_with_mode_and_read_configuration(
+        engine,
+        start_table_configuration,
+        start_table_configuration,
+        commit_files,
+        table_schema,
+        physical_predicate,
+        mode,
+    )
+}
+
+/// Replays change-feed actions using the supplied range-end table configuration.
+pub(crate) fn table_changes_action_iter_with_mode_and_read_configuration(
+    engine: Arc<dyn Engine>,
+    start_table_configuration: &TableConfiguration,
+    read_table_configuration: &TableConfiguration,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
@@ -94,10 +137,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
         })
         .map(Arc::new);
 
-    let read_partition_columns = start_table_configuration
-        .metadata()
-        .partition_columns()
-        .to_vec();
+    let read_table_configuration = read_table_configuration.clone();
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
@@ -107,7 +147,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
                 &mut current_configuration,
                 commit_file,
                 &table_schema,
-                &read_partition_columns,
+                &read_table_configuration,
                 mode,
             )?;
             scanner.into_scan_batches(engine.clone(), filter.clone())
@@ -136,7 +176,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
 ///     - Ensure that schema updates satisfy the mode's compatibility policy. Change Data Feed mode
 ///       requires equality; row-tracking mode allows additive nullable columns and relaxed
 ///       nullability, but rejects datatype changes.
-///     - Ensure that partition columns remain unchanged in both modes.
+///     - When column mapping is enabled, ensure that ordered partition columns remain unchanged.
 ///     - Read the in-commit timestamp from `CommitInfo` when that feature is enabled.
 ///
 /// Note: We check the protocol, mode-specific table feature, schema compatibility, and partition
@@ -187,7 +227,7 @@ impl LogReplayScanner {
         table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
-        read_partition_columns: &[String],
+        read_table_configuration: &TableConfiguration,
         mode: CdfMode,
     ) -> DeltaResult<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
@@ -237,24 +277,6 @@ impl LogReplayScanner {
             let protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             let has_protocol_update = protocol_opt.is_some();
 
-            if let Some(ref metadata) = metadata_opt {
-                let schema = metadata.parse_schema()?;
-                // Compatibility is evaluated against the end version's logical schema.
-                require!(
-                    mode.schemas_compatible(&schema, table_schema.as_ref()),
-                    Error::change_data_feed_incompatible_schema_at_version(
-                        table_schema,
-                        &schema,
-                        commit_file.version
-                    )
-                );
-                ensure_partition_columns_unchanged(
-                    metadata.partition_columns(),
-                    read_partition_columns,
-                    commit_file.version,
-                )?;
-            }
-
             // Update table configuration with any new Protocol or Metadata from this commit
             if has_metadata_update || has_protocol_update {
                 *table_configuration = TableConfiguration::try_new_from(
@@ -284,6 +306,23 @@ impl LogReplayScanner {
             }
 
             if has_metadata_update {
+                // Compatibility is evaluated against the end version's logical schema.
+                require!(
+                    mode.schemas_compatible(
+                        table_configuration.logical_schema_ref().as_ref(),
+                        table_schema.as_ref()
+                    ),
+                    Error::change_data_feed_incompatible_schema_at_version(
+                        table_schema,
+                        table_configuration.logical_schema_ref().as_ref(),
+                        commit_file.version
+                    )
+                );
+                ensure_partition_columns_compatible(
+                    table_configuration,
+                    read_table_configuration,
+                    commit_file.version,
+                )?;
                 require!(
                     table_configuration.is_feature_enabled(&mode.required_feature()),
                     mode.feature_disabled_error(commit_file.version)

@@ -39,7 +39,7 @@
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
-use log_replay::table_changes_action_iter_with_mode;
+use log_replay::table_changes_action_iter_with_mode_and_read_configuration;
 use scan::TableChangesScanBuilder;
 use scan_file::scan_metadata_to_scan_file;
 use url::Url;
@@ -50,7 +50,7 @@ use crate::schema::compare::SchemaComparison as _;
 use crate::schema::{try_schema, DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{ColumnMappingMode, Operation, TableFeature};
 use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
@@ -144,16 +144,6 @@ impl CdfMode {
         self == CdfMode::ChangeDataFeed
     }
 
-    /// Returns the mode-specific error for incompatible range-boundary schemas.
-    pub(crate) fn boundary_schema_error(self, start: &StructType, end: &StructType) -> Error {
-        match self {
-            CdfMode::ChangeDataFeed => Error::generic(format!(
-                "Failed to build TableChanges: Start and end version schemas are different. Found start version schema {start:?} and end version schema {end:?}",
-            )),
-            CdfMode::RowTracking => Error::change_data_feed_incompatible_schema(end, start),
-        }
-    }
-
     /// Maps a reader-support failure on a protocol update to the mode-specific error.
     pub(crate) fn protocol_support_error(self, underlying: Error, version: Version) -> Error {
         match self {
@@ -199,7 +189,8 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///   schema equality.
 /// - [`TableChanges::try_new_row_tracking_cdf_listing`] requires row tracking to remain enabled. It
 ///   allows additive nullable columns and relaxed nullability, but rejects datatype changes.
-/// - Both paths require the partition columns to remain unchanged.
+/// - When column mapping is enabled, both paths require the ordered partition columns to remain
+///   unchanged.
 ///
 /// Construction validates the range boundaries. Intermediate metadata and protocol updates are
 /// validated when the transaction log is replayed by the scan or listing operation.
@@ -237,7 +228,9 @@ impl TableChanges {
     /// these properties:
     /// - The change data feed table feature must be enabled in both the start or end versions.
     /// - Every enabled reader feature must be supported by the kernel.
-    /// - The schemas and partition columns at the start and end versions are the same.
+    /// - The schemas at the start and end versions are compatible.
+    /// - When column mapping is enabled, the ordered partition columns at the start and end
+    ///   versions are the same.
     ///
     /// Note that this does not check that change data feed is enabled for every commit in the
     /// range. It also does not check that the schema and partition columns remain compatible for
@@ -326,24 +319,9 @@ impl TableChanges {
             end_version,
         )?;
 
-        // File actions expose partition values as maps, and remove partition values are optional.
-        // Load the preceding table metadata to validate the ordered partition layout at the first
-        // change version.
-        let (start_snapshot, previous_snapshot) =
-            if let Some(previous_version) = start_version.checked_sub(1) {
-                let previous_snapshot = Snapshot::builder_for(table_root.as_url().clone())
-                    .at_version(previous_version)
-                    .build(engine)?;
-                let start_snapshot = Snapshot::builder_from(previous_snapshot.clone())
-                    .at_version(start_version)
-                    .build(engine)?;
-                (start_snapshot, Some(previous_snapshot))
-            } else {
-                let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
-                    .at_version(start_version)
-                    .build(engine)?;
-                (start_snapshot, None)
-            };
+        let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
+            .at_version(start_version)
+            .build(engine)?;
         start_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
@@ -404,30 +382,16 @@ impl TableChanges {
         let start_schema = start_snapshot.schema();
         let end_schema = end_snapshot.schema();
         if !mode.schemas_compatible(start_schema.as_ref(), end_schema.as_ref()) {
-            return Err(mode.boundary_schema_error(start_schema.as_ref(), end_schema.as_ref()));
+            return Err(Error::change_data_feed_incompatible_schema(
+                end_schema.as_ref(),
+                start_schema.as_ref(),
+            ));
         }
-        let read_partition_columns = end_snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
-        ensure_partition_columns_unchanged(
-            start_snapshot
-                .table_configuration()
-                .metadata()
-                .partition_columns(),
-            read_partition_columns,
+        ensure_partition_columns_compatible(
+            start_snapshot.table_configuration(),
+            end_snapshot.table_configuration(),
             start_snapshot.version(),
         )?;
-        if let Some(previous_snapshot) = previous_snapshot {
-            ensure_partition_columns_unchanged(
-                previous_snapshot
-                    .table_configuration()
-                    .metadata()
-                    .partition_columns(),
-                read_partition_columns,
-                previous_snapshot.version(),
-            )?;
-        }
 
         let schema = try_schema! {
             ..(end_schema.fields()),
@@ -568,9 +532,10 @@ impl TableChanges {
 
         let commits = self.log_segment.listed.ascending_commit_files.clone();
         let schema = self.end_snapshot.schema();
-        let scan_metadata = table_changes_action_iter_with_mode(
+        let scan_metadata = table_changes_action_iter_with_mode_and_read_configuration(
             engine,
             &self.start_table_config,
+            self.end_snapshot.table_configuration(),
             commits,
             schema,
             None,
@@ -588,18 +553,24 @@ impl TableChanges {
     }
 }
 
-/// Ensures the partition columns at `version` match the range's read layout.
-fn ensure_partition_columns_unchanged(
-    partition_columns_at_version: &[String],
-    read_partition_columns: &[String],
+/// Ensures the partition layout at `version` is compatible with the range's read layout.
+fn ensure_partition_columns_compatible(
+    table_configuration: &TableConfiguration,
+    read_table_configuration: &TableConfiguration,
     version: Version,
 ) -> DeltaResult<()> {
-    if partition_columns_at_version != read_partition_columns {
-        return Err(Error::ChangeDataFeedIncompatiblePartitionColumns {
-            expected: read_partition_columns.to_vec(),
-            actual: partition_columns_at_version.to_vec(),
+    let column_mapping_involved = table_configuration.column_mapping_mode()
+        != ColumnMappingMode::None
+        || read_table_configuration.column_mapping_mode() != ColumnMappingMode::None;
+    if column_mapping_involved
+        && table_configuration.metadata().partition_columns()
+            != read_table_configuration.metadata().partition_columns()
+    {
+        return Err(Error::change_data_feed_incompatible_schema_at_version(
+            read_table_configuration.logical_schema_ref().as_ref(),
+            table_configuration.logical_schema_ref().as_ref(),
             version,
-        });
+        ));
     }
     Ok(())
 }
@@ -631,7 +602,7 @@ mod tests {
         assert_result_error_with_message, test_schema_flat_with_column_mapping, Action,
         LocalMockTable,
     };
-    use crate::{Engine, Error, Predicate};
+    use crate::{Engine, Error};
 
     fn listing_test_schema() -> Arc<StructType> {
         schema_ref! {
@@ -644,13 +615,17 @@ mod tests {
         mode: CdfMode,
         schema: Arc<StructType>,
         partition_columns: &[&str],
+        column_mapping_enabled: bool,
     ) -> Metadata {
-        let properties = match mode {
+        let mut properties = match mode {
             CdfMode::ChangeDataFeed => {
                 HashMap::from([(ENABLE_CHANGE_DATA_FEED.to_owned(), "true".to_owned())])
             }
             CdfMode::RowTracking => row_tracking_properties(),
         };
+        if column_mapping_enabled {
+            properties.insert(COLUMN_MAPPING_MODE.to_owned(), "name".to_owned());
+        }
         Metadata::try_new(
             None,
             None,
@@ -669,10 +644,25 @@ mod tests {
         mode: CdfMode,
         schema: Arc<StructType>,
         partition_columns: &[&str],
+        column_mapping_enabled: bool,
     ) -> [Action; 2] {
-        let protocol = match mode {
-            CdfMode::ChangeDataFeed => Protocol::try_new_legacy(1, 4).unwrap(),
-            CdfMode::RowTracking => row_tracking_protocol(),
+        let protocol = match (mode, column_mapping_enabled) {
+            (CdfMode::ChangeDataFeed, false) => Protocol::try_new_legacy(1, 4).unwrap(),
+            (CdfMode::RowTracking, false) => row_tracking_protocol(),
+            (CdfMode::ChangeDataFeed, true) => Protocol::try_new_modern(
+                [TableFeature::ColumnMapping],
+                [TableFeature::ColumnMapping, TableFeature::ChangeDataFeed],
+            )
+            .unwrap(),
+            (CdfMode::RowTracking, true) => Protocol::try_new_modern(
+                [TableFeature::ColumnMapping],
+                [
+                    TableFeature::ColumnMapping,
+                    TableFeature::RowTracking,
+                    TableFeature::DomainMetadata,
+                ],
+            )
+            .unwrap(),
         };
         [
             Action::Protocol(protocol),
@@ -680,37 +670,41 @@ mod tests {
                 mode,
                 schema,
                 partition_columns,
+                column_mapping_enabled,
             )),
         ]
     }
 
-    fn assert_incompatible_partition_columns<T>(
-        result: DeltaResult<T>,
-        expected: &[&str],
-        actual: &[&str],
-        version: Version,
-    ) {
+    fn assert_incompatible_schema_at_version<T>(result: DeltaResult<T>, version: Version) {
         let error = match result {
-            Ok(_) => panic!("expected incompatible partition columns"),
+            Ok(_) => panic!("expected an incompatible schema"),
             Err(error) => error,
         };
-        let expected: Vec<String> = expected.iter().map(|value| (*value).to_owned()).collect();
-        let actual: Vec<String> = actual.iter().map(|value| (*value).to_owned()).collect();
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "Change data feed encountered incompatible partition columns. Expected partition \
-                 columns {expected:?}, got partition columns {actual:?} at version {version}"
-            )
-        );
         assert!(matches!(
             error,
-            Error::ChangeDataFeedIncompatiblePartitionColumns {
-                expected: found_expected,
-                actual: found_actual,
-                version: found_version,
-            } if found_expected == expected && found_actual == actual && found_version == version
+            Error::ChangeDataFeedIncompatibleSchema(_, actual)
+                if actual.starts_with(&format!("schema at version {version}:"))
         ));
+    }
+
+    fn try_new_for_mode(
+        table_root: Url,
+        engine: &dyn Engine,
+        mode: CdfMode,
+        start_version: Version,
+        end_version: Version,
+    ) -> DeltaResult<TableChanges> {
+        match mode {
+            CdfMode::ChangeDataFeed => {
+                TableChanges::try_new(table_root, engine, start_version, Some(end_version))
+            }
+            CdfMode::RowTracking => TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine,
+                start_version,
+                Some(end_version),
+            ),
+        }
     }
 
     #[test]
@@ -745,15 +739,17 @@ mod tests {
         }
     }
     #[test]
-    fn schema_evolution_fails() {
+    fn schema_evolution_returns_incompatible_schema() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
-        let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }}, metadata_columns: {} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }}, metadata_columns: {} }";
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
-        assert!(matches!(table_changes_res, Err(Error::Generic(msg)) if msg == expected_msg));
+        assert!(matches!(
+            table_changes_res,
+            Err(Error::ChangeDataFeedIncompatibleSchema(_, _))
+        ));
     }
 
     #[test]
@@ -889,9 +885,10 @@ mod tests {
 
     #[rstest::rstest]
     #[case::added(&[], &["id"])]
+    #[case::removed(&["id"], &[])]
     #[case::reordered(&["id", "value"], &["value", "id"])]
     #[tokio::test]
-    async fn try_new_rejects_partition_column_change_at_range_boundary(
+    async fn try_new_allows_no_mapping_partition_column_changes(
         #[values(CdfMode::ChangeDataFeed, CdfMode::RowTracking)] mode: CdfMode,
         #[values(0, 1)] start_version: Version,
         #[case] initial_partition_columns: &[&str],
@@ -905,6 +902,7 @@ mod tests {
                 mode,
                 Arc::clone(&schema),
                 initial_partition_columns,
+                false,
             ))
             .await;
         mock_table
@@ -912,49 +910,156 @@ mod tests {
                 mode,
                 schema,
                 read_partition_columns,
+                false,
             ))])
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let result = match mode {
-            CdfMode::ChangeDataFeed => {
-                TableChanges::try_new(table_root, engine.as_ref(), start_version, Some(1))
-            }
-            CdfMode::RowTracking => TableChanges::try_new_row_tracking_cdf_listing(
-                table_root,
-                engine.as_ref(),
-                start_version,
-                Some(1),
-            ),
-        };
-        assert_incompatible_partition_columns(
-            result,
-            read_partition_columns,
-            initial_partition_columns,
-            0,
+        let result = try_new_for_mode(table_root, engine.as_ref(), mode, start_version, 1);
+        assert!(
+            result.is_ok(),
+            "no-mapping partition changes should be allowed: {result:?}"
         );
     }
 
     #[rstest::rstest]
-    #[case::change_data_feed(CdfMode::ChangeDataFeed, false)]
-    #[case::change_data_feed_false_predicate(CdfMode::ChangeDataFeed, true)]
-    #[case::row_tracking(CdfMode::RowTracking, false)]
     #[tokio::test]
-    async fn scan_handles_incompatible_intermediate_partition_columns(
-        #[case] mode: CdfMode,
-        #[case] false_predicate: bool,
+    async fn try_new_rejects_partition_column_type_changes_without_mapping(
+        #[values(CdfMode::ChangeDataFeed, CdfMode::RowTracking)] mode: CdfMode,
+    ) {
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let mut mock_table = LocalMockTable::new();
+        let initial_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ]));
+        let read_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("value", DataType::STRING),
+        ]));
+        mock_table
+            .commit(mode_setup_actions(mode, initial_schema, &["id"], false))
+            .await;
+        mock_table
+            .commit([Action::Metadata(metadata_with_partition_columns(
+                mode,
+                read_schema,
+                &["id"],
+                false,
+            ))])
+            .await;
+
+        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let result = try_new_for_mode(table_root, engine.as_ref(), mode, 0, 1);
+        assert!(
+            matches!(result, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
+            "expected a partition type change to be schema-incompatible, got {result:?}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::added(&[], &["id"])]
+    #[case::removed(&["id"], &[])]
+    #[case::reordered(&["id", "name"], &["name", "id"])]
+    #[tokio::test]
+    async fn try_new_rejects_mapped_partition_column_changes_within_range(
+        #[values(CdfMode::ChangeDataFeed, CdfMode::RowTracking)] mode: CdfMode,
+        #[case] initial_partition_columns: &[&str],
+        #[case] read_partition_columns: &[&str],
+    ) {
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let mut mock_table = LocalMockTable::new();
+        let schema = test_schema_flat_with_column_mapping();
+        mock_table
+            .commit(mode_setup_actions(
+                mode,
+                Arc::clone(&schema),
+                initial_partition_columns,
+                true,
+            ))
+            .await;
+        mock_table
+            .commit([Action::Metadata(metadata_with_partition_columns(
+                mode,
+                schema,
+                read_partition_columns,
+                true,
+            ))])
+            .await;
+
+        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let result = try_new_for_mode(table_root, engine.as_ref(), mode, 0, 1);
+        assert!(
+            matches!(result, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
+            "expected a mapped partition change to be schema-incompatible, got {result:?}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::added(&[], &["id"])]
+    #[case::removed(&["id"], &[])]
+    #[case::reordered(&["id", "name"], &["name", "id"])]
+    #[tokio::test]
+    async fn scan_allows_mapped_partition_column_change_at_start(
+        #[values(CdfMode::ChangeDataFeed, CdfMode::RowTracking)] mode: CdfMode,
+        #[case] initial_partition_columns: &[&str],
+        #[case] read_partition_columns: &[&str],
+    ) {
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let mut mock_table = LocalMockTable::new();
+        let schema = test_schema_flat_with_column_mapping();
+        mock_table
+            .commit(mode_setup_actions(
+                mode,
+                Arc::clone(&schema),
+                initial_partition_columns,
+                true,
+            ))
+            .await;
+        mock_table
+            .commit([Action::Metadata(metadata_with_partition_columns(
+                mode,
+                schema,
+                read_partition_columns,
+                true,
+            ))])
+            .await;
+
+        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let table_changes = try_new_for_mode(table_root, engine.as_ref(), mode, 1, 1).unwrap();
+        match mode {
+            CdfMode::ChangeDataFeed => {
+                let scan = table_changes.into_scan_builder().build().unwrap();
+                let result: DeltaResult<Vec<_>> = scan.execute(engine).unwrap().try_collect();
+                assert!(result.unwrap().is_empty());
+            }
+            CdfMode::RowTracking => {
+                let result: DeltaResult<Vec<_>> = Arc::new(table_changes)
+                    .scan_file_listing(engine, TableChangesListingMode::AllChanges)
+                    .unwrap()
+                    .try_collect();
+                assert!(result.unwrap().is_empty());
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn scan_allows_intermediate_no_mapping_partition_column_changes(
+        #[values(CdfMode::ChangeDataFeed, CdfMode::RowTracking)] mode: CdfMode,
     ) {
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
         let schema = listing_test_schema();
         mock_table
-            .commit(mode_setup_actions(mode, Arc::clone(&schema), &[]))
+            .commit(mode_setup_actions(mode, Arc::clone(&schema), &[], false))
             .await;
         mock_table
             .commit([Action::Metadata(metadata_with_partition_columns(
                 mode,
                 Arc::clone(&schema),
                 &["id"],
+                false,
             ))])
             .await;
         mock_table
@@ -962,45 +1067,69 @@ mod tests {
                 mode,
                 schema,
                 &[],
+                false,
             ))])
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let table_changes = try_new_for_mode(table_root, engine.as_ref(), mode, 0, 2).unwrap();
         match mode {
             CdfMode::ChangeDataFeed => {
-                let builder = TableChanges::try_new(table_root, engine.as_ref(), 0, Some(2))
-                    .unwrap()
-                    .into_scan_builder();
-                let builder = if false_predicate {
-                    builder.with_predicate(Arc::new(Predicate::FALSE))
-                } else {
-                    builder
-                };
-                let scan = builder.build().unwrap();
+                let scan = table_changes.into_scan_builder().build().unwrap();
                 let result: DeltaResult<Vec<_>> = scan.execute(engine).unwrap().try_collect();
-                if false_predicate {
-                    assert!(result.unwrap().is_empty());
-                } else {
-                    assert_incompatible_partition_columns(result, &[], &["id"], 1);
-                }
+                assert!(result.unwrap().is_empty());
             }
             CdfMode::RowTracking => {
-                let table_changes = Arc::new(
-                    TableChanges::try_new_row_tracking_cdf_listing(
-                        table_root,
-                        engine.as_ref(),
-                        0,
-                        Some(2),
-                    )
-                    .unwrap(),
-                );
-                assert_incompatible_partition_columns(
-                    table_changes.scan_file_listing(engine, TableChangesListingMode::AllChanges),
-                    &[],
-                    &["id"],
-                    1,
-                );
+                let result: DeltaResult<Vec<_>> = Arc::new(table_changes)
+                    .scan_file_listing(engine, TableChangesListingMode::AllChanges)
+                    .unwrap()
+                    .try_collect();
+                assert!(result.unwrap().is_empty());
             }
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn scan_rejects_intermediate_mapped_partition_column_changes(
+        #[values(CdfMode::ChangeDataFeed, CdfMode::RowTracking)] mode: CdfMode,
+    ) {
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let mut mock_table = LocalMockTable::new();
+        let schema = test_schema_flat_with_column_mapping();
+        mock_table
+            .commit(mode_setup_actions(mode, Arc::clone(&schema), &[], true))
+            .await;
+        mock_table
+            .commit([Action::Metadata(metadata_with_partition_columns(
+                mode,
+                Arc::clone(&schema),
+                &["id"],
+                true,
+            ))])
+            .await;
+        mock_table
+            .commit([Action::Metadata(metadata_with_partition_columns(
+                mode,
+                schema,
+                &[],
+                true,
+            ))])
+            .await;
+
+        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let table_changes = try_new_for_mode(table_root, engine.as_ref(), mode, 0, 2).unwrap();
+        match mode {
+            CdfMode::ChangeDataFeed => {
+                let scan = table_changes.into_scan_builder().build().unwrap();
+                let result: DeltaResult<Vec<_>> = scan.execute(engine).unwrap().try_collect();
+                assert_incompatible_schema_at_version(result, 1);
+            }
+            CdfMode::RowTracking => assert_incompatible_schema_at_version(
+                Arc::new(table_changes)
+                    .scan_file_listing(engine, TableChangesListingMode::AllChanges),
+                1,
+            ),
         }
     }
 

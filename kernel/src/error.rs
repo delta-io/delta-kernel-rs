@@ -312,20 +312,6 @@ pub enum Error {
     #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
     ChangeDataFeedIncompatibleSchema(String, String),
 
-    /// Partition columns are incompatible with the layout used to read a change feed.
-    #[error(
-        "Change data feed encountered incompatible partition columns. Expected partition columns \
-         {expected:?}, got partition columns {actual:?} at version {version}"
-    )]
-    ChangeDataFeedIncompatiblePartitionColumns {
-        /// Partition columns used to read the change feed.
-        expected: Vec<String>,
-        /// Incompatible partition columns found in the table history.
-        actual: Vec<String>,
-        /// Table version containing the incompatible partition columns.
-        version: Version,
-    },
-
     /// Invalid checkpoint files
     #[error("Invalid Checkpoint: {0}")]
     InvalidCheckpoint(String),
