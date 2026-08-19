@@ -1,0 +1,23 @@
+Reading table at ../../../../kernel/tests/data/table-with-dv-small/
+version: 1
+
+Schema:
+└─ value: integer
+
+Column defaults:
+  declared: no
+  to materialize before writing:
+    (0 total)
+  by field:
+    value: (no default)
+
+value:  [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8
+]

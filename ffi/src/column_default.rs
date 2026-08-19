@@ -8,8 +8,9 @@
 //! snapshot_has_column_defaults(snapshot)                 // optional cheap branch
 //! transaction(path, engine)
 //! transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)
-//!         // Literal  -> use parsed_value
-//!         // NonLiteral -> evaluate raw_sql with the engine's own SQL evaluator
+//!         // branch on `kind`, never on whether parsed_value is present:
+//!         //   Literal    -> use parsed_value, falling back to raw_sql when it is empty
+//!         //   NonLiteral -> evaluate raw_sql with the engine's own SQL evaluator
 //! transaction_ack_column_defaults(txn)                   // REQUIRED before a write context
 //! get_unpartitioned_write_context(txn, engine)           // errors before the ack
 //! ```
@@ -28,10 +29,19 @@
 //! at the column's scale (`4.95`), dates as `YYYY-MM-DD`, timestamps as ISO-8601, booleans as
 //! `true` / `false`.
 //!
-//! That encoding has no representation for a NULL, an empty string, or empty binary, so a literal
-//! of any of those three carries **no** parsed value (a NULL pointer from the getter, an empty
-//! slice in the visitor) even though `kind` is [`CColumnDefaultKind::Literal`]. `raw_sql`
-//! distinguishes them: `NULL` vs `''` vs `X''`.
+//! Not every literal survives that encoding, so a [`CColumnDefaultKind::Literal`] may carry **no**
+//! parsed value at all (a NULL pointer from the getter, an empty slice in the visitor). Two
+//! families do this:
+//!
+//! - the encoding has no representation for a NULL, an empty string, or empty binary
+//! - the encoding is fallible, and non-UTF-8 binary (`X'DEADBEEF'`) is protocol-legal but
+//!   unencodable; out-of-range dates and timestamps are the same class, though the kernel's SQL
+//!   parser cannot produce those from a default
+//!
+//! Either way the caller falls back to `raw_sql`, which distinguishes the cases (`NULL` vs `''` vs
+//! `X''` vs `X'DEADBEEF'`). An unencodable literal is deliberately not an error: reporting it with
+//! no parsed value keeps one awkward column from denying the caller every other default on the
+//! table. So branch on `kind`, never on whether a parsed value is present.
 //!
 //! [`DataType`]: delta_kernel::schema::DataType
 //! [`serialize_partition_value`]: delta_kernel::partition::serialization::serialize_partition_value
@@ -68,17 +78,28 @@ pub enum CColumnDefaultKind {
 impl CColumnDefaultKind {
     /// Renders `column_default` as the FFI kind tag plus the literal's serialized text.
     ///
-    /// The text is `None` for a non-literal default, and also for a literal the protocol
-    /// serializes to nothing -- see [Parsed-value encoding](self#parsed-value-encoding).
+    /// The text is `None` for a non-literal default, and for any literal the protocol cannot
+    /// serialize -- see [Parsed-value encoding](self#parsed-value-encoding). A serialization
+    /// failure is deliberately NOT an error: it degrades to "no parsed value" so one awkward
+    /// literal cannot deny the caller every other default on the table.
     ///
     /// # Errors
     ///
-    /// Propagates any error from [`ColumnDefault::to_scalar`] or from serializing the literal.
+    /// Propagates any error from [`ColumnDefault::to_scalar`].
     fn render(column_default: &ColumnDefault<'_>) -> DeltaResult<(Self, Option<String>)> {
-        Ok(match column_default.to_scalar()? {
-            Some(scalar) => (Self::Literal, serialize_partition_value(&scalar)?),
-            None => (Self::NonLiteral, None),
-        })
+        let Some(scalar) = column_default.to_scalar()? else {
+            return Ok((Self::NonLiteral, None));
+        };
+        let parsed = serialize_partition_value(&scalar)
+            .inspect_err(|e| {
+                tracing::debug!(
+                    "column default {:?} parsed to a literal the protocol cannot serialize \
+                     ({e}); reporting it with no parsed value",
+                    column_default.raw_sql()
+                )
+            })
+            .unwrap_or_default();
+        Ok((Self::Literal, parsed))
     }
 }
 
@@ -89,11 +110,12 @@ impl CColumnDefaultKind {
 pub struct KernelColumnDefault {
     /// The `CURRENT_DEFAULT` metadata verbatim, as the table author wrote it.
     pub raw_sql: NullableCvoid,
-    /// Whether the kernel parsed `raw_sql` into a literal.
+    /// Whether the kernel parsed `raw_sql` into a literal. This -- not whether `parsed_value` is
+    /// present -- is the authoritative signal.
     pub kind: CColumnDefaultKind,
     /// The parsed literal, encoded as described in the [module
     /// docs](self#parsed-value-encoding). NULL for a non-literal default, and also for a literal
-    /// with no serialized form (NULL, the empty string, empty binary) -- read `raw_sql` then.
+    /// the encoding cannot represent; read `raw_sql` then.
     pub parsed_value: NullableCvoid,
 }
 
@@ -108,13 +130,20 @@ pub struct KernelColumnDefault {
 /// The returned [`KernelColumnDefault`]'s strings are allocated with `allocate_fn` and owned by the
 /// caller.
 ///
-/// Returns an error if `field_path` does not resolve to a field of `schema`, if the field's
-/// `CURRENT_DEFAULT` metadata is malformed, or if a parsed literal cannot be serialized.
+/// Unlike [`transaction_visit_top_level_column_defaults`], this applies no feature or nesting
+/// filter: it reports whatever the field declares, including a nested field's default and orphaned
+/// metadata the write path never surfaces. That makes it the only way to read a nested default,
+/// but it does NOT mean the write path will honor what it returns.
+///
+/// Returns an error if `field_path` does not resolve to a field of `schema`, or if the field's
+/// `CURRENT_DEFAULT` metadata is malformed. A literal the protocol cannot serialize is not an
+/// error -- it comes back with a NULL `parsed_value`.
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing valid schema and engine handles and a valid `field_path`
-/// slice.
+/// slice. Both handles are BORROWED, not consumed: keep using them afterward and free them as
+/// usual.
 #[no_mangle]
 pub unsafe extern "C" fn schema_field_column_default(
     schema: Handle<SharedSchema>,
@@ -157,9 +186,13 @@ fn schema_field_column_default_impl(
 /// therefore a conservative pre-check -- when it returns `false`, no write needs
 /// [`transaction_ack_column_defaults`]; when it returns `true`, the ack may still be unnecessary.
 ///
+/// Being schema-wide, this is the right signal for whether to acknowledge; the count from
+/// [`transaction_visit_top_level_column_defaults`] is not, because it omits nested defaults that
+/// nonetheless trip the gate.
+///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid snapshot handle.
+/// Caller is responsible for passing a valid snapshot handle. The handle is BORROWED, not consumed.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_has_column_defaults(snapshot: Handle<SharedSnapshot>) -> bool {
     let snapshot = unsafe { snapshot.as_ref() };
@@ -170,13 +203,15 @@ pub unsafe extern "C" fn snapshot_has_column_defaults(snapshot: Handle<SharedSna
 /// files.
 ///
 /// Required before requesting a write context for a table that enables `allowColumnDefaults` and
-/// declares at least one default; without it, write-context creation fails. Visiting the defaults
-/// does not imply the acknowledgement. Records the responsibility only -- the kernel never applies
-/// a default itself.
+/// declares at least one default anywhere in its schema; without it, write-context creation fails.
+/// Visiting the defaults does not imply the acknowledgement. Records the responsibility only -- the
+/// kernel never applies a default itself.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid transaction handle.
+/// Caller is responsible for passing a valid transaction handle. The handle is BORROWED and mutated
+/// in place: unlike the `with_*` builders it does NOT consume the handle, so keep using `txn`
+/// afterward and free it as usual.
 #[no_mangle]
 pub unsafe extern "C" fn transaction_ack_column_defaults(mut txn: Handle<ExclusiveTransaction>) {
     let txn = unsafe { txn.as_mut() };
@@ -187,9 +222,9 @@ pub unsafe extern "C" fn transaction_ack_column_defaults(mut txn: Handle<Exclusi
 /// [`transaction_visit_top_level_column_defaults`].
 ///
 /// `parsed_value` carries the encoding described in the [module docs](self#parsed-value-encoding),
-/// and is an empty slice for a non-literal default as well as for a literal with no serialized form
-/// (NULL, the empty string, empty binary) -- read `raw_sql` then. All slices are only valid for the
-/// duration of the call; copy anything the engine needs to keep.
+/// and is an empty slice for a non-literal default as well as for a literal the encoding cannot
+/// represent -- read `raw_sql` then, and branch on `kind` rather than on emptiness. All slices are
+/// only valid for the duration of the call; copy anything the engine needs to keep.
 pub type ColumnDefaultVisitor = extern "C" fn(
     engine_context: NullableCvoid,
     name: KernelStringSlice,
@@ -202,20 +237,31 @@ pub type ColumnDefaultVisitor = extern "C" fn(
 /// how many there were.
 ///
 /// Entries are visited in sorted name order, so the callback sequence is deterministic across runs.
-/// Nested defaults are not visited (a kernel limitation), and neither are defaults on a table that
-/// does not enable `allowColumnDefaults` -- both cases simply produce fewer callbacks. A table with
-/// no visitable default yields no callbacks and returns `0`.
+/// Nested defaults are not visited (a kernel limitation, tracked by delta-kernel-rs issue #2630),
+/// and neither are defaults on a table that does not enable `allowColumnDefaults` -- both cases
+/// simply produce fewer callbacks. A table with no visitable default yields no callbacks and
+/// returns `0`.
 ///
 /// This does not acknowledge the defaults; call [`transaction_ack_column_defaults`] for that.
 ///
-/// Returns an error if the kernel parsed a default into something other than a literal, or if a
-/// parsed literal cannot be serialized.
+/// A `0` return does NOT mean the acknowledgement is unnecessary. The kernel's write-context gate
+/// keys on the whole schema, so a table whose only default sits on a nested field returns `0` here
+/// and still refuses a write context until the ack. Use [`snapshot_has_column_defaults`], which is
+/// likewise schema-wide, to decide whether to acknowledge. Note that acknowledging such a table
+/// lets the write proceed while its nested default goes unapplied -- this surface cannot report
+/// that default's value (again #2630), so use [`schema_field_column_default`] to read it.
+///
+/// Returns an error if the kernel parsed a default into something other than a literal. A literal
+/// the protocol cannot serialize is not an error -- it is reported with an empty `parsed_value`. On
+/// error the callback may already have fired for earlier entries and no count is returned, so
+/// discard whatever partial state was collected.
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing valid transaction and engine handles, a valid
 /// `engine_context` pointer passed through to each `visitor` invocation, and a valid `visitor`
-/// function pointer.
+/// function pointer. Both handles are BORROWED, not consumed: keep using them afterward and free
+/// them as usual.
 #[no_mangle]
 pub unsafe extern "C" fn transaction_visit_top_level_column_defaults(
     txn: Handle<ExclusiveTransaction>,
@@ -277,8 +323,9 @@ mod tests {
     use crate::transaction::{free_transaction, transaction};
     use crate::{free_engine, free_schema, free_snapshot};
 
-    /// The hand-authored fixture whose schema declares one literal string default, one
-    /// non-literal default, and one literal decimal default (plus an `id` column with none).
+    /// The hand-authored fixture, whose schema declares a literal string default, a literal decimal
+    /// default, a non-literal default, and a literal the protocol cannot serialize (non-UTF-8
+    /// binary) -- plus an `id` column with no default at all.
     const FIXTURE: &str = "../kernel/tests/data/table-with-column-defaults/";
     /// A table that enables `deletionVectors` and declares no column default.
     const FIXTURE_NO_DEFAULTS: &str = "../kernel/tests/data/table-with-dv-small/";
@@ -359,9 +406,9 @@ mod tests {
         )])
     }
 
-    /// The schema the per-field getter tests probe: a literal default, a literal with no
-    /// serialized form, a non-literal default, a field with no default, a malformed (non-string)
-    /// default, and a nested default.
+    /// The schema the per-field getter tests probe: a serializable literal, every flavor of literal
+    /// the protocol cannot serialize, a non-literal default, a field with no default, a malformed
+    /// (non-string) default, and a nested default.
     fn getter_schema() -> Handle<SharedSchema> {
         let nested = StructType::try_new([field_with_default(
             "inner",
@@ -380,6 +427,21 @@ mod tests {
                 "null_literal",
                 DataType::INTEGER,
                 MetadataValue::String("NULL".to_string()),
+            ),
+            field_with_default(
+                "empty_string_literal",
+                DataType::STRING,
+                MetadataValue::String("''".to_string()),
+            ),
+            field_with_default(
+                "empty_binary_literal",
+                DataType::BINARY,
+                MetadataValue::String("X''".to_string()),
+            ),
+            field_with_default(
+                "unencodable_binary_literal",
+                DataType::BINARY,
+                MetadataValue::String("X'DEADBEEF'".to_string()),
             ),
             field_with_default(
                 "non_literal",
@@ -413,10 +475,24 @@ mod tests {
         "literal",
         Some(("'pending'".to_string(), CColumnDefaultKind::Literal, Some("pending".to_string())))
     )]
-    // A NULL literal has no serialized form, so it is a `Literal` carrying no `parsed_value`.
+    // Every literal the protocol cannot serialize stays a `Literal` and carries no `parsed_value`,
+    // whether the encoding simply has no representation for it (NULL, `''`, `X''`) or outright
+    // fails (non-UTF-8 binary). In all four cases `raw_sql` is what tells them apart.
     #[case::null_literal(
         "null_literal",
         Some(("NULL".to_string(), CColumnDefaultKind::Literal, None))
+    )]
+    #[case::empty_string_literal(
+        "empty_string_literal",
+        Some(("''".to_string(), CColumnDefaultKind::Literal, None))
+    )]
+    #[case::empty_binary_literal(
+        "empty_binary_literal",
+        Some(("X''".to_string(), CColumnDefaultKind::Literal, None))
+    )]
+    #[case::unencodable_binary_literal(
+        "unencodable_binary_literal",
+        Some(("X'DEADBEEF'".to_string(), CColumnDefaultKind::Literal, None))
     )]
     #[case::non_literal(
         "non_literal",
@@ -491,11 +567,14 @@ mod tests {
         unsafe { free_engine(engine) };
     }
 
+    /// The fixture's `tag` column (`X'DEADBEEF'`) is the regression guard: an unencodable literal
+    /// must degrade to an empty `parsed_value` rather than abort the visit, which would otherwise
+    /// deny the caller the three defaults sorted after it.
     #[test]
     fn visit_reports_every_top_level_default_in_sorted_order() {
         let (count, visited) = visit_defaults_of(FIXTURE);
 
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
         assert_eq!(
             visited,
             vec![
@@ -510,6 +589,12 @@ mod tests {
                     raw_sql: "'pending'".to_string(),
                     kind: CColumnDefaultKind::Literal,
                     parsed_value: "pending".to_string(),
+                },
+                VisitedDefault {
+                    name: "tag".to_string(),
+                    raw_sql: "X'DEADBEEF'".to_string(),
+                    kind: CColumnDefaultKind::Literal,
+                    parsed_value: String::new(),
                 },
                 VisitedDefault {
                     name: "ts".to_string(),

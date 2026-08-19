@@ -155,22 +155,39 @@ defaults but never materializes them, so the connector fills every omitted colum
 snapshot_has_column_defaults(snapshot)   // schema-only pre-check; true for orphaned metadata too
 transaction()
   -> transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)  // -> count
-       // per entry: name, raw_sql, CColumnDefaultKind, parsed_value (empty when NonLiteral)
+       // per entry: name, raw_sql, CColumnDefaultKind, parsed_value (may be empty -- see below)
        // visited in sorted name order; nested and feature-disabled defaults are not visited
   -> transaction_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
                                             // KernelError::InvalidTransactionStateError
   -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
 ```
 
+All four entry points BORROW their handles -- none consumes one, unlike the `with_*` transaction
+builders.
+
 `schema_field_column_default` reads one field's default by dot-separated path, returning
 `OptionalValue<KernelColumnDefault>` by value (`None` when the field declares no default; an error
-when the path does not resolve). Its `raw_sql` / `parsed_value` strings are engine-allocated and
-caller-owned. The column's `DataType` is never carried: the engine joins on the field name against
-the schema it already received from `visit_schema`. A literal's `parsed_value` uses the protocol's
-partition-value serialization (the same encoding as `visit_partition_values`), which has no
-representation for NULL / the empty string / empty binary -- those come across as a `Literal` with
-*no* `parsed_value`, and `raw_sql` disambiguates. `ffi/examples/read-table -d` prints the whole
-surface; its ctest is `read_and_print_column_defaults`.
+when the path does not resolve). It applies no feature or nesting filter, so it is the only way to
+read a *nested* default -- but it also reports orphaned metadata the write path ignores. Its
+`raw_sql` / `parsed_value` strings are engine-allocated and caller-owned. The column's `DataType` is
+never carried: the engine joins on the field name against the schema it already received from
+`visit_schema`.
+
+Two contracts are easy to get wrong:
+
+- **`parsed_value` may be empty on a `Literal`.** It uses the protocol's partition-value
+  serialization (the same encoding as `visit_partition_values`), which has no representation for
+  NULL / the empty string / empty binary and outright fails on non-UTF-8 binary (`X'DEADBEEF'`, which
+  is protocol-legal). All of those come back as a `Literal` with no `parsed_value`; `raw_sql`
+  disambiguates. An unencodable literal is deliberately not an error, so one awkward column cannot
+  deny the caller the rest of the table's defaults. Branch on `kind`, never on emptiness.
+- **A visit count of `0` does not mean the ack is unnecessary.** The kernel's gate is schema-wide, so
+  a table whose only default is nested returns `0` here and still refuses a write context until
+  `transaction_ack_column_defaults`. Use `snapshot_has_column_defaults` (also schema-wide) to decide.
+  Nested defaults are not surfaced by the visitor at all (kernel issue #2630).
+
+`ffi/examples/read-table -d` prints the whole surface; its ctests are
+`read_and_print_column_defaults` and `read_and_print_no_column_defaults`.
 
 Deletion vector update flow:
 

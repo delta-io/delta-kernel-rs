@@ -386,8 +386,12 @@ impl Snapshot {
     /// declared without the `allowColumnDefaults` writer feature). Connectors use it as a cheap
     /// pre-check before the write-path column-default APIs
     /// ([`Transaction::top_level_column_defaults`] and
-    /// [`Transaction::ack_column_defaults`](crate::transaction::Transaction::ack_column_defaults)),
-    /// which apply the feature check themselves.
+    /// [`Transaction::ack_column_defaults`](crate::transaction::Transaction::ack_column_defaults)).
+    /// The feature check itself lives in write-context creation, which is what refuses to proceed
+    /// until the defaults are acknowledged.
+    ///
+    /// Unlike [`Transaction::top_level_column_defaults`], this covers nested fields, so it matches
+    /// what that write-context gate keys on.
     ///
     /// [`Transaction::top_level_column_defaults`]: crate::transaction::Transaction::top_level_column_defaults
     pub fn has_column_defaults(&self) -> bool {

@@ -3223,7 +3223,7 @@ mod tests {
                     ignore_default,
                 )
             });
-            assert_eq!(visited, 3);
+            assert_eq!(visited, 4);
 
             assert_extern_result_error_with_message(
                 unsafe {
