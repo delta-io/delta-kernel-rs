@@ -36,7 +36,7 @@ use crate::parquet_expr_adapter::KernelParquetExprAdapterFactory;
 use crate::scalar::to_df_scalar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ScanFormat {
+pub(crate) enum ScanFormat {
     Parquet,
     Json,
 }
@@ -125,7 +125,7 @@ fn lower_scan(
 }
 
 // TODO(#3167): support metadata columns and Parquet field-ID resolution.
-fn validate_scan_schema(
+pub(crate) fn validate_scan_schema(
     format: ScanFormat,
     schema: &KernelStructType,
     output_schema: &ArrowSchemaRef,
@@ -205,7 +205,7 @@ impl TableProvider for StaticFileProvider {
 }
 
 /// Builds DataFusion's file-first table schema and a projection back to kernel output order.
-fn build_scan_table_schema_and_projection(
+pub(crate) fn build_scan_table_schema_and_projection(
     output_schema: &ArrowSchemaRef,
     file_constant_columns: &[String],
 ) -> (TableSchema, Vec<usize>) {
