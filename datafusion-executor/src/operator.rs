@@ -95,6 +95,9 @@ pub(crate) fn lower_operator(
 /// a NULL key, the corresponding probe row is retained by a left semi join and excluded by a left
 /// anti join.
 ///
+/// Join keys with different types follow DataFusion's equality coercion. This can differ from
+/// `SyncPlanExecutor`, which compares type-specific Arrow row encodings without coercion.
+///
 /// # Errors
 /// Returns an error if the key counts differ, a key cannot be lowered, or DataFusion rejects the
 /// join.
@@ -138,8 +141,7 @@ fn lower_semi_join(
         NullEquality::NullEqualsNull,
         false,
     )?;
-    // Left semi and anti joins output only probe columns, so retain the probe schema. DataFusion
-    // validates and coerces join-key types during logical-plan analysis before physical execution.
+    // Left semi and anti joins output only probe columns, so retain the probe schema.
     join.schema = Arc::clone(probe.schema());
 
     Ok(DFLogicalPlan::Join(join))
@@ -164,7 +166,7 @@ fn lower_union_all(
     let schemas_match = inputs
         .iter()
         .skip(1)
-        .all(|input| input.schema() == first.schema());
+        .all(|input| input.schema().as_arrow() == first.schema().as_arrow());
     if !schemas_match {
         return Err(DataFusionError::Plan(
             "union_all requires all inputs to have the same schema".to_string(),
@@ -172,9 +174,7 @@ fn lower_union_all(
     }
 
     let union_inputs = inputs.iter().map(Arc::clone).collect();
-    let mut union = DFUnion::try_new(union_inputs)?;
-    // All input schemas agree, so retain the first one.
-    union.schema = Arc::clone(first.schema());
+    let union = DFUnion::try_new(union_inputs)?;
 
     Ok(DFLogicalPlan::Union(union))
 }
@@ -443,6 +443,16 @@ mod tests {
     /// An empty input relation with `schema`.
     fn input_with_schema(schema: StructType) -> Arc<DFLogicalPlan> {
         Arc::new(lower_values_node(schema, vec![]).unwrap())
+    }
+
+    fn qualified_input_with_schema(schema: StructType, qualifier: &str) -> Arc<DFLogicalPlan> {
+        Arc::new(
+            LogicalPlanBuilder::from(input_with_schema(schema))
+                .alias(qualifier)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
     }
 
     // === Values ===
@@ -2271,17 +2281,26 @@ mod tests {
     }
 
     #[test]
-    fn union_all_lowers_all_inputs_with_declared_schema() {
-        let first = input_with_schema(test_schema());
-        let second = input_with_schema(test_schema());
-        let third = input_with_schema(test_schema());
+    fn union_all_lowers_differently_qualified_inputs_to_unqualified_schema() {
+        let first = qualified_input_with_schema(test_schema(), "scan_json");
+        let second = qualified_input_with_schema(test_schema(), "scan_parquet");
+        let third = qualified_input_with_schema(test_schema(), "another_scan");
         let lowered = lower_operator(
             &KernelOperator::UnionAll(KernelUnionAll),
             &[Arc::clone(&first), Arc::clone(&second), Arc::clone(&third)],
         )
         .unwrap();
 
-        assert_eq!(lowered.schema(), first.schema());
+        assert_ne!(first.schema(), second.schema());
+        assert_eq!(first.schema().as_arrow(), second.schema().as_arrow());
+        assert!(
+            lowered
+                .schema()
+                .iter()
+                .all(|(qualifier, _)| qualifier.is_none()),
+            "union output must be unqualified"
+        );
+        assert_eq!(lowered.schema().as_arrow(), first.schema().as_arrow());
         let DFLogicalPlan::Union(union) = &lowered else {
             panic!("expected Union, got {lowered:?}");
         };
@@ -2289,7 +2308,6 @@ mod tests {
         assert!(Arc::ptr_eq(&union.inputs[0], &first));
         assert!(Arc::ptr_eq(&union.inputs[1], &second));
         assert!(Arc::ptr_eq(&union.inputs[2], &third));
-        assert_eq!(union.schema.as_ref(), first.schema().as_ref());
     }
 
     /// Inputs and expected output (row order is unspecified):
