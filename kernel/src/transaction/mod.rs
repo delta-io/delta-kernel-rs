@@ -2215,7 +2215,7 @@ mod tests {
             ])?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
-        assert!(snapshot.schema().contains("fresh_column"));
+        assert!(snapshot.schema().contains("first_column"));
 
         // A second transaction starts from the committed schema, so its own change must land on
         // top of the first one rather than replacing or re-applying it.
@@ -2228,7 +2228,7 @@ mod tests {
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
 
-        assert!(snapshot.schema().contains("fresh_column"));
+        assert!(snapshot.schema().contains("first_column"));
         assert!(snapshot.schema().contains("second_column"));
         Ok(())
     }
