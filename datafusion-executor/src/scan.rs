@@ -35,8 +35,9 @@ use itertools::Itertools;
 use crate::parquet_expr_adapter::KernelParquetExprAdapterFactory;
 use crate::scalar::to_df_scalar;
 
+/// File format whose scan-schema constraints are being validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ScanFormat {
+pub(crate) enum ScanFormat {
     Parquet,
     Json,
 }
@@ -101,8 +102,8 @@ fn lower_scan(
     let output_schema: ArrowSchemaRef = Arc::new(schema.try_into_arrow()?);
     validate_scan_schema(format, schema, &output_schema)?;
 
-    let (table_schema, projection) =
-        build_scan_table_schema_and_projection(&output_schema, file_constant_columns);
+    let (table_schema, output_to_table_indices) =
+        build_scan_table_layout(&output_schema, file_constant_columns);
     let (store_url, files) = scan_files(files)?;
     let file_source: Arc<dyn FileSource> = match format {
         ScanFormat::Parquet => Arc::new(ParquetSource::new(table_schema)),
@@ -121,11 +122,16 @@ fn lower_scan(
         ScanFormat::Parquet => "scan_parquet",
         ScanFormat::Json => "scan_json",
     };
-    LogicalPlanBuilder::scan(table_name, source, Some(projection))?.build()
+    LogicalPlanBuilder::scan(table_name, source, Some(output_to_table_indices))?.build()
 }
 
+/// Validates a converted scan schema against the executor's format-specific limitations.
+///
+/// # Errors
+/// Returns an error when the schema contains unsupported metadata columns or when a Parquet schema
+/// requires field-ID resolution.
 // TODO(#3167): support metadata columns and Parquet field-ID resolution.
-fn validate_scan_schema(
+pub(crate) fn validate_scan_schema(
     format: ScanFormat,
     schema: &KernelStructType,
     output_schema: &ArrowSchemaRef,
@@ -204,8 +210,11 @@ impl TableProvider for StaticFileProvider {
     }
 }
 
-/// Builds DataFusion's file-first table schema and a projection back to kernel output order.
-fn build_scan_table_schema_and_projection(
+/// Builds DataFusion's scan table schema and a mapping from output positions to table indices.
+///
+/// The table schema places physical file columns before per-file constants. The returned mapping
+/// contains one table-schema index for each field in `output_schema`, preserving its field order.
+pub(crate) fn build_scan_table_layout(
     output_schema: &ArrowSchemaRef,
     file_constant_columns: &[String],
 ) -> (TableSchema, Vec<usize>) {
@@ -228,13 +237,13 @@ fn build_scan_table_schema_and_projection(
     constant_fields.sort_by_key(|(index, _)| *index);
 
     let file_field_count = file_fields.len();
-    let mut projection = Vec::with_capacity(output_schema.fields().len());
+    let mut output_to_table_indices = Vec::with_capacity(output_schema.fields().len());
     let mut file_index = 0;
     for field in output_schema.fields() {
         if let Some(&constant_index) = constant_positions.get(field.name().as_str()) {
-            projection.push(file_field_count + constant_index);
+            output_to_table_indices.push(file_field_count + constant_index);
         } else {
-            projection.push(file_index);
+            output_to_table_indices.push(file_index);
             file_index += 1;
         }
     }
@@ -244,7 +253,10 @@ fn build_scan_table_schema_and_projection(
         .collect();
 
     let file_schema = Arc::new(ArrowSchema::new(file_fields));
-    (TableSchema::new(file_schema, constant_fields), projection)
+    (
+        TableSchema::new(file_schema, constant_fields),
+        output_to_table_indices,
+    )
 }
 
 fn scan_files(

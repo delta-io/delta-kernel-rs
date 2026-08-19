@@ -20,6 +20,7 @@ use delta_kernel::{
 };
 use tokio::runtime::Handle;
 
+mod dynamic_scan;
 mod expression;
 mod operator;
 mod parquet_expr_adapter;
@@ -225,18 +226,25 @@ mod tests {
     use std::collections::HashMap;
 
     use bytes::Bytes;
-    use datafusion::arrow::array::{Int64Array, RecordBatch};
-    use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-    use datafusion::assert_batches_eq;
+    use datafusion::arrow::array::{Int64Array, RecordBatch, StructArray};
+    use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema};
+    use datafusion::logical_expr::{
+        col as df_col, LogicalPlan as DFLogicalPlan, LogicalPlanBuilder,
+    };
     use datafusion::object_store::memory::InMemory;
     use datafusion::object_store::path::Path as ObjectPath;
     use datafusion::object_store::ObjectStoreExt as _;
     use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
+    use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-    use delta_kernel::plans::ir::nodes::{ScanFile, ScanParquet, Values};
-    use delta_kernel::plans::ir::plan::{Plan, PlanNode};
+    use delta_kernel::expressions::{column_name, Scalar, StructData};
+    use delta_kernel::plans::ir::nodes::{DynamicScan, FileType, ScanFile, ScanParquet, Values};
+    use delta_kernel::plans::ir::plan::{Plan as KernelPlan, PlanNode};
     use delta_kernel::schema::{
-        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        ToSchema as _,
     };
     use delta_kernel::{FileSlice, StorageHandler};
     use rstest::rstest;
@@ -300,6 +308,47 @@ mod tests {
         )
     }
 
+    #[test]
+    fn constructor_does_not_modify_shared_session_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let session = SessionContext::new();
+        let session_id = session.session_id();
+        let original_state = session.state();
+        let original_planner = Arc::clone(original_state.query_planner());
+        let original_create_default_catalog = original_state
+            .config_options()
+            .catalog
+            .create_default_catalog_and_schema;
+
+        let executor = DataFusionExecutor::new(
+            session.clone(),
+            Arc::new(TestStorage::default()),
+            runtime.handle().clone(),
+        );
+
+        let session_state = session.state();
+        let executor_state = executor.session_context.state();
+        assert_eq!(session_state.session_id(), session_id);
+        assert_eq!(executor_state.session_id(), session_id);
+        assert!(Arc::ptr_eq(
+            session_state.query_planner(),
+            &original_planner
+        ));
+        assert!(Arc::ptr_eq(
+            session_state.query_planner(),
+            executor_state.query_planner()
+        ));
+        assert_eq!(
+            session_state
+                .config_options()
+                .catalog
+                .create_default_catalog_and_schema,
+            original_create_default_catalog
+        );
+    }
+
     fn test_file(data: &Bytes) -> FileMeta {
         FileMeta::new(
             Url::parse("memory:///test.parquet").unwrap(),
@@ -308,15 +357,15 @@ mod tests {
         )
     }
 
-    fn values_plan() -> Plan {
+    fn values_plan() -> KernelPlan {
         let schema = StructType::try_new([StructField::nullable("a", DataType::LONG)]).unwrap();
         let values = Values::new(schema, vec![vec![1i64.into()], vec![2i64.into()]]);
-        Plan {
+        KernelPlan {
             nodes: vec![PlanNode::new(values, vec![])],
         }
     }
 
-    fn parquet_scan_plan(files: impl IntoIterator<Item = FileMeta>) -> Plan {
+    fn parquet_scan_plan(files: impl IntoIterator<Item = FileMeta>) -> KernelPlan {
         let schema =
             Arc::new(StructType::try_new([StructField::nullable("id", DataType::LONG)]).unwrap());
         let scan = ScanParquet {
@@ -324,9 +373,86 @@ mod tests {
             file_constant_columns: Vec::new(),
             schema,
         };
-        Plan {
+        KernelPlan {
             nodes: vec![PlanNode::new(scan, vec![])],
         }
+    }
+
+    fn dynamic_scan_plan(
+        files: impl IntoIterator<Item = (&'static str, u64, i64)>,
+        file_type: FileType,
+        deletion_vector: Scalar,
+    ) -> KernelPlan {
+        let output_schema = schema_ref! {
+            nullable "version": LONG,
+            nullable "id": LONG,
+        };
+        dynamic_scan_plan_with_schema(files, file_type, deletion_vector, output_schema)
+    }
+
+    fn dynamic_scan_plan_with_schema(
+        files: impl IntoIterator<Item = (&'static str, u64, i64)>,
+        file_type: FileType,
+        deletion_vector: Scalar,
+        output_schema: delta_kernel::schema::SchemaRef,
+    ) -> KernelPlan {
+        let input_schema = schema_ref! {
+            not_null "path": STRING,
+            not_null "size": LONG,
+            not_null "filemod": LONG,
+            nullable "dv": (DeletionVectorDescriptor::to_schema()),
+            nullable "version": LONG,
+        };
+        let rows = files
+            .into_iter()
+            .map(|(path, size, version)| {
+                vec![
+                    path.into(),
+                    i64::try_from(size).unwrap().into(),
+                    0_i64.into(),
+                    deletion_vector.clone(),
+                    version.into(),
+                ]
+            })
+            .collect();
+        let values = Values::new(Arc::clone(&input_schema), rows);
+        let dynamic_scan = DynamicScan::try_new(
+            &input_schema,
+            output_schema,
+            file_type,
+            Url::parse("memory:///sidecars/").unwrap(),
+            ["version"],
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+            column_name!("dv"),
+        )
+        .unwrap();
+        KernelPlan {
+            nodes: vec![
+                PlanNode::new(values, vec![]),
+                PlanNode::new(dynamic_scan, vec![0]),
+            ],
+        }
+    }
+
+    fn present_deletion_vector() -> Scalar {
+        Scalar::Struct(
+            StructData::try_new(
+                DeletionVectorDescriptor::to_schema()
+                    .fields()
+                    .cloned()
+                    .collect(),
+                vec![
+                    "i".into(),
+                    "inline".into(),
+                    Scalar::null(DataType::INTEGER),
+                    1_i32.into(),
+                    1_i64.into(),
+                ],
+            )
+            .unwrap(),
+        )
     }
 
     fn parquet_bytes() -> Bytes {
@@ -340,6 +466,30 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![Some(1), None]))],
         )
         .unwrap();
+        let mut output = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut output, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(output)
+    }
+
+    fn nested_nullable_parquet_bytes() -> Bytes {
+        let fields = Fields::from(vec![Arc::new(Field::new(
+            "required",
+            ArrowDataType::Int64,
+            true,
+        ))]);
+        let action = StructArray::new(
+            fields.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1)]))],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "action",
+            ArrowDataType::Struct(fields),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(action)]).unwrap();
         let mut output = Vec::new();
         let mut writer = ArrowWriter::try_new(&mut output, schema, None).unwrap();
         writer.write(&batch).unwrap();
@@ -418,6 +568,224 @@ mod tests {
         .unwrap();
 
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_scan_reads_runtime_parquet_files_and_broadcasts_constants() {
+        let parquet = parquet_bytes();
+        let store = Arc::new(InMemory::new());
+        for location in ["sidecars/first.parquet", "sidecars/second.parquet"] {
+            store
+                .put(&ObjectPath::from(location), parquet.clone().into())
+                .await
+                .unwrap();
+        }
+
+        let session = SessionContext::new();
+        let executor = DataFusionExecutor::new(
+            session.clone(),
+            Arc::new(TestStorage::default()),
+            Handle::current(),
+        );
+        session.register_object_store(&Url::parse("memory:///").unwrap(), store);
+        let size = parquet.len().try_into().unwrap();
+        let plan = dynamic_scan_plan(
+            [("first.parquet", size, 10), ("second.parquet", size, 20)],
+            FileType::Parquet,
+            Scalar::null(DeletionVectorDescriptor::to_schema()),
+        );
+
+        let batches = tokio::task::spawn_blocking(move || -> DeltaResult<Vec<RecordBatch>> {
+            executor
+                .execute_op(Operation::QueryPlan(plan))?
+                .into_data()?
+                .map(|batch| batch?.try_into_record_batch())
+                .collect()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_batches_sorted_eq!(
+            &[
+                "+---------+----+",
+                "| version | id |",
+                "+---------+----+",
+                "| 10      |    |",
+                "| 10      | 1  |",
+                "| 20      |    |",
+                "| 20      | 1  |",
+                "+---------+----+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_scan_reconciles_nested_parquet_nullability() {
+        let parquet = nested_nullable_parquet_bytes();
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("sidecars/file.parquet"),
+                parquet.clone().into(),
+            )
+            .await
+            .unwrap();
+
+        let session = SessionContext::new();
+        let executor = DataFusionExecutor::new(
+            session.clone(),
+            Arc::new(TestStorage::default()),
+            Handle::current(),
+        );
+        session.register_object_store(&Url::parse("memory:///").unwrap(), store);
+        let output_schema = schema_ref! {
+            nullable "version": LONG,
+            nullable "action": {
+                not_null "required": LONG,
+            },
+        };
+        let expected_schema: Schema = output_schema.as_ref().try_into_arrow().unwrap();
+        let size = parquet.len().try_into().unwrap();
+        let plan = dynamic_scan_plan_with_schema(
+            [("file.parquet", size, 10)],
+            FileType::Parquet,
+            Scalar::null(DeletionVectorDescriptor::to_schema()),
+            output_schema,
+        );
+
+        let batches = tokio::task::spawn_blocking(move || -> DeltaResult<Vec<RecordBatch>> {
+            executor
+                .execute_op(Operation::QueryPlan(plan))?
+                .into_data()?
+                .map(|batch| batch?.try_into_record_batch())
+                .collect()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let [batch] = batches.as_slice() else {
+            panic!("expected one batch, got {}", batches.len());
+        };
+        assert_eq!(batch.schema().as_ref(), &expected_schema);
+        assert_eq!(batch.num_rows(), 1);
+        let action = batch
+            .column_by_name("action")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let required = action
+            .column_by_name("required")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(required.value(0), 1);
+    }
+
+    #[tokio::test]
+    async fn dynamic_scan_table_provider_uses_default_planner_and_pushes_projection() {
+        let parquet = parquet_bytes();
+        let parquet_size = parquet.len().try_into().unwrap();
+        let store = Arc::new(InMemory::new());
+        store
+            .put(&ObjectPath::from("sidecars/file.parquet"), parquet.into())
+            .await
+            .unwrap();
+
+        let session = SessionContext::new();
+        session.register_object_store(&Url::parse("memory:///").unwrap(), store);
+        let plan = dynamic_scan_plan(
+            [("file.parquet", parquet_size, 10)],
+            FileType::Parquet,
+            Scalar::null(DeletionVectorDescriptor::to_schema()),
+        );
+        let logical_plan = to_df_plan(&plan).unwrap();
+        assert!(matches!(&logical_plan, DFLogicalPlan::TableScan(_)));
+        let projected_plan = LogicalPlanBuilder::from(logical_plan)
+            .project([df_col("id")])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let dataframe = session.execute_logical_plan(projected_plan).await.unwrap();
+        let batches = dataframe.collect().await.unwrap();
+
+        assert_batches_eq!(
+            &["+----+", "| id |", "+----+", "| 1  |", "|    |", "+----+"],
+            &batches
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_scan_empty_input_returns_no_batches() {
+        let executor = test_executor(Handle::current());
+        let plan = dynamic_scan_plan(
+            std::iter::empty(),
+            FileType::Parquet,
+            Scalar::null(DeletionVectorDescriptor::to_schema()),
+        );
+
+        let batches = tokio::task::spawn_blocking(move || -> DeltaResult<Vec<RecordBatch>> {
+            executor
+                .execute_op(Operation::QueryPlan(plan))?
+                .into_data()?
+                .map(|batch| batch?.try_into_record_batch())
+                .collect()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(batches.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_scan_rejects_non_null_deletion_vectors() {
+        let executor = test_executor(Handle::current());
+        let plan = dynamic_scan_plan(
+            [("file.parquet", 1, 10)],
+            FileType::Parquet,
+            present_deletion_vector(),
+        );
+
+        let error = tokio::task::spawn_blocking(move || {
+            let mut data = executor
+                .execute_op(Operation::QueryPlan(plan))?
+                .into_data()?;
+            data.next().transpose()
+        })
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("deletion vectors"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_scan_rejects_json_before_execution() {
+        let executor = test_executor(Handle::current());
+        let plan = dynamic_scan_plan(
+            std::iter::empty(),
+            FileType::Json,
+            Scalar::null(DeletionVectorDescriptor::to_schema()),
+        );
+
+        let error =
+            tokio::task::spawn_blocking(move || executor.execute_op(Operation::QueryPlan(plan)))
+                .await
+                .unwrap()
+                .err()
+                .unwrap();
+
+        assert!(
+            error.to_string().contains("only supports Parquet"),
+            "{error}"
+        );
     }
 
     #[test]

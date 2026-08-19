@@ -30,6 +30,7 @@ use delta_kernel::plans::ir::nodes::{
 };
 use delta_kernel::schema::{StructField, StructType};
 
+use crate::dynamic_scan::lower_dynamic_scan;
 use crate::expression::to_df_struct_columns;
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
@@ -95,9 +96,12 @@ pub(crate) fn lower_operator(
             };
             lower_json_scan(scan)
         }
-        KernelOperator::DynamicScan(_) => Err(DataFusionError::NotImplemented(format!(
-            "lowering operator {op} to a DataFusion LogicalPlan"
-        ))),
+        KernelOperator::DynamicScan(dynamic_scan) => {
+            let [input] = inputs else {
+                return Err(input_count_error(1));
+            };
+            lower_dynamic_scan(dynamic_scan, input)
+        }
     }
 }
 

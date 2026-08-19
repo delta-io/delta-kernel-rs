@@ -1377,6 +1377,7 @@ version = "0.26.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "datafusion",
  "delta_kernel",
  "futures",
