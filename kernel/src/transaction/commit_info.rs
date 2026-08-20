@@ -27,8 +27,7 @@ fn commit_info_literal_exprs(
             Arc::new(match commit_info.operation_parameters {
                 Some(map) => lit(MapData::try_new(
                     op_params_map_type,
-                    map.into_iter()
-                        .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
+                    map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
                 )?),
                 None => null_lit(op_params_map_type),
             }),

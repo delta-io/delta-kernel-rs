@@ -4900,10 +4900,8 @@ fn test_combine_checkpoint_predicates(
     "tags",
     r#"{"checkpointMetadata":{"version":0,"tags":{"key1":"val1","key2":null}}}"#
 )]
-// Known issues: these map fields don't yet have #[allow_null_container_values].
 // commitInfo.operationParameters.description: null
-#[should_panic(expected = "StructArray re-validation failed")]
-#[case::commit_info_operation_parameters_known_issue(
+#[case::commit_info_operation_parameters(
     "commitInfo",
     "operationParameters",
     r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","description":null}}}"#

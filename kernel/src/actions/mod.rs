@@ -861,7 +861,7 @@ pub(crate) struct CommitInfo {
     pub(crate) operation: Option<String>,
     /// Map of arbitrary string key-value pairs that provide additional information about the
     /// operation. This is specified by the engine. For now this is always empty on write.
-    pub(crate) operation_parameters: Option<HashMap<String, String>>,
+    pub(crate) operation_parameters: Option<HashMap<String, Option<String>>>,
     /// The version of the delta_kernel crate used to write this commit. The kernel will always
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
@@ -1787,7 +1787,7 @@ mod tests {
                 nullable "timestamp": LONG,
                 nullable "inCommitTimestamp": LONG,
                 nullable "operation": STRING,
-                nullable "operationParameters": { STRING => not_null STRING },
+                nullable "operationParameters": { STRING => nullable STRING },
                 nullable "kernelVersion": STRING,
                 nullable "isBlindAppend": BOOLEAN,
                 nullable "engineInfo": STRING,
@@ -2101,7 +2101,7 @@ mod tests {
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
         let record_batch = engine_data.try_into_record_batch().unwrap();
 
-        let mut map_builder = create_string_map_builder(false);
+        let mut map_builder = create_string_map_builder(true);
         map_builder.append(true).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
 
