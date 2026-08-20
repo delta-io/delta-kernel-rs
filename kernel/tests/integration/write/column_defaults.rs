@@ -259,7 +259,7 @@ async fn test_blind_append_to_column_defaults_table_is_supported(
 #[case::unpartitioned("unpartitioned", &[])]
 #[case::partitioned("partitioned", &["p"])]
 #[tokio::test]
-async fn write_context_acknowledgement_depends_on_column_defaults(
+async fn write_state_acknowledgement_depends_on_column_defaults(
     #[case] label: &str,
     #[case] partition_columns: &[&str],
     #[values(false, true)] has_default: bool,
@@ -273,7 +273,7 @@ async fn write_context_acknowledgement_depends_on_column_defaults(
     } else {
         Arc::new(base)
     };
-    let table_name = format!("write_context_ack_{label}_{has_default}");
+    let table_name = format!("write_state_ack_{label}_{has_default}");
     let (store, engine, table_location) = engine_store_setup(&table_name, None);
     let table_url = create_table(
         store,
@@ -299,12 +299,9 @@ async fn write_context_acknowledgement_depends_on_column_defaults(
 
     let partition_values = HashMap::from([("p".to_string(), Scalar::Integer(7))]);
     if has_default {
-        let error = if partition_columns.is_empty() {
-            txn.unpartitioned_write_context()
-        } else {
-            txn.partitioned_write_context(partition_values.clone())
-        }
-        .expect_err("inspecting defaults must not implicitly acknowledge them");
+        let error = txn
+            .write_state()
+            .expect_err("inspecting defaults must not implicitly acknowledge them");
         assert!(matches!(
             &error,
             delta_kernel::Error::InvalidTransactionState(_)
@@ -313,10 +310,11 @@ async fn write_context_acknowledgement_depends_on_column_defaults(
 
         txn.ack_column_defaults();
     }
+    let write_state = txn.write_state()?;
     if partition_columns.is_empty() {
-        txn.unpartitioned_write_context()?;
+        write_state.unpartitioned_write_context()?;
     } else {
-        txn.partitioned_write_context(partition_values)?;
+        write_state.partitioned_write_context(partition_values)?;
     }
 
     Ok(())
@@ -561,13 +559,13 @@ async fn test_load_and_write_allow_orphan_default() -> Result<(), Box<dyn std::e
     // Read: snapshot loads despite the orphaned metadata.
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
 
-    // Write: a write context builds without error.
+    // Write: a write state and context build without error.
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     assert!(
         txn.top_level_column_defaults()?.is_empty(),
         "orphaned defaults must not be surfaced without allowColumnDefaults",
     );
-    txn.unpartitioned_write_context()?;
+    txn.write_state()?.unpartitioned_write_context()?;
 
     Ok(())
 }

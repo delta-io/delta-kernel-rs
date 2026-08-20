@@ -100,7 +100,7 @@ async fn append_only_enforces_data_change_for_file_actions(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     let arrow_schema: Arc<ArrowSchema> =
         Arc::new(write_context.physical_schema().as_ref().try_into_arrow()?);
     for value in [1, 2, 3] {
@@ -1969,6 +1969,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         // Write two partitions: country="usa" and country="japan".
         let mut txn =
             load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
+        let write_state = txn.write_state()?;
         let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> delta_kernel::DeltaResult<_> {
             let data = RecordBatch::try_new(
                 Arc::new(data_schema.as_ref().try_into_arrow()?),
@@ -1977,7 +1978,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
             Ok(Box::new(ArrowEngineData::new(data)))
         });
         for (data, partition_val) in append_data.into_iter().zip(["usa", "japan"]) {
-            let ctx = Arc::new(txn.partitioned_write_context(HashMap::from([(
+            let ctx = Arc::new(write_state.partitioned_write_context(HashMap::from([(
                 partition_col.to_string(),
                 Scalar::String(partition_val.into()),
             )]))?);

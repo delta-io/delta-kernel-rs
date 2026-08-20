@@ -225,7 +225,12 @@ pub async fn write_data_and_check_result_and_stats(
     });
 
     // write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
+    let write_context = Arc::new(
+        txn.write_state()
+            .unwrap()
+            .unpartitioned_write_context()
+            .unwrap(),
+    );
     let tasks = append_data.into_iter().map(|data| {
         // arc clones
         let engine = engine.clone();
