@@ -18,6 +18,7 @@ mod operator;
 mod plan;
 mod predicate;
 mod scalar;
+mod utils;
 
 pub use expression::to_df_expr;
 pub use predicate::to_df_predicate_expr;
