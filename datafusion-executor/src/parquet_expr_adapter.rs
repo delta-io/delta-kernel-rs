@@ -61,13 +61,13 @@ impl PhysicalExprAdapter for KernelParquetExprAdapter {
         // column leaf after that adaptation without revisiting the wrapper we introduce.
         let adapted = self.default_adapter.rewrite(expr)?;
         adapted
-            .transform_up(|expr| self.relabel_column(expr))
+            .transform_up(|expr| self.reconcile_column_nullability(expr))
             .data()
     }
 }
 
 impl KernelParquetExprAdapter {
-    fn relabel_column(
+    fn reconcile_column_nullability(
         &self,
         expr: Arc<dyn PhysicalExpr>,
     ) -> DataFusionResult<Transformed<Arc<dyn PhysicalExpr>>> {
@@ -81,12 +81,12 @@ impl KernelParquetExprAdapter {
             return Ok(Transformed::no(expr));
         }
 
-        let relabeled = RelabelNullabilityExpr {
+        let reconciled = ReconcileKernelNullabilityExpr {
             expr,
             field: Arc::new(aligned_field.clone()),
         };
-        let relabeled: Arc<dyn PhysicalExpr> = Arc::new(relabeled);
-        Ok(Transformed::yes(relabeled))
+        let reconciled: Arc<dyn PhysicalExpr> = Arc::new(reconciled);
+        Ok(Transformed::yes(reconciled))
     }
 }
 
@@ -109,6 +109,8 @@ fn align_data_type(logical_type: &DataType, physical_type: &DataType) -> DataTyp
     }
 }
 
+/// Recurses because every [`StructArray`] embeds its child fields in its data type. Rebuilding
+/// only the outer struct would leave nested struct arrays incompatible with their aligned fields.
 fn align_fields(
     logical_fields: &Fields,
     physical_fields: &Fields,
@@ -139,39 +141,45 @@ fn align_fields(
         .collect()
 }
 
+/// Reconciles nested fields with Kernel's schema after verifying their values satisfy the tighter
+/// nullability.
+///
+/// DataFusion's cast expression rejects nullable-to-non-nullable struct fields from schema
+/// metadata alone. This expression defers that decision to [`StructArray::try_new`], which also
+/// accounts for child nulls masked by a null parent.
 #[derive(Debug)]
-struct RelabelNullabilityExpr {
+struct ReconcileKernelNullabilityExpr {
     expr: Arc<dyn PhysicalExpr>,
     field: FieldRef,
 }
 
-impl PartialEq for RelabelNullabilityExpr {
+impl PartialEq for ReconcileKernelNullabilityExpr {
     fn eq(&self, other: &Self) -> bool {
         self.expr.eq(&other.expr) && self.field == other.field
     }
 }
 
-impl Eq for RelabelNullabilityExpr {}
+impl Eq for ReconcileKernelNullabilityExpr {}
 
-impl Hash for RelabelNullabilityExpr {
+impl Hash for ReconcileKernelNullabilityExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.expr.hash(state);
         self.field.hash(state);
     }
 }
 
-impl std::fmt::Display for RelabelNullabilityExpr {
+impl std::fmt::Display for ReconcileKernelNullabilityExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "relabel_nullability({})", self.expr)
+        write!(f, "reconcile_kernel_nullability({})", self.expr)
     }
 }
 
-impl PhysicalExpr for RelabelNullabilityExpr {
+impl PhysicalExpr for ReconcileKernelNullabilityExpr {
     fn evaluate(&self, batch: &RecordBatch) -> DataFusionResult<ColumnarValue> {
         let ColumnarValue::Array(array) = self.expr.evaluate(batch)? else {
-            return exec_err!("Parquet nullability relabeling requires an array value");
+            return exec_err!("Kernel nullability reconciliation requires an array value");
         };
-        relabel_nested_nullability(&array, self.field.data_type()).map(ColumnarValue::Array)
+        reconcile_nested_nullability(&array, self.field.data_type()).map(ColumnarValue::Array)
     }
 
     fn return_field(&self, _input_schema: &Schema) -> DataFusionResult<FieldRef> {
@@ -188,25 +196,25 @@ impl PhysicalExpr for RelabelNullabilityExpr {
     ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
         let [expr] = children.as_slice() else {
             return internal_err!(
-                "RelabelNullabilityExpr expected one child, got {}",
+                "ReconcileKernelNullabilityExpr expected one child, got {}",
                 children.len()
             );
         };
-        let relabeled = Self {
+        let reconciled = Self {
             expr: Arc::clone(expr),
             field: Arc::clone(&self.field),
         };
-        Ok(Arc::new(relabeled))
+        Ok(Arc::new(reconciled))
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "relabel_nullability(")?;
+        write!(f, "reconcile_kernel_nullability(")?;
         self.expr.fmt_sql(f)?;
         write!(f, ")")
     }
 }
 
-fn relabel_nested_nullability(
+fn reconcile_nested_nullability(
     array: &ArrayRef,
     target_type: &DataType,
 ) -> DataFusionResult<ArrayRef> {
@@ -216,7 +224,7 @@ fn relabel_nested_nullability(
 
     let DataType::Struct(target_fields) = target_type else {
         return exec_err!(
-            "Cannot relabel Parquet nullability from {} to {target_type}",
+            "Cannot reconcile Parquet nullability from {} to {target_type}",
             array.data_type()
         );
     };
@@ -235,10 +243,10 @@ fn relabel_nested_nullability(
     let columns: Vec<_> = source_columns
         .iter()
         .zip(target_fields)
-        .map(|(column, field)| relabel_nested_nullability(column, field.data_type()))
+        .map(|(column, field)| reconcile_nested_nullability(column, field.data_type()))
         .try_collect()?;
-    let relabeled = StructArray::try_new(target_fields.clone(), columns, source.nulls().cloned())?;
-    Ok(Arc::new(relabeled))
+    let reconciled = StructArray::try_new(target_fields.clone(), columns, source.nulls().cloned())?;
+    Ok(Arc::new(reconciled))
 }
 
 #[cfg(test)]
@@ -291,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn relabeling_nested_required_child_checks_parent_validity() {
+    fn reconciling_nested_required_child_checks_parent_validity() {
         let source_children: Fields = vec![Field::new("child", DataType::Int32, true)].into();
         let source_fields: Fields =
             vec![Field::new_struct("nested", source_children.clone(), true)].into();
@@ -309,10 +317,10 @@ mod tests {
         };
 
         let masked = outer(nested(Some(NullBuffer::from(vec![false]))));
-        let _ = relabel_nested_nullability(&masked, &target_type).unwrap();
+        let _ = reconcile_nested_nullability(&masked, &target_type).unwrap();
 
         let unmasked = outer(nested(None));
-        let error = relabel_nested_nullability(&unmasked, &target_type).unwrap_err();
+        let error = reconcile_nested_nullability(&unmasked, &target_type).unwrap_err();
         assert!(
             error
                 .to_string()
