@@ -8,6 +8,11 @@
 #   GATEWAY_HOST      Bare hostname of GATEWAY_BASE_URL, for the egress allowlist.
 # Optional named-bot comments:
 #   vars.OMNIGENT_BOT_APP_ID + secrets.OMNIGENT_BOT_APP_KEY
+# Optional model overrides:
+#   vars.MODEL                    Default Claude model.
+#   vars.CLAUDE_MAINTAINER_MODEL  Claude maintainer-pass model.
+#   vars.CODEX_MAINTAINER_MODEL   Codex maintainer-pass model.
+#   vars.DISPROVE_MODEL           GPT disprove-gate model.
 #
 # The review never runs automatically: it is triggered only by a /review comment
 # from an actor with write-or-higher repository permission, or a manual dispatch
@@ -277,6 +282,9 @@ jobs:
       - name: Write Omnigent provider config
         if: steps.creds.outputs.available == 'true'
         env:
+          CLAUDE_MAINTAINER_MODEL: ${{ vars.CLAUDE_MAINTAINER_MODEL }}
+          CODEX_MAINTAINER_MODEL: ${{ vars.CODEX_MAINTAINER_MODEL }}
+          DISPROVE_MODEL: ${{ vars.DISPROVE_MODEL }}
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           MODEL: ${{ vars.MODEL }}
         run: |
@@ -286,6 +294,9 @@ jobs:
           import json, os, pathlib
           gw = os.environ['GATEWAY_BASE_URL'].rstrip('/')
           model = os.environ.get('MODEL') or 'claude-opus-4-1'
+          claude_maintainer_model = os.environ.get('CLAUDE_MAINTAINER_MODEL') or 'claude-opus-4-8'
+          codex_maintainer_model = os.environ.get('CODEX_MAINTAINER_MODEL') or 'gpt-5-codex'
+          disprove_model = os.environ.get('DISPROVE_MODEL') or 'gpt-5.6-sol'
           cfg = {
               'providers': {
                   'gateway': {
@@ -294,7 +305,18 @@ jobs:
                       'anthropic': {
                           'base_url': gw + '/anthropic',
                           'api_key_ref': 'env:LLM_API_KEY',
-                          'models': {'default': model},
+                          'models': {
+                              'default': model,
+                              'maintainer-claude': claude_maintainer_model,
+                          },
+                      },
+                      'openai': {
+                          'base_url': gw + '/openai',
+                          'api_key_ref': 'env:LLM_API_KEY',
+                          'models': {
+                              'maintainer-codex': codex_maintainer_model,
+                              'disprove': disprove_model,
+                          },
                       },
                   }
               }

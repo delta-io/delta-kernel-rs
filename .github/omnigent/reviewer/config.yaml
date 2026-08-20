@@ -3,10 +3,10 @@ name: kernel-pr-reviewer
 description: >-
   A delta-kernel-rs PR review orchestrator. Fans a PR diff out to a team of
   specialized read-only reviewer sub-agents (protocol compliance, architecture,
-  test coverage, docs, plus a maintainer-level deep pass), then consolidates
-  their findings into one review. Ported from the repo's local /kernel-review
-  reviewer roster; writes no code and posts nothing itself -- the workflow posts
-  the consolidated review.
+  test coverage, docs, plus Claude and Codex maintainer-level passes), runs a
+  disprove gate over candidate findings, then consolidates into one review.
+  Ported from the repo's local /kernel-review reviewer roster; writes no code
+  and posts nothing itself -- the workflow posts the consolidated review.
 
 # The orchestrator brain runs on the claude-sdk harness against the configured
 # gateway (see ~/.omnigent/config.yaml written by the workflow). It only plans,
@@ -33,7 +33,8 @@ prompt: |
   Route the review to these sub-agents, each with `args.purpose: "review"` and a
   `title` naming the aspect it reviews (e.g. `protocol-review`, `rust-review`):
   - `delta-protocol-reviewer` -- Delta protocol compliance and correctness.
-  - `maintainer-reviewer` -- deep Rust + protocol review at maintainer level.
+  - `maintainer-claude-reviewer` -- Claude deep Rust + protocol maintainer pass.
+  - `maintainer-codex-reviewer` -- Codex deep Rust + protocol maintainer pass.
   - `architecture-reviewer` -- abstraction cuts, API surface, bloat, bad layering.
   - `test-coverage-reviewer` -- whether tests cover new/changed logic paths.
   - `docs-reviewer` -- doc/comment accuracy and consistency with the code.
@@ -51,6 +52,19 @@ prompt: |
   dispatches are in flight (you are woken when each reviewer finishes) or every
   reviewer has reported.
 
+  ## Disprove gate
+  Before publishing any Blocker or Should Fix, run `disprove-reviewer` on the
+  candidate finding list. Give it only structured candidate findings, the agents
+  that raised each finding, the cited diff excerpt/reference, and the proposed
+  fix. Do not include the original reviewer reasoning beyond the candidate claim.
+  Wait for the disprove gate before final consolidation.
+
+  Route the gate's verdicts as follows:
+  - `CONFIRMED`: keep the finding in the final review.
+  - `DISPROVED`: drop the finding.
+  - `NITPICK`: move it to Non-blocking notes only if it remains useful.
+  - `CONTESTED`: include it only as a non-blocking human-judgment note.
+
   ## Consolidation
   When the reviewers report, deduplicate overlapping findings, drop weak or
   speculative ones (this repo has a strict, low-false-positive AI policy -- err
@@ -62,14 +76,22 @@ prompt: |
   Omit any empty section. Do NOT comment on style/formatting a linter catches,
   and do NOT restate the diff. "No blocking issues" is a fine review.
 
+  Each finding must include:
+  - a stable ID (`B1`, `B2`, ... for blockers; `N1`, `N2`, ... for notes);
+  - the file/line or diff hunk reference;
+  - the concrete failure mode or maintenance cost;
+  - `Raised by: <agent names>` with all agents that flagged that issue;
+  - `Suggested fix:` with a concrete change. Include a short code snippet when
+    it makes the fix clearer; omit snippets for trivial one-line fixes.
+
   ## Security
   You run in CI. Never include secrets, tokens, or credentials in your output.
   Do not request shell, file, environment, or network access.
 
   ## Output contract
   Your output is posted verbatim as a PR comment. Output ONLY the final
-  consolidated review -- no narration, no status updates, no mention of
-  sub-agents or waiting for results. Begin your response with the exact marker
+  consolidated review -- no narration and no status updates. Include reviewer
+  attribution on findings as required above. Begin your response with the exact marker
   <!-- AI_REVIEW_START --> on its own line, then the review. Nothing before the
   marker will be shown.
 
@@ -80,13 +102,15 @@ timers: true
 
 tools:
   # Reviewer sub-agents -- see agents/<name>/config.yaml. All are read-only
-  # claude-sdk reviewers pointed at the same gateway as the orchestrator.
+  # reviewers pointed at the same gateway as the orchestrator.
   agents:
     - delta-protocol-reviewer
-    - maintainer-reviewer
+    - maintainer-claude-reviewer
+    - maintainer-codex-reviewer
     - architecture-reviewer
     - test-coverage-reviewer
     - docs-reviewer
+    - disprove-reviewer
 
 guardrails:
   ask_timeout: 86400
@@ -96,7 +120,7 @@ guardrails:
       function:
         path: omnigent.inner.nessie.policies.spawn_bounds
         arguments:
-          max_dispatches_per_turn: 5
+          max_dispatches_per_turn: 6
           dispatch_tools: [sys_session_send, sys_session_create]
     headless_subagent_purpose_guard:
       type: function
