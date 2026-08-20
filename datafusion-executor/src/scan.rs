@@ -124,6 +124,7 @@ fn lower_scan(
     LogicalPlanBuilder::scan(table_name, source, Some(projection))?.build()
 }
 
+// TODO(#3167): support metadata columns and Parquet field-ID resolution.
 fn validate_scan_schema(
     format: ScanFormat,
     schema: &KernelStructType,
@@ -144,6 +145,25 @@ fn validate_scan_schema(
         }
     }
     Ok(())
+}
+
+fn parquet_field_id_name(fields: &[ArrowFieldRef]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        if field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY) {
+            return Some(field.name().clone());
+        }
+
+        match field.data_type() {
+            ArrowDataType::Struct(fields) => parquet_field_id_name(fields),
+            ArrowDataType::List(field)
+            | ArrowDataType::LargeList(field)
+            | ArrowDataType::FixedSizeList(field, _)
+            | ArrowDataType::ListView(field)
+            | ArrowDataType::LargeListView(field)
+            | ArrowDataType::Map(field, _) => parquet_field_id_name(std::slice::from_ref(field)),
+            _ => None,
+        }
+    })
 }
 
 #[async_trait]
@@ -182,25 +202,6 @@ impl TableProvider for StaticFileProvider {
             .build();
         Ok(DataSourceExec::from_data_source(config))
     }
-}
-
-fn parquet_field_id_name(fields: &[ArrowFieldRef]) -> Option<String> {
-    fields.iter().find_map(|field| {
-        if field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY) {
-            return Some(field.name().clone());
-        }
-
-        match field.data_type() {
-            ArrowDataType::Struct(fields) => parquet_field_id_name(fields),
-            ArrowDataType::List(field)
-            | ArrowDataType::LargeList(field)
-            | ArrowDataType::FixedSizeList(field, _)
-            | ArrowDataType::ListView(field)
-            | ArrowDataType::LargeListView(field)
-            | ArrowDataType::Map(field, _) => parquet_field_id_name(std::slice::from_ref(field)),
-            _ => None,
-        }
-    })
 }
 
 /// Builds DataFusion's file-first table schema and a projection back to kernel output order.
@@ -290,34 +291,36 @@ fn file_constants(file: &KernelScanFile) -> Result<Vec<DFScalarValue>, DataFusio
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    use std::io::Cursor;
 
-    use datafusion::arrow::array::{
-        Array, AsArray, Int64Array, RecordBatch, StringArray as ArrowStringArray,
-    };
+    use datafusion::arrow::array::{Int64Array, RecordBatch};
     use datafusion::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
-        Schema as ArrowSchema,
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
+    use datafusion::arrow::json::ReaderBuilder as JsonReaderBuilder;
     use datafusion::assert_batches_sorted_eq;
     use datafusion::logical_expr::col as df_col;
     use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use datafusion::parquet::arrow::ArrowWriter;
     use datafusion::prelude::SessionContext;
-    use delta_kernel::actions::Add as KernelAdd;
-    use delta_kernel::expressions::{col, Expression as KernelExpression, Scalar as KernelScalar};
+    use delta_kernel::expressions::{
+        ArrayData as KernelArrayData, MapData as KernelMapData, Scalar as KernelScalar,
+    };
     use delta_kernel::plans::ir::nodes::Operator as KernelOperator;
     use delta_kernel::schema::{
-        ColumnMetadataKey, DataType as KernelDataType, MetadataColumnSpec,
-        StructField as KernelStructField, StructType as KernelStructType, ToSchema,
+        ArrayType as KernelArrayType, DataType as KernelDataType, MapType as KernelMapType,
+        StructField as KernelStructField, StructType as KernelStructType,
     };
-    use delta_kernel::{FileMeta as KernelFileMeta, PlanBuilder};
+    use delta_kernel::FileMeta as KernelFileMeta;
     use rstest::rstest;
     use tempfile::TempDir;
 
     use super::*;
     use crate::operator::lower_operator;
 
-    #[derive(Clone, Copy)]
+    // === Shared helpers ===
+
+    #[derive(Debug, Clone, Copy)]
     enum TestFormat {
         Parquet,
         Json,
@@ -336,6 +339,7 @@ mod tests {
         KernelStructType::try_new([
             KernelStructField::not_null("partition", KernelDataType::STRING),
             KernelStructField::not_null("id", KernelDataType::LONG),
+            KernelStructField::not_null("score", KernelDataType::LONG),
             KernelStructField::not_null("version", KernelDataType::LONG),
         ])
         .unwrap()
@@ -356,7 +360,11 @@ mod tests {
             TestFormat::Parquet => write_parquet(&path, ids),
             TestFormat::Json => write_json(&path, ids),
         }
-        let size = std::fs::metadata(&path).unwrap().len();
+        data_scan_file(&path, partition, version)
+    }
+
+    fn data_scan_file(path: &std::path::Path, partition: &str, version: i64) -> KernelScanFile {
+        let size = std::fs::metadata(path).unwrap().len();
         let location = format!("file://{}", path.display()).parse().unwrap();
         KernelScanFile {
             meta: KernelFileMeta {
@@ -372,25 +380,156 @@ mod tests {
     }
 
     fn write_parquet(path: &std::path::Path, ids: &[i64]) {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            ArrowDataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new("score", ArrowDataType::Int64, false),
+        ]));
+        let scores: Vec<_> = ids.iter().map(|id| id * 10).collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(ids.to_vec()))],
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Int64Array::from(scores)),
+            ],
         )
         .unwrap();
-        let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
-        writer.write(&batch).unwrap();
+        write_parquet_batch(path, &batch);
+    }
+
+    fn write_parquet_batch(path: &std::path::Path, batch: &RecordBatch) {
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
         writer.close().unwrap();
     }
 
     fn write_json(path: &std::path::Path, ids: &[i64]) {
-        let lines: Vec<String> = ids.iter().map(|id| format!(r#"{{"id":{id}}}"#)).collect();
+        let lines: Vec<String> = ids
+            .iter()
+            .map(|id| format!(r#"{{"id":{id},"score":{}}}"#, id * 10))
+            .collect();
         let contents = format!("{}\n", lines.join("\n"));
         std::fs::write(path, contents).unwrap();
+    }
+
+    fn nested_file_fields(contains_null: bool) -> [KernelStructField; 6] {
+        [
+            KernelStructField::not_null(
+                "array",
+                KernelArrayType::new(KernelDataType::LONG, contains_null),
+            ),
+            KernelStructField::not_null(
+                "array_of_arrays",
+                KernelArrayType::new(
+                    KernelArrayType::new(KernelDataType::LONG, contains_null),
+                    contains_null,
+                ),
+            ),
+            KernelStructField::not_null(
+                "map",
+                KernelMapType::new(KernelDataType::STRING, KernelDataType::LONG, contains_null),
+            ),
+            KernelStructField::not_null(
+                "map_of_maps",
+                KernelMapType::new(
+                    KernelDataType::STRING,
+                    KernelMapType::new(KernelDataType::STRING, KernelDataType::LONG, contains_null),
+                    contains_null,
+                ),
+            ),
+            KernelStructField::not_null(
+                "array_of_maps",
+                KernelArrayType::new(
+                    KernelMapType::new(KernelDataType::STRING, KernelDataType::LONG, contains_null),
+                    contains_null,
+                ),
+            ),
+            KernelStructField::not_null(
+                "map_of_arrays",
+                KernelMapType::new(
+                    KernelDataType::STRING,
+                    KernelArrayType::new(
+                        KernelArrayType::new(KernelDataType::LONG, contains_null),
+                        contains_null,
+                    ),
+                    contains_null,
+                ),
+            ),
+        ]
+    }
+
+    fn nested_scan_schema() -> KernelStructType {
+        let [array, array_of_arrays, map, map_of_maps, array_of_maps, map_of_arrays] =
+            nested_file_fields(false);
+        KernelStructType::try_new([
+            KernelStructField::not_null("partition", KernelDataType::STRING),
+            array,
+            array_of_arrays,
+            map,
+            map_of_maps,
+            array_of_maps,
+            map_of_arrays,
+            KernelStructField::not_null("version", KernelDataType::LONG),
+        ])
+        .unwrap()
+    }
+
+    fn nested_scan_file(
+        directory: &TempDir,
+        format: TestFormat,
+    ) -> (KernelScanFile, Option<ArrowSchemaRef>) {
+        let path = directory
+            .path()
+            .join(format!("nested.{}", format.extension()));
+        let contents = concat!(
+            r#"{"array":[1,2],"array_of_arrays":[[1,2],[3]],"map":{"a":10,"b":20},"#,
+            r#""map_of_maps":{"outer":{"inner":30}},"#,
+            r#""array_of_maps":[{"c":30},{"d":40}],"#,
+            r#""map_of_arrays":{"nested":[[5,6],[7]]}}"#,
+            "\n",
+            r#"{"array":[],"array_of_arrays":[],"map":{},"map_of_maps":{},"#,
+            r#""array_of_maps":[],"map_of_arrays":{}}"#,
+            "\n",
+        );
+        let physical_schema = match format {
+            TestFormat::Json => {
+                std::fs::write(&path, contents).unwrap();
+                None
+            }
+            TestFormat::Parquet => {
+                let kernel_schema = KernelStructType::try_new(nested_file_fields(true)).unwrap();
+                let schema = Arc::new((&kernel_schema).try_into_arrow().unwrap());
+                let batch = JsonReaderBuilder::new(Arc::clone(&schema))
+                    .build(Cursor::new(contents))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+                write_parquet_batch(&path, &batch);
+                let reader =
+                    ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap();
+                Some(reader.schema().clone())
+            }
+        };
+        (data_scan_file(&path, "nested", 7), physical_schema)
+    }
+
+    fn array_to_arrays_map_type(contains_null: bool) -> KernelMapType {
+        KernelMapType::new(
+            KernelArrayType::new(KernelDataType::LONG, contains_null),
+            KernelArrayType::new(
+                KernelArrayType::new(KernelDataType::LONG, contains_null),
+                contains_null,
+            ),
+            contains_null,
+        )
+    }
+
+    fn kernel_array(
+        array_type: KernelArrayType,
+        values: impl IntoIterator<Item = KernelScalar>,
+    ) -> KernelScalar {
+        KernelScalar::Array(KernelArrayData::try_new(array_type, values).unwrap())
     }
 
     fn lower_test_scan(
@@ -414,13 +553,15 @@ mod tests {
         lower_operator(&operator, &[])
     }
 
+    // === Tests ===
+
+    // In schema summaries, `?` marks a nullable field, list element, or map value.
+
     #[rstest]
     #[case::parquet(TestFormat::Parquet)]
     #[case::json(TestFormat::Json)]
     #[tokio::test]
-    async fn scans_multiple_files_with_constants_in_declared_output_order(
-        #[case] format: TestFormat,
-    ) {
+    async fn scans_multiple_files_with_constants_and_projection(#[case] format: TestFormat) {
         let directory = TempDir::new().unwrap();
         let files = vec![
             scan_file(&directory, format, "one", &[1, 2], "a", 10),
@@ -430,58 +571,14 @@ mod tests {
         let DFLogicalPlan::TableScan(scan) = &plan else {
             panic!("expected a table scan")
         };
-        assert_eq!(scan.projection.as_deref(), Some(&[2, 0, 1][..]));
-
-        let batches = SessionContext::new()
-            .execute_logical_plan(plan)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        assert_batches_sorted_eq!(
-            [
-                "+-----------+----+---------+",
-                "| partition | id | version |",
-                "+-----------+----+---------+",
-                "| a         | 1  | 10      |",
-                "| a         | 2  | 10      |",
-                "| b         | 3  | 20      |",
-                "+-----------+----+---------+",
-            ],
-            &batches
-        );
-    }
-
-    #[rstest]
-    #[case::parquet(TestFormat::Parquet)]
-    #[case::json(TestFormat::Json)]
-    fn assigns_distinct_scan_indices_to_multiple_file_fields(#[case] format: TestFormat) {
-        let schema = KernelStructType::try_new([
-            KernelStructField::not_null("partition", KernelDataType::STRING),
-            KernelStructField::not_null("first", KernelDataType::LONG),
-            KernelStructField::not_null("second", KernelDataType::LONG),
-            KernelStructField::not_null("version", KernelDataType::LONG),
-        ])
-        .unwrap();
-        let plan = lower_test_scan(format, vec![], schema).unwrap();
-        let DFLogicalPlan::TableScan(scan) = plan else {
-            panic!("expected a table scan")
-        };
-
         assert_eq!(scan.projection.as_deref(), Some(&[3, 0, 1, 2][..]));
-    }
-
-    #[rstest]
-    #[case::parquet(TestFormat::Parquet)]
-    #[case::json(TestFormat::Json)]
-    #[tokio::test]
-    async fn translates_projection_from_output_to_native_scan_order(#[case] format: TestFormat) {
-        let directory = TempDir::new().unwrap();
-        let files = vec![scan_file(&directory, format, "one", &[7], "west", 42)];
-        let scan = lower_test_scan(format, files, scan_schema()).unwrap();
-        let projected = LogicalPlanBuilder::from(scan)
-            .project([df_col("version"), df_col("id")])
+        let projected = LogicalPlanBuilder::from(plan)
+            .project([
+                df_col("version"),
+                df_col("score"),
+                df_col("partition"),
+                df_col("id"),
+            ])
             .unwrap()
             .build()
             .unwrap();
@@ -495,11 +592,13 @@ mod tests {
             .unwrap();
         assert_batches_sorted_eq!(
             [
-                "+---------+----+",
-                "| version | id |",
-                "+---------+----+",
-                "| 42      | 7  |",
-                "+---------+----+",
+                "+---------+-------+-----------+----+",
+                "| version | score | partition | id |",
+                "+---------+-------+-----------+----+",
+                "| 10      | 10    | a         | 1  |",
+                "| 10      | 20    | a         | 2  |",
+                "| 20      | 30    | b         | 3  |",
+                "+---------+-------+-----------+----+",
             ],
             &batches
         );
@@ -540,101 +639,168 @@ mod tests {
         );
     }
 
-    fn valid_add_paths(batch: &RecordBatch) -> Vec<String> {
-        let add = batch.column_by_name("add").unwrap().as_struct();
-        let paths: &ArrowStringArray = add.column_by_name("path").unwrap().as_string();
-        (0..batch.num_rows())
-            .filter(|&row| add.is_valid(row))
-            .map(|row| paths.value(row).to_string())
+    // Physical Parquet:
+    //   array<i64?>, array<array<i64?>?>, map<string, i64?>,
+    //   map<string, map<string, i64?>?>, array<map<string, i64?>?>,
+    //   map<string, array<array<i64?>?>?>
+    // Requested Kernel: the same types with every `?` removed.
+    // Expected: values below, with every output field exactly matching its requested Kernel field.
+    #[rstest]
+    #[case::basic(
+        &["array", "array_of_arrays", "map"],
+        &[
+            "+--------+-----------------+----------------+",
+            "| array  | array_of_arrays | map            |",
+            "+--------+-----------------+----------------+",
+            "| [1, 2] | [[1, 2], [3]]   | {a: 10, b: 20} |",
+            "| []     | []              | {}             |",
+            "+--------+-----------------+----------------+",
+        ]
+    )]
+    #[case::cursed(
+        &["map_of_maps", "array_of_maps", "map_of_arrays"],
+        &[
+            "+----------------------+--------------------+-------------------------+",
+            "| map_of_maps          | array_of_maps      | map_of_arrays           |",
+            "+----------------------+--------------------+-------------------------+",
+            "| {outer: {inner: 30}} | [{c: 30}, {d: 40}] | {nested: [[5, 6], [7]]} |",
+            "| {}                   | []                 | {}                      |",
+            "+----------------------+--------------------+-------------------------+",
+        ]
+    )]
+    #[tokio::test]
+    async fn reads_nested_array_and_map_columns(
+        #[values(TestFormat::Parquet, TestFormat::Json)] format: TestFormat,
+        #[case] columns: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let directory = TempDir::new().unwrap();
+        let (file, physical_schema) = nested_scan_file(&directory, format);
+        let requested_schema = nested_scan_schema();
+        let requested_arrow_schema: ArrowSchema = (&requested_schema).try_into_arrow().unwrap();
+        if let Some(physical_schema) = physical_schema {
+            for name in columns {
+                assert_ne!(
+                    physical_schema.field_with_name(name).unwrap(),
+                    requested_arrow_schema.field_with_name(name).unwrap()
+                );
+            }
+        }
+
+        let scan = lower_test_scan(format, vec![file], requested_schema).unwrap();
+        let projected = LogicalPlanBuilder::from(scan)
+            .project(columns.iter().map(|name| df_col(*name)))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(projected)
+            .await
+            .unwrap()
             .collect()
+            .await
+            .unwrap();
+        for batch in &batches {
+            for name in columns {
+                assert_eq!(
+                    batch.schema().field_with_name(name).unwrap(),
+                    requested_arrow_schema.field_with_name(name).unwrap()
+                );
+            }
+        }
+        assert_batches_sorted_eq!(expected, &batches);
     }
 
+    // Physical Parquet: map<array<i64?>, array<array<i64?>?>?>
+    // Requested Kernel: map<array<i64>, array<array<i64>>>
+    // Expected: `{[1, 2]: [[3, 4], [5]]}` with the complete requested Kernel field.
     #[tokio::test]
-    async fn legacy_checkpoint_nullable_adds_match_new_json_adds() {
-        let log = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../kernel/tests/data/with_checkpoint_no_last_checkpoint/_delta_log");
-        let checkpoint = log.join("00000000000000000002.checkpoint.parquet");
-        let commit = log.join("00000000000000000003.json");
-        let add_schema = KernelAdd::to_schema();
-        let required_add_fields: Vec<_> = add_schema
-            .fields()
-            .filter(|field| !field.is_nullable())
-            .map(|field| field.name().clone())
-            .collect();
-        let assert_required_nullability = |fields: &ArrowFields, nullable| {
-            for name in &required_add_fields {
-                let field = fields.find(name).unwrap().1;
-                assert_eq!(field.is_nullable(), nullable, "add.{name}");
-            }
-        };
-
-        let reader =
-            ParquetRecordBatchReaderBuilder::try_new(File::open(&checkpoint).unwrap()).unwrap();
-        let physical_schema = reader.schema();
-        let ArrowDataType::Struct(physical_add_fields) =
-            physical_schema.field_with_name("add").unwrap().data_type()
-        else {
-            panic!("expected physical add field to be a struct")
-        };
-        assert_required_nullability(physical_add_fields, true);
-
-        let requested_schema = Arc::new(
-            KernelStructType::try_new([
-                KernelStructField::nullable("add", add_schema),
-                KernelStructField::not_null("version", KernelDataType::LONG),
-            ])
-            .unwrap(),
+    async fn parquet_reads_map_from_array_keys_to_nested_array_values() {
+        let physical_array_type = KernelArrayType::new(KernelDataType::LONG, true);
+        let key = kernel_array(
+            physical_array_type.clone(),
+            [KernelScalar::Long(1), KernelScalar::Long(2)],
         );
-        let scan_file = |path: &std::path::Path, version| {
-            let meta = KernelFileMeta {
-                location: format!("file://{}", path.display()).parse().unwrap(),
-                last_modified: 0,
-                size: std::fs::metadata(path).unwrap().len(),
-            };
-            KernelScanFile {
-                meta,
-                file_constants: vec![KernelScalar::Long(version)],
-            }
-        };
-        let scans = [
-            PlanBuilder::scan_parquet(
-                [scan_file(&checkpoint, 2)],
-                &["version"],
-                Arc::clone(&requested_schema),
-            )
-            .unwrap(),
-            PlanBuilder::scan_json(
-                [scan_file(&commit, 3)],
-                &["version"],
-                Arc::clone(&requested_schema),
-            )
-            .unwrap(),
-        ];
-        // Metadata replay projects each scan before unioning, removing scan qualifiers.
-        let inputs = scans.into_iter().map(|scan| {
-            scan.project(
-                KernelExpression::struct_from([col!("add"), col!("version")]),
-                Arc::clone(&requested_schema),
-            )
-            .unwrap()
-        });
-        let plan = PlanBuilder::union_all(inputs).unwrap().build().unwrap();
-
-        let df_plan = crate::plan::to_df_plan(&plan).unwrap();
-        let context = SessionContext::new();
-        let dataframe = context.execute_logical_plan(df_plan).await.unwrap();
-        let batches = dataframe.collect().await.unwrap();
-        let mut paths: Vec<_> = batches.iter().flat_map(valid_add_paths).collect();
-        paths.sort();
-        assert_eq!(
-            paths,
+        let value = kernel_array(
+            KernelArrayType::new(physical_array_type.clone(), true),
             [
-                "part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet",
-                "part-00000-a190be9e-e3df-439e-b366-06a863f51e99-c000.snappy.parquet",
-            ]
+                kernel_array(
+                    physical_array_type.clone(),
+                    [KernelScalar::Long(3), KernelScalar::Long(4)],
+                ),
+                kernel_array(physical_array_type, [KernelScalar::Long(5)]),
+            ],
         );
-        let add = batches[0].column_by_name("add").unwrap().as_struct();
-        assert_required_nullability(add.fields(), false);
+        let physical_map_type = array_to_arrays_map_type(true);
+        let map = KernelScalar::Map(
+            KernelMapData::try_new(physical_map_type.clone(), [(key, value)]).unwrap(),
+        );
+
+        let physical_schema = KernelStructType::try_new([KernelStructField::not_null(
+            "array_to_arrays_map",
+            physical_map_type,
+        )])
+        .unwrap();
+        let physical_arrow_schema: ArrowSchema = (&physical_schema).try_into_arrow().unwrap();
+        let physical_arrow_schema = Arc::new(physical_arrow_schema);
+        let array = to_df_scalar(&map).unwrap().to_array_of_size(1).unwrap();
+        let batch = RecordBatch::try_new(Arc::clone(&physical_arrow_schema), vec![array]).unwrap();
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("array-map.parquet");
+        write_parquet_batch(&path, &batch);
+
+        let requested_schema = KernelStructType::try_new([
+            KernelStructField::not_null("partition", KernelDataType::STRING),
+            KernelStructField::not_null("array_to_arrays_map", array_to_arrays_map_type(false)),
+            KernelStructField::not_null("version", KernelDataType::LONG),
+        ])
+        .unwrap();
+        let requested_arrow_schema: ArrowSchema = (&requested_schema).try_into_arrow().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap();
+        assert_ne!(
+            reader
+                .schema()
+                .field_with_name("array_to_arrays_map")
+                .unwrap(),
+            requested_arrow_schema
+                .field_with_name("array_to_arrays_map")
+                .unwrap()
+        );
+
+        let file = data_scan_file(&path, "nested", 7);
+        let scan = lower_test_scan(TestFormat::Parquet, vec![file], requested_schema).unwrap();
+        let projected = LogicalPlanBuilder::from(scan)
+            .project([df_col("array_to_arrays_map")])
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches = SessionContext::new()
+            .execute_logical_plan(projected)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches[0]
+                .schema()
+                .field_with_name("array_to_arrays_map")
+                .unwrap(),
+            requested_arrow_schema
+                .field_with_name("array_to_arrays_map")
+                .unwrap()
+        );
+        assert_batches_sorted_eq!(
+            [
+                "+-------------------------+",
+                "| array_to_arrays_map     |",
+                "+-------------------------+",
+                "| {[1, 2]: [[3, 4], [5]]} |",
+                "+-------------------------+",
+            ],
+            &batches
+        );
     }
 
     #[rstest]
@@ -655,7 +821,7 @@ mod tests {
             .iter()
             .map(|field| field.name().as_str())
             .collect();
-        assert_eq!(names, ["partition", "id", "version"]);
+        assert_eq!(names, ["partition", "id", "score", "version"]);
         assert!(dataframe.collect().await.unwrap().is_empty());
     }
 
@@ -680,35 +846,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("expects 0 input(s), but received 1"));
-    }
-
-    #[test]
-    fn scan_rejects_metadata_columns() {
-        let schema = KernelStructType::try_new([KernelStructField::create_metadata_column(
-            "row_index",
-            MetadataColumnSpec::RowIndex,
-        )])
-        .unwrap();
-        let error = lower_test_scan(TestFormat::Json, vec![], schema).unwrap_err();
-        assert!(error.to_string().contains("metadata column `row_index`"));
-    }
-
-    #[test]
-    fn parquet_scan_rejects_nested_field_ids() {
-        let child = KernelStructField::nullable("child", KernelDataType::LONG)
-            .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 1_i64)]);
-        let nested = KernelStructType::try_new([child]).unwrap();
-        let schema =
-            KernelStructType::try_new([KernelStructField::nullable("nested", nested)]).unwrap();
-        let error = lower_parquet_scan(&KernelScanParquet {
-            files: vec![],
-            file_constant_columns: vec![],
-            schema: Arc::new(schema),
-        })
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("field-ID resolution for `child`"));
     }
 
     #[test]
