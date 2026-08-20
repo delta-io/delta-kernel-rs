@@ -379,6 +379,25 @@ impl Snapshot {
         self.table_configuration().table_properties()
     }
 
+    /// Whether any field of this snapshot's logical schema declares a column default
+    /// (`CURRENT_DEFAULT` metadata), nested fields included.
+    ///
+    /// Reflects schema metadata only, so this reports `true` for orphaned metadata (a default
+    /// declared without the `allowColumnDefaults` writer feature). Connectors use it as a cheap
+    /// pre-check before the write-path column-default APIs
+    /// ([`Transaction::top_level_column_defaults`] and
+    /// [`Transaction::ack_column_defaults`](crate::transaction::Transaction::ack_column_defaults)).
+    /// The feature check itself lives in write-context creation, which is what refuses to proceed
+    /// until the defaults are acknowledged.
+    ///
+    /// Unlike [`Transaction::top_level_column_defaults`], this covers nested fields, so it matches
+    /// what that write-context gate keys on.
+    ///
+    /// [`Transaction::top_level_column_defaults`]: crate::transaction::Transaction::top_level_column_defaults
+    pub fn has_column_defaults(&self) -> bool {
+        self.table_configuration().has_column_with_default()
+    }
+
     /// Returns the protocol-derived table properties as a map of key-value pairs.
     ///
     /// This includes:

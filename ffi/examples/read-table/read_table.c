@@ -8,6 +8,7 @@
 #include "arrow.h"
 #include "read_table.h"
 #include "schema.h"
+#include "column_defaults.h"
 #include "kernel_schema_visitor.h"
 #include "kernel_utils.h"
 
@@ -370,9 +371,15 @@ int main(int argc, char* argv[])
 {
   char* requested_cols = NULL;
   bool use_arrow_metadata = false;
+  bool print_defaults = false;
   int c;
-  while ((c = getopt (argc, argv, "ac:")) != -1) {
+  while ((c = getopt (argc, argv, "adc:")) != -1) {
     switch (c) {
+    case 'd':
+      // Print the table's column defaults (the `allowColumnDefaults` writer feature) after the
+      // schema. See column_defaults.h.
+      print_defaults = true;
+      break;
     case 'a':
       // Use the Arrow batch-mode scan metadata path (scan_metadata_next_arrow) instead of
       // the callback-based path (scan_metadata_next + visit_scan_metadata). This path
@@ -403,7 +410,7 @@ int main(int argc, char* argv[])
   }
 
   if (optind != (argc - 1)) {
-    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
+    printf("Usage: %s [-a] [-d] [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
     return -1;
   }
 
@@ -487,6 +494,13 @@ int main(int argc, char* argv[])
 
   CSchema *cschema = get_cschema(snapshot, engine);
   print_cschema(cschema);
+
+  if (print_defaults && !print_column_defaults(table_path_slice, cschema, snapshot, engine)) {
+    free_cschema(cschema);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    return -1;
+  }
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
