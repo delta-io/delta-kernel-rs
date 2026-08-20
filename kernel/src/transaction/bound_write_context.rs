@@ -13,9 +13,8 @@ use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
-/// A write context for a specific partition or an unpartitioned table. Created by either a
-/// [`WriteState`](super::WriteState) or the convenience methods on
-/// [`Transaction`](super::Transaction).
+/// A write context for a specific partition or an unpartitioned table. Created by a
+/// [`WriteState`](super::WriteState).
 ///
 /// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
 ///
@@ -30,8 +29,8 @@ use crate::{DeltaResult, Error};
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
-/// [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
-/// [`Transaction::unpartitioned_write_context`]: super::Transaction::unpartitioned_write_context
+/// [`WriteState::partitioned_write_context`]: super::WriteState::partitioned_write_context
+/// [`WriteState::unpartitioned_write_context`]: super::WriteState::unpartitioned_write_context
 /// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
 #[derive(Debug)]
@@ -244,7 +243,8 @@ impl BoundWriteContext {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let write_context = transaction.unpartitioned_write_context()?;
+    /// let write_state = transaction.write_state()?;
+    /// let write_context = write_state.unpartitioned_write_context()?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// ```
     // TODO(#2357): generate the random prefix internally based on table properties

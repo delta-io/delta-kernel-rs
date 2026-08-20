@@ -96,7 +96,7 @@ async fn test_create_table_with_row_tracking(
         )
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
-        let write_context = Arc::new(txn.unpartitioned_write_context()?);
+        let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
         let add_files = engine
             .write_parquet(&ArrowEngineData::new(batch), write_context.as_ref())
             .await?;
@@ -222,7 +222,7 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
     )
     .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
-    let write_context = Arc::new(txn.unpartitioned_write_context()?);
+    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
     let adds1 = engine
         .write_parquet(&ArrowEngineData::new(batch1), write_context.as_ref())
         .await?;
@@ -335,7 +335,7 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
     )
     .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
-    let write_context = Arc::new(txn.unpartitioned_write_context()?);
+    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
     let add_files = engine
         .write_parquet(&ArrowEngineData::new(batch), write_context.as_ref())
         .await?;
