@@ -11,8 +11,8 @@ Appending data to a Delta table follows these steps:
 
 1. Get a `Snapshot` of the table
 2. Create a `Transaction` from the snapshot
-3. Get the `WriteContext` from the transaction
-4. [Write Parquet files](#writing-parquet-files) using the engine and `WriteContext`
+3. Get the `BoundWriteContext` from the transaction
+4. [Write Parquet files](#writing-parquet-files) using the engine and `BoundWriteContext`
 5. Register the written files with the transaction via `add_files`
 6. Commit the transaction
 
@@ -100,9 +100,9 @@ The builder methods:
 | `with_engine_info(impl Into<String>)` | Identifies your application in the commit log |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
-## The WriteContext
+## The BoundWriteContext
 
-Before writing data, obtain a `WriteContext`. A `WriteContext` bundles everything
+Before writing data, obtain a `BoundWriteContext`. A `BoundWriteContext` bundles everything
 needed to correctly write Parquet files:
 
 ```rust,ignore
@@ -116,7 +116,7 @@ let write_context = txn.partitioned_write_context(partition_values)?;
 For partitioned tables, see
 [Writing to Partitioned Tables](./partitioned_writes.md).
 
-`WriteContext` provides:
+`BoundWriteContext` provides:
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
@@ -162,7 +162,7 @@ If you do not use `DefaultEngine`, write the files yourself. The expected flow i
 
 ```rust,ignore
 // Assume: data: Box<dyn EngineData> (logical), engine: impl Engine,
-// write_context: WriteContext.
+// write_context: BoundWriteContext.
 
 // 1. Transform logical data into physical data
 let evaluator = engine.evaluation_handler().new_expression_evaluator(

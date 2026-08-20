@@ -31,7 +31,7 @@ use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
-use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
     iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
@@ -103,6 +103,7 @@ impl Transaction {
             system_domain_metadata_additions: vec![],
             user_domain_removals: vec![],
             data_change: true,
+            column_defaults_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
@@ -222,16 +223,20 @@ impl Transaction {
     /// of scan file data. It joins the two together internally and will generate appropriate
     /// remove/add actions on commit to update the deletion vectors.
     ///
+    /// Required AddFile fields on matched rows are validated at commit. Staging can therefore
+    /// succeed for metadata that commit later rejects, including an empty path, negative size,
+    /// or incorrect physical partition keys.
+    ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`.
     ///
     /// # Arguments
     ///
     /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to the
     ///   new deletion vector descriptor for that file.
-    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
-    ///   selected elements of each FilteredEngineData must be a superset of the paths that key
-    ///   `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
-    ///   accurate `numRecords` statistic, so matched scan metadata must preserve that stat.
+    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata using
+    ///   [`scan_row_schema`]. Selected rows must preserve the scan-file values and cover every path
+    ///   in `new_dv_descriptors`. Files with deletion vectors must have an accurate
+    ///   `stats.numRecords` value.
     ///
     /// # Errors
     ///
@@ -297,26 +302,13 @@ impl Transaction {
             visitor.new_entries.clear();
             visitor.matched_file_indexes.clear();
             visitor.visit_rows_of(&scan_file)?;
-            let (data, mut selection_vector) = scan_file.into_parts();
+            let (data, _) = scan_file.into_parts();
 
             // Update selection vector to keep only files that matched DV descriptors.
             // This ensures we only generate remove/add actions for files being updated.
-            let mut current_matched_index = 0;
-            for (i, selected) in selection_vector.iter_mut().enumerate() {
-                if current_matched_index < visitor.matched_file_indexes.len() {
-                    if visitor.matched_file_indexes[current_matched_index] != i {
-                        *selected = false;
-                    } else {
-                        // `matched_file_indexes` is populated from a FilteredRowVisitor, so every
-                        // matched row was selected in the original scan metadata.
-                        current_matched_index += 1;
-                        matched_dv_files += 1;
-                    }
-                } else {
-                    // Deselect any files after the last matched file
-                    *selected = false;
-                }
-            }
+            let selection_vector =
+                selection_vector_for_matches(data.len(), &visitor.matched_file_indexes);
+            matched_dv_files += visitor.matched_file_indexes.len();
 
             // Append two temporary columns to the scan data: the new DV descriptor and the
             // rewritten stats (with `tightBounds: false`).
@@ -365,6 +357,20 @@ impl Transaction {
     }
 }
 
+fn selection_vector_for_matches(num_rows: usize, matched_file_indexes: &[usize]) -> Vec<bool> {
+    let mut next_match = 0;
+    (0..num_rows)
+        .map(|row_index| {
+            if matched_file_indexes.get(next_match) == Some(&row_index) {
+                next_match += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
+}
+
 // =============================================================================
 // Deletion vector schemas and commit helpers
 // =============================================================================
@@ -380,17 +386,11 @@ static NEW_STATS_NAME: &str = "newStats";
 /// Schema for scan row data with an additional column for new deletion vector descriptors.
 /// This is an intermediate schema used during deletion vector updates before transforming to final
 /// add actions.
-static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(
-        scan_row_schema().fields().cloned().chain([
-            StructField::nullable(
-                NEW_DELETION_VECTOR_NAME.to_string(),
-                DeletionVectorDescriptor::to_schema(),
-            ),
-            StructField::nullable(NEW_STATS_NAME.to_string(), DataType::STRING),
-        ]),
-    ))
-});
+static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(scan_row_schema().fields()),
+    nullable NEW_DELETION_VECTOR_NAME: (DeletionVectorDescriptor::to_schema()),
+    nullable NEW_STATS_NAME: STRING,
+};
 
 /// Returns the intermediate schema with deletion vector column appended to scan row schema.
 fn intermediate_dv_schema() -> &'static SchemaRef {
@@ -444,15 +444,10 @@ fn struct_deletion_vector_schema() -> &'static ArrayType {
 /// Schema for the intermediate column holding new DV descriptors.
 /// This temporary column is dropped during transformation to final add actions.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::nullable(
-            NEW_DELETION_VECTOR_NAME,
-            DeletionVectorDescriptor::to_schema(),
-        ),
-        StructField::nullable(NEW_STATS_NAME, DataType::STRING),
-    ]))
-});
+static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable NEW_DELETION_VECTOR_NAME: (DeletionVectorDescriptor::to_schema()),
+    nullable NEW_STATS_NAME: STRING,
+};
 
 /// Returns the schema for the intermediate column holding new DV descriptors.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
@@ -563,9 +558,10 @@ struct DvUpdateEntry {
 
 impl DvUpdateEntry {
     /// The (null DV, null stats) entry for rows that are not getting a DV update.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     fn null() -> Self {
         static NULL_DV: LazyLock<Scalar> =
-            LazyLock::new(|| Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
+            LazyLock::new(|| Scalar::null(DeletionVectorDescriptor::to_schema()));
         static NULL_STATS: LazyLock<Scalar> = LazyLock::new(|| Scalar::Null(DataType::STRING));
         Self {
             deletion_vector: NULL_DV.clone(),

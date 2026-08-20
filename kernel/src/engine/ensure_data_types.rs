@@ -354,8 +354,8 @@ mod tests {
     use super::*;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_conversion::TryFromKernel as _;
-    use crate::schema::{ArrayType, DataType, MapType, StructField};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::schema::{schema, ArrayType, DataType, MapType};
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
     fn accepts_safe_decimal_casts() {
@@ -637,34 +637,24 @@ mod tests {
 
     #[test]
     fn ensure_struct() {
-        let schema = DataType::struct_type_unchecked([StructField::nullable(
-            "a",
-            ArrayType::new(
-                DataType::struct_type_unchecked([
-                    StructField::nullable("w", DataType::LONG),
-                    StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
-                    StructField::nullable(
-                        "y",
-                        MapType::new(DataType::LONG, DataType::STRING, true),
-                    ),
-                    StructField::nullable(
-                        "z",
-                        DataType::struct_type_unchecked([
-                            StructField::nullable("n", DataType::LONG),
-                            StructField::nullable("m", DataType::STRING),
-                        ]),
-                    ),
-                ]),
-                true,
-            ),
-        )]);
+        let schema = DataType::from(schema! {
+            nullable "a": [ nullable {
+                nullable "w": LONG,
+                nullable "x": [ nullable LONG ],
+                nullable "y": { LONG => nullable STRING },
+                nullable "z": {
+                    nullable "n": LONG,
+                    nullable "m": STRING,
+                },
+            } ],
+        });
         let arrow_struct = ArrowDataType::try_from_kernel(&schema).unwrap();
         assert!(ensure_data_types(&schema, &arrow_struct, ValidationMode::Full).is_ok());
 
-        let kernel_simple = DataType::struct_type_unchecked([
-            StructField::nullable("w", DataType::LONG),
-            StructField::nullable("x", DataType::LONG),
-        ]);
+        let kernel_simple = DataType::from(schema! {
+            nullable "w": LONG,
+            nullable "x": LONG,
+        });
 
         let arrow_simple_ok = ArrowField::new_struct(
             "arrow_struct",
@@ -717,10 +707,10 @@ mod tests {
     fn name_based_matching_pairs_fields_by_name_with_interleaved_extra() {
         // The arrow struct has an unselected `extra` field between the matched ones. `x` must be
         // paired with the arrow `x`, not positionally with `extra`.
-        let kernel = DataType::struct_type_unchecked([
-            StructField::nullable("w", DataType::LONG),
-            StructField::nullable("x", DataType::STRING),
-        ]);
+        let kernel = DataType::from(schema! {
+            nullable "w": LONG,
+            nullable "x": STRING,
+        });
         let arrow = ArrowDataType::Struct(Fields::from(vec![
             ArrowField::new("w", ArrowDataType::Int64, true),
             ArrowField::new("extra", ArrowDataType::Int64, true),
@@ -735,10 +725,10 @@ mod tests {
     #[test]
     fn name_based_matching_rejects_wrong_type_behind_interleaved_extra() {
         // An unselected `extra` field must not mask a type mismatch on the real `x` field.
-        let kernel = DataType::struct_type_unchecked([
-            StructField::nullable("w", DataType::LONG),
-            StructField::nullable("x", DataType::LONG),
-        ]);
+        let kernel = DataType::from(schema! {
+            nullable "w": LONG,
+            nullable "x": LONG,
+        });
         let arrow = ArrowDataType::Struct(Fields::from(vec![
             ArrowField::new("w", ArrowDataType::Int64, true),
             ArrowField::new("extra", ArrowDataType::Int64, true),
@@ -951,10 +941,10 @@ mod tests {
 
     #[test]
     fn types_only_matches_struct_by_ordinal_ignoring_names() {
-        let kernel = DataType::struct_type_unchecked([
-            StructField::nullable("logical_a", DataType::LONG),
-            StructField::nullable("logical_b", DataType::STRING),
-        ]);
+        let kernel = DataType::from(schema! {
+            nullable "logical_a": LONG,
+            nullable "logical_b": STRING,
+        });
         let arrow = ArrowDataType::Struct(
             vec![
                 ArrowField::new("physical_x", ArrowDataType::Int64, true),
@@ -967,10 +957,10 @@ mod tests {
 
     #[test]
     fn types_only_rejects_struct_field_count_mismatch() {
-        let kernel = DataType::struct_type_unchecked([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-        ]);
+        let kernel = DataType::from(schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+        });
         let arrow =
             ArrowDataType::Struct(vec![ArrowField::new("x", ArrowDataType::Int64, true)].into());
         assert_result_error_with_message(
@@ -981,10 +971,10 @@ mod tests {
 
     #[test]
     fn types_only_rejects_struct_type_mismatch_by_ordinal() {
-        let kernel = DataType::struct_type_unchecked([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-        ]);
+        let kernel = DataType::from(schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+        });
         let arrow = ArrowDataType::Struct(
             vec![
                 ArrowField::new("x", ArrowDataType::Int64, true),

@@ -28,6 +28,11 @@ Delta-kernel-rs is split into a few different crates:
 - derive-macros: A crate for our [derive-macros] to live in
 - ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
   directory for more information.
+- unity-catalog-delta-client-api: Transport-agnostic client traits and wire models for the Unity
+  Catalog Delta Tables API
+- unity-catalog-delta-rest-client: REST/HTTP client for the Unity Catalog Delta Tables API
+- delta-kernel-unity-catalog: Unity Catalog integration for the kernel, providing a catalog
+  `Committer` and helpers for catalog-managed tables
 
 ## Building
 By default we build only the `kernel` and `acceptance` crates, which will also build `derive-macros`
@@ -42,6 +47,16 @@ cargo test --all-features
 This will build the kernel, run all unit tests, fetch the [Delta Acceptance Tests][dat] data and run
 the acceptance tests against it.
 
+CI also checks no-default-features builds in smaller pieces so that dependent crates do not
+accidentally enable kernel features. To run the same checks locally, use:
+
+```sh
+cargo clippy-no-default-kernel-dependents
+cargo check-no-default-kernel
+cargo check-no-default-engine
+cargo clippy-no-default-kernel-leaves
+```
+
 In general, you will want to depend on `delta-kernel-rs` by adding it as a dependency to your
 `Cargo.toml`, (that is, for rust projects using cargo) for other projects please see the [FFI]
 module. The core kernel includes facilities for reading and writing delta tables, and allows the
@@ -54,11 +69,11 @@ built with [Arrow] and [Tokio].
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.26.0"
+delta_kernel = "0.27.1"
 
 # or pull in the default Arrow/Tokio engine alongside the kernel
-delta_kernel = "0.26.0"
-delta_kernel_default_engine = { version = "0.26.0", features = ["rustls"] }
+delta_kernel = "0.27.1"
+delta_kernel_default_engine = { version = "0.27.1", features = ["rustls"] }
 ```
 
 ### Feature flags

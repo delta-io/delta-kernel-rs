@@ -299,18 +299,16 @@ mod tests {
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{schema_ref, SchemaRef};
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     #[test]
     fn test_parallel_state_log_metrics_carries_round_tripped_table_type() {
         let engine = SyncEngine::new();
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema: SchemaRef = schema_ref! {
+            nullable "id": INTEGER,
+        };
         let state_info = Arc::new(StateInfo {
             logical_schema: schema.clone(),
             physical_schema: schema,

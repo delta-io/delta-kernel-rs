@@ -9,8 +9,8 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
 use delta_kernel::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
-    StructType,
+    schema, schema_ref, try_schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
+    SchemaRef, StructField,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -25,13 +25,10 @@ use test_utils::{
 };
 
 fn simple_schema() -> SchemaRef {
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])
-        .unwrap(),
-    )
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "name": STRING,
+    }
 }
 
 fn committer() -> Box<FileSystemCommitter> {
@@ -198,10 +195,10 @@ async fn add_columns_lifecycle(
 #[case::struct_column(
     StructField::nullable(
         "address",
-        StructType::try_new(vec![
-            StructField::nullable("city", DataType::STRING),
-            StructField::nullable("zip", DataType::STRING),
-        ]).unwrap(),
+        schema! {
+            nullable "city": STRING,
+            nullable "zip": STRING,
+        },
     ),
     3,
 )]
@@ -217,11 +214,10 @@ async fn add_columns_lifecycle(
     StructField::nullable(
         "items",
         ArrayType::new(
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::STRING),
-                StructField::nullable("b", DataType::INTEGER),
-            ])
-            .unwrap(),
+            schema! {
+                nullable "a": STRING,
+                nullable "b": INTEGER,
+            },
             true,
         ),
     ),
@@ -232,11 +228,10 @@ async fn add_columns_lifecycle(
         "by_id",
         MapType::new(
             DataType::STRING,
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::STRING),
-                StructField::nullable("b", DataType::INTEGER),
-            ])
-            .unwrap(),
+            schema! {
+                nullable "a": STRING,
+                nullable "b": INTEGER,
+            },
             true,
         ),
     ),
@@ -246,11 +241,10 @@ async fn add_columns_lifecycle(
     StructField::nullable(
         "lookup",
         MapType::new(
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::STRING),
-                StructField::nullable("b", DataType::INTEGER),
-            ])
-            .unwrap(),
+            schema! {
+                nullable "a": STRING,
+                nullable "b": INTEGER,
+            },
             DataType::INTEGER,
             true,
         ),
@@ -447,7 +441,7 @@ async fn empty_create_then_add_column(
         .map(|m| vec![("delta.columnMapping.mode", m)])
         .unwrap_or_default();
 
-    let empty_schema = Arc::new(StructType::try_new(vec![])?);
+    let empty_schema = schema_ref! {};
     let v0 =
         create_table_and_load_snapshot(&table_path, empty_schema, engine.as_ref(), &properties)?;
     assert_eq!(v0.version(), 0);
@@ -543,23 +537,20 @@ async fn empty_create_then_add_column(
 #[rstest]
 #[case::already_nullable(simple_schema(), column_name!("name"))]
 #[case::required_top_level(
-    Arc::new(StructType::try_new(vec![
-        StructField::not_null("id", DataType::INTEGER),
-        StructField::nullable("name", DataType::STRING),
-    ]).unwrap()),
+    schema_ref! {
+        not_null "id": INTEGER,
+        nullable "name": STRING,
+    },
     column_name!("id")
 )]
 #[case::required_nested(
-    Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "address",
-            StructType::try_new(vec![
-                StructField::not_null("city", DataType::STRING),
-                StructField::nullable("zip", DataType::STRING),
-            ]).unwrap(),
-        ),
-    ]).unwrap()),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "address": {
+            not_null "city": STRING,
+            nullable "zip": STRING,
+        },
+    },
     column_name!("address.city")
 )]
 #[tokio::test]
@@ -618,10 +609,10 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     let is_partitioned = matches!(layout, DataLayout::Partitioned { .. });
 
     // v0: create the table with the layout column as non-null.
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::not_null(col_name, DataType::STRING),
-    ])?);
+    let schema = Arc::new(try_schema! {
+        nullable "id": INTEGER,
+        not_null (col_name): STRING,
+    }?);
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
         .unwrap_or_default();
@@ -732,10 +723,10 @@ async fn chain_add_column_and_set_nullable(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::not_null("id", DataType::INTEGER),
-        StructField::not_null("name", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        not_null "id": INTEGER,
+        not_null "name": STRING,
+    };
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
         .unwrap_or_default();
@@ -840,7 +831,9 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
     let (field, stripped_path): (StructField, Vec<String>) = if nested {
         let outer = StructField::nullable(
             "outer",
-            StructType::try_new(vec![field_with_stray_key("inner", &key, DataType::STRING)])?,
+            schema! {
+                (field_with_stray_key("inner", &key, DataType::STRING)),
+            },
         );
         (outer, vec!["outer".to_string(), "inner".to_string()])
     } else {
@@ -1152,10 +1145,10 @@ async fn add_column_with_id_below_max_column_id_succeeds() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Pre-populate the table with sparse ids (1, 100) using the create-table preserve path.
-    let schema = Arc::new(StructType::try_new(vec![
-        fixtures::cm_field("a", 1, "phys-a", DataType::INTEGER),
-        fixtures::cm_field("b", 100, "phys-b", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        (fixtures::cm_field("a", 1, "phys-a", DataType::INTEGER)),
+        (fixtures::cm_field("b", 100, "phys-b", DataType::STRING)),
+    };
     let snapshot = create_table_and_load_snapshot(
         &table_path,
         schema,
@@ -1250,11 +1243,11 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
 
     // `value` carries a stale id; protocol omits columnMapping and no mode is set (resolves to
     // None) -- residual annotations already on the table.
-    let stale_schema = StructType::try_new([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::INTEGER)
-            .add_metadata([("delta.columnMapping.id", MetadataValue::Number(2))]),
-    ])?;
+    let stale_schema = schema! {
+        nullable "id": INTEGER,
+        (StructField::nullable("value", DataType::INTEGER)
+            .add_metadata([("delta.columnMapping.id", MetadataValue::Number(2))])),
+    };
     let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?).unwrap();
     // v0 written directly to bypass create_table validation (which strips stale annotations).
     let v0 = format!(

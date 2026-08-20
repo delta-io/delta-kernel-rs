@@ -1,10 +1,8 @@
 //! IcebergCompatV3 integration tests for the CreateTable API.
 
-use std::sync::Arc;
-
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, StructField, StructType,
+    schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, StructField,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
@@ -66,7 +64,7 @@ fn v3_create_table_rejects_incompatible_props(
 #[case::top_level(StructField::nullable("maybe", DataType::VOID))]
 #[case::in_struct(StructField::nullable(
     "s",
-    StructType::new_unchecked([StructField::nullable("x", DataType::VOID)]),
+    schema! { nullable "x": VOID },
 ))]
 #[case::in_array(StructField::nullable("arr", ArrayType::new(DataType::VOID, true),))]
 #[case::in_map_value(StructField::nullable(
@@ -75,10 +73,10 @@ fn v3_create_table_rejects_incompatible_props(
 ))]
 fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        void_field,
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        (void_field),
+    };
 
     let err = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])
@@ -93,9 +91,7 @@ fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> Delta
 }
 
 /// IcebergV3 has no interval type, so icebergCompatV3 omits intervals from
-/// its type allowlist. Enabling V3 alongside an interval column must fail at `.build(...)`. This
-/// holds regardless of the `interval-type-in-dev` gate, since the V3 allowlist is the rejection
-/// point and runs before any kernel-support check.
+/// its type allowlist. Enabling V3 alongside an interval column must fail at `.build(...)`.
 #[rstest]
 fn v3_create_table_rejects_interval_column(
     #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
@@ -103,17 +99,14 @@ fn v3_create_table_rejects_interval_column(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let interval_field = if nested {
-        StructField::nullable(
-            "nested",
-            StructType::new_unchecked([StructField::nullable("iv", interval)]),
-        )
+        StructField::nullable("nested", schema! { nullable "iv": (interval) })
     } else {
         StructField::nullable("iv", interval)
     };
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        interval_field,
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        (interval_field),
+    };
 
     let err = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])

@@ -1,20 +1,16 @@
-//! Live integration tests that exercise the UC REST client against a real Unity Catalog OSS
+//! Live integration tests that exercise the UC REST client against a real Unity Catalog
 //! server.
 //!
 //! These are gated behind the `integration-test` feature so they are never compiled or run by a
 //! normal `cargo test`. The dedicated CI workflow (`.github/workflows/unitycatalog_oss_test.yml`)
-//! builds + starts a UC OSS server and runs them:
+//! builds + starts a UC server and runs them:
 //!
 //!   cargo nextest run -p unity-catalog-delta-rest-client --features integration-test -E
 //! 'test(live_)'
 #![cfg(feature = "integration-test")]
 
-use unity_catalog_delta_client_api::{
-    CreateStagingTableRequest, CreateStagingTableResponse, Operation,
-};
-use unity_catalog_delta_rest_client::http::build_http_client;
+use unity_catalog_delta_client_api::{CreateStagingTableRequest, Operation};
 use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
-use url::Url;
 
 /// Reads the server URL + token from the environment, or `None` to skip the test.
 fn server_env() -> Option<(String, String)> {
@@ -30,23 +26,8 @@ fn client(url: &str, token: &str) -> UCClient {
     UCClient::new(config).expect("failed to build UCClient")
 }
 
-/// Returns the Delta-Tables base URL (`<workspace>/delta/v1/catalogs/{c}/schemas/{s}/`) plus an
-/// authed `reqwest::Client` for the hand-rolled staging-tables POST.
-///
-/// TODO(remove): fold into UCClient once it exposes a typed staging-tables method.
-fn raw_delta_client(url: &str, token: &str, catalog: &str, schema: &str) -> (Url, reqwest::Client) {
-    let config = ClientConfig::build(url, token)
-        .build()
-        .expect("failed to build ClientConfig");
-    let base = config
-        .workspace_url
-        .join(&format!("delta/v1/catalogs/{catalog}/schemas/{schema}/"))
-        .expect("failed to join delta/v1 path onto workspace URL");
-    let http = build_http_client(&config).expect("failed to build reqwest client");
-    (base, http)
-}
-
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_get_config_round_trips() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_get_config_round_trips");
@@ -70,6 +51,7 @@ async fn live_get_config_round_trips() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_load_table_reads_metadata() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_load_table_reads_metadata");
@@ -117,6 +99,7 @@ async fn live_load_table_reads_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_get_table_credentials() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_get_table_credentials");
@@ -172,39 +155,23 @@ async fn live_get_table_credentials() {
 /// Validates the `CreateStagingTableRequest` / `CreateStagingTableResponse` wire types against a
 /// real server.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_create_staging_table() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_create_staging_table");
         return;
     };
-    if std::env::var("UC_CREATE").is_err() {
-        eprintln!("UC_CREATE unset; skipping mutating live_create_staging_table");
-        return;
-    }
     let catalog = std::env::var("UC_TEST_CATALOG").unwrap_or_else(|_| "unity".to_string());
     let schema = std::env::var("UC_TEST_SCHEMA").unwrap_or_else(|_| "default".to_string());
     let table = "delta_rest_client_staging_test";
 
-    let (base, http) = raw_delta_client(&url, &token, &catalog, &schema);
-
     let req = CreateStagingTableRequest {
         name: table.to_string(),
     };
-    let resp = http
-        .post(base.join("staging-tables").expect("staging-tables URL"))
-        .json(&req)
-        .send()
+    let staging = client(&url, &token)
+        .create_staging_table(&catalog, &schema, req)
         .await
-        .expect("staging-tables POST failed");
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    assert!(
-        status.is_success(),
-        "staging-tables POST returned {status}: {body}"
-    );
-
-    let staging: CreateStagingTableResponse =
-        serde_json::from_str(&body).expect("failed to deserialize CreateStagingTableResponse");
+        .expect("create_staging_table failed");
     assert!(
         !staging.table_id.is_empty(),
         "expected an allocated table id"

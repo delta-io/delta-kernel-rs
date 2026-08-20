@@ -494,7 +494,7 @@ mod tests {
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
     use crate::snapshot::commit;
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
     };
 

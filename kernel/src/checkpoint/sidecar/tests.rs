@@ -24,8 +24,8 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use crate::schema::{DataType, StructField, StructType};
-use crate::utils::test_utils::Action;
+use crate::schema::{schema, schema_ref, DataType, StructType};
+use crate::unit_test_utils::Action;
 use crate::{DeltaResult, Engine, EngineData, Snapshot};
 
 struct CheckpointParts {
@@ -686,30 +686,30 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
 
 /// Dummy struct type used as the data type for add/remove fields in schema validation tests.
 fn dummy_struct() -> DataType {
-    StructType::new_unchecked([]).into()
+    schema! {}.into()
 }
 
 #[rstest]
 #[case::missing_add(
-    StructType::new_unchecked([StructField::nullable("remove", dummy_struct())]),
+    schema! { nullable "remove": (dummy_struct()) },
     "missing 'add'"
 )]
 #[case::missing_remove(
-    StructType::new_unchecked([StructField::nullable("add", dummy_struct())]),
+    schema! { nullable "add": (dummy_struct()) },
     "missing 'remove'"
 )]
 #[case::non_nullable_add(
-    StructType::new_unchecked([
-        StructField::not_null("add", dummy_struct()),
-        StructField::nullable("remove", dummy_struct()),
-    ]),
+    schema! {
+        not_null "add": (dummy_struct()),
+        nullable "remove": (dummy_struct()),
+    },
     "'add' field must be nullable"
 )]
 #[case::non_nullable_remove(
-    StructType::new_unchecked([
-        StructField::nullable("add", dummy_struct()),
-        StructField::not_null("remove", dummy_struct()),
-    ]),
+    schema! {
+        nullable "add": (dummy_struct()),
+        not_null "remove": (dummy_struct()),
+    },
     "'remove' field must be nullable"
 )]
 fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expected_msg: &str) {
@@ -725,11 +725,10 @@ fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expe
 
 #[test]
 fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
-    let schema: Arc<StructType> = StructType::new_unchecked([
-        StructField::nullable("add", dummy_struct()),
-        StructField::nullable("remove", dummy_struct()),
-    ])
-    .into();
+    let schema = schema_ref! {
+        nullable "add": (dummy_struct()),
+        nullable "remove": (dummy_struct()),
+    };
     let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
     let splitter = SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema).unwrap();
     let result = SingleSidecarDataIterator::new(splitter, 0);

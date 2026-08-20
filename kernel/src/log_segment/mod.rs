@@ -33,8 +33,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version,
+    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
+    Version,
 };
 
 mod crc_replay;
@@ -140,9 +140,7 @@ fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<Predica
         .fields()
         .map(|field| action_presence_witness(field.name()))
         .collect::<Option<_>>()?;
-    let mut predicates = columns
-        .into_iter()
-        .map(|col| Expression::column(col).is_not_null());
+    let mut predicates = columns.into_iter().map(Predicate::is_not_null);
     let first = predicates.next()?;
     Some(Arc::new(predicates.fold(first, Predicate::or)))
 }
@@ -255,12 +253,13 @@ impl LogSegment {
     }
 
     /// The retained `_last_checkpoint` hint, but only when it describes the checkpoint this segment
-    /// selected (see [`LastCheckpointHint::applies_to`]) -- so the caller may trust its fields.
-    fn checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
-        let version = self.checkpoint_version?;
+    /// selected (see `LastCheckpointHint::applies_to`), so the caller may trust its fields.
+    #[internal_api]
+    pub(crate) fn checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
+        self.checkpoint_version?;
         self.last_checkpoint_metadata
             .as_ref()
-            .filter(|hint| hint.applies_to(version, &self.listed.checkpoint_parts))
+            .filter(|hint| hint.applies_to(&self.listed.checkpoint_parts))
     }
 
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
@@ -558,7 +557,7 @@ impl LogSegment {
         require!(
             matches!(
                 checkpoint.file_type,
-                LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint
+                LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint
             ),
             Error::internal_error(format!(
                 "Cannot update LogSegment with checkpoint. Path is not a single-file \
@@ -910,7 +909,7 @@ impl LogSegment {
                 // checkpoints don't have a parquet footer to read.
                 self.read_sidecar_schema_and_files(engine, checkpoint, None, cancellation_token)
             }
-            SinglePartCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
+            ClassicCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
                 // Check for sidecar column to distinguish.
                 let checkpoint_schema = Self::read_checkpoint_schema(

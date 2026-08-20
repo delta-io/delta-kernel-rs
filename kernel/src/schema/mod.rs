@@ -24,7 +24,7 @@ use crate::table_features::{
     StaleAnnotationPolicy,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::utils::require;
+use crate::utils::{require, CollectInto};
 use crate::{DeltaResult, Error};
 
 pub(crate) mod column_default;
@@ -716,15 +716,6 @@ impl StructField {
         &self.metadata
     }
 
-    /// Convert our metadata into a HashMap<String, String>. Note this copies all the data so can be
-    /// expensive for large metadata
-    pub fn metadata_with_string_values(&self) -> HashMap<String, String> {
-        self.metadata
-            .iter()
-            .map(|(key, val)| (key.clone(), val.to_string()))
-            .collect()
-    }
-
     /// Applies physical name and field ID mappings to this field.
     ///
     /// This function sets the field ID for the physical [`StructField`] only if the
@@ -1056,6 +1047,12 @@ impl StructType {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
         field.ok_or_else(|| Error::generic("Empty path"))
+    }
+
+    /// Checks whether this schema contains the field at the given column path.
+    pub fn contains_col(&self, col: impl CollectInto<ColumnName>) -> bool {
+        let col = col.collect_into();
+        self.field_at(&col).is_ok()
     }
 
     /// Visits all fields along the given column path.
@@ -1435,8 +1432,8 @@ impl<'a> IntoIterator for &'a StructType {
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
-///     StructField::new("name", DataType::STRING, false),
-///     StructField::new("age", DataType::INTEGER, true),
+///     StructField::not_null("name", DataType::STRING),
+///     StructField::nullable("age", DataType::INTEGER),
 /// ];
 /// let struct_type = StructType::try_new(fields)?;
 ///
@@ -1508,8 +1505,8 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
-///     StructField::new("name", DataType::STRING, false),
-///     StructField::new("age", DataType::INTEGER, true),
+///     StructField::not_null("name", DataType::STRING),
+///     StructField::nullable("age", DataType::INTEGER),
 /// ];
 /// let struct_type = StructType::try_new(fields)?;
 ///
@@ -1612,28 +1609,6 @@ impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
 /// Skips `Variant` internal struct fields, which are protocol-defined and always non-null.
 pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
     NonNullFieldChecker.transform_struct(schema).is_err()
-}
-
-#[cfg(not(feature = "interval-type-in-dev"))]
-struct UsesIntervalType;
-
-#[cfg(not(feature = "interval-type-in-dev"))]
-impl<'a> SchemaTransform<'a> for UsesIntervalType {
-    transform_output_type!(|'a, T| Result<(), ()>);
-
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
-        if ptype.is_interval() {
-            Err(())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// Returns whether `schema` contains an ANSI interval type at any nesting level.
-#[cfg(not(feature = "interval-type-in-dev"))]
-pub(crate) fn schema_contains_interval_type(schema: &Schema) -> bool {
-    UsesIntervalType.transform_struct(schema).is_err()
 }
 
 /// Normalizes column name field names to match the casing in the schema.
@@ -1807,10 +1782,10 @@ impl MapType {
     /// Create a schema assuming the map is stored as a struct with the specified key and value
     /// field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
-        StructType::new_unchecked([
-            StructField::not_null(key_name, self.key_type.clone()),
-            StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
-        ])
+        schema! {
+            not_null (key_name): (self.key_type.clone()),
+            (StructField::new(val_name, self.value_type.clone(), self.value_contains_null)),
+        }
     }
 }
 
@@ -2038,6 +2013,7 @@ impl PrimitiveType {
     }
 
     /// Returns whether this is one of the ANSI interval primitive types.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn is_interval(&self) -> bool {
         matches!(self, Self::IntervalYearMonth | Self::IntervalDayTime)
@@ -2453,6 +2429,17 @@ impl DataType {
     pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
     pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
 
+    /// Compact type name for diagnostics that must not expand nested schemas.
+    pub(crate) fn kind_name(&self) -> String {
+        match self {
+            Self::Primitive(primitive) => primitive.to_string(),
+            Self::Array(_) => "array".to_string(),
+            Self::Struct(_) => "struct".to_string(),
+            Self::Map(_) => "map".to_string(),
+            Self::Variant(_) => "variant".to_string(),
+        }
+    }
+
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())
@@ -2478,10 +2465,10 @@ impl DataType {
     /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
     /// binary fields: `metadata` and `value`.
     pub fn unshredded_variant() -> Self {
-        DataType::Variant(Box::new(StructType::new_unchecked([
-            StructField::not_null("metadata", DataType::BINARY),
-            StructField::not_null("value", DataType::BINARY),
-        ])))
+        DataType::Variant(Box::new(schema! {
+            not_null "metadata": BINARY,
+            not_null "value": BINARY,
+        }))
     }
 
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
@@ -2732,7 +2719,7 @@ mod tests {
 
     use super::*;
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm,
     };
@@ -3195,10 +3182,10 @@ mod tests {
     )]
     #[case(
         r#"{"type": "struct", "fields": [{"name": "a", "type": "integer", "nullable": false, "metadata": {}}, {"name": "b", "type": "string", "nullable": true, "metadata": {}}]}"#,
-        DataType::from(StructType::new_unchecked([
-            StructField::new("a", DataType::INTEGER, false),
-            StructField::new("b", DataType::STRING, true),
-        ]))
+        DataType::from(schema! {
+            not_null "a": INTEGER,
+            nullable "b": STRING,
+        })
     )]
     #[case(
         r#"{"type": "map", "keyType": "string", "valueType": "integer", "valueContainsNull": true}"#,
@@ -3241,13 +3228,8 @@ mod tests {
 
     #[test]
     fn test_make_physical_no_column_mapping() {
-        let field = StructField::nullable(
-            "e",
-            ArrayType::new(
-                StructType::new_unchecked([StructField::not_null("d", DataType::INTEGER)]),
-                true,
-            ),
-        );
+        let field =
+            StructField::nullable("e", ArrayType::new(schema! { not_null "d": INTEGER }, true));
         let physical_field = field.make_physical(ColumnMappingMode::None).unwrap();
 
         assert_eq!(physical_field.name, "e");
@@ -3336,15 +3318,15 @@ mod tests {
             ])
         }
 
-        let inner = StructType::new_unchecked([
-            cm_field("x", 3, DataType::INTEGER),
-            cm_field("y", 4, DataType::STRING),
-        ]);
-        let schema = StructType::new_unchecked([
-            cm_field("a", 1, DataType::INTEGER),
-            cm_field("b", 2, ArrayType::new(inner, true)),
-            cm_field("c", 3, DataType::STRING),
-        ]);
+        let inner = schema! {
+            (cm_field("x", 3, DataType::INTEGER)),
+            (cm_field("y", 4, DataType::STRING)),
+        };
+        let schema = schema! {
+            (cm_field("a", 1, DataType::INTEGER)),
+            (cm_field("b", 2, ArrayType::new(inner, true))),
+            (cm_field("c", 3, DataType::STRING)),
+        };
         assert_result_error_with_message(
             schema.make_physical(ColumnMappingMode::Id),
             "Duplicate column mapping ID",
@@ -3593,10 +3575,10 @@ mod tests {
     #[test]
     fn test_has_invariants() {
         // Schema with no invariants
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::STRING),
-            StructField::nullable("b", DataType::INTEGER),
-        ]);
+        let schema = schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+        };
         assert!(!schema_has_invariants(&schema));
 
         // Schema with top-level invariant
@@ -3606,132 +3588,113 @@ mod tests {
             MetadataValue::String("c > 0".to_string()),
         );
 
-        let schema =
-            StructType::new_unchecked([StructField::nullable("a", DataType::STRING), field]);
+        let schema = schema! {
+            nullable "a": STRING,
+            (field),
+        };
         assert!(schema_has_invariants(&schema));
 
         // Schema with nested invariant in a struct
-        let nested_field = StructField::nullable(
-            "nested_c",
-            DataType::try_struct_type([{
+        let nested = schema! {
+            ({
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
                     ColumnMetadataKey::Invariants.as_ref().to_string(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field
-            }])
-            .unwrap(),
-        );
+            }),
+        };
 
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::STRING),
-            StructField::nullable("b", DataType::INTEGER),
-            nested_field,
-        ]);
+        let schema = schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+            nullable "nested_c": (nested),
+        };
         assert!(schema_has_invariants(&schema));
 
         // Schema with nested invariant in an array of structs
-        let array_field = StructField::nullable(
-            "array_field",
-            ArrayType::new(
-                DataType::try_struct_type([{
-                    let mut field = StructField::nullable("d", DataType::INTEGER);
-                    field.metadata.insert(
-                        ColumnMetadataKey::Invariants.as_ref().to_string(),
-                        MetadataValue::String("d > 0".to_string()),
-                    );
-                    field
-                }])
-                .unwrap(),
-                true,
-            ),
-        );
+        let array_element = schema! {
+            ({
+                let mut field = StructField::nullable("d", DataType::INTEGER);
+                field.metadata.insert(
+                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    MetadataValue::String("d > 0".to_string()),
+                );
+                field
+            }),
+        };
 
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::STRING),
-            StructField::nullable("b", DataType::INTEGER),
-            array_field,
-        ]);
+        let schema = schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+            nullable "array_field": [ nullable (array_element) ],
+        };
         assert!(schema_has_invariants(&schema));
 
         // Schema with nested invariant in a map value that's a struct
-        let map_field = StructField::nullable(
-            "map_field",
-            MapType::new(
-                DataType::STRING,
-                DataType::try_struct_type([{
-                    let mut field = StructField::nullable("d", DataType::INTEGER);
-                    field.metadata.insert(
-                        ColumnMetadataKey::Invariants.as_ref().to_string(),
-                        MetadataValue::String("d > 0".to_string()),
-                    );
-                    field
-                }])
-                .unwrap(),
-                true,
-            ),
-        );
+        let map_value = schema! {
+            ({
+                let mut field = StructField::nullable("d", DataType::INTEGER);
+                field.metadata.insert(
+                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    MetadataValue::String("d > 0".to_string()),
+                );
+                field
+            }),
+        };
 
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::STRING),
-            StructField::nullable("b", DataType::INTEGER),
-            map_field,
-        ]);
+        let schema = schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+            nullable "map_field": { STRING => nullable (map_value) },
+        };
         assert!(schema_has_invariants(&schema));
     }
 
     fn all_nullable_schema() -> StructType {
-        StructType::new_unchecked([
-            StructField::nullable("a", DataType::STRING),
-            StructField::nullable("b", DataType::INTEGER),
-        ])
+        schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+        }
     }
 
     fn top_level_non_null_schema() -> StructType {
-        StructType::new_unchecked([
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])
+        schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        }
     }
 
     fn nested_non_null_schema() -> StructType {
-        let nested_field = StructField::nullable(
-            "parent",
-            DataType::try_struct_type([StructField::not_null("child", DataType::INTEGER)]).unwrap(),
-        );
-        StructType::new_unchecked([StructField::nullable("a", DataType::STRING), nested_field])
+        schema! {
+            nullable "a": STRING,
+            nullable "parent": {
+                not_null "child": INTEGER,
+            },
+        }
     }
 
     fn array_non_null_schema() -> StructType {
-        let array_field = StructField::nullable(
-            "arr",
-            ArrayType::new(
-                DataType::try_struct_type([StructField::not_null("child", DataType::INTEGER)])
-                    .unwrap(),
-                true,
-            ),
-        );
-        StructType::new_unchecked([array_field])
+        schema! {
+            nullable "arr": [ nullable {
+                not_null "child": INTEGER,
+            } ],
+        }
     }
 
     fn map_non_null_schema() -> StructType {
-        let map_field = StructField::nullable(
-            "map",
-            MapType::new(
-                DataType::STRING,
-                DataType::try_struct_type([StructField::not_null("child", DataType::INTEGER)])
-                    .unwrap(),
-                true,
-            ),
-        );
-        StructType::new_unchecked([map_field])
+        schema! {
+            nullable "map": { STRING => nullable {
+                not_null "child": INTEGER,
+            } },
+        }
     }
 
     fn variant_only_schema() -> StructType {
         // Variant internal fields (metadata, value) are protocol-defined non-null but
         // must NOT be counted as user-controlled non-null fields.
-        StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())])
+        schema! { nullable "v": unshredded_variant() }
     }
 
     #[rstest]
@@ -3745,70 +3708,12 @@ mod tests {
         assert_eq!(schema_contains_non_null_fields(&schema), expected);
     }
 
-    #[cfg(not(feature = "interval-type-in-dev"))]
-    #[test]
-    fn test_schema_contains_interval_type() {
-        for interval in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
-            let schemas = [
-                (
-                    "top-level",
-                    StructType::new_unchecked([StructField::nullable("iv", interval.clone())]),
-                ),
-                (
-                    "nested struct",
-                    StructType::new_unchecked([StructField::nullable(
-                        "nested",
-                        StructType::new_unchecked([StructField::nullable(
-                            "inner_iv",
-                            interval.clone(),
-                        )]),
-                    )]),
-                ),
-                (
-                    "array element",
-                    StructType::new_unchecked([StructField::nullable(
-                        "array",
-                        ArrayType::new(interval.clone(), true),
-                    )]),
-                ),
-                (
-                    "map value",
-                    StructType::new_unchecked([StructField::nullable(
-                        "map",
-                        MapType::new(DataType::STRING, interval.clone(), true),
-                    )]),
-                ),
-                (
-                    "map key",
-                    StructType::new_unchecked([StructField::nullable(
-                        "map",
-                        MapType::new(interval.clone(), DataType::STRING, true),
-                    )]),
-                ),
-            ];
-
-            for (case, schema) in schemas {
-                assert!(
-                    schema_contains_interval_type(&schema),
-                    "expected {case} schema to contain {interval:?}"
-                );
-            }
-        }
-
-        for schema in [
-            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]),
-            variant_only_schema(),
-        ] {
-            assert!(!schema_contains_interval_type(&schema));
-        }
-    }
-
     #[test]
     fn test_struct_type_iterator_basic() {
         let fields = vec![
-            StructField::new("field1", DataType::STRING, true),
-            StructField::new("field2", DataType::INTEGER, false),
-            StructField::new("field3", DataType::BOOLEAN, true),
+            StructField::nullable("field1", DataType::STRING),
+            StructField::not_null("field2", DataType::INTEGER),
+            StructField::nullable("field3", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields.clone());
 
@@ -3823,8 +3728,8 @@ mod tests {
     #[test]
     fn test_struct_type_into_iterator_owned() {
         let fields = vec![
-            StructField::new("a", DataType::STRING, true),
-            StructField::new("b", DataType::INTEGER, false),
+            StructField::nullable("a", DataType::STRING),
+            StructField::not_null("b", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3839,9 +3744,9 @@ mod tests {
     #[test]
     fn test_struct_type_into_iterator_references() {
         let fields = vec![
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new("y", DataType::FLOAT, false),
-            StructField::new("z", DataType::LONG, true),
+            StructField::nullable("x", DataType::DOUBLE),
+            StructField::not_null("y", DataType::FLOAT),
+            StructField::nullable("z", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3859,10 +3764,10 @@ mod tests {
     #[test]
     fn test_iterator_exact_size() {
         let fields = vec![
-            StructField::new("field1", DataType::STRING, true),
-            StructField::new("field2", DataType::INTEGER, false),
-            StructField::new("field3", DataType::BOOLEAN, true),
-            StructField::new("field4", DataType::DATE, true),
+            StructField::nullable("field1", DataType::STRING),
+            StructField::not_null("field2", DataType::INTEGER),
+            StructField::nullable("field3", DataType::BOOLEAN),
+            StructField::nullable("field4", DataType::DATE),
         ];
 
         // Test ExactSizeIterator for reference iterator
@@ -3883,7 +3788,7 @@ mod tests {
 
     #[test]
     fn test_iterator_with_metadata() {
-        let field_with_metadata = StructField::new("test_field", DataType::STRING, true)
+        let field_with_metadata = StructField::nullable("test_field", DataType::STRING)
             .with_metadata([("key1", MetadataValue::String("value1".to_string()))]);
 
         let struct_type = StructType::new_unchecked([field_with_metadata]);
@@ -3920,9 +3825,9 @@ mod tests {
     #[test]
     fn test_iterator_order_preservation() {
         let fields = vec![
-            StructField::new("zebra", DataType::STRING, true),
-            StructField::new("apple", DataType::INTEGER, false),
-            StructField::new("banana", DataType::BOOLEAN, true),
+            StructField::nullable("zebra", DataType::STRING),
+            StructField::not_null("apple", DataType::INTEGER),
+            StructField::nullable("banana", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3942,8 +3847,8 @@ mod tests {
     #[test]
     fn test_iterator_collect() {
         let original_fields = vec![
-            StructField::new("field1", DataType::STRING, true),
-            StructField::new("field2", DataType::INTEGER, false),
+            StructField::nullable("field1", DataType::STRING),
+            StructField::not_null("field2", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(original_fields.clone());
 
@@ -3963,10 +3868,10 @@ mod tests {
     #[test]
     fn test_iterator_functional_methods() {
         let fields = vec![
-            StructField::new("nullable_string", DataType::STRING, true),
-            StructField::new("required_int", DataType::INTEGER, false),
-            StructField::new("nullable_bool", DataType::BOOLEAN, true),
-            StructField::new("required_long", DataType::LONG, false),
+            StructField::nullable("nullable_string", DataType::STRING),
+            StructField::not_null("required_int", DataType::INTEGER),
+            StructField::nullable("nullable_bool", DataType::BOOLEAN),
+            StructField::not_null("required_long", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -3997,10 +3902,10 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_ref() {
         let fields = vec![
-            StructField::new("first", DataType::STRING, true),
-            StructField::new("second", DataType::INTEGER, false),
-            StructField::new("third", DataType::BOOLEAN, true),
-            StructField::new("fourth", DataType::LONG, false),
+            StructField::nullable("first", DataType::STRING),
+            StructField::not_null("second", DataType::INTEGER),
+            StructField::nullable("third", DataType::BOOLEAN),
+            StructField::not_null("fourth", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -4023,9 +3928,9 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_owned() {
         let fields = vec![
-            StructField::new("alpha", DataType::STRING, true),
-            StructField::new("beta", DataType::INTEGER, false),
-            StructField::new("gamma", DataType::BOOLEAN, true),
+            StructField::nullable("alpha", DataType::STRING),
+            StructField::not_null("beta", DataType::INTEGER),
+            StructField::nullable("gamma", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -4049,9 +3954,9 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_collect_reverse() {
         let fields = vec![
-            StructField::new("one", DataType::STRING, true),
-            StructField::new("two", DataType::INTEGER, false),
-            StructField::new("three", DataType::BOOLEAN, true),
+            StructField::nullable("one", DataType::STRING),
+            StructField::not_null("two", DataType::INTEGER),
+            StructField::nullable("three", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -4066,9 +3971,9 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_with_into_iter_ref() {
         let fields = vec![
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new("y", DataType::FLOAT, false),
-            StructField::new("z", DataType::LONG, true),
+            StructField::nullable("x", DataType::DOUBLE),
+            StructField::not_null("y", DataType::FLOAT),
+            StructField::nullable("z", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -4088,8 +3993,8 @@ mod tests {
     #[test]
     fn test_fused_iterator_ref() {
         let fields = vec![
-            StructField::new("test1", DataType::STRING, true),
-            StructField::new("test2", DataType::INTEGER, false),
+            StructField::nullable("test1", DataType::STRING),
+            StructField::not_null("test2", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -4110,8 +4015,8 @@ mod tests {
     #[test]
     fn test_fused_iterator_owned() {
         let fields = vec![
-            StructField::new("item1", DataType::STRING, true),
-            StructField::new("item2", DataType::INTEGER, false),
+            StructField::nullable("item1", DataType::STRING),
+            StructField::not_null("item2", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -4131,7 +4036,7 @@ mod tests {
 
     #[test]
     fn test_fused_iterator_with_into_iter_ref() {
-        let fields = vec![StructField::new("field_a", DataType::BOOLEAN, true)];
+        let fields = vec![StructField::nullable("field_a", DataType::BOOLEAN)];
         let struct_type = StructType::new_unchecked(fields);
 
         // Verify that &StructType into_iter implements FusedIterator
@@ -4164,7 +4069,7 @@ mod tests {
 
     #[test]
     fn test_double_ended_iterator_single_element() {
-        let fields = vec![StructField::new("single", DataType::STRING, true)];
+        let fields = vec![StructField::nullable("single", DataType::STRING)];
         let struct_type = StructType::new_unchecked(fields);
 
         // Test DoubleEndedIterator with single element
@@ -4177,7 +4082,7 @@ mod tests {
 
         // Test getting single element from next_back()
         let struct_type =
-            StructType::new_unchecked([StructField::new("single2", DataType::INTEGER, false)]);
+            StructType::new_unchecked([StructField::not_null("single2", DataType::INTEGER)]);
         let mut iter = struct_type.into_iter();
 
         assert_eq!(iter.next_back().unwrap().name, "single2");
@@ -4278,7 +4183,7 @@ mod tests {
 
     #[test]
     fn test_add_column() -> DeltaResult<()> {
-        let schema = StructType::try_new([StructField::nullable("col1", DataType::STRING)])?;
+        let schema = schema! { nullable "col1": STRING };
 
         let new_field = StructField::nullable("col2", DataType::INTEGER);
         let updated_schema = schema.add([new_field])?;
@@ -4291,7 +4196,7 @@ mod tests {
 
     #[test]
     fn test_add_metadata_column() -> DeltaResult<()> {
-        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        let schema = schema! { nullable "regular_col": STRING };
 
         let schema_with_metadata =
             schema.add_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)?;
@@ -4308,7 +4213,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_metadata_columns() -> DeltaResult<()> {
-        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        let schema = schema! { nullable "regular_col": STRING };
 
         let schema_with_metadata =
             schema.add_metadata_column("row_index1", MetadataColumnSpec::RowIndex)?;
@@ -4425,10 +4330,13 @@ mod tests {
 
     #[test]
     fn test_column_identifier_trait() -> DeltaResult<()> {
-        let schema = StructType::try_new([
-            StructField::nullable("regular_col", DataType::STRING),
-            StructField::create_metadata_column("row_index_col", MetadataColumnSpec::RowIndex),
-        ])?;
+        let schema = schema! {
+            nullable "regular_col": STRING,
+            (StructField::create_metadata_column(
+                "row_index_col",
+                MetadataColumnSpec::RowIndex,
+            )),
+        };
 
         // Test string identifier
         assert!(schema.contains("regular_col"));
@@ -4466,7 +4374,7 @@ mod tests {
 
     #[test]
     fn test_all_metadata_column_specs() -> DeltaResult<()> {
-        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        let schema = schema! { nullable "regular_col": STRING };
 
         let schema = schema
             .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
@@ -4580,30 +4488,23 @@ mod tests {
     fn test_display_struct_type_stable_output() -> DeltaResult<()> {
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
-        let inner_struct =
-            StructType::new_unchecked([StructField::new("q", DataType::LONG, false)]);
-        let nested_struct = StructType::new_unchecked([
-            nested_field_with_metadata,
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new("inner_struct", inner_struct, false),
-        ]);
-        let array_type = ArrayType::new(nested_struct.clone(), true);
-        let map_type = MapType::new(
-            nested_struct.clone(),
-            nested_struct.clone(), // kek
-            true,
-        );
-        let fields = vec![
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new("y", DataType::FLOAT, false),
-            StructField::new("z", DataType::LONG, true),
-            StructField::new("s", nested_struct.clone(), false),
-            StructField::nullable("array_col", array_type),
-            StructField::nullable("map_col", map_type),
-            StructField::new("a", DataType::LONG, true),
-        ];
-
-        let struct_type = StructType::new_unchecked(fields);
+        let inner_struct = schema! { not_null "q": LONG };
+        let nested_struct = schema! {
+            (nested_field_with_metadata),
+            nullable "x": DOUBLE,
+            not_null "inner_struct": (inner_struct),
+        };
+        let struct_type = schema! {
+            nullable "x": DOUBLE,
+            not_null "y": FLOAT,
+            nullable "z": LONG,
+            not_null "s": (nested_struct.clone()),
+            nullable "array_col": [ nullable (nested_struct.clone()) ],
+            nullable "map_col": {
+                (nested_struct.clone()) => nullable (nested_struct.clone())
+            },
+            nullable "a": LONG,
+        };
         assert_eq!(
             struct_type.to_string(),
             "struct:
@@ -4636,7 +4537,7 @@ mod tests {
 "
         );
 
-        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        let schema = schema! { nullable "regular_col": STRING };
         let schema = schema
             .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
             .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
@@ -4659,8 +4560,8 @@ mod tests {
     #[test]
     fn test_builder_add_fields() {
         let schema = StructType::builder()
-            .add_field(StructField::new("id", DataType::INTEGER, false))
-            .add_field(StructField::new("name", DataType::STRING, true))
+            .add_field(StructField::not_null("id", DataType::INTEGER))
+            .add_field(StructField::nullable("name", DataType::STRING))
             .build()
             .unwrap();
 
@@ -4671,11 +4572,10 @@ mod tests {
 
     #[test]
     fn test_builder_from_schema() {
-        let base_schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+        let base_schema = schema! { not_null "id": INTEGER };
 
         let extended_schema = StructTypeBuilder::from_schema(&base_schema)
-            .add_field(StructField::new("name", DataType::STRING, true))
+            .add_field(StructField::nullable("name", DataType::STRING))
             .build()
             .unwrap();
 
@@ -4780,20 +4680,30 @@ mod tests {
 
     /// Schema: { a: { b: { c: double } } } — supports walks at depths 1, 2, and 3.
     fn walk_test_schema() -> StructType {
-        let l3 = StructType::new_unchecked([StructField::new("c", DataType::DOUBLE, false)]);
-        let l2 = StructType::new_unchecked([StructField::new("b", l3, false)]);
-        StructType::new_unchecked([StructField::new("a", l2, false)])
+        schema! {
+            not_null "a": {
+                not_null "b": {
+                    not_null "c": DOUBLE,
+                },
+            },
+        }
     }
 
     #[rstest::rstest]
-    #[case::single_level(vec!["a"], vec!["a"], DataType::from(StructType::new_unchecked([
-        StructField::new("b", StructType::new_unchecked([
-            StructField::new("c", DataType::DOUBLE, false)
-        ]), false)
-    ])))]
-    #[case::nested_2(vec!["a", "b"], vec!["a", "b"], DataType::from(StructType::new_unchecked([
-        StructField::new("c", DataType::DOUBLE, false)
-    ])))]
+    #[case::single_level(
+        vec!["a"],
+        vec!["a"],
+        DataType::from(schema! {
+            not_null "b": {
+                not_null "c": DOUBLE,
+            },
+        })
+    )]
+    #[case::nested_2(
+        vec!["a", "b"],
+        vec!["a", "b"],
+        DataType::from(schema! { not_null "c": DOUBLE })
+    )]
     #[case::nested_3(vec!["a", "b", "c"], vec!["a", "b", "c"], DataType::DOUBLE)]
     #[test]
     fn test_walk_column_fields_happy(
@@ -4826,37 +4736,37 @@ mod tests {
 
     #[test]
     fn test_normalize_column_names_to_schema_casing() {
-        let inner =
-            StructType::new_unchecked(vec![StructField::new("City", DataType::STRING, false)]);
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("EventDate", DataType::DATE, false),
-            StructField::new("Address", inner, false),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            not_null "EventDate": DATE,
+            not_null "Address": {
+                not_null "City": STRING,
+            },
+        };
 
         // Mismatched casing -> normalized to schema
-        let cols = vec![ColumnName::new(["eventdate"])];
+        let cols = vec![column_name!("eventdate")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["EventDate"]
         );
 
         // Nested path -> each field name normalized
-        let cols = vec![ColumnName::new(["address", "city"])];
+        let cols = vec![column_name!("address.city")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["Address", "City"]
         );
 
         // Already matching -> unchanged
-        let cols = vec![ColumnName::new(["id"])];
+        let cols = vec![column_name!("id")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["id"]
         );
 
         // Unrecognized -> keeps original
-        let cols = vec![ColumnName::new(["nonexistent"])];
+        let cols = vec![column_name!("nonexistent")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["nonexistent"]

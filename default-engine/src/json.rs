@@ -21,7 +21,7 @@ use delta_kernel::object_store::{
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
     CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, Error,
-    FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
@@ -134,7 +134,8 @@ async fn write_json_file_impl(
     path: Url,
     buffer: Vec<u8>,
     overwrite: bool,
-) -> DeltaResult<()> {
+) -> DeltaResult<FileSize> {
+    let size = buffer.len() as FileSize;
     let put_mode = if overwrite {
         PutMode::Overwrite
     } else {
@@ -147,7 +148,7 @@ async fn write_json_file_impl(
         object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.to_string()),
         e => e.into(),
     })?;
-    Ok(())
+    Ok(size)
 }
 
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
@@ -196,7 +197,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.task_executor.block_on(write_json_file_impl(
             self.store.clone(),
             path.clone(),
@@ -887,8 +888,9 @@ mod tests {
         let result =
             handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
-        // Verify the first write is successful
-        assert!(result.is_ok());
+        let written_size = result.unwrap();
+        assert_eq!(written_size, 32);
+        assert_eq!(written_size, store.head(&object_path).await.unwrap().size);
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
@@ -899,8 +901,9 @@ mod tests {
             handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
-            // Verify the second write is successful
-            assert!(result.is_ok());
+            let written_size = result.unwrap();
+            assert_eq!(written_size, 28);
+            assert_eq!(written_size, store.head(&object_path).await.unwrap().size);
             let json = read_json_file(&store, &object_path).await?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
@@ -913,6 +916,32 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_empty_json_file_reports_zero_size() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let handler =
+            DefaultJsonHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let path = Url::parse("memory:///test/data/empty.json").unwrap();
+        let object_path = Path::from("/test/data/empty.json");
+
+        let written_size = handler
+            .write_json_file(&path, Box::new(std::iter::empty()), false)
+            .unwrap();
+        let stored_meta = store.head(&object_path).await.unwrap();
+        let stored_bytes = store
+            .get(&object_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        assert_eq!(written_size, 0);
+        assert_eq!(stored_meta.size, 0);
+        assert!(stored_bytes.is_empty());
         Ok(())
     }
 
