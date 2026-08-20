@@ -54,10 +54,12 @@ prompt: |
 
   ## Disprove gate
   Before publishing any Blocker or Should Fix, run `disprove-reviewer` on the
-  candidate finding list. Give it only structured candidate findings, the agents
-  that raised each finding, the cited diff excerpt/reference, and the proposed
-  fix. Do not include the original reviewer reasoning beyond the candidate claim.
-  Wait for the disprove gate before final consolidation.
+  candidate finding list. Dispatch exactly one `disprove-reviewer` call for the
+  whole batch; do not spawn one disprove reviewer per agent or per finding. Give
+  it only compact, structured candidate findings, the agents that raised each
+  finding, the cited diff excerpt/reference, and the proposed fix. Do not include
+  the original reviewer reasoning beyond the candidate claim. Wait for the
+  disprove gate before final consolidation.
 
   Route the gate's verdicts as follows:
   - `CONFIRMED`: keep the finding in the final review.

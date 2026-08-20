@@ -14,13 +14,16 @@
 #   vars.CODEX_MAINTAINER_MODEL   Codex maintainer-pass model.
 #   vars.DISPROVE_MODEL           GPT disprove-gate model.
 #
-# The review never runs automatically: it is triggered only by a /review comment
-# from an actor with write-or-higher repository permission, or a manual dispatch
-# from an actor with the same access. First rollout defaults to artifact-only.
+# The review runs automatically in artifact-only mode for non-draft PRs authored
+# by a repo collaborator with write-or-higher permission. It can also be triggered
+# by a /review comment or manual dispatch from an actor with the same access.
+# First rollout defaults to artifact-only.
 # =============================================================================
 name: AI PR Review
 
 on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -43,7 +46,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ai-review-${{ github.event.issue.number || inputs.pr }}
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
   cancel-in-progress: true
 
 env:
@@ -59,6 +62,11 @@ jobs:
     if: >-
       !cancelled() && (
         (
+          github.event_name == 'pull_request_target' &&
+          github.event.pull_request.draft == false &&
+          !endsWith(github.event.pull_request.user.login, '[bot]')
+        ) ||
+        (
           github.event_name == 'issue_comment' &&
           github.event.issue.pull_request != null &&
           contains(github.event.comment.body, '/review') &&
@@ -71,6 +79,7 @@ jobs:
       issues: write
     outputs:
       allowed: ${{ steps.access.outputs.allowed }}
+      auth_subject: ${{ steps.trigger.outputs.auth_subject }}
       output_mode: ${{ steps.trigger.outputs.output_mode }}
       pr_number: ${{ steps.trigger.outputs.pr_number }}
       skip: ${{ steps.trigger.outputs.skip }}
@@ -78,6 +87,10 @@ jobs:
       - name: Resolve trigger
         id: trigger
         env:
+          ACTOR: ${{ github.actor }}
+          AUTO_DRAFT: ${{ github.event.pull_request.draft }}
+          AUTO_PR: ${{ github.event.pull_request.number }}
+          AUTO_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           DISPATCH_MODE: ${{ inputs.output_mode }}
           DISPATCH_PR: ${{ inputs.pr }}
@@ -88,7 +101,16 @@ jobs:
 
           skip=false
           mode=artifact
+          auth_subject="$ACTOR"
           case "$EVENT_NAME" in
+            pull_request_target)
+              n="$AUTO_PR"
+              auth_subject="$AUTO_PR_AUTHOR"
+              if [ "$AUTO_DRAFT" = "true" ]; then
+                echo "::notice::Skipping draft PR automatic review."
+                skip=true
+              fi
+              ;;
             issue_comment)
               command="$(grep -E '^[[:space:]]*/review([[:space:]]|$)' <<<"$COMMENT_BODY" | head -n1 || true)"
               if [ -z "$command" ]; then
@@ -129,25 +151,26 @@ jobs:
           esac
 
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "auth_subject=$auth_subject" >> "$GITHUB_OUTPUT"
           echo "pr_number=$n" >> "$GITHUB_OUTPUT"
           echo "output_mode=$mode" >> "$GITHUB_OUTPUT"
 
-      - name: Check actor has write access
+      - name: Check trigger subject has write access
         id: access
         if: steps.trigger.outputs.skip != 'true'
         env:
-          ACTOR: ${{ github.actor }}
+          AUTH_SUBJECT: ${{ steps.trigger.outputs.auth_subject }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          perm="$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission' 2>/dev/null || echo none)"
+          perm="$(gh api "repos/${REPO}/collaborators/${AUTH_SUBJECT}/permission" --jq '.permission' 2>/dev/null || echo none)"
           case "$perm" in
-            admin|write)
+            admin|maintain|write)
               echo "allowed=true" >> "$GITHUB_OUTPUT"
               ;;
             *)
-              echo "::notice::${ACTOR} has '${perm}' access, not write/admin; skipping."
+              echo "::notice::${AUTH_SUBJECT} has '${perm}' access, not write/maintain/admin; skipping."
               echo "allowed=false" >> "$GITHUB_OUTPUT"
               ;;
           esac
