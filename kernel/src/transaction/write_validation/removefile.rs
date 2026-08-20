@@ -106,15 +106,12 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use test_utils::replace_column;
+    use test_utils::{deletion_vector_array, replace_column};
 
     use super::*;
-    use crate::arrow::array::{
-        new_null_array, ArrayRef, Int32Array, Int64Array, StringArray, StructArray,
-    };
-    use crate::arrow::buffer::NullBuffer;
+    use crate::arrow::array::{new_null_array, ArrayRef, Int64Array, StringArray};
     use crate::arrow::compute::concat_batches;
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+    use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -289,29 +286,7 @@ mod tests {
             .map(|field| match field.name().as_str() {
                 "path" => Arc::new(StringArray::from(vec![path])) as ArrayRef,
                 "size" => Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-                DELETION_VECTOR_NAME => {
-                    let ArrowDataType::Struct(fields) = field.data_type() else {
-                        panic!("deletionVector should be a struct");
-                    };
-                    let values = fields
-                        .iter()
-                        .map(|field| match field.name().as_str() {
-                            STORAGE_TYPE_NAME => Arc::new(StringArray::from(vec!["i"])) as ArrayRef,
-                            PATH_OR_INLINE_DV_NAME => {
-                                Arc::new(StringArray::from(vec![dv_id.unwrap_or("")])) as ArrayRef
-                            }
-                            OFFSET_NAME => Arc::new(Int32Array::from(vec![None])) as ArrayRef,
-                            "sizeInBytes" => Arc::new(Int32Array::from(vec![1])) as ArrayRef,
-                            "cardinality" => Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-                            _ => panic!("unexpected deletionVector field '{}'", field.name()),
-                        })
-                        .collect();
-                    Arc::new(StructArray::new(
-                        fields.clone(),
-                        values,
-                        Some(NullBuffer::from(vec![dv_id.is_some()])),
-                    ))
-                }
+                DELETION_VECTOR_NAME => Arc::new(deletion_vector_array("i", &[dv_id])) as ArrayRef,
                 _ => new_null_array(field.data_type(), 1 /* length */),
             })
             .collect();

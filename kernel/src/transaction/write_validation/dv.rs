@@ -141,13 +141,10 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use test_utils::replace_column;
+    use test_utils::{deletion_vector_array, replace_column};
 
     use super::*;
-    use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::arrow::array::{
-        new_null_array, Array as _, ArrayRef, Int32Array, Int64Array, StringArray, StructArray,
-    };
+    use crate::arrow::array::{new_null_array, Array as _, ArrayRef, Int64Array, StructArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
@@ -157,7 +154,6 @@ mod tests {
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::column_name;
     use crate::scan::scan_row_schema;
-    use crate::schema::ToSchema;
     use crate::unit_test_utils::{
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_files,
         set_field_as_null,
@@ -206,7 +202,8 @@ mod tests {
         let mut batch = RecordBatch::try_new(Arc::new(schema), columns)
             .expect("staged DV schema and columns should form a valid batch");
         assert_eq!(batch.num_rows(), dv_paths.len());
-        let new_dv = new_deletion_vector_array(dv_paths);
+        let dv_paths = dv_paths.iter().copied().map(Some).collect::<Vec<_>>();
+        let new_dv = deletion_vector_array("i", &dv_paths);
         let mut fields = batch.schema().fields().to_vec();
         fields.push(Arc::new(ArrowField::new(
             NEW_DELETION_VECTOR_NAME,
@@ -385,23 +382,5 @@ mod tests {
         } else {
             result.expect("unselected invalid row should be ignored");
         }
-    }
-
-    fn new_deletion_vector_array(dv_paths: &[&str]) -> StructArray {
-        let dv_schema: ArrowSchema = (&DeletionVectorDescriptor::to_schema())
-            .try_into_arrow()
-            .expect("deletion-vector schema should convert to Arrow");
-        let row_count = dv_paths.len();
-        StructArray::new(
-            dv_schema.fields().clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["i"; row_count])) as ArrayRef, // storageType
-                Arc::new(StringArray::from(dv_paths.to_vec())) as ArrayRef,    // pathOrInlineDv
-                Arc::new(Int32Array::from(vec![None; row_count])) as ArrayRef, // offset
-                Arc::new(Int32Array::from(vec![1; row_count])) as ArrayRef,    // sizeInBytes
-                Arc::new(Int64Array::from(vec![0; row_count])) as ArrayRef,    // cardinality
-            ],
-            None,
-        )
     }
 }

@@ -10,7 +10,6 @@ use delta_kernel::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
     StructArray,
 };
-use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::compute::{concat, concat_batches};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -23,7 +22,6 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{
     col, lit, null_lit, ExpressionStructPatchBuilder, MapData, Scalar,
 };
-use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::{scan_row_schema, StatsOptions};
@@ -37,9 +35,9 @@ use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, copy_directory, create_add_files_metadata,
-    create_default_engine, create_default_engine_mt_executor, insert_data, into_record_batch,
-    load_and_begin_transaction, read_actions_from_commit, replace_array_row, replace_column,
-    setup_test_table_p37, setup_test_tables, test_table_setup,
+    create_default_engine, create_default_engine_mt_executor, deletion_vector_array, insert_data,
+    into_record_batch, load_and_begin_transaction, read_actions_from_commit, replace_array_row,
+    replace_column, setup_test_table_p37, setup_test_tables, test_table_setup,
 };
 use url::Url;
 
@@ -352,7 +350,7 @@ async fn commit_validates_file_action_uniqueness(
             .iter()
             .map(|file| {
                 (
-                    file.path(),
+                    file.path,
                     1, /* size */
                     1, /* modification_time */
                     Some(1),
@@ -386,7 +384,7 @@ async fn commit_validates_file_action_uniqueness(
                 size_in_bytes: 1,
                 cardinality: 1,
             };
-            (file.path().to_string(), descriptor)
+            (file.path.to_string(), descriptor)
         })
         .collect();
     txn.update_deletion_vectors(
@@ -408,13 +406,13 @@ async fn commit_validates_file_action_uniqueness(
 
 #[derive(Clone)]
 struct SelectedFileActions {
-    rows: [FileActionKey; 2],
+    rows: [FileActionInput; 2],
     selection_vector: &'static [bool],
 }
 
 #[derive(Clone)]
 struct FileActionUniquenessCase {
-    adds: [FileActionKey; 2],
+    adds: [FileActionInput; 2],
     removes: SelectedFileActions,
     dv_updates: SelectedFileActions,
     expected_error: Option<&'static str>,
@@ -446,66 +444,43 @@ impl FileActionUniquenessCase {
     }
 }
 
-fn file_action(path: &str, dv_unique_id: Option<&str>) -> FileActionKey {
-    FileActionKey::new(path, dv_unique_id.map(str::to_owned))
+#[derive(Clone, Copy)]
+struct FileActionInput {
+    path: &'static str,
+    path_or_inline_dv: Option<&'static str>,
+}
+
+const fn file_action(
+    path: &'static str,
+    path_or_inline_dv: Option<&'static str>,
+) -> FileActionInput {
+    FileActionInput {
+        path,
+        path_or_inline_dv,
+    }
 }
 
 fn apply_path_dv(
     base_row: &RecordBatch,
-    file_action_keys: &[FileActionKey],
+    file_actions: &[FileActionInput],
 ) -> Result<RecordBatch, ArrowError> {
     let batch = concat_batches(
         &base_row.schema(),
-        &vec![base_row.clone(); file_action_keys.len()],
+        &vec![base_row.clone(); file_actions.len()],
     )?;
     let paths = Arc::new(StringArray::from(
-        file_action_keys
+        file_actions
             .iter()
-            .map(FileActionKey::path)
+            .map(|file| file.path)
             .collect::<Vec<_>>(),
     ));
     let batch = replace_column(&batch, "path", paths);
 
-    let schema = batch.schema();
-    let deletion_vector_index = schema.index_of("deletionVector")?;
-    let ArrowDataType::Struct(fields) = schema.field(deletion_vector_index).data_type() else {
-        panic!("deletionVector should be a struct");
-    };
-    let dv_unique_ids = file_action_keys
+    let paths_or_inline_dvs = file_actions
         .iter()
-        .map(FileActionKey::dv_unique_id)
+        .map(|file| file.path_or_inline_dv)
         .collect::<Vec<_>>();
-    let deletion_vectors = Arc::new(StructArray::new(
-        fields.clone(),
-        vec![
-            Arc::new(StringArray::from(
-                dv_unique_ids
-                    .iter()
-                    .map(|dv_unique_id| dv_unique_id.map(|_| "u"))
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef, // storageType
-            Arc::new(StringArray::from(dv_unique_ids.clone())) as ArrayRef, // pathOrInlineDv
-            Arc::new(Int32Array::from(vec![None; file_action_keys.len()])) as ArrayRef, // offset
-            Arc::new(Int32Array::from(
-                dv_unique_ids
-                    .iter()
-                    .map(|dv_unique_id| dv_unique_id.map(|_| 1))
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef, // sizeInBytes
-            Arc::new(Int64Array::from(
-                dv_unique_ids
-                    .iter()
-                    .map(|dv_unique_id| dv_unique_id.map(|_| 1))
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef, // cardinality
-        ],
-        Some(NullBuffer::from(
-            dv_unique_ids
-                .iter()
-                .map(Option::is_some)
-                .collect::<Vec<_>>(),
-        )),
-    ));
+    let deletion_vectors = Arc::new(deletion_vector_array("u", &paths_or_inline_dvs));
     Ok(replace_column(&batch, "deletionVector", deletion_vectors))
 }
 
