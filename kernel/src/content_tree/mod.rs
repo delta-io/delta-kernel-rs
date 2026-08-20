@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 #![allow(unreachable_pub)]
 
+mod builder;
 mod dv_conversion;
 pub(crate) mod stats;
 
@@ -37,6 +38,13 @@ pub(crate) const SPLIT_OFFSETS: &str = "splitOffsets";
 pub(crate) const EQUALITY_IDS: &str = "equalityIds";
 pub(crate) const FORMAT_VERSION: &str = "formatVersion";
 pub(crate) const TAGS: &str = "tags";
+
+/// Field names within the [`TrackingInfo`] sub-struct that the write path populates.
+pub(crate) const TRACKING_STATUS: &str = "status";
+pub(crate) const TRACKING_SNAPSHOT_ID: &str = "snapshotId";
+pub(crate) const SEQUENCE_NUMBER: &str = "sequenceNumber";
+pub(crate) const FILE_SEQUENCE_NUMBER: &str = "fileSequenceNumber";
+pub(crate) const FIRST_ROW_ID: &str = "firstRowId";
 
 /// Field names for the different fields within content_stats.
 pub(crate) const LOWER_BOUND: &str = "lower_bound";
