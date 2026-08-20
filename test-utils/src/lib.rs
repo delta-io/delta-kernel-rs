@@ -617,6 +617,19 @@ pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -
     concat(&arrays).expect("replacement value must match the modified column type")
 }
 
+/// Returns a copy of `batch` with `field` replaced by `column`.
+///
+/// # Panics
+///
+/// Panics if `field` does not exist or `column` is incompatible with the batch schema.
+pub fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
+    let schema = batch.schema();
+    let index = schema.index_of(field).expect("field in schema");
+    let mut columns = batch.columns().to_vec();
+    columns[index] = column;
+    RecordBatch::try_new(schema, columns).expect("replacement column must match the batch schema")
+}
+
 pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {

@@ -10,6 +10,7 @@ use delta_kernel::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
     StructArray,
 };
+use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::compute::{concat, concat_batches};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -22,6 +23,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{
     col, lit, null_lit, ExpressionStructPatchBuilder, MapData, Scalar,
 };
+use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::{scan_row_schema, StatsOptions};
@@ -36,8 +38,8 @@ use tempfile::tempdir;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, copy_directory, create_add_files_metadata,
     create_default_engine, create_default_engine_mt_executor, insert_data, into_record_batch,
-    load_and_begin_transaction, read_actions_from_commit, replace_array_row, setup_test_table_p37,
-    setup_test_tables, test_table_setup,
+    load_and_begin_transaction, read_actions_from_commit, replace_array_row, replace_column,
+    setup_test_table_p37, setup_test_tables, test_table_setup,
 };
 use url::Url;
 
@@ -211,6 +213,300 @@ fn selected_scan_file_batch(
         }
     }
     Err(Error::generic("expected at least one scan file"))
+}
+
+#[rstest]
+#[case::valid(FileActionUniquenessCase::valid())]
+#[case::duplicate_add(FileActionUniquenessCase {
+    adds: [
+        file_action("same.parquet", None),
+        file_action("same.parquet", None),
+    ],
+    expected_error: Some("multiple AddFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_remove(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", Some("different-dv")),
+        ],
+        selection_vector: &[true, true],
+    },
+    expected_error: Some("multiple RemoveFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_remove_implicit_tail(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", None),
+        ],
+        selection_vector: &[true],
+    },
+    expected_error: Some("multiple RemoveFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_remove_unselected(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", None),
+        ],
+        selection_vector: &[true, false],
+    },
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_remove_same_key(FileActionUniquenessCase {
+    adds: [
+        file_action("remove-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    expected_error: Some("same deletion vector ID"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_remove_same_path_different_dv(FileActionUniquenessCase {
+    adds: [
+        file_action("remove-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", Some("old-dv")),
+            file_action("remove-1.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_collides_with_dv_update(FileActionUniquenessCase {
+    adds: [
+        file_action("dv-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    dv_updates: SelectedFileActions {
+        rows: [
+            file_action("dv-0.parquet", Some("old-dv")),
+            file_action("dv-1.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    expected_error: Some("multiple AddFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_ignores_unselected_dv_update_collision(FileActionUniquenessCase {
+    adds: [
+        file_action("dv-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    dv_updates: SelectedFileActions {
+        rows: [
+            file_action("dv-0.parquet", None),
+            file_action("dv-1.parquet", None),
+        ],
+        selection_vector: &[false, true],
+    },
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::remove_collides_with_dv_update(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("dv-0.parquet", None),
+            file_action("remove-1.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    expected_error: Some("multiple RemoveFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[tokio::test]
+async fn commit_validates_file_action_uniqueness(
+    #[case] case: FileActionUniquenessCase,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let (_store, engine, table_url, _) = create_dv_table_with_files(
+        "file_action_uniqueness",
+        schema,
+        &[],
+        &[
+            "remove-0.parquet",
+            "remove-1.parquet",
+            "dv-0.parquet",
+            "dv-1.parquet",
+        ],
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+    let batches = scan_files
+        .into_iter()
+        .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let base_row = batch.slice(0, 1);
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+
+    txn.add_files(create_add_files_metadata(
+        txn.add_files_schema(),
+        case.adds
+            .iter()
+            .map(|file| {
+                (
+                    file.path(),
+                    1, /* size */
+                    1, /* modification_time */
+                    Some(1),
+                )
+            })
+            .collect(),
+    )?);
+    let removes = apply_path_dv(&base_row, &case.removes.rows)?;
+    txn.remove_files(FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(removes)),
+        case.removes.selection_vector.to_vec(),
+    )?);
+    let scan_file = apply_path_dv(&base_row, &case.dv_updates.rows)?;
+    let descriptors = case
+        .dv_updates
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            case.dv_updates
+                .selection_vector
+                .get(*index)
+                .copied()
+                .unwrap_or(true)
+        })
+        .map(|(index, file)| {
+            let descriptor = DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedRelative,
+                path_or_inline_dv: format!("new-dv-{index}.bin"),
+                offset: Some(0),
+                size_in_bytes: 1,
+                cardinality: 1,
+            };
+            (file.path().to_string(), descriptor)
+        })
+        .collect();
+    txn.update_deletion_vectors(
+        descriptors,
+        std::iter::once(Ok(FilteredEngineData::try_new(
+            Box::new(ArrowEngineData::new(scan_file)),
+            case.dv_updates.selection_vector.to_vec(),
+        )?)),
+    )?;
+
+    let result = txn.commit(engine.as_ref());
+    if let Some(expected_error) = case.expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        result?.unwrap_committed();
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SelectedFileActions {
+    rows: [FileActionKey; 2],
+    selection_vector: &'static [bool],
+}
+
+#[derive(Clone)]
+struct FileActionUniquenessCase {
+    adds: [FileActionKey; 2],
+    removes: SelectedFileActions,
+    dv_updates: SelectedFileActions,
+    expected_error: Option<&'static str>,
+}
+
+impl FileActionUniquenessCase {
+    fn valid() -> Self {
+        Self {
+            adds: [
+                file_action("add-0.parquet", None),
+                file_action("add-1.parquet", None),
+            ],
+            removes: SelectedFileActions {
+                rows: [
+                    file_action("remove-0.parquet", None),
+                    file_action("remove-1.parquet", None),
+                ],
+                selection_vector: &[true, true],
+            },
+            dv_updates: SelectedFileActions {
+                rows: [
+                    file_action("dv-0.parquet", None),
+                    file_action("dv-1.parquet", None),
+                ],
+                selection_vector: &[true, true],
+            },
+            expected_error: None,
+        }
+    }
+}
+
+fn file_action(path: &str, dv_unique_id: Option<&str>) -> FileActionKey {
+    FileActionKey::new(path, dv_unique_id.map(str::to_owned))
+}
+
+fn apply_path_dv(
+    base_row: &RecordBatch,
+    file_action_keys: &[FileActionKey],
+) -> Result<RecordBatch, ArrowError> {
+    let batch = concat_batches(
+        &base_row.schema(),
+        &vec![base_row.clone(); file_action_keys.len()],
+    )?;
+    let paths = Arc::new(StringArray::from(
+        file_action_keys
+            .iter()
+            .map(FileActionKey::path)
+            .collect::<Vec<_>>(),
+    ));
+    let batch = replace_column(&batch, "path", paths);
+
+    let schema = batch.schema();
+    let deletion_vector_index = schema.index_of("deletionVector")?;
+    let ArrowDataType::Struct(fields) = schema.field(deletion_vector_index).data_type() else {
+        panic!("deletionVector should be a struct");
+    };
+    let dv_unique_ids = file_action_keys
+        .iter()
+        .map(FileActionKey::dv_unique_id)
+        .collect::<Vec<_>>();
+    let deletion_vectors = Arc::new(StructArray::new(
+        fields.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                dv_unique_ids
+                    .iter()
+                    .map(|dv_unique_id| dv_unique_id.map(|_| "u"))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef, // storageType
+            Arc::new(StringArray::from(dv_unique_ids.clone())) as ArrayRef, // pathOrInlineDv
+            Arc::new(Int32Array::from(vec![None; file_action_keys.len()])) as ArrayRef, // offset
+            Arc::new(Int32Array::from(
+                dv_unique_ids
+                    .iter()
+                    .map(|dv_unique_id| dv_unique_id.map(|_| 1))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef, // sizeInBytes
+            Arc::new(Int64Array::from(
+                dv_unique_ids
+                    .iter()
+                    .map(|dv_unique_id| dv_unique_id.map(|_| 1))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef, // cardinality
+        ],
+        Some(NullBuffer::from(
+            dv_unique_ids
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+        )),
+    ));
+    Ok(replace_column(&batch, "deletionVector", deletion_vectors))
 }
 
 #[derive(Clone, Copy)]

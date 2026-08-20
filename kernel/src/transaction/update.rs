@@ -378,7 +378,7 @@ fn selection_vector_for_matches(num_rows: usize, matched_file_indexes: &[usize])
 /// Column name for temporary column used during deletion vector updates.
 /// This column holds new DV descriptors appended to scan file metadata before transforming to final
 /// add actions.
-static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
+pub(super) static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
 
 /// Column name for the temporary column holding the rewritten `stats` string for a DV update.
 static NEW_STATS_NAME: &str = "newStats";
@@ -393,7 +393,7 @@ static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 };
 
 /// Returns the intermediate schema with deletion vector column appended to scan row schema.
-fn intermediate_dv_schema() -> &'static SchemaRef {
+pub(super) fn intermediate_dv_schema() -> &'static SchemaRef {
     &INTERMEDIATE_DV_SCHEMA
 }
 
