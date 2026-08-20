@@ -8,9 +8,9 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use super::LogSegment;
+use crate::actions::{self, Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{get_commit_schema, CheckpointAction, CHECKPOINT_ACTION_NAME};
-use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(any(feature = "declarative-plans", feature = "adaptive-metadata-in-dev"))]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
@@ -129,16 +129,16 @@ impl LogSegment {
         crc_protocol: Option<&Protocol>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         #[cfg(feature = "declarative-plans")]
-        let batches = match engine.plan_executor() {
+        let actions_batches = match engine.plan_executor() {
             Some(executor) => self.read_pm_batches_via_plan(executor.as_ref())?,
             None => Box::new(self.read_pm_batches(engine)?) as _,
         };
         #[cfg(not(feature = "declarative-plans"))]
-        let batches = self.read_pm_batches(engine)?;
+        let actions_batches = self.read_pm_batches(engine)?;
 
         let mut metadata_opt = None;
         let mut protocol_opt = None;
-        for actions_batch in batches {
+        for actions_batch in actions_batches {
             let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
@@ -151,11 +151,10 @@ impl LogSegment {
             }
         }
 
-        // Second pass: phase 1 reads P&M only from `protocol`/`metaData` actions. With
-        // `declarative-plans` it runs an engine plan that can't unnest the `checkpoint` action, and
-        // folding the action into one scan would drop the plan for non-adaptive tables too, so we
-        // re-resolve here. TODO: add an unnest op to the plan IR (+ proto) so a single pass for
-        // resolving P&M can be performed with AMT.
+        // P&M nested in an adaptive `checkpoint` action needs a second pass (an extra log read,
+        // taken only for adaptive tables; see the early-out below): the `declarative-plans` plan
+        // can't unnest `checkpoint`, and a plain scan would penalize non-adaptive tables.
+        // TODO: add a plan IR (+ proto) unnest op so one pass handles AMT.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let (metadata_opt, protocol_opt) =
             self.reconcile_pm_with_checkpoint(engine, metadata_opt, protocol_opt, crc_protocol)?;
@@ -178,7 +177,7 @@ impl LogSegment {
         let known_adaptive = top_level_protocol
             .as_ref()
             .or(crc_protocol)
-            .is_some_and(protocol_enables_adaptive);
+            .is_some_and(adaptive_metadata_enabled);
         let incomplete_without_crc = (top_level_metadata.is_none() || top_level_protocol.is_none())
             && crc_protocol.is_none();
         if !(known_adaptive || incomplete_without_crc) {
@@ -203,7 +202,7 @@ impl LogSegment {
                 let metadata = metadata_opt.unwrap_or_else(|| checkpoint.metadata().clone());
                 let protocol = protocol_opt.unwrap_or_else(|| checkpoint.protocol().clone());
                 require!(
-                    protocol_enables_adaptive(&protocol),
+                    adaptive_metadata_enabled(&protocol),
                     Error::invalid_protocol(
                         "found a checkpoint action but the protocol does not enable the \
                          adaptiveMetadata reader feature"
@@ -284,7 +283,7 @@ impl LogSegment {
 
 /// Whether `protocol` enables the `adaptiveMetadata` reader feature.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn protocol_enables_adaptive(protocol: &Protocol) -> bool {
+fn adaptive_metadata_enabled(protocol: &Protocol) -> bool {
     protocol
         .reader_features()
         .is_some_and(|features| features.contains(&TableFeature::AdaptiveMetadataPreview))
