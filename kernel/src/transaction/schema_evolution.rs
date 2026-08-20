@@ -327,7 +327,7 @@ mod tests {
     fn add_struct_with_nested_leaf(name: &str, leaf_name: &str) -> SchemaOperation {
         SchemaOperation::AddColumn {
             path: ColumnName::new(Vec::<String>::new()),
-            field: StructField::nullable(name, inner),
+            field: StructField::nullable(name, schema! { nullable (leaf_name): STRING }),
         }
     }
 
@@ -675,22 +675,6 @@ mod tests {
     }
 
     // === Column mapping tests ===
-
-    fn get_cm_id(field: &StructField) -> i64 {
-        field
-            .column_mapping_id()
-            .expect("field should have column mapping ID")
-    }
-
-    fn get_physical_name(field: &StructField) -> String {
-        match field
-            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-            .expect("field should have physical name")
-        {
-            MetadataValue::String(s) => s.clone(),
-            other => panic!("expected String, got {other:?}"),
-        }
-    }
 
     #[rstest]
     #[case::name_mode_root(
