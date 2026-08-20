@@ -75,11 +75,7 @@ async fn test_multiple_files_in_commit_all_use_relative_paths(
         create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
 
     let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?.with_engine_info("test");
-    let write_context = txn
-        .write_state()
-        .unwrap()
-        .unpartitioned_write_context()
-        .unwrap();
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     for values in [vec![1, 2], vec![3, 4]] {
         let add_meta = engine
             .write_parquet(

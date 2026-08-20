@@ -810,10 +810,10 @@ mod tests {
     use test_utils::delta_kernel_default_engine::DefaultEngine;
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
-        create_table_get_unpartitioned_write_context, free_write_context, get_logical_to_physical,
-        get_partitioned_write_context, get_physical_write_schema, get_unpartitioned_write_context,
-        get_write_dir, get_write_path, get_write_schema, resolve_file_path, visit_partition_values,
-        SharedWriteContext,
+        create_table_get_partitioned_write_context, create_table_get_unpartitioned_write_context,
+        free_write_context, get_logical_to_physical, get_partitioned_write_context,
+        get_physical_write_schema, get_unpartitioned_write_context, get_write_dir, get_write_path,
+        get_write_schema, resolve_file_path, visit_partition_values, SharedWriteContext,
     };
 
     use super::*;
@@ -2271,7 +2271,48 @@ mod tests {
                 engine.shallow_copy(),
             )
         });
-        build_and_commit(builder, &engine);
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+
+        let partition_values = partition_value_map_new();
+        let value = "2024-01-01";
+        assert!(ok_or_panic(unsafe {
+            partition_value_map_insert_string(
+                partition_values.shallow_copy(),
+                kernel_string_slice!(col),
+                kernel_string_slice!(value),
+                engine.shallow_copy(),
+            )
+        }));
+        let write_context = ok_or_panic(unsafe {
+            create_table_get_partitioned_write_context(
+                txn.shallow_copy(),
+                partition_values,
+                engine.shallow_copy(),
+            )
+        });
+        let write_dir = recover_string(
+            unsafe { get_write_dir(write_context.shallow_copy(), allocate_str) }.unwrap(),
+        );
+        assert!(write_dir.ends_with("date=2024-01-01/"), "{write_dir}");
+        unsafe { free_write_context(write_context) };
+
+        let missing_partition_value = unsafe {
+            create_table_get_partitioned_write_context(
+                txn.shallow_copy(),
+                partition_value_map_new(),
+                engine.shallow_copy(),
+            )
+        };
+        assert_extern_result_error_with_message(
+            missing_partition_value,
+            KernelError::UnknownError,
+            Some("Invalid partition values: missing partition column 'date'. Provided: []"),
+        );
+
+        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let version = unsafe { version_and_free(committed) };
+        assert_eq!(version, 0);
 
         // A partitioned create records the partition columns in the table metadata.
         let log = read_v0_commit(&store, &table_url).await;
