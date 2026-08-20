@@ -11,17 +11,18 @@ use crate::metrics::{MetricId, ScanMetadataCompleted, ScanType, TableType};
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
 /// to keep updates fast across parallel executing threads.
 pub(crate) struct ScanMetrics {
-    /// Add files that entered deduplication. This normally excludes add files filtered by data
-    /// skipping. During parse-error fallback, deduplication runs first, so add files filtered by
-    /// retry-time data skipping are included.
+    /// Add actions in replay input before predicate filtering and deduplication. Includes
+    /// checkpoint and delta files.
     num_add_files_seen: AtomicU64,
+    /// Add actions in delta-file replay input before predicate filtering and deduplication.
+    num_add_files_seen_from_delta_files: AtomicU64,
     /// Add files that survived log replay (files to read). includes files that survived
     /// dataskipping, partition pruning, and add/remove deduplication.
     num_active_add_files: AtomicU64,
     /// Number of bytes in the active add files as reported by the add action size field
     active_add_files_bytes: AtomicU64,
-    /// Remove files seen (from delta/commit files only).
-    num_remove_files_seen: AtomicU64,
+    /// Remove actions in delta-file replay input before deduplication.
+    num_remove_files_seen_from_delta_files: AtomicU64,
     /// Non-file actions seen (protocol, metadata, etc.).
     num_non_file_actions: AtomicU64,
     /// Files filtered by predicates (data skipping + partition pruning).
@@ -38,9 +39,10 @@ impl Default for ScanMetrics {
     fn default() -> Self {
         Self {
             num_add_files_seen: AtomicU64::new(0),
+            num_add_files_seen_from_delta_files: AtomicU64::new(0),
             num_active_add_files: AtomicU64::new(0),
             active_add_files_bytes: AtomicU64::new(0),
-            num_remove_files_seen: AtomicU64::new(0),
+            num_remove_files_seen_from_delta_files: AtomicU64::new(0),
             num_non_file_actions: AtomicU64::new(0),
             num_predicate_filtered: AtomicU64::new(0),
             peak_hash_set_size: AtomicUsize::new(0),
@@ -51,8 +53,12 @@ impl Default for ScanMetrics {
 }
 
 impl ScanMetrics {
-    pub(crate) fn incr_add_files_seen(&self) {
+    pub(crate) fn record_add_file_seen(&self, is_from_delta_file: bool) {
         self.num_add_files_seen.fetch_add(1, Ordering::Relaxed);
+        if is_from_delta_file {
+            self.num_add_files_seen_from_delta_files
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Record that we've seen an active add file, plus its size
@@ -62,8 +68,9 @@ impl ScanMetrics {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn incr_remove_files_seen(&self) {
-        self.num_remove_files_seen.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn incr_remove_files_seen_from_delta_files(&self) {
+        self.num_remove_files_seen_from_delta_files
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn incr_non_file_actions(&self) {
@@ -96,9 +103,12 @@ impl ScanMetrics {
     /// preserved since it represents a high-water mark across all phases.
     pub(crate) fn reset_counters(&self) {
         self.num_add_files_seen.store(0, Ordering::Relaxed);
+        self.num_add_files_seen_from_delta_files
+            .store(0, Ordering::Relaxed);
         self.num_active_add_files.store(0, Ordering::Relaxed);
         self.active_add_files_bytes.store(0, Ordering::Relaxed);
-        self.num_remove_files_seen.store(0, Ordering::Relaxed);
+        self.num_remove_files_seen_from_delta_files
+            .store(0, Ordering::Relaxed);
         self.num_non_file_actions.store(0, Ordering::Relaxed);
         self.num_predicate_filtered.store(0, Ordering::Relaxed);
         self.dedup_visitor_time_ns.store(0, Ordering::Relaxed);
@@ -124,9 +134,14 @@ impl ScanMetrics {
             scan_type,
             duration,
             num_add_files_seen: self.num_add_files_seen.load(Ordering::Relaxed),
+            num_add_files_seen_from_delta_files: self
+                .num_add_files_seen_from_delta_files
+                .load(Ordering::Relaxed),
             num_active_add_files: self.num_active_add_files.load(Ordering::Relaxed),
             active_add_files_bytes: self.active_add_files_bytes.load(Ordering::Relaxed),
-            num_remove_files_seen: self.num_remove_files_seen.load(Ordering::Relaxed),
+            num_remove_files_seen_from_delta_files: self
+                .num_remove_files_seen_from_delta_files
+                .load(Ordering::Relaxed),
             num_non_file_actions: self.num_non_file_actions.load(Ordering::Relaxed),
             num_predicate_filtered: self.num_predicate_filtered.load(Ordering::Relaxed),
             peak_hash_set_size: self.peak_hash_set_size.load(Ordering::Relaxed),
@@ -142,9 +157,14 @@ impl ScanMetrics {
     /// Log all metrics with a message in the current tracing span context.
     pub(crate) fn log(&self, message: impl AsRef<str>) {
         let add_files_seen = self.num_add_files_seen.load(Ordering::Relaxed);
+        let add_files_seen_from_delta_files = self
+            .num_add_files_seen_from_delta_files
+            .load(Ordering::Relaxed);
         let active_add_files = self.num_active_add_files.load(Ordering::Relaxed);
         let active_add_files_bytes = self.active_add_files_bytes.load(Ordering::Relaxed);
-        let remove_files_seen = self.num_remove_files_seen.load(Ordering::Relaxed);
+        let remove_files_seen_from_delta_files = self
+            .num_remove_files_seen_from_delta_files
+            .load(Ordering::Relaxed);
         let non_file_actions = self.num_non_file_actions.load(Ordering::Relaxed);
         let predicate_filtered = self.num_predicate_filtered.load(Ordering::Relaxed);
         let peak_hash_set_size = self.peak_hash_set_size.load(Ordering::Relaxed);
@@ -152,9 +172,10 @@ impl ScanMetrics {
         let predicate_eval_time_ns = self.predicate_eval_time_ns.load(Ordering::Relaxed);
         info!(
             add_files_seen,
+            add_files_seen_from_delta_files,
             active_add_files,
             active_add_files_bytes,
-            remove_files_seen,
+            remove_files_seen_from_delta_files,
             non_file_actions,
             predicate_filtered,
             peak_hash_set_size,

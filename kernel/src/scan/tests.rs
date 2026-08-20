@@ -2325,50 +2325,57 @@ mod scan_metadata_completed_tests {
     }
 
     #[rstest]
-    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 17236, 0, 0)]
+    #[case::basic_scan("./tests/data/parsed-stats/", None, (6, 2, 6, 17236, 0, 0))]
     #[case::static_skip_all(
         "./tests/data/parsed-stats/",
         Some(Arc::new(Pred::FALSE)),
-        0,
-        0,
-        0,
-        0,
-        0
+        (0, 0, 0, 0, 0, 0)
     )]
-    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 0, 2, 0)]
+    #[case::with_removes("./tests/data/table-with-cdf/", None, (1, 1, 0, 0, 2, 0))]
     #[case::with_checkpoint(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
         None,
-        2,
-        1,
-        1010,
-        1,
-        0
+        (2, 1, 1, 1010, 1, 0)
     )]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
         Some(Arc::new(Expr::eq(col!("letter"), lit("a")))),
-        2, 2, 1502, 0, 4
+        (6, 6, 2, 1502, 0, 4)
     )]
     fn test_scan_metrics(
         #[case] table: &str,
         #[case] predicate: Option<Arc<Pred>>,
-        #[case] expected_add_seen: u64,
-        #[case] expected_active: u64,
-        #[case] expected_active_bytes: u64,
-        #[case] expected_removes: u64,
-        #[case] expected_filtered: u64,
+        #[case] expected: (u64, u64, u64, u64, u64, u64),
     ) {
+        let (
+            expected_add_seen,
+            expected_add_seen_from_delta,
+            expected_active,
+            expected_active_bytes,
+            expected_removes,
+            expected_filtered,
+        ) = expected;
         let (reporter, _guard, _) = run_scan(table, predicate, None);
         let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
             panic!("expected ScanMetadataCompleted");
         };
         assert!(e.duration > Duration::ZERO);
         assert_eq!(e.num_add_files_seen, expected_add_seen);
+        assert_eq!(
+            e.num_add_files_seen_from_delta_files,
+            expected_add_seen_from_delta
+        );
         assert_eq!(e.num_active_add_files, expected_active);
         assert_eq!(e.active_add_files_bytes, expected_active_bytes);
-        assert_eq!(e.num_remove_files_seen, expected_removes);
+        assert_eq!(e.num_remove_files_seen_from_delta_files, expected_removes);
         assert_eq!(e.num_predicate_filtered, expected_filtered);
+        let rendered = e.to_string();
+        assert!(rendered.contains(&format!(
+            "add_files_seen_from_delta_files={expected_add_seen_from_delta}"
+        )));
+        assert!(rendered.contains(&format!(
+            "remove_files_seen_from_delta_files={expected_removes}"
+        )));
     }
 
     // The parallel-scan paths (both sequential and parallel phase events) are covered by

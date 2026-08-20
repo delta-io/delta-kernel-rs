@@ -281,9 +281,10 @@ pub struct ScanMetadataCompleted {
     pub scan_type: ScanType,
     pub duration_ns: u64,
     pub num_add_files_seen: u64,
+    pub num_add_files_seen_from_delta_files: u64,
     pub num_active_add_files: u64,
     pub active_add_files_bytes: u64,
-    pub num_remove_files_seen: u64,
+    pub num_remove_files_seen_from_delta_files: u64,
     pub num_non_file_actions: u64,
     pub num_predicate_filtered: u64,
     pub peak_hash_set_size: u64,
@@ -544,9 +545,10 @@ impl MetricEvent {
                 scan_type,
                 duration,
                 num_add_files_seen,
+                num_add_files_seen_from_delta_files,
                 num_active_add_files,
                 active_add_files_bytes,
-                num_remove_files_seen,
+                num_remove_files_seen_from_delta_files,
                 num_non_file_actions,
                 num_predicate_filtered,
                 peak_hash_set_size,
@@ -559,9 +561,10 @@ impl MetricEvent {
                 scan_type: (*scan_type).into(),
                 duration_ns: ns(*duration),
                 num_add_files_seen: *num_add_files_seen,
+                num_add_files_seen_from_delta_files: *num_add_files_seen_from_delta_files,
                 num_active_add_files: *num_active_add_files,
                 active_add_files_bytes: *active_add_files_bytes,
-                num_remove_files_seen: *num_remove_files_seen,
+                num_remove_files_seen_from_delta_files: *num_remove_files_seen_from_delta_files,
                 num_non_file_actions: *num_non_file_actions,
                 num_predicate_filtered: *num_predicate_filtered,
                 peak_hash_set_size: *peak_hash_set_size as u64, // note usize -> u64 cast
@@ -716,9 +719,10 @@ mod tests {
             scan_type: kernel::ScanType::ParallelPhase,
             duration: Duration::from_nanos(13),
             num_add_files_seen: 17,
+            num_add_files_seen_from_delta_files: 18,
             num_active_add_files: 19,
             active_add_files_bytes: 23,
-            num_remove_files_seen: 29,
+            num_remove_files_seen_from_delta_files: 29,
             num_non_file_actions: 31,
             num_predicate_filtered: 37,
             peak_hash_set_size: 41,
@@ -740,9 +744,10 @@ mod tests {
             );
             assert_eq!(e.duration_ns, 13);
             assert_eq!(e.num_add_files_seen, 17);
+            assert_eq!(e.num_add_files_seen_from_delta_files, 18);
             assert_eq!(e.num_active_add_files, 19);
             assert_eq!(e.active_add_files_bytes, 23);
-            assert_eq!(e.num_remove_files_seen, 29);
+            assert_eq!(e.num_remove_files_seen_from_delta_files, 29);
             assert_eq!(e.num_non_file_actions, 31);
             assert_eq!(e.num_predicate_filtered, 37);
             assert_eq!(e.peak_hash_set_size, 41);

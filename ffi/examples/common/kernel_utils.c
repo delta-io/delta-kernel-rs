@@ -291,9 +291,10 @@ void print_metric(MetricEvent event) {
     }
     PM_U64(smc, duration_ns);
     PM_U64(smc, num_add_files_seen);
+    PM_U64(smc, num_add_files_seen_from_delta_files);
     PM_U64(smc, num_active_add_files);
     PM_U64(smc, active_add_files_bytes);
-    PM_U64(smc, num_remove_files_seen);
+    PM_U64(smc, num_remove_files_seen_from_delta_files);
     PM_U64(smc, num_non_file_actions);
     PM_U64(smc, num_predicate_filtered);
     PM_U64(smc, peak_hash_set_size);

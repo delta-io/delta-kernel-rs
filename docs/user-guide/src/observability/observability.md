@@ -149,9 +149,10 @@ consumed. It provides detailed statistics about the log replay process:
 | `operation_id` | Unique ID for this scan, useful for correlation. |
 | `scan_type` | Which scan path produced the event (see below). |
 | `duration` | Wall-clock time from scan start to iterator exhaustion. |
-| `num_add_files_seen` | Add files that entered deduplication. This normally excludes data-skipped files; parse-error fallback includes data-skipped files during retry. |
+| `num_add_files_seen` | Add actions in replay input before predicate filtering and deduplication. Includes checkpoint and delta files. |
+| `num_add_files_seen_from_delta_files` | Add actions in delta-file replay input before predicate filtering and deduplication. |
 | `num_active_add_files` | Add files that survived log replay. These are the files your connector reads. |
-| `num_remove_files_seen` | Remove actions encountered in commit files. |
+| `num_remove_files_seen_from_delta_files` | Remove actions in delta-file replay input before deduplication. |
 | `num_non_file_actions` | Non-file actions (protocol, metadata, etc.) seen during replay. |
 | `num_predicate_filtered` | Files eliminated by predicate evaluation (data skipping and partition pruning). |
 | `peak_hash_set_size` | Peak size of the internal deduplication set. Indicates memory pressure during log replay. |
@@ -168,8 +169,10 @@ The `scan_type` field tells you which scan execution path produced the event:
 | `ScanType::SequentialPhase` | The sequential phase of `Scan::parallel_scan_metadata()`. |
 | `ScanType::ParallelPhase` | The parallel phase of `Scan::parallel_scan_metadata()`. |
 
-If you use `parallel_scan_metadata`, you'll receive two `ScanMetadataCompleted`
-events per scan: one for each phase.
+For `parallel_scan_metadata`, `finish()` emits the sequential-phase event. If it
+returns parallel work, call `state.log_metrics()` exactly once after all workers
+complete to emit the parallel-phase event. The counters are phase-local. Combine
+the two events by `operation_id` to obtain whole-scan counts.
 
 ### Storage and file I/O events
 

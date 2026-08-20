@@ -583,6 +583,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct ExpectedMetrics {
         add_files_seen: u64,
+        add_files_seen_from_delta_files: u64,
         active_add_files: u64,
         remove_files_seen: u64,
         non_file_actions: u64,
@@ -616,14 +617,21 @@ mod tests {
 
         // Extract and verify counter values from Phase 1 (sequential log line)
         let add_files_seen = extract_metric(sequential_logs, "add_files_seen");
+        let add_files_seen_from_delta_files =
+            extract_metric(sequential_logs, "add_files_seen_from_delta_files");
         let active_add_files = extract_metric(sequential_logs, "active_add_files");
-        let remove_files_seen = extract_metric(sequential_logs, "remove_files_seen");
+        let remove_files_seen =
+            extract_metric(sequential_logs, "remove_files_seen_from_delta_files");
         let non_file_actions = extract_metric(sequential_logs, "non_file_actions");
         let predicate_filtered = extract_metric(sequential_logs, "predicate_filtered");
 
         assert_eq!(
             add_files_seen, sequential_expected.add_files_seen,
             "Sequential add_files_seen mismatch"
+        );
+        assert_eq!(
+            add_files_seen_from_delta_files, sequential_expected.add_files_seen_from_delta_files,
+            "Sequential add_files_seen_from_delta_files mismatch"
         );
         assert_eq!(
             active_add_files, sequential_expected.active_add_files,
@@ -650,6 +658,7 @@ mod tests {
         if let Some(expected) = parallel_expected {
             // Accumulate totals across all parallel logs
             let mut total_add_files_seen = 0u64;
+            let mut total_add_files_seen_from_delta_files = 0u64;
             let mut total_active_add_files = 0u64;
             let mut total_remove_files_seen = 0u64;
             let mut total_non_file_actions = 0u64;
@@ -662,8 +671,11 @@ mod tests {
 
                 // Extract and accumulate metrics
                 total_add_files_seen += extract_metric(remaining, "add_files_seen");
+                total_add_files_seen_from_delta_files +=
+                    extract_metric(remaining, "add_files_seen_from_delta_files");
                 total_active_add_files += extract_metric(remaining, "active_add_files");
-                total_remove_files_seen += extract_metric(remaining, "remove_files_seen");
+                total_remove_files_seen +=
+                    extract_metric(remaining, "remove_files_seen_from_delta_files");
                 total_non_file_actions += extract_metric(remaining, "non_file_actions");
                 total_predicate_filtered += extract_metric(remaining, "predicate_filtered");
 
@@ -678,6 +690,10 @@ mod tests {
             assert_eq!(
                 total_add_files_seen, expected.add_files_seen,
                 "Parallel add_files_seen mismatch"
+            );
+            assert_eq!(
+                total_add_files_seen_from_delta_files, expected.add_files_seen_from_delta_files,
+                "Parallel add_files_seen_from_delta_files mismatch"
             );
             assert_eq!(
                 total_active_add_files, expected.active_add_files,
@@ -711,6 +727,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
@@ -718,6 +735,7 @@ mod tests {
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 101,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 101,
             remove_files_seen: 0,
             non_file_actions: 0,
@@ -729,6 +747,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
@@ -736,6 +755,7 @@ mod tests {
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 101,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 101,
             remove_files_seen: 0,
             non_file_actions: 0,
@@ -751,15 +771,17 @@ mod tests {
         }),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
         },
-        // Data skipping predicate filters 4 files (101 -> 97).
-        // add_files_seen counts files AFTER data skipping.
+        // Data skipping predicate filters 4 files (101 -> 97). add_files_seen counts all input
+        // Adds, while active_add_files counts the Adds remaining after filtering and deduplication.
         expected_parallel_metrics: Some(ExpectedMetrics {
-            add_files_seen: 97,
+            add_files_seen: 101,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 97,
             remove_files_seen: 0,
             non_file_actions: 0,
@@ -779,9 +801,10 @@ mod tests {
             Arc::new(Expr::eq(col!("letter"), lit("a")))
         }),
         expected_sequential_metrics: ExpectedMetrics {
-            // Columnar filter prunes all 4 non-matching files (b, c, e, null) before the
-            // visitor. The is_add guard protects Removes but not null-partition Adds.
-            add_files_seen: 2,
+            // Columnar filtering prunes all 4 non-matching files (b, c, e, null), but
+            // add_files_seen counts all 6 input Adds.
+            add_files_seen: 6,
+            add_files_seen_from_delta_files: 6,
             active_add_files: 2,
             remove_files_seen: 0,
             non_file_actions: 4,
@@ -795,6 +818,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 3,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 3,
             remove_files_seen: 0,
             non_file_actions: 4,
@@ -807,6 +831,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
@@ -814,6 +839,7 @@ mod tests {
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 2,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 2,
             remove_files_seen: 0,
             non_file_actions: 0,
@@ -825,6 +851,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 3,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 3,
             remove_files_seen: 0,
             non_file_actions: 4,
@@ -837,6 +864,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
@@ -844,6 +872,7 @@ mod tests {
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 2,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 2,
             remove_files_seen: 0,
             non_file_actions: 0,
@@ -855,6 +884,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
@@ -862,6 +892,7 @@ mod tests {
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 4,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 4,
             remove_files_seen: 0,
             non_file_actions: 0,
@@ -873,6 +904,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
@@ -880,6 +912,7 @@ mod tests {
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 4,
+            add_files_seen_from_delta_files: 0,
             active_add_files: 4,
             remove_files_seen: 0,
             non_file_actions: 0,
@@ -890,8 +923,9 @@ mod tests {
         path: "table-without-dv-small",
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
-            // This table has single-part checkpoint, completes in sequential phase
+            // This table has only commit files, so it completes in the sequential phase.
             add_files_seen: 1,
+            add_files_seen_from_delta_files: 1,
             active_add_files: 1,
             remove_files_seen: 0,
             non_file_actions: 3,
@@ -911,6 +945,7 @@ mod tests {
             //             then checkpoint (add B filtered by remove)
             // Result: 2 adds seen, 1 active (only C), 1 remove seen, B filtered by dedup
             add_files_seen: 2,
+            add_files_seen_from_delta_files: 1,
             active_add_files: 1,
             remove_files_seen: 1,
             non_file_actions: 4,
