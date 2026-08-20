@@ -551,6 +551,7 @@ impl Snapshot {
     ///
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_clustering_column_infos(
         &self,
@@ -908,6 +909,11 @@ impl Snapshot {
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
     /// and the overall checkpoint process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Kernel does not support reading or writing the table, or if the
+    /// snapshot is not published.
     pub fn create_checkpoint_writer(
         self: Arc<Self>,
         engine: &dyn Engine,
@@ -954,6 +960,7 @@ impl Snapshot {
     ///
     /// # Errors
     ///
+    /// - If Kernel does not support reading or writing the table.
     /// - [`Error::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if the
     ///   resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
     ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
@@ -981,6 +988,8 @@ impl Snapshot {
             );
             return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
+
+        self.table_configuration().ensure_read_write_supported()?;
 
         let crc = self.resolve_crc_for_write(engine)?;
 
@@ -1100,6 +1109,7 @@ impl Snapshot {
     ///   write sidecar files.
     ///
     /// # Errors
+    /// - If Kernel does not support reading or writing the table.
     /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint` feature.
     /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature. Note: the
     ///   Delta protocol permits writing V1 checkpoints to such tables; this is a kernel limitation.

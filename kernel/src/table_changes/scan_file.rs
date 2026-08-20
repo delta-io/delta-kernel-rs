@@ -488,7 +488,7 @@ mod tests {
 
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType, TableChangesFileAction};
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-    use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
+    use crate::actions::{Add, Cdc, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
@@ -498,9 +498,12 @@ mod tests {
     };
     use crate::table_changes::test_utils::{row_tracking_table_config, test_deletion_vector};
     use crate::table_changes::CdfMode;
-    use crate::table_configuration::TableConfiguration;
-    use crate::table_properties::{COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED};
-    use crate::unit_test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+    use crate::table_features::ColumnMappingMode;
+    use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
+        MockTableConfigurationBuilder,
+    };
     use crate::Engine as _;
 
     fn row_tracking_add(
@@ -654,23 +657,14 @@ mod tests {
             nullable "value": STRING,
         };
 
-        // Create a TableConfiguration for testing
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            table_schema.clone(),
-            vec![],
-            0,
-            HashMap::from([
-                (ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string()),
-                (COLUMN_MAPPING_MODE.to_string(), "none".to_string()),
-            ]),
-        )
-        .unwrap();
-        // CDF (enableChangeDataFeed) requires min_writer_version = 4
-        let protocol = Protocol::try_new_legacy(1, 4).unwrap();
-        let table_config =
-            TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(table_schema.clone())
+            .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_column_mapping(ColumnMappingMode::None)
+            // CDF (enableChangeDataFeed) requires min_writer_version = 4
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 4).build())
+            .with_table_root(&table_root)
+            .build();
 
         let scan_metadata = table_changes_action_iter(
             Arc::new(engine),

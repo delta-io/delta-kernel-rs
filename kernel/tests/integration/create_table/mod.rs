@@ -585,6 +585,45 @@ fn test_create_table_with_feature_signal(
 }
 
 #[rstest]
+#[case::v2("v2", true)]
+#[case::classic("classic", false)]
+fn test_create_table_checkpoint_policy_auto_enables_v2_checkpoint(
+    #[case] policy: &str,
+    #[case] expect_v2_checkpoint: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([("delta.checkpointPolicy", policy)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let table_config = snapshot.table_configuration();
+    let protocol = table_config.protocol();
+
+    assert_eq!(
+        table_config.is_feature_supported(&TableFeature::V2Checkpoint),
+        expect_v2_checkpoint,
+        "checkpointPolicy={policy}: v2Checkpoint supported should be {expect_v2_checkpoint}"
+    );
+    assert_eq!(
+        protocol
+            .reader_features()
+            .is_some_and(|f| f.contains(&TableFeature::V2Checkpoint)),
+        expect_v2_checkpoint,
+    );
+    assert_eq!(
+        protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&TableFeature::V2Checkpoint)),
+        expect_v2_checkpoint,
+    );
+
+    Ok(())
+}
+
+#[rstest]
 fn test_create_table_with_checkpoint_stats_properties(
     #[values(true, false)] write_stats_as_json: bool,
     #[values(true, false)] write_stats_as_struct: bool,

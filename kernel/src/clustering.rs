@@ -49,6 +49,7 @@ pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
 /// Callers needing to correlate a clustering column with per-file statistics must use
 /// [`physical_column`]: stats are keyed on physical names.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 #[internal_api]
 pub(crate) struct ClusteringColumnInfo {
     /// The physical column reference as stored in the `delta.clustering` domain.
@@ -365,7 +366,7 @@ mod tests {
     #[case::ten(10)]
     fn test_validate_clustering_column_count(#[case] num_columns: usize) {
         let schema = schema! {
-            ..((0..num_columns).map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, false)))
+            ..((0..num_columns).map(|i| StructField::not_null(format!("col{i}"), DataType::INTEGER)))
         };
 
         let columns: Vec<ColumnName> = (0..num_columns)

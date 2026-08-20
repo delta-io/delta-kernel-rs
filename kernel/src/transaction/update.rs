@@ -558,6 +558,7 @@ struct DvUpdateEntry {
 
 impl DvUpdateEntry {
     /// The (null DV, null stats) entry for rows that are not getting a DV update.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     fn null() -> Self {
         static NULL_DV: LazyLock<Scalar> =
             LazyLock::new(|| Scalar::null(DeletionVectorDescriptor::to_schema()));

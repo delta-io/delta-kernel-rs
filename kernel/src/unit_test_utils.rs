@@ -1,3 +1,5 @@
+use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -30,10 +32,15 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::path::ParsedLogPath;
-use crate::table_features::ColumnMappingMode;
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::{
+    ColumnMappingMode, FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION,
+};
+use crate::table_properties::COLUMN_MAPPING_MODE;
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef, Version};
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
 /// synthetic log-file listings in tests.
@@ -290,6 +297,21 @@ pub(crate) fn action_batch() -> Box<dyn EngineData> {
     parse_json_batch(json_strings)
 }
 
+/// A batch containing a single `checkpoint` action covering every element kind, including one
+/// `txn`-typed and one `domainMetadata`-typed sidecar. The checkpoint row is surrounded by
+/// non-checkpoint action rows so the outer `CheckpointVisitor` must skip other rows in the
+/// batch and locate the checkpoint action among them.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
+    let json_strings: StringArray = vec![
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        r#"{"checkpoint":[{"checkpointMetadata":{"version":42}},{"contentRoot":{"path":"s3://bucket/manifest","sizeInBytes":1024,"version":40}},{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["adaptiveMetadata-preview"],"writerFeatures":["adaptiveMetadata-preview"]}},{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}},{"txn":{"appId":"myApp","version":3}},{"domainMetadata":{"domain":"myDomain","configuration":"cfg","removed":false}},{"sidecar":{"type":"txn","path":"txn-sidecar.parquet","sizeInBytes":100,"modificationTime":1}},{"sidecar":{"type":"domainMetadata","path":"dm-sidecar.parquet","sizeInBytes":200,"modificationTime":2}}]}"#,
+        r#"{"txn":{"appId":"otherApp","version":9}}"#,
+    ]
+    .into();
+    parse_json_batch(json_strings)
+}
+
 // TODO: allow tests to pass in context (issue#1133)
 #[track_caller]
 pub(crate) fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
@@ -322,36 +344,215 @@ pub(crate) fn assert_schema_feature_validation(
     extra_err_schemas: &[&StructType],
     err_msg: &str,
 ) {
-    make_test_tc(schema_with.clone(), protocol_with.clone(), [])
-        .expect("feature present + supported");
-    make_test_tc(schema_without.clone(), protocol_without.clone(), [])
-        .expect("feature absent + unsupported");
-    make_test_tc(schema_without.clone(), protocol_with.clone(), [])
-        .expect("feature absent + supported");
-    assert_result_error_with_message(
-        make_test_tc(schema_with.clone(), protocol_without.clone(), []),
-        err_msg,
-    );
+    let try_build = |schema: &StructType, protocol: &Protocol| {
+        MockTableConfigurationBuilder::new()
+            .with_schema(schema.clone())
+            .with_protocol(protocol.clone())
+            .try_build()
+    };
+    try_build(schema_with, protocol_with).expect("feature present + supported");
+    try_build(schema_without, protocol_without).expect("feature absent + unsupported");
+    try_build(schema_without, protocol_with).expect("feature absent + supported");
+    assert_result_error_with_message(try_build(schema_with, protocol_without), err_msg);
     for schema in extra_err_schemas {
-        assert_result_error_with_message(
-            make_test_tc((*schema).clone(), protocol_without.clone(), []),
-            err_msg,
-        );
+        assert_result_error_with_message(try_build(schema, protocol_without), err_msg);
     }
 }
 
-/// Creates a [`TableConfiguration`] from a schema, protocol, and table properties.
-/// Useful for testing validators that need a TC.
-pub(crate) fn make_test_tc(
-    schema: StructType,
+// ==================== Mock TableConfiguration ====================
+
+/// Builds a mock [`TableConfiguration`] for unit tests.
+///
+/// Defaults to a flat `value: INTEGER` schema, no partition columns, no table properties, and a
+/// table-features protocol (reader 3, writer 7) listing no features, rooted at `file:///` at
+/// version 0. Every axis is overridable.
+pub(crate) struct MockTableConfigurationBuilder {
+    schema: Option<SchemaRef>,
+    partition_columns: Vec<String>,
+    props: HashMap<String, String>,
     protocol: Protocol,
-    props: impl IntoIterator<Item = (String, String)>,
-) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
-    let schema = std::sync::Arc::new(schema);
-    let metadata =
-        Metadata::try_new(None, None, schema, vec![], 0, props.into_iter().collect()).unwrap();
-    let table_root = Url::try_from("file:///").unwrap();
-    crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
+    table_root: Url,
+    version: Version,
+}
+
+impl MockTableConfigurationBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            schema: None,
+            partition_columns: vec![],
+            props: HashMap::new(),
+            protocol: MockProtocolBuilder::new().build(),
+            table_root: Url::parse("file:///").unwrap(),
+            version: 0,
+        }
+    }
+
+    /// Sets the table schema, overriding the flat default.
+    pub(crate) fn with_schema(mut self, schema: impl Into<SchemaRef>) -> Self {
+        self.schema = Some(schema.into());
+        self
+    }
+
+    pub(crate) fn with_partition_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl ToString>,
+    ) -> Self {
+        self.partition_columns = columns.into_iter().map(|c| c.to_string()).collect();
+        self
+    }
+
+    /// Adds table properties, keeping any previously set ones.
+    pub(crate) fn with_properties<K: ToString, V: ToString>(
+        mut self,
+        props: impl IntoIterator<Item = impl Borrow<(K, V)>>,
+    ) -> Self {
+        self.props.extend(props.into_iter().map(|pair| {
+            let (key, value) = pair.borrow();
+            (key.to_string(), value.to_string())
+        }));
+        self
+    }
+
+    /// Sets the column-mapping mode property.
+    ///
+    /// Callers using `name` or `id` must provide a schema with column-mapping metadata through
+    /// [`Self::with_schema`].
+    pub(crate) fn with_column_mapping(self, mode: impl Into<Option<ColumnMappingMode>>) -> Self {
+        let Some(mode) = mode.into() else {
+            return self;
+        };
+        let mode = match mode {
+            ColumnMappingMode::None => "none",
+            ColumnMappingMode::Id => "id",
+            ColumnMappingMode::Name => "name",
+        };
+        self.with_properties([(COLUMN_MAPPING_MODE, mode)])
+    }
+
+    /// Uses `protocol` verbatim.
+    pub(crate) fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    pub(crate) fn with_table_root(mut self, table_root: impl AsRef<str>) -> Self {
+        self.table_root = Url::parse(table_root.as_ref()).unwrap();
+        self
+    }
+
+    pub(crate) fn with_version(mut self, version: Version) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Builds the [`TableConfiguration`], panicking if the configuration is invalid. Use
+    /// [`Self::try_build`] to assert on construction errors.
+    #[track_caller]
+    pub(crate) fn build(self) -> TableConfiguration {
+        self.try_build().unwrap()
+    }
+
+    pub(crate) fn try_build(self) -> DeltaResult<TableConfiguration> {
+        let schema = self
+            .schema
+            .unwrap_or_else(|| schema_ref! { nullable "value": INTEGER });
+        let metadata =
+            Metadata::try_new(None, None, schema, self.partition_columns, 0, self.props)?;
+
+        TableConfiguration::try_new(metadata, self.protocol, self.table_root, self.version)
+    }
+}
+
+/// Builds a mock [`Protocol`] for unit tests.
+///
+/// Defaults to a table-features protocol (reader 3, writer 7) listing no features.
+pub(crate) struct MockProtocolBuilder {
+    reader_features: Vec<TableFeature>,
+    writer_features: Vec<TableFeature>,
+    reader_version: i32,
+    writer_version: i32,
+}
+
+impl MockProtocolBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            reader_features: vec![],
+            writer_features: vec![],
+            reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+            writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
+        }
+    }
+
+    /// Sets the protocol features, splitting them across the reader and writer lists by type.
+    pub(crate) fn with_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.writer_features = features
+            .into_iter()
+            .map(|feature| feature.borrow().clone())
+            .collect();
+        assert!(
+            self.writer_features
+                .iter()
+                .all(|feature| feature.feature_type() != FeatureType::Unknown),
+            "unknown features require explicit reader/writer feature lists"
+        );
+        self.reader_features = self
+            .writer_features
+            .iter()
+            .filter(|feature| feature.feature_type() == FeatureType::ReaderWriter)
+            .cloned()
+            .collect();
+        self
+    }
+
+    /// Sets the protocol's reader features explicitly.
+    pub(crate) fn with_reader_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.reader_features = features
+            .into_iter()
+            .map(|feature| feature.borrow().clone())
+            .collect();
+        self
+    }
+
+    /// Sets the protocol's writer features explicitly.
+    pub(crate) fn with_writer_features(
+        mut self,
+        features: impl IntoIterator<Item = impl Borrow<TableFeature>>,
+    ) -> Self {
+        self.writer_features = features
+            .into_iter()
+            .map(|feature| feature.borrow().clone())
+            .collect();
+        self
+    }
+
+    /// Sets the protocol's minimum reader and writer versions.
+    pub(crate) fn with_versions(mut self, reader: i32, writer: i32) -> Self {
+        self.reader_version = reader;
+        self.writer_version = writer;
+        self
+    }
+
+    /// Builds the protocol, panicking if it is invalid.
+    #[track_caller]
+    pub(crate) fn build(self) -> Protocol {
+        // The protocol permits feature lists if and only if the version is exactly the
+        // table-features version, so legacy versions drop them.
+        Protocol::try_new(
+            self.reader_version,
+            self.writer_version,
+            (self.reader_version == TABLE_FEATURES_MIN_READER_VERSION)
+                .then_some(self.reader_features),
+            (self.writer_version == TABLE_FEATURES_MIN_WRITER_VERSION)
+                .then_some(self.writer_features),
+        )
+        .unwrap()
+    }
 }
 
 // ==================== Test schema helpers ====================
@@ -1070,7 +1271,7 @@ pub(crate) mod column_mapping_physical_name_dedup_fixtures {
     }
 
     fn cm_field(name: &str, id: i64, phys: &str, ty: impl Into<DataType>) -> StructField {
-        StructField::new(name, ty, true).with_metadata([
+        StructField::nullable(name, ty).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
                 MetadataValue::Number(id),

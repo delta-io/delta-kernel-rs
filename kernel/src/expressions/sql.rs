@@ -326,13 +326,14 @@ fn decode_binary_literal(input: &str) -> DeltaResult<Vec<u8>> {
             "binary literal must contain an even number of hex digits: {input}"
         )));
     }
-    hex.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let hi = (pair[0] as char)
+    let (pairs, _) = hex.as_bytes().as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|&[hi, lo]| {
+            let hi = (hi as char)
                 .to_digit(16)
                 .ok_or_else(|| Error::generic(format!("invalid hex digit in {input}")))?;
-            let lo = (pair[1] as char)
+            let lo = (lo as char)
                 .to_digit(16)
                 .ok_or_else(|| Error::generic(format!("invalid hex digit in {input}")))?;
             Ok((hi << 4 | lo) as u8)

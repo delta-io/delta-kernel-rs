@@ -259,6 +259,18 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
     Arc::new(Expr::struct_from(sub_exprs)).into()
 }
 
+/// Constructs a reference column expression whose middle field name contains a literal period
+/// (`a`, `b.c`, `d`). The C example builds the same column from a structured parts array and
+/// checks it round-trips to this reference.
+///
+/// # Safety
+/// The caller must free the returned handle with
+/// [`crate::expressions::free_kernel_expression`].
+#[no_mangle]
+pub unsafe extern "C" fn get_testing_dotted_field_column() -> Handle<SharedExpression> {
+    Arc::new(Expr::column(["a", "b.c", "d"])).into()
+}
+
 /// Constructs a simple kernel predicate using only primitive types for round-trip testing.
 /// This predicate only uses types that have full visitor support.
 ///

@@ -66,12 +66,14 @@ mod scan_file;
 #[cfg(test)]
 mod test_utils;
 
+#[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
 #[internal_api]
 pub(crate) use scan_file::{TableChangesFileAction, TableChangesScanFile};
 
 /// Selects the history represented by [`TableChanges::scan_file_listing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 #[internal_api]
 pub(crate) enum TableChangesListingMode {
     /// Preserves each commit's file actions.

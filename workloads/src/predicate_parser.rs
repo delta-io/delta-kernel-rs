@@ -89,8 +89,8 @@ fn preprocess_timestamp_ntz(input: &str) -> Cow<'_, str> {
 /// # Example
 /// ```ignore
 /// let schema = Schema::try_new(vec![
-///     StructField::new("id", DataType::LONG, false),
-///     StructField::new("name", DataType::STRING, false),
+///     StructField::not_null("id", DataType::LONG),
+///     StructField::not_null("name", DataType::STRING),
 /// ])?;
 /// let pred = parse_predicate("id < 500 AND name = 'alice'", &schema).unwrap();
 /// ```

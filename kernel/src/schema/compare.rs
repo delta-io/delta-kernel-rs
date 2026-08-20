@@ -7,13 +7,13 @@
 //!  # use delta_kernel::schema::StructField;
 //!  # use delta_kernel::schema::DataType;
 //!  let schema = StructType::try_new([
-//!     StructField::new("id", DataType::LONG, false),
-//!     StructField::new("value", DataType::STRING, true),
+//!     StructField::not_null("id", DataType::LONG),
+//!     StructField::nullable("value", DataType::STRING),
 //!  ])?;
 //!  let read_schema = StructType::try_new([
-//!     StructField::new("id", DataType::LONG, true),
-//!     StructField::new("value", DataType::STRING, true),
-//!     StructField::new("year", DataType::INTEGER, true),
+//!     StructField::nullable("id", DataType::LONG),
+//!     StructField::nullable("value", DataType::STRING),
+//!     StructField::nullable("year", DataType::INTEGER),
 //!  ])?;
 //!  // Schemas are compatible since the `read_schema` adds a nullable column `year`
 //!  assert!(schema.can_read_as(&read_schema).is_ok());
@@ -414,15 +414,15 @@ mod tests {
     #[test]
     fn duplicate_field_modulo_case() {
         let existing_schema = schema! {
-            (StructField::new("id", DataType::LONG, false)),
-            (StructField::new("Id", DataType::LONG, false)),
+            (StructField::not_null("id", DataType::LONG)),
+            (StructField::not_null("Id", DataType::LONG)),
             not_null "name": STRING,
             nullable "age": INTEGER,
         };
 
         let read_schema = schema! {
-            (StructField::new("id", DataType::LONG, false)),
-            (StructField::new("Id", DataType::LONG, false)),
+            (StructField::not_null("id", DataType::LONG)),
+            (StructField::not_null("Id", DataType::LONG)),
             not_null "name": STRING,
             nullable "age": INTEGER,
         };

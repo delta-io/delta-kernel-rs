@@ -572,10 +572,7 @@ mod execution_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
@@ -589,25 +586,18 @@ mod tests {
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
-    use crate::table_configuration::TableConfiguration;
-    use crate::unit_test_utils::create_log_path;
+    use crate::unit_test_utils::{
+        create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
+    };
     use crate::Engine as _;
 
     fn mock_snapshot(log_segment: LogSegment) -> DeltaResult<Arc<Snapshot>> {
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            partitioned_schema(),
-            vec!["p".to_string()],
-            0,
-            HashMap::new(),
-        )?;
-        let table_configuration = TableConfiguration::try_new(
-            metadata,
-            Protocol::try_new_legacy(2, 5)?,
-            Url::parse("memory:///")?,
-            0,
-        )?;
+        let table_configuration = MockTableConfigurationBuilder::new()
+            .with_schema(partitioned_schema())
+            .with_partition_columns(["p"])
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
+            .with_table_root("memory:///")
+            .try_build()?;
         Ok(Arc::new(Snapshot::new(log_segment, table_configuration)?))
     }
 

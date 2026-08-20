@@ -134,18 +134,15 @@ mod tests {
 
 #[cfg(test)]
 mod column_default_tests {
-    use std::collections::HashMap;
-
     use rstest::rstest;
     use test_utils::LoggingTest;
-    use url::Url;
 
     use super::iceberg_compat_v3_column_defaults_validation;
-    use crate::actions::{Metadata, Protocol};
     use crate::schema::ColumnMetadataKey::CurrentDefault;
     use crate::schema::{schema, ArrayType, DataType, MetadataValue, StructField, StructType};
     use crate::table_configuration::TableConfiguration;
     use crate::table_features::TableFeature;
+    use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
 
     /// Builds a `TableConfiguration` carrying `schema` with `allowColumnDefaults` enabled, so
     /// the IcebergCompatV3 column-default validation can be driven directly. The config does not
@@ -153,22 +150,15 @@ mod column_default_tests {
     /// validation is invoked directly instead, and the end-to-end V3 path is covered by the
     /// integration tests.
     fn table_config_with_schema(schema: StructType) -> TableConfiguration {
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            std::sync::Arc::new(schema),
-            vec![],
-            0,
-            HashMap::new(),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_modern(
-            TableFeature::EMPTY_LIST,
-            [TableFeature::AllowColumnDefaults],
-        )
-        .unwrap();
-        TableConfiguration::try_new(metadata, protocol, Url::parse("file:///t/").unwrap(), 0)
-            .unwrap()
+        MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AllowColumnDefaults])
+                    .build(),
+            )
+            .with_table_root("file:///t/")
+            .build()
     }
 
     fn field_with_default(

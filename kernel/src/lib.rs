@@ -357,6 +357,13 @@ pub trait AsAny: Any + Send + Sync {
     /// let a: &dyn Any = f.any_ref();
     /// let b: &Bar = a.downcast_ref().unwrap();
     /// ```
+    ///
+    /// When downcasting from behind an `Arc<dyn Trait>`, borrow the trait object first
+    /// (`arc.as_ref().any_ref()`): `Arc<dyn Trait>` is itself `Sized + Any`, so calling `any_ref()`
+    /// directly on the `Arc` downcasts the *`Arc`*, not the value inside it. The owning [`as_any`]
+    /// has no such hazard -- its `Arc<Self>` receiver binds to the inner value.
+    ///
+    /// [`as_any`]: AsAny::as_any
     fn any_ref(&self) -> &(dyn Any + Send + Sync);
 
     /// Obtains an `Arc<dyn Any>` reference to the object:

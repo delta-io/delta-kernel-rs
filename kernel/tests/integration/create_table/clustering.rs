@@ -144,7 +144,7 @@ async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
 
     // Build schema with 10 columns (cluster on column 5, within default 32 limit)
     let fields: Vec<StructField> = (0..10)
-        .map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, true))
+        .map(|i| StructField::nullable(format!("col{i}"), DataType::INTEGER))
         .collect();
     let schema = Arc::new(StructType::try_new(fields)?);
 
@@ -169,7 +169,7 @@ async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
 
     // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)
     let fields: Vec<StructField> = (0..40)
-        .map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, true))
+        .map(|i| StructField::nullable(format!("col{i}"), DataType::INTEGER))
         .collect();
     let schema = Arc::new(StructType::try_new(fields)?);
 

@@ -8,12 +8,12 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::{CancellationTokenRef, Error, Snapshot};
+use delta_kernel::{CancellationToken as _, CancellationTokenRef, Error, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     actions_to_string, add_commit, generate_simple_batch, load_test_data, record_batch_to_bytes,
-    TestAction, TestCancellationToken,
+    TestAction, TestCancellationToken, TokenCapturingEngine,
 };
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
@@ -187,6 +187,73 @@ async fn precancelled_scan_over_checkpoint_yields_cancelled(
         .build()?;
 
     assert_cancelled(scan.scan_metadata(engine.as_ref()));
+    Ok(())
+}
+
+/// Asserts the captured token is the exact `Arc` the caller supplied (identity), and therefore
+/// downcasts back to the caller's concrete type and observes cancellation through it.
+fn assert_token_recovered_by_identity(
+    seen: Option<CancellationTokenRef>,
+    token: Arc<TestCancellationToken>,
+) {
+    let seen = seen.expect("kernel should have passed the cancellation token to the handler");
+    // Same allocation, not an equivalent wrapper.
+    assert!(
+        Arc::ptr_eq(&(token.clone() as CancellationTokenRef), &seen),
+        "kernel must pass the caller's token through by identity"
+    );
+    let recovered = seen
+        .as_ref()
+        .any_ref()
+        .downcast_ref::<TestCancellationToken>()
+        .expect("token must downcast to the type the caller supplied");
+    assert!(!recovered.is_cancelled());
+    token.cancel();
+    assert!(recovered.is_cancelled());
+}
+
+// Pins the pass-through-identity guarantee on the JSON read path: the engine receives the very
+// `Arc` the caller supplied, not a wrapper, so it can downcast back to its own token type.
+#[tokio::test]
+async fn engine_receives_the_callers_token_by_identity_json(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, table_root) = json_only_table().await?;
+    let engine = TokenCapturingEngine::new(Arc::new(DefaultEngineBuilder::new(storage).build()));
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+
+    let token = Arc::new(TestCancellationToken::default());
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(token.clone() as CancellationTokenRef)
+        .build()?;
+    scan.scan_metadata(&engine)?.for_each(drop);
+
+    assert_token_recovered_by_identity(engine.json_token(), token);
+    Ok(())
+}
+
+// Same guarantee on the PARQUET read path, which the JSON-only fixture cannot reach. Checkpoint
+// replay threads the token through separate `.cloned()` call sites; a live (uncancelled) token lets
+// the read actually execute so the parquet handler observes it.
+#[tokio::test]
+async fn engine_receives_the_callers_token_by_identity_parquet(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_name = "with_checkpoint_no_last_checkpoint";
+    let url =
+        url::Url::from_directory_path(std::fs::canonicalize(format!("./tests/data/{table_name}"))?)
+            .unwrap();
+
+    let engine = TokenCapturingEngine::new(test_utils::create_default_engine(&url)?);
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+
+    let token = Arc::new(TestCancellationToken::default());
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(token.clone() as CancellationTokenRef)
+        .build()?;
+    scan.scan_metadata(&engine)?.for_each(drop);
+
+    assert_token_recovered_by_identity(engine.parquet_token(), token);
     Ok(())
 }
 

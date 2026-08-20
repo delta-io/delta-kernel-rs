@@ -879,6 +879,7 @@ pub(crate) fn get_any_level_column_physical_name(
 ///
 /// Walks the schema once, matching each path component by `physical_name(mode)`, and returns the
 /// resolved logical [`ColumnName`] together with the data type of the final (leaf) field.
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 pub(crate) fn physical_to_logical_column_name_and_type(
     logical_schema: &StructType,
     physical_col: &ColumnName,
@@ -912,7 +913,7 @@ mod tests {
     use crate::schema::{schema, DataType, MetadataValue, StructField, StructType};
     use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
-        make_test_tc, test_deep_nested_schema_missing_leaf_cm,
+        test_deep_nested_schema_missing_leaf_cm, MockTableConfigurationBuilder,
     };
     use crate::utils::FoldWithOption as _;
 
@@ -921,46 +922,55 @@ mod tests {
         let annotated = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
         let plain = create_schema(None, None, None, None);
         let cmm_id = HashMap::from([("delta.columnMapping.mode".to_string(), "id".to_string())]);
-        let no_props = HashMap::new();
+        let no_props: HashMap<String, String> = HashMap::new();
+
+        let mode_of = |schema: &StructType, protocol: &Protocol, props: &HashMap<_, _>| {
+            MockTableConfigurationBuilder::new()
+                .with_schema(schema.clone())
+                .with_protocol(protocol.clone())
+                .with_properties(props.clone())
+                .build()
+                .column_mapping_mode()
+        };
 
         // v2 legacy + mode=id => Id (annotated schema required)
-        let tc = make_test_tc(
-            annotated.clone(),
-            Protocol::try_new_legacy(2, 5).unwrap(),
-            cmm_id.clone(),
-        )
-        .unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+        assert_eq!(
+            mode_of(&annotated, &protocol, &cmm_id),
+            ColumnMappingMode::Id
+        );
 
         // v2 legacy + no mode => None
-        let tc = make_test_tc(
-            plain.clone(),
-            Protocol::try_new_legacy(2, 5).unwrap(),
-            no_props.clone(),
-        )
-        .unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
 
         // v3 + empty features + mode=id => None (mode ignored without CM feature)
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
-        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(mode_of(&plain, &protocol, &cmm_id), ColumnMappingMode::None);
 
         // v3 + empty features + no mode => None
-        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
 
         // v3 + CM feature + mode=id => Id
         let protocol =
             Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
                 .unwrap();
-        let tc = make_test_tc(annotated.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
+        assert_eq!(
+            mode_of(&annotated, &protocol, &cmm_id),
+            ColumnMappingMode::Id
+        );
 
         // v3 + CM feature + no mode => None
-        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
 
         // v3 + DV feature (no CM) + mode=id => None (mode ignored)
         let protocol = Protocol::try_new_modern(
@@ -968,12 +978,13 @@ mod tests {
             [TableFeature::DeletionVectors],
         )
         .unwrap();
-        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(mode_of(&plain, &protocol, &cmm_id), ColumnMappingMode::None);
 
         // v3 + DV feature + no mode => None
-        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
 
         // v3 + DV + CM features + mode=id => Id
         let protocol = Protocol::try_new_modern(
@@ -981,12 +992,16 @@ mod tests {
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
         )
         .unwrap();
-        let tc = make_test_tc(annotated.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
+        assert_eq!(
+            mode_of(&annotated, &protocol, &cmm_id),
+            ColumnMappingMode::Id
+        );
 
         // v3 + DV + CM features + no mode => None
-        let tc = make_test_tc(plain.clone(), protocol, no_props).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert_eq!(
+            mode_of(&plain, &protocol, &no_props),
+            ColumnMappingMode::None
+        );
     }
 
     // Creates optional schema field annotations for column mapping id and physical name, as a
@@ -1298,7 +1313,7 @@ mod tests {
     }
 
     fn make_cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {
-        StructField::new(name, data_type, false).with_metadata([
+        StructField::not_null(name, data_type).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
                 MetadataValue::Number(id),
@@ -2102,7 +2117,7 @@ mod tests {
     #[test]
     fn test_get_any_level_column_physical_name_success() {
         let inner = schema! {
-            (StructField::new("y", DataType::INTEGER, false).add_metadata([
+            (StructField::not_null("y", DataType::INTEGER).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     MetadataValue::String("col-inner-y".to_string()),
@@ -2115,7 +2130,7 @@ mod tests {
         };
 
         let schema = schema! {
-            (StructField::new("a", inner, true).add_metadata([
+            (StructField::nullable("a", inner).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     MetadataValue::String("col-outer-a".to_string()),
@@ -2191,7 +2206,7 @@ mod tests {
         #[case] has_id: bool,
         #[case] expected_err: &str,
     ) {
-        let mut inner_field = StructField::new("y", DataType::INTEGER, false);
+        let mut inner_field = StructField::not_null("y", DataType::INTEGER);
         if has_physical_name {
             inner_field = inner_field.add_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -2209,7 +2224,7 @@ mod tests {
             (inner_field),
         };
         let schema = schema! {
-            (StructField::new("a", inner, true).add_metadata([
+            (StructField::nullable("a", inner).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     MetadataValue::String("col-outer-a".to_string()),
@@ -2248,7 +2263,7 @@ mod tests {
         #[case] expected: Option<&str>,
     ) {
         let field =
-            StructField::new("a", DataType::INTEGER, true).fold_with(annotation, |field, value| {
+            StructField::nullable("a", DataType::INTEGER).fold_with(annotation, |field, value| {
                 field.add_metadata([(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), value)])
             });
         let result = expect_physical_name(&field);
@@ -2292,7 +2307,7 @@ mod tests {
 
     #[test]
     fn physical_to_logical_with_name_mapping() {
-        let field = StructField::new("user_id", DataType::INTEGER, false).with_metadata([(
+        let field = StructField::not_null("user_id", DataType::INTEGER).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
             MetadataValue::String("col-abc-123".to_string()),
         )]);
@@ -2327,12 +2342,12 @@ mod tests {
 
     #[test]
     fn physical_to_logical_nested_struct_with_mapping() {
-        let inner_field = StructField::new("city", DataType::STRING, true).with_metadata([(
+        let inner_field = StructField::nullable("city", DataType::STRING).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
             MetadataValue::String("col-inner-456".to_string()),
         )]);
         let inner_struct = schema! { (inner_field) };
-        let outer_field = StructField::new("address", inner_struct, true).with_metadata([(
+        let outer_field = StructField::nullable("address", inner_struct).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
             MetadataValue::String("col-outer-123".to_string()),
         )]);
