@@ -369,12 +369,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(
-            txn.write_state()
-                .unwrap()
-                .unpartitioned_write_context()
-                .unwrap(),
-        );
+        let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
         let tasks = append_data.into_iter().map(|data| {
             // arc clones
             let engine = engine.clone();

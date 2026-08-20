@@ -67,12 +67,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(
-        txn.write_state()
-            .unwrap()
-            .unpartitioned_write_context()
-            .unwrap(),
-    );
+    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
 
     let add_files_metadata = engine
         .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
@@ -151,12 +146,7 @@ async fn test_append_timestamp_stats_are_millisecond_truncated(
     )?;
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(
-        txn.write_state()
-            .unwrap()
-            .unpartitioned_write_context()
-            .unwrap(),
-    );
+    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
     let add_files_metadata = engine
         .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
         .await?;
@@ -327,12 +317,7 @@ async fn test_append_variant(
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(
-        txn.write_state()
-            .unwrap()
-            .unpartitioned_write_context()
-            .unwrap(),
-    );
+    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
 
     let add_files_metadata = (*engine)
         .default_parquet_handler()
@@ -487,12 +472,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .unwrap();
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(
-        txn.write_state()
-            .unwrap()
-            .unpartitioned_write_context()
-            .unwrap(),
-    );
+    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
 
     let add_files_metadata = (*engine)
         .default_parquet_handler()
@@ -714,11 +694,9 @@ async fn write_rejects_invalid_void_placement(
     );
 }
 
-// Validation must trigger when the connector requests write state, before any Parquet is written.
-// Both partitioned and unpartitioned table layouts are covered, and the `all_void_table` case is
-// included because it is the shape where `strip_void_from_schema` would otherwise silently produce
-// an empty physical schema -- so the fail-fast guard is most load-bearing there. The commit-time
-// check (exercised by `write_rejects_invalid_void_placement`) remains as defense-in-depth.
+// Requesting write state must reject invalid schemas before any Parquet is written.
+// Keep the all-void case because stripping void fields would otherwise produce an empty physical
+// schema; commit-time validation remains defense-in-depth.
 #[rstest]
 #[case::unpartitioned_void_array(
     "void_fail_fast_unpartitioned_array",

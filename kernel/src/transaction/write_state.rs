@@ -86,48 +86,17 @@ impl WriteState {
         }
     }
 
-    /// Creates a write context for writing data to a specific partition.
+    /// Creates a write context bound to one partition.
     ///
-    /// Performs the following validations and transformations:
+    /// `partition_values` must contain one typed value for every logical partition column and no
+    /// other keys. Names are matched case-insensitively and normalized to schema case. Values are
+    /// validated, serialized according to the Delta protocol, and keyed by physical column name in
+    /// the returned context. Null-equivalent values require nullable partition columns.
     ///
-    /// - **Key completeness**: ensures all partition columns are present and no extra keys exist.
-    ///   For example, if the table has partition columns `["year", "region"]` and you pass
-    ///   `{"year": Scalar::Integer(2024)}`, this returns an error for missing "region".
+    /// The context materializes partition columns when required by the table protocol. Input data
+    /// passed to its logical-to-physical expression must omit partition columns.
     ///
-    /// - **Case normalization**: matches keys case-insensitively against the schema and normalizes
-    ///   to schema case. For example, passing `"YEAR"` for a column named `"year"` is accepted and
-    ///   normalized.
-    ///
-    /// - **Type checking**: rejects non-primitive partition column types (struct, array, map) and
-    ///   validates that each non-null `Scalar`'s type matches the partition column's schema type.
-    ///   For example, passing `Scalar::String("2024")` for an `INTEGER` column returns an error.
-    ///   Null-equivalent scalars (null scalars, empty strings, and empty binary) all of which
-    ///   collapse to JSON null in `partitionValues`) skip the value type check, but they are only
-    ///   legal when the partition column is nullable; passing any of these for a `nullable: false`
-    ///   partition column returns an error.
-    ///
-    /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per the
-    ///   Delta protocol's "Partition Value Serialization" rules. `Scalar::Null(...)` becomes `None`
-    ///   in `add.partitionValues` (JSON null). `Scalar::String("")` also becomes `None` (empty
-    ///   string equals null for all types). `Scalar::Date(19723)` becomes `Some("2024-01-01")`.
-    ///
-    /// - **Key translation**: translates logical column names to physical names using the table's
-    ///   column mapping mode. For example, under `ColumnMappingMode::Name`, logical `"year"` might
-    ///   become physical `"col-abc-123"` in the `partitionValues` map.
-    ///
-    /// - **Partition column materialization**: the returned [`BoundWriteContext`]'s
-    ///   [`logical_to_physical`] expression injects partition columns when the table requires
-    ///   materializing partition columns (e.g. `materializePartitionColumns` or `icebergCompatV3`).
-    ///   The input data fed to that expression must not contain partition columns.
-    ///
-    /// The returned [`BoundWriteContext`] also provides a [`write_dir`] that returns the correct
-    /// target directory (Hive-style paths when column mapping is off, random prefix when on).
-    ///
-    /// Returns an error if the table is not partitioned or if the partition keys or values are
-    /// invalid.
-    ///
-    /// [`write_dir`]: BoundWriteContext::write_dir
-    /// [`logical_to_physical`]: BoundWriteContext::logical_to_physical
+    /// Returns an error if the table is unpartitioned or the keys or values are invalid.
     pub fn partitioned_write_context(
         self: &Arc<Self>,
         partition_values: HashMap<String, Scalar>,

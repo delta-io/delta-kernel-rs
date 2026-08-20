@@ -122,8 +122,6 @@ pub unsafe extern "C" fn create_table_get_partitioned_write_context(
     .into_extern_result(&engine)
 }
 
-/// Shared body for the partitioned write-context entry points: bind the owned partition values to
-/// the transaction's write state and wrap the result in a shared handle.
 fn partitioned_write_context_impl(
     build: impl FnOnce(HashMap<String, Scalar>) -> DeltaResult<BoundWriteContext>,
     partition_values: PartitionValueMap,
