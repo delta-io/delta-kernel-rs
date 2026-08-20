@@ -78,12 +78,8 @@ fn modify_field_at_path(
         ("element", DataType::Array(array)) => {
             modify_field_at_path(&mut array.element_type, rest, modifier)
         }
-        ("key", DataType::Map(map)) => {
-            modify_field_at_path(&mut map.key_type, rest, modifier)
-        }
-        ("value", DataType::Map(map)) => {
-            modify_field_at_path(&mut map.value_type, rest, modifier)
-        }
+        ("key", DataType::Map(map)) => modify_field_at_path(&mut map.key_type, rest, modifier),
+        ("value", DataType::Map(map)) => modify_field_at_path(&mut map.value_type, rest, modifier),
         (name, DataType::Struct(parent)) => {
             let lowered = name.to_lowercase();
             let field = parent
@@ -181,12 +177,10 @@ pub(crate) fn apply_schema_operations(
                     .path()
                     .split_last()
                     .ok_or_else(|| Error::generic("empty column path"))?;
-                modify_field_at_path(&mut root, parent, |parent| {
-                    set_field_nullable(parent, leaf)
-                })
-                .map_err(|e| {
-                    Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
-                })?;
+                modify_field_at_path(&mut root, parent, |parent| set_field_nullable(parent, leaf))
+                    .map_err(|e| {
+                        Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
+                    })?;
             }
         }
 
