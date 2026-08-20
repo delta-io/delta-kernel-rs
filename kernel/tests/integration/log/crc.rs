@@ -11,7 +11,7 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -57,10 +57,10 @@ async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
 async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("value", DataType::STRING, true),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1687,6 +1687,46 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaR
     Ok(())
 }
 
+// The newest txn by log order for an app_id wins, then expiration is applied to it: an expired
+// newest yields None, it does NOT fall back to an older non-expired txn. Uses non-monotonic
+// lastUpdated (v1 far-future, v2 tiny) so the newest-by-log-order txn (v2) is the expired one.
+#[tokio::test]
+async fn test_set_txn_expired_newest_returns_none_not_older_via_log_replay() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = schema_ref! { nullable "id": INTEGER };
+    create_table(&table_path, schema, "test_engine")
+        .with_table_properties([("delta.setTransactionRetentionDuration", "interval 365 days")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let store = Arc::new(LocalFileSystem::new());
+    add_commit(
+        &table_path,
+        store.as_ref(),
+        1,
+        r#"{"txn":{"appId":"app","version":1,"lastUpdated":99999999999999}}"#.to_string(),
+    )
+    .await
+    .unwrap();
+    add_commit(
+        &table_path,
+        store.as_ref(),
+        2,
+        r#"{"txn":{"appId":"app","version":2,"lastUpdated":1000}}"#.to_string(),
+    )
+    .await
+    .unwrap();
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 2);
+    assert!(fresh.crc_at_version().is_none());
+    assert_eq!(fresh.get_app_id_version("app", engine.as_ref())?, None);
+
+    Ok(())
+}
+
 // ============================================================================
 // File Histogram Tracking Across Commits
 // ============================================================================
@@ -1773,10 +1813,10 @@ const LARGE_FILE_ROW_COUNT: i32 = (FIRST_BIN_BOUNDARY * 2 / APPROX_BYTES_PER_ROW
 #[tokio::test]
 async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("data", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "data": STRING,
+    };
 
     // ===== v0: empty table =====
     let committed = create_table(&table_path, schema, "test_engine")
@@ -2520,6 +2560,111 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> DeltaRe
     };
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         fresh.get_domain_metadata("dom_before", &no_parquet).ok()
+    }))
+    .is_err());
+
+    Ok(())
+}
+
+// ============================================================================
+// Set transactions rooted in a stale (but authoritative) CRC
+// ============================================================================
+
+/// Builds checkpoint@10, commits to v20, and a CRC at v15. Loaded with the default `Disabled`
+/// replay so the v15 CRC is retained as a stale base (`crc_at_version()` is `None`). Seeds three
+/// app_ids covering every reconcile arm:
+/// - `app_before` set at v5 and never touched again (base stands),
+/// - `app_updated` set at v6 then re-set to a higher version at v16 (tail supersedes the base),
+/// - `app_after` set at v18 (new in the tail).
+async fn setup_stale_crc_txn_table<E: TaskExecutor>(
+    engine: &Arc<DefaultEngine<E>>,
+    table_path: &str,
+) -> DeltaResult<()> {
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let mut snap = create_table(table_path, schema, "test_engine")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    for v in 1..=20i64 {
+        snap = commit_data(snap, engine, v, |txn| match v {
+            5 => txn.with_transaction_id("app_before".to_string(), 5),
+            6 => txn.with_transaction_id("app_updated".to_string(), 6),
+            16 => txn.with_transaction_id("app_updated".to_string(), 16),
+            18 => txn.with_transaction_id("app_after".to_string(), 18),
+            _ => txn,
+        })
+        .await?;
+
+        if v == 10 {
+            snap = snap.checkpoint(engine.as_ref(), None)?.1;
+        }
+        if v == 15 {
+            snap.write_checksum(engine.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
+// Every app_id resolves against a stale Complete CRC by scanning only the commit tail. The
+// NoParquetReadsEngine panics if the v10 checkpoint is read, proving the checkpoint is skipped.
+#[rstest]
+#[case::base_stands("app_before", Some(5))]
+#[case::tail_supersedes_base("app_updated", Some(16))]
+#[case::tail_added("app_after", Some(18))]
+#[case::never_existed("app_missing", None)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_txn_query_rooted_in_stale_complete_crc(
+    #[case] app_id: &str,
+    #[case] expected: Option<i64>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    setup_stale_crc_txn_table(&engine, &table_path).await?;
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 20);
+    assert!(
+        fresh.crc_at_version().is_none(),
+        "the stale CRC must not sit at the snapshot version"
+    );
+
+    let engine = NoParquetReadsEngine {
+        inner: engine.clone(),
+    };
+    assert_eq!(fresh.get_app_id_version(app_id, &engine)?, expected);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    setup_stale_crc_txn_table(&engine, &table_path).await?;
+
+    // Strip setTransactions from the v15 CRC so it reloads as Partial: not authoritative, so the
+    // query must not take the rooted path.
+    strip_field_from_crc(&table_path, 15, "setTransactions");
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 20);
+    assert!(fresh.crc_at_version().is_none());
+
+    // Results are still correct via the full scan (with the real engine).
+    assert_eq!(
+        fresh.get_app_id_version("app_before", engine.as_ref())?,
+        Some(5)
+    );
+    assert_eq!(
+        fresh.get_app_id_version("app_updated", engine.as_ref())?,
+        Some(16)
+    );
+
+    // A full scan reads the v10 checkpoint, so NoParquetReadsEngine panics: the Partial base did
+    // NOT take the rooted (checkpoint-skipping) path.
+    let no_parquet = NoParquetReadsEngine {
+        inner: engine.clone(),
+    };
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fresh.get_app_id_version("app_before", &no_parquet).ok()
     }))
     .is_err());
 

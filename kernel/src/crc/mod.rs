@@ -309,7 +309,15 @@ mod tests {
     use rstest::rstest;
 
     use super::{Crc, CrcRaw, DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
-    use crate::actions::{DomainMetadata, SetTransaction};
+    use crate::actions::{DomainMetadata, Protocol, SetTransaction};
+    use crate::table_features::TableFeature;
+
+    /// A minimal valid protocol for round-trip tests. `Protocol::default()` is `(0, 0)`, which
+    /// `try_new` rejects, so a default protocol can't round-trip through serde (deserialization
+    /// validates via `try_new`).
+    fn valid_protocol() -> Protocol {
+        Protocol::try_new(1, 1, TableFeature::NO_LIST, TableFeature::NO_LIST).unwrap()
+    }
 
     /// Helper to create a minimal `Crc` with only `set_transaction_state` and
     /// `domain_metadata_state` populated.
@@ -318,6 +326,7 @@ mod tests {
         domain_metadata_state: DomainMetadataState,
     ) -> Crc {
         Crc {
+            protocol: valid_protocol(),
             set_transaction_state,
             domain_metadata_state,
             ..Default::default()
@@ -599,6 +608,7 @@ mod tests {
         );
 
         let crc = Crc {
+            protocol: valid_protocol(),
             file_stats_state: FileStatsState::Complete(FileStats {
                 num_files: 10,
                 table_size_bytes: 1024 * 1024,
@@ -685,6 +695,49 @@ mod tests {
             err.contains(field),
             "expected error to mention {field} for value {bad}, got: {err}"
         );
+    }
+
+    // ===== protocol validation on the CRC deserialization path =====
+
+    /// Minimal CRC JSON whose `protocol` is the supplied fragment. Proves CRC deserialization
+    /// runs the protocol through `Protocol::try_new` instead of building an unchecked one.
+    fn crc_json_with_protocol(protocol: &str) -> String {
+        format!(
+            r#"{{
+                "tableSizeBytes": 0,
+                "numFiles": 0,
+                "numMetadata": 1,
+                "numProtocol": 1,
+                "metadata": {{
+                    "id": "test",
+                    "format": {{"provider": "parquet", "options": {{}}}},
+                    "schemaString": "{{\"type\":\"struct\",\"fields\":[]}}",
+                    "partitionColumns": [],
+                    "configuration": {{}},
+                    "createdTime": 0
+                }},
+                "protocol": {protocol}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn deserialize_crc_accepts_orphaned_column_mapping() {
+        let json = crc_json_with_protocol(
+            r#"{"minReaderVersion": 3, "minWriterVersion": 7,
+                "readerFeatures": [], "writerFeatures": ["columnMapping"]}"#,
+        );
+        let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
+        assert_eq!(crc.protocol.min_reader_version(), 3);
+    }
+
+    #[test]
+    fn deserialize_crc_rejects_orphaned_non_legacy_reader_writer_feature() {
+        let json = crc_json_with_protocol(
+            r#"{"minReaderVersion": 3, "minWriterVersion": 7,
+                "readerFeatures": [], "writerFeatures": ["columnMapping", "deletionVectors"]}"#,
+        );
+        assert!(Crc::try_from_json_bytes(json.as_bytes(), 0).is_err());
     }
 
     #[test]

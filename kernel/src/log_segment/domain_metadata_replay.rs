@@ -139,7 +139,7 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema_ref;
     use crate::transaction::create_table::create_table as create_table_txn;
     use crate::{RowVisitor as _, Snapshot};
 
@@ -158,11 +158,9 @@ mod tests {
         // The domainMetadata writer feature is enabled so domain metadata actions are valid.
         let _ = create_table_txn(
             url.as_str(),
-            Arc::new(StructType::new_unchecked(vec![StructField::new(
-                "id",
-                DataType::INTEGER,
-                true,
-            )])),
+            schema_ref! {
+                nullable "id": INTEGER,
+            },
             "test",
         )
         .with_table_properties([("delta.feature.domainMetadata", "supported")])

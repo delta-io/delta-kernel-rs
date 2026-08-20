@@ -9,22 +9,26 @@ use crate::engine::arrow_utils;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta,
-    FilteredEngineData, JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    FileSize, FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
 ///
-/// Operations not yet implemented on the plan-execution path delegate to the required `fallback`
-/// handler.
+/// Operations not yet implemented on the plan-execution path delegate to `fallback` when one is
+/// configured, and otherwise return an unsupported error.
 pub struct PlanBasedJsonHandler {
     executor: Arc<dyn PlanExecutor>,
-    fallback: Arc<dyn JsonHandler>,
+    fallback: Option<Arc<dyn JsonHandler>>,
 }
 
 impl PlanBasedJsonHandler {
-    /// Construct a handler that delegates not-yet-implemented operations to `fallback`.
-    pub fn new(plan_executor: Arc<dyn PlanExecutor>, fallback: Arc<dyn JsonHandler>) -> Self {
+    /// Construct a handler that delegates not-yet-implemented operations to `fallback`, or returns
+    /// an unsupported error for them when `fallback` is `None`.
+    pub fn new(
+        plan_executor: Arc<dyn PlanExecutor>,
+        fallback: Option<Arc<dyn JsonHandler>>,
+    ) -> Self {
         Self {
             executor: plan_executor,
             fallback,
@@ -60,9 +64,15 @@ impl JsonHandler for PlanBasedJsonHandler {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
+        let Some(fallback) = &self.fallback else {
+            return Err(Error::unsupported(
+                "PlanBasedJsonHandler does not support write_json_file yet, and no fallback \
+                 handler is configured",
+            ));
+        };
         debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
-        self.fallback.write_json_file(path, data, overwrite)
+        fallback.write_json_file(path, data, overwrite)
     }
 }
 
@@ -84,7 +94,7 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{schema_ref, SchemaRef};
     use crate::{
         DeltaResult, Engine as _, EngineData, FileDataReadResultIterator, FileMeta,
         JsonHandler as _, ParquetHandler as _,
@@ -93,7 +103,7 @@ mod tests {
     fn make_handler() -> PlanBasedJsonHandler {
         PlanBasedJsonHandler::new(
             Arc::new(SyncPlanExecutor::default()),
-            SyncEngine::new().json_handler(),
+            Some(SyncEngine::new().json_handler()),
         )
     }
 
@@ -114,17 +124,18 @@ mod tests {
         let filtered = Ok(FilteredEngineData::with_all_rows_selected(
             single_column_data(vec!["a", "b"]),
         ));
-        make_handler()
+        let written_size = make_handler()
             .write_json_file(&url, Box::new(std::iter::once(filtered)), false)
             .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written_size, contents.len() as u64);
         assert_eq!(contents, "{\"x\":\"a\"}\n{\"x\":\"b\"}\n");
     }
 
     fn make_parquet_handler() -> PlanBasedParquetHandler {
         PlanBasedParquetHandler::new(
             Arc::new(SyncPlanExecutor::default()),
-            SyncEngine::new().parquet_handler(),
+            Some(SyncEngine::new().parquet_handler()),
         )
     }
 
@@ -147,8 +158,7 @@ mod tests {
     #[test]
     fn test_read_json_files() {
         let (_temp, file_meta) = temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#, r#"{"x": 3}"#]);
-        let schema =
-            Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
+        let schema = schema_ref! { not_null "x": INTEGER };
 
         let mut iter = make_handler()
             .read_json_files(&[file_meta], schema, None)
@@ -172,7 +182,7 @@ mod tests {
     }
 
     fn test_schema() -> SchemaRef {
-        Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap())
+        schema_ref! { not_null "x": INTEGER }
     }
 
     /// No files -> an absent plan -> a zero-row result (no rows, no error), for either handler.
@@ -194,8 +204,7 @@ mod tests {
         .unwrap();
         let input: Box<dyn EngineData> = Box::new(ArrowEngineData::new(input_batch));
 
-        let output_schema =
-            Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
+        let output_schema = schema_ref! { not_null "x": INTEGER };
 
         let parsed = make_handler().parse_json(input, output_schema).unwrap();
         let record_batch: RecordBatch = ArrowEngineData::try_from_engine_data(parsed)

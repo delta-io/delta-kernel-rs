@@ -13,7 +13,7 @@ use crate::table_properties::{
     ENABLE_ROW_TRACKING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
-use crate::utils::test_utils::Action;
+use crate::unit_test_utils::{Action, MockTableConfigurationBuilder};
 
 pub(crate) const TEST_MATERIALIZED_ROW_ID_COLUMN_NAME: &str = "_row_id";
 pub(crate) const TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME: &str = "_row_commit_version";
@@ -52,13 +52,12 @@ pub(crate) fn row_tracking_setup_actions(schema: SchemaRef) -> [Action; 2] {
 }
 
 pub(crate) fn row_tracking_table_config(table_root: Url, schema: SchemaRef) -> TableConfiguration {
-    TableConfiguration::try_new(
-        row_tracking_metadata(schema),
-        row_tracking_protocol(),
-        table_root,
-        0,
-    )
-    .unwrap()
+    MockTableConfigurationBuilder::new()
+        .with_schema(schema)
+        .with_properties(row_tracking_properties())
+        .with_protocol(row_tracking_protocol())
+        .with_table_root(table_root)
+        .build()
 }
 
 pub(crate) fn test_deletion_vector(

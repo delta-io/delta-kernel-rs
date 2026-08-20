@@ -11,7 +11,7 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use crate::path::ParsedLogPath;
+use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
 
@@ -107,28 +107,33 @@ pub(crate) enum HintAction {
 }
 
 impl LastCheckpointHint {
-    /// Whether this hint describes the checkpoint a log segment selected -- the `checkpoint_parts`
-    /// at `version`. Multiple checkpoints can share a version (e.g. concurrent writers), so a
-    /// matching version alone is not enough; multi-part checkpoints must have the expected parts
-    /// and V2 checkpoints must have the matching file name.
-    pub(crate) fn applies_to(
-        &self,
-        version: Version,
-        checkpoint_parts: &[ParsedLogPath<FileMeta>],
-    ) -> bool {
-        // A multi-part V1 checkpoint is keyed by `(version, numParts)` with deterministic
-        // per-version names, so a matching part count pins the identity. `parts` is absent
-        // for a single-part / classic checkpoint.
-        self.version == version
-            && self.parts.unwrap_or(1) == checkpoint_parts.len()
-            && match &self.v2_checkpoint {
-                // A V2 checkpoint's file name carries a UUID, so it must match the selected part
-                // (`checkpoint_parts.first()`), the file the hint's fields describe.
-                Some(v2) => {
-                    checkpoint_parts.first().map(|p| p.filename.as_str()) == Some(v2.path.as_str())
-                }
-                None => true,
-            }
+    /// Whether this hint describes the checkpoint a log segment selected, given that segment's
+    /// `checkpoint_parts`. Multiple checkpoints can share a version, so a matching version alone is
+    /// not enough: the hint's own identity must equal the selected checkpoint's.
+    ///
+    /// On a mismatch, callers read the checkpoint file itself instead of trusting the hint's
+    /// fields.
+    pub(crate) fn applies_to(&self, checkpoint_parts: &[ParsedLogPath<FileMeta>]) -> bool {
+        let Some(selected) = checkpoint_parts.first() else {
+            return false;
+        };
+        self.version == selected.version
+            && CheckpointInstance::of(selected) == self.implied_instance()
+    }
+
+    /// The checkpoint identity this hint's fields describe, mirroring Delta-Spark's
+    /// `getFormatEnum`: a `v2Checkpoint` object means uuid-named, else `parts` means multi-part,
+    /// else classic-named. `None` if `parts` overflows `u32`, so no checkpoint can match it.
+    fn implied_instance(&self) -> Option<CheckpointInstance> {
+        Some(match (&self.v2_checkpoint, self.parts) {
+            (Some(v2), _) => CheckpointInstance::Uuid {
+                filename: v2.path.clone(),
+            },
+            (None, Some(parts)) => CheckpointInstance::MultiPart {
+                num_parts: parts.try_into().ok()?,
+            },
+            (None, None) => CheckpointInstance::Classic,
+        })
     }
 
     /// Parses a hint from raw `_last_checkpoint` bytes, dropping oversized fields so the retained
@@ -233,9 +238,9 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema;
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::create_log_path;
+    use crate::unit_test_utils::create_log_path;
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
     /// `path` and file metadata. An empty `sidecarFiles` (a leaf checkpoint) parses to `Some([])`,
@@ -279,7 +284,8 @@ mod tests {
                     {"path": "sidecar-1.parquet", "sizeInBytes": 42, "modificationTime": 1700000000000}
                 ],
                 "nonFileActions": [
-                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7}},
+                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
+                        "readerFeatures": [], "writerFeatures": []}},
                     {"metaData": {"id": "table-id", "format": {"provider": "parquet", "options": {}},
                         "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
                         "partitionColumns": [], "configuration": {}}},
@@ -327,8 +333,8 @@ mod tests {
         assert!(serde_json::from_slice::<LastCheckpointHint>(bad_type).is_err());
     }
 
-    /// `applies_to` accepts the hint only for the checkpoint a segment selected: the version and
-    /// part count must match, and for a V2 checkpoint the first part's file name must match too.
+    /// `applies_to` accepts the hint only for the checkpoint a segment actually selected: same
+    /// version, and the identity the hint's fields imply must equal the selected checkpoint's.
     #[test]
     fn applies_to_matches_only_the_selected_checkpoint() {
         let root = Url::parse("memory:///_delta_log/").unwrap();
@@ -347,11 +353,18 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(v2.applies_to(1, &[part(selected)]));
-        assert!(!v2.applies_to(2, &[part(selected)]), "wrong version");
-        assert!(!v2.applies_to(1, &[part(other)]), "wrong v2 path");
+        assert!(v2.applies_to(&[part(selected)]));
+        assert!(!v2.applies_to(&[part(other)]), "wrong v2 path");
+        let v2_wrong_version = LastCheckpointHint {
+            version: 2,
+            ..v2.clone()
+        };
+        assert!(
+            !v2_wrong_version.applies_to(&[part(selected)]),
+            "wrong version"
+        );
 
-        // V1 multi-part: keyed by (version, numParts); the file name is not consulted.
+        // V1 multi-part: the part count comes from the selected part's file name.
         let mp1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
         let mp2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
         let v1_multi = LastCheckpointHint {
@@ -359,15 +372,42 @@ mod tests {
             parts: Some(2),
             ..Default::default()
         };
-        assert!(v1_multi.applies_to(1, &[part(mp1), part(mp2)]));
-        assert!(!v1_multi.applies_to(1, &[part(mp1)]), "wrong part count");
+        assert!(v1_multi.applies_to(&[part(mp1), part(mp2)]));
+        let mp1_of_3 = "00000000000000000001.checkpoint.0000000001.0000000003.parquet";
+        assert!(!v1_multi.applies_to(&[part(mp1_of_3)]), "wrong part count");
 
         // V1 single-part: an absent `parts` means one part.
         let v1_single = LastCheckpointHint {
             version: 1,
             ..Default::default()
         };
-        assert!(v1_single.applies_to(1, &[part("00000000000000000001.checkpoint.parquet")]));
+        let classic = "00000000000000000001.checkpoint.parquet";
+        assert!(v1_single.applies_to(&[part(classic)]));
+
+        // Naming has to match, not just part count: a 1-of-1 multi-part and a uuid-named checkpoint
+        // each hold one part too.
+        let one_of_one = "00000000000000000001.checkpoint.0000000001.0000000001.parquet";
+        assert!(
+            !v1_single.applies_to(&[part(one_of_one)]),
+            "single-file hint applied to a multi-part checkpoint"
+        );
+        assert!(
+            !v1_single.applies_to(&[part(selected)]),
+            "single-file hint applied to a uuid-named checkpoint"
+        );
+        // Nor can a multi-part hint describe a single whole file.
+        let v1_one_part = LastCheckpointHint {
+            version: 1,
+            parts: Some(1),
+            ..Default::default()
+        };
+        assert!(v1_one_part.applies_to(&[part(one_of_one)]));
+        assert!(
+            !v1_one_part.applies_to(&[part(classic)]),
+            "multi-part hint applied to a classic checkpoint"
+        );
+
+        assert!(!v1_single.applies_to(&[]), "no checkpoint selected");
     }
 
     /// `sidecarFiles` / `nonFileActions` are dropped only when their count exceeds the threshold --
@@ -524,7 +564,7 @@ mod tests {
         config: &[("delta.checkpointPolicy", "v2")],
     })]
     fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> DeltaResult<()> {
-        use crate::utils::test_utils::load_test_table;
+        use crate::unit_test_utils::load_test_table;
 
         let ExpectedHint {
             table,
@@ -619,7 +659,7 @@ mod tests {
         assert_eq!(metadata.format_provider(), "parquet", "{table}: format");
         assert_eq!(
             metadata.parse_schema()?,
-            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+            schema! { nullable "id": LONG },
             "{table}: metadata schema"
         );
         assert!(

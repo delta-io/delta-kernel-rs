@@ -794,7 +794,7 @@ fn get_earliest_recreatable_commit(
                     }
                 }
             }
-            LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint => {
+            LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint => {
                 last_complete_checkpoint = Some(parsed_log_path.version);
             }
             LogPathFileType::MultiPartCheckpoint {
@@ -909,18 +909,17 @@ mod tests {
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{schema_ref, SchemaRef};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{Action, LocalMockTable};
+    use crate::unit_test_utils::{Action, LocalMockTable};
     use crate::utils::FoldWithOption as _;
     use crate::Version;
 
     fn get_test_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]))
+        schema_ref! {
+            nullable "value": INTEGER,
+        }
     }
 
     fn set_mod_time(mock_table: &LocalMockTable, version: Version, timestamp: Timestamp) {

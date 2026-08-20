@@ -35,6 +35,9 @@ mod parquet;
 mod storage;
 
 #[cfg(feature = "declarative-plans")]
+mod aggs;
+
+#[cfg(feature = "declarative-plans")]
 pub(crate) mod plan;
 
 #[cfg(feature = "declarative-plans")]
@@ -93,8 +96,8 @@ impl Engine for SyncEngine {
     }
 
     #[cfg(feature = "declarative-plans")]
-    fn plan_executor(&self) -> Arc<dyn crate::plans::PlanExecutor> {
-        self.plan_executor.clone()
+    fn plan_executor(&self) -> Option<Arc<dyn crate::plans::PlanExecutor>> {
+        Some(self.plan_executor.clone())
     }
 }
 

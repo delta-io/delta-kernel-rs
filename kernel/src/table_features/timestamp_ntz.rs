@@ -44,32 +44,26 @@ impl<'a> SchemaTransform<'a> for UsesTimestampNtz {
 #[cfg(test)]
 mod tests {
     use crate::actions::Protocol;
-    use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::schema;
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::assert_schema_feature_validation;
+    use crate::unit_test_utils::assert_schema_feature_validation;
 
     #[test]
     fn test_timestamp_ntz_feature_validation() {
-        let schema_with = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("ts", DataType::Primitive(PrimitiveType::TimestampNtz), true),
-        ]);
-        let schema_without = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]);
-        let nested_schema_with = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                StructType::new_unchecked([StructField::new(
-                    "inner_ts",
-                    DataType::Primitive(PrimitiveType::TimestampNtz),
-                    true,
-                )]),
-                true,
-            ),
-        ]);
+        let schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "ts": TIMESTAMP_NTZ,
+        };
+        let schema_without = schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
+        let nested_schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "nested": {
+                nullable "inner_ts": TIMESTAMP_NTZ,
+            },
+        };
         let protocol_with = Protocol::try_new_modern(
             [TableFeature::TimestampWithoutTimezone],
             [TableFeature::TimestampWithoutTimezone],

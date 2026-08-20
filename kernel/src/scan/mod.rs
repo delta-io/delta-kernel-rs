@@ -15,12 +15,12 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
@@ -39,10 +39,11 @@ use crate::scan::log_replay::{
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    lazy_schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
-    StructType, ToSchema as _,
+    lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
+    StructField, StructType, ToSchema as _,
 };
-use crate::table_features::{ColumnMappingMode, Operation};
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -75,16 +76,11 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
 /// Discovery restores JSON stats when structured stats cannot satisfy the scan.
 pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let add_schema = Add::to_schema();
-    let fields_no_stats: Vec<_> = add_schema
-        .fields()
-        .filter(|f| f.name() != "stats")
-        .cloned()
-        .collect();
-    let add_no_stats = StructType::new_unchecked(fields_no_stats);
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        ADD_NAME,
-        add_no_stats,
-    )]))
+    schema_ref! {
+        nullable ADD_NAME: {
+            ..(add_schema.fields().filter(|f| f.name() != "stats")),
+        },
+    }
 });
 
 #[allow(unused)]
@@ -117,7 +113,7 @@ pub struct StatsOptions {
     /// the existing JSON is passed through regardless.
     pub(crate) synthesize_json: bool,
 
-    /// Which struct stats columns to emit in `stats_parsed`.
+    /// Which struct stats columns to request in `stats_parsed`.
     pub(crate) struct_stats: StructStats,
 }
 
@@ -130,7 +126,7 @@ pub enum StructStats {
     None,
     /// Emit all indexed stats columns.
     All,
-    /// Emit only the specified stats columns.
+    /// Emit at least the specified stats columns. Predicate-referenced columns may also appear.
     Columns(Vec<ColumnName>),
 }
 
@@ -160,8 +156,8 @@ impl StatsOptions {
         }
     }
 
-    /// Struct stats projected to the specified columns without JSON synthesis. Like
-    /// [`Self::all_struct`] but narrowed to a subset of indexed columns.
+    /// Struct stats for at least the specified columns without JSON synthesis. Predicate-referenced
+    /// columns may also appear because scan paths can retain stats used for data skipping.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
@@ -417,10 +413,17 @@ impl ScanBuilder {
         // per-row partition-value parse done only to build them.
         state_info.skip_row_transforms = self.without_row_transforms;
 
+        let physical_stats_output_schema = build_physical_stats_output_schema(
+            self.snapshot.table_configuration(),
+            &state_info,
+            &self.stats,
+        )?;
+
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
+            physical_stats_output_schema,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
             cancellation_token: self.cancellation_token,
@@ -598,28 +601,20 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
     }
 }
 
-static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    StructType::new_unchecked(vec![StructField::nullable(
-        "add",
-        StructType::new_unchecked(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("partitionValues", partition_values),
-            StructField::not_null("size", DataType::LONG),
-            StructField::nullable("modificationTime", DataType::LONG),
-            StructField::nullable("stats", DataType::STRING),
-            StructField::nullable(
-                "tags",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-            StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
-            StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-            StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
-        ]),
-    )])
-    .into()
-});
+static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable "add": {
+        not_null "path": STRING,
+        not_null "partitionValues": { STRING => nullable STRING },
+        not_null "size": LONG,
+        nullable "modificationTime": LONG,
+        nullable "stats": STRING,
+        nullable "tags": { STRING => nullable STRING },
+        nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
+        nullable BASE_ROW_ID_NAME: LONG,
+        nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
+        nullable CLUSTERING_PROVIDER_NAME: STRING,
+    },
+};
 
 pub(crate) fn restored_add_schema() -> &'static SchemaRef {
     &RESTORED_ADD_SCHEMA
@@ -683,11 +678,54 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
+    #[allow(dead_code)] // Only used when `declarative-plans` is enabled
+    physical_stats_output_schema: Option<SchemaRef>,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
     /// Optional cooperative cancellation token supplied via
     /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+}
+
+/// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
+///
+/// For example, if the caller requests `[a, b]` and the predicate references `c`,
+/// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
+/// Returns `None` when no eligible struct stats are requested and errors when a requested column
+/// cannot be resolved.
+fn build_physical_stats_output_schema(
+    table_configuration: &TableConfiguration,
+    state_info: &StateInfo,
+    stats: &StatsOptions,
+) -> DeltaResult<Option<SchemaRef>> {
+    match &stats.struct_stats {
+        StructStats::None => Ok(None),
+        StructStats::All => Ok(state_info.physical_stats_schema.clone()),
+        StructStats::Columns(columns) if columns.is_empty() => Ok(None),
+        StructStats::Columns(columns) => {
+            let logical_schema = table_configuration.logical_schema();
+            let column_mapping_mode = table_configuration.column_mapping_mode();
+            let physical_columns: Vec<_> = columns
+                .iter()
+                .map(|column| {
+                    get_any_level_column_physical_name(&logical_schema, column, column_mapping_mode)
+                })
+                .try_collect()?;
+            let stats_schema = table_configuration
+                .build_expected_stats_schemas(None, Some(&physical_columns))?
+                .physical;
+
+            Ok(stats_schema_with_data_columns(stats_schema))
+        }
+    }
+}
+
+/// Returns `schema` only when it contains stats for at least one data column.
+///
+/// Expected stats schemas always contain `numRecords` and `tightBounds`. `nullCount` is present
+/// only when at least one data column survives stats filtering.
+fn stats_schema_with_data_columns(schema: SchemaRef) -> Option<SchemaRef> {
+    schema.field(NULL_COUNT).is_some().then_some(schema)
 }
 
 impl std::fmt::Debug for Scan {
@@ -1030,18 +1068,18 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// Returns an error if log discovery, checkpoint inspection, or plan construction fails.
+    /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
+    /// or if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
-        let log_segment = self.snapshot.log_segment();
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
-        let plan_executor = engine.plan_executor();
+        let plan_executor = engine.require_plan_executor()?;
         let shape = CheckpointShape::try_new(
             plan_executor.as_ref(),
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
         )?;
-        scan_plan::build_metadata_scan_plan(&self.state_info, log_segment, &shape)
+        self.build_metadata_scan_plan(&shape)
     }
 
     // Factored out to facilitate testing
@@ -1120,7 +1158,7 @@ impl Scan {
         )?;
 
         let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add"]),
+            prefix: column_name!("add"),
         };
         let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))

@@ -5,23 +5,39 @@ use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
-use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use delta_kernel::arrow::array::{
+    new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray,
+};
+use delta_kernel::arrow::compute::{concat, concat_batches};
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
+use delta_kernel::arrow::error::ArrowError;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::expressions::{column_expr, Scalar};
+use delta_kernel::expressions::{
+    col, lit, null_lit, ExpressionStructPatchBuilder, MapData, Scalar,
+};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::scan::{scan_row_schema, StatsOptions};
+use delta_kernel::schema::{schema_ref, DataType, MapType};
+use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Error, Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
+use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    begin_transaction, copy_directory, create_default_engine, create_default_engine_mt_executor,
-    load_and_begin_transaction, read_actions_from_commit, setup_test_tables,
+    assert_result_error_with_message, begin_transaction, copy_directory, create_add_files_metadata,
+    create_default_engine, create_default_engine_mt_executor, insert_data, into_record_batch,
+    load_and_begin_transaction, read_actions_from_commit, replace_array_row, setup_test_table_p37,
+    setup_test_tables, test_table_setup,
 };
 use url::Url;
 
@@ -29,6 +45,366 @@ use crate::common::write_utils::{
     create_dv_table_with_files, get_scan_files, get_simple_int_schema, sequential_dv_descriptors,
     set_table_properties, write_data_and_check_result_and_stats,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppendOnlyWrite {
+    Remove,
+    DeletionVectorUpdate,
+}
+
+#[rstest::rstest]
+#[case::no_data_change_all_selected(
+    false, /* data_change */
+    &[true, true, true], /* selection_vector */
+    None, /* expected_error */
+)]
+#[case::data_change_all_selected(
+    true, /* data_change */
+    &[true, true, true], /* selection_vector */
+    Some("Append-only tables cannot remove files"), /* expected_error */
+)]
+#[case::no_data_change_partially_selected(
+    false, /* data_change */
+    &[true, false, true], /* selection_vector */
+    None, /* expected_error */
+)]
+#[case::data_change_partially_selected(
+    true, /* data_change */
+    &[true, false, true], /* selection_vector */
+    Some("Append-only tables cannot remove files"), /* expected_error */
+)]
+#[case::data_change_none_selected(
+    true, /* data_change */
+    &[false, false, false], /* selection_vector */
+    None, /* expected_error */
+)]
+#[tokio::test]
+async fn append_only_enforces_data_change_for_file_actions(
+    #[values(AppendOnlyWrite::Remove, AppendOnlyWrite::DeletionVectorUpdate)]
+    operation: AppendOnlyWrite,
+    #[values(0, 1)] batch_index: usize,
+    #[case] data_change: bool,
+    #[case] selection_vector: &[bool],
+    #[case] expected_error: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let schema = schema_ref! { nullable "number": INTEGER };
+
+    let snapshot = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([
+            ("delta.appendOnly", "true"),
+            ("delta.enableDeletionVectors", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let write_context = txn.unpartitioned_write_context()?;
+    let arrow_schema: Arc<ArrowSchema> =
+        Arc::new(write_context.physical_schema().as_ref().try_into_arrow()?);
+    for value in [1, 2, 3] {
+        let data = ArrowEngineData::new(RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![value]))],
+        )?);
+        txn.add_files(engine.write_parquet(&data, &write_context).await?);
+    }
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+    let staged_batches = (0..2)
+        .map(|index| {
+            let scan_files = selected_scan_file_batch(snapshot.clone(), engine.as_ref())?;
+            let (data, _) = scan_files.into_parts();
+            assert_eq!(data.len(), selection_vector.len());
+            let selection_vector = if index == batch_index {
+                selection_vector.to_vec()
+            } else {
+                vec![false; data.len()]
+            };
+            FilteredEngineData::try_new(data, selection_vector)
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?
+        .with_operation("DELETE".to_string())
+        .with_data_change(data_change);
+    // NOTE: The data_change=false cases do not preserve removed records in replacement AddFiles.
+    // This is not a valid rearrangement, we construct such commit only for testing.
+    let commit_result = match operation {
+        AppendOnlyWrite::Remove => {
+            for scan_files in staged_batches {
+                txn.remove_files(scan_files);
+            }
+            txn.commit(engine.as_ref())
+        }
+        AppendOnlyWrite::DeletionVectorUpdate => {
+            let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
+            let dv_map = add_actions
+                .iter()
+                .zip(selection_vector)
+                .enumerate()
+                .filter(|(_, (_, selected))| **selected)
+                .map(|(index, (add, _))| {
+                    let path = add["path"]
+                        .as_str()
+                        .expect("add path should be present")
+                        .to_string();
+                    let dv = DeletionVectorDescriptor {
+                        storage_type: DeletionVectorStorageType::PersistedRelative,
+                        path_or_inline_dv: format!("dv-{index}.bin"),
+                        offset: Some(0),
+                        size_in_bytes: 1,
+                        cardinality: 1,
+                    };
+                    (path, dv)
+                })
+                .collect();
+            txn.update_deletion_vectors(dv_map, staged_batches.into_iter().map(Ok))?;
+            txn.commit(engine.as_ref())
+        }
+    };
+
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(commit_result, expected_error);
+    } else {
+        commit_result?.unwrap_committed();
+    }
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot.version(),
+        if expected_error.is_some() { 1 } else { 2 }
+    );
+    let scan = snapshot.scan_builder().build()?;
+    let mut active_files = 0;
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        let scan_files = scan_metadata?.scan_files;
+        active_files += scan_files
+            .selection_vector()
+            .iter()
+            .filter(|selected| **selected)
+            .count()
+            + scan_files.data().len()
+            - scan_files.selection_vector().len();
+    }
+    let selected_files = selection_vector
+        .iter()
+        .filter(|selected| **selected)
+        .count();
+    let expected_active_files = match operation {
+        AppendOnlyWrite::Remove if expected_error.is_none() => 3 - selected_files,
+        AppendOnlyWrite::Remove | AppendOnlyWrite::DeletionVectorUpdate => 3,
+    };
+    assert_eq!(active_files, expected_active_files);
+
+    Ok(())
+}
+
+fn selected_scan_file_batch(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+) -> DeltaResult<FilteredEngineData> {
+    for scan_files in get_scan_files(snapshot, engine)? {
+        let data = scan_files.apply_selection_vector()?;
+        if !data.is_empty() {
+            return Ok(FilteredEngineData::with_all_rows_selected(data));
+        }
+    }
+    Err(Error::generic("expected at least one scan file"))
+}
+
+#[derive(Clone, Copy)]
+struct StagedRemoveFileModification {
+    field: &'static str,
+    value: StagedRemoveFileFieldValue,
+    modified_row_index: usize,
+}
+
+#[derive(Clone, Copy)]
+enum StagedRemoveFileFieldValue {
+    Null,
+    String(&'static str),
+    Int64(i64),
+}
+
+impl StagedRemoveFileModification {
+    const fn modify_value(
+        field: &'static str,
+        string_value: Option<&'static str>,
+        modified_row_index: usize,
+    ) -> Self {
+        Self {
+            field,
+            value: match string_value {
+                Some(value) => StagedRemoveFileFieldValue::String(value),
+                None => StagedRemoveFileFieldValue::Null,
+            },
+            modified_row_index,
+        }
+    }
+
+    const fn modify_size(size: i64, modified_row_index: usize) -> Self {
+        Self {
+            field: "size",
+            value: StagedRemoveFileFieldValue::Int64(size),
+            modified_row_index,
+        }
+    }
+}
+
+#[rstest]
+#[case::missing_path(
+    StagedRemoveFileModification::modify_value("path", None, 0 /* modified_row_index */),
+    &[true, true, true],
+    Some("missing required field 'path'"),
+)]
+#[case::empty_path(
+    StagedRemoveFileModification::modify_value("path", Some(""), 1 /* modified_row_index */),
+    &[true, true, true],
+    Some("path must not be empty"),
+)]
+#[case::missing_path_unselected(
+    StagedRemoveFileModification::modify_value("path", None, 2 /* modified_row_index */),
+    &[true, true, false],
+    None,
+)]
+#[case::short_selection_vector_missing_path(
+    StagedRemoveFileModification::modify_value("path", None, 2 /* modified_row_index */),
+    &[false, false],
+    Some("missing required field 'path'"),
+)]
+#[case::missing_size(
+    StagedRemoveFileModification::modify_value("size", None, 1 /* modified_row_index */),
+    &[true, true, true],
+    Some("missing required field 'size'"),
+)]
+#[case::missing_size_unselected(
+    StagedRemoveFileModification::modify_value("size", None, 2 /* modified_row_index */),
+    &[true, true, false],
+    None,
+)]
+#[case::negative_size(
+    StagedRemoveFileModification::modify_size(-1, 1 /* modified_row_index */),
+    &[true, true, true],
+    Some("size must be non-negative"),
+)]
+#[case::missing_modification_time(
+    StagedRemoveFileModification::modify_value(
+        "modificationTime",
+        None,
+        1 /* modified_row_index */,
+    ),
+    &[true, true, true],
+    None,
+)]
+#[case::missing_stats(
+    StagedRemoveFileModification::modify_value("stats", None, 2 /* modified_row_index */),
+    &[true, true, true],
+    None,
+)]
+#[case::missing_deletion_vector(
+    StagedRemoveFileModification::modify_value(
+        "deletionVector",
+        None,
+        0 /* modified_row_index */,
+    ),
+    &[true, true, true],
+    None,
+)]
+#[case::missing_file_constant_values(
+    StagedRemoveFileModification::modify_value(
+        "fileConstantValues",
+        None,
+        1 /* modified_row_index */,
+    ),
+    &[true, true, true],
+    None,
+)]
+#[tokio::test]
+async fn commit_validates_staged_remove_fields(
+    #[case] modification: StagedRemoveFileModification,
+    #[case] selection_vector: &[bool],
+    #[case] expected_error: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // === Create table ===
+    let schema = get_simple_int_schema();
+    let (table_url, engine, _store, _table_name) =
+        setup_test_table_p37(schema, &[], None, "remove_required_field_table").await?;
+    let engine = Arc::new(engine);
+
+    // === Insert files ===
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let adds = create_add_files_metadata(
+        txn.add_files_schema(),
+        vec![
+            ("file-1.parquet", 1, 1, Some(1)),
+            ("file-2.parquet", 2, 2, Some(1)),
+            ("file-3.parquet", 3, 3, Some(1)),
+        ],
+    )?;
+    txn.add_files(adds);
+    txn.commit(engine.as_ref())?.unwrap_committed();
+
+    // === Modify staged remove metadata ===
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let mut batches = Vec::new();
+    for scan_files in get_scan_files(snapshot.clone(), engine.as_ref())? {
+        batches.push(into_record_batch(scan_files.apply_selection_vector()?));
+    }
+    let schema = batches
+        .first()
+        .expect("at least one scan metadata batch")
+        .schema();
+    let batch = concat_batches(&schema, &batches)?;
+    assert_eq!(batch.num_rows(), 3);
+    let path_index = batch.schema().index_of("path")?;
+    let paths = batch
+        .column(path_index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("path is a string column");
+    let mut expected_surviving_paths = paths
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| !selection_vector.get(*row).copied().unwrap_or(true))
+        .map(|(_, path)| path.expect("path is present").to_owned())
+        .collect::<Vec<_>>();
+    expected_surviving_paths.sort();
+    let corrupted = modify_staged_remove_file(&batch, modification)?;
+
+    // === Commit and assert ===
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.remove_files(FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(corrupted)),
+        selection_vector.to_vec(),
+    )?);
+    let result = txn.commit(engine.as_ref());
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        let snapshot = result?.unwrap_post_commit_snapshot();
+        let mut surviving_paths = Vec::new();
+        for scan_files in get_scan_files(snapshot, engine.as_ref())? {
+            let (data, selection_vector) = scan_files.into_parts();
+            let batch = into_record_batch(data);
+            let path_index = batch.schema().index_of("path")?;
+            let paths = batch
+                .column(path_index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("path is a string column");
+            for row in 0..batch.num_rows() {
+                if selection_vector.get(row).copied().unwrap_or(true) {
+                    surviving_paths.push(paths.value(row).to_owned());
+                }
+            }
+        }
+        surviving_paths.sort();
+        assert_eq!(surviving_paths, expected_surviving_paths);
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {
@@ -191,6 +567,82 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
         }
         _ => panic!("Transaction should be committed"),
     }
+
+    Ok(())
+}
+
+/// Verifies that `extendedFileMetadata` is true exactly when `size` and `partitionValues` are
+/// present; `tags` does not affect it.
+///
+/// `Transaction::remove_files` requires `size`, so only `partitionValues` may be missing from that
+/// pair.
+#[rstest::rstest]
+#[case::all_present(&[], true)]
+#[case::missing_partition_values(&[ExtendedMetadataField::PartitionValues], false)]
+#[case::missing_tags(&[ExtendedMetadataField::Tags], true)]
+#[case::only_size(&[
+    ExtendedMetadataField::PartitionValues,
+    ExtendedMetadataField::Tags,
+], false)]
+#[tokio::test]
+async fn test_remove_scanned_file_sets_extended_metadata(
+    #[case] missing_fields: &[ExtendedMetadataField],
+    #[case] expected_extended_file_metadata: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let schema = schema_ref! { nullable "number": INTEGER };
+
+    let snapshot = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snapshot = insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+
+    let scan = snapshot.clone().scan_builder().build()?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        txn.remove_files(with_missing_extended_metadata_fields(
+            engine.as_ref(),
+            scan_metadata?.scan_files,
+            missing_fields,
+        )?);
+    }
+    let commit_result = txn.commit(engine.as_ref());
+    commit_result?.unwrap_committed();
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+    let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
+    assert_eq!(remove_actions.len(), 1);
+    let remove = &remove_actions[0];
+    assert_eq!(
+        remove["extendedFileMetadata"],
+        expected_extended_file_metadata
+    );
+    for field in ExtendedMetadataField::ALL {
+        let present = remove
+            .get(field.name())
+            .is_some_and(|value| !value.is_null());
+        assert_eq!(present, !missing_fields.contains(&field));
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+    let mut surviving_files = 0;
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        surviving_files += scan_metadata?
+            .scan_files
+            .selection_vector()
+            .iter()
+            .filter(|selected| **selected)
+            .count();
+    }
+    assert_eq!(surviving_files, 0);
 
     Ok(())
 }
@@ -517,21 +969,263 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     Ok(())
 }
 
+#[derive(Clone)]
+struct ScanFileModification {
+    field_name: &'static str,
+    value: ArrayRef,
+    row_id: usize,
+}
+
+#[rstest::rstest]
+#[case::missing_path(
+    ScanFileModification {
+        field_name: "path",
+        value: new_null_array(&ArrowDataType::Utf8, 1),
+        row_id: 0,
+    },
+    "Number of matched DV files does not match number of new DV descriptors"
+)]
+#[case::empty_path(
+    ScanFileModification {
+        field_name: "path",
+        value: string_array(""),
+        row_id: 0,
+    },
+    "path must not be empty"
+)]
+#[case::missing_partition_values(
+    ScanFileModification {
+        field_name: "partitionValues",
+        value: null_partition_values(),
+        row_id: 1,
+    },
+    "missing required field 'partitionValues'"
+)]
+#[case::extra_partition_key(
+    ScanFileModification {
+        field_name: "partitionValues",
+        value: string_map_array(&[("stray", Some("value"))]),
+        row_id: 2,
+    },
+    "partitionValues keys"
+)]
+#[case::duplicate_partition_key(
+    ScanFileModification {
+        field_name: "partitionValues",
+        value: string_map_array(&[
+            ("stray", Some("first")),
+            ("stray", Some("second")),
+        ]),
+        row_id: 0,
+    },
+    "duplicate partition column names"
+)]
+#[case::missing_size(
+    ScanFileModification {
+        field_name: "size",
+        value: new_null_array(&ArrowDataType::Int64, 1),
+        row_id: 1,
+    },
+    "missing required field 'size'"
+)]
+#[case::negative_size(
+    ScanFileModification {
+        field_name: "size",
+        value: int64_array(-1),
+        row_id: 2,
+    },
+    "size must be non-negative"
+)]
+#[case::missing_modification_time(
+    ScanFileModification {
+        field_name: "modificationTime",
+        value: new_null_array(&ArrowDataType::Int64, 1),
+        row_id: 0,
+    },
+    "missing required field 'modificationTime'"
+)]
 #[tokio::test]
-async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_update_deletion_vectors_rejects_corrupted_scan_files(
+    #[case] modification: ScanFileModification,
+    #[case] expected_error: &str,
+    #[values(0, 1, 2)] invalid_batch_index: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const BATCH_COUNT: usize = 3;
+
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "part": STRING,
+    };
+    let (_store, engine, table_url, file_paths) = create_dv_table_with_files(
+        "test_table",
+        schema,
+        &[("part", Some("value"))],
+        &["file0.parquet", "file1.parquet", "file2.parquet"],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan_file = get_scan_files(snapshot.clone(), engine.as_ref())?
+        .into_iter()
+        .next()
+        .expect("table should contain one scan-file batch");
+    let scan_files =
+        make_scan_file_batches(scan_file, &modification, invalid_batch_index, BATCH_COUNT);
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let mut descriptors = sequential_dv_descriptors(&file_paths);
+    if modification.field_name == "path" {
+        if modification.value.is_null(0) {
+            assert_result_error_with_message(
+                txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok)),
+                expected_error,
+            );
+            return Ok(());
+        }
+        let path = modification.value.as_string::<i32>().value(0);
+        let descriptor = descriptors
+            .remove(&file_paths[0])
+            .expect("descriptor for the original path modified by this test");
+        descriptors.insert(path.to_string(), descriptor);
+    }
+    txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok))?;
+
+    assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
+    Ok(())
+}
+
+fn make_scan_file_batches(
+    scan_file: FilteredEngineData,
+    modification: &ScanFileModification,
+    invalid_batch_index: usize,
+    batch_count: usize,
+) -> Vec<FilteredEngineData> {
+    let (data, selection_vector) = scan_file.into_parts();
+    let batch = into_record_batch(data);
+    (0..batch_count)
+        .map(|batch_index| {
+            let selection_vector = if batch_index == invalid_batch_index {
+                selection_vector.clone()
+            } else {
+                vec![false; batch.num_rows()]
+            };
+            let scan_file = FilteredEngineData::try_new(
+                Box::new(ArrowEngineData::new(batch.clone())),
+                selection_vector,
+            )
+            .expect("selection vector length should match scan-file row count");
+            if batch_index == invalid_batch_index {
+                modify_scan_file(scan_file, modification)
+            } else {
+                scan_file
+            }
+        })
+        .collect()
+}
+
+fn modify_scan_file(
+    scan_file: FilteredEngineData,
+    modification: &ScanFileModification,
+) -> FilteredEngineData {
+    let (data, selection_vector) = scan_file.into_parts();
+    let batch = into_record_batch(data);
+    let schema = batch.schema();
+    let mut columns = batch.columns().to_vec();
+    let row_index = (0..batch.num_rows())
+        .filter(|&row_index| selection_vector.get(row_index).copied().unwrap_or(true))
+        .nth(modification.row_id)
+        .expect("modified selected row must exist in scan-file batch");
+
+    if modification.field_name == "partitionValues" {
+        let constants_index = schema
+            .index_of("fileConstantValues")
+            .expect("fileConstantValues field in scan data");
+        let constants = columns[constants_index].as_struct();
+        let partition_values_index = constants
+            .fields()
+            .iter()
+            .position(|field| field.name() == "partitionValues")
+            .expect("partitionValues field in fileConstantValues");
+        let partition_values = constants.column(partition_values_index);
+        let mut constant_columns = constants.columns().to_vec();
+        constant_columns[partition_values_index] =
+            replace_array_row(partition_values, modification.value.clone(), row_index);
+        columns[constants_index] = Arc::new(StructArray::new(
+            constants.fields().clone(),
+            constant_columns,
+            constants.nulls().cloned(),
+        ));
+    } else {
+        let field_index = schema
+            .index_of(modification.field_name)
+            .expect("modified field in scan data");
+        columns[field_index] =
+            replace_array_row(&columns[field_index], modification.value.clone(), row_index);
+    }
+
+    let batch = RecordBatch::try_new(schema, columns)
+        .expect("modified scan-file schema and columns should form a valid batch");
+    FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection_vector)
+        .expect("selection vector length should match modified scan-file row count")
+}
+
+fn string_array(value: &str) -> ArrayRef {
+    Arc::new(StringArray::from(vec![value]))
+}
+
+fn int64_array(value: i64) -> ArrayRef {
+    Arc::new(Int64Array::from(vec![value]))
+}
+
+fn null_partition_values() -> ArrayRef {
+    let partition_values = string_map_array(&[]);
+    new_null_array(partition_values.data_type(), 1)
+}
+
+fn string_map_array(values: &[(&str, Option<&str>)]) -> ArrayRef {
+    let mut builder = MapBuilder::new(
+        Some(MapFieldNames {
+            entry: "key_value".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        }),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    )
+    .with_keys_field(ArrowField::new("key", ArrowDataType::Utf8, false))
+    .with_values_field(ArrowField::new("value", ArrowDataType::Utf8, true));
+    for (key, value) in values {
+        builder.keys().append_value(key);
+        match value {
+            Some(value) => builder.values().append_value(value),
+            None => builder.values().append_null(),
+        }
+    }
+    builder
+        .append(true)
+        .expect("partition-values row should be valid");
+    Arc::new(builder.finish())
+}
+
+#[rstest::rstest]
+#[case::unpartitioned(&[])]
+#[case::partitioned(&[("value", Some("partition"))])]
+#[tokio::test]
+async fn test_update_deletion_vectors_multiple_files(
+    #[case] partition_values: &[(&str, Option<&str>)],
+) -> Result<(), Box<dyn std::error::Error>> {
     // This test verifies that update_deletion_vectors can update multiple files
     // in a single call, creating proper Remove and Add actions for each file.
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
 
     // Setup: Create table with 3 files
     let file_names = &["file0.parquet", "file1.parquet", "file2.parquet"];
     let (store, engine, table_url, file_paths) =
-        create_dv_table_with_files("test_table", schema, file_names).await?;
+        create_dv_table_with_files("test_table", schema, partition_values, file_names).await?;
 
     // Create DV update transaction
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -640,15 +1334,25 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// A DV update over a batch where only some files are targeted: only the matched files get
-/// remove/add pairs.
+#[rstest::rstest]
+#[case::target_in_explicit_prefix(&[true, true], &[0], false)]
+#[case::target_in_implicit_tail(&[true, true], &[3], false)]
+#[case::multiple_targets(&[true, true], &[0, 3], false)]
+#[case::empty_selection_vector(&[], &[3], false)]
+#[case::unselected_rows_are_ignored(&[true, false, true, false], &[2], false)]
+#[case::unselected_target_is_rejected(&[true, false, true, false], &[2, 3], true)]
+#[case::no_updates_short_selection_vector(&[true, true], &[], false)]
+#[case::no_updates_empty_selection_vector(&[], &[], false)]
 #[tokio::test]
-async fn test_update_deletion_vectors_updates_only_matched_files(
+async fn test_update_deletion_vectors_respects_selection_vector(
+    #[case] selection_vector: &[bool],
+    #[case] target_indexes: &[usize],
+    #[case] expect_mismatch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
 
     let file_names = &[
         "file0.parquet",
@@ -657,10 +1361,29 @@ async fn test_update_deletion_vectors_updates_only_matched_files(
         "file3.parquet",
     ];
     let (store, engine, table_url, file_paths) =
-        create_dv_table_with_files("test_table", schema, file_names).await?;
+        create_dv_table_with_files("test_table", schema, &[], file_names).await?;
 
-    // Target only files 1 and 3 for a DV update; files 0 and 2 must be left untouched.
-    let targeted = [file_paths[1].clone(), file_paths[3].clone()];
+    // Attach DV to all files first, if later DV updates incorrectly remove the existing DV,
+    // the test will fail.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut setup_txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
+    let initial_dvs = sequential_dv_descriptors(&file_paths);
+    let initial_dv_ids: HashMap<_, _> = initial_dvs
+        .iter()
+        .map(|(path, dv)| (path.clone(), dv.unique_id()))
+        .collect();
+    setup_txn.update_deletion_vectors(
+        initial_dvs,
+        get_scan_files(snapshot, engine.as_ref())?
+            .into_iter()
+            .map(Ok),
+    )?;
+    setup_txn.commit(engine.as_ref())?.unwrap_committed();
+
+    let targeted: Vec<String> = target_indexes
+        .iter()
+        .map(|&index| file_paths[index].clone())
+        .collect();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
@@ -682,9 +1405,30 @@ async fn test_update_deletion_vectors_updates_only_matched_files(
             )
         })
         .collect();
+    let updated_dv_ids: HashMap<_, _> = dv_map
+        .iter()
+        .map(|(path, dv)| (path.clone(), dv.unique_id()))
+        .collect();
 
-    let scan_files = get_scan_files(snapshot, engine.as_ref())?;
-    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    let batches = get_scan_files(snapshot, engine.as_ref())?
+        .into_iter()
+        .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let scan_files = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(batch)),
+        selection_vector.to_vec(),
+    )?;
+
+    let update_result = txn.update_deletion_vectors(dv_map, std::iter::once(Ok(scan_files)));
+    if expect_mismatch {
+        assert_result_error_with_message(
+            update_result,
+            "Number of matched DV files does not match number of new DV descriptors",
+        );
+    } else {
+        update_result?;
+    }
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     let version = committed.commit_version();
 
@@ -701,22 +1445,53 @@ async fn test_update_deletion_vectors_updates_only_matched_files(
     let adds: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("add")).collect();
     let removes: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("remove")).collect();
 
-    // Only the two targeted files produce remove/add pairs.
-    assert_eq!(adds.len(), 2, "only the targeted files should be re-added");
-    assert_eq!(
-        removes.len(),
-        2,
-        "only the targeted files should be removed"
-    );
+    let expected_count = if expect_mismatch {
+        0
+    } else {
+        target_indexes.len()
+    };
+    assert_eq!(adds.len(), expected_count, "unexpected re-added files");
+    assert_eq!(removes.len(), expected_count, "unexpected removed files");
 
     let mut added_paths: Vec<&str> = adds.iter().map(|a| a["path"].as_str().unwrap()).collect();
     added_paths.sort();
-    let mut expected: Vec<&str> = targeted.iter().map(String::as_str).collect();
+    let mut removed_paths: Vec<&str> = removes
+        .iter()
+        .map(|a| a["path"].as_str().unwrap())
+        .collect();
+    removed_paths.sort();
+    let mut expected: Vec<&str> = if expect_mismatch {
+        Vec::new()
+    } else {
+        targeted.iter().map(String::as_str).collect()
+    };
     expected.sort();
     assert_eq!(
         added_paths, expected,
         "re-added paths must be exactly the targeted files"
     );
+    assert_eq!(
+        removed_paths, expected,
+        "removed paths must be exactly the targeted files"
+    );
+
+    let dv_id = |action: &serde_json::Value| {
+        let dv = &action["deletionVector"];
+        format!(
+            "{}{}@{}",
+            dv["storageType"].as_str().unwrap(),
+            dv["pathOrInlineDv"].as_str().unwrap(),
+            dv["offset"].as_i64().unwrap()
+        )
+    };
+    for add in &adds {
+        let path = add["path"].as_str().unwrap();
+        assert_eq!(dv_id(add), updated_dv_ids[path]);
+    }
+    for remove in &removes {
+        let path = remove["path"].as_str().unwrap();
+        assert_eq!(dv_id(remove), initial_dv_ids[path]);
+    }
 
     // Each new add carries its DV and widened tightBounds, with numRecords preserved.
     for add in &adds {
@@ -813,6 +1588,60 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtendedMetadataField {
+    Size,
+    PartitionValues,
+    Tags,
+}
+
+impl ExtendedMetadataField {
+    const ALL: [Self; 3] = [Self::Size, Self::PartitionValues, Self::Tags];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::PartitionValues => "partitionValues",
+            Self::Tags => "tags",
+        }
+    }
+}
+
+fn with_missing_extended_metadata_fields(
+    engine: &dyn Engine,
+    scan_files: FilteredEngineData,
+    missing_fields: &[ExtendedMetadataField],
+) -> Result<FilteredEngineData, Box<dyn std::error::Error>> {
+    let (data, selection_vector) = scan_files.into_parts();
+    let map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+    let tags = if missing_fields.contains(&ExtendedMetadataField::Tags) {
+        Scalar::null(map_type.clone())
+    } else {
+        Scalar::Map(MapData::try_new(map_type.clone(), [("key", "value")])?)
+    };
+    let mut patch =
+        ExpressionStructPatchBuilder::new().replace_at(["fileConstantValues"], "tags", lit(tags));
+    for field in missing_fields {
+        patch = match field {
+            ExtendedMetadataField::Size => patch.replace("size", null_lit(DataType::LONG)),
+            ExtendedMetadataField::PartitionValues => patch.replace_at(
+                ["fileConstantValues"],
+                field.name(),
+                null_lit(map_type.clone()),
+            ),
+            ExtendedMetadataField::Tags => patch,
+        };
+    }
+    let schema = scan_row_schema();
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        schema.clone(),
+        Arc::new(Expr::struct_patch(patch)?),
+        schema.into(),
+    )?;
+    let data = evaluator.evaluate(data.as_ref())?;
+    Ok(FilteredEngineData::try_new(data, selection_vector)?)
 }
 
 #[tokio::test]
@@ -1038,10 +1867,8 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             .scan_builder()
             .with_stats(StatsOptions::all());
         if use_predicate {
-            scan_builder = scan_builder.with_predicate(Arc::new(Pred::gt(
-                column_expr!("number"),
-                Expr::literal(0_i32),
-            )));
+            scan_builder =
+                scan_builder.with_predicate(Arc::new(Pred::gt(col!("number"), lit(0_i32))));
         }
         let scan = scan_builder.build()?;
 
@@ -1103,11 +1930,11 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
 #[rstest::rstest]
 #[case::no_predicate(None, &["usa", "japan"])]
 #[case::data_predicate(
-    Some(Pred::gt(column_expr!("id"), Expr::literal(0_i32))),
+    Some(Pred::gt(col!("id"), lit(0_i32))),
     &["usa", "japan"]
 )]
 #[case::partition_predicate(
-    Some(Pred::eq(column_expr!("country"), Expr::literal("usa".to_string()))),
+    Some(Pred::eq(col!("country"), lit("usa".to_string()))),
     &["usa"]
 )]
 #[tokio::test]
@@ -1118,10 +1945,10 @@ async fn test_remove_files_partitioned_with_parsed_columns(
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "country";
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("country", DataType::STRING),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "country": STRING,
+    };
     let data_schema = schema_ref! { nullable "id": INTEGER };
 
     // Local directory backing: `read_actions_from_commit` reads commit JSON off disk
@@ -1216,4 +2043,38 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         }
     }
     Ok(())
+}
+
+fn modify_staged_remove_file(
+    batch: &RecordBatch,
+    modification: StagedRemoveFileModification,
+) -> Result<RecordBatch, ArrowError> {
+    let field_index = batch.schema().index_of(modification.field)?;
+    let mut columns = batch.columns().to_vec();
+    let modified_value = match modification.value {
+        StagedRemoveFileFieldValue::Null => {
+            new_null_array(batch.schema().field(field_index).data_type(), 1)
+        }
+        StagedRemoveFileFieldValue::String(value) => {
+            Arc::new(StringArray::from(vec![value])) as ArrayRef
+        }
+        StagedRemoveFileFieldValue::Int64(value) => {
+            Arc::new(Int64Array::from(vec![value])) as ArrayRef
+        }
+    };
+    let column = batch.column(field_index);
+    let slices = [
+        column.slice(0, modification.modified_row_index),
+        modified_value,
+        column.slice(
+            modification.modified_row_index + 1,
+            batch.num_rows() - modification.modified_row_index - 1,
+        ),
+    ];
+    let arrays = slices
+        .iter()
+        .map(|array| array.as_ref())
+        .collect::<Vec<&dyn Array>>();
+    columns[field_index] = concat(&arrays)?;
+    RecordBatch::try_new(batch.schema(), columns)
 }

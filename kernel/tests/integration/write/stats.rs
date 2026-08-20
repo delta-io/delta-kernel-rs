@@ -11,10 +11,10 @@ use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{column_expr, ColumnName};
-use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+use delta_kernel::expressions::{col, lit, ColumnName};
+use delta_kernel::schema::{schema_ref, DataType, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
+use delta_kernel::{Predicate as Pred, Snapshot};
 use test_utils::{
     create_table_and_load_snapshot, read_actions_from_commit, test_table_setup,
     test_table_setup_mt, write_batch_to_table,
@@ -131,15 +131,12 @@ async fn test_write_stats_for_complex_type_columns(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
-        StructField::nullable(
-            "props",
-            MapType::new(DataType::STRING, DataType::LONG, true),
-        ),
-        StructField::nullable("v", DataType::unshredded_variant()),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "tags": [ nullable STRING ],
+        nullable "props": { STRING => nullable LONG },
+        nullable "v": (DataType::unshredded_variant()),
+    };
 
     let mode_str = match cm_mode {
         ColumnMappingMode::None => "none",
@@ -233,7 +230,7 @@ async fn test_write_stats_for_complex_type_columns(
     // Data skipping should skip file 1 entirely and return only file 2's rows.
     let scan = scan_snapshot
         .scan_builder()
-        .with_predicate(Arc::new(Pred::gt(column_expr!("id"), Expr::literal(5_i64))))
+        .with_predicate(Arc::new(Pred::gt(col!("id"), lit(5_i64))))
         .build()?;
     let batches: Vec<RecordBatch> = scan
         .execute(engine.clone())?
@@ -278,20 +275,14 @@ async fn test_write_stats_nested_complex_types_respect_column_limit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable(
-            "data",
-            DataType::try_struct_type(vec![
-                StructField::nullable("name", DataType::STRING),
-                StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
-                StructField::nullable(
-                    "props",
-                    MapType::new(DataType::STRING, DataType::LONG, true),
-                ),
-            ])?,
-        ),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "data": {
+            nullable "name": STRING,
+            nullable "tags": [ nullable STRING ],
+            nullable "props": { STRING => nullable LONG },
+        },
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();

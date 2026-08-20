@@ -713,10 +713,6 @@ mod tests {
     // contract, not this path; this test holds a real second reference.)
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
-    // The surviving handle keeps a second engine `Arc` live past the drain, so the background
-    // executor's thread outlives the test; Miri flags the unjoined thread at teardown even though
-    // the assertions pass. Skip under Miri, matching the tokio-FFI tests in `transaction`.
-    #[cfg_attr(miri, ignore)]
     async fn terminal_calls_after_into_summary_error() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, snapshot) = setup(vec![vec![TestAction::Add("A".to_string())]]).await;
 
@@ -842,10 +838,12 @@ mod tests {
         state: &mut KernelExpressionVisitorState,
     ) -> usize {
         let id = "id";
+        let parts = [kernel_string_slice!(id)];
         let col = unsafe {
             ok_or_panic(visit_expression_column(
                 state,
-                kernel_string_slice!(id),
+                parts.as_ptr(),
+                parts.len(),
                 allocate_err,
             ))
         };
@@ -936,10 +934,12 @@ mod tests {
         state: &mut KernelExpressionVisitorState,
     ) -> usize {
         let missing = "nonexistent";
+        let parts = [kernel_string_slice!(missing)];
         let col = unsafe {
             ok_or_panic(visit_expression_column(
                 state,
-                kernel_string_slice!(missing),
+                parts.as_ptr(),
+                parts.len(),
                 allocate_err,
             ))
         };

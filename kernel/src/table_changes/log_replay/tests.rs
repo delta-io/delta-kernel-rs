@@ -11,12 +11,12 @@ use super::{
 };
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
+use crate::expressions::{col, lit, BinaryPredicateOp};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{schema, schema_ref, DataType, SchemaRef, StructField};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_changes::test_utils::{
     row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
@@ -24,33 +24,31 @@ use crate::table_changes::test_utils::{
 use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
-use crate::table_properties::{ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED};
-use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+use crate::table_properties::{
+    ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
+};
+use crate::unit_test_utils::{
+    assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
+    MockTableConfigurationBuilder,
+};
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    }
 }
 
 fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
-    let metadata = Metadata::try_new(
-        None,
-        None,
-        get_schema(),
-        vec![],
-        0,
-        HashMap::from([
-            ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-            ("delta.columnMapping.mode".to_string(), "none".to_string()),
-        ]),
-    )
-    .unwrap();
-    // CDF requires min_writer_version = 4
-    let protocol = Protocol::try_new_legacy(1, 4).unwrap();
-    TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap()
+    MockTableConfigurationBuilder::new()
+        .with_schema(get_schema())
+        .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+        .with_column_mapping(ColumnMappingMode::None)
+        // CDF requires min_writer_version = 4
+        .with_protocol(MockProtocolBuilder::new().with_versions(1, 4).build())
+        .with_table_root(table_root)
+        .build()
 }
 
 /// Helper to create a Metadata action with the given schema and configuration
@@ -296,10 +294,10 @@ async fn column_mapping_should_succeed() {
         ]))
     }
 
-    let cm_schema = Arc::new(StructType::new_unchecked([
-        cm_field("id", DataType::INTEGER, 1),
-        cm_field("value", DataType::STRING, 2),
-    ]));
+    let cm_schema = schema_ref! {
+        (cm_field("id", DataType::INTEGER, 1)),
+        (cm_field("value", DataType::STRING, 2)),
+    };
 
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
@@ -407,9 +405,7 @@ async fn row_tracking_unavailable_midstream_fails(#[case] properties: &[(&str, &
 }
 
 fn nested_id_type(value_type: DataType) -> DataType {
-    DataType::from(StructType::new_unchecked([StructField::nullable(
-        "value", value_type,
-    )]))
+    DataType::from(schema! { nullable "value": (value_type) })
 }
 
 #[rstest]
@@ -432,13 +428,11 @@ async fn row_tracking_schema_compatibility(
     #[case] expect_compatible: bool,
 ) {
     let schema = |id_type: DataType, has_year: bool| {
-        let fields = [
-            StructField::nullable("id", id_type),
-            StructField::nullable("value", DataType::STRING),
-        ]
-        .into_iter()
-        .chain(has_year.then(|| StructField::nullable("year", DataType::INTEGER)));
-        Arc::new(StructType::new_unchecked(fields))
+        schema_ref! {
+            nullable "id": (id_type),
+            nullable "value": STRING,
+            ..(has_year.then(|| StructField::nullable("year", DataType::INTEGER))),
+        }
     };
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
@@ -471,8 +465,11 @@ fn row_tracking_schema_compatibility_checks_nullability(
     #[case] read_nullable: bool,
     #[case] expected: bool,
 ) {
-    let schema =
-        |nullable| StructType::new_unchecked([StructField::new("id", DataType::INTEGER, nullable)]);
+    let schema = |nullable| {
+        schema! {
+            (StructField::new("id", DataType::INTEGER, nullable)),
+        }
+    };
     assert_eq!(
         CdfMode::RowTracking
             .schemas_compatible(&schema(candidate_nullable), &schema(read_nullable),),
@@ -487,11 +484,15 @@ fn row_tracking_schema_compatibility_requires_new_columns_to_be_nullable(
     #[case] new_column_nullable: bool,
     #[case] expected: bool,
 ) {
-    let candidate = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
-    let read_schema = StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::new("new_column", DataType::STRING, new_column_nullable),
-    ]);
+    let candidate = schema! { nullable "id": INTEGER };
+    let read_schema = schema! {
+        nullable "id": INTEGER,
+        (StructField::new(
+            "new_column",
+            DataType::STRING,
+            new_column_nullable,
+        )),
+    };
     assert_eq!(
         CdfMode::RowTracking.schemas_compatible(&candidate, &read_schema),
         expected
@@ -593,51 +594,51 @@ async fn incompatible_schemas_fail() {
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields: `id: long`, `value: string` and `year: int` (nullable).
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-        StructField::nullable("year", DataType::INTEGER),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": STRING,
+        nullable "year": INTEGER,
+    };
     assert_incompatible_schema(schema, get_schema()).await;
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields: `id: long` and `value: string`.
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": STRING,
+    };
     assert_incompatible_schema(schema, get_schema()).await;
 
     // NOTE: Once type widening is supported, this should not return an error.
     //
     // The CDF schema has fields: `id: long` and `value: string`.
     // This commit has schema with fields: `id: int` and `value: string`.
-    let cdf_schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-    ]));
-    let commit_schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let cdf_schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": STRING,
+    };
+    let commit_schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
     assert_incompatible_schema(cdf_schema, commit_schema).await;
 
     // Note: Once schema evolution is supported, this should not return an error.
     //
     // The CDF schema has fields: nullable `id`  and nullable `value`.
     // This commit has schema with fields: non-nullable `id` and nullable `value`.
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::not_null("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        not_null "id": LONG,
+        nullable "value": STRING,
+    };
     assert_incompatible_schema(schema, get_schema()).await;
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields:`id: string` and `value: string`.
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::STRING),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": STRING,
+        nullable "value": STRING,
+    };
     assert_incompatible_schema(schema, get_schema()).await;
 
     // Note: Once schema evolution is supported, this should not return an error.
@@ -703,15 +704,15 @@ async fn demonstration_schema_evolution_failures() {
     // Scenario 1: Adding a nullable column (safe evolution)
     // Initial: {id: int, value: string}
     // Evolved: {id: int, value: string, new_col: int?}
-    let initial = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
-    let evolved = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-        StructField::nullable("new_col", DataType::INTEGER),
-    ]));
+    let initial = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
+    let evolved = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+        nullable "new_col": INTEGER,
+    };
     let res = test_schema_evolution(initial, evolved).await;
     assert!(
         matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
@@ -721,14 +722,14 @@ async fn demonstration_schema_evolution_failures() {
     // Scenario 2: Type widening (int -> long) - supported by type widening feature
     // Initial: {id: int, value: string}
     // Evolved: {id: long, value: string}
-    let initial = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
-    let evolved = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let initial = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
+    let evolved = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": STRING,
+    };
     let res = test_schema_evolution(initial, evolved).await;
     assert!(
         matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
@@ -738,14 +739,14 @@ async fn demonstration_schema_evolution_failures() {
     // Scenario 3: Changing nullability from non-null to nullable (safe evolution)
     // Initial: {id: int!, value: string}
     // Evolved: {id: int?, value: string}
-    let initial = Arc::new(StructType::new_unchecked([
-        StructField::not_null("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
-    let evolved = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let initial = schema_ref! {
+        not_null "id": INTEGER,
+        nullable "value": STRING,
+    };
+    let evolved = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
     let res = test_schema_evolution(initial, evolved).await;
     assert!(
         matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
@@ -991,11 +992,7 @@ async fn data_skipping_filter() {
         .await;
 
     // Look for actions with id > 4
-    let predicate = Predicate::binary(
-        BinaryPredicateOp::GreaterThan,
-        column_expr!("id"),
-        Scalar::from(4),
-    );
+    let predicate = Predicate::binary(BinaryPredicateOp::GreaterThan, col!("id"), lit(4));
     let logical_schema = get_schema();
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
@@ -1055,28 +1052,20 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
         .await;
 
     // Partitioned schema: `part` is the partition column, `id` a data column.
-    let logical_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("part", DataType::STRING),
-    ]));
-    let metadata = Metadata::try_new(
-        None,
-        None,
-        logical_schema.clone(),
-        vec!["part".to_string()],
-        0,
-        HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
-    )
-    .unwrap();
-    let protocol = Protocol::try_new_legacy(1, 4).unwrap();
+    let logical_schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "part": STRING,
+    };
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-    let table_config = TableConfiguration::try_new(metadata, protocol, table_root_url, 0).unwrap();
+    let table_config = MockTableConfigurationBuilder::new()
+        .with_schema(logical_schema.clone())
+        .with_partition_columns(["part"])
+        .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+        .with_protocol(MockProtocolBuilder::new().with_versions(1, 4).build())
+        .with_table_root(table_root_url)
+        .build();
 
-    let predicate = Predicate::binary(
-        BinaryPredicateOp::Equal,
-        column_expr!("part"),
-        Scalar::from("x"),
-    );
+    let predicate = Predicate::binary(BinaryPredicateOp::Equal, col!("part"), lit("x"));
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
             Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
@@ -1132,11 +1121,7 @@ async fn data_skipping_filter_prunes_stats_but_keeps_removes() {
         .await;
 
     let logical_schema = get_schema();
-    let predicate = Predicate::binary(
-        BinaryPredicateOp::GreaterThan,
-        column_expr!("id"),
-        Scalar::from(4),
-    );
+    let predicate = Predicate::binary(BinaryPredicateOp::GreaterThan, col!("id"), lit(4));
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
             Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),

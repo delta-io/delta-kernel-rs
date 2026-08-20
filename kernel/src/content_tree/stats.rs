@@ -149,22 +149,22 @@ fn get_field_id(field: &StructField) -> Option<i32> {
 /// - offset 1/2: `lower_bound` / `upper_bound` (typed as `bounds_type`)
 /// - offset 3: `tight_bounds` (boolean) - excluded for variants
 /// - offset 4: `value_count` (long)
-/// - offset 5: `null_value_count` (long) - only if `nullable`
+/// - offset 5: `null_value_count` (long) - always present
 /// - offset 6: `nan_value_count` (long) - only for float/double `bounds_type`
 /// - offset 7: `avg_value_size_in_bytes` (int) - for string/binary `bounds_type`, or any variant
 ///
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
-fn build_stats_struct(base_field_id: i32, bounds_type: &DataType, nullable: bool) -> StructType {
+fn build_stats_struct(base_field_id: i32, bounds_type: &DataType) -> StructType {
     let is_variant = matches!(bounds_type, DataType::Variant(_));
     let (has_nan_count, has_size_stats) = match bounds_type {
         DataType::Primitive(ptype) => (
             matches!(ptype, PrimitiveType::Float | PrimitiveType::Double),
             matches!(ptype, PrimitiveType::String | PrimitiveType::Binary),
         ),
+        DataType::Variant(_) => (false, true),
         _ => (false, false),
     };
-    let has_size_stats = has_size_stats || is_variant;
 
     // (name, type, offset, include) -- filtered in declaration order to preserve field ordering.
     let specs = [
@@ -191,7 +191,7 @@ fn build_stats_struct(base_field_id: i32, bounds_type: &DataType, nullable: bool
             NULL_VALUE_COUNT,
             DataType::LONG,
             STATS_OFFSET_NULL_VALUE_COUNT,
-            nullable,
+            true,
         ),
         (
             NAN_VALUE_COUNT,
@@ -219,17 +219,9 @@ fn build_stats_struct(base_field_id: i32, bounds_type: &DataType, nullable: bool
 /// dotted path (`path`, whose last segment is the leaf itself) and keyed at the leaf's base stats
 /// field ID (see [`build_stats_struct`] for the sub-fields).
 ///
-/// `nullable` is the leaf's *effective* nullability -- its own, or inherited from any nullable
-/// struct ancestor -- and drives whether a `null_value_count` sub-field is emitted: a leaf under a
-/// nullable ancestor can be physically null even when declared not-null.
-///
 /// Errors if the leaf is missing its field-id metadata, or is an (as-yet unimplemented) geospatial
 /// column.
-fn leaf_stats_field(
-    field: &StructField,
-    path: &[String],
-    nullable: bool,
-) -> DeltaResult<Option<StructField>> {
+fn leaf_stats_field(field: &StructField, path: &[String]) -> DeltaResult<Option<StructField>> {
     // Only leaves carry a field ID that matters for stats. A field ID that is absent, or present
     // but not `i32`-representable, is malformed => error. The spec limits which fields may carry
     // stats, so a field ID outside the supported range is expected for some reserved metadata
@@ -268,14 +260,11 @@ fn leaf_stats_field(
     };
 
     let stats_struct = match field.data_type() {
-        DataType::Primitive(_) => build_stats_struct(base_stats_id, field.data_type(), nullable),
+        DataType::Primitive(_) => build_stats_struct(base_stats_id, field.data_type()),
         // A variant's inner fields carry no field IDs; the base stats ID covers the whole variant,
         // and its bounds are always recorded as unshredded variants regardless of physical
-        // shredding. `null_value_count` follows the leaf's effective `nullable` -- a NULL variant
-        // is a column-level SQL null, independent of the physical encoding.
-        DataType::Variant(_) => {
-            build_stats_struct(base_stats_id, &DataType::unshredded_variant(), nullable)
-        }
+        // shredding.
+        DataType::Variant(_) => build_stats_struct(base_stats_id, &DataType::unshredded_variant()),
         // Array/map columns carry no leaf stats. (Structs are descended into by the collector and
         // never reach here.)
         _ => return Ok(None),
@@ -360,8 +349,6 @@ struct StatsSchemaCollector<'a> {
     path: Vec<String>,
     /// Accumulated flat stats fields, in schema order.
     fields: Vec<StructField>,
-    /// Whether any struct ancestor on the current path is nullable.
-    ancestor_nullable: bool,
     /// Delta stat categories in scope at the current position, or `None` to emit every leaf.
     filter: Option<CategoryScopes<'a>>,
 }
@@ -374,15 +361,11 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector<'a> {
         // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `path` is
         // discarded, so the skipped pop is harmless.
         let result = if let DataType::Struct(_) = field.data_type() {
-            // A nullable struct makes every leaf beneath it physically nullable; restore on the way
-            // back up so siblings are unaffected. The stat-category scopes step into this struct's
-            // sub-schema in lockstep and are restored the same way.
-            let saved_nullable = self.ancestor_nullable;
+            // The stat-category scopes step into this struct's sub-schema and are restored on the
+            // way back up so siblings are unaffected.
             let saved_filter = self.filter;
-            self.ancestor_nullable |= field.is_nullable();
             self.filter = self.filter.map(|s| s.descend(field.name()));
             let result = self.recurse_into_struct_field(field);
-            self.ancestor_nullable = saved_nullable;
             self.filter = saved_filter;
             result
         } else if self.filter.is_some_and(|s| !s.leaf_present(field.name())) {
@@ -391,12 +374,10 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector<'a> {
         } else {
             // Every non-struct type is a leaf handled by `leaf_stats_field` -- including variants
             // (never descended into: their inner fields carry no field IDs) and array/map columns
-            // (which produce no stats). A surviving leaf emits its full type-appropriate stats
-            // struct, with `null_value_count` gated by the leaf's effective nullability.
+            // (which produce no stats).
             // TODO: prune per-category sub-fields (e.g. drop `upper_bound` when only `minValues`
             // is present).
-            let nullable = field.is_nullable() || self.ancestor_nullable;
-            leaf_stats_field(field, &self.path, nullable).map(|stats| self.fields.extend(stats))
+            leaf_stats_field(field, &self.path).map(|stats| self.fields.extend(stats))
         };
         self.path.pop();
         result
@@ -465,7 +446,6 @@ fn collect_stats<'a>(
     let mut collector = StatsSchemaCollector {
         path: Vec::new(),
         fields: Vec::new(),
-        ancestor_nullable: false,
         filter,
     };
     collector.transform_struct(table_struct)?;
@@ -520,26 +500,18 @@ mod tests {
     }
 
     /// Asserts every stats sub-field of `stats_struct` carries the expected offset from `base_id`.
-    /// `expected_nullable` is the leaf's effective nullability (its own, or inherited from a
-    /// nullable ancestor); the `null_value_count` check is gated on it. Variants omit
-    /// `tight_bounds` and always carry the size stat.
-    fn assert_stats_field_ids(
-        stats_struct: &StructType,
-        base_id: i32,
-        field: &StructField,
-        expected_nullable: bool,
-    ) {
+    /// `null_value_count` is always present. Variants omit `tight_bounds` and always carry the size
+    /// stat.
+    fn assert_stats_field_ids(stats_struct: &StructType, base_id: i32, field: &StructField) {
         let is_variant = matches!(field.data_type(), DataType::Variant(_));
         assert_eq!(
             get_field_id(stats_struct.field(VALUE_COUNT).unwrap()),
             Some(base_id + STATS_OFFSET_VALUE_COUNT)
         );
-        if expected_nullable {
-            assert_eq!(
-                get_field_id(stats_struct.field(NULL_VALUE_COUNT).unwrap()),
-                Some(base_id + STATS_OFFSET_NULL_VALUE_COUNT)
-            );
-        }
+        assert_eq!(
+            get_field_id(stats_struct.field(NULL_VALUE_COUNT).unwrap()),
+            Some(base_id + STATS_OFFSET_NULL_VALUE_COUNT)
+        );
         if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
             assert_eq!(
                 get_field_id(stats_struct.field(NAN_VALUE_COUNT).unwrap()),
@@ -571,20 +543,21 @@ mod tests {
         }
     }
 
+    // `null_value_count` is always present, so counts include it regardless of nullability.
     #[rstest]
-    #[case(DataType::INTEGER, false, 1, 10_200, 4)] // fixed-length, non-null
-    #[case(DataType::STRING, true, 2, 10_400, 6)] // size stats + null count
-    #[case(DataType::DOUBLE, true, 5, 11_000, 6)] // nan count + null count
-    #[case(DataType::FLOAT, false, 100, 30_000, 5)] // nan count, non-null
-    #[case(DataType::LONG, true, 42, 18_400, 5)] // fixed-length + null count
-    #[case(DataType::BINARY, true, 3, 10_600, 6)] // size stats + null count
-    #[case(DataType::BINARY, false, 4, 10_800, 5)] // size stats, non-null
+    #[case(DataType::INTEGER, false, 1, 10_200, 5)] // fixed-length
+    #[case(DataType::STRING, true, 2, 10_400, 6)] // size stats
+    #[case(DataType::DOUBLE, true, 5, 11_000, 6)] // nan count
+    #[case(DataType::FLOAT, false, 100, 30_000, 6)] // nan count
+    #[case(DataType::LONG, true, 42, 18_400, 5)] // fixed-length
+    #[case(DataType::BINARY, true, 3, 10_600, 6)] // size stats
+    #[case(DataType::BINARY, false, 4, 10_800, 6)] // size stats
     #[case(
         DataType::INTEGER,
         false,
         MAX_DATA_FIELD_ID,
         MAX_DATA_STATS_FIELD_ID,
-        4
+        5
     )] // top of range
     fn stats_schema_primitive_field(
         #[case] data_type: DataType,
@@ -611,7 +584,7 @@ mod tests {
         );
         // The stats group field itself carries the base stats ID, not the original field ID.
         assert_eq!(get_field_id(stats.field("c").unwrap()), Some(expected_base));
-        assert_stats_field_ids(&stats_struct, expected_base, &field, nullable);
+        assert_stats_field_ids(&stats_struct, expected_base, &field);
     }
 
     #[test]
@@ -667,17 +640,17 @@ mod tests {
         assert_eq!(stats.fields().count(), 2);
         assert!(stats.field("a").is_none());
 
-        // `b` is declared not-null but inherits nullability from its nullable ancestor `a`, so it
-        // gains a null_value_count (5 sub-fields, not 4).
+        // `b` is a not-null int; it still carries a null_value_count (always present), so 5
+        // sub-fields (lower, upper, tight, value, null).
         let b_stats = stats_struct_for_name("a.b", &stats);
         assert_eq!(b_stats.fields().count(), 5);
         assert_eq!(get_field_id(stats.field("a.b").unwrap()), Some(10_400));
-        assert_stats_field_ids(&b_stats, 10_400, &field_b, true);
+        assert_stats_field_ids(&b_stats, 10_400, &field_b);
 
         let c_stats = stats_struct_for_name("a.c", &stats);
         assert_eq!(c_stats.fields().count(), 6); // null + nan count
         assert_eq!(get_field_id(stats.field("a.c").unwrap()), Some(10_600));
-        assert_stats_field_ids(&c_stats, 10_600, &field_c, true);
+        assert_stats_field_ids(&c_stats, 10_600, &field_c);
     }
 
     #[rstest]
@@ -747,7 +720,7 @@ mod tests {
         assert!(stats.field("a.b").is_none());
 
         let c_stats = stats_struct_for_name("a.b.c", &stats);
-        // Not-null int, but nullable ancestors `a`/`b` add a null_value_count (5, not 4).
+        // Not-null int; null_value_count is always present, so 5 sub-fields.
         assert_eq!(c_stats.fields().count(), 5);
         assert!(c_stats.field(VALUE_COUNT).is_some());
         assert!(c_stats.field(LOWER_BOUND).is_some());
@@ -792,7 +765,7 @@ mod tests {
         // Variants exclude tight_bounds and always include the size stat.
         assert!(v_stats.field(TIGHT_BOUNDS).is_none());
         assert!(v_stats.field(AVG_VALUE_SIZE_IN_BYTES).is_some());
-        assert_stats_field_ids(&v_stats, 10_600, &field, field.is_nullable());
+        assert_stats_field_ids(&v_stats, 10_600, &field);
     }
 
     #[test]
@@ -827,26 +800,22 @@ mod tests {
         ); // 10_000+200*6
     }
 
-    /// `null_value_count` follows the leaf's EFFECTIVE nullability: its own, or inherited from a
-    /// nullable struct ancestor (a leaf under a nullable struct can be physically null). Covers
-    /// plain and variant leaves, at top level and nested under a struct. Note an unshredded
-    /// variant's inner `value` is not_null, so a nullable variant's null tracking follows the
-    /// column, not the encoding.
+    /// `null_value_count` is always emitted, independent of the leaf's or any ancestor's
+    /// nullability. Covers plain and variant leaves, at top level and nested under a not-null
+    /// struct (the case that historically omitted it).
     #[rstest]
-    #[case::top_level_nullable_variant(DataType::unshredded_variant(), true, None, true)]
-    #[case::not_null_int_under_nullable_struct(DataType::INTEGER, false, Some(true), true)]
-    #[case::not_null_int_under_not_null_struct(DataType::INTEGER, false, Some(false), false)]
-    #[case::not_null_variant_under_nullable_struct(
+    #[case::top_level_not_null_int(DataType::INTEGER, false, None)]
+    #[case::top_level_nullable_variant(DataType::unshredded_variant(), true, None)]
+    #[case::not_null_int_under_not_null_struct(DataType::INTEGER, false, Some(false))]
+    #[case::not_null_variant_under_not_null_struct(
         DataType::unshredded_variant(),
         false,
-        Some(true),
-        true
+        Some(false)
     )]
-    fn null_value_count_follows_effective_nullability(
+    fn null_value_count_always_present(
         #[case] leaf_type: DataType,
         #[case] leaf_nullable: bool,
         #[case] parent_nullable: Option<bool>,
-        #[case] expect_null_count: bool,
     ) {
         let leaf = field_with_id("leaf", leaf_type, leaf_nullable, 2);
         let (schema, leaf_name) = match parent_nullable {
@@ -863,10 +832,7 @@ mod tests {
         };
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         let leaf_stats = stats_struct_for_name(leaf_name, &stats);
-        assert_eq!(
-            leaf_stats.field(NULL_VALUE_COUNT).is_some(),
-            expect_null_count
-        );
+        assert!(leaf_stats.field(NULL_VALUE_COUNT).is_some());
     }
 
     #[test]
@@ -999,37 +965,20 @@ mod tests {
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         // 3 data + 2 supported metadata; _file and _pos are skipped.
         assert_eq!(stats.fields().count(), 5);
-        assert_stats_field_ids(
-            &stats_struct_for_name(id.name(), &stats),
-            10_000,
-            &id,
-            id.is_nullable(),
-        );
-        assert_stats_field_ids(
-            &stats_struct_for_name(name.name(), &stats),
-            10_200,
-            &name,
-            name.is_nullable(),
-        );
-        assert_stats_field_ids(
-            &stats_struct_for_name(score.name(), &stats),
-            10_400,
-            &score,
-            score.is_nullable(),
-        );
+        assert_stats_field_ids(&stats_struct_for_name(id.name(), &stats), 10_000, &id);
+        assert_stats_field_ids(&stats_struct_for_name(name.name(), &stats), 10_200, &name);
+        assert_stats_field_ids(&stats_struct_for_name(score.name(), &stats), 10_400, &score);
         assert!(stats.field("_file").is_none());
         assert!(stats.field("_pos").is_none());
         assert_stats_field_ids(
             &stats_struct_for_name(row_id.name(), &stats),
             9_200,
             &row_id,
-            row_id.is_nullable(),
         );
         assert_stats_field_ids(
             &stats_struct_for_name(last_updated_seq_no.name(), &stats),
             9_000,
             &last_updated_seq_no,
-            last_updated_seq_no.is_nullable(),
         );
     }
 
@@ -1221,8 +1170,9 @@ mod tests {
         let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
         assert_eq!(filtered.field("c").is_some(), expected_present);
         if expected_present {
-            // Non-null int => lower, upper, tight_bounds, value_count (the full unfiltered set).
-            assert_eq!(stats_struct_for_name("c", &filtered).fields().count(), 4);
+            // Int leaf => lower, upper, tight_bounds, value_count, null_value_count (the full
+            // unfiltered set; null_value_count is always present).
+            assert_eq!(stats_struct_for_name("c", &filtered).fields().count(), 5);
         }
     }
 
@@ -1274,25 +1224,6 @@ mod tests {
         assert_eq!(filtered.fields().count(), 1);
         assert!(filtered.field("d").is_some());
         assert!(filtered.field("a.b").is_none());
-    }
-
-    #[test]
-    fn filtered_notnull_leaf_under_nullable_ancestor_emits_null_value_count() {
-        // {a: nullable struct{b: int NOT NULL}}; `b` present via minValues. The nullable ancestor
-        // makes `b` physically nullable, so its stats struct still carries `null_value_count` --
-        // driven by effective nullability, not by presence in the `nullCount` category.
-        let table = StructType::new_unchecked([field_with_id(
-            "a",
-            StructType::new_unchecked([field_with_id("b", DataType::INTEGER, false, 2)]).into(),
-            true,
-            1,
-        )]);
-        let delta = delta_stats(None, Some(nested_cat("a", ["b"])), None);
-        let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
-        let stats = stats_struct_for_name("a.b", &filtered);
-        // lower, upper, tight_bounds, value_count, null_value_count (from the nullable ancestor).
-        assert_eq!(stats.fields().count(), 5);
-        assert!(stats.field(NULL_VALUE_COUNT).is_some());
     }
 
     #[test]

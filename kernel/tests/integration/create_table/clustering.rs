@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::ColumnName;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::expressions::{column_name, ColumnName};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -19,20 +19,23 @@ use super::simple_schema;
 ///   { id: int, name: string, address: { city: string, zip: string },
 ///     l1: { l2: { l3: { l4: { value: double } } } } }
 fn clustering_test_schema() -> DeltaResult<Arc<StructType>> {
-    let address = StructType::try_new(vec![
-        StructField::new("city", DataType::STRING, true),
-        StructField::new("zip", DataType::STRING, true),
-    ])?;
-    let l4 = StructType::try_new(vec![StructField::new("value", DataType::DOUBLE, true)])?;
-    let l3 = StructType::try_new(vec![StructField::new("l4", l4, true)])?;
-    let l2 = StructType::try_new(vec![StructField::new("l3", l3, true)])?;
-    let l1 = StructType::try_new(vec![StructField::new("l2", l2, true)])?;
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("name", DataType::STRING, true),
-        StructField::new("address", address, true),
-        StructField::new("l1", l1, true),
-    ])?))
+    Ok(schema_ref! {
+        nullable "id": INTEGER,
+        nullable "name": STRING,
+        nullable "address": {
+            nullable "city": STRING,
+            nullable "zip": STRING,
+        },
+        nullable "l1": {
+            nullable "l2": {
+                nullable "l3": {
+                    nullable "l4": {
+                        nullable "value": DOUBLE,
+                    },
+                },
+            },
+        },
+    })
 }
 
 #[rstest]
@@ -130,7 +133,7 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
 
     // Verify clustering columns via snapshot read path
     let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
-    assert_eq!(clustering_columns, Some(vec![ColumnName::new(["id"])]));
+    assert_eq!(clustering_columns, Some(vec![column_name!("id")]));
 
     Ok(())
 }
@@ -141,7 +144,7 @@ async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
 
     // Build schema with 10 columns (cluster on column 5, within default 32 limit)
     let fields: Vec<StructField> = (0..10)
-        .map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, true))
+        .map(|i| StructField::nullable(format!("col{i}"), DataType::INTEGER))
         .collect();
     let schema = Arc::new(StructType::try_new(fields)?);
 
@@ -166,7 +169,7 @@ async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
 
     // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)
     let fields: Vec<StructField> = (0..40)
-        .map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, true))
+        .map(|i| StructField::nullable(format!("col{i}"), DataType::INTEGER))
         .collect();
     let schema = Arc::new(StructType::try_new(fields)?);
 

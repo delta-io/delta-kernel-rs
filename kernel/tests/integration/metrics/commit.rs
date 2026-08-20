@@ -9,7 +9,7 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, TransactionCommitSuccess};
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -305,13 +305,13 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count(
     // Three files get a new deletion vector in a single update_deletion_vectors call.
     // num_dv_updates must be the count of updated FILES (3), not the number of scan-metadata
     // batches they arrive in -- a single batch carrying all three would otherwise report 1.
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
     let file_names = &["file0.parquet", "file1.parquet", "file2.parquet"];
     let (_store, engine, table_url, file_paths) =
-        create_dv_table_with_files("dv_metrics_table", schema, file_names).await?;
+        create_dv_table_with_files("dv_metrics_table", schema, &[], file_names).await?;
 
     let reporter = Arc::new(LastCommitSuccess::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -348,13 +348,13 @@ async fn commit_dv_update_accumulates_file_count_across_calls(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // num_dv_updates must accumulate (`+=`) across multiple update_deletion_vectors calls on one
     // transaction: two calls updating one file each must report 2, not the last call's 1.
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
     let file_names = &["file0.parquet", "file1.parquet"];
     let (_store, engine, table_url, file_paths) =
-        create_dv_table_with_files("dv_metrics_multi_call_table", schema, file_names).await?;
+        create_dv_table_with_files("dv_metrics_multi_call_table", schema, &[], file_names).await?;
 
     let reporter = Arc::new(LastCommitSuccess::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
