@@ -17,7 +17,8 @@
 # The review runs automatically in artifact-only mode for non-draft PRs authored
 # by a repo collaborator with write-or-higher permission. It can also be triggered
 # by a /review comment or manual dispatch from an actor with the same access.
-# First rollout defaults to artifact-only.
+# First rollout defaults to artifact-only. Push a no-op PR-branch update to
+# retrigger the automatic path while this workflow is being validated.
 # =============================================================================
 name: AI PR Review
 
