@@ -201,8 +201,10 @@ use delta_kernel::schema::{
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, CancellationToken, CancelledFuture, DeltaResult, DeltaResultIterator, Engine,
-    EngineData, Error, FileMeta, FilteredEngineData, LogPath, Snapshot,
+    try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, DeltaResult,
+    DeltaResultIterator, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    FilteredEngineData, JsonHandler, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
+    Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -1597,6 +1599,169 @@ impl CancellationToken for TestCancellationToken {
             }
             notified.await;
         })
+    }
+}
+
+/// An [`Engine`] decorator that records the [`CancellationTokenRef`] kernel passes to the JSON and
+/// Parquet cancellation-aware reads, so a test can assert kernel threaded the caller's own token
+/// through by identity. Every other handler call, and the non-cancellation reads, delegate to the
+/// wrapped engine unchanged.
+///
+/// Only the first token observed on each path is retained: a scan drives the read path once with
+/// the caller's token, but a subsequent empty-sidecar read must not clobber it with `None`.
+pub struct TokenCapturingEngine {
+    inner: Arc<dyn Engine>,
+    json: Arc<CapturingJsonHandler>,
+    parquet: Arc<CapturingParquetHandler>,
+}
+
+impl TokenCapturingEngine {
+    /// Wrap `inner`, capturing tokens on both read paths.
+    pub fn new(inner: Arc<dyn Engine>) -> Self {
+        let json = Arc::new(CapturingJsonHandler {
+            inner: inner.json_handler(),
+            seen: Mutex::new(None),
+        });
+        let parquet = Arc::new(CapturingParquetHandler {
+            inner: inner.parquet_handler(),
+            seen: Mutex::new(None),
+        });
+        Self {
+            inner,
+            json,
+            parquet,
+        }
+    }
+
+    /// The token the JSON read path received, or `None` if it never ran or was handed no token.
+    pub fn json_token(&self) -> Option<CancellationTokenRef> {
+        self.json.seen.lock().unwrap().clone()
+    }
+
+    /// The token the Parquet read path received, or `None` if it never ran or was handed no token.
+    pub fn parquet_token(&self) -> Option<CancellationTokenRef> {
+        self.parquet.seen.lock().unwrap().clone()
+    }
+}
+
+impl Engine for TokenCapturingEngine {
+    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
+        self.inner.storage_handler()
+    }
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.json.clone()
+    }
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.parquet.clone()
+    }
+}
+
+/// Records the first token handed to a `Mutex`-guarded slot, leaving a token already there intact.
+fn capture_first_token(
+    seen: &Mutex<Option<CancellationTokenRef>>,
+    token: &Option<CancellationTokenRef>,
+) {
+    let mut seen = seen.lock().unwrap();
+    if seen.is_none() {
+        seen.clone_from(token);
+    }
+}
+
+struct CapturingJsonHandler {
+    inner: Arc<dyn JsonHandler>,
+    seen: Mutex<Option<CancellationTokenRef>>,
+}
+
+impl JsonHandler for CapturingJsonHandler {
+    fn parse_json(
+        &self,
+        json_strings: Box<dyn EngineData>,
+        output_schema: SchemaRef,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        self.inner.parse_json(json_strings, output_schema)
+    }
+
+    fn read_json_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.inner
+            .read_json_files(files, physical_schema, predicate)
+    }
+
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        capture_first_token(&self.seen, &cancellation_token);
+        self.inner.read_json_files_with_cancellation(
+            files,
+            physical_schema,
+            predicate,
+            cancellation_token,
+        )
+    }
+
+    fn write_json_file(
+        &self,
+        path: &Url,
+        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        overwrite: bool,
+    ) -> DeltaResult<u64> {
+        self.inner.write_json_file(path, data, overwrite)
+    }
+}
+
+struct CapturingParquetHandler {
+    inner: Arc<dyn ParquetHandler>,
+    seen: Mutex<Option<CancellationTokenRef>>,
+}
+
+impl ParquetHandler for CapturingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.inner
+            .read_parquet_files(files, physical_schema, predicate)
+    }
+
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        capture_first_token(&self.seen, &cancellation_token);
+        self.inner.read_parquet_files_with_cancellation(
+            files,
+            physical_schema,
+            predicate,
+            cancellation_token,
+        )
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: Url,
+        data: FileDataReadResultIterator,
+    ) -> DeltaResult<()> {
+        self.inner.write_parquet_file(location, data)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.inner.read_parquet_footer(file)
     }
 }
 
