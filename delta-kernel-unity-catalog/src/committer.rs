@@ -112,17 +112,10 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         Ok(())
     }
 
-    /// Validates that this commit does not include ALTER TABLE changes (protocol, metadata,
-    /// or clustering column changes).
-    fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
-        require!(
-            !commit_metadata.has_protocol_change(),
-            errors::alter_table_unsupported("protocol")
-        );
-        require!(
-            !commit_metadata.has_metadata_change(),
-            errors::alter_table_unsupported("metadata")
-        );
+    /// Validates that this commit does not include unsupported ALTER TABLE changes.
+    fn validate_no_unsupported_alter_table_changes(
+        commit_metadata: &CommitMetadata,
+    ) -> DeltaResult<()> {
         require!(
             !commit_metadata.has_domain_metadata_change(CLUSTERING_DOMAIN_NAME),
             errors::alter_table_unsupported("clustering columns")
@@ -183,7 +176,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             "commit_version_non_zero called with version 0"
         );
         self.validate_catalog_managed_state(&commit_metadata)?;
-        Self::validate_no_alter_table_changes(&commit_metadata)?;
+        Self::validate_no_unsupported_alter_table_changes(&commit_metadata)?;
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
             .json_handler()
@@ -201,6 +194,24 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 file_modification_timestamp: committed.last_modified,
             },
         }];
+        if let Some(protocol) = commit_metadata.new_protocol() {
+            updates.push(DeltaTableUpdate::UpdateProtocol {
+                protocol: serde_json::to_value(protocol).map_err(|e| {
+                    DeltaError::generic(format!(
+                        "failed to serialize protocol for UC update_table: {e}"
+                    ))
+                })?,
+            });
+        }
+        if let Some(metadata) = commit_metadata.new_metadata() {
+            updates.push(DeltaTableUpdate::UpdateMetadata {
+                metadata: serde_json::to_value(metadata).map_err(|e| {
+                    DeltaError::generic(format!(
+                        "failed to serialize metadata for UC update_table: {e}"
+                    ))
+                })?,
+            });
+        }
         if let Some(max_pub) = commit_metadata.max_published_version() {
             updates.push(DeltaTableUpdate::SetLatestBackfilledVersion {
                 latest_published_version: u64_to_wire_i64(max_pub, "max published version")?,
@@ -313,6 +324,7 @@ fn staged_commit_file_name(path: &url::Url) -> DeltaResult<String> {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::sync::Mutex;
 
     use delta_kernel::arrow::array::{Array, RecordBatch, StringArray};
     use delta_kernel::committer::{CatalogCommit, CommitMetadata};
@@ -329,6 +341,22 @@ mod tests {
     impl UpdateTableClient for MockUpdateTableClient {
         async fn update_table(&self, _: &TableIdentifier, _: UpdateTableRequest) -> Result<()> {
             unimplemented!()
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingUpdateTableClient {
+        request: Mutex<Option<UpdateTableRequest>>,
+    }
+
+    impl UpdateTableClient for CapturingUpdateTableClient {
+        async fn update_table(
+            &self,
+            _: &TableIdentifier,
+            request: UpdateTableRequest,
+        ) -> Result<()> {
+            *self.request.lock().unwrap() = Some(request);
+            Ok(())
         }
     }
 
@@ -539,36 +567,74 @@ mod tests {
         );
     }
 
-    #[test]
-    fn commit_version_non_zero_rejects_protocol_change() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_version_non_zero_forwards_protocol_and_metadata_changes() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
-        let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_protocol_change();
+        let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 1)
+            .with_protocol_change()
+            .with_metadata_change();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log/_staged_commits")).unwrap();
 
-        let err = test_committer()
+        let client = Arc::new(CapturingUpdateTableClient::default());
+        let committer = UCCommitter::new(
+            client.clone(),
+            "test-table-id",
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
+        );
+        let result = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("table protocol"),
-            "expected protocol change error, got: {err}"
+            .unwrap();
+        assert!(matches!(result, CommitResponse::Committed { .. }));
+
+        let request = client.request.lock().unwrap().clone().unwrap();
+        let protocol = request.protocol().expect("missing protocol update");
+        assert_eq!(protocol["minReaderVersion"], 3);
+        assert_eq!(protocol["minWriterVersion"], 7);
+        assert_eq!(
+            protocol["readerFeatures"],
+            serde_json::json!(["catalogManaged", "vacuumProtocolCheck"])
+        );
+        assert_eq!(
+            protocol["writerFeatures"],
+            serde_json::json!(["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"])
+        );
+
+        let metadata = request.metadata().expect("missing metadata update");
+        assert_eq!(
+            metadata["configuration"]["io.unitycatalog.tableId"],
+            "test-table-id"
+        );
+        assert_eq!(
+            metadata["configuration"]["delta.enableInCommitTimestamps"],
+            "true"
         );
     }
 
-    #[test]
-    fn commit_version_non_zero_rejects_metadata_change() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_version_non_zero_omits_unchanged_protocol_and_metadata() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
-        let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_metadata_change();
+        let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 1);
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log/_staged_commits")).unwrap();
 
-        let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("table metadata"),
-            "expected metadata change error, got: {err}"
+        let client = Arc::new(CapturingUpdateTableClient::default());
+        let committer = UCCommitter::new(
+            client.clone(),
+            "test-table-id",
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         );
+        let result = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap();
+        assert!(matches!(result, CommitResponse::Committed { .. }));
+
+        let request = client.request.lock().unwrap().clone().unwrap();
+        assert!(request.staged_commit().is_some());
+        assert_eq!(request.protocol(), None);
+        assert_eq!(request.metadata(), None);
     }
 
     #[test]

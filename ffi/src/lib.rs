@@ -1888,6 +1888,65 @@ pub unsafe extern "C" fn visit_metadata(
     );
 }
 
+/// Visit each metadata configuration (key/value pair) for the specified metadata handle by
+/// invoking the provided `visitor` callback once per entry.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid metadata handle, a valid `context` as an opaque
+/// pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata_configuration_from_metadata(
+    metadata: Handle<SharedMetadata>,
+    context: NullableCvoid,
+    visitor: extern "C" fn(
+        context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ),
+) {
+    let metadata = unsafe { metadata.as_ref() };
+    metadata.configuration().iter().for_each(|(key, value)| {
+        visitor(
+            context,
+            kernel_string_slice!(key),
+            kernel_string_slice!(value),
+        );
+    });
+}
+
+/// Visit the schema string for the specified metadata handle.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid metadata handle, a valid `context` as an opaque
+/// pointer passed to the `visitor` invocation, and a valid `visitor` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata_schema_string(
+    metadata: Handle<SharedMetadata>,
+    context: NullableCvoid,
+    visitor: extern "C" fn(context: NullableCvoid, schema_string: KernelStringSlice),
+) {
+    let metadata = unsafe { metadata.as_ref() };
+    let schema_string = metadata.schema_string();
+    visitor(context, kernel_string_slice!(schema_string));
+}
+
+/// Get an iterator over the partition columns for the specified metadata handle.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid metadata handle and freeing the returned iterator
+/// with [`free_string_slice_data`].
+#[no_mangle]
+pub unsafe extern "C" fn metadata_partition_columns(
+    metadata: Handle<SharedMetadata>,
+) -> Handle<StringSliceIterator> {
+    let metadata = unsafe { metadata.as_ref() };
+    let iter: Box<StringIter> = Box::new(metadata.partition_columns().to_vec().into_iter());
+    iter.into()
+}
+
 // === Snapshot-level computed property FFI ===
 
 type StringIter = dyn Iterator<Item = String> + Send;
@@ -2000,8 +2059,8 @@ mod tests {
     use test_utils::{
         actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
         actions_to_string_with_metadata, add_commit, add_staged_commit, create_table, TestAction,
-        METADATA, METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES,
-        TEST_ICT_ENABLEMENT_TIMESTAMP,
+        METADATA, METADATA_WITH_FEATURES, METADATA_WITH_PARTITION_COLS,
+        METADATA_WITH_TABLE_PROPERTIES, TEST_ICT_ENABLEMENT_TIMESTAMP,
     };
     use url::Url;
 
@@ -2549,13 +2608,20 @@ mod tests {
         HashMap::from([
             (String::from("delta.appendOnly"), String::from("true")),
             (String::from("custom.key"), String::from("custom_value")),
-        ])
+        ]),
+        Vec::<String>::new()
     )]
-    #[case(METADATA, HashMap::new())]
+    #[case(METADATA, HashMap::new(), Vec::<String>::new())]
+    #[case(
+        METADATA_WITH_PARTITION_COLS,
+        HashMap::new(),
+        vec![String::from("val")]
+    )]
     #[tokio::test]
     async fn test_visit_metadata_configuration(
         #[case] metadata: &str,
         #[case] expected: HashMap<String, String>,
+        #[case] expected_partition_columns: Vec<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///";
         let storage = Arc::new(InMemory::new());
@@ -2585,12 +2651,54 @@ mod tests {
             map.insert(k, v);
         }
 
+        extern "C" fn collect_string(engine_context: NullableCvoid, value: KernelStringSlice) {
+            let value_out =
+                unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut Option<String>) };
+            *value_out = Some(unsafe { String::try_from_slice(&value) }.unwrap());
+        }
+
         let mut collected: HashMap<String, String> = HashMap::new();
         let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
         unsafe { visit_metadata_configuration(snap.shallow_copy(), ctx, collect_property) };
 
         assert_eq!(collected, expected);
 
+        let metadata = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
+        let mut collected_from_metadata: HashMap<String, String> = HashMap::new();
+        let ctx = NonNull::new(&mut collected_from_metadata as *mut _ as *mut c_void);
+        unsafe {
+            visit_metadata_configuration_from_metadata(
+                metadata.shallow_copy(),
+                ctx,
+                collect_property,
+            )
+        };
+
+        assert_eq!(collected_from_metadata, expected);
+
+        let mut schema_string: Option<String> = None;
+        let ctx = NonNull::new(&mut schema_string as *mut _ as *mut c_void);
+        unsafe { visit_metadata_schema_string(metadata.shallow_copy(), ctx, collect_string) };
+        let schema_string = schema_string.unwrap();
+        assert!(schema_string.contains(r#""name":"id""#));
+        assert!(schema_string.contains(r#""name":"val""#));
+
+        let partition_iter = unsafe { metadata_partition_columns(metadata.shallow_copy()) };
+        let mut partition_columns = Vec::new();
+        let mut partition_value: Option<String> = None;
+        while unsafe {
+            string_slice_next(
+                partition_iter.shallow_copy(),
+                NonNull::new(&mut partition_value as *mut _ as *mut c_void),
+                collect_string,
+            )
+        } {
+            partition_columns.push(partition_value.take().unwrap());
+        }
+        unsafe { free_string_slice_data(partition_iter) };
+        assert_eq!(partition_columns, expected_partition_columns);
+
+        unsafe { free_metadata(metadata) };
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
         Ok(())
