@@ -161,9 +161,9 @@ fn build_stats_struct(base_field_id: i32, bounds_type: &DataType) -> StructType 
             matches!(ptype, PrimitiveType::Float | PrimitiveType::Double),
             matches!(ptype, PrimitiveType::String | PrimitiveType::Binary),
         ),
+        DataType::Variant(_) => (false, true),
         _ => (false, false),
     };
-    let has_size_stats = has_size_stats || is_variant;
 
     // (name, type, offset, include) -- filtered in declaration order to preserve field ordering.
     let specs = [
