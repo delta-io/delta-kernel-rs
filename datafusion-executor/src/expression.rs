@@ -6,9 +6,7 @@ use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArra
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::utils::take_function_args;
 use datafusion::common::{Column as DFColumn, DataFusionError, ScalarValue as DFScalarValue};
-use datafusion::functions::core::expr_fn::{
-    coalesce, get_field, get_field_path, named_struct, nullif,
-};
+use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
 use datafusion::functions_nested::expr_fn::make_array;
 use datafusion::logical_expr::{
     binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs,
@@ -18,9 +16,9 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
-    BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
-    Expression as KernelExpression, ExpressionRef, ExpressionStructPatch, MapToStructExpression,
-    ParseJsonExpression, UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
+    BinaryExpression, BinaryExpressionOp, Expression as KernelExpression, ExpressionRef,
+    ExpressionStructPatch, MapToStructExpression, ParseJsonExpression, UnaryExpressionOp,
+    VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
@@ -30,6 +28,7 @@ use delta_kernel::{DeltaResult, EngineData, Error};
 
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
+use crate::utils::column_to_df_expr;
 
 /// Converts `expr` into the equivalent DataFusion [`Expr`](DFExpr), resolving column references
 /// against `input_schema`.
@@ -111,28 +110,6 @@ pub(crate) fn to_df_struct_columns(
         _ => Err(Error::generic(format!(
             "Expression must be a Struct or StructPatch, got {expr:?}"
         ))),
-    }
-}
-
-/// Lowers a column reference to a nested field access, e.g. `a.b.c` becomes a single
-/// `get_field(col("a"), "b", "c")` call. The path is resolved against `input_schema` (via
-/// [`StructType::field_at`]) to fail fast, but the resolved field is otherwise unused.
-pub(crate) fn column_to_df_expr(
-    name: &KernelColumnName,
-    input_schema: &StructType,
-) -> DeltaResult<DFExpr> {
-    let _ = input_schema.field_at(name)?;
-    let mut path = name.iter();
-    let Some(root) = path.next() else {
-        return Err(Error::generic("cannot convert an empty column reference"));
-    };
-    let root = DFExpr::Column(DFColumn::new_unqualified(root));
-    let field_names = Vec::from_iter(path.map(lit));
-    // A bare column stays a bare column; only nested access wraps it in a `get_field` call.
-    if field_names.is_empty() {
-        Ok(root)
-    } else {
-        Ok(get_field_path(root, field_names))
     }
 }
 
@@ -568,8 +545,8 @@ mod tests {
     use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
-        col, lit, null_lit, Expression as KernelExpr, ExpressionStructPatch,
-        ExpressionStructPatchBuilder,
+        col, lit, null_lit, ColumnName as KernelColumnName, Expression as KernelExpr,
+        ExpressionStructPatch, ExpressionStructPatchBuilder,
     };
     use delta_kernel::schema::{schema, schema_ref, ArrayType, DataType, MapType, StructType};
     use rstest::rstest;
