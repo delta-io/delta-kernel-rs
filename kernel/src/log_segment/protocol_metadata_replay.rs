@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use super::LogSegment;
-use crate::actions::{self, Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
+use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{get_commit_schema, CheckpointAction, CHECKPOINT_ACTION_NAME};
 #[cfg(any(feature = "declarative-plans", feature = "adaptive-metadata-in-dev"))]
@@ -90,7 +90,7 @@ impl LogSegment {
                 crc.version
             );
             let pruned = self.segment_after_version(crc.version);
-            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine, Some(&crc.protocol))?;
+            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine)?;
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -113,7 +113,7 @@ impl LogSegment {
         }
 
         // Case 3: Full P&M log replay.
-        let (metadata_opt, protocol_opt) = self.replay_for_pm(engine, None)?;
+        let (metadata_opt, protocol_opt) = self.replay_for_pm(engine)?;
         Ok((
             metadata_opt,
             protocol_opt,
@@ -122,11 +122,10 @@ impl LogSegment {
     }
 
     /// Replays the log segment for Protocol and Metadata, stopping early once both are found.
-    #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
+    /// Under `adaptive-metadata-in-dev`, also reconciles any P&M nested in a `checkpoint` action.
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
-        crc_protocol: Option<&Protocol>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         #[cfg(feature = "declarative-plans")]
         let actions_batches = match engine.plan_executor() {
@@ -151,39 +150,29 @@ impl LogSegment {
             }
         }
 
-        // P&M nested in an adaptive `checkpoint` action needs a second pass (an extra log read,
-        // taken only for adaptive tables; see the early-out below): the `declarative-plans` plan
-        // can't unnest `checkpoint`, and a plain scan would penalize non-adaptive tables.
-        // TODO: add a plan IR (+ proto) unnest op so one pass handles AMT.
+        // P&M can be nested in a `checkpoint` action this pass doesn't see: the `declarative-plans`
+        // plan can't unnest `checkpoint`, and the non-plan pass projects only top-level
+        // protocol/metaData. Re-resolve including any `checkpoint` action.
+        // TODO: add a plan IR (+ proto) unnest op so a single pass handles AMT.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let (metadata_opt, protocol_opt) =
-            self.reconcile_pm_with_checkpoint(engine, metadata_opt, protocol_opt, crc_protocol)?;
+            self.reconcile_pm_with_checkpoint(engine, metadata_opt, protocol_opt)?;
 
         Ok((metadata_opt, protocol_opt))
     }
 
     /// Re-resolve P&M including any `checkpoint` action; newest wins, so a later top-level commit
-    /// overrides it. Returns `top_level_*` unchanged when there is no `checkpoint` action.
+    /// overrides it. Returns `top_level_*` when no `checkpoint` action supersedes them.
+    ///
+    /// Always rescans with `checkpoint` projected in, since the first pass sees only top-level
+    /// protocol/metaData. Newest-first replay then resolves the correct P&M.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn reconcile_pm_with_checkpoint(
         &self,
         engine: &dyn Engine,
         top_level_metadata: Option<Metadata>,
         top_level_protocol: Option<Protocol>,
-        crc_protocol: Option<&Protocol>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        // Skip the extra scan when the table can't be adaptive: not flagged adaptive and P&M is
-        // either complete or covered by a CRC.
-        let known_adaptive = top_level_protocol
-            .as_ref()
-            .or(crc_protocol)
-            .is_some_and(adaptive_metadata_enabled);
-        let incomplete_without_crc = (top_level_metadata.is_none() || top_level_protocol.is_none())
-            && crc_protocol.is_none();
-        if !(known_adaptive || incomplete_without_crc) {
-            return Ok((top_level_metadata, top_level_protocol));
-        }
-
         let schema =
             get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CHECKPOINT_ACTION_NAME])?;
         let mut metadata_opt = None;
@@ -473,6 +462,45 @@ mod tests {
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         assert_eq!(snapshot.version(), 1);
         // The checkpoint action's metadata (two columns) wins over the older top-level metaData.
+        assert!(snapshot.schema().field("name").is_some());
+    }
+
+    // A newer manifest-commit `checkpoint` action that turns on AMT must win over older, complete,
+    // non-AMT top-level P&M. The first pass sees only the older top-level protocol/metaData, so the
+    // reconcile scan must still run rather than trust the first pass's (stale) view that the table
+    // is non-AMT and skip it.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn test_newer_checkpoint_action_overrides_complete_non_amt_top_level_pm() {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        // v0: complete, non-AMT top-level protocol (legacy reader 1 / writer 2) + metaData (single
+        // column). Actions are separate newline-delimited lines in the commit file.
+        let protocol =
+            serde_json::json!({ "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 } });
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            0,
+            format!("{protocol}\n{}", metadata_commit(SCHEMA_STRING)),
+        )
+        .await
+        .unwrap();
+        // v1: a manifest commit whose only P&M lives in an AMT checkpoint action (two columns).
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            1,
+            checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(snapshot.version(), 1);
+        // The newer checkpoint action's metadata (two columns) wins over the older top-level
+        // metaData; a successful build also proves its adaptive protocol was resolved.
         assert!(snapshot.schema().field("name").is_some());
     }
 
