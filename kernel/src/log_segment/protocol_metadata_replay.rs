@@ -27,7 +27,7 @@ use crate::schema::column_name;
 use crate::schema::schema_ref;
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error};
+use crate::{DeltaResult, Engine, Error};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -134,7 +134,12 @@ impl LogSegment {
             let mut protocol_opt = None;
             for actions_batch in self.read_pm_batches_via_plan(executor.as_ref())? {
                 let actions = actions_batch?.actions;
-                try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)?;
+                if metadata_opt.is_none() {
+                    metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+                }
+                if protocol_opt.is_none() {
+                    protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+                }
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 require!(
                     CheckpointAction::try_new_from_data(actions.as_ref())?.is_none(),
@@ -151,7 +156,13 @@ impl LogSegment {
         let mut protocol_opt = None;
         for actions_batch in self.read_pm_batches(engine)? {
             let actions = actions_batch?.actions;
-            if try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)? {
+            if metadata_opt.is_none() {
+                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+            }
+            if protocol_opt.is_none() {
+                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+            }
+            if metadata_opt.is_some() && protocol_opt.is_some() {
                 break;
             }
             // A `checkpoint` action is complete state at its version: fill any gap and stop.
@@ -252,22 +263,6 @@ impl LogSegment {
         };
         self.read_actions(engine, schema)
     }
-}
-
-/// Fill `metadata`/`protocol` from `actions` if not already resolved, returning whether both are
-/// now present.
-fn try_fill_pm(
-    actions: &dyn EngineData,
-    metadata: &mut Option<Metadata>,
-    protocol: &mut Option<Protocol>,
-) -> DeltaResult<bool> {
-    if metadata.is_none() {
-        *metadata = Metadata::try_new_from_data(actions)?;
-    }
-    if protocol.is_none() {
-        *protocol = Protocol::try_new_from_data(actions)?;
-    }
-    Ok(metadata.is_some() && protocol.is_some())
 }
 
 #[cfg(test)]
