@@ -3530,12 +3530,11 @@ mod tests {
         let ordered_list_col = ordered.column(0).as_list::<O>();
         assert!(!ordered_list_col.is_null(0));
         assert!(ordered_list_col.is_null(1));
-        let (ArrowDataType::List(element_field) | ArrowDataType::LargeList(element_field)) =
-            ordered.fields()[0].data_type()
-        else {
-            panic!("expected a list column");
-        };
-        assert!(!element_field.is_nullable());
+        // The reordered column stays a list whose element struct is non-nullable.
+        assert!(matches!(
+            ordered.fields()[0].data_type(),
+            ArrowDataType::List(f) | ArrowDataType::LargeList(f) if !f.is_nullable()
+        ));
         let present = ordered_list_col.value(0);
         assert_eq!(present.as_struct().column_names(), vec!["c", "b"]);
     }
