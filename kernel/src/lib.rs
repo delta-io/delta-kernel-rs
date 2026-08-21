@@ -27,6 +27,8 @@
 //! The [`Engine`] trait allows connectors to bring their own implementation of functionality such
 //! as reading and writing Parquet and JSON files, listing files in storage, and evaluating
 //! expressions. It exposes handler traits for each capability.
+//! When adding functionality to an engine that interacts with cloud storage (for example, writing
+//! JSON files), make sure to test it against S3, Azure, and GCS.
 //!
 //! ## Expression handling
 //!
