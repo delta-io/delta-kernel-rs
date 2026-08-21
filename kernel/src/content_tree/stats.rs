@@ -412,30 +412,20 @@ pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType>
     collect_stats_schema(table_struct, None)
 }
 
-/// Generates the AMT `content_stats` schema restricted to the leaves that carry Delta JSON stats.
+/// Generates the AMT `content_stats` schema restricted to the leaves that carry Delta stats.
 ///
 /// Same flat layout as [`stats_schema`], but a leaf is emitted only if its column appears in at
 /// least one Delta stat category (`nullCount`/`minValues`/`maxValues`) of `delta_stats_schema`.
 /// This avoids reading per-column stats that no Delta stat records. `delta_stats_schema` is the
-/// nested Delta Protocol JSON stats schema (as produced by `expected_stats_schema`); membership is
+/// nested Delta Protocol stats schema (nesting in table schema is reflected in the stats schema)
 /// tested segment-by-segment as the walk descends (see [`CategoryScopes`]).
 ///
-/// The caller decides membership: `delta_stats_schema` must list every leaf it wants stats for.
-/// Because `expected_stats_schema` is built from the data schema, reserved-metadata leaves such as
-/// `_row_id` / `_last_updated_sequence_number` are absent from it and are therefore dropped here --
-/// unlike [`stats_schema`], which emits them whenever they carry a supported reserved field ID. A
-/// caller that wants AMT stats for a reserved-metadata leaf must include it in `delta_stats_schema`
-/// (e.g. as a scalar leaf in a category), the same way it would for any other leaf.
 ///
 /// `table_struct` must be a physical schema (carrying `parquet.field.id`, as [`stats_schema`]
 /// requires), and `delta_stats_schema` must use the same physical names. Membership is matched by
 /// field name, so a naming mismatch (e.g. logical stat names against a physical `table_struct`
 /// under column mapping) matches nothing and drops every leaf.
 ///
-/// The per-leaf skip rules and error conditions of [`stats_schema`] apply to each leaf that
-/// *survives* the filter (array/map, out-of-range field ID, missing field ID, geospatial). A leaf
-/// filtered out because it is absent from every category is skipped before those checks run, so --
-/// unlike [`stats_schema`] -- a missing field ID on such a leaf does not error.
 pub(crate) fn filtered_stats_schema(
     table_struct: &StructType,
     delta_stats_schema: &StructType,
