@@ -28,8 +28,6 @@ use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
 use crate::metrics::{CommitFailureReason, MetricId};
-use crate::partition::serialization::serialize_partition_value;
-use crate::partition::validation::validate_partition_values;
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
@@ -38,7 +36,7 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_NAME, PARTITION_VALUES_PARSED_NAME, SIZE_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
+use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{
     lazy_schema_ref, schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType,
@@ -70,6 +68,7 @@ pub(crate) mod data_layout;
 
 pub(crate) mod alter_table;
 pub use alter_table::AlterTableTransaction;
+mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
@@ -80,12 +79,12 @@ pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]
 mod stats_verifier;
 mod update;
-mod write_context;
+mod write_state;
 mod write_validation;
 
+pub use bound_write_context::BoundWriteContext;
 use stats_verifier::StatsColumnVerifier;
-use write_context::SharedWriteState;
-pub use write_context::WriteContext;
+pub use write_state::WriteState;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -827,7 +826,7 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Reject `WriteContext` handouts on empty-schema tables, so engines fail
+    /// Reject `BoundWriteContext` handouts on empty-schema tables, so engines fail
     /// before staging any parquet. CREATE TABLE is exempt.
     fn ensure_schema_non_empty_for_write_context(&self) -> DeltaResult<()> {
         if self.is_create_table() {
@@ -946,6 +945,11 @@ impl<S> Transaction<S> {
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
     }
+
+    #[cfg(test)]
+    fn replace_effective_table_config(&mut self, table_config: TableConfiguration) {
+        self.effective_table_config = table_config;
+    }
 }
 
 // =============================================================================
@@ -1012,51 +1016,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
             .physical_stats_column_names(self.physical_clustering_columns.as_deref())
     }
 
-    // Generate the logical-to-physical expression which must be evaluated on every data chunk
-    // before writing.
-    fn generate_logical_to_physical(
-        &self,
-        partition_values: Option<&HashMap<String, Scalar>>,
-    ) -> DeltaResult<Expression> {
-        let logical_schema = self.effective_table_config.logical_schema();
-        let mut patch = ExpressionStructPatchBuilder::new();
-        if self
-            .effective_table_config
-            .should_materialize_partition_columns()
-        {
-            let partition_cols: HashSet<&str> = self
-                .effective_table_config
-                .logical_partition_columns()
-                .iter()
-                .map(String::as_str)
-                .collect();
-            // Insert each partition column after the nearest preceding surviving field
-            // (non-partition and non-void), in the order they appear in the logical schema.
-            // This keeps the post-transform data aligned with the physical schema.
-            let mut predecessor: Option<&str> = None;
-            for field in logical_schema.fields() {
-                let name = field.name().as_str();
-                if partition_cols.contains(name) {
-                    let value = partition_values.and_then(|m| m.get(name)).ok_or_else(|| {
-                        Error::internal_error(format!(
-                            "partition column '{name}' missing while building logical-to-physical \
-                             expression"
-                        ))
-                    })?;
-                    let literal = lit(value.clone());
-                    patch = match predecessor {
-                        Some(predecessor) => patch.insert_after(predecessor, literal),
-                        None => patch.prepend(literal),
-                    };
-                } else if *field.data_type() != DataType::VOID {
-                    predecessor = Some(name);
-                }
-            }
-        }
-        let patch = add_void_stripping(patch, &logical_schema);
-        Expression::struct_patch(patch)
-    }
-
     /// Returns the logical partition column names for this table.
     pub fn logical_partition_columns(&self) -> &[String] {
         self.effective_table_config.logical_partition_columns()
@@ -1116,20 +1075,31 @@ impl<S: SupportsDataFiles> Transaction<S> {
         validate_schema_for_write(&self.effective_table_config.logical_schema())
     }
 
-    /// Builds the [`SharedWriteState`] for a write context.
-    fn shared_write_state(&self) -> DeltaResult<Arc<SharedWriteState>> {
-        let table_config = &self.effective_table_config;
-        let props = table_config.table_properties();
-        Ok(Arc::new(SharedWriteState {
-            table_root: table_config.table_root().clone(),
-            logical_schema: table_config.logical_schema_without_partition_columns(),
-            physical_schema: table_config.physical_write_schema(),
-            column_mapping_mode: table_config.column_mapping_mode(),
-            stats_columns: self.stats_columns(),
-            logical_partition_columns: table_config.logical_partition_columns().to_vec(),
-            randomize_file_prefixes: props.should_randomize_file_prefixes(),
-            random_prefix_length: props.random_prefix_length(),
-        }))
+    /// Creates the table-wide state needed to write data files.
+    ///
+    /// The returned shared state can create [`BoundWriteContext`] instances in this process,
+    /// or it can be encoded and transported to distributed writers. Each context retains a
+    /// reference to the same immutable state. All table-wide write validation runs before the
+    /// state is returned so a writer does not begin producing files for a table that kernel cannot
+    /// write to safely.
+    ///
+    /// The state captures the transaction configuration when this method is called. If the
+    /// transaction is subsequently modified, call this method again to capture the updated
+    /// configuration.
+    ///
+    /// Returns an error if the table has an empty or unsupported schema, or if the table declares
+    /// column defaults that the connector has not acknowledged.
+    pub fn write_state(&self) -> DeltaResult<Arc<WriteState>> {
+        self.ensure_schema_non_empty_for_write_context()?;
+        self.ensure_column_defaults_acknowledged()?;
+        self.validate_for_data_write()?;
+        // The effective table configuration can change while building a transaction, so this
+        // state must be derived on demand rather than cached on the transaction. TODO(#3149):
+        // revisit caching if transaction construction becomes immutable.
+        Ok(Arc::new(WriteState::new(
+            &self.effective_table_config,
+            self.stats_columns(),
+        )))
     }
 
     /// Creates a write context for writing data to a specific partition.
@@ -1161,92 +1131,44 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///   column mapping mode. For example, under `ColumnMappingMode::Name`, logical `"year"` might
     ///   become physical `"col-abc-123"` in the `partitionValues` map.
     ///
-    /// - **Partition column materialization**: the returned [`WriteContext`]'s
+    /// - **Partition column materialization**: the returned [`BoundWriteContext`]'s
     ///   [`logical_to_physical`] expression injects partition columns when the table requires
     ///   materializing partition columns (e.g. `materializePartitionColumns` or `icebergCompatV3`).
     ///   The input data fed to that expression must not contain partition columns.
     ///
-    /// The returned [`WriteContext`] also provides a [`write_dir`] that returns the correct
+    /// The returned [`BoundWriteContext`] also provides a [`write_dir`] that returns the correct
     /// target directory (Hive-style paths when column mapping is off, random prefix when on).
+    /// This convenience method is equivalent to creating a fresh [`WriteState`] and immediately
+    /// binding `partition_values`. When writing multiple partitions, call [`write_state`] once and
+    /// create every context from the returned shared state.
     ///
     /// Returns an error if the table is not partitioned (use
     /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead), or if the
     /// table enables `allowColumnDefaults`, declares at least one column default, and
     /// [`ack_column_defaults`](Self::ack_column_defaults) has not been called.
     ///
-    /// [`write_dir`]: WriteContext::write_dir
-    /// [`logical_to_physical`]: WriteContext::logical_to_physical
+    /// [`write_dir`]: BoundWriteContext::write_dir
+    /// [`logical_to_physical`]: BoundWriteContext::logical_to_physical
+    /// [`write_state`]: Self::write_state
     pub fn partitioned_write_context(
         &self,
         partition_values: HashMap<String, Scalar>,
-    ) -> DeltaResult<WriteContext> {
-        self.ensure_schema_non_empty_for_write_context()?;
-        self.ensure_column_defaults_acknowledged()?;
-        self.validate_for_data_write()?;
-        let shared = self.shared_write_state()?;
-        require!(
-            !shared.logical_partition_columns.is_empty(),
-            Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
-        );
-        // Validate keys (completeness, case normalization) and value types, then return
-        // the map re-keyed to schema case.
-        let full_logical_schema = self.effective_table_config.logical_schema();
-        let normalized = validate_partition_values(
-            &shared.logical_partition_columns,
-            &full_logical_schema,
-            partition_values,
-        )?;
-
-        // Serialize values and translate keys from logical to physical names.
-        let mut serialized = HashMap::with_capacity(normalized.len());
-        for logical_name in &shared.logical_partition_columns {
-            let scalar = normalized.get(logical_name).ok_or_else(|| {
-                Error::internal_error(format!(
-                    "partition column '{logical_name}' missing after validation"
-                ))
-            })?;
-            let value = serialize_partition_value(scalar)?;
-            let physical_name = full_logical_schema
-                .field(logical_name)
-                .ok_or_else(|| {
-                    Error::internal_error(format!(
-                        "partition column '{logical_name}' not found in schema after validation"
-                    ))
-                })?
-                .physical_name(shared.column_mapping_mode)
-                .to_string();
-            serialized.insert(physical_name, value);
-        }
-        let logical_to_physical = Arc::new(self.generate_logical_to_physical(Some(&normalized))?);
-
-        Ok(WriteContext {
-            shared,
-            logical_to_physical,
-            physical_partition_values: serialized,
-        })
+    ) -> DeltaResult<BoundWriteContext> {
+        self.write_state()?
+            .partitioned_write_context(partition_values)
     }
 
     /// Creates a write context for writing data to an unpartitioned table.
+    ///
+    /// This convenience method is equivalent to creating a fresh [`WriteState`] and immediately
+    /// creating an unpartitioned context from it.
     ///
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead), or if the table
     /// enables `allowColumnDefaults`, declares at least one column default, and
     /// [`ack_column_defaults`](Self::ack_column_defaults) has not been called.
-    pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
-        self.ensure_schema_non_empty_for_write_context()?;
-        self.ensure_column_defaults_acknowledged()?;
-        self.validate_for_data_write()?;
-        let shared = self.shared_write_state()?;
-        require!(
-            shared.logical_partition_columns.is_empty(),
-            Error::generic("table is partitioned; use partitioned_write_context() instead")
-        );
-        let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
-        Ok(WriteContext {
-            shared,
-            logical_to_physical,
-            physical_partition_values: HashMap::new(),
-        })
+    pub fn unpartitioned_write_context(&self) -> DeltaResult<BoundWriteContext> {
+        self.write_state()?.unpartitioned_write_context()
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -2178,7 +2100,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
-        // Regression coverage for stale SharedWriteState caching: keep the first context alive
+        // Regression coverage for stale WriteState caching: keep the first context alive
         // while the transaction's effective table config changes.
         let initial_write_context = txn.unpartitioned_write_context()?;
         assert!(!initial_write_context
@@ -2347,7 +2269,8 @@ mod tests {
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)
                 .unwrap();
-            txn.effective_table_config = try_table_config(&txn, schema, writer_features).unwrap();
+            let table_config = try_table_config(&txn, schema, writer_features).unwrap();
+            txn.replace_effective_table_config(table_config);
             txn
         }
 
@@ -2497,7 +2420,7 @@ mod tests {
     fn snapshot_and_partitioned_write_context(
         table_path: &str,
         partition_values: HashMap<String, Scalar>,
-    ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
+    ) -> Result<(Arc<Snapshot>, BoundWriteContext), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -2512,7 +2435,7 @@ mod tests {
     /// Helper: evaluates the logical-to-physical transform on the given batch and returns the
     /// output RecordBatch.
     fn eval_logical_to_physical(
-        wc: &WriteContext,
+        wc: &BoundWriteContext,
         batch: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
         let input_schema = StructType::try_from_arrow(batch.schema())?;
@@ -2912,12 +2835,13 @@ mod tests {
             .metadata()
             .clone()
             .with_configuration_entry(APPEND_ONLY, enabled.to_string());
-        txn.effective_table_config = TableConfiguration::try_new_from(
+        let table_config = TableConfiguration::try_new_from(
             &txn.effective_table_config,
             Some(metadata),
             None,
             txn.effective_table_config.version(),
         )?;
+        txn.replace_effective_table_config(table_config);
         Ok(())
     }
 
@@ -3278,7 +3202,8 @@ mod tests {
         ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
     }
 
-    /// Validates that [`WriteContext::logical_to_physical`] correctly renames fields at all nesting
+    /// Validates that [`BoundWriteContext::logical_to_physical`] correctly renames fields at all
+    /// nesting
     /// levels. Builds a RecordBatch with logical names, evaluates the transform, and checks
     /// that the output uses physical names from the physical schema — including nested struct
     /// children.

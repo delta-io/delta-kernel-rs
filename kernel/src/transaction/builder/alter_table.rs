@@ -117,11 +117,8 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// The field must not already exist in the schema (case-insensitive). The field must be
     /// nullable because existing data files do not contain this column and will read NULL for it.
-    ///
-    /// The field must not be a metadata column.
-    ///
-    /// With column mapping enabled, existing IDs and physical names are preserved and missing
-    /// annotations are assigned.
+    /// On column-mapping tables, Kernel assigns or preserves column-mapping IDs and physical names
+    /// for the added field.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {

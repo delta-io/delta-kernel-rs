@@ -610,7 +610,6 @@ impl ObjectStore for RestObjectStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let prefix = prefix.map(|p| p.as_ref().to_string()).unwrap_or_default();
-        // Both `list` and `list_with_offset` recurse; only `list_with_delimiter` is non-recursive.
         self.list_paginated(prefix, None, None, true)
     }
 
@@ -631,7 +630,12 @@ impl ObjectStore for RestObjectStore {
                 raw.to_string()
             }
         };
-        self.list_paginated(prefix, Some(offset_str), Some(offset.clone()), true)
+        // NOTE: This intentionally diverges from `ObjectStore::list_with_offset`, which is
+        // expected to behave like recursive `list(prefix)` filtered by `offset`. Delta log
+        // continuation only needs direct children because `_delta_log` is flat.
+        // TODO: Split the Delta-log-specific REST listing path from the general `ObjectStore`
+        // method so `list_with_offset` can preserve the recursive trait contract.
+        self.list_paginated(prefix, Some(offset_str), Some(offset.clone()), false)
     }
 
     fn delete_stream(

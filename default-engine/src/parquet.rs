@@ -27,7 +27,7 @@ use delta_kernel::parquet::arrow::async_reader::{
 };
 use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
 use delta_kernel::schema::{SchemaRef, StructType};
-use delta_kernel::transaction::WriteContext;
+use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
     FileDataReadResultIterator, FileMeta, FoldWithOption as _, ParquetFooter, ParquetHandler,
@@ -242,18 +242,18 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         Ok(DataFileMetadata::new(file_meta, stats))
     }
 
-    /// Write `data` to a new parquet file under the [`WriteContext::write_dir`] and return
+    /// Write `data` to a new parquet file under the [`BoundWriteContext::write_dir`] and return
     /// Add action metadata ready for [`Transaction::add_files`].
     ///
     /// Note that the schema does not contain the dataChange column. In order to set `data_change`
     /// flag, use [`delta_kernel::transaction::Transaction::with_data_change`].
     ///
-    /// [`WriteContext::write_dir`]: delta_kernel::transaction::WriteContext::write_dir
+    /// [`BoundWriteContext::write_dir`]: delta_kernel::transaction::BoundWriteContext::write_dir
     /// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
     pub async fn write_parquet_file(
         &self,
         data: Box<dyn EngineData>,
-        write_context: &WriteContext,
+        write_context: &BoundWriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let file_metadata = self
             .write_parquet(

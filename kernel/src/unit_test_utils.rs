@@ -297,6 +297,21 @@ pub(crate) fn action_batch() -> Box<dyn EngineData> {
     parse_json_batch(json_strings)
 }
 
+/// A batch containing a single `checkpoint` action covering every element kind, including one
+/// `txn`-typed and one `domainMetadata`-typed sidecar. The checkpoint row is surrounded by
+/// non-checkpoint action rows so the outer `CheckpointVisitor` must skip other rows in the
+/// batch and locate the checkpoint action among them.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
+    let json_strings: StringArray = vec![
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        r#"{"checkpoint":[{"checkpointMetadata":{"version":42}},{"contentRoot":{"path":"s3://bucket/manifest","sizeInBytes":1024,"version":40}},{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["adaptiveMetadata-preview"],"writerFeatures":["adaptiveMetadata-preview"]}},{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}},{"txn":{"appId":"myApp","version":3}},{"domainMetadata":{"domain":"myDomain","configuration":"cfg","removed":false}},{"sidecar":{"type":"txn","path":"txn-sidecar.parquet","sizeInBytes":100,"modificationTime":1}},{"sidecar":{"type":"domainMetadata","path":"dm-sidecar.parquet","sizeInBytes":200,"modificationTime":2}}]}"#,
+        r#"{"txn":{"appId":"otherApp","version":9}}"#,
+    ]
+    .into();
+    parse_json_batch(json_strings)
+}
+
 // TODO: allow tests to pass in context (issue#1133)
 #[track_caller]
 pub(crate) fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {

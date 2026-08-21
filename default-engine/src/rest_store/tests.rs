@@ -506,6 +506,24 @@ async fn list_with_offset_excludes_offset_entry() {
     assert_eq!(paths, vec!["d/3"]);
 }
 
+#[tokio::test]
+async fn list_with_offset_sends_start_from_without_recursive() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dirs/d"))
+        .and(wiremock::matchers::query_param("start_from", "2"))
+        .and(wiremock::matchers::query_param_is_missing("recursive"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"contents":[]}"#))
+        .mount(&server)
+        .await;
+    let store = store_for(&server, HeaderMap::new());
+    let metas = store
+        .list_with_offset(Some(&Path::from("d")), &Path::from("d/2"))
+        .collect::<Vec<_>>()
+        .await;
+    assert!(metas.is_empty());
+}
+
 /// An out-of-order page violates the sorted-listing contract and must surface as an error
 /// rather than feeding log replay a misordered listing.
 #[tokio::test]

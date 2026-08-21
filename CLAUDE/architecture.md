@@ -67,16 +67,20 @@ file listing without re-scanning the table.
 
 ## Write Path
 
-`Snapshot` -> `Transaction` -> commit
+`Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContext`) -> commit
 
-The kernel coordinates the write transaction: it provides the write context (validated partition
-values, recommended write directory, physical schema, stats columns), assembles commit
-actions (CommitInfo, Add files, Remove files), enforces protocol compliance (table features, schema
-validation), and delegates the atomic commit to a `Committer`.
+Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
+partition values to create a `BoundWriteContext` containing validated partition values, schemas,
+statistics columns, and the recommended write directory. The transaction registers the resulting
+files, enforces protocol compliance, assembles commit actions, and delegates the atomic commit to
+a `Committer`.
 
 **Data-write steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
-2. Get `WriteContext` via `partitioned_write_context(values)` or `unpartitioned_write_context()`
+2. For a single context, get a `BoundWriteContext` directly from the transaction. For multiple
+   partitions or distributed writers, call `txn.write_state()` once and bind each partition from
+   that immutable state. Calling a transaction convenience method creates a fresh state from the
+   transaction's current configuration.
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)` and stage any removals or deletion-vector updates
 5. Commit: returns `CommittedTransaction`, `ConflictedTransaction`, or `RetryableTransaction`
@@ -127,9 +131,10 @@ all returned batches: the engine may split a single file across multiple batches
 - `kernel/src/scan/`: `Scan`, `ScanBuilder`, log replay, data skipping
 - `kernel/src/incremental_scan/`: `IncrementalScanBuilder`, streaming file-action diff
   between two versions
-- `kernel/src/commit_range/`: ordered actions over a range of commits
-- `kernel/src/transaction/`: `Transaction`, `WriteContext`, `create_table` builder
-- `kernel/src/partition/`: partition value validation, serialization, Hive-style path
+
+- `kernel/src/transaction/` -- `Transaction`, `WriteState`, `BoundWriteContext`, `create_table`
+  builder
+- `kernel/src/partition/` -- partition value validation, serialization, Hive-style path
    encoding, URI encoding for `add.path`
 - `kernel/src/committer/`: `Committer` trait, `FileSystemCommitter`
 - `kernel/src/log_segment/`: log file discovery, Protocol/Metadata replay
