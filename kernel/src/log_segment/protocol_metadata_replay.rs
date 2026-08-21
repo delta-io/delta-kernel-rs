@@ -165,7 +165,7 @@ impl LogSegment {
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 break;
             }
-            // A `checkpoint` action is complete state at its version: fill any gap and stop.
+            // Use the checkpoint's P&M for any field not already found.
             #[cfg(feature = "adaptive-metadata-in-dev")]
             if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
                 metadata_opt.get_or_insert_with(|| checkpoint.metadata().clone());
