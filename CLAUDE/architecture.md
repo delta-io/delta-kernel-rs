@@ -77,9 +77,10 @@ a `Committer`.
 
 **Data-write steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
-2. Call `txn.write_state()` after configuring the transaction, then bind each partition from that
-   immutable state. Distributed writers can encode the state and decode it on each worker before
-   binding partition values.
+2. Call `txn.write_state()` after configuring the transaction, then get a `BoundWriteContext` from
+   `WriteState::unpartitioned_write_context()` or
+   `WriteState::partitioned_write_context()`. Distributed writers can encode the state and decode
+   it on each worker before binding partition values.
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)` and stage any removals or deletion-vector updates
 5. Commit: returns `CommittedTransaction`, `ConflictedTransaction`, or `RetryableTransaction`

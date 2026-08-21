@@ -678,15 +678,15 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     )?;
 
     // Write data for both transactions
-    let write_context1 = Arc::new(txn1.write_state()?.unpartitioned_write_context()?);
-    let write_context2 = Arc::new(txn2.write_state()?.unpartitioned_write_context()?);
+    let write_context1 = txn1.write_state()?.unpartitioned_write_context()?;
+    let write_context2 = txn2.write_state()?.unpartitioned_write_context()?;
 
     let metadata1 = engine1
-        .write_parquet(&ArrowEngineData::new(data1), write_context1.as_ref())
+        .write_parquet(&ArrowEngineData::new(data1), &write_context1)
         .await?;
 
     let metadata2 = engine2
-        .write_parquet(&ArrowEngineData::new(data2), write_context2.as_ref())
+        .write_parquet(&ArrowEngineData::new(data2), &write_context2)
         .await?;
 
     txn1.add_files(metadata1);

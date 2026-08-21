@@ -67,10 +67,10 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
+        .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
         .await?;
 
     txn.add_files(add_files_metadata);
@@ -146,9 +146,9 @@ async fn test_append_timestamp_stats_are_millisecond_truncated(
     )?;
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
+        .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
         .await?;
     txn.add_files(add_files_metadata);
     assert!(txn.commit(engine.as_ref())?.is_committed());
@@ -317,7 +317,7 @@ async fn test_append_variant(
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
     let add_files_metadata = (*engine)
         .default_parquet_handler()
@@ -472,7 +472,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .unwrap();
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
     let add_files_metadata = (*engine)
         .default_parquet_handler()

@@ -87,10 +87,10 @@ async fn main() -> DeltaResult<()> {
 
     // Write Parquet and add file metadata to the transaction
     let write_state = txn.write_state()?;
-    let write_context = Arc::new(write_state.unpartitioned_write_context()?);
+    let write_context = write_state.unpartitioned_write_context()?;
     let data = ArrowEngineData::new(batch);
     let file_metadata = engine
-        .write_parquet(&data, write_context.as_ref())
+        .write_parquet(&data, &write_context)
         .await?;
     txn.add_files(file_metadata);
 
@@ -177,9 +177,9 @@ let data = ArrowEngineData::new(batch);
 **Write the Parquet file and collect file metadata:**
 ```rust,ignore
 let write_state = txn.write_state()?;
-let write_context = Arc::new(write_state.unpartitioned_write_context()?);
+let write_context = write_state.unpartitioned_write_context()?;
 let file_metadata = engine
-    .write_parquet(&data, write_context.as_ref())
+    .write_parquet(&data, &write_context)
     .await?;
 txn.add_files(file_metadata);
 ```

@@ -1978,11 +1978,11 @@ async fn test_remove_files_partitioned_with_parsed_columns(
             Ok(Box::new(ArrowEngineData::new(data)))
         });
         for (data, partition_val) in append_data.into_iter().zip(["usa", "japan"]) {
-            let ctx = Arc::new(write_state.partitioned_write_context(HashMap::from([(
+            let ctx = write_state.partitioned_write_context(HashMap::from([(
                 partition_col.to_string(),
                 Scalar::String(partition_val.into()),
-            )]))?);
-            let add_meta = engine.write_parquet(data?.as_ref(), ctx.as_ref()).await?;
+            )]))?;
+            let add_meta = engine.write_parquet(data?.as_ref(), &ctx).await?;
             txn.add_files(add_meta);
         }
         txn.commit(engine.as_ref())?.unwrap_committed();
