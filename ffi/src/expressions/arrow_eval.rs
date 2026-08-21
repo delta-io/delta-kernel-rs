@@ -400,7 +400,6 @@ mod tests {
     };
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-    use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate as _;
     use delta_kernel::expressions::{col, lit, Expression, Predicate};
 
     use super::*;
@@ -848,7 +847,6 @@ mod tests {
 
         use delta_kernel::arrow::array::Int64Array;
         use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
-        use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicateOp as _;
         use delta_kernel::expressions::{
             col, column_name, joined_column_expr, lit, BinaryExpressionOp, BinaryPredicateOp,
             ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
