@@ -75,6 +75,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::ChangeDataFeed,
     TableFeature::TypeWidening,
     TableFeature::RowTracking,
+    TableFeature::VariantType,
+    TableFeature::VariantShredding,
     // Invariants is auto-enabled by `maybe_enable_invariants` when the schema has non-null
     // fields. Allowing explicit `delta.feature.invariants=supported` lets users pre-enable
     // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
@@ -701,11 +703,19 @@ fn validate_extract_table_features_and_properties(
 
         // Add to appropriate feature lists based on feature type
         let needs_domain_metadata = feature == TableFeature::RowTracking;
+        let needs_variant_type = feature == TableFeature::VariantShredding;
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
         // RowTracking requires DomainMetadata as a dependency
         if needs_domain_metadata {
             add_feature_to_lists(
                 TableFeature::DomainMetadata,
+                &mut reader_features,
+                &mut writer_features,
+            );
+        }
+        if needs_variant_type {
+            add_feature_to_lists(
+                TableFeature::VariantType,
                 &mut reader_features,
                 &mut writer_features,
             );
@@ -1516,6 +1526,8 @@ mod tests {
     #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
+    #[case::variant_type(TableFeature::VariantType, "variantType")]
+    #[case::variant_shredding(TableFeature::VariantShredding, "variantShredding")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
     #[case::invariants(TableFeature::Invariants, "invariants")]
     fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
@@ -1541,6 +1553,28 @@ mod tests {
                 "{feature:?} is WriterOnly but reader_features is not empty"
             ),
         }
+    }
+
+    #[test]
+    fn test_variant_shredding_feature_signal_adds_variant_type_dependency() {
+        let properties = HashMap::from([(
+            "delta.feature.variantShredding".to_string(),
+            "supported".to_string(),
+        )]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+
+        assert!(validated
+            .reader_features
+            .contains(&TableFeature::VariantType));
+        assert!(validated
+            .reader_features
+            .contains(&TableFeature::VariantShredding));
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::VariantType));
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::VariantShredding));
     }
 
     fn multi_column_schema() -> SchemaRef {
