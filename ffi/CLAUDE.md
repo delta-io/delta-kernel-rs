@@ -152,6 +152,9 @@ transaction()
   -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
 ```
 
+`ffi/examples/read-table -d` prints the whole surface; its ctest is
+`read_and_print_column_defaults`.
+
 Deletion vector update flow:
 
 ```
