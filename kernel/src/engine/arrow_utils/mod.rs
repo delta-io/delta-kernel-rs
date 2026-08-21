@@ -914,7 +914,9 @@ pub(crate) fn reorder_struct_array(
                     final_fields_cols[reorder_index.index] = Some((new_field, col));
                 }
                 ReorderIndexTransform::Nested(children) => {
-                    let input_field_name = input_fields[parquet_position].name();
+                    let field = &input_fields[parquet_position];
+                    let input_field_name = field.name();
+                    let field_nullable = field.is_nullable();
                     match input_cols[parquet_position].data_type() {
                         ArrowDataType::Struct(_) => {
                             let struct_array = input_cols[parquet_position].as_struct().clone();
@@ -930,7 +932,7 @@ pub(crate) fn reorder_struct_array(
                             let new_field = Arc::new(ArrowField::new_struct(
                                 input_field_name,
                                 result_array.fields().clone(),
-                                input_fields[parquet_position].is_nullable(),
+                                field_nullable,
                             ));
                             final_fields_cols[reorder_index.index] =
                                 Some((new_field, result_array));
@@ -940,7 +942,7 @@ pub(crate) fn reorder_struct_array(
                             final_fields_cols[reorder_index.index] = reorder_list(
                                 list_array,
                                 input_field_name,
-                                input_fields[parquet_position].is_nullable(),
+                                field_nullable,
                                 children,
                             )?;
                         }
@@ -949,7 +951,7 @@ pub(crate) fn reorder_struct_array(
                             final_fields_cols[reorder_index.index] = reorder_list(
                                 list_array,
                                 input_field_name,
-                                input_fields[parquet_position].is_nullable(),
+                                field_nullable,
                                 children,
                             )?;
                         }
@@ -1025,7 +1027,7 @@ fn reorder_list<O: OffsetSizeTrait>(
     list_nullable: bool,
     children: &[ReorderIndex],
 ) -> DeltaResult<FieldArrayOpt> {
-    let (list_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
+    let (list_values_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
     if let Some(struct_array) = maybe_sa.as_struct_opt() {
         let struct_array = struct_array.clone();
         let result_array = Arc::new(reorder_struct_array(
@@ -1036,9 +1038,9 @@ fn reorder_list<O: OffsetSizeTrait>(
             None, // No file_location passed since metadata columns can't be nested
         )?);
         let new_list_field = Arc::new(ArrowField::new_struct(
-            list_field.name(),
+            list_values_field.name(),
             result_array.fields().clone(),
-            list_field.is_nullable(),
+            list_values_field.is_nullable(),
         ));
         let new_field = Arc::new(ArrowField::new_list(
             input_field_name,
