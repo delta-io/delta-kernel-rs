@@ -8,10 +8,10 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use super::LogSegment;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use crate::actions::CHECKPOINT_ACTION_NAME;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
@@ -26,7 +26,7 @@ use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::column_name;
 use crate::schema::schema_ref;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::table_features::TableFeature;
+use crate::table_features::adaptive_metadata_enabled;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error};
@@ -305,14 +305,6 @@ fn resolve_pm_from_checkpoint(
     Ok(Some((metadata, protocol)))
 }
 
-/// Whether `protocol` enables the `adaptiveMetadata` reader feature.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn adaptive_metadata_enabled(protocol: &Protocol) -> bool {
-    protocol
-        .reader_features()
-        .is_some_and(|features| features.contains(&TableFeature::AdaptiveMetadataPreview))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -365,7 +357,10 @@ mod tests {
     }
 
     // Build a top-level `metaData` commit line with the given schema (no protocol).
-    #[cfg(all(feature = "adaptive-metadata-in-dev", not(feature = "declarative-plans")))]
+    #[cfg(all(
+        feature = "adaptive-metadata-in-dev",
+        not(feature = "declarative-plans")
+    ))]
     fn metadata_commit(schema_string: &str) -> String {
         serde_json::json!({ "metaData": {
             "id": "test-table",
@@ -379,7 +374,10 @@ mod tests {
 
     // A two-column schema, used to distinguish "newer" metadata from the single-column
     // `SCHEMA_STRING` in override tests.
-    #[cfg(all(feature = "adaptive-metadata-in-dev", not(feature = "declarative-plans")))]
+    #[cfg(all(
+        feature = "adaptive-metadata-in-dev",
+        not(feature = "declarative-plans")
+    ))]
     const TWO_COLUMN_SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
 
     // Checkpoint-action resolution is a non-plan-path capability; the plan path rejects it.

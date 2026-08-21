@@ -852,6 +852,12 @@ pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableF
     }
 }
 
+/// Whether `protocol` enables the `adaptiveMetadata` reader feature.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn adaptive_metadata_enabled(protocol: &Protocol) -> bool {
+    extract_enabled_reader_features(protocol).contains(&TableFeature::AdaptiveMetadataPreview)
+}
+
 /// Add `feature` to the appropriate feature list(s) for its type, skipping duplicates.
 pub(crate) fn add_feature_to_lists(
     feature: TableFeature,
