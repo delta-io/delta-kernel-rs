@@ -1366,7 +1366,8 @@ pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> LogSegmentLoadType
 /// a [`ScanType::SequentialPhase`] event. If it returns parallel work, the caller emits a
 /// [`ScanType::ParallelPhase`] event by calling
 /// [`ParallelState::log_metrics`](crate::scan::ParallelState::log_metrics) after all workers
-/// complete. The two phase events share an `operation_id` and contain phase-local counters.
+/// complete. The two phase events share an `operation_id`. Action counts and timings are
+/// phase-local, while `peak_hash_set_size` is the whole-scan high-water mark.
 #[derive(Debug, Clone)]
 pub struct ScanMetadataCompleted {
     // === Set on span creation ===

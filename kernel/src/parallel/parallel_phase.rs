@@ -585,6 +585,7 @@ mod tests {
         add_files_seen: u64,
         add_files_seen_from_delta_files: u64,
         selected_add_files: u64,
+        selected_add_files_bytes: u64,
         remove_files_seen: u64,
         non_file_actions: u64,
         predicate_filtered: u64,
@@ -620,6 +621,7 @@ mod tests {
         let add_files_seen_from_delta_files =
             extract_metric(sequential_logs, "add_files_seen_from_delta_files");
         let selected_add_files = extract_metric(sequential_logs, "selected_add_files");
+        let selected_add_files_bytes = extract_metric(sequential_logs, "selected_add_files_bytes");
         let remove_files_seen =
             extract_metric(sequential_logs, "remove_files_seen_from_delta_files");
         let non_file_actions = extract_metric(sequential_logs, "non_file_actions");
@@ -636,6 +638,10 @@ mod tests {
         assert_eq!(
             selected_add_files, sequential_expected.selected_add_files,
             "Sequential selected_add_files mismatch"
+        );
+        assert_eq!(
+            selected_add_files_bytes, sequential_expected.selected_add_files_bytes,
+            "Sequential selected_add_files_bytes mismatch"
         );
         assert_eq!(
             remove_files_seen, sequential_expected.remove_files_seen,
@@ -660,6 +666,7 @@ mod tests {
             let mut total_add_files_seen = 0u64;
             let mut total_add_files_seen_from_delta_files = 0u64;
             let mut total_selected_add_files = 0u64;
+            let mut total_selected_add_files_bytes = 0u64;
             let mut total_remove_files_seen = 0u64;
             let mut total_non_file_actions = 0u64;
             let mut total_predicate_filtered = 0u64;
@@ -674,6 +681,8 @@ mod tests {
                 total_add_files_seen_from_delta_files +=
                     extract_metric(remaining, "add_files_seen_from_delta_files");
                 total_selected_add_files += extract_metric(remaining, "selected_add_files");
+                total_selected_add_files_bytes +=
+                    extract_metric(remaining, "selected_add_files_bytes");
                 total_remove_files_seen +=
                     extract_metric(remaining, "remove_files_seen_from_delta_files");
                 total_non_file_actions += extract_metric(remaining, "non_file_actions");
@@ -698,6 +707,10 @@ mod tests {
             assert_eq!(
                 total_selected_add_files, expected.selected_add_files,
                 "Parallel selected_add_files mismatch"
+            );
+            assert_eq!(
+                total_selected_add_files_bytes, expected.selected_add_files_bytes,
+                "Parallel selected_add_files_bytes mismatch"
             );
             assert_eq!(
                 total_remove_files_seen, expected.remove_files_seen,
@@ -729,6 +742,7 @@ mod tests {
             add_files_seen: 0,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 0,
+            selected_add_files_bytes: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
@@ -737,6 +751,7 @@ mod tests {
             add_files_seen: 101,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 101,
+            selected_add_files_bytes: 54541,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -749,6 +764,7 @@ mod tests {
             add_files_seen: 0,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 0,
+            selected_add_files_bytes: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
@@ -757,6 +773,7 @@ mod tests {
             add_files_seen: 101,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 101,
+            selected_add_files_bytes: 54541,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -773,6 +790,7 @@ mod tests {
             add_files_seen: 0,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 0,
+            selected_add_files_bytes: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
@@ -783,6 +801,7 @@ mod tests {
             add_files_seen: 101,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 97,
+            selected_add_files_bytes: 52616,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 4,
@@ -806,6 +825,7 @@ mod tests {
             add_files_seen: 6,
             add_files_seen_from_delta_files: 6,
             selected_add_files: 2,
+            selected_add_files_bytes: 1502,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 4,
@@ -820,6 +840,7 @@ mod tests {
             add_files_seen: 3,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 3,
+            selected_add_files_bytes: 1481,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
@@ -833,6 +854,7 @@ mod tests {
             add_files_seen: 0,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 0,
+            selected_add_files_bytes: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
@@ -841,6 +863,7 @@ mod tests {
             add_files_seen: 2,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 2,
+            selected_add_files_bytes: 1003,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -853,6 +876,7 @@ mod tests {
             add_files_seen: 3,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 3,
+            selected_add_files_bytes: 1481,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
@@ -866,6 +890,7 @@ mod tests {
             add_files_seen: 0,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 0,
+            selected_add_files_bytes: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
@@ -874,6 +899,7 @@ mod tests {
             add_files_seen: 2,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 2,
+            selected_add_files_bytes: 1003,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -886,6 +912,7 @@ mod tests {
             add_files_seen: 0,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 0,
+            selected_add_files_bytes: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
@@ -894,6 +921,7 @@ mod tests {
             add_files_seen: 4,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 4,
+            selected_add_files_bytes: 2009,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -906,6 +934,7 @@ mod tests {
             add_files_seen: 0,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 0,
+            selected_add_files_bytes: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
@@ -914,6 +943,7 @@ mod tests {
             add_files_seen: 4,
             add_files_seen_from_delta_files: 0,
             selected_add_files: 4,
+            selected_add_files_bytes: 2009,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -927,6 +957,7 @@ mod tests {
             add_files_seen: 1,
             add_files_seen_from_delta_files: 1,
             selected_add_files: 1,
+            selected_add_files_bytes: 548,
             remove_files_seen: 0,
             non_file_actions: 3,
             predicate_filtered: 0,
@@ -947,6 +978,7 @@ mod tests {
             add_files_seen: 2,
             add_files_seen_from_delta_files: 1,
             selected_add_files: 1,
+            selected_add_files_bytes: 1010,
             remove_files_seen: 1,
             non_file_actions: 4,
             predicate_filtered: 0,
