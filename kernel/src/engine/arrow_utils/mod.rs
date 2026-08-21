@@ -915,8 +915,6 @@ pub(crate) fn reorder_struct_array(
                 }
                 ReorderIndexTransform::Nested(children) => {
                     let field = &input_fields[parquet_position];
-                    let input_field_name = field.name();
-                    let field_nullable = field.is_nullable();
                     match input_cols[parquet_position].data_type() {
                         ArrowDataType::Struct(_) => {
                             let struct_array = input_cols[parquet_position].as_struct().clone();
@@ -930,9 +928,9 @@ pub(crate) fn reorder_struct_array(
                             )?);
                             // create the new field specifying the correct order for the struct
                             let new_field = Arc::new(ArrowField::new_struct(
-                                input_field_name,
+                                field.name(),
                                 result_array.fields().clone(),
-                                field_nullable,
+                                field.is_nullable(),
                             ));
                             final_fields_cols[reorder_index.index] =
                                 Some((new_field, result_array));
@@ -941,8 +939,8 @@ pub(crate) fn reorder_struct_array(
                             let list_array = input_cols[parquet_position].as_list::<i32>().clone();
                             final_fields_cols[reorder_index.index] = reorder_list(
                                 list_array,
-                                input_field_name,
-                                field_nullable,
+                                field.name(),
+                                field.is_nullable(),
                                 children,
                             )?;
                         }
@@ -950,15 +948,15 @@ pub(crate) fn reorder_struct_array(
                             let list_array = input_cols[parquet_position].as_list::<i64>().clone();
                             final_fields_cols[reorder_index.index] = reorder_list(
                                 list_array,
-                                input_field_name,
-                                field_nullable,
+                                field.name(),
+                                field.is_nullable(),
                                 children,
                             )?;
                         }
                         ArrowDataType::Map(_, _) => {
                             let map_array = input_cols[parquet_position].as_map().clone();
                             final_fields_cols[reorder_index.index] =
-                                reorder_map(map_array, input_field_name, children)?;
+                                reorder_map(map_array, field.name(), children)?;
                         }
                         _ => {
                             return Err(Error::internal_error(
@@ -1042,17 +1040,18 @@ fn reorder_list<O: OffsetSizeTrait>(
             result_array.fields().clone(),
             result_array.is_nullable(),
         ));
-        let new_field = Arc::new(ArrowField::new_list(
-            input_field_name,
-            new_list_field.clone(),
-            list_nullable,
-        ));
         let list = Arc::new(GenericListArray::try_new(
             new_list_field,
             offset_buffer,
             result_array,
             null_buf,
         )?);
+        // Derive the field type from the rebuilt array so it stays List or LargeList per `O`.
+        let new_field = Arc::new(ArrowField::new(
+            input_field_name,
+            list.data_type().clone(),
+            list_nullable,
+        ));
         Ok(Some((new_field, list)))
     } else {
         Err(Error::internal_error(
@@ -1572,7 +1571,8 @@ mod tests {
     use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, AsArray, BooleanArray, GenericListArray, Int32Array,
         Int32Builder, Int64Array, LargeStringArray, ListArray, MapArray, MapBuilder, MapFieldNames,
-        NullArray, StringArray, StringBuilder, StringViewArray, StructArray, StructBuilder,
+        NullArray, OffsetSizeTrait, StringArray, StringBuilder, StringViewArray, StructArray,
+        StructBuilder,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -3483,44 +3483,41 @@ mod tests {
     }
 
     // A nullable list column with a non-nullable element struct and null rows: the outer column's
-    // nullability must survive reorder, else its null rows fail `StructArray::try_new`.
-    #[test]
-    fn reorder_nullable_list_of_non_nullable_struct_with_null_rows() {
+    // nullability must survive reorder, else its null rows fail `StructArray::try_new`. `List`
+    // (i32 offsets) and `LargeList` (i64) take separate reorder arms, so cover both.
+    #[rstest]
+    #[case::list(false)]
+    #[case::large_list(true)]
+    fn reorder_nullable_list_of_non_nullable_struct_with_null_rows(#[case] large_list: bool) {
+        if large_list {
+            reorder_nullable_list_preserves_outer_nullability::<i64>();
+        } else {
+            reorder_nullable_list_preserves_outer_nullability::<i32>();
+        }
+    }
+
+    fn reorder_nullable_list_preserves_outer_nullability<O: OffsetSizeTrait>() {
         // Row 0 holds two elements; row 1 is a null list entry.
-        let boolean = Arc::new(BooleanArray::from(vec![false, true]));
-        let int = Arc::new(Int32Array::from(vec![42, 28]));
+        let boolean = Arc::new(BooleanArray::from(vec![false, true])) as ArrowArrayRef;
+        let int = Arc::new(Int32Array::from(vec![42, 28])) as ArrowArrayRef;
         let list_sa = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
-                boolean as ArrowArrayRef,
+                boolean,
             ),
             (
                 Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
-                int as ArrowArrayRef,
+                int,
             ),
         ]);
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2]));
-        let item_field = ArrowField::new("item", list_sa.data_type().clone(), false);
+        let offsets = OffsetBuffer::<O>::from_lengths([2, 0]);
+        let item_field = Arc::new(ArrowField::new("item", list_sa.data_type().clone(), false));
         let nulls = NullBuffer::from(vec![true, false]);
         let list = Arc::new(
-            GenericListArray::try_new(
-                Arc::new(item_field),
-                offsets,
-                Arc::new(list_sa),
-                Some(nulls),
-            )
-            .unwrap(),
+            GenericListArray::<O>::try_new(item_field, offsets, Arc::new(list_sa), Some(nulls))
+                .unwrap(),
         );
-        let element_fields: ArrowFields = vec![
-            Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
-            Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
-        ]
-        .into();
-        let list_field = Arc::new(ArrowField::new(
-            "list",
-            ArrowDataType::new_list(ArrowDataType::Struct(element_fields), false),
-            true,
-        ));
+        let list_field = Arc::new(ArrowField::new("list", list.data_type().clone(), true));
         let struct_array = StructArray::from(vec![(list_field, list as ArrowArrayRef)]);
         let reorder = vec![ReorderIndex::nested(
             0,
@@ -3530,10 +3527,12 @@ mod tests {
         let ordered = reorder_struct_array(struct_array, &reorder, None, None).unwrap();
 
         assert!(ordered.fields()[0].is_nullable());
-        let ordered_list_col = ordered.column(0).as_list::<i32>();
+        let ordered_list_col = ordered.column(0).as_list::<O>();
         assert!(!ordered_list_col.is_null(0));
         assert!(ordered_list_col.is_null(1));
-        let ArrowDataType::List(element_field) = ordered.fields()[0].data_type() else {
+        let (ArrowDataType::List(element_field) | ArrowDataType::LargeList(element_field)) =
+            ordered.fields()[0].data_type()
+        else {
             panic!("expected a list column");
         };
         assert!(!element_field.is_nullable());
