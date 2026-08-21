@@ -34,14 +34,15 @@ pub struct SharedWriteContext;
 /// Caller is responsible for passing a [valid][Handle#Validity] transaction handle and engine.
 #[no_mangle]
 pub unsafe extern "C" fn get_unpartitioned_write_context(
-    txn: Handle<ExclusiveTransaction>,
+    mut txn: Handle<ExclusiveTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
-    let txn = unsafe { txn.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    txn.unpartitioned_write_context()
+    let txn = unsafe { txn.as_mut() };
+    let extern_engine = unsafe { engine.as_ref() };
+    txn.transaction(extern_engine.engine().as_ref())
+        .and_then(|transaction| transaction.unpartitioned_write_context())
         .map(|context| Arc::new(context).into())
-        .into_extern_result(&engine)
+        .into_extern_result(&extern_engine)
 }
 
 /// Gets the write context from a create-table transaction for an unpartitioned table.
@@ -58,10 +59,11 @@ pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    txn.unpartitioned_write_context()
+    let extern_engine = unsafe { engine.as_ref() };
+    txn.transaction()
+        .unpartitioned_write_context()
         .map(|context| Arc::new(context).into())
-        .into_extern_result(&engine)
+        .into_extern_result(&extern_engine)
 }
 
 /// Gets the write context from a transaction for a partitioned table, for the partition described
@@ -83,14 +85,20 @@ pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
 /// value map handle, and engine.
 #[no_mangle]
 pub unsafe extern "C" fn get_partitioned_write_context(
-    txn: Handle<ExclusiveTransaction>,
+    mut txn: Handle<ExclusiveTransaction>,
     partition_values: Handle<ExclusivePartitionValueMap>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
-    let txn = unsafe { txn.as_ref() };
+    let txn = unsafe { txn.as_mut() };
     let partition_values = unsafe { partition_values.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    partitioned_write_context_impl(|pv| txn.partitioned_write_context(pv), *partition_values)
+    txn.transaction(engine.engine().as_ref())
+        .and_then(|transaction| {
+            partitioned_write_context_impl(
+                |pv| transaction.partitioned_write_context(pv),
+                *partition_values,
+            )
+        })
         .into_extern_result(&engine)
 }
 
@@ -109,9 +117,12 @@ pub unsafe extern "C" fn create_table_get_partitioned_write_context(
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let partition_values = unsafe { partition_values.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    partitioned_write_context_impl(|pv| txn.partitioned_write_context(pv), *partition_values)
-        .into_extern_result(&engine)
+    let extern_engine = unsafe { engine.as_ref() };
+    partitioned_write_context_impl(
+        |pv| txn.transaction().partitioned_write_context(pv),
+        *partition_values,
+    )
+    .into_extern_result(&extern_engine)
 }
 
 /// Shared body for the partitioned write-context entry points: hand the owned partition values to

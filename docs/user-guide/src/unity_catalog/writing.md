@@ -61,7 +61,7 @@ let snapshot = snapshot_builder_from_load_table(&resp)?.build(&engine)?;
 The returned `Snapshot` reflects all ratified commits the catalog knows about,
 including those that haven't been published to `_delta_log/` yet.
 
-## Create a transaction with `UCCommitter`
+## Create a transaction and `UCCommitter`
 
 `UCCommitter` implements Kernel's `Committer` trait. It stages the commit to
 `_staged_commits/`, then submits it to the UC `update_table` API for Unity
@@ -73,13 +73,14 @@ use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::TableIdentifier;
 
 let table_id = resp.metadata.table_uuid.clone();
-let committer = Box::new(UCCommitter::new(
+let committer = UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+);
+let txn = snapshot.clone().transaction_builder()
+    .with_operation(delta_kernel::transaction::Operation::Write)
+    .build(&engine)?;
 ```
 
 `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
@@ -97,14 +98,13 @@ multi-threaded runtime (the default for `#[tokio::main]`).
 
 ## Write data
 
-From this point, writing data works the same as any Kernel transaction. Get the
-write context, write Parquet files to the table's storage location, and add the
-resulting file metadata to the transaction.
+From this point, writing data works the same as any Kernel transaction. Get the write context,
+write Parquet files to the table's storage location, and pass the resulting file metadata to
+`commit()` directly or collect multiple batches in `CommitActions`.
 
 ```rust,ignore
 let write_context = txn.unpartitioned_write_context()?;
 // ... write Parquet files using write_context ...
-txn.add_files(file_metadata);
 ```
 
 See [Appending Data](../writing/append.md) for the full details on writing
@@ -117,7 +117,7 @@ Call `txn.commit()` to stage the commit and ratify it through UC.
 ```rust,ignore
 use delta_kernel::transaction::CommitResult;
 
-match txn.commit(&engine)? {
+match txn.commit(&engine, &committer, file_metadata.into())? {
     CommitResult::CommittedTransaction(committed) => {
         let version = committed.commit_version();
         let post_commit_snapshot = committed
@@ -129,9 +129,11 @@ match txn.commit(&engine)? {
         // Another writer committed this version first. Rebase onto the new
         // snapshot and retry. UCCommitter does not retry at this level.
     }
-    CommitResult::RetryableTransaction(_retryable) => {
+    CommitResult::RetryableTransaction(retryable) => {
         // Transient I/O or server error after the UC HTTP client's own retry
-        // budget was exhausted. Retry the commit from scratch.
+        // budget was exhausted. Retry the exact transaction and actions.
+        let next_result = retryable.retry(&engine, &committer)?;
+        // Handle `next_result` with the same result loop.
     }
 }
 ```
@@ -174,14 +176,14 @@ use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::TableIdentifier;
 
 // Build a committer to drive publishing
-let committer: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
+let committer = UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
+);
 
 let published_snapshot = post_commit_snapshot
-    .publish(&engine, committer.as_ref())?;
+    .publish(&engine, &committer)?;
 ```
 
 Publishing copies each staged commit from `_staged_commits/<version>.<uuid>.json`
@@ -276,28 +278,22 @@ let engine = build_engine_with_credentials(&table_uri, &creds)?;
 // 4. Build a Snapshot from the load_table response
 let snapshot = snapshot_builder_from_load_table(&resp)?.build(&engine)?;
 
-// 5. Create transaction with UCCommitter
-let committer = Box::new(UCCommitter::new(
+// 5. Create the transaction and its commit-time UCCommitter
+let committer = UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+);
+let txn = snapshot.clone().transaction_builder()
+    .with_operation(delta_kernel::transaction::Operation::Write)
+    .build(&engine)?;
 
 // 6. Write data
 let write_context = txn.unpartitioned_write_context()?;
 // ... write Parquet files using write_context ...
-txn.add_files(file_metadata);
 
 // 7. Commit, publish, and checkpoint
-let committer_for_publish: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
-    update_client.clone(),
-    table_id.clone(),
-    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
-
-match txn.commit(&engine)? {
+match txn.commit(&engine, &committer, file_metadata.into())? {
     CommitResult::CommittedTransaction(committed) => {
         let post_commit_snapshot = committed
             .post_commit_snapshot()
@@ -305,7 +301,7 @@ match txn.commit(&engine)? {
 
         // Publish staged commits to _delta_log/
         let published_snapshot = post_commit_snapshot
-            .publish(&engine, committer_for_publish.as_ref())?;
+            .publish(&engine, &committer)?;
 
         // Checkpoint the published snapshot
         published_snapshot.checkpoint(&engine, None)?;

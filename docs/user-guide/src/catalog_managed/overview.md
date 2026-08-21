@@ -126,7 +126,8 @@ IDs, catalog APIs, or catalog servers. Instead:
 |      .with_log_tail(commits)                              |
 |      .with_max_catalog_version(version)                   |
 |      .build(&engine)                                      |
-|    snapshot.transaction(committer, &engine)                |
+|    snapshot.transaction_builder().build(&engine)           |
+|    txn.commit(&engine, committer, actions)                  |
 +---------------------------+-------------------------------+
                             | calls Kernel APIs
                             v

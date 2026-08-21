@@ -10,12 +10,10 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, TransactionOptions};
 use delta_kernel::{DeltaResult, Snapshot};
 use tempfile::tempdir;
-use test_utils::{
-    begin_transaction, create_default_engine, setup_test_tables, write_batch_to_table,
-};
+use test_utils::{create_default_engine, setup_test_tables, write_batch_to_table};
 use url::Url;
 
 use crate::common::write_utils::get_simple_int_schema;
@@ -31,8 +29,12 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
 
     // Create table and verify post_commit_snapshot
     let create_result = create_table_txn(table_url.as_str(), schema, env!("CARGO_PKG_VERSION"))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
 
     let mut current_snapshot = match create_result {
         CommitResult::CommittedTransaction(committed) => {
@@ -56,10 +58,17 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
     for i in 1..11 {
         let base_version = current_snapshot.version();
 
-        let txn =
-            begin_transaction(current_snapshot.clone(), engine.as_ref())?.with_engine_info("test");
+        let txn = current_snapshot
+            .clone()
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("test"))
+            .build(engine.as_ref())?;
 
-        match txn.commit(engine.as_ref())? {
+        match txn.commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )? {
             CommitResult::CommittedTransaction(committed) => {
                 let post_snapshot = committed
                     .post_commit_snapshot()
@@ -129,7 +138,11 @@ async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_t
         setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = begin_transaction(snapshot.clone(), &engine)?.with_engine_info("test");
+        let txn = snapshot
+            .clone()
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("test"))
+            .build(&engine)?;
 
         let result = txn.partitioned_write_context(HashMap::from([(
             "nonexistent".to_string(),

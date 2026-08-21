@@ -231,7 +231,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
@@ -276,7 +275,7 @@ mod tests {
         )
         .with_data_layout(DataLayout::partitioned(["year"]))
         .with_table_properties(properties)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap();
 
         let mut write_state = txn.write_state().unwrap();

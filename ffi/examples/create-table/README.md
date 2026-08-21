@@ -4,7 +4,7 @@ create-table
 C FFI example for CREATE TABLE. Demonstrates the schema-visitor handoff
 (`KernelSchemaVisitorState` + `visit_field_*`) used by `get_create_table_builder`, the
 consuming-and-returning handle pattern of `create_table_builder_with_table_property` /
-`create_table_with_engine_info`, and the final `create_table_commit`.
+`create_table_builder_with_engine_info`, and the final `create_table_commit`.
 
 # Building
 

@@ -7,3 +7,6 @@
 
 pub mod alter_table;
 pub mod create_table;
+mod update;
+
+pub use update::TransactionBuilder;

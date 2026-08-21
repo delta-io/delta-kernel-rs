@@ -7,12 +7,12 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
+use delta_kernel::transaction::TransactionOptions;
 use delta_kernel::Snapshot;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    begin_transaction, create_table_and_load_snapshot, read_add_infos, test_table_setup,
-    write_batch_to_table,
+    create_table_and_load_snapshot, read_add_infos, test_table_setup, write_batch_to_table,
 };
 use url::Url;
 
@@ -24,13 +24,18 @@ async fn write_batch_to_table_simple(
     engine: &DefaultEngine<TokioBackgroundExecutor>,
     data: RecordBatch,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut txn = begin_transaction(snapshot.clone(), engine)?.with_engine_info("test");
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test"))
+        .build(engine)?;
     let write_context = txn.unpartitioned_write_context()?;
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
-    txn.add_files(add_meta);
-    let committed = txn.commit(engine)?.unwrap_committed();
+    let committed = txn
+        .commit(engine, &FileSystemCommitter::new(), add_meta.into())?
+        .unwrap_committed();
     Ok(committed.post_commit_snapshot().unwrap().clone())
 }
 
@@ -74,8 +79,13 @@ async fn test_multiple_files_in_commit_all_use_relative_paths(
     let snapshot =
         create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
 
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?.with_engine_info("test");
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test"))
+        .build(engine.as_ref())?;
     let write_context = txn.unpartitioned_write_context().unwrap();
+    let mut actions = delta_kernel::transaction::CommitActions::new();
     for values in [vec![1, 2], vec![3, 4]] {
         let add_meta = engine
             .write_parquet(
@@ -83,9 +93,11 @@ async fn test_multiple_files_in_commit_all_use_relative_paths(
                 &write_context,
             )
             .await?;
-        txn.add_files(add_meta);
+        actions.add_files(add_meta);
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+        .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap().clone();
 
     let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
@@ -134,8 +146,8 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
 
-    let mut txn = create_table_txn(table_url.as_str(), schema.clone(), "test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let txn =
+        create_table_txn(table_url.as_str(), schema.clone(), "test/1.0").build(engine.as_ref())?;
     let write_context = txn.unpartitioned_write_context()?;
     let add_meta = engine
         .write_parquet(
@@ -143,8 +155,13 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
             &write_context,
         )
         .await?;
-    txn.add_files(add_meta);
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            add_meta.into(),
+        )?
+        .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap().clone();
 
     let add_infos = read_add_infos(&snapshot, engine.as_ref())?;

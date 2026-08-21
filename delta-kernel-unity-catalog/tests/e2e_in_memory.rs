@@ -120,11 +120,17 @@ fn commit(
     update_table_client: &Arc<InMemoryUpdateTableClient>,
     engine: &DefaultEngine<TokioMultiThreadExecutor>,
 ) -> Result<Arc<Snapshot>, TestError> {
+    let committer = uc_committer(update_table_client);
     Ok(snapshot
         .clone()
-        .transaction(Box::new(uc_committer(update_table_client)), engine)?
+        .transaction_builder()
         .with_operation("WRITE".to_string())
-        .commit(engine)?
+        .build(engine)?
+        .commit(
+            engine,
+            &committer,
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_post_commit_snapshot())
 }
 
@@ -187,11 +193,16 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     assert_eq!(snapshot.version(), max);
 
     // Next insert should fail with MaxUnpublishedCommitsExceeded
-    let committer = Box::new(uc_committer(&update_table_client));
+    let committer = uc_committer(&update_table_client);
     let err = snapshot
         .clone()
-        .transaction(committer, &engine)?
-        .commit(&engine)
+        .transaction_builder()
+        .build(&engine)?
+        .commit(
+            &engine,
+            &committer,
+            delta_kernel::transaction::CommitActions::new(),
+        )
         .unwrap_err();
     assert!(
         matches!(err, delta_kernel::Error::Generic(msg) if msg.contains("Max unpublished commits"))
@@ -261,10 +272,15 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
     };
 
     // v0 create: writes 000.json directly to storage, does not call the catalog.
+    let committer = uc_committer(&client);
     create_table(table_uri.as_str(), schema, "delta-kernel-uc-test")
         .with_table_properties(get_required_properties_for_disk(TABLE_ID))
-        .build(engine.as_ref(), Box::new(uc_committer(&client)))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &committer,
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     client.create_table(TABLE_ID)?;
 

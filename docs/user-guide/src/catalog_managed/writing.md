@@ -16,7 +16,8 @@ A catalog-managed write has four phases:
    Build snapshot with Snapshot::builder_for(path).with_log_tail(commits).build()
 
 2. COMMIT
-   Transaction generates actions. Committer stages them to _staged_commits/.
+   Transaction and CommitActions define the commit. Committer stages its actions to
+   _staged_commits/.
    Committer calls the catalog API to ratify the staged commit.
 
 3. HANDLE RESULT
@@ -48,36 +49,37 @@ let snapshot = Snapshot::builder_for(path)
 
 ## Phase 2: Create a transaction and commit
 
-To begin a write, create a transaction with your catalog's `Committer`, add files, and
-call `commit()`:
+To begin a write, create a transaction, produce file metadata, and call `commit()` with your
+catalog's `Committer`:
 
 ```rust,ignore
-// transaction() moves the Box<dyn Committer> into the Transaction, and commit()
-// consumes the Transaction, so the boxed committer is gone by the time you need
-// to publish. Construct a second committer for publish() in Phase 3 and clone
-// any catalog-client state you need to keep in scope across both calls.
-let committer = Box::new(MyCatalogCommitter::new(
+use delta_kernel::transaction::Operation;
+
+// The transaction captures immutable write intent. The committer remains an
+// execution dependency supplied to commit(), so the same value can be reused
+// for publish() in Phase 3.
+let committer = MyCatalogCommitter::new(
     catalog_client.clone(),
     table_id.clone(),
-));
-let mut txn = snapshot
-    .transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+);
+let txn = snapshot
+    .transaction_builder()
+    .with_operation(Operation::Write)
+    .build(&engine)?;
 
 // Drive your Parquet writer from the write context, then hand the resulting
-// add-file metadata batch to the transaction. See the
+// add-file metadata batch to commit. See the
 // [Appending data](../writing/append.md) how-to for the full Parquet-writing flow.
 let write_context = txn.unpartitioned_write_context()?;
 // ... use write_context to produce add_metadata: Box<dyn EngineData>
 //     matching txn.add_files_schema() ...
-txn.add_files(add_metadata);
-
 // Commit the transaction. Kernel invokes committer.commit() internally; Phase 3
 // handles the result.
-let commit_result = txn.commit(&engine)?;
+let commit_result = txn.commit(&engine, &committer, add_metadata.into())?;
 ```
 
-The `?` on `txn.commit(&engine)?` only propagates non-recoverable errors. Successful
+The `?` on `txn.commit(&engine, &committer, add_metadata.into())?` only propagates
+non-recoverable errors. Successful
 commits, conflicts, and retryable I/O errors arrive as the three variants of
 `CommitResult` in the match below. Everything else (auth errors, catalog protocol
 errors, etc.) bubbles out directly.
@@ -117,15 +119,8 @@ match commit_result {
             .post_commit_snapshot()
             .ok_or_else(|| Error::generic("missing post-commit snapshot"))?;
 
-        // commit() consumed the Box<dyn Committer> from Phase 2. publish() only
-        // needs &dyn Committer, so construct a fresh instance here. This moves
-        // catalog_client and table_id; clone them if you need them for a retry
-        // loop around the whole write.
-        let publish_committer =
-            MyCatalogCommitter::new(catalog_client, table_id);
-
-        // Proceed to publish (Phase 4).
-        let published_snapshot = post_commit.publish(&engine, &publish_committer)?;
+        // commit() only borrowed the committer, so reuse it for publishing.
+        let published_snapshot = post_commit.publish(&engine, &committer)?;
     }
     CommitResult::ConflictedTransaction(conflicted) => {
         // Another writer already committed at this version.
@@ -133,11 +128,10 @@ match commit_result {
         // attempted. Rebase onto the new table state and retry.
     }
     CommitResult::RetryableTransaction(retryable) => {
-        // Transient I/O error. `retryable.error` gives the underlying cause;
-        // `retryable.transaction` is the original transaction you can retry
-        // without rebasing. Kernel reaches this arm only for `Error::IOError`
-        // variants; return other error kinds as-is rather than disguising
-        // them as IOError to force retry.
+        // Transient I/O error. `retryable.error` gives the underlying cause.
+        // Retry the exact prepared transaction and actions without rebasing.
+        let next_result = retryable.retry(&engine, &committer)?;
+        // Handle `next_result` with the same result loop.
     }
 }
 ```

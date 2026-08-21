@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
-use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
@@ -44,7 +43,7 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionConfig, TransactionOptions};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler};
 
@@ -735,14 +734,24 @@ fn validate_extract_table_features_and_properties(
 /// Use this to configure table properties before building a [`CreateTableTransaction`].
 /// If the table build fails, no transaction will be created.
 ///
+/// Existing-table-only intent is not available on this builder:
+///
+/// ```compile_fail
+/// use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
+///
+/// fn invalid(builder: CreateTableTransactionBuilder) {
+///     let _ = builder.with_blind_append();
+/// }
+/// ```
+///
 /// Created via [`create_table()`](super::super::create_table::create_table).
 pub struct CreateTableTransactionBuilder {
     path: String,
     schema: SchemaRef,
-    engine_info: String,
+    default_engine_info: String,
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
-    correlation_id: Option<Arc<str>>,
+    config: TransactionConfig,
 }
 
 impl CreateTableTransactionBuilder {
@@ -754,10 +763,10 @@ impl CreateTableTransactionBuilder {
         Self {
             path: path.as_ref().to_string(),
             schema,
-            engine_info: engine_info.into(),
+            default_engine_info: engine_info.into(),
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
-            correlation_id: None,
+            config: TransactionConfig::default(),
         }
     }
 
@@ -845,10 +854,24 @@ impl CreateTableTransactionBuilder {
         self
     }
 
-    /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
-    /// metric events to the caller's own request or operation id. An empty id is treated as unset.
-    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
-        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+    /// Replaces options that are valid for every transaction variant.
+    ///
+    /// If `options` omits engine information, the value supplied to
+    /// [`create_table`](super::super::create_table::create_table) is used.
+    pub fn with_options(mut self, options: TransactionOptions) -> Self {
+        self.config.set_options(options);
+        self
+    }
+
+    /// Set whether file actions supplied at commit represent a logical data change.
+    pub fn with_data_change(mut self, data_change: bool) -> Self {
+        self.config.set_data_change(data_change);
+        self
+    }
+
+    /// Acknowledge that the connector applies column defaults before writing.
+    pub fn ack_column_defaults(mut self) -> Self {
+        self.config.acknowledge_column_defaults();
         self
     }
 
@@ -874,7 +897,6 @@ impl CreateTableTransactionBuilder {
     /// # Arguments
     ///
     /// * `engine` - The engine instance to use for validation
-    /// * `committer` - The committer to use for the transaction
     ///
     /// # Errors
     ///
@@ -884,11 +906,7 @@ impl CreateTableTransactionBuilder {
     /// - The schema has `delta.invariants` metadata on any column
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
-    pub fn build(
-        self,
-        engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> DeltaResult<CreateTableTransaction> {
+    pub fn build(mut self, engine: &dyn Engine) -> DeltaResult<CreateTableTransaction> {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
@@ -977,14 +995,16 @@ impl CreateTableTransactionBuilder {
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
+        if self.config.options.engine_info.is_none() {
+            self.config.options.engine_info = Some(self.default_engine_info);
+        }
+
         // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(
             table_configuration,
-            self.engine_info,
-            committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
-            self.correlation_id,
+            self.config,
         )
     }
 }
@@ -1022,8 +1042,23 @@ mod tests {
             CreateTableTransactionBuilder::new("/path/to/table", schema.clone(), "TestApp/1.0");
 
         assert_eq!(builder.path, "/path/to/table");
-        assert_eq!(builder.engine_info, "TestApp/1.0");
+        assert_eq!(builder.default_engine_info, "TestApp/1.0");
+        assert!(builder.config.options.engine_info.is_none());
         assert!(builder.table_properties.is_empty());
+    }
+
+    #[test]
+    fn with_options_preserves_create_table_engine_info() {
+        let builder =
+            CreateTableTransactionBuilder::new("/path/to/table", test_schema(), "TestApp/1.0")
+                .with_options(TransactionOptions::new().with_correlation_id("request-1"));
+
+        assert_eq!(builder.default_engine_info, "TestApp/1.0");
+        assert!(builder.config.options.engine_info.is_none());
+        assert_eq!(
+            builder.config.options.correlation_id.as_deref(),
+            Some("request-1")
+        );
     }
 
     #[test]

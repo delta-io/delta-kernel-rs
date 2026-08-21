@@ -11,13 +11,13 @@ use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, Transaction
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{schema_ref, DataType, StructField};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, TransactionOptions};
 use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    assert_result_error_with_message, begin_transaction, create_add_files_metadata, insert_data,
-    insert_data_with, install_thread_local_metrics_reporter, test_table_setup_mt,
+    assert_result_error_with_message, create_add_files_metadata, insert_data, insert_data_with,
+    install_thread_local_metrics_reporter, test_table_setup_mt,
 };
 use url::Url;
 
@@ -54,8 +54,12 @@ fn setup_empty_table() -> DeltaResult<(tempfile::TempDir, Url)> {
     let (temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?
+        .build(setup_engine.as_ref())?
+        .commit(
+            setup_engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     Ok((temp_dir, table_url))
 }
@@ -112,9 +116,11 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let mut txn = begin_transaction(snap, engine.as_ref())?
+    let txn = snap
+        .transaction_builder()
         .with_operation("WRITE".to_string())
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine.as_ref())?;
     let add_files_schema = txn.add_files_schema();
     // Two separate add_files() calls -> two batches, four files total.
     let batches = vec![
@@ -127,12 +133,14 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
             ("f3.parquet", 1324, 1_000_003, Some(3)),
         ],
     ];
+    let mut actions = delta_kernel::transaction::CommitActions::new();
     for batch in batches {
         let metadata = create_add_files_metadata(add_files_schema, batch)
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-        txn.add_files(metadata);
+        actions.add_files(metadata);
     }
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+        .unwrap_committed();
 
     let success = reporter.take_success();
     assert_eq!(success.num_add_files, 4);
@@ -148,9 +156,13 @@ async fn commit_success_carries_correlation_id() -> DeltaResult<()> {
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .with_correlation_id("commit-req-1")
-        .commit(setup_engine.as_ref())?
+        .with_options(TransactionOptions::new().with_correlation_id("commit-req-1"))
+        .build(setup_engine.as_ref())?
+        .commit(
+            setup_engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let success = reporter.take_success();
@@ -177,11 +189,15 @@ async fn create_table_builder_carries_correlation_id(
 
     let mut builder = create_table(&table_path, simple_schema(), "Test/1.0");
     if let Some(id) = correlation_id {
-        builder = builder.with_correlation_id(id);
+        builder = builder.with_options(TransactionOptions::new().with_correlation_id(id));
     }
     builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let success = reporter.take_success();
@@ -205,8 +221,12 @@ async fn alter_table_builder_carries_correlation_id(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     // Install the reporter after the create commit so the captured event is the alter commit.
@@ -218,12 +238,16 @@ async fn alter_table_builder_carries_correlation_id(
     // Set the id in the `Ready` state (before `add_column`) to exercise the carry-through.
     let mut builder = snapshot.alter_table();
     if let Some(id) = correlation_id {
-        builder = builder.with_correlation_id(id);
+        builder = builder.with_options(TransactionOptions::new().with_correlation_id(id));
     }
     builder
         .add_column(StructField::nullable("extra", DataType::STRING))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build()?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let success = reporter.take_success();
@@ -317,15 +341,19 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count(
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
         .with_operation("UPDATE".to_string())
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine.as_ref())?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
 
     let mut paths_with_unmatched = file_paths.clone();
     paths_with_unmatched.push("missing.parquet".to_string());
     let mut scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
     assert_result_error_with_message(
-        txn.update_deletion_vectors(
+        actions.update_deletion_vectors(
             sequential_dv_descriptors(&paths_with_unmatched),
             scan_files.drain(..).map(Ok),
         ),
@@ -335,8 +363,9 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count(
     // A failed call with an unmatched path must not contribute its three matched files.
     let mut scan_files = get_scan_files(snapshot, engine.as_ref())?;
     let dv_map = sequential_dv_descriptors(&file_paths);
-    txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    actions.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
+    txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+        .unwrap_committed();
 
     let success = reporter.take_success();
     assert_eq!(success.num_dv_updates, 3);
@@ -360,9 +389,13 @@ async fn commit_dv_update_accumulates_file_count_across_calls(
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
         .with_operation("UPDATE".to_string())
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine.as_ref())?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
 
     // Each call re-derives scan files from the same snapshot and updates exactly one file, so
     // matched_dv_files is 1 per call and the accumulator must reach 2.
@@ -370,9 +403,10 @@ async fn commit_dv_update_accumulates_file_count_across_calls(
     for path in &file_paths {
         let mut scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
         let dv_map = std::iter::once((path.clone(), all_descriptors[path].clone())).collect();
-        txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
+        actions.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
     }
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+        .unwrap_committed();
 
     let success = reporter.take_success();
     assert_eq!(success.num_dv_updates, 2);

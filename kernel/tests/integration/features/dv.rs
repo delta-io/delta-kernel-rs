@@ -9,18 +9,19 @@ use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{BooleanArray, Int64Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::schema_ref;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, TransactionOptions};
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
     add_commit, create_add_files_metadata, create_default_engine_mt_executor, create_table,
-    engine_store_setup, generate_batch, into_record_batch, load_and_begin_transaction,
-    read_actions_from_commit, record_batch_to_bytes, IntoArray,
+    engine_store_setup, generate_batch, into_record_batch, read_actions_from_commit,
+    record_batch_to_bytes, IntoArray,
 };
 
 use crate::common::write_utils::{
@@ -192,9 +193,12 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
         write_parquet_file(&store, &table_url, "2", &data_batch_2).await?;
 
     // Step 2: Add both files to the table via a transaction
-    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-        .with_engine_info("test engine")
-        .with_operation("WRITE".to_string());
+    let txn = Snapshot::builder_for(table_url.clone())
+        .build(engine.as_ref())?
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test engine"))
+        .with_operation("WRITE".to_string())
+        .build(engine.as_ref())?;
 
     // Create add file metadata for both files
     let add_files_schema = txn.add_files_schema();
@@ -216,8 +220,11 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
         ],
     )?;
 
-    txn.add_files(add_metadata);
-    let commit_result = txn.commit(engine.as_ref())?;
+    let commit_result = txn.commit(
+        engine.as_ref(),
+        &FileSystemCommitter::new(),
+        add_metadata.into(),
+    )?;
     assert!(matches!(
         commit_result,
         CommitResult::CommittedTransaction(_)
@@ -242,7 +249,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     // Step 5: Update deletion vectors for first file only
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
     let write_context = txn.unpartitioned_write_context()?;
     let dv_descriptor_1 =
         write_deletion_vector_to_store(&store, &write_context, dv_file1_first, "").await?;
@@ -251,8 +258,9 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     let mut dv_map = HashMap::new();
     dv_map.insert(data_file_path_1.clone(), dv_descriptor_1);
 
-    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-    let commit_result = txn.commit(engine.as_ref())?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    let commit_result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?;
     assert!(matches!(
         commit_result,
         CommitResult::CommittedTransaction(_)
@@ -279,7 +287,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     // Step 8: Update deletion vectors for both files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
     let write_context = txn.unpartitioned_write_context()?;
 
     // Write deletion vectors for both files
@@ -294,19 +302,20 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     dv_map2.insert(data_file_path_2.clone(), dv_descriptor_2);
 
     // Test multiple calls
-    txn.update_deletion_vectors(
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.update_deletion_vectors(
         dv_map1,
         get_scan_files(snapshot.clone(), engine.as_ref())?
             .into_iter()
             .map(Ok),
     )?;
-    txn.update_deletion_vectors(
+    actions.update_deletion_vectors(
         dv_map2,
         get_scan_files(snapshot.clone(), engine.as_ref())?
             .into_iter()
             .map(Ok),
     )?;
-    let commit_result = txn.commit(engine.as_ref())?;
+    let commit_result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?;
     assert!(matches!(
         commit_result,
         CommitResult::CommittedTransaction(_)
@@ -419,15 +428,17 @@ async fn test_dv_update_stats_tight_bound(
     let mut dv = KernelDeletionVector::new();
     dv.add_deleted_row_indexes([3u64]);
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
     let write_context = txn.unpartitioned_write_context()?;
     let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
 
     let scan_files = get_scan_files(snapshot, engine.as_ref())?;
     let mut dv_map = HashMap::new();
     dv_map.insert(data_file_path.to_string(), dv_descriptor);
-    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+        .unwrap_committed();
 
     // The new AddFile must report tightBounds: false while preserving every other stats field.
     let v2_adds = read_actions_from_commit(&table_url, 2, "add")?;
