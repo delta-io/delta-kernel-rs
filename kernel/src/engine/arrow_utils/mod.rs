@@ -5,7 +5,7 @@ pub(crate) mod apply_schema;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -1424,25 +1424,8 @@ pub(crate) fn filter_to_record_batch(
 // we want to keep nulls in our partition map, so we end up with data in the log like:
 // {partitionValues:{"foo": null}}, which is what is generally expected. Without this we would
 // get: {partitionValues:{}}
-struct NullValueMapEncoder<'a> {
-    field: &'a ArrowFieldRef,
-    array: &'a MapArray,
-}
-
-impl<'a> Encoder for NullValueMapEncoder<'a> {
-    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
-        let options = EncoderOptions::default().with_explicit_nulls(true);
-        // this unwrap is technically unsafe, but we _know_ that the array is a MapArray, and that
-        // `make_encoder` won't return an error for that. It would still be nice if we could return
-        // a `Result`, but we cannot
-        #[allow(clippy::unwrap_used)]
-        let mut encoder = make_encoder(self.field, self.array, &options).unwrap();
-        encoder.encode(idx, out);
-    }
-}
-
 /// This is a special encoder factory that will use the default encoder for all array types except
-/// MapArrays. For MapArrays, it will make a `NullValueMapEncoder` which encodes the map preserving
+/// MapArrays. For MapArrays, it uses Arrow's map encoder with options preserving
 /// keys that have null values.
 #[derive(Debug)]
 struct NullValueMapEncoderFactory;
@@ -1454,22 +1437,39 @@ impl EncoderFactory for NullValueMapEncoderFactory {
         array: &'a dyn ArrowArray,
         _options: &'a EncoderOptions,
     ) -> Result<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
-        // It would be tempting to use `make_encoder` below, but we can't because we have to create
-        // a new `EncoderOptions` in order to set `with_explicit_nulls`. Then the lifetime of the
-        // created encoder becomes tied to the lifetime of the `EncoderOptions`, and we cannot
-        // return it from this method as the options would be freed here.  We _also_ can't put the
-        // options inside the NullValueMapEncoderFactory, because this method takes `&self` not
-        // `&'a self`, and we can't change that as it's part of the trait definition.
+        // `make_encoder` needs a new `EncoderOptions` in order to set `with_explicit_nulls`. The
+        // lifetime of the created encoder becomes tied to the lifetime of the `EncoderOptions`,
+        // and local options would be freed here. We also can't put the options inside the
+        // NullValueMapEncoderFactory, because this method takes `&self` not `&'a self`, and we
+        // can't change that as it's part of the trait definition. Static options satisfy the
+        // required lifetime. Building here returns Arrow errors because `Encoder::encode` cannot
+        // return a `Result`; a per-row wrapper would have to unwrap them.
         match array.data_type() {
             ArrowDataType::Map(_, _) => {
-                let array = array.as_map();
-                let encoder = NullValueMapEncoder { field, array };
-                let array_encoder = Box::new(encoder) as Box<dyn Encoder + 'a>;
-                let nulls = array.nulls().cloned();
-                Ok(Some(NullableEncoder::new(array_encoder, nulls)))
+                static MAP_OPTIONS: LazyLock<EncoderOptions> =
+                    LazyLock::new(|| EncoderOptions::default().with_explicit_nulls(true));
+                // A map with non-string keys is valid Arrow but unsupported by Arrow's JSON map
+                // encoder. If every map is null (for example, `[null, null]`), the JSON writer
+                // omits the field and never encodes a key, so preserve that generic behavior.
+                if array.null_count() == array.len() {
+                    let encoder = Box::new(NullMapPlaceholderEncoder);
+                    return Ok(Some(NullableEncoder::new(encoder, array.nulls().cloned())));
+                }
+                // The writer retains this encoder for the batch, avoiding reconstruction of its
+                // key and value encoders for every row.
+                make_encoder(field, array, &MAP_OPTIONS).map(Some)
             }
             _ => Ok(None),
         }
+    }
+}
+
+// Every row is null, so the JSON writer uses the null buffer without calling this placeholder.
+struct NullMapPlaceholderEncoder;
+
+impl Encoder for NullMapPlaceholderEncoder {
+    fn encode(&mut self, _idx: usize, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"null");
     }
 }
 
@@ -3991,7 +3991,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_we_encode_maps_with_null_values() {
+    fn encodes_map_rows_with_explicit_null_values() {
         let schema = ArrowSchema::new(vec![
             ArrowField::new("str_col", ArrowDataType::Utf8, false),
             ArrowField::new(
@@ -4010,19 +4010,30 @@ mod tests {
                     )),
                     false, // sorted
                 ),
-                false,
+                true,
             ),
         ]);
-        let s_array = StringArray::from(vec!["foo"]);
+        let s_array = StringArray::from(vec!["values", "empty", "null", "after_null"]);
 
         let string_builder = StringBuilder::new();
         let string_builder2 = StringBuilder::new();
         let mut map_builder = MapBuilder::new(None, string_builder, string_builder2);
 
-        // Append one entry: "bar" -> null
-        map_builder.keys().append_value("bar");
+        // Preserve a null value inside a non-null map as `"b": null`.
+        map_builder.keys().append_value("a");
+        map_builder.values().append_value("1");
+        map_builder.keys().append_value("b");
         map_builder.values().append_null();
-        map_builder.append(true).unwrap(); // finish the map row
+        map_builder.append(true).unwrap();
+
+        // An empty map emits `"map_col": {}`; a null map omits `map_col`.
+        map_builder.append(true).unwrap();
+        map_builder.append(false).unwrap();
+
+        // A non-null map after the null row verifies batch encoder reuse.
+        map_builder.keys().append_value("c");
+        map_builder.values().append_value("3");
+        map_builder.append(true).unwrap();
 
         let map_array: MapArray = map_builder.finish();
         let batch = RecordBatch::try_new(
@@ -4036,8 +4047,34 @@ mod tests {
         let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data)))).unwrap();
         assert_eq!(
             json,
-            "{\"str_col\":\"foo\",\"map_col\":{\"bar\":null}}\n".as_bytes()
+            concat!(
+                "{\"str_col\":\"values\",\"map_col\":{\"a\":\"1\",\"b\":null}}\n",
+                "{\"str_col\":\"empty\",\"map_col\":{}}\n",
+                "{\"str_col\":\"null\"}\n",
+                "{\"str_col\":\"after_null\",\"map_col\":{\"c\":\"3\"}}\n",
+            )
+            .as_bytes()
         );
+    }
+
+    #[test]
+    fn omits_map_field_when_all_rows_are_null_and_key_type_is_unsupported() {
+        let mut map_builder = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+        map_builder.append(false).unwrap();
+        let map_array = map_builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "map_col",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(batch));
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+        let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data)))).unwrap();
+
+        // This is the outer JSON row; the null `map_col` field is omitted.
+        assert_eq!(json, b"{}\n");
     }
 
     #[rstest]
