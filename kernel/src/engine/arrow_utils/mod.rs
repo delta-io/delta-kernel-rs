@@ -3482,9 +3482,7 @@ mod tests {
         }
     }
 
-    // A nullable list column with a non-nullable element struct and null rows: the outer column's
-    // nullability must survive reorder, else its null rows fail `StructArray::try_new`. `List`
-    // (i32 offsets) and `LargeList` (i64) take separate reorder arms, so cover both.
+    // Reorder must keep a nullable list column nullable, for both List and LargeList.
     #[rstest]
     #[case::list(false)]
     #[case::large_list(true)]
