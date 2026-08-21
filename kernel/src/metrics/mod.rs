@@ -4,9 +4,9 @@
 //! snapshot creation, scans, and transactions. Metrics are collected during operations
 //! and reported as events via the `MetricsReporter` trait.
 //!
-//! Each operation (Snapshot, Transaction, Scan) is assigned a unique operation ID ([`MetricId`])
-//! when it starts, and all subsequent events for that operation reference this ID.
-//! This allows reporters to correlate events and track operation lifecycles.
+//! Lifecycle, transaction, and scan events with an `operation_id` use [`MetricId`] for correlation.
+//! Handler and file-read events, including `_last_checkpoint` reads, are process-level and do not
+//! carry an operation ID.
 //!
 //! # Example: Implementing a Custom MetricsReporter
 //!
@@ -85,12 +85,13 @@ use std::sync::Arc;
 
 pub use events::{
     emit_json_read_completed, emit_parquet_read_completed, CommitFailureReason, CrcReadSuccess,
-    DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess,
-    LogSegmentLoadType, MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
-    ProtocolMetadataLoadSuccess, ProtocolMetadataSource, ScanMetadataCompleted, ScanType,
-    SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess,
-    SnapshotLoadMetricContext, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
-    TableType, TransactionCommitFailure, TransactionCommitSuccess,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LastCheckpointReadFailure,
+    LastCheckpointReadFailureReason, LastCheckpointReadSuccess, LogSegmentLoadFailure,
+    LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId, ParquetReadCompleted,
+    ProtocolMetadataLoadFailure, ProtocolMetadataLoadSuccess, ProtocolMetadataSource,
+    ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess, SnapshotBuildFailure,
+    SnapshotBuildSuccess, SnapshotLoadMetricContext, StorageCopyCompleted, StorageListCompleted,
+    StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,
 };
 pub(crate) use events::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,

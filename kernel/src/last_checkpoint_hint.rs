@@ -11,6 +11,8 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
+use crate::metrics::events::LAST_CHECKPOINT_READ_SPAN;
+use crate::metrics::LastCheckpointReadFailureReason;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
@@ -191,27 +193,44 @@ impl LastCheckpointHint {
     /// are assumed to cause failure.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
-    #[instrument(name = "last_checkpoint.read", skip_all, err)]
+    #[instrument(
+        name = LAST_CHECKPOINT_READ_SPAN,
+        skip_all,
+        fields(report, failure_reason),
+        err
+    )]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage.read_files(vec![(file_path, None)])?.next() {
+        let mut files = storage
+            .read_files(vec![(file_path, None)])
+            .inspect_err(|err| {
+                if matches!(err, Error::FileNotFound(_)) {
+                    record_read_failure(LastCheckpointReadFailureReason::NotFound);
+                }
+            })?;
+        match files.next() {
             Some(Ok(data)) => {
-                let result: Option<LastCheckpointHint> =
-                    Self::from_bytes_with_oversized_fields_dropped(&data)
-                        .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-                        .ok();
+                let result = Self::from_bytes_with_oversized_fields_dropped(&data)
+                    .map(Some)
+                    .unwrap_or_else(|e| {
+                        record_read_failure(LastCheckpointReadFailureReason::Invalid);
+                        warn!("invalid _last_checkpoint JSON: {e}");
+                        None
+                    });
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
             Some(Err(Error::FileNotFound(_))) => {
+                record_read_failure(LastCheckpointReadFailureReason::NotFound);
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
             Some(Err(err)) => Err(err),
             None => {
+                record_read_failure(LastCheckpointReadFailureReason::Invalid);
                 warn!("empty _last_checkpoint file");
                 Ok(None)
             }
@@ -233,14 +252,120 @@ impl LastCheckpointHint {
     }
 }
 
+fn record_read_failure(reason: LastCheckpointReadFailureReason) {
+    tracing::Span::current().record("failure_reason", reason.as_ref());
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
     use rstest::rstest;
 
     use super::*;
+    use crate::metrics::MetricEvent;
     use crate::schema::schema;
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::create_log_path;
+    use crate::unit_test_utils::{
+        create_log_path, install_thread_local_metrics_reporter, CapturingReporter,
+    };
+
+    #[derive(Debug, Clone, Copy)]
+    enum ReadBehavior {
+        TopLevelError,
+        TopLevelFileNotFound,
+        IteratorError,
+        EmptyIterator,
+    }
+
+    #[derive(Debug)]
+    struct ReadBehaviorStorage(ReadBehavior);
+
+    impl StorageHandler for ReadBehaviorStorage {
+        fn list_from(
+            &self,
+            _path: &Url,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn read_files(
+            &self,
+            _files: Vec<crate::FileSlice>,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+            match self.0 {
+                ReadBehavior::TopLevelError => Err(Error::generic("top-level read failure")),
+                ReadBehavior::TopLevelFileNotFound => {
+                    Err(Error::file_not_found("_last_checkpoint"))
+                }
+                ReadBehavior::IteratorError => Ok(Box::new(std::iter::once(Err(Error::generic(
+                    "iterator read failure",
+                ))))),
+                ReadBehavior::EmptyIterator => Ok(Box::new(std::iter::empty())),
+            }
+        }
+
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+            unreachable!("not exercised by LastCheckpointHint::try_read")
+        }
+
+        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> DeltaResult<()> {
+            unreachable!("not exercised by LastCheckpointHint::try_read")
+        }
+
+        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+            unreachable!("not exercised by LastCheckpointHint::try_read")
+        }
+
+        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+            unreachable!("not exercised by LastCheckpointHint::try_read")
+        }
+    }
+
+    #[rstest]
+    #[case::top_level_error(
+        ReadBehavior::TopLevelError,
+        LastCheckpointReadFailureReason::Error,
+        true
+    )]
+    #[case::top_level_file_not_found(
+        ReadBehavior::TopLevelFileNotFound,
+        LastCheckpointReadFailureReason::NotFound,
+        true
+    )]
+    #[case::iterator_error(
+        ReadBehavior::IteratorError,
+        LastCheckpointReadFailureReason::Error,
+        true
+    )]
+    #[case::empty_iterator(
+        ReadBehavior::EmptyIterator,
+        LastCheckpointReadFailureReason::Invalid,
+        false
+    )]
+    fn read_storage_branches_emit_one_failure(
+        #[case] behavior: ReadBehavior,
+        #[case] expected_reason: LastCheckpointReadFailureReason,
+        #[case] expected_error: bool,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let storage = ReadBehaviorStorage(behavior);
+        let log_root = Url::parse("memory:///_delta_log/").unwrap();
+
+        let result = LastCheckpointHint::try_read(&storage, &log_root);
+        assert_eq!(result.is_err(), expected_error);
+        let reasons: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::LastCheckpointReadFailure(event) => Some(event.reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, [expected_reason]);
+    }
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
     /// `path` and file metadata. An empty `sidecarFiles` (a leaf checkpoint) parses to `Some([])`,
