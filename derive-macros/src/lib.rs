@@ -467,8 +467,21 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         Ok(fields) => fields,
         Err(e) => return e.to_compile_error().into(),
     };
-    let (field_idents, field_types): (Vec<_>, Vec<_>) =
-        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
+
+    let (field_types, field_values): (Vec<_>, Vec<_>) = fields
+        .iter()
+        .map(|f: &&Field| {
+            let ident: &Option<Ident> = &f.ident;
+            let value: TokenStream = if has_named_attr(&f.attrs, "allow_null_container_values") {
+                quote! {
+                    delta_kernel::expressions::Scalar::from(value.#ident).with_nullable_container_values()
+                }
+            } else {
+                quote! { value.#ident.into()}
+            };
+            (&f.ty, value)
+        })
+        .unzip();
 
     let expanded = quote! {
         #[automatically_derived]
@@ -480,7 +493,7 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
             fn from(value: #struct_name) -> Self {
                 Self::from_values_unchecked(
                     <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
-                    vec![ #(value.#field_idents.into()),* ],
+                    vec![ #(#field_values),* ],
                 )
             }
         }
@@ -674,6 +687,23 @@ mod tests {
         let tokens = gen_schema_fields(&input.data, input.ident.span())
             .unwrap_or_else(|e| e.to_compile_error());
         Ok(tokens.to_string())
+    }
+
+    #[rstest]
+    #[case::enum_input("enum E { A }")]
+    #[case::tuple_struct("struct S(i32);")]
+    #[case::unit_struct("struct S;")]
+    fn schema_fields_rejects_non_named_structs(#[case] input: &str) {
+        let input = syn::parse_str::<DeriveInput>(input).unwrap();
+        // This is the exact `Err` the `IntoStructData` derive forwards via
+        // `e.to_compile_error().into()`.
+        let err = schema_fields(&input.data, "IntoStructData", input.ident.span()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("IntoStructData can only be derived for structs with named fields"),
+            "found: {err}"
+        );
+        assert!(err.to_compile_error().to_string().contains("compile_error"));
     }
 
     #[test]

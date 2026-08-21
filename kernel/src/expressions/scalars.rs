@@ -402,6 +402,24 @@ impl Scalar {
         Self::Null(data_type.into())
     }
 
+    /// Set a map scalar's `value_contains_null` to true, so a value built for an
+    /// `#[allow_null_container_values]` field matches the value-nullable type `ToSchema` declares.
+    /// Non-map scalars are returned unchanged.
+    #[internal_api]
+    pub(crate) fn with_nullable_container_values(self) -> Self {
+        match self {
+            Self::Map(mut data) => {
+                data.data_type.value_contains_null = true;
+                Self::Map(data)
+            }
+            Self::Null(DataType::Map(mut map_type)) => {
+                map_type.value_contains_null = true;
+                Self::Null(DataType::Map(map_type))
+            }
+            other => other,
+        }
+    }
+
     /// Constructs a Decimal value from raw parts
     pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;
@@ -2239,6 +2257,37 @@ mod tests {
         values.swap(0, 2);
         let reordered = StructData::try_new(fields, values).unwrap();
         assert_eq!(Person::try_from(reordered).unwrap(), person);
+    }
+
+    #[rstest]
+    #[case::present(Some(HashMap::from([("k".to_string(), "v".to_string())])))]
+    #[case::absent(None)]
+    fn into_struct_data_marks_allow_null_container_values_map_as_value_nullable(
+        #[case] tags: Option<HashMap<String, String>>,
+    ) {
+        #[derive(ToSchema, IntoStructData)]
+        struct HasNullableMap {
+            #[allow_null_container_values]
+            tags: Option<HashMap<String, String>>,
+        }
+
+        let Scalar::Struct(data) = Scalar::from(HasNullableMap { tags }) else {
+            unreachable!()
+        };
+
+        // The value's map type matches the schema field's (both value-nullable), so the struct is
+        // self-consistent and `try_new` accepts it.
+        assert_eq!(&data.values()[0].data_type(), data.fields()[0].data_type());
+        let (fields, values) = data.into_parts();
+        StructData::try_new(fields, values).unwrap();
+    }
+
+    #[rstest]
+    #[case::integer(Scalar::from(1i32))]
+    #[case::string(Scalar::from("s"))]
+    #[case::null_integer(Scalar::Null(DataType::INTEGER))]
+    fn with_nullable_container_values_leaves_non_map_scalars_unchanged(#[case] scalar: Scalar) {
+        assert_eq!(scalar.clone().with_nullable_container_values(), scalar);
     }
 
     #[test]
