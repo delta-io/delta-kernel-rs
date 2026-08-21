@@ -1040,7 +1040,7 @@ fn reorder_list<O: OffsetSizeTrait>(
         let new_list_field = Arc::new(ArrowField::new_struct(
             list_values_field.name(),
             result_array.fields().clone(),
-            list_values_field.is_nullable(),
+            result_array.is_nullable(),
         ));
         let new_field = Arc::new(ArrowField::new_list(
             input_field_name,
