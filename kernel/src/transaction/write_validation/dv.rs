@@ -263,7 +263,7 @@ mod tests {
                         .into_iter()
                         .collect();
                     make_staged_dv_from_addfile(
-                        nullable_add_files(&["same"]),
+                        nullable_add_files(&["path"]),
                         &[if batch_index == 0 {
                             "new-dv-0"
                         } else {
@@ -275,7 +275,7 @@ mod tests {
                 .collect::<Vec<_>>()
         } else {
             vec![make_staged_dv_from_addfile(
-                nullable_add_files(&["same", "same"]),
+                nullable_add_files(&["path", "path"]),
                 &["new-dv-0", "new-dv-1"],
                 selection_vector.to_vec(),
             )]

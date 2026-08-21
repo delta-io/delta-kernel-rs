@@ -149,48 +149,48 @@ mod tests {
     #[rstest]
     #[case::duplicate_add_different_dv(
         &[
-            FileActionCase::new(TestFileAction::Add, "same", Some("dv-1")),
-            FileActionCase::new(TestFileAction::Add, "same", Some("dv-2")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv-1")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv-2")),
         ],
         Some("multiple AddFile actions"),
     )]
     #[case::duplicate_remove_different_dv(
         &[
-            FileActionCase::new(TestFileAction::Remove, "same", Some("dv-1")),
-            FileActionCase::new(TestFileAction::Remove, "same", Some("dv-2")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv-1")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv-2")),
         ],
         Some("multiple RemoveFile actions"),
     )]
     #[case::add_remove_same_dv(
         &[
-            FileActionCase::new(TestFileAction::Add, "same", Some("dv")),
-            FileActionCase::new(TestFileAction::Remove, "same", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv")),
         ],
         Some("same deletion vector ID"),
     )]
     #[case::remove_add_same_dv(
         &[
-            FileActionCase::new(TestFileAction::Remove, "same", None),
-            FileActionCase::new(TestFileAction::Add, "same", None),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", None),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", None),
         ],
         Some("same deletion vector ID"),
     )]
     #[case::add_remove_different_dv(
         &[
-            FileActionCase::new(TestFileAction::Add, "same", Some("dv-1")),
-            FileActionCase::new(TestFileAction::Remove, "same", Some("dv-2")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv-1")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv-2")),
         ],
         None,
     )]
     #[case::same_dv_different_paths(
         &[
-            FileActionCase::new(TestFileAction::Add, "first", Some("dv")),
-            FileActionCase::new(TestFileAction::Add, "second", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "first", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "second", Some("dv")),
         ],
         None,
     )]
     fn file_action_combinations_accepted_or_rejected(
-        #[case] file_actions: &[FileActionCase],
+        #[case] file_actions: &[FileActionTrackerTestCase],
         #[case] expected_error: Option<&str>,
     ) {
         let mut tracker = FileActionTracker::default();
@@ -206,12 +206,12 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum TestFileAction {
+    enum TestFileActionType {
         Add,
         Remove,
     }
 
-    impl TestFileAction {
+    impl TestFileActionType {
         fn record(
             self,
             tracker: &mut FileActionTracker,
@@ -226,15 +226,15 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct FileActionCase {
-        action_type: TestFileAction,
+    struct FileActionTrackerTestCase {
+        action_type: TestFileActionType,
         path: &'static str,
         dv_id: Option<&'static str>,
     }
 
-    impl FileActionCase {
+    impl FileActionTrackerTestCase {
         const fn new(
-            action_type: TestFileAction,
+            action_type: TestFileActionType,
             path: &'static str,
             dv_id: Option<&'static str>,
         ) -> Self {

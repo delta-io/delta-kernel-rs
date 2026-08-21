@@ -133,28 +133,25 @@ mod tests {
     }
 
     #[rstest]
-    #[case::same_batch(false, None)]
-    #[case::different_batches(true, None)]
-    #[case::different_dv_id(false, Some("existing-dv"))]
+    #[case::same_batch(&[&["path", "path"][..]], None)]
+    #[case::different_batches(&[&["path"][..], &["path"][..]], None)]
+    #[case::different_dv_id(&[&["path"][..]], Some(("path", "existing-dv")))]
     fn duplicate_add_file_paths_rejected(
-        #[case] different_batches: bool,
-        #[case] existing_dv_id: Option<&str>,
+        #[case] batch_paths: &[&[&str]],
+        #[case] existing_add: Option<(&str, &str)>,
     ) {
-        let batches = if existing_dv_id.is_some() {
-            vec![nullable_add_files(&["same"])]
-        } else if different_batches {
-            vec![nullable_add_files(&["same"]), nullable_add_files(&["same"])]
-        } else {
-            vec![nullable_add_files(&["same", "same"])]
-        };
+        let batches = batch_paths
+            .iter()
+            .map(|paths| nullable_add_files(paths))
+            .collect::<Vec<_>>();
         let adds: Vec<Box<dyn EngineData>> = batches
             .into_iter()
             .map(|batch| Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
             .collect();
         let mut existing_file_actions = FileActionTracker::default();
-        if let Some(dv_id) = existing_dv_id {
+        if let Some((path, dv_id)) = existing_add {
             existing_file_actions
-                .record_add("same", Some(dv_id.to_owned()))
+                .record_add(path, Some(dv_id.to_owned()))
                 .expect("first AddFile should be accepted");
         }
 

@@ -641,21 +641,21 @@ pub fn deletion_vector_array(
                     .iter()
                     .map(|path| path.map(|_| storage_type))
                     .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(paths_or_inline_dvs.to_vec())),
-            Arc::new(Int32Array::from(vec![None; row_count])),
+            )), // storageType
+            Arc::new(StringArray::from(paths_or_inline_dvs.to_vec())), // pathOrInlineDv
+            Arc::new(Int32Array::from(vec![None; row_count])),         // offset
             Arc::new(Int32Array::from(
                 paths_or_inline_dvs
                     .iter()
                     .map(|path| path.map(|_| 1))
                     .collect::<Vec<_>>(),
-            )),
+            )), // sizeInBytes
             Arc::new(Int64Array::from(
                 paths_or_inline_dvs
                     .iter()
                     .map(|path| path.map(|_| 1))
                     .collect::<Vec<_>>(),
-            )),
+            )), // cardinality
         ],
         Some(NullBuffer::from(
             paths_or_inline_dvs
