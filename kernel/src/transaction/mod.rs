@@ -1796,6 +1796,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use super::schema_evolution::SchemaOperation;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
     use crate::arrow::array::{
