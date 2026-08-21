@@ -199,7 +199,7 @@ use delta_kernel::schema::{
     schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
-use delta_kernel::transaction::{CommitResult, Transaction};
+use delta_kernel::transaction::{CommitActions, CommitResult, Transaction, TransactionOptions};
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, DeltaResult,
     DeltaResultIterator, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta,
@@ -1102,27 +1102,30 @@ pub async fn insert_data_with<E: TaskExecutor>(
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-    let mut txn = snapshot
-        .transaction(committer, engine.as_ref())?
+    let mut builder = snapshot
+        .transaction_builder()
         .with_operation(operation.to_string())
-        .with_data_change(data_change);
-    txn.ack_column_defaults();
+        .with_data_change(data_change)
+        .ack_column_defaults();
     if is_blind_append {
-        txn = txn.with_blind_append();
+        builder = builder.with_blind_append();
     }
+    let txn = builder.build(engine.as_ref())?;
 
     let write_context = txn.unpartitioned_write_context()?;
     let add_files_metadata = engine
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
-    txn.add_files(add_files_metadata);
-
-    txn.commit(engine.as_ref())
+    txn.commit(
+        engine.as_ref(),
+        committer.as_ref(),
+        CommitActions::from(add_files_metadata),
+    )
 }
 
-/// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
+/// Starts a transaction using the passed snapshot.
 pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<Transaction> {
-    snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)
+    snapshot.transaction_builder().build(engine)
 }
 
 /// A catalog [`Committer`] for tests: writes every commit directly to the published Delta log
@@ -1155,7 +1158,7 @@ impl Committer for TestCatalogCommitter {
     }
 }
 
-/// Load latest snapshot from `table_url` and start a transaction using a [`FileSystemCommitter`].
+/// Load the latest snapshot from `table_url` and start a transaction.
 ///
 /// Convenience for the common test pattern of building a fresh snapshot just to start a
 /// transaction, when the snapshot itself is not needed afterward.
@@ -1518,12 +1521,13 @@ pub async fn write_batch_to_table(
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut txn = snapshot
+    let txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_engine_info("DefaultEngine")
-        .with_data_change(true);
-    txn.ack_column_defaults();
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("DefaultEngine"))
+        .with_data_change(true)
+        .ack_column_defaults()
+        .build(engine)?;
     let write_context = if txn.logical_partition_columns().is_empty() {
         assert!(
             partition_values.is_empty(),
@@ -1536,8 +1540,7 @@ pub async fn write_batch_to_table(
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
-    txn.add_files(add_meta);
-    match txn.commit(engine)? {
+    match txn.commit(engine, &FileSystemCommitter::new(), add_meta.into())? {
         delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
             .post_commit_snapshot()
             .expect("Failed to get post_commit_snapshot")
@@ -1832,8 +1835,12 @@ pub fn create_table_and_load_snapshot(
 
     let _ = create_table(table_path, schema, "Test/1.0")
         .with_table_properties(properties.to_vec())
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+        .build(engine)?
+        .commit(
+            engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
 
     let table_url = delta_kernel::try_parse_uri(table_path)?;
     Snapshot::builder_for(table_url).build(engine)
@@ -1997,15 +2004,17 @@ pub fn remove_all_and_get_remove_actions(
     let scan = snapshot.clone().scan_builder().build()?;
     let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
 
-    let mut txn = snapshot
+    let txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_engine_info("DefaultEngine")
-        .with_data_change(true);
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("DefaultEngine"))
+        .with_data_change(true)
+        .build(engine)?;
+    let mut actions = CommitActions::new();
     for sm in all_scan_metadata {
-        txn.remove_files(sm.scan_files);
+        actions.remove_files(sm.scan_files);
     }
-    let committed = match txn.commit(engine)? {
+    let committed = match txn.commit(engine, &FileSystemCommitter::new(), actions)? {
         CommitResult::CommittedTransaction(c) => c,
         _ => panic!("Transaction should be committed"),
     };

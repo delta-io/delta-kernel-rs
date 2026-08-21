@@ -37,19 +37,22 @@ The pattern for partitioned writes is: **group your data by partition values, cr
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::Scalar;
+# use delta_kernel::transaction::Operation;
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/partitioned_table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
-let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_data_change(true);
+let txn = snapshot
+    .transaction_builder()
+    .with_operation(Operation::Write)
+    .with_data_change(true)
+    .build(&engine)?;
 
 // Build the write state before iterating over partitions.
 let write_state = txn.write_state()?;
+let mut actions = delta_kernel::transaction::CommitActions::new();
 
 // Suppose you have data grouped by partition values already.
 let partitions: Vec<(HashMap<String, Scalar>, RecordBatch)> = todo!("group your data");
@@ -62,15 +65,21 @@ for (partition_values, batch) in partitions {
     let data = ArrowEngineData::new(batch);
     let file_metadata = engine.write_parquet(&data, &wc).await?;
 
-    // 3. Register the written file
-    txn.add_files(file_metadata);
+    // 3. Collect the written file metadata
+    actions.add_files(file_metadata);
 }
 
 // Commit all partitions in a single transaction
-txn.commit(&engine)?;
+txn.commit(&engine, &FileSystemCommitter::new(), actions)?;
 # Ok(())
 # }
 ```
+
+Each `BoundWriteContext` is temporary writer-local state for one partition. The coordinator keeps
+the returned file metadata, not the contexts themselves. Once all worker results are collected,
+`CommitActions` holds that metadata and Kernel combines it with the immutable transaction as a
+`PreparedCommit`. That executable value is retained after a retryable failure. A conflict retains
+the inputs in a non-executable state until the transaction is rebuilt against a fresh snapshot.
 
 Each `partitioned_write_context` call takes a `HashMap<String, Scalar>` mapping logical
 partition column names to typed values:

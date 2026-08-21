@@ -73,6 +73,7 @@ use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::CommitActions;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
@@ -1321,8 +1322,12 @@ impl TestTableBuilder {
         let mut stale_hint_bytes: Option<Vec<u8>> = None;
 
         let mut snapshot = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref())?
+            .commit(
+                engine.as_ref(),
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new(),
+            )?
             .unwrap_post_commit_snapshot();
 
         let crcs_at = self.log_state.crcs_at();
@@ -1447,10 +1452,12 @@ async fn write_data_commit<E: TaskExecutor>(
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+    let txn = snapshot
+        .transaction_builder()
         .with_operation("WRITE".to_string())
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine)?;
+    let mut actions = CommitActions::new();
 
     let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
 
@@ -1493,10 +1500,10 @@ async fn write_data_commit<E: TaskExecutor>(
         let add_files = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
-        txn.add_files(add_files);
+        actions.add_files(add_files);
     }
 
-    txn.commit(engine)
+    txn.commit(engine, &FileSystemCommitter::new(), actions)
 }
 
 /// Generate a single column of data based on its Arrow type.

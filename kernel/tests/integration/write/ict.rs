@@ -4,17 +4,18 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, TransactionOptions};
 use delta_kernel::Snapshot;
 use tempfile::TempDir;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
-use test_utils::{engine_store_setup, load_and_begin_transaction};
+use test_utils::engine_store_setup;
 use url::Url;
 
 use crate::common::write_utils::get_simple_int_schema;
@@ -52,25 +53,22 @@ async fn get_ict_at_version(
     Ok(ict)
 }
 
-/// Helper function to generate a simple data file and add it to the transaction
-/// This simplifies repetitive data generation in tests
-async fn generate_and_add_data_file(
-    txn: &mut delta_kernel::transaction::Transaction,
+/// Helper function to generate simple data-file metadata.
+async fn generate_data_file(
+    txn: &delta_kernel::transaction::Transaction,
     engine: &DefaultEngine<TokioBackgroundExecutor>,
     schema: SchemaRef,
     values: Vec<i32>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
     let data = RecordBatch::try_new(
         Arc::new(schema.as_ref().try_into_arrow()?),
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
     let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
-    let file_meta = engine
+    Ok(engine
         .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
-        .await?;
-    txn.add_files(file_meta);
-    Ok(())
+        .await?)
 }
 
 #[tokio::test]
@@ -108,14 +106,17 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut txn =
-        load_and_begin_transaction(table_url.clone(), &engine)?.with_engine_info("ict test");
+    let txn = Snapshot::builder_for(table_url.clone())
+        .build(&engine)?
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("ict test"))
+        .build(&engine)?;
 
     // Add some data
-    generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
+    let file_meta = generate_data_file(&txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
 
     // First commit
-    let commit_result = txn.commit(&engine)?;
+    let commit_result = txn.commit(&engine, &FileSystemCommitter::new(), file_meta.into())?;
     match commit_result {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(
@@ -153,14 +154,17 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut txn2 =
-        load_and_begin_transaction(table_url.clone(), &engine)?.with_engine_info("ict test 2");
+    let txn2 = Snapshot::builder_for(table_url.clone())
+        .build(&engine)?
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("ict test 2"))
+        .build(&engine)?;
 
     // Add more data
-    generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;
+    let file_meta = generate_data_file(&txn2, &engine, schema, vec![4, 5, 6]).await?;
 
     // Second commit
-    let commit_result2 = txn2.commit(&engine)?;
+    let commit_result2 = txn2.commit(&engine, &FileSystemCommitter::new(), file_meta.into())?;
     match commit_result2 {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(

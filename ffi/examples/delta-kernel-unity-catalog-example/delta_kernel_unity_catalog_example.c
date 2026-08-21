@@ -219,14 +219,15 @@ int main(int argc, char* argv[])
 
     SharedSnapshot* snapshot = snapshot_res.ok;
 
-    // Create a transaction with the UC committer
+    // Create a transaction from the catalog-aware snapshot. The committer is supplied at commit.
     ExternResultHandleExclusiveTransaction txn_res =
-      transaction_with_committer(snapshot, engine, uc_committer);
+      transaction_from_snapshot(snapshot, engine);
 
     if (txn_res.tag != OkHandleExclusiveTransaction) {
         print_error("Failed to create transaction with UC committer", (Error*)txn_res.err);
         free_error((Error*)txn_res.err);
         free_engine(engine);
+        free_uc_committer(uc_committer);
         free_uc_commit_client(uc_client);
         free_snapshot(snapshot);
         return -1;
@@ -247,6 +248,7 @@ int main(int argc, char* argv[])
         print_error("Failed to set engine info", (Error*)txn_with_info_res.err);
         free_error((Error*)txn_with_info_res.err);
         free_engine(engine);
+        free_uc_committer(uc_committer);
         free_uc_commit_client(uc_client);
         free_snapshot(snapshot);
         return -1;
@@ -254,9 +256,10 @@ int main(int argc, char* argv[])
 
     HandleExclusiveTransaction txn_with_info = txn_with_info_res.ok;
     // calling commit here will end up calling our callback
-    ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn_with_info, engine);
+    ExternResultHandleExclusiveCommitResult commit_res =
+        commit_with_committer(txn_with_info, uc_committer, engine);
 
-    if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
+    if (commit_res.tag != OkHandleExclusiveCommitResult) {
         print_error("Commit failed", (Error*)commit_res.err);
         free_error((Error*)commit_res.err);
         free_engine(engine);
@@ -265,13 +268,33 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    HandleExclusiveCommittedTransaction committed = commit_res.ok;
+    HandleExclusiveCommitResult result = commit_res.ok;
+    if (commit_result_kind(&result) != Committed) {
+        fprintf(stderr, "Commit did not succeed; result kind: %d\n",
+                commit_result_kind(&result));
+        free_commit_result(result);
+        free_engine(engine);
+        free_uc_commit_client(uc_client);
+        free_snapshot(snapshot);
+        return -1;
+    }
+    ExternResultHandleExclusiveCommittedTransaction committed_res =
+        commit_result_into_committed(result, engine);
+    if (committed_res.tag != OkHandleExclusiveCommittedTransaction) {
+        print_error("Failed to extract committed transaction", (Error*)committed_res.err);
+        free_error((Error*)committed_res.err);
+        free_engine(engine);
+        free_uc_commit_client(uc_client);
+        free_snapshot(snapshot);
+        return -1;
+    }
+    HandleExclusiveCommittedTransaction committed = committed_res.ok;
     printf("\nCommitted version: %lu\n",
            (unsigned long)committed_transaction_version(&committed));
     free_committed_transaction(committed);
 
     // Cleanup
-    // Note: txn_with_info was consumed by commit(), so we don't free it
+    // Note: txn_with_info and uc_committer were consumed by commit_with_committer().
     free_engine(engine);
     free_uc_commit_client(uc_client);
     free_snapshot(snapshot);

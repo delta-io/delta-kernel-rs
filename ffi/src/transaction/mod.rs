@@ -13,11 +13,13 @@ pub use deletion_vector::{
 };
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::transaction::create_table::{
-    CreateTableTransaction, CreateTableTransactionBuilder,
-};
+use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::{CommitResult, CommittedTransaction, Transaction};
+use delta_kernel::transaction::{
+    CommitActions, CommitResult, CommittedTransaction, ConflictedTransaction, CreateTable,
+    PreparedCommit, Transaction, TransactionBuilder, TransactionOptions,
+};
+use delta_kernel::Engine;
 use delta_kernel_ffi_macros::handle_descriptor;
 pub use partition_value::{
     free_partition_value_map, partition_value_map_insert_binary, partition_value_map_insert_bool,
@@ -40,19 +42,157 @@ use crate::{
     TryFromStringSlice, Url,
 };
 
+/// Internal FFI adapter that retains actions staged through the C transaction API.
+#[doc(hidden)]
+pub struct FfiTransaction {
+    builder: Option<TransactionBuilder>,
+    transaction: Option<Transaction>,
+    options: TransactionOptions,
+    actions: CommitActions,
+}
+
+impl FfiTransaction {
+    fn new(builder: TransactionBuilder) -> Self {
+        Self {
+            builder: Some(builder),
+            transaction: None,
+            options: TransactionOptions::new(),
+            actions: CommitActions::new(),
+        }
+    }
+
+    pub(super) fn update_builder(
+        &mut self,
+        update: impl FnOnce(TransactionBuilder) -> TransactionBuilder,
+    ) -> DeltaResult<()> {
+        let builder = self.builder.take().ok_or_else(|| {
+            delta_kernel::Error::generic(
+                "transaction configuration cannot change after the transaction is frozen",
+            )
+        })?;
+        self.builder = Some(update(builder));
+        Ok(())
+    }
+
+    pub(super) fn update_options(
+        &mut self,
+        update: impl FnOnce(TransactionOptions) -> TransactionOptions,
+    ) -> DeltaResult<()> {
+        if self.builder.is_none() {
+            return Err(delta_kernel::Error::generic(
+                "transaction configuration cannot change after the transaction is frozen",
+            ));
+        }
+        self.options = update(std::mem::take(&mut self.options));
+        Ok(())
+    }
+
+    pub(super) fn transaction(&mut self, engine: &dyn Engine) -> DeltaResult<&Transaction> {
+        if self.transaction.is_none() {
+            let builder = self.builder.as_ref().ok_or_else(|| {
+                delta_kernel::Error::generic("transaction has no builder or frozen state")
+            })?;
+            let transaction = builder
+                .clone()
+                .with_options(self.options.clone())
+                .build(engine)?;
+            self.builder = None;
+            self.options = TransactionOptions::new();
+            self.transaction = Some(transaction);
+        }
+        self.transaction.as_ref().ok_or_else(|| {
+            delta_kernel::Error::generic("transaction has no builder or frozen state")
+        })
+    }
+
+    fn into_parts(mut self, engine: &dyn Engine) -> DeltaResult<(Transaction, CommitActions)> {
+        self.transaction(engine)?;
+        let transaction = self.transaction.take().ok_or_else(|| {
+            delta_kernel::Error::generic("transaction has no builder or frozen state")
+        })?;
+        Ok((transaction, self.actions))
+    }
+
+    fn validate_commit(
+        &mut self,
+        engine: &dyn Engine,
+        committer: &dyn Committer,
+    ) -> DeltaResult<()> {
+        self.transaction(engine)?;
+        let transaction = self.transaction.as_ref().ok_or_else(|| {
+            delta_kernel::Error::generic("transaction has no builder or frozen state")
+        })?;
+        transaction.validate_commit_actions(&self.actions)?;
+        transaction.validate_committer(committer)
+    }
+}
+
+#[doc(hidden)]
+pub enum FfiPreparedCommit {
+    Existing(PreparedCommit),
+    Create(PreparedCommit<CreateTable>),
+}
+
+#[doc(hidden)]
+pub enum FfiConflictedCommit {
+    Existing(ConflictedTransaction),
+    Create(ConflictedTransaction<CreateTable>),
+}
+
+#[doc(hidden)]
+pub enum FfiCommitResult {
+    Committed(CommittedTransaction),
+    Conflicted {
+        conflicted_commit: FfiConflictedCommit,
+        conflict_version: u64,
+    },
+    Retryable {
+        prepared_commit: FfiPreparedCommit,
+    },
+}
+
+/// Internal FFI adapter that retains actions staged for a frozen create-table transaction.
+#[doc(hidden)]
+pub struct FfiCreateTableTransaction {
+    transaction: Transaction<CreateTable>,
+    actions: CommitActions<CreateTable>,
+}
+
+impl FfiCreateTableTransaction {
+    fn new(transaction: Transaction<CreateTable>) -> Self {
+        Self {
+            transaction,
+            actions: CommitActions::new(),
+        }
+    }
+
+    pub(super) fn transaction(&self) -> &Transaction<CreateTable> {
+        &self.transaction
+    }
+
+    fn into_parts(self) -> (Transaction<CreateTable>, CommitActions<CreateTable>) {
+        (self.transaction, self.actions)
+    }
+
+    fn validate_commit(&self, committer: &dyn Committer) -> DeltaResult<()> {
+        self.transaction.validate_commit_actions(&self.actions)?;
+        self.transaction.validate_committer(committer)
+    }
+}
+
 /// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
 ///
-/// Returned by [`transaction`] and [`transaction_with_committer`]. Supports all transaction
-/// operations including existing-table-only operations like blind append and file removal.
-#[handle_descriptor(target=Transaction, mutable=true, sized=true)]
+/// Returned by [`transaction`]. Supports all transaction operations including
+/// existing-table-only operations like blind append and file removal.
+#[handle_descriptor(target=FfiTransaction, mutable=true, sized=true)]
 pub struct ExclusiveTransaction;
 
 /// A handle for a create-table transaction (`Transaction<CreateTable>`).
 ///
 /// Returned by [`create_table_builder_build`]. Only supports operations valid during table
-/// creation: adding files, setting data change, engine info, and committing. Operations like
-/// file removal, blind append, and deletion vector updates are not available.
-#[handle_descriptor(target=CreateTableTransaction, mutable=true, sized=true)]
+/// creation after the intent is frozen: deriving write contexts, adding files, and committing.
+/// Operations like file removal, blind append, and deletion vector updates are not available.
+#[handle_descriptor(target=FfiCreateTableTransaction, mutable=true, sized=true)]
 pub struct ExclusiveCreateTransaction;
 
 /// A handle for a [`CommittedTransaction`].
@@ -63,6 +203,34 @@ pub struct ExclusiveCreateTransaction;
 /// [`free_committed_transaction`].
 #[handle_descriptor(target=CommittedTransaction, mutable=true, sized=true)]
 pub struct ExclusiveCommittedTransaction;
+
+/// A handle for the result of a commit attempt.
+///
+/// Inspect the result with [`commit_result_kind`]. Consume committed results with
+/// [`commit_result_into_committed`] and recover the exact prepared commit from retryable results
+/// with [`commit_result_into_prepared_commit`]. Conflicted results cannot be retried until the
+/// transaction is rebuilt against a fresh snapshot.
+#[handle_descriptor(target=FfiCommitResult, mutable=true, sized=true)]
+pub struct ExclusiveCommitResult;
+
+/// A handle retaining a retryable immutable transaction and its exact commit actions.
+///
+/// Retry with [`prepared_commit_retry`] or release with [`free_prepared_commit`]. Conflicted
+/// results do not produce this handle because their transaction is bound to a stale snapshot.
+#[handle_descriptor(target=FfiPreparedCommit, mutable=true, sized=true)]
+pub struct ExclusivePreparedCommit;
+
+/// The outcome represented by an [`ExclusiveCommitResult`] handle.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelCommitResultKind {
+    /// The commit succeeded.
+    Committed = 0,
+    /// Another commit already claimed the attempted version.
+    Conflicted = 1,
+    /// The attempt failed with a transient I/O error and may be retried unchanged.
+    Retryable = 2,
+}
 
 /// Handle for a mutable boxed committer that can be passed across FFI
 #[handle_descriptor(target = dyn Committer, mutable = true, sized = false)]
@@ -89,59 +257,50 @@ fn transaction_impl(
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
     let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
-    let transaction = snapshot.transaction(committer, engine.as_ref());
-    Ok(Box::new(transaction?).into())
+    let builder = snapshot.transaction_builder();
+    Ok(Box::new(FfiTransaction::new(builder)).into())
 }
 
-/// Start a transaction with a custom committer
-/// NOTE: This consumes the committer handle
+/// Start a transaction from an existing snapshot.
+///
+/// This entry point preserves snapshot state supplied by a catalog connector, such as the maximum
+/// published catalog version. Supply the committer later via [`commit_with_committer`].
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles
+/// Caller is responsible for passing valid handles.
 #[no_mangle]
-pub unsafe extern "C" fn transaction_with_committer(
+pub unsafe extern "C" fn transaction_from_snapshot(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
-    committer: Handle<MutableCommitter>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
     let snapshot = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
-    let committer = unsafe { committer.into_inner() };
-    transaction_with_committer_impl(snapshot, engine, committer).into_extern_result(&engine)
+    let builder = snapshot.transaction_builder();
+    Ok(Box::new(FfiTransaction::new(builder)).into()).into_extern_result(&engine)
 }
 
-fn transaction_with_committer_impl(
-    snapshot: Arc<Snapshot>,
-    extern_engine: &dyn ExternEngine,
-    committer: Box<dyn Committer>,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let engine = extern_engine.engine();
-    let transaction = snapshot.transaction(committer, engine.as_ref());
-    Ok(Box::new(transaction?).into())
-}
-
-/// Convert a [`CommitResult`] into a [`CommittedTransaction`] handle, or an error if the commit
-/// was not successful.
-///
-/// The returned handle owns the [`CommittedTransaction`] and must be freed with
-/// [`free_committed_transaction`].
-///
-/// TODO: expose the full `CommitResult` enum through FFI for conflict resolution.
-fn commit_result_to_committed_handle<S>(
+fn into_ffi_commit_result<S>(
     result: DeltaResult<CommitResult<S>>,
-) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
+    wrap_prepared: impl FnOnce(PreparedCommit<S>) -> FfiPreparedCommit,
+    wrap_conflicted: impl FnOnce(ConflictedTransaction<S>) -> FfiConflictedCommit,
+) -> DeltaResult<Handle<ExclusiveCommitResult>> {
     match result? {
-        CommitResult::CommittedTransaction(committed) => Ok(Box::new(committed).into()),
-        CommitResult::RetryableTransaction(_) => Err(delta_kernel::Error::unsupported(
-            "commit failed: retryable transaction not supported in FFI (yet)",
-        )),
+        CommitResult::CommittedTransaction(committed) => {
+            Ok(Box::new(FfiCommitResult::Committed(committed)).into())
+        }
         CommitResult::ConflictedTransaction(conflicted) => {
-            Err(delta_kernel::Error::Generic(format!(
-                "commit conflict at version {}",
-                conflicted.conflict_version()
-            )))
+            let conflict_version = conflicted.conflict_version();
+            let conflicted_commit = wrap_conflicted(conflicted);
+            Ok(Box::new(FfiCommitResult::Conflicted {
+                conflicted_commit,
+                conflict_version,
+            })
+            .into())
+        }
+        CommitResult::RetryableTransaction(retryable) => {
+            let prepared_commit = wrap_prepared(retryable.into_prepared_commit());
+            Ok(Box::new(FfiCommitResult::Retryable { prepared_commit }).into())
         }
     }
 }
@@ -177,11 +336,12 @@ pub unsafe extern "C" fn with_engine_info(
 }
 
 fn with_engine_info_impl(
-    txn: Transaction,
+    mut txn: FfiTransaction,
     engine_info: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
-    Ok(Box::new(txn.with_engine_info(info)).into())
+    txn.update_options(|options| options.with_engine_info(info))?;
+    Ok(Box::new(txn).into())
 }
 
 /// Set the operation that this transaction is performing. This string will be persisted in the
@@ -203,11 +363,12 @@ pub unsafe extern "C" fn with_operation(
 }
 
 fn with_operation_impl(
-    txn: Transaction,
+    mut txn: FfiTransaction,
     operation: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let operation: String = unsafe { TryFromStringSlice::try_from_slice(&operation) }?;
-    Ok(Box::new(txn.with_operation(operation)).into())
+    txn.update_builder(|builder| builder.with_operation(operation))?;
+    Ok(Box::new(txn).into())
 }
 
 /// Add domain metadata to the transaction. The domain metadata will be written to the Delta log
@@ -237,13 +398,14 @@ pub unsafe extern "C" fn with_domain_metadata(
 }
 
 fn with_domain_metadata_impl(
-    txn: Transaction,
+    mut txn: FfiTransaction,
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
-    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
+    txn.update_options(|options| options.with_domain_metadata(domain, configuration))?;
+    Ok(Box::new(txn).into())
 }
 
 /// Remove domain metadata from the table in this transaction. A tombstone action with
@@ -268,11 +430,12 @@ pub unsafe extern "C" fn with_domain_metadata_removed(
 }
 
 fn with_domain_metadata_removed_impl(
-    txn: Transaction,
+    mut txn: FfiTransaction,
     domain: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
-    Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
+    txn.update_builder(|builder| builder.with_domain_metadata_removed(domain))?;
+    Ok(Box::new(txn).into())
 }
 
 /// Add file metadata to the transaction for files that have been written. The metadata contains
@@ -289,41 +452,102 @@ pub unsafe extern "C" fn add_files(
 ) {
     let txn = unsafe { txn.as_mut() };
     let write_metadata = unsafe { write_metadata.into_inner() };
-    txn.add_files(write_metadata);
+    txn.actions.add_files(write_metadata);
 }
 
 /// Mark the transaction as having data changes or not (these are recorded at the file level).
+/// This consumes the transaction handle and returns a new handle for the updated transaction.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle.
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle.
 #[no_mangle]
-pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, data_change: bool) {
-    let underlying_txn = unsafe { txn.as_mut() };
-    underlying_txn.set_data_change(data_change);
+pub unsafe extern "C" fn with_data_change(
+    txn: Handle<ExclusiveTransaction>,
+    data_change: bool,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_data_change_impl(*txn, data_change).into_extern_result(&engine)
 }
 
-/// Attempt to commit a transaction to the table. On success, returns a handle to the
-/// [`CommittedTransaction`] from which the caller can read the version and the optional
-/// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
+fn with_data_change_impl(
+    mut txn: FfiTransaction,
+    data_change: bool,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    txn.update_builder(|builder| builder.with_data_change(data_change))?;
+    Ok(Box::new(txn).into())
+}
+
+/// Attempt to commit a transaction to the table.
 ///
-/// Returns an error if the commit fails. The FFI surfaces conflicted and retryable
-/// `CommitResult` variants as errors today (see TODO on `commit_result_to_committed_handle`).
+/// Returns a commit-result handle for committed, conflicted, and retryable outcomes. The caller
+/// must inspect and consume or free the result handle.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
-/// method is called.
+/// Caller is responsible for passing a valid handle. The transaction is consumed after preflight
+/// validation succeeds. On validation error, the transaction handle remains valid.
 #[no_mangle]
 pub unsafe extern "C" fn commit(
     txn: Handle<ExclusiveTransaction>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
-    let txn = unsafe { txn.into_inner() };
+) -> ExternResult<Handle<ExclusiveCommitResult>> {
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    let committer = FileSystemCommitter::new();
+    let mut txn = txn;
+    if let Err(error) = unsafe { txn.as_mut() }.validate_commit(engine.as_ref(), &committer) {
+        return Err(error).into_extern_result(&extern_engine);
+    }
+    let txn = unsafe { txn.into_inner() };
+    let (transaction, actions) = match (*txn).into_parts(engine.as_ref()) {
+        Ok(parts) => parts,
+        Err(error) => return Err(error).into_extern_result(&extern_engine),
+    };
+    into_ffi_commit_result(
+        transaction.commit(engine.as_ref(), &committer, actions),
+        FfiPreparedCommit::Existing,
+        FfiConflictedCommit::Existing,
+    )
+    .into_extern_result(&extern_engine)
+}
+
+/// Attempt to commit a transaction with a custom committer.
+///
+/// Returns a commit-result handle for committed, conflicted, and retryable outcomes.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES both the transaction and committer
+/// handles after preflight validation succeeds. On validation error, both handles remain valid.
+#[no_mangle]
+pub unsafe extern "C" fn commit_with_committer(
+    txn: Handle<ExclusiveTransaction>,
+    committer: Handle<MutableCommitter>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCommitResult>> {
+    let extern_engine = unsafe { engine.as_ref() };
+    let engine = extern_engine.engine();
+    let mut txn = txn;
+    if let Err(error) =
+        unsafe { txn.as_mut() }.validate_commit(engine.as_ref(), unsafe { committer.as_ref() })
+    {
+        return Err(error).into_extern_result(&extern_engine);
+    }
+    let txn = unsafe { txn.into_inner() };
+    let committer = unsafe { committer.into_inner() };
+    let (transaction, actions) = match (*txn).into_parts(engine.as_ref()) {
+        Ok(parts) => parts,
+        Err(error) => return Err(error).into_extern_result(&extern_engine),
+    };
+    into_ffi_commit_result(
+        transaction.commit(engine.as_ref(), committer.as_ref(), actions),
+        FfiPreparedCommit::Existing,
+        FfiConflictedCommit::Existing,
+    )
+    .into_extern_result(&extern_engine)
 }
 
 // ============================================================================
@@ -340,30 +564,6 @@ pub unsafe extern "C" fn create_table_free_transaction(txn: Handle<ExclusiveCrea
     txn.drop_handle();
 }
 
-/// Attaches engine info to a create-table transaction.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle. CONSUMES the transaction handle.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_with_engine_info(
-    txn: Handle<ExclusiveCreateTransaction>,
-    engine_info: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    create_table_with_engine_info_impl(*txn, engine_info).into_extern_result(&engine)
-}
-
-fn create_table_with_engine_info_impl(
-    txn: CreateTableTransaction,
-    engine_info: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
-    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
-    Ok(Box::new(txn.with_engine_info(info)).into())
-}
-
 /// Add file metadata to a create-table transaction for files that have been written. The metadata
 /// contains information about files written during the transaction that will be added to the
 /// Delta log during commit.
@@ -378,44 +578,288 @@ pub unsafe extern "C" fn create_table_add_files(
 ) {
     let txn = unsafe { txn.as_mut() };
     let write_metadata = unsafe { write_metadata.into_inner() };
-    txn.add_files(write_metadata);
+    txn.actions.add_files(write_metadata);
 }
 
-/// Mark the create-table transaction as having data changes or not (these are recorded at the
-/// file level).
+/// Attempt to commit a create-table transaction.
+///
+/// Returns a commit-result handle for committed, conflicted, and retryable outcomes. The caller
+/// must inspect and consume or free the result handle.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. The transaction is consumed after preflight
+/// validation succeeds. On validation error, the transaction handle remains valid.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_commit(
+    txn: Handle<ExclusiveCreateTransaction>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCommitResult>> {
+    let extern_engine = unsafe { engine.as_ref() };
+    let engine = extern_engine.engine();
+    let committer = FileSystemCommitter::new();
+    if let Err(error) = unsafe { txn.as_ref() }.validate_commit(&committer) {
+        return Err(error).into_extern_result(&extern_engine);
+    }
+    let txn = unsafe { txn.into_inner() };
+    let (transaction, actions) = (*txn).into_parts();
+    into_ffi_commit_result(
+        transaction.commit(engine.as_ref(), &committer, actions),
+        FfiPreparedCommit::Create,
+        FfiConflictedCommit::Create,
+    )
+    .into_extern_result(&extern_engine)
+}
+
+/// Attempt to commit a create-table transaction with a custom committer.
+///
+/// Returns a commit-result handle for committed, conflicted, and retryable outcomes.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES both the transaction and committer
+/// handles after preflight validation succeeds. On validation error, both handles remain valid.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_commit_with_committer(
+    txn: Handle<ExclusiveCreateTransaction>,
+    committer: Handle<MutableCommitter>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCommitResult>> {
+    let extern_engine = unsafe { engine.as_ref() };
+    let engine = extern_engine.engine();
+    if let Err(error) = unsafe { txn.as_ref() }.validate_commit(unsafe { committer.as_ref() }) {
+        return Err(error).into_extern_result(&extern_engine);
+    }
+    let txn = unsafe { txn.into_inner() };
+    let committer = unsafe { committer.into_inner() };
+    let (transaction, actions) = (*txn).into_parts();
+    into_ffi_commit_result(
+        transaction.commit(engine.as_ref(), committer.as_ref(), actions),
+        FfiPreparedCommit::Create,
+        FfiConflictedCommit::Create,
+    )
+    .into_extern_result(&extern_engine)
+}
+
+// ============================================================================
+// Commit result and prepared commit FFI functions
+// ============================================================================
+
+/// Return the outcome represented by a commit-result handle.
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn create_table_set_data_change(
-    mut txn: Handle<ExclusiveCreateTransaction>,
-    data_change: bool,
-) {
-    let underlying_txn = unsafe { txn.as_mut() };
-    underlying_txn.set_data_change(data_change);
+pub unsafe extern "C" fn commit_result_kind(
+    result: &Handle<ExclusiveCommitResult>,
+) -> KernelCommitResultKind {
+    match unsafe { result.as_ref() } {
+        FfiCommitResult::Committed(_) => KernelCommitResultKind::Committed,
+        FfiCommitResult::Conflicted { .. } => KernelCommitResultKind::Conflicted,
+        FfiCommitResult::Retryable { .. } => KernelCommitResultKind::Retryable,
+    }
 }
 
-/// Attempt to commit a create-table transaction. On success, returns a handle to the
-/// [`CommittedTransaction`] from which the caller can read the version and the optional
-/// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
-///
-/// Returns an error if the commit fails.
+/// Return the conflicting table version, or `None` for a non-conflicted result.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
-/// method is called.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn create_table_commit(
-    txn: Handle<ExclusiveCreateTransaction>,
+pub unsafe extern "C" fn commit_result_conflict_version(
+    result: &Handle<ExclusiveCommitResult>,
+) -> OptionalValue<u64> {
+    match unsafe { result.as_ref() } {
+        FfiCommitResult::Conflicted {
+            conflict_version, ..
+        } => OptionalValue::Some(*conflict_version),
+        _ => OptionalValue::None,
+    }
+}
+
+/// Consume a committed result and return its committed-transaction handle.
+///
+/// # Errors
+///
+/// Returns an error if `result` is conflicted or retryable.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the result handle on success. On
+/// error, the result handle remains valid.
+#[no_mangle]
+pub unsafe extern "C" fn commit_result_into_committed(
+    result: Handle<ExclusiveCommitResult>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
-    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let validation = match unsafe { result.as_ref() } {
+        FfiCommitResult::Committed(_) => Ok(()),
+        FfiCommitResult::Conflicted { .. } => Err(delta_kernel::Error::generic(
+            "cannot extract a committed transaction from a conflicted result",
+        )),
+        FfiCommitResult::Retryable { .. } => Err(delta_kernel::Error::generic(
+            "cannot extract a committed transaction from a retryable result",
+        )),
+    };
+    if let Err(error) = validation {
+        return Err(error).into_extern_result(&engine);
+    }
+    let result = unsafe { result.into_inner() };
+    let committed = match *result {
+        FfiCommitResult::Committed(committed) => Ok(Box::new(committed).into()),
+        FfiCommitResult::Conflicted { .. } => Err(delta_kernel::Error::generic(
+            "cannot extract a committed transaction from a conflicted result",
+        )),
+        FfiCommitResult::Retryable { .. } => Err(delta_kernel::Error::generic(
+            "cannot extract a committed transaction from a retryable result",
+        )),
+    };
+    committed.into_extern_result(&engine)
+}
+
+/// Consume a retryable result and return its exact prepared commit.
+///
+/// # Errors
+///
+/// Returns an error if `result` is committed or conflicted.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the result handle on success. On
+/// error, the result handle remains valid.
+#[no_mangle]
+pub unsafe extern "C" fn commit_result_into_prepared_commit(
+    result: Handle<ExclusiveCommitResult>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusivePreparedCommit>> {
+    let engine = unsafe { engine.as_ref() };
+    let validation = match unsafe { result.as_ref() } {
+        FfiCommitResult::Committed(_) => Err(delta_kernel::Error::generic(
+            "cannot extract a prepared commit from a committed result",
+        )),
+        FfiCommitResult::Conflicted { .. } => Err(delta_kernel::Error::generic(
+            "cannot retry a conflicted transaction without rebasing it against a fresh snapshot",
+        )),
+        FfiCommitResult::Retryable { .. } => Ok(()),
+    };
+    if let Err(error) = validation {
+        return Err(error).into_extern_result(&engine);
+    }
+    let result = unsafe { result.into_inner() };
+    let prepared = match *result {
+        FfiCommitResult::Committed(_) => Err(delta_kernel::Error::generic(
+            "cannot extract a prepared commit from a committed result",
+        )),
+        FfiCommitResult::Conflicted { .. } => Err(delta_kernel::Error::generic(
+            "cannot retry a conflicted transaction without rebasing it against a fresh snapshot",
+        )),
+        FfiCommitResult::Retryable { prepared_commit } => Ok(Box::new(prepared_commit).into()),
+    };
+    prepared.into_extern_result(&engine)
+}
+
+/// Retry the exact transaction and actions retained by a prepared commit.
+///
+/// Returns a new commit-result handle.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the prepared-commit handle after
+/// committer validation succeeds. On validation error, the handle remains valid.
+#[no_mangle]
+pub unsafe extern "C" fn prepared_commit_retry(
+    prepared: Handle<ExclusivePreparedCommit>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCommitResult>> {
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    let committer = FileSystemCommitter::new();
+    let validation = match unsafe { prepared.as_ref() } {
+        FfiPreparedCommit::Existing(prepared) => prepared.validate_committer(&committer),
+        FfiPreparedCommit::Create(prepared) => prepared.validate_committer(&committer),
+    };
+    if let Err(error) = validation {
+        return Err(error).into_extern_result(&extern_engine);
+    }
+    let prepared = unsafe { prepared.into_inner() };
+    let result = match *prepared {
+        FfiPreparedCommit::Existing(prepared) => into_ffi_commit_result(
+            prepared.commit(engine.as_ref(), &committer),
+            FfiPreparedCommit::Existing,
+            FfiConflictedCommit::Existing,
+        ),
+        FfiPreparedCommit::Create(prepared) => into_ffi_commit_result(
+            prepared.commit(engine.as_ref(), &committer),
+            FfiPreparedCommit::Create,
+            FfiConflictedCommit::Create,
+        ),
+    };
+    result.into_extern_result(&extern_engine)
+}
+
+/// Retry a prepared commit with a custom committer.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES both the prepared-commit and
+/// committer handles after committer validation succeeds. On validation error, both handles
+/// remain valid.
+#[no_mangle]
+pub unsafe extern "C" fn prepared_commit_retry_with_committer(
+    prepared: Handle<ExclusivePreparedCommit>,
+    committer: Handle<MutableCommitter>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCommitResult>> {
+    let extern_engine = unsafe { engine.as_ref() };
+    let engine = extern_engine.engine();
+    let validation = match unsafe { prepared.as_ref() } {
+        FfiPreparedCommit::Existing(prepared) => {
+            prepared.validate_committer(unsafe { committer.as_ref() })
+        }
+        FfiPreparedCommit::Create(prepared) => {
+            prepared.validate_committer(unsafe { committer.as_ref() })
+        }
+    };
+    if let Err(error) = validation {
+        return Err(error).into_extern_result(&extern_engine);
+    }
+    let prepared = unsafe { prepared.into_inner() };
+    let committer = unsafe { committer.into_inner() };
+    let result = match *prepared {
+        FfiPreparedCommit::Existing(prepared) => into_ffi_commit_result(
+            prepared.commit(engine.as_ref(), committer.as_ref()),
+            FfiPreparedCommit::Existing,
+            FfiConflictedCommit::Existing,
+        ),
+        FfiPreparedCommit::Create(prepared) => into_ffi_commit_result(
+            prepared.commit(engine.as_ref(), committer.as_ref()),
+            FfiPreparedCommit::Create,
+            FfiConflictedCommit::Create,
+        ),
+    };
+    result.into_extern_result(&extern_engine)
+}
+
+/// Free a commit-result handle without consuming its contents.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_commit_result(result: Handle<ExclusiveCommitResult>) {
+    unsafe { result.drop_handle() };
+}
+
+/// Free a prepared-commit handle without retrying it.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_prepared_commit(prepared: Handle<ExclusivePreparedCommit>) {
+    unsafe { prepared.drop_handle() };
 }
 
 // ============================================================================
@@ -659,10 +1103,35 @@ fn create_table_builder_with_table_property_impl(
     Ok(Box::new(builder).into())
 }
 
-/// Build a create-table transaction using the default [`FileSystemCommitter`]. Returns a
-/// create-table transaction handle that can be used with [`create_table_add_files`],
-/// [`create_table_set_data_change`], [`create_table_with_engine_info`], and
-/// [`create_table_commit`] to optionally stage initial data before committing.
+/// Replace the engine information recorded by a create-table builder.
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle, `engine_info`, and `engine`.
+/// CONSUMES the builder handle unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_builder_with_engine_info(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    engine_info: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let engine_info = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
+    engine_info
+        .map(|info: &str| {
+            Box::new(builder.with_options(TransactionOptions::new().with_engine_info(info))).into()
+        })
+        .into_extern_result(&engine)
+}
+
+/// Build a create-table transaction. Returns a create-table transaction handle that can be used
+/// with [`create_table_add_files`],
+/// [`create_table_commit`], and the create-table write-context functions to optionally stage
+/// initial data before committing.
 ///
 /// # Safety
 ///
@@ -675,39 +1144,16 @@ pub unsafe extern "C" fn create_table_builder_build(
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
     let builder = unsafe { *builder.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    let committer = Box::new(FileSystemCommitter::new());
-    create_table_builder_build_impl(builder, committer, extern_engine)
-        .into_extern_result(&extern_engine)
-}
-
-/// Build a create-table transaction with a custom committer. Same as
-/// [`create_table_builder_build`] but uses the provided committer instead of the default.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles.
-/// CONSUMES both the builder and committer handles -- caller must not use them after this call.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_builder_build_with_committer(
-    builder: Handle<ExclusiveCreateTableBuilder>,
-    committer: Handle<MutableCommitter>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
-    let builder = unsafe { *builder.into_inner() };
-    let committer = unsafe { committer.into_inner() };
-    let extern_engine = unsafe { engine.as_ref() };
-    create_table_builder_build_impl(builder, committer, extern_engine)
-        .into_extern_result(&extern_engine)
+    create_table_builder_build_impl(builder, extern_engine).into_extern_result(&extern_engine)
 }
 
 fn create_table_builder_build_impl(
     builder: CreateTableTransactionBuilder,
-    committer: Box<dyn Committer>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
     let engine = extern_engine.engine();
-    let create_txn = builder.build(engine.as_ref(), committer)?;
-    Ok(Box::new(create_txn).into())
+    let transaction = builder.build(engine.as_ref())?;
+    Ok(Box::new(FfiCreateTableTransaction::new(transaction)).into())
 }
 
 /// Free a [`CreateTableTransactionBuilder`] without building.
@@ -769,7 +1215,7 @@ pub unsafe extern "C" fn remove_files(
     };
     let result: DeltaResult<bool> = (|| {
         let filtered = FilteredEngineData::try_new(data, sv)?;
-        txn.remove_files(filtered);
+        txn.actions.remove_files(filtered);
         Ok(true)
     })();
     result.into_extern_result(&engine)
@@ -836,6 +1282,47 @@ mod tests {
         &'static str,
     )>;
 
+    struct CatalogIoCommitter;
+
+    impl Committer for CatalogIoCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn Engine,
+            _actions: delta_kernel::DeltaResultIterator<'_, FilteredEngineData>,
+            _commit_metadata: delta_kernel::committer::CommitMetadata,
+        ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
+            Err(delta_kernel::Error::IOError(std::io::Error::other(
+                "simulated catalog IO error",
+            )))
+        }
+
+        fn is_catalog_committer(&self) -> bool {
+            true
+        }
+
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: delta_kernel::committer::PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    fn ffi_add_files_schema(
+        txn: &Handle<ExclusiveTransaction>,
+        engine: &Handle<SharedExternEngine>,
+    ) -> SchemaRef {
+        let mut txn = txn.shallow_copy();
+        let extern_engine = unsafe { engine.as_ref() };
+        let engine = extern_engine.engine();
+        unsafe { txn.as_mut() }
+            .transaction(engine.as_ref())
+            .unwrap()
+            .add_files_schema()
+            .clone()
+    }
+
     /// Create v1.1 and v3.7 test tables on the local filesystem under a fresh temp directory.
     ///
     /// Keep the returned [`tempfile::TempDir`] alive for the duration of the test.
@@ -870,6 +1357,17 @@ mod tests {
         let version = unsafe { committed_transaction_version(&committed) };
         unsafe { free_committed_transaction(committed) };
         version
+    }
+
+    unsafe fn committed_from_result(
+        result: Handle<ExclusiveCommitResult>,
+        engine: &Handle<SharedExternEngine>,
+    ) -> Handle<ExclusiveCommittedTransaction> {
+        assert_eq!(
+            unsafe { commit_result_kind(&result) },
+            KernelCommitResultKind::Committed
+        );
+        ok_or_panic(unsafe { commit_result_into_committed(result, engine.shallow_copy()) })
     }
 
     fn check_txn_id_exists(commit_info: &serde_json::Value) {
@@ -993,7 +1491,7 @@ mod tests {
             let txn = ok_or_panic(unsafe {
                 transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
             });
-            unsafe { set_data_change(txn.shallow_copy(), false) };
+            let txn = ok_or_panic(unsafe { with_data_change(txn, false, engine.shallow_copy()) });
 
             // Add engine info
             let engine_info = "default_engine";
@@ -1060,7 +1558,7 @@ mod tests {
                 ),
             ])
             .unwrap();
-            let parquet_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() };
+            let parquet_schema = ffi_add_files_schema(&txn, &engine);
             let file_info = write_parquet_file(
                 table_path_str,
                 "my_file.parquet",
@@ -1074,7 +1572,8 @@ mod tests {
 
             unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
 
-            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            let result = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            let committed = unsafe { committed_from_result(result, &engine) };
             unsafe { free_committed_transaction(committed) };
 
             // Confirm that our commit is what we expect
@@ -1134,6 +1633,204 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn transaction_configuration_fails_at_freeze_boundary(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = schema_ref! { nullable "number": INTEGER };
+        let (_tmp_test_dir, tables) =
+            setup_local_test_tables(schema, &[], "freeze_boundary").await?;
+        let (table_url, _test_engine, _store, _table_name) = tables.into_iter().next().unwrap();
+        let table_path = table_url.to_file_path().unwrap();
+        let table_path = table_path.to_str().unwrap();
+        let engine = get_default_engine(table_path);
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+
+        let write_context = ok_or_panic(unsafe {
+            get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+        });
+        let result = unsafe { with_data_change(txn, false, engine.shallow_copy()) };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::GenericError,
+            Some(
+                "Generic delta kernel error: transaction configuration cannot change after the \
+                 transaction is frozen",
+            ),
+        );
+
+        unsafe {
+            free_write_context(write_context);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflicted_commit_result_cannot_be_retried_without_rebase(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = schema_ref! { nullable "number": INTEGER };
+        let (_tmp_test_dir, tables) = setup_local_test_tables(schema, &[], "ffi_conflict").await?;
+        let (table_url, _test_engine, _store, _table_name) = tables.into_iter().next().unwrap();
+        let table_path = table_url.to_file_path().unwrap();
+        let table_path = table_path.to_str().unwrap();
+        let engine = get_default_engine(table_path);
+
+        let txn1 = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn1 = ok_or_panic(unsafe { with_data_change(txn1, false, engine.shallow_copy()) });
+        let txn2 = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn2 = ok_or_panic(unsafe { with_data_change(txn2, false, engine.shallow_copy()) });
+
+        let first = ok_or_panic(unsafe { commit(txn1, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(first, &engine) };
+        unsafe { free_committed_transaction(committed) };
+
+        let conflicted = ok_or_panic(unsafe { commit(txn2, engine.shallow_copy()) });
+        assert_eq!(
+            unsafe { commit_result_kind(&conflicted) },
+            KernelCommitResultKind::Conflicted
+        );
+        assert_eq!(
+            unsafe { commit_result_conflict_version(&conflicted) },
+            OptionalValue::Some(1)
+        );
+        let result = unsafe {
+            commit_result_into_prepared_commit(conflicted.shallow_copy(), engine.shallow_copy())
+        };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::GenericError,
+            Some(
+                "Generic delta kernel error: cannot retry a conflicted transaction without \
+                 rebasing it against a fresh snapshot",
+            ),
+        );
+
+        unsafe {
+            free_commit_result(conflicted);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_lazy_freeze_preserves_transaction_builder(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = schema_ref! { nullable "number": INTEGER };
+        let (_tmp_test_dir, tables) =
+            setup_local_test_tables(schema, &[], "ffi_freeze_recovery").await?;
+        let (table_url, _test_engine, _store, _table_name) = tables.into_iter().next().unwrap();
+        let table_path = table_url.to_file_path().unwrap();
+        let table_path = table_path.to_str().unwrap();
+        let engine = get_default_engine(table_path);
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let invalid_operation = "CREATE TABLE";
+        let txn = ok_or_panic(unsafe {
+            with_operation(
+                txn,
+                kernel_string_slice!(invalid_operation),
+                engine.shallow_copy(),
+            )
+        });
+
+        let result =
+            unsafe { get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy()) };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::UnknownError,
+            Some(
+                "Invalid transaction state: CREATE TABLE, REPLACE TABLE, and ALTER TABLE \
+                 operations require their dedicated transaction builders",
+            ),
+        );
+
+        let valid_operation = "WRITE";
+        let txn = ok_or_panic(unsafe {
+            with_operation(
+                txn,
+                kernel_string_slice!(valid_operation),
+                engine.shallow_copy(),
+            )
+        });
+        let context = ok_or_panic(unsafe {
+            get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+        });
+
+        unsafe {
+            free_write_context(context);
+            free_transaction(txn);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepared_retry_preflight_error_preserves_handle(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = schema_ref! { nullable "number": INTEGER };
+        let (store, test_engine, table_url) =
+            test_utils::engine_store_setup("ffi_retry_preflight", None);
+        test_utils::create_table(
+            Arc::clone(&store),
+            table_url.clone(),
+            schema,
+            &[],
+            true,
+            vec!["catalogManaged", "vacuumProtocolCheck"],
+            vec!["inCommitTimestamp", "catalogManaged", "vacuumProtocolCheck"],
+        )
+        .await?;
+        let snapshot = delta_kernel::Snapshot::builder_for(table_url)
+            .with_max_catalog_version(0)
+            .build(&test_engine)?;
+        let transaction = snapshot
+            .transaction_builder()
+            .with_data_change(false)
+            .build(&test_engine)?;
+        let prepared = transaction.prepare_commit(CommitActions::new())?;
+        let prepared: Handle<ExclusivePreparedCommit> =
+            Box::new(FfiPreparedCommit::Existing(prepared)).into();
+        let engine = engine_handle_for_store(store);
+
+        let result =
+            unsafe { prepared_commit_retry(prepared.shallow_copy(), engine.shallow_copy()) };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::GenericError,
+            Some(
+                "Generic delta kernel error: This table is catalog-managed and requires a \
+                 catalog committer. Please provide a catalog committer when committing the \
+                 transaction.",
+            ),
+        );
+
+        let committer: Box<dyn Committer> = Box::new(CatalogIoCommitter);
+        let committer: Handle<MutableCommitter> = committer.into();
+        let retryable = ok_or_panic(unsafe {
+            prepared_commit_retry_with_committer(prepared, committer, engine.shallow_copy())
+        });
+        assert_eq!(
+            unsafe { commit_result_kind(&retryable) },
+            KernelCommitResultKind::Retryable
+        );
+        let prepared = ok_or_panic(unsafe {
+            commit_result_into_prepared_commit(retryable, engine.shallow_copy())
+        });
+
+        unsafe {
+            free_prepared_commit(prepared);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
     /// Callback for [`visit_partition_values`] that collects each entry into a
     /// `Vec<(key, value, is_null)>` passed via the engine context pointer.
     extern "C" fn collect_partition_value(
@@ -1178,7 +1875,7 @@ mod tests {
             let txn = ok_or_panic(unsafe {
                 transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
             });
-            unsafe { set_data_change(txn.shallow_copy(), true) };
+            let txn = ok_or_panic(unsafe { with_data_change(txn, true, engine.shallow_copy()) });
             let engine_info = "default_engine";
             let txn = unsafe {
                 ok_or_panic(with_engine_info(
@@ -1294,7 +1991,7 @@ mod tests {
             let metadata_json = format!(
                 r#"{{"path":"{add_path}", "partitionValues": {{"part":"100"}}, "size": {size}, "modificationTime": 0, "stats": {{"numRecords": {num_rows}}}}}"#,
             );
-            let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
+            let metadata_schema = ffi_add_files_schema(&txn, &engine)
                 .as_ref()
                 .try_into_arrow()?;
             let file_info = create_arrow_ffi_from_json(metadata_schema, &metadata_json)?;
@@ -1303,7 +2000,8 @@ mod tests {
             });
             unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
 
-            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            let result = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            let committed = unsafe { committed_from_result(result, &engine) };
             unsafe { free_committed_transaction(committed) };
 
             // The commit's add action records the partition values and Hive-style path.
@@ -1573,7 +2271,7 @@ mod tests {
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = ok_or_panic(unsafe { with_data_change(txn, false, engine.shallow_copy()) });
 
         let domain = "testDomain";
         let configuration = r#"{"key": "value"}"#;
@@ -1586,7 +2284,8 @@ mod tests {
             )
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let result = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(result, &engine) };
         let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 1);
 
@@ -1599,13 +2298,14 @@ mod tests {
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = ok_or_panic(unsafe { with_data_change(txn, false, engine.shallow_copy()) });
 
         let txn = ok_or_panic(unsafe {
             with_domain_metadata_removed(txn, kernel_string_slice!(domain), engine.shallow_copy())
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let result = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(result, &engine) };
         let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 2);
 
@@ -1628,7 +2328,7 @@ mod tests {
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = ok_or_panic(unsafe { with_data_change(txn, false, engine.shallow_copy()) });
 
         let sys_domain = "delta.system";
         let config = "config";
@@ -1662,7 +2362,7 @@ mod tests {
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = ok_or_panic(unsafe { with_data_change(txn, false, engine.shallow_copy()) });
 
         let dup_domain = "dup";
         let config_a = "a";
@@ -1722,7 +2422,7 @@ mod tests {
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = ok_or_panic(unsafe { with_data_change(txn, false, engine.shallow_copy()) });
 
         let domain = "myDomain";
         let config = "config";
@@ -1833,13 +2533,9 @@ mod tests {
             };
 
             let txn = ok_or_panic(unsafe {
-                transaction_with_committer(
-                    snapshot.shallow_copy(),
-                    engine.shallow_copy(),
-                    uc_committer,
-                )
+                transaction_from_snapshot(snapshot.shallow_copy(), engine.shallow_copy())
             });
-            unsafe { set_data_change(txn.shallow_copy(), false) };
+            let txn = ok_or_panic(unsafe { with_data_change(txn, false, engine.shallow_copy()) });
 
             let engine_info = "uc_test_engine";
             let engine_info_kernel_string = kernel_string_slice!(engine_info);
@@ -1870,12 +2566,7 @@ mod tests {
             ])
             .unwrap();
 
-            let parquet_schema = unsafe {
-                txn_with_engine_info
-                    .shallow_copy()
-                    .as_ref()
-                    .add_files_schema()
-            };
+            let parquet_schema = ffi_add_files_schema(&txn_with_engine_info, &engine);
             let file_info = put_parquet_file(
                 &store,
                 &table_url,
@@ -1891,10 +2582,13 @@ mod tests {
 
             unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };
 
-            let commit_result = unsafe { commit(txn_with_engine_info, engine.shallow_copy()) };
+            let commit_result = unsafe {
+                commit_with_committer(txn_with_engine_info, uc_committer, engine.shallow_copy())
+            };
 
             // UC committer returns success from our mock callback
-            let committed = ok_or_panic(commit_result);
+            let result = ok_or_panic(commit_result);
+            let committed = unsafe { committed_from_result(result, &engine) };
             let post_commit_snapshot =
                 match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
                     OptionalValue::Some(snapshot) => snapshot,
@@ -2143,7 +2837,8 @@ mod tests {
     ) -> u64 {
         let txn =
             ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let result = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(result, engine) };
         let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 0);
         version
@@ -2413,7 +3108,8 @@ mod tests {
 
         let txn =
             ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let result = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(result, &engine) };
 
         assert_eq!(unsafe { committed_transaction_version(&committed) }, 0);
 
@@ -2445,7 +3141,7 @@ mod tests {
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path), engine.shallow_copy())
         });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = ok_or_panic(unsafe { with_data_change(txn, false, engine.shallow_copy()) });
         let engine_info = "test-engine/1.0";
         let txn = ok_or_panic(unsafe {
             with_engine_info(
@@ -2455,7 +3151,8 @@ mod tests {
             )
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let result = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(result, &engine) };
         let v = unsafe { committed_transaction_version(&committed) };
         assert_eq!(v, 2);
 
@@ -2735,19 +3432,17 @@ mod tests {
         );
         let table_path_str = table_path.as_str();
 
-        // Create a FileSystemCommitter handle and pass it to build_with_committer
+        // Create a FileSystemCommitter handle and pass it at commit time.
         let committer: Box<dyn delta_kernel::committer::Committer> =
             Box::new(FileSystemCommitter::new());
         let committer_handle: Handle<MutableCommitter> = committer.into();
 
-        let txn = ok_or_panic(unsafe {
-            create_table_builder_build_with_committer(
-                builder,
-                committer_handle,
-                engine.shallow_copy(),
-            )
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+        let result = ok_or_panic(unsafe {
+            create_table_commit_with_committer(txn, committer_handle, engine.shallow_copy())
         });
-        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(result, &engine) };
         let committed_version = unsafe { version_and_free(committed) };
         assert_eq!(committed_version, 0);
 
@@ -2815,7 +3510,7 @@ mod tests {
             )
         });
 
-        let parquet_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() };
+        let parquet_schema = ffi_add_files_schema(&txn, &engine);
         let file_info = put_parquet_file(
             store,
             table_url,
@@ -2832,7 +3527,8 @@ mod tests {
             )
         });
         unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let result = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(result, &engine) };
         unsafe { free_committed_transaction(committed) };
 
         Ok((table_path.to_string(), engine))
@@ -2942,7 +3638,8 @@ mod tests {
             )
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let result = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(result, &engine) };
         unsafe { free_committed_transaction(committed) };
         assert_no_active_files(&kernel_engine, table_path.as_str())?;
 
@@ -3021,18 +3718,24 @@ mod tests {
         );
         let snapshot = delta_kernel::snapshot::Snapshot::builder_for(table_url.clone())
             .build(kernel_engine.as_ref())?;
-        let mut add_txn = snapshot
+        let add_txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
-            .with_engine_info("test-engine/1.0")
-            .with_operation("WRITE".to_string());
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("test-engine/1.0"))
+            .with_operation("WRITE".to_string())
+            .build(kernel_engine.as_ref())?;
         let add_files_schema = add_txn.add_files_schema();
         let add_metadata = test_utils::create_add_files_metadata(
             add_files_schema,
             vec![(&data_file_path, parquet_len as i64, 1_000_000, Some(4))],
         )?;
-        add_txn.add_files(add_metadata);
-        let _ = add_txn.commit(kernel_engine.as_ref())?.unwrap_committed();
+        let _ = add_txn
+            .commit(
+                kernel_engine.as_ref(),
+                &FileSystemCommitter::new(),
+                add_metadata.into(),
+            )?
+            .unwrap_committed();
 
         // Build and write a connector-authored DV file deleting rows 1 and 2 (ids 20, 30).
         let mut dv = KernelDeletionVector::new();
@@ -3113,7 +3816,8 @@ mod tests {
             )
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let result = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = unsafe { committed_from_result(result, &engine) };
         let committed_version = unsafe { version_and_free(committed) };
         assert_eq!(committed_version, 2);
 

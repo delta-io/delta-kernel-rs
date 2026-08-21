@@ -15,7 +15,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
-use delta_kernel::transaction::{CommitResult, RetryableTransaction};
+use delta_kernel::transaction::{CommitResult, Operation, TransactionOptions};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
@@ -86,12 +86,15 @@ async fn try_main() -> DeltaResult<()> {
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
 
     // Write sample data to the table
-    let committer = Box::new(FileSystemCommitter::new());
-    let mut txn = snapshot
-        .transaction(committer, &engine)?
-        .with_operation("INSERT".to_string())
-        .with_engine_info("default_engine/write-table-example")
-        .with_data_change(true);
+    let committer = FileSystemCommitter::new();
+    let txn = snapshot
+        .transaction_builder()
+        .with_operation(Operation::Write)
+        .with_options(
+            TransactionOptions::new().with_engine_info("default_engine/write-table-example"),
+        )
+        .with_data_change(true)
+        .build(&engine)?;
 
     // Write the data using the engine
     let write_context = Arc::new(txn.unpartitioned_write_context()?);
@@ -99,29 +102,28 @@ async fn try_main() -> DeltaResult<()> {
         .write_parquet(&sample_data, write_context.as_ref())
         .await?;
 
-    // Add the file metadata to the transaction
-    txn.add_files(file_metadata);
-
     // Commit the transaction (in a simple retry loop)
     let mut retries = 0;
+    let mut commit_result = txn.commit(&engine, &committer, file_metadata.into())?;
     let committed = loop {
         if retries > 5 {
             return Err(Error::generic(
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
-        txn = match txn.commit(&engine)? {
+        match commit_result {
             CommitResult::CommittedTransaction(committed) => break committed,
             CommitResult::ConflictedTransaction(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
                 println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
                 return Err(Error::generic("Commit failed"));
             }
-            CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
+            CommitResult::RetryableTransaction(retryable) => {
+                let error = &retryable.error;
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
-                transaction
+                commit_result = retryable.retry(&engine, &committer)?;
             }
-        };
+        }
         retries += 1;
     };
 
@@ -197,8 +199,12 @@ async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) 
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
     let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+        .build(engine)?
+        .commit(
+            engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())

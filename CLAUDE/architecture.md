@@ -67,27 +67,40 @@ file listing without re-scanning the table.
 
 ## Write Path
 
-`Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContext`) -> commit
+`Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContext` -> file metadata) ->
+`CommitActions` -> `PreparedCommit` -> commit
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
 partition values to create a `BoundWriteContext` containing validated partition values, schemas,
-statistics columns, and the recommended write directory. The transaction registers the resulting
-files, enforces protocol compliance, assembles commit actions, and delegates the atomic commit to
-a `Committer`.
+statistics columns, and the recommended write directory. Writers collect the resulting add,
+remove, and deletion-vector inputs in `CommitActions`. Kernel binds those inputs to the immutable
+transaction as a `PreparedCommit`, enforces protocol compliance, assembles log actions, and
+delegates the atomic commit to a `Committer`.
+
+`BoundWriteContext` and `PreparedCommit` serve different phases. A `BoundWriteContext` is a
+writer-local plan for producing a correct Parquet file; it is not retained after the writer returns
+file metadata. A `PreparedCommit` is the coordinator-owned recovery unit containing the immutable
+transaction and the exact `CommitActions` assembled from writer results.
 
 **Data-write steps:**
-1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
+1. Create a `Transaction` from a snapshot
 2. For a single context, get a `BoundWriteContext` directly from the transaction. For multiple
    partitions or distributed writers, call `txn.write_state()` once and bind each partition from
    that immutable state. Calling a transaction convenience method creates a fresh state from the
    transaction's current configuration.
 3. Write Parquet files (via engine), collect file metadata
-4. Register files via `txn.add_files(metadata)` and stage any removals or deletion-vector updates
-5. Commit: returns `CommittedTransaction`, `ConflictedTransaction`, or `RetryableTransaction`
+4. Collect files and any removals or deletion-vector updates in `CommitActions`
+5. Call `txn.commit(engine, committer, actions)`: returns `CommittedTransaction`,
+   `ConflictedTransaction`, or `RetryableTransaction`. Retryable results retain the executable
+   `PreparedCommit`; conflicts retain stale intent and actions for rebuilding against a fresh
+   snapshot.
 
-- **Transaction** (`kernel/src/transaction/`): blind append writes, file removals, deletion-vector
-  updates, table creation (including clustered tables via `DataLayout`), and limited schema
-  evolution
+- **Transaction** (`kernel/src/transaction/`): immutable commit intent, write contexts, table
+  creation (including clustered tables via `DataLayout`), and limited schema evolution
+- **CommitActions** (`kernel/src/transaction/`): late-produced add, remove, and deletion-vector
+  inputs
+- **PreparedCommit** (`kernel/src/transaction/`): immutable transaction intent paired with exact
+  commit actions for execution and same-snapshot retry
 - **Committer** (`kernel/src/committer/`): commit coordination. `FileSystemCommitter` for
   filesystem tables (atomic put-if-absent to `_delta_log/`); custom `Committer` implementations
   for catalog-managed tables (staging, ratifying, publishing).

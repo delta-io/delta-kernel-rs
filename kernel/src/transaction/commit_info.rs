@@ -32,6 +32,16 @@ fn commit_info_literal_exprs(
                 None => null_lit(op_params_map_type),
             }),
         ),
+        (
+            "operationMetrics",
+            Arc::new(match commit_info.operation_metrics {
+                Some(map) => lit(MapData::try_new(
+                    MapType::new(DataType::STRING, DataType::STRING, true),
+                    map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
+                )?),
+                None => null_lit(MapType::new(DataType::STRING, DataType::STRING, true)),
+            }),
+        ),
         ("kernelVersion", Arc::new(lit(commit_info.kernel_version))),
         ("isBlindAppend", Arc::new(lit(commit_info.is_blind_append))),
         ("engineInfo", Arc::new(lit(commit_info.engine_info))),
@@ -113,12 +123,11 @@ mod tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
-    use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
+    use crate::arrow::record_batch::{RecordBatch, RecordBatchOptions};
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
-    use crate::transaction::Transaction;
+    use crate::transaction::{Transaction, TransactionOptions};
     use crate::unit_test_utils::load_test_table;
     use crate::utils::FoldWithOption as _;
     use crate::{DeltaResult, Engine, EngineData};
@@ -215,12 +224,77 @@ mod tests {
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction_builder()
             .with_operation("WRITE".to_string())
-            .fold_with(engine_commit_info, |txn, (data, schema)| {
-                txn.with_commit_info(data, schema)
-            });
+            .fold_with(engine_commit_info, |builder, (data, schema)| {
+                builder.with_options(TransactionOptions::new().with_commit_info(data, schema))
+            })
+            .build(engine.as_ref())?;
         Ok((engine, txn))
+    }
+
+    #[test]
+    fn structured_operation_metadata_setters_replace_maps() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let txn = snapshot
+            .transaction_builder()
+            .with_options(
+                TransactionOptions::new()
+                    .with_operation_parameters([("mode", "Append"), ("partitionBy", "[]")])?
+                    .with_operation_metrics([("numFiles", "3"), ("numOutputRows", "10")])?,
+            )
+            .build(engine.as_ref())?;
+
+        assert_eq!(txn.operation_parameters.get("mode").unwrap(), "Append");
+        assert_eq!(txn.operation_parameters.get("partitionBy").unwrap(), "[]");
+        assert_eq!(txn.operation_metrics.get("numFiles").unwrap(), "3");
+        assert_eq!(txn.operation_metrics.get("numOutputRows").unwrap(), "10");
+        Ok(())
+    }
+
+    #[test]
+    fn structured_operation_metadata_is_written() -> DeltaResult<()> {
+        let (engine, txn) = make_txn(None)?;
+        let mut commit_info = make_kernel_commit_info();
+        commit_info.operation_parameters = Some(std::collections::HashMap::from([(
+            "mode".to_string(),
+            Some("Append".to_string()),
+        )]));
+        commit_info.operation_metrics = Some(std::collections::HashMap::from([(
+            "numFiles".to_string(),
+            Some("3".to_string()),
+        )]));
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), commit_info)?,
+        )?;
+        let commit_info = commit_info_struct(&result);
+        assert_eq!(get_map(commit_info, "operationParameters").len(), 1);
+        assert_eq!(get_map(commit_info, "operationMetrics").len(), 1);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::empty(0)]
+    #[case::multiple(2)]
+    fn custom_commit_info_requires_exactly_one_row(#[case] row_count: usize) -> DeltaResult<()> {
+        let values = vec!["custom"; row_count];
+        let (data, schema) = make_engine_commit_info(
+            vec![ArrowField::new("customApp", ArrowDataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(values)) as ArrayRef],
+        );
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+
+        let error = snapshot
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_commit_info(data, schema))
+            .build(engine.as_ref())
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("custom commitInfo must contain exactly one row"));
+        Ok(())
     }
 
     /// no engine_commit_info -- output is the kernel CommitInfo wrapped in a "commitInfo"
@@ -295,6 +369,7 @@ mod tests {
         map_builder.values().append_value("stale_value");
         map_builder.append(true).unwrap();
         let stale_op_params = Arc::new(map_builder.finish()) as ArrayRef;
+        let stale_op_metrics = stale_op_params.clone();
 
         let (data, schema) = make_engine_commit_info(
             vec![
@@ -304,6 +379,11 @@ mod tests {
                 ArrowField::new(
                     "operationParameters",
                     stale_op_params.data_type().clone(),
+                    true,
+                ),
+                ArrowField::new(
+                    "operationMetrics",
+                    stale_op_metrics.data_type().clone(),
                     true,
                 ),
                 ArrowField::new("kernelVersion", ArrowDataType::Utf8, true),
@@ -316,6 +396,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
                 stale_op_params,
+                stale_op_metrics,
                 Arc::new(StringArray::from(vec!["v0.0.0"])) as ArrayRef,
                 Arc::new(BooleanArray::from(vec![None::<bool>])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["stale_engine"])) as ArrayRef,
@@ -329,12 +410,16 @@ mod tests {
         )?;
         let commit_info = commit_info_struct(&result);
 
-        // All 8 CommitInfo fields are present in the engine schema -- no fields appended.
-        assert_eq!(commit_info.num_columns(), 8);
+        // Every CommitInfo field is present in the engine schema -- no fields appended.
+        assert_eq!(
+            commit_info.num_columns(),
+            CommitInfo::to_schema().fields().count()
+        );
 
         assert_eq!(get_str(commit_info, "operation"), "WRITE");
         assert!(!get_str(commit_info, "kernelVersion").is_empty());
         assert_eq!(get_map(commit_info, "operationParameters").len(), 0);
+        assert_eq!(get_map(commit_info, "operationMetrics").len(), 0);
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
         assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
@@ -440,8 +525,12 @@ mod tests {
     /// fields preceding them, is equivalent to producing the full CommitInfo schema).
     #[test]
     fn test_build_commit_info_empty_engine_schema() -> DeltaResult<()> {
-        // A 0-row, 0-column RecordBatch with an empty kernel schema.
-        let empty_batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
+        // An explicit one-row, zero-column RecordBatch with an empty kernel schema.
+        let empty_batch = RecordBatch::try_new_with_options(
+            Arc::new(ArrowSchema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(1)),
+        )?;
         let empty_schema = schema_ref! {};
         let (engine, txn) = make_txn(Some((
             Box::new(ArrowEngineData::new(empty_batch)),

@@ -28,6 +28,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::TransactionOptions;
 use delta_kernel::transforms::{transform_output_type, SchemaTransform};
 use test_utils::delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
@@ -153,33 +154,50 @@ async fn v3_commit_validates_num_records(
 
     let _ = create_table(TABLE_ROOT, simple_schema(), "Test/1.0")
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap()
-        .commit(engine.as_ref())
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )
         .unwrap();
     let snapshot = Snapshot::builder_for(TABLE_ROOT)
         .build(engine.as_ref())
         .unwrap();
 
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
-        .unwrap()
-        .with_engine_info("Test/1.0")
-        .with_data_change(true);
+    let txn = snapshot
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("Test/1.0"))
+        .with_data_change(true)
+        .build(engine.as_ref())
+        .unwrap();
     let add_files = create_add_files_metadata(
         txn.add_files_schema(),
         vec![("part-fake.parquet", 1024, 1_000_000, num_records)],
     )
     .unwrap();
-    txn.add_files(add_files);
-
     match expected {
         Ok(expected_version) => {
-            let committed = txn.commit(engine.as_ref()).unwrap().unwrap_committed();
+            let committed = txn
+                .commit(
+                    engine.as_ref(),
+                    &FileSystemCommitter::new(),
+                    add_files.into(),
+                )
+                .unwrap()
+                .unwrap_committed();
             assert_eq!(committed.commit_version(), expected_version);
         }
         Err(needle) => {
-            let err = txn.commit(engine.as_ref()).unwrap_err().to_string();
+            let err = txn
+                .commit(
+                    engine.as_ref(),
+                    &FileSystemCommitter::new(),
+                    add_files.into(),
+                )
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains(needle) && err.contains("part-fake.parquet"),
                 "expected error containing {needle:?} and 'part-fake.parquet', got: {err}",
@@ -258,9 +276,13 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties(props)
         .with_data_layout(DataLayout::partitioned(["region"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap()
-        .commit(engine.as_ref())
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )
         .unwrap();
 
     // === 4 commits (2 outer iters x 2 partitions), checkpoint, 4 more commits ===

@@ -6,11 +6,12 @@ use std::sync::Arc;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::{Int32Array, Int64Array, StringArray, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, TransactionOptions};
 use delta_kernel::{Snapshot, Version};
 use rstest::rstest;
 use tempfile::{tempdir, TempDir};
@@ -18,7 +19,7 @@ use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExe
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, create_add_files_metadata, create_table,
-    engine_store_setup, into_record_batch, load_and_begin_transaction,
+    engine_store_setup, into_record_batch,
 };
 use url::Url;
 
@@ -56,36 +57,41 @@ async fn write_data_to_table(
     schema: SchemaRef,
     values: Vec<i32>,
 ) -> Result<Version, Box<dyn std::error::Error>> {
-    let mut txn =
-        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_engine_info("test");
+    let txn = Snapshot::builder_for(table_url.clone())
+        .build(engine.as_ref())?
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test"))
+        .build(engine.as_ref())?;
 
-    add_files_to_transaction(&mut txn, engine, schema, values).await?;
+    let add_files = create_file_metadata(&txn, engine, schema, values).await?;
 
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(
+        engine.as_ref(),
+        &FileSystemCommitter::new(),
+        add_files.into(),
+    )?;
     match result {
         CommitResult::CommittedTransaction(committed) => Ok(committed.commit_version()),
         _ => panic!("Transaction should be committed"),
     }
 }
 
-// Helper function to add files to an existing transaction
-async fn add_files_to_transaction(
-    txn: &mut delta_kernel::transaction::Transaction,
+// Helper function to create file metadata using an existing transaction's write context.
+async fn create_file_metadata(
+    txn: &delta_kernel::transaction::Transaction,
     engine: &Arc<DefaultEngine<TokioBackgroundExecutor>>,
     schema: SchemaRef,
     values: Vec<i32>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
     let data = RecordBatch::try_new(
         Arc::new(schema.as_ref().try_into_arrow()?),
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
     let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
-    let add_files_metadata = engine
+    Ok(engine
         .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
-        .await?;
-    txn.add_files(add_files_metadata);
-    Ok(())
+        .await?)
 }
 
 #[tokio::test]
@@ -120,17 +126,21 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
 
     // Now remove the files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("cdf remove test")
-        .with_data_change(true);
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("cdf remove test"))
+        .with_data_change(true)
+        .build(engine.as_ref())?;
 
     let scan = snapshot.scan_builder().build()?;
     let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
     let (data, selection_vector) = scan_metadata.scan_files.into_parts();
-    txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
     // This should succeed - remove-only transactions are allowed with CDF
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?;
     match result {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(committed.commit_version(), 2);
@@ -158,21 +168,25 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
 
     // Now create a transaction with both add AND remove files, but dataChange=false
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("cdf mixed test")
-        .with_data_change(false); // dataChange=false is key here
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("cdf mixed test"))
+        .with_data_change(false)
+        .build(engine.as_ref())?; // dataChange=false is key here
 
     // Add new files
-    add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
+    let add_files = create_file_metadata(&txn, &engine, schema, vec![4, 5, 6]).await?;
+    let mut actions = delta_kernel::transaction::CommitActions::from(add_files);
 
     // Also remove existing files
     let scan = snapshot.scan_builder().build()?;
     let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
     let (data, selection_vector) = scan_metadata.scan_files.into_parts();
-    txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+    actions.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
     // This should succeed - mixed operations are allowed when dataChange=false
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?;
     match result {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(committed.commit_version(), 2);
@@ -199,21 +213,25 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 
     // Now create a transaction with both add AND remove files with dataChange=true
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("cdf mixed fail test")
-        .with_data_change(true); // dataChange=true - this should fail
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("cdf mixed fail test"))
+        .with_data_change(true)
+        .build(engine.as_ref())?; // dataChange=true - this should fail
 
     // Add new files
-    add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
+    let add_files = create_file_metadata(&txn, &engine, schema, vec![4, 5, 6]).await?;
+    let mut actions = delta_kernel::transaction::CommitActions::from(add_files);
 
     // Also remove existing files
     let scan = snapshot.scan_builder().build()?;
     let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
     let (data, selection_vector) = scan_metadata.scan_files.into_parts();
-    txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+    actions.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
     assert_result_error_with_message(
-        txn.commit(engine.as_ref()),
+        txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions),
         "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
          This would require writing CDC files for DML operations, which is not yet supported. \
          Consider using separate transactions: one to add files, another to remove files or update deletion vectors.",
@@ -270,7 +288,7 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut setup_txn = begin_transaction(snapshot, &engine)?;
+    let setup_txn = begin_transaction(snapshot, &engine)?;
     let existing_file = create_add_files_metadata(
         setup_txn.add_files_schema(),
         vec![(
@@ -280,10 +298,15 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
             Some(3),
         )],
     )?;
-    setup_txn.add_files(existing_file);
-    let snapshot = setup_txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    let snapshot = setup_txn
+        .commit(&engine, &FileSystemCommitter::new(), existing_file.into())?
+        .unwrap_post_commit_snapshot();
 
-    let mut txn = begin_transaction(snapshot.clone(), &engine)?.with_data_change(data_change);
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_data_change(data_change)
+        .build(&engine)?;
     let new_file = create_add_files_metadata(
         txn.add_files_schema(),
         vec![(
@@ -293,7 +316,7 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
             Some(1),
         )],
     )?;
-    txn.add_files(new_file);
+    let mut actions = delta_kernel::transaction::CommitActions::from(new_file);
     let descriptor = DeletionVectorDescriptor::try_new(
         DeletionVectorStorageType::PersistedAbsolute,
         "memory:///dv.bin",
@@ -301,12 +324,12 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
         1,       /* size_in_bytes */
         1,       /* cardinality */
     )?;
-    txn.update_deletion_vectors(
+    actions.update_deletion_vectors(
         HashMap::from([("existing.parquet".to_string(), descriptor)]),
         get_scan_files(snapshot, &engine)?.into_iter().map(Ok),
     )?;
 
-    let commit_result = txn.commit(&engine);
+    let commit_result = txn.commit(&engine, &FileSystemCommitter::new(), actions);
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(commit_result, expected_error);
         let snapshot = Snapshot::builder_for(table_url).build(&engine)?;

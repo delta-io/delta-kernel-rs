@@ -17,6 +17,7 @@ use delta_kernel::actions::deletion_vector_writer::{
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
@@ -27,15 +28,14 @@ use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::{BoundWriteContext, CommitResult, Transaction};
+use delta_kernel::transaction::{BoundWriteContext, CommitResult, Transaction, TransactionOptions};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    begin_transaction, create_add_files_metadata, create_table, engine_store_setup,
-    into_record_batch, load_and_begin_transaction, modify_add_file_partition_keys,
-    AddFilePartitionKeyModify,
+    create_add_files_metadata, create_table, engine_store_setup, into_record_batch,
+    modify_add_file_partition_keys, AddFilePartitionKeyModify,
 };
 use url::Url;
 use uuid::Uuid;
@@ -212,8 +212,11 @@ pub async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-        .with_data_change(true);
+    let txn = Snapshot::builder_for(table_url.clone())
+        .build(engine.as_ref())?
+        .transaction_builder()
+        .with_data_change(true)
+        .build(engine.as_ref())?;
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -237,13 +240,18 @@ pub async fn write_data_and_check_result_and_stats(
         })
     });
 
-    let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-    for meta in add_files_metadata {
-        txn.add_files(meta?);
-    }
+    let add_files_metadata = futures::future::join_all(tasks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<DeltaResult<Vec<_>>>()?;
 
     // commit!
-    match txn.commit(engine.as_ref())? {
+    match txn.commit(
+        engine.as_ref(),
+        &FileSystemCommitter::new(),
+        add_files_metadata.into(),
+    )? {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(committed.commit_version(), expected_since_commit as Version);
             assert_eq!(
@@ -397,10 +405,13 @@ pub async fn create_dv_table_with_files(
 
     // Write files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("test engine")
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test engine"))
         .with_operation("WRITE".to_string())
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine.as_ref())?;
 
     let add_files_schema = txn.add_files_schema();
 
@@ -430,9 +441,11 @@ pub async fn create_dv_table_with_files(
             &modifications,
         )))
     };
-    txn.add_files(metadata);
-
-    let _ = txn.commit(engine.as_ref())?;
+    let _ = txn.commit(
+        engine.as_ref(),
+        &FileSystemCommitter::new(),
+        metadata.into(),
+    )?;
 
     let paths: Vec<String> = file_paths.iter().map(|&s| s.to_string()).collect();
     Ok((store, engine, table_url, paths))
@@ -499,7 +512,10 @@ pub fn create_dv_update_transaction(
     table_url: &Url,
     engine: &dyn Engine,
 ) -> Result<Transaction, Box<dyn std::error::Error>> {
-    Ok(load_and_begin_transaction(table_url.clone(), engine)?
-        .with_engine_info("test engine")
-        .with_operation("DELETE".to_string()))
+    Ok(Snapshot::builder_for(table_url.clone())
+        .build(engine)?
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test engine"))
+        .with_operation("DELETE".to_string())
+        .build(engine)?)
 }

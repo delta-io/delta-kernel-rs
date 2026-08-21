@@ -14,9 +14,9 @@ Before reading this page, make sure you understand
 
 ## Writing domain metadata
 
-To attach domain metadata to a commit, call `with_domain_metadata()` on the
-transaction. This method is available on both create-table and existing-table
-transactions.
+To attach domain metadata to a commit, call `TransactionOptions::with_domain_metadata()` and pass
+the options to the transaction builder with `with_options()`. Create-table, existing-table, and
+alter-table builders all accept these options.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -26,6 +26,7 @@ transactions.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::transaction::{Operation, TransactionOptions};
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -33,35 +34,38 @@ transactions.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_domain_metadata(
-        "myConnector.settings".to_string(),
-        r#"{"version": 1, "compress": true}"#.to_string(),
+    .transaction_builder()
+    .with_options(
+        TransactionOptions::new().with_domain_metadata(
+            "myConnector.settings".to_string(),
+            r#"{"version": 1, "compress": true}"#.to_string(),
+        ),
     )
-    .with_operation("UPDATE METADATA".to_string());
+    .with_operation(Operation::Custom("UPDATE METADATA".to_string()))
+    .build(&engine)?;
 
-txn.commit(&engine)?;
+txn.commit(&engine, &FileSystemCommitter::new(), delta_kernel::transaction::CommitActions::new())?;
 # Ok(())
 # }
 ```
 
-The `with_domain_metadata` signature takes two `String` arguments:
+`TransactionOptions::with_domain_metadata()` takes two `String` arguments:
 
 ```rust,ignore
-pub fn with_domain_metadata(self, domain: String, configuration: String) -> Self
+TransactionOptions::new().with_domain_metadata(domain, configuration)
 ```
 
 The `domain` identifies the metadata namespace and `configuration` holds the
 value. The configuration is an opaque string. You can store JSON, plain text,
 or any format your connector understands.
 
-You can set metadata for multiple distinct domains in the same transaction by
-calling `with_domain_metadata` more than once with different domain names.
+You can set metadata for multiple distinct domains by calling `with_domain_metadata` more than
+once while constructing the same `TransactionOptions` value.
 
 ## Removing domain metadata
 
 To remove a domain from an existing table, call `with_domain_metadata_removed()`
-on an existing-table transaction. This method is not available on create-table
+on an existing-table transaction builder. This method is not available on create-table
 transactions because there is no metadata to remove from a table that does not
 exist yet.
 
@@ -73,6 +77,7 @@ exist yet.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::transaction::Operation;
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -80,11 +85,12 @@ exist yet.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_builder()
     .with_domain_metadata_removed("myConnector.settings".to_string())
-    .with_operation("REMOVE METADATA".to_string());
+    .with_operation(Operation::Custom("REMOVE METADATA".to_string()))
+    .build(&engine)?;
 
-txn.commit(&engine)?;
+txn.commit(&engine, &FileSystemCommitter::new(), delta_kernel::transaction::CommitActions::new())?;
 # Ok(())
 # }
 ```
@@ -162,10 +168,9 @@ apply:
   transaction.
 
 > [!NOTE]
-> Validation is deferred until `commit()`. The builder methods
-> `with_domain_metadata()` and `with_domain_metadata_removed()` do not check
-> for duplicates or reserved prefixes eagerly. Errors surface when you call
-> `commit()`.
+> Validation is performed by `build()`. `TransactionOptions::with_domain_metadata()` and
+> `TransactionBuilder::with_domain_metadata_removed()` only collect intent; duplicate domains and
+> reserved prefixes surface as build errors.
 
 ## What's next
 

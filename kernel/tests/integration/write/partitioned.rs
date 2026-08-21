@@ -19,11 +19,10 @@ use delta_kernel::schema::{schema, schema_ref, DataType, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::TransactionOptions;
 use delta_kernel::Snapshot;
 use rstest::rstest;
-use test_utils::{
-    begin_transaction, get_column, read_scan, test_table_setup_mt, write_batch_to_table,
-};
+use test_utils::{get_column, read_scan, test_table_setup_mt, write_batch_to_table};
 use url::Url;
 
 use crate::common::read_utils::read_parquet_file;
@@ -781,8 +780,12 @@ fn create_interval_partitioned_table(
     let snapshot = create_table(table_path, schema, "test/1.0")
         .with_data_layout(DataLayout::partitioned(["period"]))
         .with_table_properties(properties)
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?
+        .build(engine)?
+        .commit(
+            engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_post_commit_snapshot();
     Ok(snapshot)
 }
@@ -807,9 +810,11 @@ fn create_partitioned_table(
         builder =
             builder.with_table_properties([("delta.columnMapping.mode", cm_mode_str(cm_mode))]);
     }
-    let _ = builder
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+    let _ = builder.build(engine)?.commit(
+        engine,
+        &FileSystemCommitter::new(),
+        delta_kernel::transaction::CommitActions::new(),
+    )?;
     Ok(Snapshot::builder_for(table_path).build(engine)?)
 }
 
@@ -998,11 +1003,18 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     let _ = create_table(&table_path, table_schema.clone(), "test/1.0")
         .with_data_layout(DataLayout::partitioned([partition_col]))
         .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
 
-    let mut txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
-        .with_engine_info("default engine");
+    let txn = Snapshot::builder_for(&table_path)
+        .build(engine.as_ref())?
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("default engine"))
+        .build(engine.as_ref())?;
 
     // Data batch must not contain the partition column.
     let data_schema = schema_ref! { nullable "number": INTEGER };
@@ -1018,8 +1030,9 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         Scalar::String("a".into()),
     )]))?;
     let result = engine.write_parquet(&data, &write_context).await?;
-    txn.add_files(result);
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn
+        .commit(engine.as_ref(), &FileSystemCommitter::new(), result.into())?
+        .is_committed());
 
     let (add, _) = read_single_add(&table_path, 1)?;
     let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
@@ -1075,8 +1088,12 @@ async fn test_materialize_partition_columns_e2e(
             ("delta.feature.materializePartitionColumns", "supported"),
             ("delta.columnMapping.mode", cm),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // Data schema excludes partition columns.
@@ -1104,10 +1121,12 @@ async fn test_materialize_partition_columns_e2e(
     };
 
     // A single commit writing two distinct partitions.
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("default engine")
-        .with_data_change(true);
+    let txn = snapshot
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("default engine"))
+        .with_data_change(true)
+        .build(engine.as_ref())?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
     for (d1, d2, p1, p2) in [
         (vec![1, 2, 3], vec![10, 20, 30], "x", 5),
         (vec![4, 5], vec![40, 50], "y", 6),
@@ -1116,9 +1135,11 @@ async fn test_materialize_partition_columns_e2e(
         let add = engine
             .write_parquet(&ArrowEngineData::new(make_batch(d1, d2)), &wc)
             .await?;
-        txn.add_files(add);
+        actions.add_files(add);
     }
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn
+        .commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+        .unwrap_post_commit_snapshot();
 
     // ===== Verify the materialized partition columns from parquet =====
     let logical_schema = snapshot.schema();
@@ -1184,8 +1205,12 @@ async fn test_materialize_all_primitive_partition_types() -> Result<(), Box<dyn 
     let _ = create_table(&table_path, all_types_schema(), "test/1.0")
         .with_data_layout(DataLayout::partitioned(PARTITION_COLS.iter().copied()))
         .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // Data schema excludes partition columns.
@@ -1246,11 +1271,18 @@ async fn test_input_data_with_partition_column_errors(
     let _ = create_table(&table_path, table_schema.clone(), "test/1.0")
         .with_data_layout(DataLayout::partitioned([partition_col]))
         .with_table_properties(properties)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
 
-    let txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
-        .with_engine_info("default engine");
+    let txn = Snapshot::builder_for(&table_path)
+        .build(engine.as_ref())?
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("default engine"))
+        .build(engine.as_ref())?;
 
     // Contract violation: the batch includes the `partition` column.
     let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
@@ -1343,12 +1375,18 @@ async fn test_partition_null_validation(
     let _ = create_table(&table_path, schema, "test/1.0")
         .with_data_layout(DataLayout::partitioned(["p"]))
         .with_table_properties(properties)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
-    let result = begin_transaction(snapshot, engine.as_ref())?
-        .with_engine_info("default engine")
+    let result = snapshot
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("default engine"))
+        .build(engine.as_ref())?
         .partitioned_write_context(HashMap::from([("p".to_string(), value)]));
 
     match expected_err {
@@ -1401,22 +1439,30 @@ async fn test_partition_null_validation_mixed_nullability(
         false, // write_partition_values_parsed; unused, no checkpoint in this test
     )?;
 
-    begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("default engine")
+    snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("default engine"))
+        .build(engine.as_ref())?
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::String("a".into())),
             ("p_optional".to_string(), Scalar::Null(DataType::STRING)),
         ]))?;
 
-    begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("default engine")
+    snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("default engine"))
+        .build(engine.as_ref())?
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::String("a".into())),
             ("p_optional".to_string(), Scalar::String(String::new())),
         ]))?;
 
-    let err = begin_transaction(snapshot, engine.as_ref())?
-        .with_engine_info("default engine")
+    let err = snapshot
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("default engine"))
+        .build(engine.as_ref())?
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::Null(DataType::STRING)),
             ("p_optional".to_string(), Scalar::String("b".into())),

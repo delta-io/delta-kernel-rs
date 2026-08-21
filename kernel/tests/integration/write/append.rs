@@ -18,15 +18,14 @@ use delta_kernel::schema::{schema, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::{Transaction, WriteState};
+use delta_kernel::transaction::{Transaction, TransactionOptions, WriteState};
 use delta_kernel::{DeltaResult, Error as KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{json, Deserializer};
 use test_utils::{
-    assert_result_error_with_message, into_record_batch, load_and_begin_transaction,
-    modify_add_file_partition_keys, set_json_value, setup_test_tables, test_read,
-    AddFilePartitionKeyModify,
+    assert_result_error_with_message, into_record_batch, modify_add_file_partition_keys,
+    set_json_value, setup_test_tables, test_read, AddFilePartitionKeyModify,
 };
 
 use crate::common::write_utils::{
@@ -133,11 +132,20 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_engine_info("default engine");
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(&engine)?
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("default engine"))
+            .build(&engine)?;
 
         // Commit without adding any add files
-        assert!(txn.commit(&engine)?.is_committed());
+        assert!(txn
+            .commit(
+                &engine,
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new()
+            )?
+            .is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -209,9 +217,12 @@ async fn test_append_partitioned(
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
-        let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_engine_info("default engine")
-            .with_data_change(false);
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(&engine)?
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("default engine"))
+            .with_data_change(false)
+            .build(&engine)?;
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -252,13 +263,20 @@ async fn test_append_partitioned(
                 })
             });
 
-        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        for meta in add_files_metadata {
-            txn.add_files(meta?);
-        }
+        let add_files_metadata = futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<DeltaResult<Vec<_>>>()?;
 
         // commit!
-        assert!(txn.commit(engine.as_ref())?.is_committed());
+        assert!(txn
+            .commit(
+                engine.as_ref(),
+                &FileSystemCommitter::new(),
+                add_files_metadata.into()
+            )?
+            .is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -354,8 +372,11 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(table_schema, &[], None, "test_table").await?
     {
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_engine_info("default engine");
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(&engine)?
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("default engine"))
+            .build(&engine)?;
 
         // create two new arrow record batches to append
         let append_data = [["a", "b"], ["c", "d"]].map(|data| -> DeltaResult<_> {
@@ -408,8 +429,11 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
                 .next()
                 .expect("at least one test table");
         let engine = Arc::new(engine);
-        let mut txn =
-            load_and_begin_transaction(table_url, engine.as_ref())?.with_data_change(true);
+        let txn = Snapshot::builder_for(table_url)
+            .build(engine.as_ref())?
+            .transaction_builder()
+            .with_data_change(true)
+            .build(engine.as_ref())?;
 
         let data = ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
@@ -419,7 +443,7 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
 
         // Corrupt the addFile at the second batch.
         let valid_meta = engine.write_parquet(&data, write_context.as_ref()).await?;
-        txn.add_files(valid_meta);
+        let mut actions = delta_kernel::transaction::CommitActions::from(valid_meta);
         let to_be_corrupted_meta = engine.write_parquet(&data, write_context.as_ref()).await?;
 
         let batch = into_record_batch(to_be_corrupted_meta);
@@ -438,10 +462,10 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
         let mut columns = batch.columns().to_vec();
         columns[index] = new_null_array(nullable_schema.field(index).data_type(), batch.num_rows());
         let corrupted = RecordBatch::try_new(nullable_schema, columns)?;
-        txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
+        actions.add_files(Box::new(ArrowEngineData::new(corrupted)));
 
         let err = txn
-            .commit(engine.as_ref())
+            .commit(engine.as_ref(), &FileSystemCommitter::new(), actions)
             .expect_err(&format!(
                 "commit should reject an add missing required field '{field}'"
             ))
@@ -500,8 +524,12 @@ async fn commit_rejects_add_with_invalid_partition_keys(
         builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
     }
     builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_post_commit_snapshot();
 
     let data_schema = schema! { nullable "d": INTEGER };
@@ -538,12 +566,17 @@ async fn commit_rejects_add_with_invalid_partition_keys(
             insertion => insertion,
         })
         .collect();
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_data_change(true);
+    let txn = snapshot
+        .transaction_builder()
+        .with_data_change(true)
+        .build(engine.as_ref())?;
     let add = make_add(&txn, "b", 6)?;
     let corrupted = modify_add_file_partition_keys(into_record_batch(add), &modifications);
-    txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
-    assert_result_error_with_message(txn.commit(engine.as_ref()), "partitionValues keys");
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.add_files(Box::new(ArrowEngineData::new(corrupted)));
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions),
+        "partitionValues keys",
+    );
     Ok(())
 }

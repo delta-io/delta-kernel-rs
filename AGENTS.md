@@ -117,11 +117,15 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
 
-**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `BoundWriteContext`
-(via `partitioned_write_context` or `unpartitioned_write_context`) for local writers. Distributed
-writers can create and transport a `WriteState`, then bind partition values on each writer to get
-a `BoundWriteContext`. Kernel assembles commit actions, enforces protocol compliance, and delegates
-the atomic commit to a `Committer`.
+**Write path:** `Snapshot` -> `Transaction` -> `WriteState` / `BoundWriteContext` -> file metadata
+-> `CommitActions` -> `PreparedCommit` -> `commit()`.
+Kernel provides `BoundWriteContext` (via `partitioned_write_context` or
+`unpartitioned_write_context`) for local writers. Distributed writers can create and transport a
+`WriteState`, then bind partition values on each writer to get a `BoundWriteContext`. The context
+guides file production; it is not stored in the commit. Writers return file metadata, which the
+coordinator collects with any remove/DV inputs in `CommitActions`. Kernel binds the immutable
+transaction and those actions as a `PreparedCommit`, retains it across retryable failures, enforces
+protocol compliance, assembles log actions, and delegates the atomic commit to a `Committer`.
 
 **Engine trait:** exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
 `EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing
@@ -175,11 +179,14 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
   column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
   custom ones when possible. See **Common test helpers** below for a curated starter list.
-- **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
-  successful commit and get the `CommittedTransaction`. When you only need the resulting
-  snapshot, use `txn.commit(engine)?.unwrap_post_commit_snapshot()` to get the
-  `SnapshotRef` directly. Do NOT use `match` + `panic!` for either: both helpers provide a clear
-  error message on failure. Available under `#[cfg(test)]` and the `test-utils` feature.
+- **Committing in tests:** Use
+  `txn.commit(engine, &FileSystemCommitter::new(), actions)?.unwrap_committed()` to assert a
+  successful data-action commit, or pass `CommitActions::new()` for a metadata-only commit. When
+  you only need the resulting snapshot, use
+  `txn.commit(engine, &FileSystemCommitter::new(), actions)?.unwrap_post_commit_snapshot()` to get
+  the `SnapshotRef` directly.
+  Do NOT use `match` + `panic!` for either: both helpers provide a clear error message on failure.
+  Available under `#[cfg(test)]` and the `test-utils` feature.
 - **Prefer snapshot/public API assertions over reading raw commit JSON.** Only read raw
   commit JSON when the data is inaccessible via public API (e.g., system domain metadata
   is blocked by `get_domain_metadata`). For commit JSON reads, use `read_actions_from_commit`

@@ -10,16 +10,17 @@
 //! - Blind append, operation setting, domain metadata removal, and file removal
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
-use super::Transaction;
+use super::{
+    CommitActions, ExistingTable, Operation as TransactionOperation, Transaction,
+    TransactionConfig, TransactionInit,
+};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
-use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
@@ -27,21 +28,24 @@ use crate::error::Error;
 use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
 };
-use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{
-    iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
-};
-use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
 // Update table transactions only
 // =============================================================================
+#[derive(Default)]
+pub(super) struct ExistingTransactionConfig {
+    pub(super) common: TransactionConfig,
+    pub(super) operation: Option<TransactionOperation>,
+    pub(super) domain_metadata_removals: Vec<String>,
+    pub(super) is_blind_append: bool,
+}
+
 impl Transaction {
     // -------------------------------------------------------------------------
     // Constructor
@@ -50,26 +54,13 @@ impl Transaction {
     /// Create a new transaction from a snapshot for an existing table. The snapshot will be used
     /// to read the current state of the table (e.g. to read the current version).
     ///
-    /// Instead of using this API, the more typical (user-facing) API is
-    /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
-    /// a snapshot.
-    pub(crate) fn try_new_existing_table(
-        snapshot: impl Into<SnapshotRef>,
-        committer: Box<dyn Committer>,
-        engine: &dyn Engine,
+    /// Instead of using this API, callers create a transaction through
+    /// [`Snapshot::transaction_builder`](crate::snapshot::Snapshot::transaction_builder).
+    pub(super) fn try_new_existing_table(
+        read_snapshot: SnapshotRef,
+        clustering_columns: Option<Vec<ColumnName>>,
+        config: ExistingTransactionConfig,
     ) -> DeltaResult<Self> {
-        let read_snapshot = snapshot.into();
-
-        // important! before writing to the table we must check it is supported
-        read_snapshot
-            .table_configuration()
-            .ensure_operation_supported(Operation::Write)?;
-
-        // Read clustering columns from snapshot (returns None if clustering not enabled)
-        let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
-
-        let commit_timestamp = current_time_ms()?;
-
         let span = tracing::info_span!(
             "txn",
             path = %read_snapshot.table_root(),
@@ -78,75 +69,24 @@ impl Transaction {
 
         let effective_table_config = read_snapshot.table_configuration().clone();
 
-        // Surface IcebergCompatV3 interoperability risks without rejecting tables based on
-        // kernel parser limitations.
-        if effective_table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            iceberg_compat_v3_column_defaults_validation(&effective_table_config)?;
-        }
-
-        Ok(Transaction {
+        Transaction::try_from_init(TransactionInit::<ExistingTable> {
             span,
-            operation_id: MetricId::new(),
-            correlation_id: None,
             read_snapshot_opt: Some(read_snapshot),
             effective_table_config,
             should_emit_protocol: false,
             should_emit_metadata: false,
-            committer,
-            operation: None,
-            engine_info: None,
-            add_files_metadata: vec![],
-            remove_files_metadata: vec![],
-            set_transactions: vec![],
-            commit_timestamp,
-            user_domain_metadata_additions: vec![],
+            operation: config.operation,
+            config: config.common,
             system_domain_metadata_additions: vec![],
-            user_domain_removals: vec![],
-            data_change: true,
-            column_defaults_acknowledged: false,
-            engine_commit_info: None,
-            is_blind_append: false,
-            dv_matched_files: vec![],
-            num_dv_updates: 0,
+            user_domain_removals: config.domain_metadata_removals,
+            is_blind_append: config.is_blind_append,
             physical_clustering_columns: clustering_columns,
-            _state: PhantomData,
+            _state: std::marker::PhantomData,
         })
     }
+}
 
-    // -------------------------------------------------------------------------
-    // Public API
-    // -------------------------------------------------------------------------
-
-    /// Mark this transaction as a blind append.
-    ///
-    /// Blind append transactions should only add new files and avoid write operations that
-    /// depend on existing table state.
-    pub fn with_blind_append(mut self) -> Self {
-        self.is_blind_append = true;
-        self
-    }
-
-    /// Set the operation that this transaction is performing. This string will be persisted in the
-    /// commit and visible to anyone who describes the table history.
-    pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
-        self
-    }
-
-    /// Remove domain metadata from the Delta log.
-    /// If the domain exists in the Delta log, this creates a tombstone to logically delete
-    /// the domain. The tombstone preserves the previous configuration value.
-    /// If the domain does not exist in the Delta log, this is a no-op.
-    /// Note that each domain can only appear once per transaction. That is, multiple operations
-    /// on the same domain are disallowed in a single transaction, as well as setting and removing
-    /// the same domain in a single transaction. If a duplicate domain is included, the `commit`
-    /// will fail (that is, we don't eagerly check domain validity here).
-    /// Removing metadata for multiple distinct domains is allowed.
-    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
-        self.user_domain_removals.push(domain);
-        self
-    }
-
+impl CommitActions<ExistingTable> {
     /// Remove files from the table in this transaction. This API generally enables the engine to
     /// delete data (at file-level granularity) from the table. Note that this API can be called
     /// multiple times to remove multiple batches.
@@ -163,10 +103,12 @@ impl Transaction {
     /// # use delta_kernel::Engine;
     /// # use delta_kernel::snapshot::Snapshot;
     /// # use delta_kernel::committer::FileSystemCommitter;
+    /// # use delta_kernel::transaction::CommitActions;
     /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    /// let txn = snapshot.clone().transaction_builder().build(engine.as_ref())?;
+    /// let mut actions = CommitActions::new();
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -177,11 +119,11 @@ impl Transaction {
     ///     let metadata = metadata?;
     ///     // In practice, you would modify the selection vector to choose which files to remove
     ///     let files_to_remove = metadata.scan_files;
-    ///     txn.remove_files(files_to_remove);
+    ///     actions.remove_files(files_to_remove);
     /// }
     ///
     /// // Commit the transaction
-    /// txn.commit(engine.as_ref())?;
+    /// txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -205,8 +147,8 @@ impl Transaction {
     /// let metadata = scan.scan_metadata(engine)?;
     /// let mut dv_map = HashMap::new();
     /// // ... populate dv_map ...
-    /// let files_iter = Transaction::scan_metadata_to_engine_data(metadata);
-    /// txn.update_deletion_vectors(dv_map, files_iter)?;
+    /// let files_iter = CommitActions::scan_metadata_to_engine_data(metadata);
+    /// actions.update_deletion_vectors(dv_map, files_iter)?;
     /// ```
     pub fn scan_metadata_to_engine_data(
         scan_metadata: impl Iterator<Item = DeltaResult<crate::scan::ScanMetadata>>,
@@ -241,9 +183,6 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The transaction targets table creation instead of an existing table
-    /// - The table does not have deletion vectors enabled via protocol support and the
-    ///   `delta.enableDeletionVectors=true` table property
     /// - A file path in `new_dv_descriptors` is not found in `existing_data_files`
     /// - A matched file's scan metadata is missing or has invalid `stats.numRecords`
     /// - A matched file's `stats` is not valid JSON or is not a JSON object
@@ -251,8 +190,12 @@ impl Transaction {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?
-    ///     .with_operation("UPDATE".to_string());
+    /// use delta_kernel::transaction::Operation;
+    ///
+    /// let txn = snapshot.clone().transaction_builder()
+    ///     .with_operation(Operation::Update)
+    ///     .build(engine)?;
+    /// let mut actions = CommitActions::new();
     ///
     /// let scan = snapshot.scan_builder().build()?;
     /// let files: Vec<FilteredEngineData> = scan.scan_metadata(engine)?
@@ -265,8 +208,8 @@ impl Transaction {
     /// let mut dv_map = HashMap::new();
     /// // ... populate dv_map with file paths and their new DV descriptors ...
     ///
-    /// txn.update_deletion_vectors(dv_map, files.into_iter())?;
-    /// txn.commit(engine)?;
+    /// actions.update_deletion_vectors(dv_map, files.into_iter())?;
+    /// txn.commit(engine, &FileSystemCommitter::new(), actions)?;
     /// ```
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
@@ -281,13 +224,6 @@ impl Transaction {
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
         existing_data_files: impl Iterator<Item = DeltaResult<FilteredEngineData>>,
     ) -> DeltaResult<()> {
-        if self.is_create_table() {
-            return Err(Error::generic(
-                "Deletion vector operations require an existing table",
-            ));
-        }
-        self.ensure_deletion_vectors_enabled()?;
-
         let mut matched_dv_files = 0;
         let mut matched_files = Vec::new();
         let mut visitor = DvMatchVisitor::new(&new_dv_descriptors);
@@ -337,22 +273,7 @@ impl Transaction {
 
         self.dv_matched_files.extend(matched_files);
         self.num_dv_updates += matched_dv_files;
-        Ok(())
-    }
-
-    /// Verify the table has deletion vectors *enabled* (feature supported in both reader and
-    /// writer features AND the `delta.enableDeletionVectors` table property set to `true`).
-    fn ensure_deletion_vectors_enabled(&self) -> DeltaResult<()> {
-        if !self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::DeletionVectors)
-        {
-            return Err(Error::unsupported(
-                "Deletion vector writes require reader version 3, writer version 7, the \
-                 'deletionVectors' feature in both reader and writer features, and the \
-                 `delta.enableDeletionVectors` table property set to `true`",
-            ));
-        }
+        self.has_dv_update_request = true;
         Ok(())
     }
 }
@@ -469,19 +390,18 @@ impl<S> Transaction<S> {
     pub(super) fn generate_dv_update_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
+        attempt_timestamp: i64,
+        dv_matched_files: &'a [FilteredEngineData],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
-        // Create-table transactions should not have any DV update actions
-        if self.is_create_table() && !self.dv_matched_files.is_empty() {
-            return Err(crate::error::Error::internal_error(
-                "CREATE TABLE transaction cannot have DV update actions",
-            ));
-        }
-
         // The rewritten stats are for the add action only, so they are dropped here.
         static COLUMNS_TO_DROP: &[&str] = &[NEW_DELETION_VECTOR_NAME, NEW_STATS_NAME];
-        let remove_actions =
-            self.generate_remove_actions(engine, self.dv_matched_files.iter(), COLUMNS_TO_DROP)?;
-        let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter())?;
+        let remove_actions = self.generate_remove_actions(
+            engine,
+            attempt_timestamp,
+            dv_matched_files.iter(),
+            COLUMNS_TO_DROP,
+        )?;
+        let add_actions = self.generate_adds_for_dv_update(engine, dv_matched_files.iter())?;
         Ok(remove_actions.chain(add_actions))
     }
 
