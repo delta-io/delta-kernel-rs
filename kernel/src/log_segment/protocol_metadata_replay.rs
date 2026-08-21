@@ -154,11 +154,12 @@ impl LogSegment {
             if try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)? {
                 break;
             }
+            // A `checkpoint` action is complete state at its version: fill any gap and stop.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            if let Some((metadata, protocol)) =
-                resolve_pm_from_checkpoint(actions.as_ref(), &metadata_opt, &protocol_opt)?
-            {
-                return Ok((Some(metadata), Some(protocol)));
+            if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
+                metadata_opt.get_or_insert_with(|| checkpoint.metadata().clone());
+                protocol_opt.get_or_insert_with(|| checkpoint.protocol().clone());
+                return Ok((metadata_opt, protocol_opt));
             }
         }
         Ok((metadata_opt, protocol_opt))
@@ -267,26 +268,6 @@ fn try_fill_pm(
         *protocol = Protocol::try_new_from_data(actions)?;
     }
     Ok(metadata.is_some() && protocol.is_some())
-}
-
-/// Resolve complete P&M from a `checkpoint` action in `actions`, filling any gap in `metadata`/
-/// `protocol` from it. Returns `None` when there's no `checkpoint` action.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn resolve_pm_from_checkpoint(
-    actions: &dyn EngineData,
-    metadata: &Option<Metadata>,
-    protocol: &Option<Protocol>,
-) -> DeltaResult<Option<(Metadata, Protocol)>> {
-    let Some(checkpoint) = CheckpointAction::try_new_from_data(actions)? else {
-        return Ok(None);
-    };
-    let metadata = metadata
-        .clone()
-        .unwrap_or_else(|| checkpoint.metadata().clone());
-    let protocol = protocol
-        .clone()
-        .unwrap_or_else(|| checkpoint.protocol().clone());
-    Ok(Some((metadata, protocol)))
 }
 
 #[cfg(test)]
