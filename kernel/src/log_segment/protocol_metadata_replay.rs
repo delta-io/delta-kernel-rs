@@ -25,9 +25,7 @@ use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
 use crate::schema::schema_ref;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::table_features::adaptive_metadata_enabled;
-#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error};
 
@@ -128,24 +126,16 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        // The plan reader can't unnest a `checkpoint` action; it errors when one is present rather
-        // than return possibly-stale top-level P&M. The non-plan reader resolves it inline.
+        // The plan reader can't unnest a `checkpoint` action, so it rejects one rather than return
+        // possibly-stale top-level P&M. The non-plan reader resolves it inline.
         #[cfg(feature = "declarative-plans")]
-        let (actions_batches, _is_plan_path) = match engine.plan_executor() {
-            Some(executor) => (self.read_pm_batches_via_plan(executor.as_ref())?, true),
-            None => (Box::new(self.read_pm_batches(engine)?) as _, false),
-        };
-        #[cfg(not(feature = "declarative-plans"))]
-        let (actions_batches, _is_plan_path) = (self.read_pm_batches(engine)?, false);
-
-        let mut metadata_opt = None;
-        let mut protocol_opt = None;
-        for actions_batch in actions_batches {
-            let actions = actions_batch?.actions;
-            let both_found = try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)?;
-
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            if _is_plan_path {
+        if let Some(executor) = engine.plan_executor() {
+            let mut metadata_opt = None;
+            let mut protocol_opt = None;
+            for actions_batch in self.read_pm_batches_via_plan(executor.as_ref())? {
+                let actions = actions_batch?.actions;
+                try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)?;
+                #[cfg(feature = "adaptive-metadata-in-dev")]
                 require!(
                     CheckpointAction::try_new_from_data(actions.as_ref())?.is_none(),
                     Error::unsupported(
@@ -154,21 +144,23 @@ impl LogSegment {
                     )
                 );
             }
-
-            if both_found {
-                break;
-            }
-
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            if !_is_plan_path {
-                if let Some((metadata, protocol)) =
-                    resolve_pm_from_checkpoint(actions.as_ref(), &metadata_opt, &protocol_opt)?
-                {
-                    return Ok((Some(metadata), Some(protocol)));
-                }
-            }
+            return Ok((metadata_opt, protocol_opt));
         }
 
+        let mut metadata_opt = None;
+        let mut protocol_opt = None;
+        for actions_batch in self.read_pm_batches(engine)? {
+            let actions = actions_batch?.actions;
+            if try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)? {
+                break;
+            }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            if let Some((metadata, protocol)) =
+                resolve_pm_from_checkpoint(actions.as_ref(), &metadata_opt, &protocol_opt)?
+            {
+                return Ok((Some(metadata), Some(protocol)));
+            }
+        }
         Ok((metadata_opt, protocol_opt))
     }
 
@@ -278,8 +270,7 @@ fn try_fill_pm(
 }
 
 /// Resolve complete P&M from a `checkpoint` action in `actions`, filling any gap in `metadata`/
-/// `protocol` from it. Returns `None` when there's no `checkpoint` action. Errors if the resolved
-/// protocol doesn't enable `adaptiveMetadata`.
+/// `protocol` from it. Returns `None` when there's no `checkpoint` action.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn resolve_pm_from_checkpoint(
     actions: &dyn EngineData,
@@ -295,13 +286,6 @@ fn resolve_pm_from_checkpoint(
     let protocol = protocol
         .clone()
         .unwrap_or_else(|| checkpoint.protocol().clone());
-    require!(
-        adaptive_metadata_enabled(&protocol),
-        Error::invalid_protocol(
-            "found a checkpoint action but the protocol does not enable the \
-             adaptiveMetadata reader feature"
-        )
-    );
     Ok(Some((metadata, protocol)))
 }
 
@@ -404,34 +388,6 @@ mod tests {
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         assert_eq!(snapshot.version(), 0);
         assert!(snapshot.schema().field("id").is_some());
-    }
-
-    #[cfg(all(
-        feature = "adaptive-metadata-in-dev",
-        not(feature = "declarative-plans")
-    ))]
-    #[tokio::test]
-    async fn test_checkpoint_action_without_adaptive_feature_is_rejected() {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
-        let table_root = url::Url::parse("memory:///").unwrap();
-        // Protocol lists no features, yet the commit carries a checkpoint action.
-        add_commit(
-            table_root.as_str(),
-            store.as_ref(),
-            0,
-            checkpoint_commit(0, &[], SCHEMA_STRING),
-        )
-        .await
-        .unwrap();
-
-        let err = Snapshot::builder_for(table_root)
-            .build(&engine)
-            .expect_err("checkpoint action without the feature must be rejected");
-        assert!(
-            matches!(err, crate::Error::InvalidProtocol(_)),
-            "unexpected error: {err}"
-        );
     }
 
     // Top-level actions are seen first in backward replay, so the v1 metaData wins; the protocol
