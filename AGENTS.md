@@ -154,8 +154,8 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
   when necessary: e.g. for states the builder cannot express, such as corrupt or malformed logs.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
-- When adding functionality to an engine that interacts with cloud storage (for example, writing
-  JSON files), make sure to test it against S3, Azure, and GCS.
+- When adding cloud-storage functionality to an engine, such as writing JSON files, make sure to
+  test it against S3, Azure, and GCS.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
   version (time travel), and updating from an existing snapshot.
 - Consider table state: only versioned JSON commits, after a checkpoint, after a version
