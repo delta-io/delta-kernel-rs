@@ -14,6 +14,7 @@
 
 use tracing::warn;
 
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use crate::content_tree::{
     AVG_VALUE_SIZE_IN_BYTES, LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, TIGHT_BOUNDS,
     UPPER_BOUND, VALUE_COUNT,
@@ -265,7 +266,8 @@ fn leaf_stats_field(field: &StructField, path: &[String]) -> DeltaResult<Option<
         // shredding.
         DataType::Variant(_) => build_stats_struct(base_stats_id, &DataType::unshredded_variant()),
         // Array/map columns carry no leaf stats. (Structs are descended into by the collector and
-        // never reach here.)
+        // never reach here.) Note the missing/out-of-range field-id checks above run first, so a
+        // malformed array/map leaf errors/warn-drops rather than reaching this silent drop.
         _ => return Ok(None),
     };
 
@@ -280,19 +282,80 @@ fn leaf_stats_field(field: &StructField, path: &[String]) -> DeltaResult<Option<
     )))
 }
 
+/// Returns the struct sub-schema of `schema.<field_name>`, or `None` if the field is absent or is
+/// not a struct. In a Delta stats schema every category node is a struct mirroring the table
+/// nesting (leaves -- variants included -- are scalars), so a non-struct node is a leaf or a
+/// shape mismatch and terminates the descent.
+fn get_struct_sub_schema<'a>(schema: &'a StructType, field_name: &str) -> Option<&'a StructType> {
+    match schema.field(field_name).map(StructField::data_type) {
+        Some(DataType::Struct(s)) => Some(s.as_ref()),
+        _ => None,
+    }
+}
+
+/// The three Delta JSON stat category sub-schemas (`nullCount`/`minValues`/`maxValues`) in scope
+/// at the current position of a schema walk. Each is `None` when the category omits that subtree.
+///
+/// The Delta stats schema is *nested* (it mirrors the table struct), while `content_stats` is
+/// *flat*. As the collector descends into a struct field, [`descend`](Self::descend) steps each
+/// category into the matching sub-schema so a leaf's membership can be tested segment-by-segment
+/// against the leaf's own name -- never by parsing the flat dotted output name (a column name may
+/// itself contain a dot).
+#[derive(Clone, Copy)]
+struct CategoryScopes<'a> {
+    /// Scopes for the three categories, indexed by [`STAT_CATEGORIES`]. Every method treats them
+    /// uniformly, so they live in one array rather than three named fields.
+    categories: [Option<&'a StructType>; 3],
+}
+
+/// The three Delta JSON stat category names, in the order [`CategoryScopes::categories`] indexes.
+const STAT_CATEGORIES: [&str; 3] = [NULL_COUNT, MIN_VALUES, MAX_VALUES];
+
+impl<'a> CategoryScopes<'a> {
+    /// Builds the top-level scopes from a Delta JSON stats schema.
+    fn from_delta_stats_schema(delta_stats_schema: &'a StructType) -> Self {
+        CategoryScopes {
+            categories: STAT_CATEGORIES.map(|c| get_struct_sub_schema(delta_stats_schema, c)),
+        }
+    }
+
+    /// Steps every category into its `<name>` sub-schema for a struct descent.
+    fn descend(&self, name: &str) -> CategoryScopes<'a> {
+        CategoryScopes {
+            categories: self
+                .categories
+                .map(|scope| scope.and_then(|s| get_struct_sub_schema(s, name))),
+        }
+    }
+
+    /// Whether a leaf named `leaf_name` appears in *any* category. Every leaf -- variants included
+    /// -- is a scalar in each category (a variant appears in `nullCount` as a scalar `LONG` and is
+    /// absent from `minValues`/`maxValues`), so presence is a same-name field lookup.
+    fn leaf_present(&self, leaf_name: &str) -> bool {
+        self.categories
+            .iter()
+            .any(|scope| scope.is_some_and(|s| s.field(leaf_name).is_some()))
+    }
+}
+
 /// A [`SchemaTransform`] that collects the flat AMT `content_stats` schema by visiting every leaf
 /// of a table schema (see [`stats_schema`] for the layout, [`leaf_stats_field`] for each leaf).
 ///
+/// When `filter` is `Some`, only leaves present in at least one Delta stat category are emitted
+/// (see [`filtered_stats_schema`]); when `None`, every stat-eligible leaf is emitted.
+///
 /// Uses the `Result<(), Error>` carrier: the rebuilt output is discarded, [`Self::fields`] is the
 /// real result, and an `Err` short-circuits the walk.
-struct StatsSchemaCollector {
+struct StatsSchemaCollector<'a> {
     /// Field names from the root to the current node; the last segment is the leaf being visited.
     path: Vec<String>,
     /// Accumulated flat stats fields, in schema order.
     fields: Vec<StructField>,
+    /// Delta stat categories in scope at the current position, or `None` to emit every leaf.
+    filter: Option<CategoryScopes<'a>>,
 }
 
-impl<'a> SchemaTransform<'a> for StatsSchemaCollector {
+impl<'a> SchemaTransform<'a> for StatsSchemaCollector<'a> {
     transform_output_type!(|'a, T| Result<(), Error>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), Error> {
@@ -300,11 +363,23 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector {
         // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `path` is
         // discarded, so the skipped pop is harmless.
         let result = if let DataType::Struct(_) = field.data_type() {
-            self.recurse_into_struct_field(field)
+            // The stat-category scopes step into this struct's sub-schema and are restored on the
+            // way back up so siblings are unaffected.
+            let saved_filter = self.filter;
+            self.filter = self.filter.map(|s| s.descend(field.name()));
+            let result = self.recurse_into_struct_field(field);
+            self.filter = saved_filter;
+            result
+        } else if self.filter.is_some_and(|s| !s.leaf_present(field.name())) {
+            // Absent from every category: emit no stats for this leaf.
+            Ok(())
         } else {
             // Every non-struct type is a leaf handled by `leaf_stats_field` -- including variants
             // (never descended into: their inner fields carry no field IDs) and array/map columns
-            // (which produce no stats).
+            // (which produce no stats). The filter is column-granular: a surviving leaf keeps its
+            // full stats struct regardless of which categories it appeared in.
+            // TODO: prune per-category sub-fields (e.g. drop `upper_bound` when only `minValues`
+            // is present).
             leaf_stats_field(field, &self.path).map(|stats| self.fields.extend(stats))
         };
         self.path.pop();
@@ -334,9 +409,43 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector {
 /// Returns an error if a leaf is missing its field-id metadata entirely, or is an (as-yet
 /// unimplemented) geospatial column.
 pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType> {
+    collect_stats_schema(table_struct, None)
+}
+
+/// Generates the AMT `content_stats` schema restricted to the leaves that carry Delta stats.
+///
+/// Same flat layout as [`stats_schema`], but a leaf is emitted only if its column appears in at
+/// least one Delta stat category (`nullCount`/`minValues`/`maxValues`) of `delta_stats_schema`.
+/// This avoids reading per-column stats that no Delta stat records. `delta_stats_schema` is the
+/// nested Delta Protocol stats schema (nesting in table schema is reflected in the stats schema)
+/// tested segment-by-segment as the walk descends (see [`CategoryScopes`]).
+///
+///
+/// `table_struct` must be a physical schema (carrying `parquet.field.id`, as [`stats_schema`]
+/// requires), and `delta_stats_schema` must use the same physical names. Membership is matched by
+/// field name, so a naming mismatch (e.g. logical stat names against a physical `table_struct`
+/// under column mapping) matches nothing and drops every leaf.
+///
+pub(crate) fn filtered_stats_schema(
+    table_struct: &StructType,
+    delta_stats_schema: &StructType,
+) -> DeltaResult<StructType> {
+    collect_stats_schema(
+        table_struct,
+        Some(CategoryScopes::from_delta_stats_schema(delta_stats_schema)),
+    )
+}
+
+/// Shared body of [`stats_schema`] and [`filtered_stats_schema`]: walks `table_struct` with the
+/// (optional) Delta stat filter and returns the flat `content_stats` schema.
+fn collect_stats_schema<'a>(
+    table_struct: &'a StructType,
+    filter: Option<CategoryScopes<'a>>,
+) -> DeltaResult<StructType> {
     let mut collector = StatsSchemaCollector {
         path: Vec::new(),
         fields: Vec::new(),
+        filter,
     };
     collector.transform_struct(table_struct)?;
     // `new_unchecked` skips name dedup; safe because `ColumnName`'s `Display` is lossless -- a leaf
@@ -349,9 +458,11 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::scan::data_skipping::stats_schema::{expected_stats_schema, StatsConfig};
     use crate::schema::{ArrayType, MapType};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+    use crate::table_properties::DataSkippingNumIndexedCols;
 
     #[rstest]
     #[case(0, 10_000)]
@@ -392,42 +503,30 @@ mod tests {
     /// stat.
     fn assert_stats_field_ids(stats_struct: &StructType, base_id: i32, field: &StructField) {
         let is_variant = matches!(field.data_type(), DataType::Variant(_));
-        assert_eq!(
-            get_field_id(stats_struct.field(VALUE_COUNT).unwrap()),
-            Some(base_id + STATS_OFFSET_VALUE_COUNT)
-        );
-        assert_eq!(
-            get_field_id(stats_struct.field(NULL_VALUE_COUNT).unwrap()),
-            Some(base_id + STATS_OFFSET_NULL_VALUE_COUNT)
-        );
-        if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
+        let assert_offset = |name: &str, offset: i32| {
             assert_eq!(
-                get_field_id(stats_struct.field(NAN_VALUE_COUNT).unwrap()),
-                Some(base_id + STATS_OFFSET_NAN_VALUE_COUNT)
+                get_field_id(stats_struct.field(name).unwrap()),
+                Some(base_id + offset)
             );
+        };
+        assert_offset(VALUE_COUNT, STATS_OFFSET_VALUE_COUNT);
+        assert_offset(NULL_VALUE_COUNT, STATS_OFFSET_NULL_VALUE_COUNT);
+        if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
+            assert_offset(NAN_VALUE_COUNT, STATS_OFFSET_NAN_VALUE_COUNT);
         }
         if is_variant
             || field.data_type() == &DataType::STRING
             || field.data_type() == &DataType::BINARY
         {
-            assert_eq!(
-                get_field_id(stats_struct.field(AVG_VALUE_SIZE_IN_BYTES).unwrap()),
-                Some(base_id + STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES)
+            assert_offset(
+                AVG_VALUE_SIZE_IN_BYTES,
+                STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
             );
         }
-        assert_eq!(
-            get_field_id(stats_struct.field(LOWER_BOUND).unwrap()),
-            Some(base_id + STATS_OFFSET_LOWER_BOUND)
-        );
-        assert_eq!(
-            get_field_id(stats_struct.field(UPPER_BOUND).unwrap()),
-            Some(base_id + STATS_OFFSET_UPPER_BOUND)
-        );
+        assert_offset(LOWER_BOUND, STATS_OFFSET_LOWER_BOUND);
+        assert_offset(UPPER_BOUND, STATS_OFFSET_UPPER_BOUND);
         if !is_variant {
-            assert_eq!(
-                get_field_id(stats_struct.field(TIGHT_BOUNDS).unwrap()),
-                Some(base_id + STATS_OFFSET_TIGHT_BOUNDS)
-            );
+            assert_offset(TIGHT_BOUNDS, STATS_OFFSET_TIGHT_BOUNDS);
         }
     }
 
@@ -942,5 +1041,382 @@ mod tests {
             get_field_id(stats.field("b.z").unwrap()),
             Some(10_000 + 200 * 20)
         );
+    }
+
+    // === filtered_stats_schema ===
+
+    /// Builds a Delta JSON stats schema from its three category sub-structs (any may be omitted).
+    /// Only field names and struct nesting matter to the filter, so leaf types are arbitrary.
+    fn delta_stats(
+        null_count: Option<StructType>,
+        min_values: Option<StructType>,
+        max_values: Option<StructType>,
+    ) -> StructType {
+        let categories = [
+            (NULL_COUNT, null_count),
+            (MIN_VALUES, min_values),
+            (MAX_VALUES, max_values),
+        ];
+        let fields = categories
+            .into_iter()
+            .filter_map(|(name, sub)| sub.map(|s| StructField::nullable(name, s)));
+        StructType::new_unchecked(fields)
+    }
+
+    /// A stat category sub-struct listing `names` as (arbitrary-typed) leaves.
+    fn stat_cols<'a>(names: impl IntoIterator<Item = &'a str>) -> StructType {
+        StructType::new_unchecked(
+            names
+                .into_iter()
+                .map(|n| StructField::nullable(n, DataType::LONG)),
+        )
+    }
+
+    /// A stat category with a single nested struct field `name` whose leaves are `leaves` --
+    /// mirrors a nested table column in one category.
+    fn nested_cat<'a>(name: &str, leaves: impl IntoIterator<Item = &'a str>) -> StructType {
+        StructType::new_unchecked([StructField::nullable(name, stat_cols(leaves))])
+    }
+
+    #[test]
+    fn filtered_equals_stats_schema_when_every_leaf_present() {
+        // {id: long, a: struct{b: int}, v: variant}, with every leaf in all three categories.
+        let table = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 0),
+            field_with_id(
+                "a",
+                StructType::new_unchecked([field_with_id("b", DataType::INTEGER, true, 2)]).into(),
+                true,
+                1,
+            ),
+            field_with_id("v", DataType::unshredded_variant(), true, 3),
+        ]);
+        // Each category mirrors the table: `a` is a nested struct; `v` is a scalar (a variant's
+        // real shape in a Delta stats schema -- a `LONG` in `nullCount`, never nested).
+        let category = || {
+            StructType::new_unchecked([
+                StructField::nullable("id", DataType::LONG),
+                StructField::nullable("a", stat_cols(["b"])),
+                StructField::nullable("v", DataType::LONG),
+            ])
+        };
+        let delta = delta_stats(Some(category()), Some(category()), Some(category()));
+
+        let filtered = filtered_stats_schema(&table, &delta).expect("filtered should succeed");
+        let full = stats_schema(&table).expect("stats_schema should succeed");
+        assert_eq!(filtered, full);
+    }
+
+    #[test]
+    fn filtered_drops_array_and_map_even_when_in_null_count() {
+        let table = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 0),
+            field_with_id(
+                "arr",
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+                true,
+                1,
+            ),
+            field_with_id(
+                "m",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    true,
+                ))),
+                true,
+                2,
+            ),
+        ]);
+        // All three columns appear in nullCount; array/map carry no leaf stats regardless.
+        let delta = delta_stats(
+            Some(stat_cols(["id", "arr", "m"])),
+            Some(stat_cols(["id"])),
+            Some(stat_cols(["id"])),
+        );
+        let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
+        assert_eq!(filtered.fields().count(), 1);
+        assert!(filtered.field("id").is_some());
+    }
+
+    #[rstest]
+    #[case::only_null_count(true, false, false, true)]
+    #[case::only_min(false, true, false, true)]
+    #[case::only_max(false, false, true, true)]
+    #[case::min_and_max(false, true, true, true)]
+    #[case::none(false, false, false, false)]
+    fn filtered_includes_leaf_iff_in_any_category(
+        #[case] in_null_count: bool,
+        #[case] in_min: bool,
+        #[case] in_max: bool,
+        #[case] expected_present: bool,
+    ) {
+        let table = StructType::new_unchecked([field_with_id("c", DataType::INTEGER, false, 1)]);
+        let cat = |included: bool| included.then(|| stat_cols(["c"]));
+        let delta = delta_stats(cat(in_null_count), cat(in_min), cat(in_max));
+
+        let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
+        assert_eq!(filtered.field("c").is_some(), expected_present);
+        if expected_present {
+            // Int leaf => lower, upper, tight_bounds, value_count, null_value_count (the full
+            // unfiltered set; null_value_count is always present).
+            assert_eq!(stats_struct_for_name("c", &filtered).fields().count(), 5);
+        }
+    }
+
+    /// Nested-leaf membership is decided per leaf: a leaf survives iff it appears in some category,
+    /// independent of its siblings.
+    #[rstest]
+    // `a.c` via nullCount, `a.b` via minValues => both survive.
+    #[case::each_via_a_different_category(Some(nested_cat("a", ["c"])), Some(nested_cat("a", ["b"])), &["a.b", "a.c"])]
+    // Only `a.b` appears anywhere => `a.c` is dropped.
+    #[case::sibling_absent_is_dropped(None, Some(nested_cat("a", ["b"])), &["a.b"])]
+    fn filtered_nested_leaf_membership_is_per_leaf(
+        #[case] null_count: Option<StructType>,
+        #[case] min_values: Option<StructType>,
+        #[case] expected: &[&str],
+    ) {
+        // {a: struct{b: int, c: string}}
+        let table = StructType::new_unchecked([field_with_id(
+            "a",
+            StructType::new_unchecked([
+                field_with_id("b", DataType::INTEGER, true, 2),
+                field_with_id("c", DataType::STRING, true, 3),
+            ])
+            .into(),
+            true,
+            1,
+        )]);
+        let delta = delta_stats(null_count, min_values, None);
+        let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
+        assert_eq!(filtered.fields().count(), expected.len());
+        for path in expected {
+            assert!(filtered.field(path).is_some(), "expected {path} to survive");
+        }
+    }
+
+    #[test]
+    fn filtered_drops_entire_substruct_absent_from_all_categories() {
+        // {a: struct{b: int}, d: long}; only `d` is present, so the whole `a` subtree is dropped.
+        let table = StructType::new_unchecked([
+            field_with_id(
+                "a",
+                StructType::new_unchecked([field_with_id("b", DataType::INTEGER, true, 2)]).into(),
+                true,
+                1,
+            ),
+            field_with_id("d", DataType::LONG, true, 3),
+        ]);
+        let delta = delta_stats(Some(stat_cols(["d"])), None, None);
+        let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
+        assert_eq!(filtered.fields().count(), 1);
+        assert!(filtered.field("d").is_some());
+        assert!(filtered.field("a.b").is_none());
+    }
+
+    #[test]
+    fn filtered_drops_substruct_when_ancestor_category_node_is_leaf() {
+        // {a: struct{b: int}}; `a`'s category node is a scalar (shape mismatch), so the descent
+        // terminates (get_struct_sub_schema returns None) and the whole `a` subtree is dropped.
+        let table = StructType::new_unchecked([field_with_id(
+            "a",
+            StructType::new_unchecked([field_with_id("b", DataType::INTEGER, true, 2)]).into(),
+            true,
+            1,
+        )]);
+        let delta = delta_stats(Some(stat_cols(["a"])), None, None);
+        let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
+        assert_eq!(filtered.fields().count(), 0);
+    }
+
+    /// A variant survives the filter exactly when present in some category, like any other leaf.
+    #[rstest]
+    #[case::present_in_null_count(true, true)]
+    #[case::absent_from_all(false, false)]
+    fn filtered_variant_membership_matches_scalar_presence(
+        #[case] in_null_count: bool,
+        #[case] expected_present: bool,
+    ) {
+        let table = StructType::new_unchecked([field_with_id(
+            "v",
+            DataType::unshredded_variant(),
+            true,
+            3,
+        )]);
+        let delta = delta_stats(in_null_count.then(|| stat_cols(["v"])), None, None);
+        assert_eq!(
+            filtered_stats_schema(&table, &delta)
+                .expect("should succeed")
+                .field("v")
+                .is_some(),
+            expected_present
+        );
+    }
+
+    /// Guards against fixture-vs-reality drift: derive the Delta stats schema from the real
+    /// [`expected_stats_schema`] (the only nested stats schema the kernel produces) and confirm
+    /// that a variant survives the filter alongside the primitive leaves. With every leaf carrying
+    /// a `nullCount` stat, the filter is a no-op, so the result equals the unfiltered
+    /// [`stats_schema`].
+    #[test]
+    fn filtered_keeps_all_leaves_from_real_expected_stats_schema() {
+        let table = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 0),
+            field_with_id("s", DataType::STRING, true, 1),
+            field_with_id("v", DataType::unshredded_variant(), true, 2),
+        ]);
+        let config = StatsConfig {
+            data_skipping_stats_columns: None,
+            data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
+        };
+        let delta = expected_stats_schema(&table, &config, None, None).expect("stats schema");
+
+        let filtered = filtered_stats_schema(&table, &delta).expect("filtered should succeed");
+        assert!(
+            filtered.field("v").is_some(),
+            "variant present in nullCount must survive"
+        );
+        assert_eq!(
+            filtered,
+            stats_schema(&table).expect("stats_schema should succeed")
+        );
+    }
+
+    #[test]
+    fn filtered_leaf_in_category_still_warn_dropped_when_out_of_range() {
+        // Presence in a category does not bypass the supported-range gate in `leaf_stats_field`.
+        let table = StructType::new_unchecked([field_with_id(
+            "c",
+            DataType::INTEGER,
+            false,
+            MAX_DATA_FIELD_ID + 1,
+        )]);
+        let delta = delta_stats(Some(stat_cols(["c"])), None, None);
+        let filtered = filtered_stats_schema(&table, &delta).expect("out-of-range warn-drops");
+        assert_eq!(filtered.fields().count(), 0);
+    }
+
+    #[test]
+    fn filtered_leaf_in_category_missing_field_id_still_errors() {
+        // Presence in a category does not bypass the missing-field-id error either.
+        let table = StructType::new_unchecked([StructField::not_null("c", DataType::INTEGER)]);
+        let delta = delta_stats(Some(stat_cols(["c"])), None, None);
+        assert!(filtered_stats_schema(&table, &delta).is_err());
+    }
+
+    #[test]
+    fn filtered_skips_missing_field_id_leaf_when_absent_from_all_categories() {
+        // The filter runs before `leaf_stats_field`, so a leaf absent from every category is
+        // skipped without triggering its missing-field-id error.
+        let table = StructType::new_unchecked([
+            StructField::not_null("no_id", DataType::INTEGER),
+            field_with_id("c", DataType::INTEGER, false, 1),
+        ]);
+        let delta = delta_stats(Some(stat_cols(["c"])), None, None);
+        let filtered = filtered_stats_schema(&table, &delta)
+            .expect("absent leaf is filtered before its missing-id check");
+        assert_eq!(filtered.fields().count(), 1);
+        assert!(filtered.field("c").is_some());
+    }
+
+    #[test]
+    fn filtered_restores_scope_for_sibling_struct_at_nested_level() {
+        // {p: struct{x: struct{a}, y: struct{b}}}: `p.x.a` via nullCount, `p.y.b` via minValues.
+        // `y` must descend from `p`'s saved scope -- not `x`'s child scope, not root -- so both
+        // survive. This exercises restoration to a non-root saved scope, unlike the other tests.
+        let table = StructType::new_unchecked([field_with_id(
+            "p",
+            StructType::new_unchecked([
+                field_with_id(
+                    "x",
+                    StructType::new_unchecked([field_with_id("a", DataType::INTEGER, true, 3)])
+                        .into(),
+                    true,
+                    2,
+                ),
+                field_with_id(
+                    "y",
+                    StructType::new_unchecked([field_with_id("b", DataType::INTEGER, true, 5)])
+                        .into(),
+                    true,
+                    4,
+                ),
+            ])
+            .into(),
+            true,
+            1,
+        )]);
+        let null_count = StructType::new_unchecked([StructField::nullable(
+            "p",
+            StructType::new_unchecked([StructField::nullable("x", stat_cols(["a"]))]),
+        )]);
+        let min_values = StructType::new_unchecked([StructField::nullable(
+            "p",
+            StructType::new_unchecked([StructField::nullable("y", stat_cols(["b"]))]),
+        )]);
+        let delta = delta_stats(Some(null_count), Some(min_values), None);
+
+        let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
+        assert_eq!(filtered.fields().count(), 2);
+        assert!(filtered.field("p.x.a").is_some());
+        assert!(filtered.field("p.y.b").is_some());
+    }
+
+    #[test]
+    fn filtered_drops_all_leaves_on_naming_mode_mismatch() {
+        // Physical table names vs (logical) stats-schema names => no overlap => empty, no error.
+        let table = StructType::new_unchecked([
+            field_with_id("col-abc", DataType::INTEGER, false, 1),
+            field_with_id("col-def", DataType::LONG, true, 2),
+        ]);
+        let delta = delta_stats(Some(stat_cols(["logical_a", "logical_b"])), None, None);
+        let filtered = filtered_stats_schema(&table, &delta).expect("mismatch drops all, no error");
+        assert_eq!(filtered.fields().count(), 0);
+    }
+
+    #[rstest]
+    // A table column named like a stat category is matched one level deep (inside the category),
+    // not against the top-level category header.
+    #[case::leaf_inside_category(stat_cols(["nullCount"]), true)]
+    #[case::only_the_category_header(stat_cols(["other"]), false)]
+    fn filtered_handles_column_named_like_a_stat_category(
+        #[case] null_count: StructType,
+        #[case] expected_present: bool,
+    ) {
+        let table =
+            StructType::new_unchecked([field_with_id("nullCount", DataType::LONG, true, 1)]);
+        let delta = delta_stats(Some(null_count), None, None);
+        let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
+        assert_eq!(filtered.field("nullCount").is_some(), expected_present);
+    }
+
+    /// C1 contract: `stats_schema` emits a reserved-metadata leaf unconditionally, but the filter
+    /// emits it only when the caller lists it in a category. The caller decides membership.
+    #[rstest]
+    #[case::included_survives(true, true)]
+    #[case::omitted_dropped(false, false)]
+    fn filtered_reserved_metadata_leaf_requires_caller_inclusion(
+        #[case] include_in_category: bool,
+        #[case] expected_present: bool,
+    ) {
+        let table = StructType::new_unchecked([field_with_id(
+            "_row_id",
+            DataType::LONG,
+            true,
+            ROW_ID_FIELD_ID,
+        )]);
+        // The unfiltered path always emits the reserved-metadata leaf.
+        assert!(stats_schema(&table)
+            .expect("stats_schema should succeed")
+            .field("_row_id")
+            .is_some());
+        // The filtered path emits it only when the caller includes it in a category.
+        let delta = delta_stats(
+            include_in_category.then(|| stat_cols(["_row_id"])),
+            None,
+            None,
+        );
+        let filtered = filtered_stats_schema(&table, &delta).expect("should succeed");
+        assert_eq!(filtered.field("_row_id").is_some(), expected_present);
     }
 }
