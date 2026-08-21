@@ -958,6 +958,7 @@ pub(crate) fn reorder_struct_array(
                             final_fields_cols[reorder_index.index] =
                                 reorder_map(map_array, field.name(), children)?;
                         }
+                        // TODO(#3178): ListView/LargeListView fall through here.
                         _ => {
                             return Err(Error::internal_error(
                                 "Nested reorder can only apply to struct/list/map.",
