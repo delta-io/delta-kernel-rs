@@ -122,18 +122,20 @@ impl LogSegment {
     }
 
     /// Replays the log segment for Protocol and Metadata, stopping early once both are found.
-    /// Under `adaptive-metadata-in-dev`, also reconciles any P&M nested in a `checkpoint` action.
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        // Only the plan reader can't project the nested `checkpoint` action, so only it needs the
+        // checkpoint-projected reconcile pass; the non-plan reader resolves checkpoints inline here.
+        // TODO: a plan IR unnest op would let the plan path project `checkpoint` and drop that pass.
         #[cfg(feature = "declarative-plans")]
-        let actions_batches = match engine.plan_executor() {
-            Some(executor) => self.read_pm_batches_via_plan(executor.as_ref())?,
-            None => Box::new(self.read_pm_batches(engine)?) as _,
+        let (actions_batches, _plan_needs_checkpoint_pass) = match engine.plan_executor() {
+            Some(executor) => (self.read_pm_batches_via_plan(executor.as_ref())?, true),
+            None => (Box::new(self.read_pm_batches(engine)?) as _, false),
         };
         #[cfg(not(feature = "declarative-plans"))]
-        let actions_batches = self.read_pm_batches(engine)?;
+        let (actions_batches, _plan_needs_checkpoint_pass) = (self.read_pm_batches(engine)?, false);
 
         let mut metadata_opt = None;
         let mut protocol_opt = None;
@@ -142,25 +144,28 @@ impl LogSegment {
             if try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)? {
                 break;
             }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            if !_plan_needs_checkpoint_pass {
+                if let Some((metadata, protocol)) =
+                    resolve_pm_from_checkpoint(actions.as_ref(), &metadata_opt, &protocol_opt)?
+                {
+                    return Ok((Some(metadata), Some(protocol)));
+                }
+            }
         }
 
-        // P&M can be nested in a `checkpoint` action this pass doesn't see: the `declarative-plans`
-        // plan can't unnest `checkpoint`, and the non-plan pass projects only top-level
-        // protocol/metaData. Re-resolve including any `checkpoint` action.
-        // TODO: add a plan IR (+ proto) unnest op so a single pass handles AMT.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let (metadata_opt, protocol_opt) =
-            self.reconcile_pm_with_checkpoint(engine, metadata_opt, protocol_opt)?;
+        #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+        if _plan_needs_checkpoint_pass {
+            return self.reconcile_pm_with_checkpoint(engine, metadata_opt, protocol_opt);
+        }
 
         Ok((metadata_opt, protocol_opt))
     }
 
-    /// Re-resolve P&M including any `checkpoint` action; newest wins, so a later top-level commit
-    /// overrides it. Returns `top_level_*` when no `checkpoint` action supersedes them.
-    ///
-    /// Always rescans with `checkpoint` projected in, since the first pass sees only top-level
-    /// protocol/metaData. Newest-first replay then resolves the correct P&M.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
+    /// Re-resolve P&M with `checkpoint` projected in, for the plan reader that can't project it.
+    /// Newest wins, so a later top-level commit overrides the checkpoint; returns `top_level_*`
+    /// when no `checkpoint` action supersedes them.
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
     fn reconcile_pm_with_checkpoint(
         &self,
         engine: &dyn Engine,
@@ -176,24 +181,13 @@ impl LogSegment {
         let mut protocol_opt = None;
         for actions_batch in self.read_actions(engine, schema)? {
             let actions = actions_batch?.actions;
-            let both_found = try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)?;
-
-            // A `checkpoint` action is complete state at its version: fill any gap and stop.
-            if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
-                let metadata = metadata_opt.unwrap_or_else(|| checkpoint.metadata().clone());
-                let protocol = protocol_opt.unwrap_or_else(|| checkpoint.protocol().clone());
-                require!(
-                    adaptive_metadata_enabled(&protocol),
-                    Error::invalid_protocol(
-                        "found a checkpoint action but the protocol does not enable the \
-                         adaptiveMetadata reader feature"
-                    )
-                );
-                return Ok((Some(metadata), Some(protocol)));
-            }
-
-            if both_found {
+            if try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)? {
                 break;
+            }
+            if let Some((metadata, protocol)) =
+                resolve_pm_from_checkpoint(actions.as_ref(), &metadata_opt, &protocol_opt)?
+            {
+                return Ok((Some(metadata), Some(protocol)));
             }
         }
 
@@ -249,11 +243,20 @@ impl LogSegment {
         Ok(Box::new(batches))
     }
 
-    // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
+    // Replay the commit log, projecting rows to Protocol and Metadata action columns, plus the
+    // `checkpoint` action under `adaptive-metadata-in-dev` so a single pass also resolves P&M
+    // embedded in a manifest-commit checkpoint.
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+            (&CHECKPOINT_ACTION_FIELD),
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let schema = schema_ref! {
             (&PROTOCOL_FIELD),
             (&METADATA_FIELD),
@@ -276,6 +279,30 @@ fn try_fill_pm(
         *protocol = Protocol::try_new_from_data(actions)?;
     }
     Ok(metadata.is_some() && protocol.is_some())
+}
+
+/// Resolve complete P&M from a `checkpoint` action in `actions`, filling any gap in `metadata`/
+/// `protocol` from it. Returns `None` when there's no `checkpoint` action. Errors if the resolved
+/// protocol doesn't enable `adaptiveMetadata`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn resolve_pm_from_checkpoint(
+    actions: &dyn EngineData,
+    metadata: &Option<Metadata>,
+    protocol: &Option<Protocol>,
+) -> DeltaResult<Option<(Metadata, Protocol)>> {
+    let Some(checkpoint) = CheckpointAction::try_new_from_data(actions)? else {
+        return Ok(None);
+    };
+    let metadata = metadata.clone().unwrap_or_else(|| checkpoint.metadata().clone());
+    let protocol = protocol.clone().unwrap_or_else(|| checkpoint.protocol().clone());
+    require!(
+        adaptive_metadata_enabled(&protocol),
+        Error::invalid_protocol(
+            "found a checkpoint action but the protocol does not enable the \
+             adaptiveMetadata reader feature"
+        )
+    );
+    Ok(Some((metadata, protocol)))
 }
 
 /// Whether `protocol` enables the `adaptiveMetadata` reader feature.
@@ -554,10 +581,11 @@ mod tests {
         //
         // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
         //
-        // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- We currently
-        // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
-        // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
-        assert_eq!(data.len(), 4);
+        // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- row group skipping is
+        // disabled for parts missing a projected column, so parts 1 and 5 are read regardless. Under
+        // `adaptive-metadata-in-dev` no classic part carries the projected `checkpoint` column, so
+        // part 3 no longer skips either -- all five are read instead of two.
+        assert_eq!(data.len(), 5);
     }
 
     // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the
