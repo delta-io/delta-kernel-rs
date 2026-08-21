@@ -8,10 +8,10 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use super::LogSegment;
-use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{get_commit_schema, CheckpointAction, CHECKPOINT_ACTION_NAME};
-#[cfg(any(feature = "declarative-plans", feature = "adaptive-metadata-in-dev"))]
+use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
+use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
+#[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
@@ -27,7 +27,7 @@ use crate::schema::schema_ref;
 use crate::table_features::TableFeature;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Engine, EngineData, Error};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -139,13 +139,7 @@ impl LogSegment {
         let mut protocol_opt = None;
         for actions_batch in actions_batches {
             let actions = actions_batch?.actions;
-            if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-            }
-            if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
-            }
-            if metadata_opt.is_some() && protocol_opt.is_some() {
+            if try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)? {
                 break;
             }
         }
@@ -173,18 +167,16 @@ impl LogSegment {
         top_level_metadata: Option<Metadata>,
         top_level_protocol: Option<Protocol>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let schema =
-            get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CHECKPOINT_ACTION_NAME])?;
+        let schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+            (&CHECKPOINT_ACTION_FIELD),
+        };
         let mut metadata_opt = None;
         let mut protocol_opt = None;
         for actions_batch in self.read_actions(engine, schema)? {
             let actions = actions_batch?.actions;
-            if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-            }
-            if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
-            }
+            let both_found = try_fill_pm(actions.as_ref(), &mut metadata_opt, &mut protocol_opt)?;
 
             // A `checkpoint` action is complete state at its version: fill any gap and stop.
             if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
@@ -200,7 +192,7 @@ impl LogSegment {
                 return Ok((Some(metadata), Some(protocol)));
             }
 
-            if metadata_opt.is_some() && protocol_opt.is_some() {
+            if both_found {
                 break;
             }
         }
@@ -268,6 +260,22 @@ impl LogSegment {
         };
         self.read_actions(engine, schema)
     }
+}
+
+/// Fill `metadata`/`protocol` from `actions` if not already resolved, returning whether both are
+/// now present.
+fn try_fill_pm(
+    actions: &dyn EngineData,
+    metadata: &mut Option<Metadata>,
+    protocol: &mut Option<Protocol>,
+) -> DeltaResult<bool> {
+    if metadata.is_none() {
+        *metadata = Metadata::try_new_from_data(actions)?;
+    }
+    if protocol.is_none() {
+        *protocol = Protocol::try_new_from_data(actions)?;
+    }
+    Ok(metadata.is_some() && protocol.is_some())
 }
 
 /// Whether `protocol` enables the `adaptiveMetadata` reader feature.
@@ -347,8 +355,6 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     const TWO_COLUMN_SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
 
-    // Loading a table whose only commit is a manifest-commit `checkpoint` action must resolve
-    // Protocol and Metadata from inside that action (they are not present as top-level actions).
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[tokio::test]
     async fn test_load_resolves_pm_from_manifest_commit_checkpoint_action() {
@@ -364,16 +370,13 @@ mod tests {
         .await
         .unwrap();
 
-        // A successful build proves BOTH Protocol and Metadata were resolved (otherwise the build
-        // fails with MissingProtocol / MissingMetadata), and the schema comes from the embedded
-        // metaData.
+        // A successful build means P&M resolved from the checkpoint action; the schema confirms the
+        // embedded metaData was used.
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         assert_eq!(snapshot.version(), 0);
         assert!(snapshot.schema().field("id").is_some());
     }
 
-    // A `checkpoint` action found under a protocol that does not enable the adaptiveMetadata reader
-    // feature is invalid and must be rejected.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[tokio::test]
     async fn test_checkpoint_action_without_adaptive_feature_is_rejected() {
@@ -394,14 +397,13 @@ mod tests {
             .build(&engine)
             .expect_err("checkpoint action without the feature must be rejected");
         assert!(
-            err.to_string().contains("adaptiveMetadata"),
+            matches!(err, crate::Error::InvalidProtocol(_)),
             "unexpected error: {err}"
         );
     }
 
-    // A later top-level `metaData` log commit must win over the checkpoint action's embedded
-    // metadata (top-level actions are seen first in backward replay), while the protocol still
-    // comes from the checkpoint action.
+    // Top-level actions are seen first in backward replay, so the v1 metaData wins; the protocol
+    // still comes from the checkpoint action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[tokio::test]
     async fn test_later_log_commit_metadata_overrides_checkpoint_action() {
