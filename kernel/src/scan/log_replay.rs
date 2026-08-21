@@ -534,7 +534,7 @@ impl ScanLogReplayProcessor {
         })
     }
 
-    fn record_active_add_files(
+    fn record_selected_add_files(
         &self,
         selection_vector: &[bool],
         active_add_file_sizes: &[u64],
@@ -549,7 +549,7 @@ impl ScanLogReplayProcessor {
         );
         for (selected, size) in selection_vector.iter().zip(active_add_file_sizes) {
             if *selected {
-                self.metrics.record_active_add_file(*size);
+                self.metrics.record_selected_add_file(*size);
             }
         }
         Ok(())
@@ -997,7 +997,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 active_add_file_sizes,
             }
         };
-        self.record_active_add_files(&final_selection, &active_add_file_sizes)?;
+        self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let scan_metadata =
             ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
@@ -1096,7 +1096,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 active_add_file_sizes,
             }
         };
-        self.record_active_add_files(&final_selection, &active_add_file_sizes)?;
+        self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let scan_metadata =
             ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics

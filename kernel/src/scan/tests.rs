@@ -2365,8 +2365,8 @@ mod scan_metadata_completed_tests {
             e.num_add_files_seen_from_delta_files,
             expected_add_seen_from_delta
         );
-        assert_eq!(e.num_active_add_files, expected_active);
-        assert_eq!(e.active_add_files_bytes, expected_active_bytes);
+        assert_eq!(e.num_selected_add_files, expected_active);
+        assert_eq!(e.selected_add_files_bytes, expected_active_bytes);
         assert_eq!(e.num_remove_files_seen_from_delta_files, expected_removes);
         assert_eq!(e.num_predicate_filtered, expected_filtered);
         let rendered = e.to_string();

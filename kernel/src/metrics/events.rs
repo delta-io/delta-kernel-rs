@@ -1387,9 +1387,9 @@ pub struct ScanMetadataCompleted {
     /// Add actions in delta-file replay input before predicate filtering and deduplication.
     pub num_add_files_seen_from_delta_files: u64,
     /// Add files that survived log replay (the files the connector reads).
-    pub num_active_add_files: u64,
+    pub num_selected_add_files: u64,
     /// Size in bytes of the files that survived log replay (files to read).
-    pub active_add_files_bytes: u64,
+    pub selected_add_files_bytes: u64,
     /// Remove actions in delta-file replay input before deduplication.
     pub num_remove_files_seen_from_delta_files: u64,
     /// Non-file actions seen (protocol, metadata, etc.).
@@ -1418,8 +1418,8 @@ impl ScanMetadataCompleted {
             duration: Duration::from_nanos(v.duration_ns),
             num_add_files_seen: v.num_add_files_seen,
             num_add_files_seen_from_delta_files: v.num_add_files_seen_from_delta_files,
-            num_active_add_files: v.num_active_add_files,
-            active_add_files_bytes: v.active_add_files_bytes,
+            num_selected_add_files: v.num_selected_add_files,
+            selected_add_files_bytes: v.selected_add_files_bytes,
             num_remove_files_seen_from_delta_files: v.num_remove_files_seen_from_delta_files,
             num_non_file_actions: v.num_non_file_actions,
             num_predicate_filtered: v.num_predicate_filtered,
@@ -1440,8 +1440,8 @@ impl fmt::Display for ScanMetadataCompleted {
             duration,
             num_add_files_seen,
             num_add_files_seen_from_delta_files,
-            num_active_add_files,
-            active_add_files_bytes,
+            num_selected_add_files,
+            selected_add_files_bytes,
             num_remove_files_seen_from_delta_files,
             num_non_file_actions,
             num_predicate_filtered,
@@ -1455,8 +1455,8 @@ impl fmt::Display for ScanMetadataCompleted {
              correlation_id={correlation_id:?}, scan_type={scan_type}, duration={duration:?}, \
              add_files_seen={num_add_files_seen}, \
              add_files_seen_from_delta_files={num_add_files_seen_from_delta_files}, \
-             active_add_files={num_active_add_files}, \
-             active_add_files_bytes={active_add_files_bytes}, \
+             selected_add_files={num_selected_add_files}, \
+             selected_add_files_bytes={selected_add_files_bytes}, \
              remove_files_seen_from_delta_files={num_remove_files_seen_from_delta_files}, \
              non_file_actions={num_non_file_actions}, \
              predicate_filtered={num_predicate_filtered}, peak_hash_set_size={peak_hash_set_size}, \
@@ -1474,8 +1474,8 @@ struct ScanMetadataCompletedAttrs {
     duration_ns: u64,
     num_add_files_seen: u64,
     num_add_files_seen_from_delta_files: u64,
-    num_active_add_files: u64,
-    active_add_files_bytes: u64,
+    num_selected_add_files: u64,
+    selected_add_files_bytes: u64,
     num_remove_files_seen_from_delta_files: u64,
     num_non_file_actions: u64,
     num_predicate_filtered: u64,
@@ -1504,8 +1504,8 @@ impl Visit for ScanMetadataCompletedAttrs {
             "num_add_files_seen_from_delta_files" => {
                 self.num_add_files_seen_from_delta_files = value
             }
-            "num_active_add_files" => self.num_active_add_files = value,
-            "active_add_files_bytes" => self.active_add_files_bytes = value,
+            "num_selected_add_files" => self.num_selected_add_files = value,
+            "selected_add_files_bytes" => self.selected_add_files_bytes = value,
             "num_remove_files_seen_from_delta_files" => {
                 self.num_remove_files_seen_from_delta_files = value
             }
@@ -1736,8 +1736,8 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         duration_ns = e.duration.as_nanos() as u64,
         num_add_files_seen = e.num_add_files_seen,
         num_add_files_seen_from_delta_files = e.num_add_files_seen_from_delta_files,
-        num_active_add_files = e.num_active_add_files,
-        active_add_files_bytes = e.active_add_files_bytes,
+        num_selected_add_files = e.num_selected_add_files,
+        selected_add_files_bytes = e.selected_add_files_bytes,
         num_remove_files_seen_from_delta_files = e.num_remove_files_seen_from_delta_files,
         num_non_file_actions = e.num_non_file_actions,
         num_predicate_filtered = e.num_predicate_filtered,

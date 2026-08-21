@@ -18,9 +18,9 @@ pub(crate) struct ScanMetrics {
     num_add_files_seen_from_delta_files: AtomicU64,
     /// Add files that survived log replay (files to read). includes files that survived
     /// dataskipping, partition pruning, and add/remove deduplication.
-    num_active_add_files: AtomicU64,
+    num_selected_add_files: AtomicU64,
     /// Number of bytes in the active add files as reported by the add action size field
-    active_add_files_bytes: AtomicU64,
+    selected_add_files_bytes: AtomicU64,
     /// Remove actions in delta-file replay input before deduplication.
     num_remove_files_seen_from_delta_files: AtomicU64,
     /// Non-file actions seen (protocol, metadata, etc.).
@@ -40,8 +40,8 @@ impl Default for ScanMetrics {
         Self {
             num_add_files_seen: AtomicU64::new(0),
             num_add_files_seen_from_delta_files: AtomicU64::new(0),
-            num_active_add_files: AtomicU64::new(0),
-            active_add_files_bytes: AtomicU64::new(0),
+            num_selected_add_files: AtomicU64::new(0),
+            selected_add_files_bytes: AtomicU64::new(0),
             num_remove_files_seen_from_delta_files: AtomicU64::new(0),
             num_non_file_actions: AtomicU64::new(0),
             num_predicate_filtered: AtomicU64::new(0),
@@ -61,10 +61,10 @@ impl ScanMetrics {
         }
     }
 
-    /// Record that we've seen an active add file, plus its size
-    pub(crate) fn record_active_add_file(&self, bytes: u64) {
-        self.num_active_add_files.fetch_add(1, Ordering::Relaxed);
-        self.active_add_files_bytes
+    /// Record that we've seen a selected add file, plus its size
+    pub(crate) fn record_selected_add_file(&self, bytes: u64) {
+        self.num_selected_add_files.fetch_add(1, Ordering::Relaxed);
+        self.selected_add_files_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
@@ -105,8 +105,8 @@ impl ScanMetrics {
         self.num_add_files_seen.store(0, Ordering::Relaxed);
         self.num_add_files_seen_from_delta_files
             .store(0, Ordering::Relaxed);
-        self.num_active_add_files.store(0, Ordering::Relaxed);
-        self.active_add_files_bytes.store(0, Ordering::Relaxed);
+        self.num_selected_add_files.store(0, Ordering::Relaxed);
+        self.selected_add_files_bytes.store(0, Ordering::Relaxed);
         self.num_remove_files_seen_from_delta_files
             .store(0, Ordering::Relaxed);
         self.num_non_file_actions.store(0, Ordering::Relaxed);
@@ -137,8 +137,8 @@ impl ScanMetrics {
             num_add_files_seen_from_delta_files: self
                 .num_add_files_seen_from_delta_files
                 .load(Ordering::Relaxed),
-            num_active_add_files: self.num_active_add_files.load(Ordering::Relaxed),
-            active_add_files_bytes: self.active_add_files_bytes.load(Ordering::Relaxed),
+            num_selected_add_files: self.num_selected_add_files.load(Ordering::Relaxed),
+            selected_add_files_bytes: self.selected_add_files_bytes.load(Ordering::Relaxed),
             num_remove_files_seen_from_delta_files: self
                 .num_remove_files_seen_from_delta_files
                 .load(Ordering::Relaxed),
@@ -160,8 +160,8 @@ impl ScanMetrics {
         let add_files_seen_from_delta_files = self
             .num_add_files_seen_from_delta_files
             .load(Ordering::Relaxed);
-        let active_add_files = self.num_active_add_files.load(Ordering::Relaxed);
-        let active_add_files_bytes = self.active_add_files_bytes.load(Ordering::Relaxed);
+        let selected_add_files = self.num_selected_add_files.load(Ordering::Relaxed);
+        let selected_add_files_bytes = self.selected_add_files_bytes.load(Ordering::Relaxed);
         let remove_files_seen_from_delta_files = self
             .num_remove_files_seen_from_delta_files
             .load(Ordering::Relaxed);
@@ -173,8 +173,8 @@ impl ScanMetrics {
         info!(
             add_files_seen,
             add_files_seen_from_delta_files,
-            active_add_files,
-            active_add_files_bytes,
+            selected_add_files,
+            selected_add_files_bytes,
             remove_files_seen_from_delta_files,
             non_file_actions,
             predicate_filtered,

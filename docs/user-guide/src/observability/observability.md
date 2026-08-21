@@ -151,7 +151,7 @@ consumed. It provides detailed statistics about the log replay process:
 | `duration` | Wall-clock time from scan start to iterator exhaustion. |
 | `num_add_files_seen` | Add actions in replay input before predicate filtering and deduplication. Includes checkpoint and delta files. |
 | `num_add_files_seen_from_delta_files` | Add actions in delta-file replay input before predicate filtering and deduplication. |
-| `num_active_add_files` | Add files that survived log replay. These are the files your connector reads. |
+| `num_selected_add_files` | Add files that survived log replay. These are the files your connector reads. |
 | `num_remove_files_seen_from_delta_files` | Remove actions in delta-file replay input before deduplication. |
 | `num_non_file_actions` | Non-file actions (protocol, metadata, etc.) seen during replay. |
 | `num_predicate_filtered` | Files eliminated by predicate evaluation (data skipping and partition pruning). |
