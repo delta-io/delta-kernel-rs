@@ -557,10 +557,12 @@ mod tests {
         // Part 3 skips normally (four read), but under `adaptive-metadata-in-dev` the projected
         // `checkpoint` column is also missing from every classic part, so part 3 no longer skips
         // and all five are read.
-        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        assert_eq!(data.len(), 4);
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        assert_eq!(data.len(), 5);
+        let expected_parts = if cfg!(feature = "adaptive-metadata-in-dev") {
+            5
+        } else {
+            4
+        };
+        assert_eq!(data.len(), expected_parts);
     }
 
     // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the
