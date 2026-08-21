@@ -1046,7 +1046,7 @@ fn reorder_list<O: OffsetSizeTrait>(
             result_array,
             null_buf,
         )?);
-        // Derive the field type from the rebuilt array so it stays List or LargeList per `O`.
+        // Take the field's type from the rebuilt array so a LargeList isn't forced to List.
         let new_field = Arc::new(ArrowField::new(
             input_field_name,
             list.data_type().clone(),
