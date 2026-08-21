@@ -10,7 +10,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
 use delta_kernel::schema::{
     schema, schema_ref, try_schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
-    SchemaRef, StructField,
+    SchemaRef, StructField, StructType,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -422,6 +422,64 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
         .expect("b is int");
     assert_eq!(b_col.value(0), 100);
 
+    Ok(())
+}
+
+/// Nested `add_column_at` on a column-mapped table: commit + reload must persist the nested
+/// field's CM id / physical name and advance `maxColumnId`.
+#[rstest]
+#[tokio::test]
+async fn add_column_at_nested_struct_with_column_mapping(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "address",
+            StructType::try_new(vec![StructField::nullable("city", DataType::STRING)])?,
+        ),
+    ])?);
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max = max_column_id(&snapshot).expect("CM table must have maxColumnId");
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("address"),
+            StructField::nullable("zip", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let zip = reloaded_schema.field_at_path(&["address".to_string(), "zip".to_string()]);
+    let cm_id = zip
+        .column_mapping_id()
+        .expect("nested field must receive a column mapping id");
+    assert!(
+        cm_id > original_max,
+        "nested field id {cm_id} must exceed original max {original_max}"
+    );
+    match zip
+        .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+        .expect("physical name should be assigned")
+    {
+        MetadataValue::String(s) => assert!(s.starts_with("col-")),
+        other => panic!("expected String, got {other:?}"),
+    }
+    assert_eq!(
+        max_column_id(&reloaded).expect("CM table must have maxColumnId"),
+        cm_id,
+        "table maxColumnId must equal the nested field's assigned id",
+    );
     Ok(())
 }
 
