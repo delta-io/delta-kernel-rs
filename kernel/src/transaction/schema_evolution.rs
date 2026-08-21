@@ -100,12 +100,8 @@ fn modify_field_at_path(
         ("element", DataType::Array(array)) => {
             modify_field_at_path(&mut array.element_type, rest, modifier)
         }
-        ("key", DataType::Map(map)) => {
-            modify_field_at_path(&mut map.key_type, rest, modifier)
-        }
-        ("value", DataType::Map(map)) => {
-            modify_field_at_path(&mut map.value_type, rest, modifier)
-        }
+        ("key", DataType::Map(map)) => modify_field_at_path(&mut map.key_type, rest, modifier),
+        ("value", DataType::Map(map)) => modify_field_at_path(&mut map.value_type, rest, modifier),
         (name, DataType::Struct(parent)) => {
             let lowered = name.to_lowercase();
             let field = parent
@@ -203,12 +199,10 @@ pub(super) fn apply_schema_operations(
                     .path()
                     .split_last()
                     .ok_or_else(|| Error::generic("empty column path"))?;
-                modify_field_at_path(&mut root, parent, |parent| {
-                    set_field_nullable(parent, leaf)
-                })
-                .map_err(|e| {
-                    Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
-                })?;
+                modify_field_at_path(&mut root, parent, |parent| set_field_nullable(parent, leaf))
+                    .map_err(|e| {
+                        Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
+                    })?;
             }
         }
 
@@ -281,16 +275,12 @@ pub(super) fn evolve_table_config(
         .clone()
         .with_schema(evolved_schema.clone())?
         .fold_with(new_max_column_id, |evolved_metadata, id| {
-            evolved_metadata
-                .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+            evolved_metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
         });
 
     // Validates the evolved metadata against the protocol.
-    let evolved_table_config = TableConfiguration::try_new_with_schema(
-        table_config,
-        evolved_metadata,
-        evolved_schema,
-    )?;
+    let evolved_table_config =
+        TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)?;
     Ok(evolved_table_config)
 }
 

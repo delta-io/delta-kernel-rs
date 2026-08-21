@@ -1749,8 +1749,8 @@ mod tests {
     use rstest::rstest;
     use url::Url;
 
-    use super::*;
     use super::schema_evolution::SchemaOperation;
+    use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
@@ -2129,12 +2129,10 @@ mod tests {
         let (engine, txn, _tempdir) = create_existing_table_txn()?;
 
         let snapshot = txn
-            .with_schema_changes(vec![
-                SchemaOperation::add_column(
-                    StructField::nullable("first_column", DataType::INTEGER),
-                    ColumnName::new(Vec::<String>::new()),
-                )
-            ])?
+            .with_schema_changes(vec![SchemaOperation::add_column(
+                StructField::nullable("first_column", DataType::INTEGER),
+                ColumnName::new(Vec::<String>::new()),
+            )])?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
         assert!(snapshot.schema().contains("first_column"));
