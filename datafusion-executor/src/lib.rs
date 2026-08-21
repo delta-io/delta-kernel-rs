@@ -14,8 +14,13 @@ use datafusion::execution::context::SessionContext;
 use delta_kernel::StorageHandler;
 
 mod expression;
+mod operator;
+mod parquet_expr_adapter;
+mod plan;
 mod predicate;
 mod scalar;
+mod scan;
+mod utils;
 
 pub use expression::to_df_expr;
 pub use predicate::to_df_predicate_expr;
@@ -42,9 +47,15 @@ pub struct DataFusionExecutor {
 }
 
 impl DataFusionExecutor {
-    pub fn new(storage_handler: Arc<dyn StorageHandler>) -> Self {
+    /// Creates an executor that plans and runs scans through `session_ctx`.
+    ///
+    /// The supplied [`SessionContext`] controls scan parallelism and provides the object-store
+    /// registry used by [`ScanParquet`](delta_kernel::plans::ir::nodes::ScanParquet) and
+    /// [`ScanJson`](delta_kernel::plans::ir::nodes::ScanJson). The object store referenced by a
+    /// scan must be registered in that context's runtime environment.
+    pub fn new(session_ctx: SessionContext, storage_handler: Arc<dyn StorageHandler>) -> Self {
         Self {
-            session_ctx: SessionContext::new(),
+            session_ctx,
             storage_handler,
         }
     }
