@@ -1375,9 +1375,13 @@ dependencies = [
 name = "datafusion_executor"
 version = "0.26.0"
 dependencies = [
+ "async-trait",
  "datafusion",
  "delta_kernel",
+ "itertools",
  "rstest",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
