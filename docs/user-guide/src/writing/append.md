@@ -49,7 +49,7 @@ let mut txn = snapshot
 
 // 3. Create write state and bind a write context
 let write_state = txn.write_state()?;
-let write_context = Arc::new(write_state.unpartitioned_write_context()?);
+let write_context = write_state.unpartitioned_write_context()?;
 
 // 4. Write Parquet file(s)
 // Assumes the table schema is: name (STRING), age (INTEGER), city (STRING)
@@ -63,7 +63,7 @@ let batch = RecordBatch::try_new(
 )?;
 let data = ArrowEngineData::new(batch);
 let file_metadata = engine
-    .write_parquet(&data, write_context.as_ref())
+    .write_parquet(&data, &write_context)
     .await?;
 
 // 5. Register the files
@@ -143,7 +143,7 @@ The `DefaultEngine` provides an async helper that does everything for you:
 
 ```rust,ignore
 let file_metadata = engine
-    .write_parquet(&data, write_context.as_ref())
+    .write_parquet(&data, &write_context)
     .await?;
 ```
 

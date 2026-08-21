@@ -243,12 +243,10 @@ async fn test_append_partitioned(
                     None => write_state.partitioned_write_context(partition_values),
                 }
                 .unwrap();
-                let write_context = Arc::new(write_context);
-                // arc clones
                 let engine = engine.clone();
                 tokio::task::spawn(async move {
                     engine
-                        .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
+                        .write_parquet(data.as_ref().unwrap(), &write_context)
                         .await
                 })
             });
@@ -416,12 +414,12 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )?);
-        let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
+        let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
         // Corrupt the addFile at the second batch.
-        let valid_meta = engine.write_parquet(&data, write_context.as_ref()).await?;
+        let valid_meta = engine.write_parquet(&data, &write_context).await?;
         txn.add_files(valid_meta);
-        let to_be_corrupted_meta = engine.write_parquet(&data, write_context.as_ref()).await?;
+        let to_be_corrupted_meta = engine.write_parquet(&data, &write_context).await?;
 
         let batch = into_record_batch(to_be_corrupted_meta);
         let index = batch.schema().index_of(field)?;

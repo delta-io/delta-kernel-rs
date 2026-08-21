@@ -260,9 +260,9 @@ async fn run_ctas_test(
     }
     let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let write_context = Arc::new(tgt_txn.write_state()?.unpartitioned_write_context()?);
+    let write_context = tgt_txn.write_state()?.unpartitioned_write_context()?;
     let add_meta = engine
-        .write_parquet(&ArrowEngineData::new(source_data), write_context.as_ref())
+        .write_parquet(&ArrowEngineData::new(source_data), &write_context)
         .await?;
     tgt_txn.add_files(add_meta);
 

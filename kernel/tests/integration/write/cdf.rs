@@ -80,9 +80,9 @@ async fn add_files_to_transaction(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
+        .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_files_metadata);
     Ok(())
