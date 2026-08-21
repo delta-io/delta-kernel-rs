@@ -1,6 +1,5 @@
 //! Integration tests for type-specific writes (timestampNtz, variant, shredded variant).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
@@ -12,7 +11,6 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField};
@@ -69,10 +67,10 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
+        .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
         .await?;
 
     txn.add_files(add_files_metadata);
@@ -148,9 +146,9 @@ async fn test_append_timestamp_stats_are_millisecond_truncated(
     )?;
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
+        .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
         .await?;
     txn.add_files(add_files_metadata);
     assert!(txn.commit(engine.as_ref())?.is_committed());
@@ -319,7 +317,7 @@ async fn test_append_variant(
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
     let add_files_metadata = (*engine)
         .default_parquet_handler()
@@ -474,7 +472,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .unwrap();
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
     let add_files_metadata = (*engine)
         .default_parquet_handler()
@@ -560,9 +558,8 @@ async fn test_not_null_data_column_rejects_null_in_batch(
         "non-null schema must auto-enable the `invariants` writer feature",
     );
 
-    let write_context = begin_transaction(snapshot, engine.as_ref())?
-        .with_engine_info("default engine")
-        .unpartitioned_write_context()?;
+    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
     // Use the connector-facing physical schema (not the logical one); the logical schema
     // would hide bugs in the logical->physical mapping that engines hit in production.
@@ -697,39 +694,32 @@ async fn write_rejects_invalid_void_placement(
     );
 }
 
-// Validation must trigger when the connector requests a write context, before any Parquet is
-// written. Both public entry points (partitioned and unpartitioned) are covered, and the
-// `all_void_table` case is included because it is the shape where `strip_void_from_schema`
-// would otherwise silently produce an empty physical schema -- so the fail-fast guard is most
-// load-bearing there. The commit-time check (exercised by `write_rejects_invalid_void_placement`)
-// remains as defense-in-depth.
+// Requesting write state must reject invalid schemas before any Parquet is written.
+// Keep the all-void case because stripping void fields would otherwise produce an empty physical
+// schema; commit-time validation remains defense-in-depth.
 #[rstest]
 #[case::unpartitioned_void_array(
     "void_fail_fast_unpartitioned_array",
     vec![],
-    HashMap::new(),
     schema_ref! { nullable "id": INTEGER, nullable "arr": [ nullable VOID ] },
     "array element type",
 )]
 #[case::partitioned_void_array(
     "void_fail_fast_partitioned_array",
     vec!["id"],
-    HashMap::from([("id".to_string(), Scalar::Integer(1))]),
     schema_ref! { nullable "id": INTEGER, nullable "arr": [ nullable VOID ] },
     "array element type",
 )]
 #[case::unpartitioned_all_void(
     "void_fail_fast_unpartitioned_all_void",
     vec![],
-    HashMap::new(),
     schema_ref! { nullable "a": VOID, nullable "b": VOID },
     "at least one non-void column",
 )]
 #[tokio::test]
-async fn write_context_creation_fails_fast_on_invalid_void_schema(
+async fn write_state_creation_fails_fast_on_invalid_void_schema(
     #[case] test_name: &str,
     #[case] partition_columns: Vec<&str>,
-    #[case] partition_values: HashMap<String, Scalar>,
     #[case] schema: SchemaRef,
     #[case] expected_msg: &str,
 ) {
@@ -753,13 +743,9 @@ async fn write_context_creation_fails_fast_on_invalid_void_schema(
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
         .expect("transaction should create");
 
-    let err = if partition_columns.is_empty() {
-        txn.unpartitioned_write_context()
-            .expect_err("unpartitioned_write_context should reject invalid void schema")
-    } else {
-        txn.partitioned_write_context(partition_values)
-            .expect_err("partitioned_write_context should reject invalid void schema")
-    };
+    let err = txn
+        .write_state()
+        .expect_err("write_state should reject invalid void schema");
     assert!(
         err.to_string().contains(expected_msg),
         "expected error containing '{expected_msg}', got: {err}"
@@ -788,7 +774,7 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
 
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
 
-    let wc = txn.unpartitioned_write_context()?;
+    let wc = txn.write_state()?.unpartitioned_write_context()?;
     let physical = wc.physical_schema();
 
     // Physical schema should NOT contain void column
@@ -858,7 +844,7 @@ async fn write_context_excludes_nested_void_from_physical_schema(
     }
 
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    let wc = txn.unpartitioned_write_context()?;
+    let wc = txn.write_state()?.unpartitioned_write_context()?;
     let physical = wc.physical_schema();
 
     // Physical schema struct should NOT contain the void field
@@ -896,7 +882,7 @@ async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::e
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    let wc = txn.unpartitioned_write_context()?;
+    let wc = txn.write_state()?.unpartitioned_write_context()?;
 
     // The transform expression should mention dropping "b" inside the struct
     let l2p = wc.logical_to_physical();

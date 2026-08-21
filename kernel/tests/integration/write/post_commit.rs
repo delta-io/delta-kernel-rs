@@ -130,8 +130,9 @@ async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_t
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = begin_transaction(snapshot.clone(), &engine)?.with_engine_info("test");
+        let write_state = txn.write_state()?;
 
-        let result = txn.partitioned_write_context(HashMap::from([(
+        let result = write_state.partitioned_write_context(HashMap::from([(
             "nonexistent".to_string(),
             Scalar::String("val".into()),
         )]));
