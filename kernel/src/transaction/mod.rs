@@ -72,8 +72,8 @@ mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
-#[internal_api]
-pub(crate) use schema_evolution::SchemaOperation;
+#[cfg(feature = "internal-api")]
+pub use schema_evolution::SchemaOperation;
 #[cfg(feature = "internal-api")]
 pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]
@@ -1750,6 +1750,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use super::schema_evolution::SchemaOperation;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};

@@ -45,11 +45,13 @@ pub(crate) enum SchemaOperation {
 
 impl SchemaOperation {
     #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn add_column(field: StructField, path: ColumnName) -> SchemaOperation {
         SchemaOperation::AddColumn { path, field }
     }
 
     #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn set_nullable(column: ColumnName) -> SchemaOperation {
         SchemaOperation::SetNullable { column }
     }
