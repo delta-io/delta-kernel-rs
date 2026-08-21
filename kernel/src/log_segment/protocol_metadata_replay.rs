@@ -283,6 +283,8 @@ mod tests {
     use crate::object_store::memory::InMemory;
     #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::Engine;
     use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
     use crate::{DeltaResult, Error};
@@ -317,10 +319,7 @@ mod tests {
     }
 
     // Build a top-level `metaData` commit line with the given schema (no protocol).
-    #[cfg(all(
-        feature = "adaptive-metadata-in-dev",
-        not(feature = "declarative-plans")
-    ))]
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     fn metadata_commit(schema_string: &str) -> String {
         serde_json::json!({ "metaData": {
             "id": "test-table",
@@ -334,21 +333,24 @@ mod tests {
 
     // A two-column schema, used to distinguish "newer" metadata from the single-column
     // `SCHEMA_STRING` in override tests.
-    #[cfg(all(
-        feature = "adaptive-metadata-in-dev",
-        not(feature = "declarative-plans")
-    ))]
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     const TWO_COLUMN_SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
 
-    // Checkpoint-action resolution is a non-plan-path capability; the plan path rejects it.
-    #[cfg(all(
-        feature = "adaptive-metadata-in-dev",
-        not(feature = "declarative-plans")
-    ))]
+    // An engine that forces the non-plan reader (the plan reader rejects checkpoint actions), so
+    // checkpoint resolution is exercised in every feature config, not only with plans disabled.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
+        let engine = SyncEngine::new_with_store(store);
+        #[cfg(feature = "declarative-plans")]
+        let engine = DelegatingEngine::new(Arc::new(engine)).without_plan_executor();
+        engine
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[tokio::test]
     async fn test_load_resolves_pm_from_manifest_commit_checkpoint_action() {
         let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = non_plan_engine(store.clone());
         let table_root = url::Url::parse("memory:///").unwrap();
         add_commit(
             table_root.as_str(),
@@ -368,14 +370,11 @@ mod tests {
 
     // Top-level actions are seen first in backward replay, so the v1 metaData wins; the protocol
     // still comes from the checkpoint action.
-    #[cfg(all(
-        feature = "adaptive-metadata-in-dev",
-        not(feature = "declarative-plans")
-    ))]
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[tokio::test]
     async fn test_later_log_commit_metadata_overrides_checkpoint_action() {
         let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = non_plan_engine(store.clone());
         let table_root = url::Url::parse("memory:///").unwrap();
         add_commit(
             table_root.as_str(),
@@ -403,14 +402,11 @@ mod tests {
 
     // When a newer checkpoint action carries metadata that differs from an older top-level
     // metaData, the checkpoint's metadata must win.
-    #[cfg(all(
-        feature = "adaptive-metadata-in-dev",
-        not(feature = "declarative-plans")
-    ))]
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[tokio::test]
     async fn test_newer_checkpoint_action_metadata_overrides_older_top_level_metadata() {
         let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = non_plan_engine(store.clone());
         let table_root = url::Url::parse("memory:///").unwrap();
         // v0: a top-level metaData with a single-column schema (the older, subsumed metadata).
         add_commit(
@@ -437,18 +433,13 @@ mod tests {
         assert!(snapshot.schema().field("name").is_some());
     }
 
-    // A newer manifest-commit `checkpoint` action that turns on AMT must win over older, complete,
-    // non-AMT top-level P&M. The first pass sees only the older top-level protocol/metaData, so the
-    // reconcile scan must still run rather than trust the first pass's (stale) view that the table
-    // is non-AMT and skip it.
-    #[cfg(all(
-        feature = "adaptive-metadata-in-dev",
-        not(feature = "declarative-plans")
-    ))]
+    // A newer manifest-commit `checkpoint` action must win over older, complete, non-AMT top-level
+    // P&M: newest-first replay reaches the checkpoint before the older top-level actions.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[tokio::test]
     async fn test_newer_checkpoint_action_overrides_complete_non_amt_top_level_pm() {
         let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = non_plan_engine(store.clone());
         let table_root = url::Url::parse("memory:///").unwrap();
         // v0: complete, non-AMT top-level protocol (legacy reader 1 / writer 2) + metaData (single
         // column). Actions are separate newline-delimited lines in the commit file.
