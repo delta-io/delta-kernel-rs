@@ -554,9 +554,12 @@ mod tests {
         //
         // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- row group skipping is
         // disabled for parts missing a projected column, so parts 1 and 5 are read regardless.
-        // Under `adaptive-metadata-in-dev` no classic part carries the projected
-        // `checkpoint` column, so part 3 no longer skips either -- all five are read
-        // instead of two.
+        // Part 3 skips normally (four read), but under `adaptive-metadata-in-dev` the projected
+        // `checkpoint` column is also missing from every classic part, so part 3 no longer skips
+        // and all five are read.
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        assert_eq!(data.len(), 4);
+        #[cfg(feature = "adaptive-metadata-in-dev")]
         assert_eq!(data.len(), 5);
     }
 
