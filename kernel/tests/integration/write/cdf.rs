@@ -11,7 +11,8 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Snapshot, Version};
+use delta_kernel::table_changes::TableChanges;
+use delta_kernel::{Engine as _, Snapshot, Version};
 use rstest::rstest;
 use tempfile::{tempdir, TempDir};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
@@ -340,5 +341,152 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
         assert_eq!(existing_dv, Some(("memory:///dv.bin".to_string(), 1)));
     }
 
+    Ok(())
+}
+
+// ---- Concurrent-commit race regression (#3173) -----------------------------
+
+/// Storage handler that forwards to the real handler, but writes one extra
+/// commit into `_delta_log/` right after the FIRST listing of that directory —
+/// exactly the interleaving of a concurrent committer landing between
+/// `LogSegment::for_table_changes` and the end-snapshot build.
+struct RacingCommitterStorage {
+    inner: Arc<dyn delta_kernel::StorageHandler>,
+    injected: std::sync::atomic::AtomicBool,
+    commit_path: Url,
+    commit_bytes: bytes::Bytes,
+}
+
+impl delta_kernel::StorageHandler for RacingCommitterStorage {
+    fn list_from(
+        &self,
+        path: &Url,
+    ) -> delta_kernel::DeltaResult<Box<dyn Iterator<Item = delta_kernel::DeltaResult<delta_kernel::FileMeta>>>>
+    {
+        // Capture the listing BEFORE injecting the commit so this listing
+        // (the CDF log segment's) does not see the new version.
+        let listing = self.inner.list_from(path)?;
+        if !self.injected.swap(true, std::sync::atomic::Ordering::SeqCst)
+            && path.as_str().contains("_delta_log")
+        {
+            self.inner
+                .put(&self.commit_path, self.commit_bytes.clone(), false)
+                .expect("inject racing commit");
+        }
+        Ok(listing)
+    }
+
+    fn read_files(
+        &self,
+        files: Vec<delta_kernel::FileSlice>,
+    ) -> delta_kernel::DeltaResult<Box<dyn Iterator<Item = delta_kernel::DeltaResult<bytes::Bytes>>>>
+    {
+        self.inner.read_files(files)
+    }
+
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> delta_kernel::DeltaResult<()> {
+        self.inner.copy_atomic(src, dest)
+    }
+
+    fn put(&self, path: &Url, data: bytes::Bytes, overwrite: bool) -> delta_kernel::DeltaResult<()> {
+        self.inner.put(path, data, overwrite)
+    }
+
+    fn head(&self, path: &Url) -> delta_kernel::DeltaResult<delta_kernel::FileMeta> {
+        self.inner.head(path)
+    }
+
+    fn delete(&self, path: &Url) -> delta_kernel::DeltaResult<()> {
+        self.inner.delete(path)
+    }
+}
+
+/// Engine that answers every handler with the real engine's except storage,
+/// which is wrapped in [`RacingCommitterStorage`].
+struct RacingEngine {
+    inner: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    storage: Arc<RacingCommitterStorage>,
+}
+
+impl delta_kernel::Engine for RacingEngine {
+    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+
+    fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
+        self.storage.clone()
+    }
+
+    fn json_handler(&self) -> Arc<dyn delta_kernel::JsonHandler> {
+        self.inner.json_handler()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn delta_kernel::ParquetHandler> {
+        self.inner.parquet_handler()
+    }
+}
+
+/// A commit landing between the CDF log-segment listing and the end-snapshot
+/// build must not change which version the change feed reads: the end snapshot
+/// is pinned to the listed end version instead of re-resolving "latest".
+#[tokio::test]
+async fn cdf_end_snapshot_pinned_to_listed_end_version() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = get_simple_int_schema();
+    let (table_url, engine, _tmp) = create_cdf_table("cdf-race", schema.clone()).await?;
+    let v1 = write_data_to_table(&table_url, &engine, schema, vec![1, 2, 3]).await?;
+    assert_eq!(v1, 1, "table should be at version 1 before the race");
+
+    // Build the racing commit (v2): the table's own create metadata with the
+    // partition columns flipped — a valid metaData action that changes how the
+    // range would be interpreted if the end snapshot were to load it.
+    let v0 = table_url.join("_delta_log/00000000000000000000.json")?;
+    let v0_meta = engine.storage_handler().head(&v0)?;
+    let v0_bytes = engine
+        .storage_handler()
+        .read_files(vec![(v0_meta.location, None)])?
+        .collect::<Result<Vec<_>, _>>()?
+        .concat();
+    // The create commit holds one action per line; keep the metaData line
+    // and flip its partition columns.
+    let v0_text = String::from_utf8(v0_bytes)?;
+    let metadata_line = v0_text
+        .lines()
+        .find(|l| l.trim_start().starts_with("{\"metaData\""))
+        .expect("create commit carries a metaData action");
+    let mut metadata_json: serde_json::Value = serde_json::from_str(metadata_line)?;
+    metadata_json["metaData"]["partitionColumns"] = serde_json::json!(["number"]);
+    let commit_bytes = bytes::Bytes::from(serde_json::to_string(&metadata_json)?);
+
+    let racing_storage = Arc::new(RacingCommitterStorage {
+        inner: engine.storage_handler(),
+        injected: std::sync::atomic::AtomicBool::new(false),
+        commit_path: table_url.join("_delta_log/00000000000000000002.json")?,
+        commit_bytes,
+    });
+    let racing_engine = RacingEngine {
+        inner: engine.clone(),
+        storage: racing_storage.clone(),
+    };
+
+    let table_changes = TableChanges::try_new(table_url.clone(), &racing_engine, 0, None)?;
+    assert_eq!(
+        table_changes.end_version(),
+        1,
+        "the CDF range must end at the version the log segment listed"
+    );
+
+    // Reading the feed to completion must work with the pinned end snapshot.
+    let racing_engine = Arc::new(racing_engine);
+    let scan = table_changes.into_scan_builder().build()?;
+    let _ = scan
+        .execute(racing_engine.clone())?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // The racing commit really did land before the snapshot build ran.
+    assert!(
+        racing_storage.injected.load(std::sync::atomic::Ordering::SeqCst),
+        "the racing commit should have been injected during construction"
+    );
     Ok(())
 }
