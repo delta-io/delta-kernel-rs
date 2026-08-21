@@ -21,10 +21,6 @@ use crate::utils::FoldWithOption as _;
 use crate::DeltaResult;
 
 /// A schema evolution operation to be applied to a table.
-///
-/// Operations are validated and applied in order during
-/// [`apply_schema_operations`]. Each operation sees the schema state after all prior operations
-/// have been applied.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 #[internal_api]
