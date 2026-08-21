@@ -152,6 +152,13 @@ transaction()
   -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
 ```
 
+Both examples demo this via `-d`, sharing `ffi/examples/common/column_defaults.{h,c}`:
+`read-table` reports what a table declares (ctest `read_and_print_column_defaults`), while
+`write-table` runs the full visit -> ack -> write-context -> commit sequence (ctest
+`write_table_column_defaults`) -- the only place the acknowledgement gate is exercised from C,
+since read-table never builds a write context. The ack is recorded per transaction, so a writer
+must visit and ack on the same transaction it later requests the write context from.
+
 Deletion vector update flow:
 
 ```

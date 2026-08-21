@@ -31,6 +31,8 @@ acceptance/tests/dat/
 acceptance/workloads/
 ffi/examples/read-table/build
 ffi/examples/visit-expression/build
+ffi/examples/write-table/build
+ffi/examples/create-table/build
 /build
 /kernel/target
 /target
