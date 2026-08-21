@@ -9,6 +9,7 @@ use delta_kernel::history_manager::{get_earliest_commit, latest_version_as_of, H
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::TransactionOptions;
 use delta_kernel::{DeltaResult, Snapshot, Version};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -72,15 +73,26 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> DeltaResult<()> {
     // v0: CreateTable
     let schema = get_simple_int_schema();
     let mut snap = create_table(&table_path, schema, "AtTimestampTest/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_post_commit_snapshot();
 
     // v1..=4: noop commits (each writes a metaData-free, add-free commit JSON).
     for _ in 1..=4 {
-        snap = test_utils::begin_transaction(snap.clone(), engine.as_ref())?
-            .with_engine_info("AtTimestampTest")
-            .commit(engine.as_ref())?
+        snap = snap
+            .clone()
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("AtTimestampTest"))
+            .build(engine.as_ref())?
+            .commit(
+                engine.as_ref(),
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new(),
+            )?
             .unwrap_post_commit_snapshot();
     }
 

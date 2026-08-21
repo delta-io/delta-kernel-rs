@@ -20,7 +20,7 @@ written or already existed.
 ```rust,ignore
 use delta_kernel::snapshot::ChecksumWriteResult;
 
-let committed = match txn.commit(&engine)? {
+let committed = match txn.commit(&engine, &FileSystemCommitter::new(), actions)? {
     CommitResult::CommittedTransaction(c) => c,
     _ => panic!("unexpected result"),
 };
@@ -65,7 +65,7 @@ After every commit, write the checksum first, then decide whether to
 checkpoint:
 
 ```rust,ignore
-let committed = match txn.commit(&engine)? {
+let committed = match txn.commit(&engine, &FileSystemCommitter::new(), actions)? {
     CommitResult::CommittedTransaction(c) => c,
     _ => panic!("unexpected result"),
 };

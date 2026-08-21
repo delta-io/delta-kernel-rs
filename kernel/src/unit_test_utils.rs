@@ -22,7 +22,6 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
@@ -1072,7 +1071,7 @@ pub(crate) fn setup_column_mapping_txn(
 
     let txn = create_table("memory:///test_table", schema, "DefaultEngine")
         .with_table_properties([("delta.columnMapping.mode", mode_str)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     Ok((engine, txn))
 }
 

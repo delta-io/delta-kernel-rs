@@ -190,9 +190,14 @@ pub(super) fn create_simple_table(
     } else {
         builder
     };
+    let committer = make_committer(catalog_managed);
     builder
-        .build(engine, make_committer(catalog_managed))?
-        .commit(engine)?
+        .build(engine)?
+        .commit(
+            engine,
+            committer.as_ref(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     Ok(())
 }

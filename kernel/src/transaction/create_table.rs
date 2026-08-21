@@ -20,8 +20,8 @@
 //!
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0")
 //!     .with_table_properties([("myapp.version", "1.0")])
-//!     .build(engine, Box::new(FileSystemCommitter::new()))?
-//!     .commit(engine)?;
+//!     .build(engine)?
+//!     .commit(engine, &FileSystemCommitter::new(), delta_kernel::transaction::CommitActions::new())?;
 //! # Ok(())
 //! # }
 //! ```
@@ -31,19 +31,13 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
-use std::marker::PhantomData;
-use std::sync::Arc;
-
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
 use crate::actions::DomainMetadata;
-use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
-use crate::transaction::{CreateTable, Transaction};
-use crate::utils::current_time_ms;
+use crate::transaction::{CreateTable, Operation, Transaction, TransactionConfig, TransactionInit};
 use crate::DeltaResult;
 
 /// A type alias for create-table transactions.
@@ -59,7 +53,6 @@ use crate::DeltaResult;
 /// - **`remove_files()`** — Cannot remove files from a table that has no files.
 /// - **`with_blind_append()`** — Blind append semantics don't apply to table creation.
 /// - **`update_deletion_vectors()`** — Deletion vectors require an existing table.
-/// - **`with_transaction_id()`** — Transaction ID (app_id) tracking is for existing tables.
 /// - **`with_operation()`** — The operation is fixed to `"CREATE TABLE"`.
 ///
 /// # Example
@@ -77,8 +70,8 @@ use crate::DeltaResult;
 /// ])?);
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0")
-///     .build(engine, Box::new(FileSystemCommitter::new()))?
-///     .commit(engine)?;
+///     .build(engine)?
+///     .commit(engine, &FileSystemCommitter::new(), delta_kernel::transaction::CommitActions::new())?;
 /// # Ok(())
 /// # }
 /// ```
@@ -115,10 +108,10 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///
 /// let transaction = create_table("/tmp/my_table", schema, "MyApp/1.0")
-///     .build(&engine, Box::new(FileSystemCommitter::new()))?;
+///     .build(&engine)?;
 ///
 /// // Commit the transaction to create the table
-/// transaction.commit(&engine)?;
+/// transaction.commit(&engine, &FileSystemCommitter::new(), delta_kernel::transaction::CommitActions::new())?;
 /// # Ok(())
 /// # }
 /// ```
@@ -140,43 +133,28 @@ impl CreateTableTransaction {
     /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
     pub(crate) fn try_new_create_table(
         effective_table_config: TableConfiguration,
-        engine_info: String,
-        committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
-        correlation_id: Option<Arc<str>>,
+        config: TransactionConfig,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
             "txn",
             path = %effective_table_config.table_root(),
             operation = "CREATE",
         );
-        Ok(Transaction {
+        Transaction::try_from_init(TransactionInit::<CreateTable> {
             span,
-            operation_id: MetricId::new(),
-            correlation_id,
             read_snapshot_opt: None,
             effective_table_config,
             should_emit_protocol: true,
             should_emit_metadata: true,
-            committer,
-            operation: Some("CREATE TABLE".to_string()),
-            engine_info: Some(engine_info),
-            add_files_metadata: vec![],
-            remove_files_metadata: vec![],
-            set_transactions: vec![],
-            commit_timestamp: current_time_ms()?,
-            user_domain_metadata_additions: vec![],
+            operation: Some(Operation::CreateTable),
+            config,
             system_domain_metadata_additions: system_domain_metadata,
             user_domain_removals: vec![],
-            data_change: true,
-            column_defaults_acknowledged: false,
-            engine_commit_info: None,
             is_blind_append: false,
-            dv_matched_files: vec![],
-            num_dv_updates: 0,
             physical_clustering_columns: clustering_columns,
-            _state: PhantomData,
+            _state: std::marker::PhantomData,
         })
     }
 }

@@ -46,7 +46,7 @@ column. The flow is:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, TransactionOptions};
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -57,10 +57,14 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // 2. Build and commit an alter-table transaction that adds a new column.
 let result = snapshot
     .alter_table()
+    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .with_engine_info("my-app/1.0")
-    .commit(&engine)?;
+    .build()?
+    .commit(
+        &engine,
+        &FileSystemCommitter::new(),
+        delta_kernel::transaction::CommitActions::new(),
+    )?;
 
 match result {
     CommitResult::CommittedTransaction(committed) => {
@@ -105,8 +109,12 @@ let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build()?
+    .commit(
+        &engine,
+        &FileSystemCommitter::new(),
+        delta_kernel::transaction::CommitActions::new(),
+    )?;
 ```
 
 The builder uses a type-state pattern to enforce that at least one operation is

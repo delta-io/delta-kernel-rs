@@ -82,7 +82,11 @@ get_default_engine()  ->  Handle<SharedExternEngine>
         |
     add_files()
         |
-    commit()          ->  ExternResult<u64>  (committed version)
+    commit()          ->  Handle<ExclusiveCommitResult>
+        |
+commit_result_kind()
+        |
+commit_result_into_committed() or commit_result_into_prepared_commit()
 ```
 
 For more control over scans, you can use the scan builder API instead of the
@@ -216,14 +220,21 @@ feature is enabled; the rest are always available.
 | Function | Purpose |
 |----------|---------|
 | `transaction` | Start a write transaction on the latest snapshot |
-| `transaction_with_committer` | Start a transaction with a custom committer |
+| `transaction_from_snapshot` | Start a transaction from a supplied snapshot, preserving catalog state |
 | `with_engine_info` | Record a free-form engine identifier on the transaction (consumes and returns a new handle) |
 | `with_transaction_id` | Set an `(app_id, version)` pair for idempotent writes (consumes and returns a new handle; see [Idempotent Writes](../writing/idempotent_writes.md)) |
 | `with_domain_metadata` / `with_domain_metadata_removed` | Attach or remove a domain-metadata entry (each consumes and returns a new handle) |
-| `add_files` | Append file-level write metadata to the transaction |
-| `set_data_change` | Toggle the transaction's data-change flag (does not consume the handle) |
-| `remove_files` | Register Remove actions for the files selected by a scan-metadata batch |
-| `commit` | Commit the transaction and return the new version number |
+| `add_files` | Append file-level write metadata to the pending commit actions |
+| `with_data_change` | Toggle the transaction's data-change flag (consumes and returns a new handle) |
+| `remove_files` | Add Remove actions for the files selected by a scan-metadata batch |
+| `commit` | Attempt the commit and return a committed, conflicted, or retryable result handle |
+| `commit_with_committer` | Attempt the commit with a custom committer |
+| `commit_result_kind` / `commit_result_conflict_version` | Inspect a commit outcome without consuming it |
+| `commit_result_into_committed` | Consume a successful result and recover the committed transaction |
+| `commit_result_into_prepared_commit` | Consume a conflict or retryable result and recover its exact prepared commit |
+| `prepared_commit_retry` | Retry a prepared commit without restaging its actions |
+| `prepared_commit_retry_with_committer` | Retry a prepared commit with a custom committer |
+| `free_commit_result` / `free_prepared_commit` | Release recoverable commit-state handles |
 | `free_transaction` | Release the transaction handle without committing |
 
 **Write context and file writing**
@@ -262,13 +273,13 @@ unpartitioned writes.
 |----------|---------|
 | `get_create_table_builder` | Create a builder for a new Delta table with a schema |
 | `create_table_builder_with_table_property` | Add a table property to the builder |
-| `create_table_builder_build` | Consume the builder and produce a create-table transaction using the default (filesystem) committer |
-| `create_table_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
-| `create_table_with_engine_info` | Attach a free-form engine identifier to a create-table transaction (consumes and returns a new handle) |
-| `create_table_set_data_change` | Toggle the data-change flag on a create-table transaction (does not consume the handle) |
+| `create_table_builder_with_engine_info` | Replace the engine identifier on the builder |
+| `create_table_builder_with_data_change` | Set the builder's data-change flag |
+| `create_table_builder_build` | Consume the builder and produce a create-table transaction |
 | `create_table_get_unpartitioned_write_context` | Get a `BoundWriteContext` to stage initial data files during table creation |
 | `create_table_add_files` | Register file metadata for initial data being written alongside the CREATE TABLE commit |
-| `create_table_commit` | Commit the create-table transaction |
+| `create_table_commit` | Attempt the create-table commit and return a commit-result handle |
+| `create_table_commit_with_committer` | Attempt the create-table commit with a custom committer |
 | `free_create_table_builder` | Release a create-table builder handle (before it is consumed by `create_table_builder_build*`) |
 | `create_table_free_transaction` | Release a create-table transaction handle (after build, before commit) |
 
@@ -312,7 +323,7 @@ catalog-aware committer without implementing the committer trait from scratch.
 | Function | Purpose |
 |----------|---------|
 | `get_uc_commit_client` | Wrap an engine-provided `CCommit` callback in a `SharedFfiUCCommitClient` |
-| `get_uc_committer` | Produce a `MutableCommitter` bound to a specific `table_id`, ready to pass to `transaction_with_committer` |
+| `get_uc_committer` | Produce a `MutableCommitter` bound to a specific `table_id`, ready to pass to a custom-committer commit API |
 | `free_uc_commit_client` / `free_uc_committer` | Release the corresponding handles |
 
 **Expressions and predicates**

@@ -401,10 +401,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// This is the public API for building Add action metadata from file write results. Custom
 /// Arrow-based engines that write parquet files themselves (bypassing
 /// [`DefaultEngine::write_parquet`]) should call this to produce the Add action metadata for
-/// [`Transaction::add_files`].
+/// [`CommitActions::add_files`].
 ///
 /// [`DataFileMetadata`]: parquet::DataFileMetadata
-/// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
+/// [`CommitActions::add_files`]: delta_kernel::transaction::CommitActions::add_files
 pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &BoundWriteContext,

@@ -1,11 +1,13 @@
 //! Integration tests for transaction-identifier write paths.
 
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::transaction::TransactionOptions;
 use delta_kernel::{Error as KernelError, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};
+use test_utils::{set_json_value, setup_test_tables};
 
 use crate::common::write_utils::{get_simple_int_schema, validate_txn_id, ZERO_UUID};
 
@@ -22,20 +24,37 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
     {
         // can't have duplicate app_id in same transaction
         assert!(matches!(
-            load_and_begin_transaction(table_url.clone(), &engine)?
-                .with_transaction_id("app_id1".to_string(), 0)
-                .with_transaction_id("app_id1".to_string(), 1)
-                .commit(&engine),
+            Snapshot::builder_for(table_url.clone())
+                .build(&engine)?
+                .transaction_builder()
+                .with_options(
+                    TransactionOptions::new()
+                        .with_transaction_id("app_id1".to_string(), 0)
+                        .with_transaction_id("app_id1".to_string(), 1),
+                )
+                .build(&engine),
             Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
         ));
 
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_engine_info("default engine")
-            .with_transaction_id("app_id1".to_string(), 1)
-            .with_transaction_id("app_id2".to_string(), 2);
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(&engine)?
+            .transaction_builder()
+            .with_options(
+                TransactionOptions::new()
+                    .with_engine_info("default engine")
+                    .with_transaction_id("app_id1".to_string(), 1)
+                    .with_transaction_id("app_id2".to_string(), 2),
+            )
+            .build(&engine)?;
 
         // commit!
-        assert!(txn.commit(&engine)?.is_committed());
+        assert!(txn
+            .commit(
+                &engine,
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new()
+            )?
+            .is_committed());
 
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)

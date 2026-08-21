@@ -18,16 +18,15 @@
 //!
 //! ```ignore
 //! // Allowed: at least one op queued before build().
-//! snapshot.alter_table().add_column(field).build(engine, committer)?;
+//! snapshot.alter_table().add_column(field).build()?;
 //!
 //! // Not allowed: build() is not defined on Ready (no ops queued).
-//! snapshot.alter_table().build(engine, committer)?;  // compile error
+//! snapshot.alter_table().build()?;  // compile error
 //! ```
 
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
@@ -41,8 +40,9 @@ use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
     apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
 };
+use crate::transaction::{TransactionConfig, TransactionOptions};
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Error};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
 /// See [`Chainable`] for the operations available on this state.
@@ -73,10 +73,20 @@ mod sealed {
 /// - At least one schema operation must be queued before `build()` is callable.
 /// - Only operations valid for the current state can be chained. This will disallow incompatible
 ///   chaining.
+///
+/// Data-write intent is not available on this metadata-only builder:
+///
+/// ```compile_fail
+/// use delta_kernel::transaction::builder::alter_table::AlterTableTransactionBuilder;
+///
+/// fn invalid(builder: AlterTableTransactionBuilder) {
+///     let _ = builder.with_data_change(true);
+/// }
+/// ```
 pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
-    correlation_id: Option<Arc<str>>,
+    config: TransactionConfig,
     // PhantomData marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
     _state: PhantomData<S>,
@@ -93,15 +103,14 @@ impl<S> AlterTableTransactionBuilder<S> {
         AlterTableTransactionBuilder {
             snapshot: self.snapshot,
             operations: self.operations,
-            correlation_id: self.correlation_id,
+            config: self.config,
             _state: PhantomData,
         }
     }
 
-    /// Attach an opaque, caller-supplied correlation id for joining the alter-table commit's metric
-    /// events to the caller's own request or operation id. An empty id is treated as unset.
-    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
-        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+    /// Replaces options that are valid for every transaction variant.
+    pub fn with_options(mut self, options: TransactionOptions) -> Self {
+        self.config.set_options(options);
         self
     }
 }
@@ -109,10 +118,14 @@ impl<S> AlterTableTransactionBuilder<S> {
 impl AlterTableTransactionBuilder<Ready> {
     /// Create a new builder from a snapshot.
     pub(crate) fn new(snapshot: SnapshotRef) -> Self {
+        let config = TransactionConfig {
+            data_change: false,
+            ..TransactionConfig::default()
+        };
         AlterTableTransactionBuilder {
             snapshot,
             operations: Vec::new(),
-            correlation_id: None,
+            config,
             _state: PhantomData,
         }
     }
@@ -161,11 +174,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
     ///   `timestampNtz` column without the `timestampNtz` feature)
-    pub fn build(
-        self,
-        _engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> DeltaResult<AlterTableTransaction> {
+    pub fn build(self) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
         // We don't support ALTER TABLE on tables with icebergCompatV3 enabled yet. See
         // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
@@ -231,11 +240,6 @@ impl AlterTableTransactionBuilder<Modifying> {
             evolved_schema,
         )?;
 
-        AlterTableTransaction::try_new_alter_table(
-            self.snapshot,
-            evolved_table_config,
-            committer,
-            self.correlation_id,
-        )
+        AlterTableTransaction::try_new_alter_table(self.snapshot, evolved_table_config, self.config)
     }
 }

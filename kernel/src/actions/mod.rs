@@ -880,8 +880,10 @@ pub(crate) struct CommitInfo {
     /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
     pub(crate) operation: Option<String>,
     /// Map of arbitrary string key-value pairs that provide additional information about the
-    /// operation. This is specified by the engine. For now this is always empty on write.
+    /// operation. This is specified by the engine.
     pub(crate) operation_parameters: Option<HashMap<String, Option<String>>>,
+    /// Metrics associated with the operation. This is specified by the engine.
+    pub(crate) operation_metrics: Option<HashMap<String, Option<String>>>,
     /// The version of the delta_kernel crate used to write this commit. The kernel will always
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
@@ -907,6 +909,7 @@ impl CommitInfo {
             in_commit_timestamp,
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: Some(HashMap::new()),
+            operation_metrics: Some(HashMap::new()),
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             is_blind_append: is_blind_append.then_some(true),
             engine_info,
@@ -1940,6 +1943,7 @@ mod tests {
                 nullable "inCommitTimestamp": LONG,
                 nullable "operation": STRING,
                 nullable "operationParameters": { STRING => nullable STRING },
+                nullable "operationMetrics": { STRING => nullable STRING },
                 nullable "kernelVersion": STRING,
                 nullable "isBlindAppend": BOOLEAN,
                 nullable "engineInfo": STRING,
@@ -2263,6 +2267,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(0)])),
                 Arc::new(Int64Array::from(vec![None::<i64>])),
                 Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
+                operation_parameters.clone(),
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(BooleanArray::from(vec![None::<bool>])),

@@ -128,7 +128,7 @@ Catalog-managed publish flow (after a catalog committer stages commits):
 committed_transaction_post_commit_snapshot()
   -> snapshot_publish_with_committer(snapshot, committer, engine)
      // borrows snapshot; consumes committer (do not free)
-  -> use returned snapshot for subsequent transaction_with_committer / checkpoint
+  -> use returned snapshot for subsequent transaction_from_snapshot + commit_with_committer / checkpoint
      // mint a fresh get_uc_committer for that transaction -- it also consumes
   -> free_snapshot (returned snapshot) when done
   -> free_snapshot (post-commit input snapshot)
