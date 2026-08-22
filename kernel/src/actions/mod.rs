@@ -1434,6 +1434,18 @@ impl CheckpointAction {
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
         self.content_root.to_filemeta(table_root)
     }
+
+    /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
+    #[internal_api]
+    pub(crate) fn protocol(&self) -> &Protocol {
+        &self.protocol
+    }
+
+    /// The table metadata embedded in this checkpoint action (at [`Self::version`]).
+    #[internal_api]
+    pub(crate) fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
 }
 
 /// The sidecar action references a sidecar file which provides some of the checkpoint's

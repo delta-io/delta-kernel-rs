@@ -4,16 +4,26 @@
 //! Protocol and Metadata actions from a [`LogSegment`].
 
 use std::sync::Arc;
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use std::sync::LazyLock;
 
 use tracing::{info, instrument};
 
 use super::LogSegment;
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use crate::actions::CHECKPOINT_ACTION_NAME;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use crate::plans::ir::nodes::Agg;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
@@ -21,6 +31,10 @@ use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
 use crate::schema::schema_ref;
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use crate::EngineData;
 use crate::{DeltaResult, Engine, Error};
 
 impl LogSegment {
@@ -120,19 +134,40 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        // Providing a plan executor opts the engine into declarative P&M replay.
+        // The plan can't unnest the checkpoint's P&M, so reconcile it with the top-level P&M here.
         #[cfg(feature = "declarative-plans")]
-        let actions_batches = match engine.plan_executor() {
-            Some(executor) => self.read_pm_batches_via_plan(executor.as_ref())?,
-            None => Box::new(self.read_pm_batches(engine)?) as _,
-        };
-
-        #[cfg(not(feature = "declarative-plans"))]
-        let actions_batches = self.read_pm_batches(engine)?;
+        if let Some(executor) = engine.plan_executor() {
+            let mut metadata_opt = None;
+            let mut protocol_opt = None;
+            for actions_batch in self.read_pm_batches_via_plan(executor.as_ref())? {
+                let actions = actions_batch?.actions;
+                if metadata_opt.is_none() {
+                    metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+                }
+                if protocol_opt.is_none() {
+                    protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+                }
+                // Top-level version is newer when it strictly exceeds the checkpoint's; a missing
+                // version (None) sorts oldest, so the checkpoint fills that field.
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
+                    let (protocol_ver, metadata_ver, checkpoint_ver) =
+                        read_pm_versions(actions.as_ref())?;
+                    merge_checkpoint_pm(
+                        &mut metadata_opt,
+                        &mut protocol_opt,
+                        &checkpoint,
+                        metadata_ver > checkpoint_ver,
+                        protocol_ver > checkpoint_ver,
+                    );
+                }
+            }
+            return Ok((metadata_opt, protocol_opt));
+        }
 
         let mut metadata_opt = None;
         let mut protocol_opt = None;
-        for actions_batch in actions_batches {
+        for actions_batch in self.read_pm_batches(engine)? {
             let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
@@ -143,6 +178,21 @@ impl LogSegment {
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 break;
             }
+            // Newest-first replay: a field already found is newer than this checkpoint, so it is
+            // kept; the checkpoint fills any field still missing.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
+                let (keep_metadata, keep_protocol) =
+                    (metadata_opt.is_some(), protocol_opt.is_some());
+                merge_checkpoint_pm(
+                    &mut metadata_opt,
+                    &mut protocol_opt,
+                    &checkpoint,
+                    keep_metadata,
+                    keep_protocol,
+                );
+                return Ok((metadata_opt, protocol_opt));
+            }
         }
         Ok((metadata_opt, protocol_opt))
     }
@@ -152,6 +202,16 @@ impl LogSegment {
         &self,
         executor: &dyn PlanExecutor,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        // The `checkpoint` action is projected as an opaque column; `replay_for_pm` parses and
+        // reconciles it by version, since the plan can't unnest the nested P&M itself.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let versioned_schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+            (&CHECKPOINT_ACTION_FIELD),
+            not_null "version": LONG,
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
             (&METADATA_FIELD),
@@ -175,16 +235,50 @@ impl LogSegment {
 
         let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
             .aggregate_ungrouped(|a| {
-                a.max_non_null_by(
-                    column_name!(PROTOCOL_NAME),
-                    column_name!(PROTOCOL_NAME),
-                    column_name!("version"),
-                )
-                .max_non_null_by(
-                    column_name!(METADATA_NAME),
-                    column_name!(METADATA_NAME),
-                    column_name!("version"),
-                )
+                let a = a
+                    .max_non_null_by(
+                        column_name!(PROTOCOL_NAME),
+                        column_name!(PROTOCOL_NAME),
+                        column_name!("version"),
+                    )
+                    .max_non_null_by(
+                        column_name!(METADATA_NAME),
+                        column_name!(METADATA_NAME),
+                        column_name!("version"),
+                    );
+                // Also recover the version each value came from, for the newest-wins merge.
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                let a = a
+                    .max_non_null_by(
+                        column_name!(CHECKPOINT_ACTION_NAME),
+                        column_name!(CHECKPOINT_ACTION_NAME),
+                        column_name!("version"),
+                    )
+                    .aggregate_as(
+                        Agg::max_non_null_by(
+                            column_name!("version"),
+                            column_name!(PROTOCOL_NAME),
+                            column_name!("version"),
+                        ),
+                        "protocol_version",
+                    )
+                    .aggregate_as(
+                        Agg::max_non_null_by(
+                            column_name!("version"),
+                            column_name!(METADATA_NAME),
+                            column_name!("version"),
+                        ),
+                        "metadata_version",
+                    )
+                    .aggregate_as(
+                        Agg::max_non_null_by(
+                            column_name!("version"),
+                            column_name!(CHECKPOINT_ACTION_NAME),
+                            column_name!("version"),
+                        ),
+                        "checkpoint_version",
+                    );
+                a
             })?
             .build()?;
 
@@ -196,11 +290,20 @@ impl LogSegment {
         Ok(Box::new(batches))
     }
 
-    // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
+    // Replay the commit log, projecting rows to Protocol and Metadata action columns, plus the
+    // `checkpoint` action under `adaptive-metadata-in-dev` so a single pass also resolves P&M
+    // embedded in a manifest-commit checkpoint.
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+            (&CHECKPOINT_ACTION_FIELD),
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let schema = schema_ref! {
             (&PROTOCOL_FIELD),
             (&METADATA_FIELD),
@@ -209,23 +312,338 @@ impl LogSegment {
     }
 }
 
+/// Merge a checkpoint action's embedded P&M into the P&M found from top-level actions. Each field
+/// takes the checkpoint's value unless the top-level value is newer, as determined by the caller:
+/// found-ness for the newest-first non-plan stream, version comparison for the plan's single row.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn merge_checkpoint_pm(
+    metadata_opt: &mut Option<Metadata>,
+    protocol_opt: &mut Option<Protocol>,
+    checkpoint: &CheckpointAction,
+    keep_top_level_metadata: bool,
+    keep_top_level_protocol: bool,
+) {
+    if !keep_top_level_metadata {
+        *metadata_opt = Some(checkpoint.metadata().clone());
+    }
+    if !keep_top_level_protocol {
+        *protocol_opt = Some(checkpoint.protocol().clone());
+    }
+}
+
+/// Reads the `*_version` columns the plan aggregate emits: the version at which the newest
+/// protocol, metaData, and checkpoint action were found (`None` if that action never appeared).
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+fn read_pm_versions(
+    actions: &dyn EngineData,
+) -> DeltaResult<(Option<i64>, Option<i64>, Option<i64>)> {
+    #[derive(Default)]
+    struct PmVersionsVisitor {
+        protocol: Option<i64>,
+        metadata: Option<i64>,
+        checkpoint: Option<i64>,
+    }
+    impl RowVisitor for PmVersionsVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+                (
+                    vec![
+                        column_name!("protocol_version"),
+                        column_name!("metadata_version"),
+                        column_name!("checkpoint_version"),
+                    ],
+                    vec![DataType::LONG, DataType::LONG, DataType::LONG],
+                )
+                    .into()
+            });
+            NAMES_AND_TYPES.as_ref()
+        }
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            if row_count > 0 {
+                self.protocol = getters[0].get_opt(0, "protocol_version")?;
+                self.metadata = getters[1].get_opt(0, "metadata_version")?;
+                self.checkpoint = getters[2].get_opt(0, "checkpoint_version")?;
+            }
+            Ok(())
+        }
+    }
+    let mut visitor = PmVersionsVisitor::default();
+    visitor.visit_rows_of(actions)?;
+    Ok((visitor.protocol, visitor.metadata, visitor.checkpoint))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    #[cfg(feature = "declarative-plans")]
+    #[cfg(any(feature = "declarative-plans", feature = "adaptive-metadata-in-dev"))]
     use std::sync::Arc;
 
     use itertools::Itertools;
     use test_log::test;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use test_utils::add_commit;
 
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::object_store::memory::InMemory;
     #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::Engine;
     use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
     use crate::{DeltaResult, Error};
+
+    // A minimal single-column Delta schema, serialized as `metaData.schemaString` expects.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    const SCHEMA_STRING: &str =
+        r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}"#;
+
+    // Build a manifest-commit `checkpoint` action commit line embedding Protocol + Metadata at the
+    // given `checkpointMetadata.version`, with the given reader/writer features and schema. The
+    // commit has NO top-level protocol/metaData, so P&M can only be resolved from the checkpoint
+    // action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn checkpoint_commit(version: i64, features: &[&str], schema_string: &str) -> String {
+        serde_json::json!({ "checkpoint": [
+            { "checkpointMetadata": { "version": version } },
+            { "contentRoot": { "path": "metadata/root.parquet", "sizeInBytes": 1, "version": version } },
+            { "protocol": {
+                "minReaderVersion": 3, "minWriterVersion": 7,
+                "readerFeatures": features, "writerFeatures": features,
+            } },
+            { "metaData": {
+                "id": "test-table",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": schema_string,
+                "partitionColumns": [],
+                "configuration": {},
+            } },
+        ] })
+        .to_string()
+    }
+
+    // Build a top-level `metaData` commit line with the given schema (no protocol).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn metadata_commit(schema_string: &str) -> String {
+        serde_json::json!({ "metaData": {
+            "id": "test-table",
+            "format": { "provider": "parquet", "options": {} },
+            "schemaString": schema_string,
+            "partitionColumns": [],
+            "configuration": {},
+        } })
+        .to_string()
+    }
+
+    // A two-column schema, used to distinguish "newer" metadata from the single-column
+    // `SCHEMA_STRING` in override tests.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    const TWO_COLUMN_SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
+
+    // An engine that forces the non-plan reader (the plan reader rejects checkpoint actions), so
+    // checkpoint resolution is exercised in every feature config, not only with plans disabled.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
+        let engine = SyncEngine::new_with_store(store);
+        #[cfg(feature = "declarative-plans")]
+        let engine = DelegatingEngine::new(Arc::new(engine)).without_plan_executor();
+        engine
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn test_load_resolves_pm_from_manifest_commit_checkpoint_action() {
+        let store = Arc::new(InMemory::new());
+        let engine = non_plan_engine(store.clone());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            0,
+            checkpoint_commit(0, &["adaptiveMetadata-preview"], SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+
+        // A successful build means P&M resolved from the checkpoint action; the schema confirms the
+        // embedded metaData was used.
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(snapshot.version(), 0);
+        assert!(snapshot.schema().field("id").is_some());
+    }
+
+    // Top-level actions are seen first in backward replay, so the v1 metaData wins; the protocol
+    // still comes from the checkpoint action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn test_later_log_commit_metadata_overrides_checkpoint_action() {
+        let store = Arc::new(InMemory::new());
+        let engine = non_plan_engine(store.clone());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            0,
+            checkpoint_commit(0, &["adaptiveMetadata-preview"], SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+        // A metadata-only log commit at v1 with a two-column schema.
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            1,
+            metadata_commit(TWO_COLUMN_SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(snapshot.version(), 1);
+        // Newer metadata (two columns) wins over the checkpoint action's single-column metadata.
+        assert!(snapshot.schema().field("name").is_some());
+    }
+
+    // When a newer checkpoint action carries metadata that differs from an older top-level
+    // metaData, the checkpoint's metadata must win.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn test_newer_checkpoint_action_metadata_overrides_older_top_level_metadata() {
+        let store = Arc::new(InMemory::new());
+        let engine = non_plan_engine(store.clone());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        // v0: a top-level metaData with a single-column schema (the older, subsumed metadata).
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            0,
+            metadata_commit(SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+        // v1: a manifest-commit checkpoint action embedding a two-column schema.
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            1,
+            checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(snapshot.version(), 1);
+        // The checkpoint action's metadata (two columns) wins over the older top-level metaData.
+        assert!(snapshot.schema().field("name").is_some());
+    }
+
+    // A newer manifest-commit `checkpoint` action must win over older, complete, non-AMT top-level
+    // P&M: newest-first replay reaches the checkpoint before the older top-level actions.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn test_newer_checkpoint_action_overrides_complete_non_amt_top_level_pm() {
+        let store = Arc::new(InMemory::new());
+        let engine = non_plan_engine(store.clone());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        // v0: complete, non-AMT top-level protocol (legacy reader 1 / writer 2) + metaData (single
+        // column). Actions are separate newline-delimited lines in the commit file.
+        let protocol =
+            serde_json::json!({ "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 } });
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            0,
+            format!("{protocol}\n{}", metadata_commit(SCHEMA_STRING)),
+        )
+        .await
+        .unwrap();
+        // v1: a manifest commit whose only P&M lives in an AMT checkpoint action (two columns).
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            1,
+            checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(snapshot.version(), 1);
+        // The newer checkpoint action's metadata (two columns) wins over the older top-level
+        // metaData; a successful build also proves its adaptive protocol was resolved.
+        assert!(snapshot.schema().field("name").is_some());
+    }
+
+    // Plan path (plain SyncEngine has a plan executor): a checkpoint newer than complete top-level
+    // P&M wins both fields, exercising the version reconciliation in the plan branch.
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    #[tokio::test]
+    async fn test_plan_newer_checkpoint_overrides_top_level_pm() {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        let protocol =
+            serde_json::json!({ "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 } });
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            0,
+            format!("{protocol}\n{}", metadata_commit(SCHEMA_STRING)),
+        )
+        .await
+        .unwrap();
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            1,
+            checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(snapshot.version(), 1);
+        // The newer checkpoint's two-column metadata wins; a successful build also proves its
+        // adaptive protocol resolved over the older non-AMT top-level protocol.
+        assert!(snapshot.schema().field("name").is_some());
+    }
+
+    // Plan path: a metadata-only commit newer than the checkpoint keeps the top-level metadata,
+    // while the protocol still comes from the checkpoint. Covers the keep-top-level merge branch.
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    #[tokio::test]
+    async fn test_plan_later_metadata_overrides_checkpoint() {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            0,
+            checkpoint_commit(0, &["adaptiveMetadata-preview"], SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            1,
+            metadata_commit(TWO_COLUMN_SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(snapshot.version(), 1);
+        assert!(snapshot.schema().field("name").is_some());
+    }
 
     // A [`PlanExecutor`] whose every operation fails, used to prove that a plan-path failure
     // surfaces from P&M replay rather than falling back to legacy replay.
@@ -275,10 +693,17 @@ mod tests {
         //
         // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
         //
-        // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- We currently
-        // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
-        // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
-        assert_eq!(data.len(), 4);
+        // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- row group skipping is
+        // disabled for parts missing a projected column, so parts 1 and 5 are read regardless.
+        // Part 3 skips normally (four read), but under `adaptive-metadata-in-dev` the projected
+        // `checkpoint` column is also missing from every classic part, so part 3 no longer skips
+        // and all five are read.
+        let expected_parts = if cfg!(feature = "adaptive-metadata-in-dev") {
+            5
+        } else {
+            4
+        };
+        assert_eq!(data.len(), expected_parts);
     }
 
     // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the
