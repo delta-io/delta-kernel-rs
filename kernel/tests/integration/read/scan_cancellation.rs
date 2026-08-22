@@ -426,3 +426,26 @@ async fn snapshot_build_cancelled_during_listing() -> Result<(), Box<dyn std::er
     );
     Ok(())
 }
+
+// An incremental build (`Snapshot::builder_from`) re-lists the log to find new commits, so an
+// already-cancelled token stops it the same way it stops a from-scratch build -- rather than
+// returning a snapshot advanced from a partial listing.
+#[tokio::test]
+async fn precancelled_incremental_snapshot_build_yields_cancelled(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, table_root) = json_only_table().await?;
+    let engine = DefaultEngineBuilder::new(storage).build();
+
+    let base = Snapshot::builder_for(table_root).build(&engine)?;
+
+    let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+    let result = Snapshot::builder_from(base)
+        .with_cancellation_token(token)
+        .build(&engine);
+
+    assert!(
+        matches!(result, Err(Error::Cancelled)),
+        "a cancelled incremental snapshot build must surface Error::Cancelled"
+    );
+    Ok(())
+}

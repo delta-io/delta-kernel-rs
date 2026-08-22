@@ -10,6 +10,7 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
+use crate::unit_test_utils::TestCancellationToken;
 use crate::{Engine as _, FileMeta};
 
 // size markers used to identify commit sources in tests
@@ -1770,13 +1771,13 @@ fn find_complete_checkpoint_version_same_version_cases(
 
 /// A storage handler whose listing yields `count` synthetic commit paths and records how many were
 /// pulled, so a test can tell where a cancelled listing actually stopped.
-struct EndlessListingHandler {
+struct FiniteListingHandler {
     log_root: Url,
     count: usize,
     items_pulled: Arc<AtomicU32>,
 }
 
-impl StorageHandler for EndlessListingHandler {
+impl StorageHandler for FiniteListingHandler {
     fn list_from(
         &self,
         _path: &Url,
@@ -1818,20 +1819,26 @@ impl StorageHandler for EndlessListingHandler {
     }
 }
 
+// Builds a `FiniteListingHandler` over `memory:///_delta_log/` yielding `count` paths, returning
+// the log root and the shared pull counter alongside it.
+fn finite_listing_handler(count: usize) -> (Url, Arc<AtomicU32>, FiniteListingHandler) {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let pulled = Arc::new(AtomicU32::new(0));
+    let storage = FiniteListingHandler {
+        log_root: log_root.clone(),
+        count,
+        items_pulled: pulled.clone(),
+    };
+    (log_root, pulled, storage)
+}
+
 // An already-cancelled token fails the listing before any storage call, via the default
 // `list_from_with_cancellation` (this handler does not override it).
 #[test]
 fn precancelled_token_stops_listing_before_any_storage_call() {
-    let log_root = Url::parse("memory:///_delta_log/").unwrap();
-    let pulled = Arc::new(AtomicU32::new(0));
-    let storage = EndlessListingHandler {
-        log_root: log_root.clone(),
-        count: 100,
-        items_pulled: pulled.clone(),
-    };
+    let (log_root, pulled, storage) = finite_listing_handler(100);
 
-    let token: CancellationTokenRef =
-        Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled());
+    let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
 
     let result = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token));
     assert!(matches!(result, Err(Error::Cancelled)));
@@ -1843,15 +1850,9 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
 // This is the regression guard for polling inside (rather than outside) the version `take_while`.
 #[test]
 fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
-    let log_root = Url::parse("memory:///_delta_log/").unwrap();
-    let pulled = Arc::new(AtomicU32::new(0));
-    let storage = EndlessListingHandler {
-        log_root: log_root.clone(),
-        count: 100,
-        items_pulled: pulled.clone(),
-    };
+    let (log_root, pulled, storage) = finite_listing_handler(100);
 
-    let token = Arc::new(crate::unit_test_utils::TestCancellationToken::default());
+    let token = Arc::new(TestCancellationToken::default());
     let token_ref: CancellationTokenRef = token.clone();
     let mut iter =
         list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token_ref))
@@ -1873,13 +1874,7 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 // With no token the listing is unchanged, so cancellation support is strictly opt-in.
 #[test]
 fn listing_without_token_is_unchanged() {
-    let log_root = Url::parse("memory:///_delta_log/").unwrap();
-    let pulled = Arc::new(AtomicU32::new(0));
-    let storage = EndlessListingHandler {
-        log_root: log_root.clone(),
-        count: 5,
-        items_pulled: pulled.clone(),
-    };
+    let (log_root, _pulled, storage) = finite_listing_handler(5);
 
     let listed: Vec<_> = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, None)
         .unwrap()
@@ -1891,7 +1886,7 @@ fn listing_without_token_is_unchanged() {
 /// An iterator that yields nothing but cancels `token` the instant it is polled (i.e. as the
 /// enclosing listing is exhausted), so a later poll of the token observes the cancellation.
 struct CancelOnExhaustion {
-    token: Arc<crate::unit_test_utils::TestCancellationToken>,
+    token: Arc<TestCancellationToken>,
     done: bool,
 }
 
@@ -1910,7 +1905,7 @@ impl Iterator for CancelOnExhaustion {
 /// exhausted, counting its `list_from` calls. Lets a test flip the token *between* backward-scan
 /// windows rather than before the first one.
 struct CancelAfterListingHandler {
-    token: Arc<crate::unit_test_utils::TestCancellationToken>,
+    token: Arc<TestCancellationToken>,
     list_calls: Arc<AtomicU32>,
 }
 
@@ -1957,7 +1952,7 @@ impl StorageHandler for CancelAfterListingHandler {
 #[test]
 fn backward_scan_checks_cancellation_between_windows() {
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
-    let token = Arc::new(crate::unit_test_utils::TestCancellationToken::default());
+    let token = Arc::new(TestCancellationToken::default());
     let list_calls = Arc::new(AtomicU32::new(0));
     let storage = CancelAfterListingHandler {
         token: token.clone(),

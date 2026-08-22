@@ -107,9 +107,10 @@ pub(crate) fn list_delta_log_from_storage(
             Ok(path) => path.version <= end_version,
             Err(_) => true,
         });
-    // Poll for cancellation OUTSIDE the version `take_while` above. Inside it, cancellation would
-    // end the iterator with `None`, making a truncated listing indistinguishable from a complete
-    // one; outside, it always surfaces as a terminal `Error::Cancelled`.
+    // Wrap the filtered pipeline so cancellation is checked as the iterator is consumed, outside
+    // the version `take_while` above. Checked inside, a cancelled listing would end with `None` and
+    // be indistinguishable from a complete one; outside, it surfaces as a terminal
+    // `Error::Cancelled`.
     Ok(CancellableIterator::new(files, cancellation_token.cloned()))
 }
 
