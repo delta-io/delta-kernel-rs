@@ -27,21 +27,15 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
-use crate::table_configuration::TableConfiguration;
-use crate::table_features::{
-    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata, ColumnMappingMode,
-    Operation, TableFeature,
-};
-use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::table_features::{Operation, TableFeature};
 use crate::transaction::alter_table::AlterTableTransaction;
-use crate::transaction::schema_evolution::{
-    apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
-};
-use crate::utils::FoldWithOption as _;
+use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::{DeltaResult, Engine, Error};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
@@ -128,7 +122,10 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
-        self.operations.push(SchemaOperation::AddColumn { field });
+        self.operations.push(SchemaOperation::AddColumn {
+            path: ColumnName::new(Vec::<String>::new()),
+            field,
+        });
         self.transition()
     }
 
@@ -139,6 +136,31 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     pub fn set_nullable(mut self, column: ColumnName) -> AlterTableTransactionBuilder<Modifying> {
         self.operations
             .push(SchemaOperation::SetNullable { column });
+        self.transition()
+    }
+
+    /// Add a new column or nested field to the table schema.
+    ///
+    /// `path` identifies the struct that will contain `field`. An empty path targets the table's
+    /// root schema; path segments may traverse nested structs, array elements, map keys, and map
+    /// values.
+    ///
+    /// The added field must be nullable (existing data files lack the column and will read NULL),
+    /// must not be a top-level metadata column and must not collide case-insensitively with a
+    /// sibling in the target struct. The path must resolve to a struct.
+    ///
+    /// With column mapping enabled, existing IDs and physical names are preserved and missing
+    /// annotations are assigned.
+    ///
+    /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
+    #[internal_api]
+    pub(crate) fn add_column_at(
+        mut self,
+        path: ColumnName,
+        field: StructField,
+    ) -> AlterTableTransactionBuilder<Modifying> {
+        self.operations
+            .push(SchemaOperation::AddColumn { path, field });
         self.transition()
     }
 }
@@ -186,50 +208,7 @@ impl AlterTableTransactionBuilder<Modifying> {
         // protocol must also re-check this on the evolved `TableConfiguration`.
         table_config.ensure_operation_supported(Operation::Write)?;
 
-        let schema = Arc::unwrap_or_clone(table_config.logical_schema());
-        let column_mapping_mode = table_config.column_mapping_mode();
-        let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
-        // Whether the pre-alter schema already carried column-mapping metadata -- the only fact the
-        // strip below needs from it. Captured as a bool (not a clone) before
-        // `apply_schema_operations` consumes `schema` by value. Short-circuits outside
-        // `None` mode, where no strip fires.
-        let current_has_cm = column_mapping_mode == ColumnMappingMode::None
-            && schema_has_column_mapping_metadata(&schema);
-        let SchemaEvolutionResult {
-            schema: evolved_schema,
-            new_max_column_id,
-        } = apply_schema_operations(
-            schema,
-            self.operations,
-            column_mapping_mode,
-            current_max_column_id,
-        )?;
-
-        // Only in `None` mode: if this ALTER introduced column-mapping annotations into a table
-        // that was clean before it, strip them; residual annotations already present on the
-        // table are left in place (see `strip_stray_column_mapping_metadata`).
-        let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
-            strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
-                .map_or(evolved_schema, Arc::new)
-        } else {
-            evolved_schema
-        };
-
-        let evolved_metadata = table_config
-            .metadata()
-            .clone()
-            .with_schema(evolved_schema.clone())?
-            .fold_with(new_max_column_id, |evolved_metadata, id| {
-                evolved_metadata
-                    .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
-            });
-
-        // Validates the evolved metadata against the protocol.
-        let evolved_table_config = TableConfiguration::try_new_with_schema(
-            table_config,
-            evolved_metadata,
-            evolved_schema,
-        )?;
+        let evolved_table_config = evolve_table_config(table_config, self.operations)?;
 
         AlterTableTransaction::try_new_alter_table(
             self.snapshot,
