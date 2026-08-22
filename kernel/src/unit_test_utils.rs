@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use itertools::Itertools;
@@ -1301,7 +1302,7 @@ pub(crate) fn geography_type(crs: &str, algorithm: EdgeInterpolationAlgorithm) -
 /// crate-under-test, so its impl does not satisfy the crate-self trait in unit tests. Integration
 /// tests (which see one external `delta_kernel`) use the `test_utils` one instead.
 #[derive(Default)]
-pub(crate) struct TestCancellationToken(std::sync::atomic::AtomicBool);
+pub(crate) struct TestCancellationToken(AtomicBool);
 
 impl TestCancellationToken {
     /// A token that is already cancelled.
@@ -1313,13 +1314,13 @@ impl TestCancellationToken {
 
     /// Request cancellation.
     pub(crate) fn cancel(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
 impl crate::cancellation::CancellationToken for TestCancellationToken {
     fn is_cancelled(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
+        self.0.load(Ordering::SeqCst)
     }
     fn cancelled_future(&self) -> crate::cancellation::CancelledFuture<'_> {
         Box::pin(std::future::ready(()))

@@ -55,8 +55,7 @@ impl StorageHandler for MeteredStorageHandler {
         )))
     }
 
-    // The token is forwarded exactly as received: `CancellationToken` guarantees a caller gets back
-    // the value it supplied, so wrapping it here would break its downcast.
+    // Forward the token by identity so a caller can still downcast it to recover their own.
     fn list_from_with_cancellation(
         &self,
         path: &Url,
