@@ -27,6 +27,10 @@ use crate::{DeltaResult, Error, FileMeta};
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
 /// caller-declared `schema` field holding its output schema. The rest emit rows they were given, so
 /// they inherit an input's schema; each payload's docs name which input.
+///
+/// Operators downstream of an ordered scan must preserve its row-order and file-boundary
+/// guarantees through the plan result. Errors are outside the ordering guarantee and may be
+/// returned eagerly.
 #[derive(Debug, Clone, Display)]
 #[strum(serialize_all = "snake_case")]
 pub enum Operator {
@@ -103,8 +107,11 @@ impl From<FileMeta> for ScanFile {
 /// Reads Parquet `files` into row batches matching `schema`. The engine returns exactly the
 /// columns named by `schema`, in schema order.
 ///
-/// Output row order is unspecified: the engine is free to read `files` in any order, in
-/// parallel, and to interleave rows from different files.
+/// When `ordered_scan` is false, output row order is unspecified: the engine is free to read
+/// `files` in any order, in parallel, and to interleave rows from different files. When it is true,
+/// output follows the input file order and preserves row order within each file. A file may produce
+/// zero, one, or multiple batches, and each batch contains rows from at most one file. Downstream
+/// operators must preserve these guarantees. Errors may be returned eagerly.
 ///
 /// # Column resolution
 ///
@@ -186,6 +193,8 @@ pub struct ScanParquet {
     pub files: Vec<ScanFile>,
     pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
+    /// Whether output must preserve input file order and row order within each file.
+    pub ordered_scan: bool,
 }
 
 /// Reads newline-delimited JSON `files` (one JSON object per line) into row batches matching
@@ -196,8 +205,10 @@ pub struct ScanParquet {
 /// each JSON line. Missing JSON fields produce NULL for nullable `schema` fields and an error for
 /// non-nullable fields.
 ///
-/// Output row order is unspecified: the engine is free to read `files` in any order, in
-/// parallel, and to interleave rows from different files.
+/// When `ordered_scan` is false, output row order is unspecified. When it is true, output follows
+/// the input file order and preserves row order within each file. A file may produce zero, one, or
+/// multiple batches, and each batch contains rows from at most one file. Downstream operators must
+/// preserve these guarantees. Errors may be returned eagerly.
 ///
 /// # File-constant columns
 ///
@@ -211,6 +222,8 @@ pub struct ScanJson {
     pub files: Vec<ScanFile>,
     pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
+    /// Whether output must preserve input file order and row order within each file.
+    pub ordered_scan: bool,
 }
 
 /// Inline literal rows. Each `rows[i]` carries one [`Scalar`] per **top-level** field

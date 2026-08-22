@@ -44,7 +44,8 @@ impl ParquetHandler for PlanBasedParquetHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
-        let query = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)?.build()?;
+        let query =
+            PlanBuilder::scan_parquet_ordered(files.to_vec(), &[], physical_schema)?.build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
@@ -83,6 +84,7 @@ mod tests {
     use tempfile::tempdir;
     use url::Url;
 
+    use super::super::assert_ordered_file_batches;
     use super::PlanBasedParquetHandler;
     use crate::arrow::array::{Array, Int64Array, RecordBatch};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
@@ -187,6 +189,48 @@ mod tests {
                 .values(),
             &[10, 20, 30]
         );
+    }
+
+    #[test]
+    fn test_read_parquet_files_preserves_input_file_order() {
+        let temp_dir = tempdir().unwrap();
+        let first_batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let second_batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![3, 4])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let (first, schema) =
+            make_test_parquet_file(&temp_dir.path().join("first.parquet"), &first_batch);
+        let (second, _) =
+            make_test_parquet_file(&temp_dir.path().join("second.parquet"), &second_batch);
+
+        let batches: Vec<RecordBatch> = make_handler()
+            .read_parquet_files(&[second, first], schema, None)
+            .unwrap()
+            .map(|result| {
+                ArrowEngineData::try_from_engine_data(result.unwrap())
+                    .unwrap()
+                    .into()
+            })
+            .collect();
+        let batch_values: Vec<Vec<i64>> = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_ordered_file_batches(batch_values);
     }
 
     /// No files -> an absent plan -> a zero-row result (no rows, no error).
