@@ -30,9 +30,9 @@ use crate::schema::{
 use crate::table_features::validate_geospatial_feature_support;
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
-    get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
-    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
+    extract_enabled_writer_features, get_any_level_column_physical_name,
+    validate_iceberg_compat_if_needed, validate_timestamp_ntz_feature_support, ColumnMappingMode,
+    EnablementCheck, FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
     MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
@@ -251,15 +251,47 @@ impl TableConfiguration {
             });
         }
 
-        // note that while we could pick apart the protocol/metadata updates and validate them
-        // individually, instead we just re-parse so that we can recycle the try_new validation
-        // (instead of duplicating it here).
+        // Note that while we could pick apart the protocol/metadata updates and validate them
+        // individually, instead we re-parse so that we can recycle the try_new validation.
         Self::try_new(
             new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
             new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
             table_configuration.table_root.clone(),
             new_version,
         )
+    }
+
+    /// Validate that the kernel supports adding `feature` to this table configuration.
+    pub(crate) fn validate_feature_for_addition(&self, feature: &TableFeature) -> DeltaResult<()> {
+        require!(
+            !matches!(
+                feature,
+                TableFeature::CatalogManaged | TableFeature::CatalogOwnedPreview
+            ),
+            Error::unsupported("Upgrading an existing table to catalog-managed is not supported")
+        );
+
+        // Adding protocol support would immediately activate ICT, but this generic path cannot
+        // emit the required enablement metadata or first in-commit timestamp.
+        require!(
+            feature != &TableFeature::InCommitTimestamp
+                || self.table_properties().enable_in_commit_timestamps != Some(true),
+            Error::unsupported(
+                "Adding 'inCommitTimestamp' to an existing table with \
+                 'delta.enableInCommitTimestamps=true' is not supported"
+            )
+        );
+
+        match feature.feature_type() {
+            FeatureType::WriterOnly => self.check_feature_support(feature, Operation::Write),
+            FeatureType::ReaderWriter => {
+                self.check_feature_support(feature, Operation::Scan)?;
+                self.check_feature_support(feature, Operation::Write)
+            }
+            FeatureType::Unknown => Err(Error::unsupported(format!(
+                "Unknown feature '{feature}' cannot be added"
+            ))),
+        }
     }
 
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately
@@ -678,24 +710,7 @@ impl TableConfiguration {
     /// For table features protocol (v7), returns the explicit writer_features list.
     /// For legacy protocol (v1-6), infers features from the version number.
     fn get_enabled_writer_features(&self) -> Vec<TableFeature> {
-        match self.protocol.min_writer_version() {
-            TABLE_FEATURES_MIN_WRITER_VERSION => {
-                // Table features writer: use explicit writer_features list
-                self.protocol
-                    .writer_features()
-                    .map(|f| f.to_vec())
-                    .unwrap_or_default()
-            }
-            v if (1..=6).contains(&v) => {
-                // Legacy writer: infer features from version
-                LEGACY_WRITER_FEATURES
-                    .iter()
-                    .filter(|f| f.is_valid_for_legacy_writer(v))
-                    .cloned()
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
+        extract_enabled_writer_features(&self.protocol)
     }
 
     /// Returns `Ok` if the kernel supports the given operation on this table. This checks that
@@ -965,6 +980,31 @@ mod test {
         MockTableConfigurationBuilder,
     };
     use crate::Error;
+
+    #[test]
+    fn validate_feature_for_addition_checks_required_kernel_operations() {
+        let supported_writer = create_mock_table_config(&[], &[TableFeature::DomainMetadata]);
+        assert!(supported_writer
+            .validate_feature_for_addition(&TableFeature::DomainMetadata)
+            .is_ok());
+
+        let supported_reader_writer =
+            create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
+        assert!(supported_reader_writer
+            .validate_feature_for_addition(&TableFeature::DeletionVectors)
+            .is_ok());
+
+        let unsupported = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+        assert!(unsupported
+            .validate_feature_for_addition(&TableFeature::GeospatialType)
+            .is_err());
+
+        let write_unsupported = create_mock_table_config(&[], &[TableFeature::TypeWidening]);
+        assert_result_error_with_message(
+            write_unsupported.validate_feature_for_addition(&TableFeature::TypeWidening),
+            "Feature 'typeWidening' is not supported for writes",
+        );
+    }
 
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {

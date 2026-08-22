@@ -295,6 +295,7 @@ mod tests {
             "UPDATE",
             "DELETE",
             "OPTIMIZE",
+            "ADD FEATURE",
             "CREATE TABLE",
             "REPLACE TABLE",
             "CREATE TABLE AS SELECT",

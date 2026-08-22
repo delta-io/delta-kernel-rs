@@ -1,4 +1,4 @@
-//! Builder for ALTER TABLE (schema evolution) transactions.
+//! Builder for ALTER TABLE transactions.
 //!
 //! This module contains [`AlterTableTransactionBuilder`], which uses a type-state pattern to
 //! enforce valid operation chaining at compile time.
@@ -7,8 +7,10 @@
 //!
 //! - [`Ready`]: Initial state. Operations are available, but `build()` is not (at least one
 //!   operation is required).
-//! - [`Modifying`]: After any chainable schema operation. More ops can be chained, and `build()` is
-//!   available. See [`AlterTableTransactionBuilder<Modifying>`] for ops.
+//! - [`Modifying`]: After a schema operation. More schema ops can be chained, and `build()` is
+//!   available.
+//! - [`AddingFeatures`]: After a table feature operation. More features can be added, and `build()`
+//!   is available.
 //!
 //! # Transitions
 //!
@@ -27,14 +29,16 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata, ColumnMappingMode,
-    Operation, TableFeature,
+    protocol_with_added_features, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, ColumnMappingMode, Operation, TableFeature,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
@@ -48,9 +52,37 @@ use crate::{DeltaResult, Engine, Error};
 /// See [`Chainable`] for the operations available on this state.
 pub struct Ready;
 
-/// State after at least one operation has been added. `build()` is available.
+/// State after at least one schema operation has been added. `build()` is available.
+///
+/// Feature operations are unavailable once schema modification begins:
+///
+/// ```compile_fail
+/// # use delta_kernel::table_features::TableFeature;
+/// # use delta_kernel::transaction::builder::alter_table::{
+/// #     AlterTableTransactionBuilder, Modifying,
+/// # };
+/// # fn cannot_add_feature(builder: AlterTableTransactionBuilder<Modifying>) {
+/// builder.add_table_feature(TableFeature::DeletionVectors);
+/// # }
+/// ```
 /// See [`Chainable`] for the operations available on this state.
 pub struct Modifying;
+
+/// State after at least one table feature has been added. `build()` is available, but schema
+/// operations are not.
+///
+/// Schema operations are unavailable once feature addition begins:
+///
+/// ```compile_fail
+/// # use delta_kernel::schema::{DataType, StructField};
+/// # use delta_kernel::transaction::builder::alter_table::{
+/// #     AddingFeatures, AlterTableTransactionBuilder,
+/// # };
+/// # fn cannot_add_column(builder: AlterTableTransactionBuilder<AddingFeatures>) {
+/// builder.add_column(StructField::nullable("value", DataType::INTEGER));
+/// # }
+/// ```
+pub struct AddingFeatures;
 
 /// Marker trait for builder states that accept chainable schema operations. Grouping states
 /// under one bound lets each op (like `add_column`) live on a single `impl<S: Chainable>`
@@ -67,17 +99,19 @@ mod sealed {
     impl Sealed for super::Modifying {}
 }
 
-/// Builder for constructing an [`AlterTableTransaction`] with schema evolution operations.
+/// Builder for constructing an [`AlterTableTransaction`] with protocol or schema operations.
 ///
 /// Uses a type-state pattern (`S`) to enforce at compile time:
-/// - At least one schema operation must be queued before `build()` is callable.
+/// - At least one operation must be queued before `build()` is callable.
 /// - Only operations valid for the current state can be chained. This will disallow incompatible
 ///   chaining.
 pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
+    table_features: Vec<TableFeature>,
+    allow_protocol_versions_increase: bool,
     correlation_id: Option<Arc<str>>,
-    // PhantomData marker for builder state (Ready or Modifying).
+    // PhantomData marker for builder state (Ready, Modifying, or AddingFeatures).
     // Zero-sized; only affects which methods are available at compile time.
     _state: PhantomData<S>,
 }
@@ -93,6 +127,8 @@ impl<S> AlterTableTransactionBuilder<S> {
         AlterTableTransactionBuilder {
             snapshot: self.snapshot,
             operations: self.operations,
+            table_features: self.table_features,
+            allow_protocol_versions_increase: self.allow_protocol_versions_increase,
             correlation_id: self.correlation_id,
             _state: PhantomData,
         }
@@ -112,9 +148,21 @@ impl AlterTableTransactionBuilder<Ready> {
         AlterTableTransactionBuilder {
             snapshot,
             operations: Vec::new(),
+            table_features: Vec::new(),
+            allow_protocol_versions_increase: false,
             correlation_id: None,
             _state: PhantomData,
         }
+    }
+
+    /// Add a supported table feature while conservatively preserving current capabilities.
+    #[internal_api]
+    pub(crate) fn add_table_feature(
+        mut self,
+        feature: TableFeature,
+    ) -> AlterTableTransactionBuilder<AddingFeatures> {
+        self.table_features.push(feature);
+        self.transition()
     }
 }
 
@@ -182,17 +230,12 @@ impl AlterTableTransactionBuilder<Modifying> {
         }
         // Rejects writes to tables kernel can't safely commit to: writer version out of
         // kernel's supported range, unsupported writer features, or schemas with SQL-expression
-        // invariants. Runs on the pre-alter snapshot; future ALTER variants that change the
-        // protocol must also re-check this on the evolved `TableConfiguration`.
+        // invariants.
         table_config.ensure_operation_supported(Operation::Write)?;
 
         let schema = Arc::unwrap_or_clone(table_config.logical_schema());
         let column_mapping_mode = table_config.column_mapping_mode();
         let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
-        // Whether the pre-alter schema already carried column-mapping metadata -- the only fact the
-        // strip below needs from it. Captured as a bool (not a clone) before
-        // `apply_schema_operations` consumes `schema` by value. Short-circuits outside
-        // `None` mode, where no strip fires.
         let current_has_cm = column_mapping_mode == ColumnMappingMode::None
             && schema_has_column_mapping_metadata(&schema);
         let SchemaEvolutionResult {
@@ -205,9 +248,6 @@ impl AlterTableTransactionBuilder<Modifying> {
             current_max_column_id,
         )?;
 
-        // Only in `None` mode: if this ALTER introduced column-mapping annotations into a table
-        // that was clean before it, strip them; residual annotations already present on the
-        // table are left in place (see `strip_stray_column_mapping_metadata`).
         let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
             strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
                 .map_or(evolved_schema, Arc::new)
@@ -235,6 +275,69 @@ impl AlterTableTransactionBuilder<Modifying> {
             self.snapshot,
             evolved_table_config,
             committer,
+            false,
+            true,
+            "ALTER TABLE",
+            self.correlation_id,
+        )
+    }
+}
+
+impl AlterTableTransactionBuilder<AddingFeatures> {
+    /// Add another supported table feature to this protocol-only transaction.
+    #[internal_api]
+    pub(crate) fn add_table_feature(mut self, feature: TableFeature) -> Self {
+        self.table_features.push(feature);
+        self
+    }
+
+    /// Allow adding table features to increase the writer protocol to 7 and, when required by a
+    /// requested reader-writer feature, the reader protocol to 3.
+    #[internal_api]
+    pub(crate) fn with_allow_protocol_versions_increase(mut self, allow: bool) -> Self {
+        self.allow_protocol_versions_increase = allow;
+        self
+    }
+
+    /// Validate and apply table feature operations, then build a protocol-only transaction.
+    pub fn build(
+        self,
+        _engine: &dyn Engine,
+        committer: Box<dyn Committer>,
+    ) -> DeltaResult<AlterTableTransaction> {
+        let table_config = self.snapshot.table_configuration();
+        let requested_features: Vec<_> = self
+            .table_features
+            .into_iter()
+            .filter(|feature| !table_config.is_feature_supported(feature))
+            .collect();
+        if requested_features.is_empty() {
+            return Err(Error::invalid_protocol(
+                "All requested table features are already supported by the current protocol",
+            ));
+        }
+        let evolved_protocol = protocol_with_added_features(
+            table_config.protocol(),
+            requested_features.iter().cloned(),
+            self.allow_protocol_versions_increase,
+        )?;
+        let evolved_table_config = TableConfiguration::try_new_from(
+            table_config,
+            None,
+            Some(evolved_protocol),
+            table_config.version(),
+        )?;
+        for feature in &requested_features {
+            evolved_table_config.validate_feature_for_addition(feature)?;
+        }
+
+        AlterTableTransaction::try_new_alter_table(
+            self.snapshot,
+            evolved_table_config,
+            committer,
+            true,
+            false,
+            "ADD FEATURE",
             self.correlation_id,
         )
     }

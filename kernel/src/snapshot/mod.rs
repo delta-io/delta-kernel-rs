@@ -894,8 +894,9 @@ impl Snapshot {
         Transaction::try_new_existing_table(self, committer, engine)
     }
 
-    /// Creates a builder for altering this table's metadata. Currently supports schema change
-    /// operations.
+    /// Creates a builder for altering this table's protocol or metadata. Currently supports
+    /// schema change operations. Selected table-feature additions are experimental and available
+    /// only with the `internal-api` feature.
     ///
     /// The returned builder allows chaining operations before building an
     /// [`AlterTableTransaction`] that can be committed.
