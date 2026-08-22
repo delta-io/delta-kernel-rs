@@ -10,6 +10,7 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
+use crate::unit_test_utils::TestCancellationToken;
 use crate::{Engine as _, FileMeta};
 
 // size markers used to identify commit sources in tests
@@ -217,7 +218,15 @@ fn list_and_destructure(
     Option<ParsedLogPath>,
     Option<Version>,
 ) {
-    let r = LogSegmentFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
+    let r = LogSegmentFiles::list(
+        storage,
+        log_root,
+        log_tail,
+        start_version,
+        end_version,
+        None,
+    )
+    .unwrap();
     (
         r.ascending_commit_files,
         r.ascending_compaction_files,
@@ -689,9 +698,14 @@ async fn backward_scan_single_checkpoint_cases(
     let (storage, log_root) = create_storage(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
 
@@ -818,6 +832,7 @@ async fn backward_scan_multipart_checkpoint_cases(
         &log_root,
         vec![],
         end_version,
+        None,
     )
     .unwrap();
 
@@ -868,6 +883,7 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         &log_root,
         log_tail,
         10,
+        None,
     )
     .unwrap();
 
@@ -918,6 +934,7 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         &log_root,
         log_tail,
         8,
+        None,
     )
     .unwrap();
 
@@ -960,6 +977,7 @@ async fn backward_scan_log_tail_defines_latest_version() {
         &log_root,
         log_tail,
         5,
+        None,
     )
     .unwrap();
 
@@ -1017,7 +1035,7 @@ async fn test_zero_byte_commit_kept_in_listing() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[0].version, 0);
     assert_eq!(result.ascending_commit_files[1].version, 1);
@@ -1046,10 +1064,16 @@ async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_sca
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4)
-            .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            4,
+            None,
+        )
+        .unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4), None).unwrap()
     };
 
     assert!(
@@ -1086,10 +1110,16 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10)
-            .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            10,
+            None,
+        )
+        .unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10), None).unwrap()
     };
 
     // Should fall back to checkpoint at v5 (the empty v10 checkpoint is skipped)
@@ -1115,7 +1145,7 @@ async fn test_zero_byte_crc_kept() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
 
     // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
     let crc = result.latest_crc_file.unwrap();
@@ -1138,9 +1168,14 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        None,
+    )
+    .unwrap();
 
     // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
     assert_eq!(counter.call_count(), 2);
@@ -1163,7 +1198,7 @@ async fn test_list_commits_zero_byte_commit_kept() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2))
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None)
             .unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[2].version, 2);
@@ -1235,7 +1270,8 @@ async fn list_commits_merges_log_tail(
         .collect();
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end).unwrap();
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end, None)
+            .unwrap();
 
     let commits = &result.ascending_commit_files;
     assert_eq!(commits.len(), expected.len());
@@ -1262,7 +1298,7 @@ async fn test_list_commits_keeps_commits_across_checkpoint() {
     let (storage, log_root) = create_storage(files).await;
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5))
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5), None)
             .unwrap();
     let versions: Vec<_> = result
         .ascending_commit_files
@@ -1595,6 +1631,7 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
         &log_root,
         vec![],
         None,
+        None,
     )
     .unwrap();
 
@@ -1728,4 +1765,208 @@ fn find_complete_checkpoint_version_same_version_cases(
     #[case] expected: Option<u64>,
 ) {
     assert_eq!(find_complete_checkpoint_version(&files), expected);
+}
+
+// ===== cancellation tests =====
+
+/// A storage handler whose listing yields `count` synthetic commit paths and records how many were
+/// pulled, so a test can tell where a cancelled listing actually stopped.
+struct FiniteListingHandler {
+    log_root: Url,
+    count: usize,
+    items_pulled: Arc<AtomicU32>,
+}
+
+impl StorageHandler for FiniteListingHandler {
+    fn list_from(
+        &self,
+        _path: &Url,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        let log_root = self.log_root.clone();
+        let pulled = self.items_pulled.clone();
+        let iter = (0..self.count as u64).map(move |version| {
+            pulled.fetch_add(1, Ordering::Relaxed);
+            Ok(FileMeta::new(
+                log_root.join(&format!("{version:020}.json"))?,
+                version as i64,
+                1,
+            ))
+        });
+        Ok(Box::new(iter))
+    }
+
+    fn read_files(
+        &self,
+        _files: Vec<crate::FileSlice>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        panic!("read_files should not be called during listing");
+    }
+
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        panic!("put should not be called during listing");
+    }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        panic!("copy_atomic should not be called during listing");
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        panic!("head should not be called during listing");
+    }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during listing");
+    }
+}
+
+// Builds a `FiniteListingHandler` over `memory:///_delta_log/` yielding `count` paths, returning
+// the log root and the shared pull counter alongside it.
+fn finite_listing_handler(count: usize) -> (Url, Arc<AtomicU32>, FiniteListingHandler) {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let pulled = Arc::new(AtomicU32::new(0));
+    let storage = FiniteListingHandler {
+        log_root: log_root.clone(),
+        count,
+        items_pulled: pulled.clone(),
+    };
+    (log_root, pulled, storage)
+}
+
+// An already-cancelled token fails the listing before any storage call, via the default
+// `list_from_with_cancellation` (this handler does not override it).
+#[test]
+fn precancelled_token_stops_listing_before_any_storage_call() {
+    let (log_root, pulled, storage) = finite_listing_handler(100);
+
+    let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+
+    let result = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token));
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(pulled.load(Ordering::Relaxed), 0);
+}
+
+// Cancelling partway yields the items already produced, then exactly one terminal
+// `Error::Cancelled` -- never a bare `None`, which would make a truncated listing look complete.
+// This is the regression guard for polling inside (rather than outside) the version `take_while`.
+#[test]
+fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
+    let (log_root, pulled, storage) = finite_listing_handler(100);
+
+    let token = Arc::new(TestCancellationToken::default());
+    let token_ref: CancellationTokenRef = token.clone();
+    let mut iter =
+        list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token_ref))
+            .unwrap();
+
+    assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 0));
+    assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 1));
+
+    token.cancel();
+
+    assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+    // Fused: no second error and no further items.
+    assert!(iter.next().is_none());
+    assert!(iter.next().is_none());
+    // The listing stopped early rather than draining all 100 entries.
+    assert!(pulled.load(Ordering::Relaxed) < 100);
+}
+
+// With no token the listing is unchanged, so cancellation support is strictly opt-in.
+#[test]
+fn listing_without_token_is_unchanged() {
+    let (log_root, _pulled, storage) = finite_listing_handler(5);
+
+    let listed: Vec<_> = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, None)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(listed.len(), 5);
+}
+
+/// An iterator that yields nothing but cancels `token` the instant it is polled (i.e. as the
+/// enclosing listing is exhausted), so a later poll of the token observes the cancellation.
+struct CancelOnExhaustion {
+    token: Arc<TestCancellationToken>,
+    done: bool,
+}
+
+impl Iterator for CancelOnExhaustion {
+    type Item = DeltaResult<FileMeta>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.done {
+            self.done = true;
+            self.token.cancel();
+        }
+        None
+    }
+}
+
+/// A storage handler that returns an empty listing and cancels `token` as that listing is
+/// exhausted, counting its `list_from` calls. Lets a test flip the token *between* backward-scan
+/// windows rather than before the first one.
+struct CancelAfterListingHandler {
+    token: Arc<TestCancellationToken>,
+    list_calls: Arc<AtomicU32>,
+}
+
+impl StorageHandler for CancelAfterListingHandler {
+    fn list_from(
+        &self,
+        _path: &Url,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        self.list_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Box::new(CancelOnExhaustion {
+            token: self.token.clone(),
+            done: false,
+        }))
+    }
+
+    fn read_files(
+        &self,
+        _files: Vec<crate::FileSlice>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        panic!("read_files should not be called during listing");
+    }
+
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        panic!("put should not be called during listing");
+    }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        panic!("copy_atomic should not be called during listing");
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        panic!("head should not be called during listing");
+    }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during listing");
+    }
+}
+
+// The backward scan collects each window eagerly and re-checks the token at the top of every
+// window. Window 1 lists an empty window and succeeds; the token flips as that listing is
+// exhausted, so it is window 2's up-front check -- not window 1's -- that surfaces the cancellation
+// (exactly one listing ran).
+#[test]
+fn backward_scan_checks_cancellation_between_windows() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let token = Arc::new(TestCancellationToken::default());
+    let list_calls = Arc::new(AtomicU32::new(0));
+    let storage = CancelAfterListingHandler {
+        token: token.clone(),
+        list_calls: list_calls.clone(),
+    };
+    let token_ref: CancellationTokenRef = token;
+
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &storage,
+        &log_root,
+        vec![],
+        5_000,
+        Some(&token_ref),
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(list_calls.load(Ordering::Relaxed), 1);
 }

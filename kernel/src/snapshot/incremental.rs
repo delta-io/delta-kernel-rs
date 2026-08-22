@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::{IncrementalReplay, Snapshot};
+use crate::cancellation::CancellationTokenRef;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
@@ -98,7 +99,8 @@ impl Snapshot {
     ///
     /// [`SnapshotBuilder::at_version`]: crate::snapshot::SnapshotBuilder::at_version
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, target_version))]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, target_version, cancellation_token))]
     pub(super) fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
@@ -107,6 +109,7 @@ impl Snapshot {
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Arc<Self>> {
         let existing_log_segment = &existing_snapshot.log_segment;
         let existing_snapshot_version = existing_snapshot.version();
@@ -137,6 +140,7 @@ impl Snapshot {
             existing_snapshot_version,
             log_tail,
             requested_version,
+            cancellation_token,
         )
         .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?
         {
@@ -237,6 +241,7 @@ impl Snapshot {
         existing_snapshot_version: Version,
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
@@ -250,6 +255,7 @@ impl Snapshot {
             log_tail,
             Some(listing_start),
             requested_version,
+            cancellation_token,
         )?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
@@ -640,6 +646,7 @@ mod tests {
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             true, /* built_as_latest */
+            None, /* cancellation_token */
         )?;
         assert_eq!(result, base_snapshot);
         // `PartialEq` ignores `built_as_latest`, so assert it explicitly.
@@ -720,6 +727,7 @@ mod tests {
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             false, /* built_as_latest */
+            None,  /* cancellation_token */
         )?;
 
         // Latest commit should now be version 2
@@ -779,6 +787,7 @@ mod tests {
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             false, /* built_as_latest */
+            None,  /* cancellation_token */
         )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
@@ -791,6 +800,7 @@ mod tests {
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             false, /* built_as_latest */
+            None,  /* cancellation_token */
         );
         assert!(matches!(
             older_version,
