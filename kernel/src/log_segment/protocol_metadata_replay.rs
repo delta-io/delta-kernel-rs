@@ -147,18 +147,19 @@ impl LogSegment {
                 if protocol_opt.is_none() {
                     protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
                 }
+                // Top-level version is newer when it strictly exceeds the checkpoint's; a missing
+                // version (None) sorts oldest, so the checkpoint fills that field.
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
-                    // The checkpoint wins a field unless a strictly newer top-level version exists;
-                    // a missing top-level version (None) sorts oldest, so the checkpoint fills it.
                     let (protocol_ver, metadata_ver, checkpoint_ver) =
                         read_pm_versions(actions.as_ref())?;
-                    if protocol_ver <= checkpoint_ver {
-                        protocol_opt = Some(checkpoint.protocol().clone());
-                    }
-                    if metadata_ver <= checkpoint_ver {
-                        metadata_opt = Some(checkpoint.metadata().clone());
-                    }
+                    merge_checkpoint_pm(
+                        &mut metadata_opt,
+                        &mut protocol_opt,
+                        &checkpoint,
+                        metadata_ver > checkpoint_ver,
+                        protocol_ver > checkpoint_ver,
+                    );
                 }
             }
             return Ok((metadata_opt, protocol_opt));
@@ -177,11 +178,19 @@ impl LogSegment {
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 break;
             }
-            // Use the checkpoint's P&M for any field not already found.
+            // Newest-first replay: a field already found is newer than this checkpoint, so it is
+            // kept; the checkpoint fills any field still missing.
             #[cfg(feature = "adaptive-metadata-in-dev")]
             if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
-                metadata_opt.get_or_insert_with(|| checkpoint.metadata().clone());
-                protocol_opt.get_or_insert_with(|| checkpoint.protocol().clone());
+                let (keep_metadata, keep_protocol) =
+                    (metadata_opt.is_some(), protocol_opt.is_some());
+                merge_checkpoint_pm(
+                    &mut metadata_opt,
+                    &mut protocol_opt,
+                    &checkpoint,
+                    keep_metadata,
+                    keep_protocol,
+                );
                 return Ok((metadata_opt, protocol_opt));
             }
         }
@@ -300,6 +309,25 @@ impl LogSegment {
             (&METADATA_FIELD),
         };
         self.read_actions(engine, schema)
+    }
+}
+
+/// Merge a checkpoint action's embedded P&M into the P&M found from top-level actions. Each field
+/// takes the checkpoint's value unless the top-level value is newer, as determined by the caller:
+/// found-ness for the newest-first non-plan stream, version comparison for the plan's single row.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn merge_checkpoint_pm(
+    metadata_opt: &mut Option<Metadata>,
+    protocol_opt: &mut Option<Protocol>,
+    checkpoint: &CheckpointAction,
+    keep_top_level_metadata: bool,
+    keep_top_level_protocol: bool,
+) {
+    if !keep_top_level_metadata {
+        *metadata_opt = Some(checkpoint.metadata().clone());
+    }
+    if !keep_top_level_protocol {
+        *protocol_opt = Some(checkpoint.protocol().clone());
     }
 }
 
