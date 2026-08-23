@@ -229,6 +229,43 @@ impl Transaction {
     ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`.
     ///
+    /// # Data Shape & Staging
+    ///
+    /// Given scan metadata input and a map of new deletion vector descriptors:
+    ///
+    /// ```text
+    /// scan metadata input:
+    ///
+    /// path            size  stats                                 deletionVector
+    /// part-1.parquet  100   {"numRecords":10,"tightBounds":true}  old_dv
+    /// part-2.parquet  200   {"numRecords":20,"tightBounds":true}  null
+    ///
+    /// DV map:
+    ///
+    /// {
+    ///   "part-1.parquet": new_dv
+    /// }
+    /// ```
+    ///
+    /// Kernel matches the map by `path` and stages the selected scan row with two temporary columns:
+    ///
+    /// ```text
+    /// path            ...  deletionVector  newDeletionVector  newStats
+    /// part-1.parquet  ...  old_dv          new_dv             {"numRecords":10,"tightBounds":false}
+    /// ```
+    ///
+    /// On commit, this produces:
+    ///
+    /// ```text
+    /// Remove(path="part-1.parquet", deletionVector=old_dv)
+    /// Add(
+    ///   path="part-1.parquet",
+    ///   deletionVector=new_dv,
+    ///   stats={"numRecords":10,"tightBounds":false},
+    ///   ...preserved file metadata
+    /// )
+    /// ```
+    ///
     /// # Arguments
     ///
     /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to the
