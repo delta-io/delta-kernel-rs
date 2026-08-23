@@ -132,21 +132,80 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        // Pick the batch source. Plan output is one aggregated row with no arrival order, so we
+        // pass a `version_reader` to reconcile the checkpoint action by version. The raw log stream
+        // is newest-first, so a `None` reader keeps the first value seen for each field instead.
         #[cfg(feature = "declarative-plans")]
-        if let Some(executor) = engine.plan_executor() {
-            // Plan output is one aggregated row with no arrival order, so `resolve_pm` compares
-            // source versions.
-            let batches = self.read_pm_batches_via_plan(executor.as_ref())?;
+        #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
+        let (actions_batches, version_reader): (
+            Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+            Option<SourceVersionReader>,
+        ) = if let Some(executor) = engine.plan_executor() {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             let version_reader: Option<SourceVersionReader> = Some(read_pm_versions);
             #[cfg(not(feature = "adaptive-metadata-in-dev"))]
             let version_reader: Option<SourceVersionReader> = None;
-            return resolve_pm(batches, version_reader);
-        }
+            (
+                self.read_pm_batches_via_plan(executor.as_ref())?,
+                version_reader,
+            )
+        } else {
+            (Box::new(self.read_pm_batches(engine)?), None)
+        };
+        #[cfg(not(feature = "declarative-plans"))]
+        #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
+        let (actions_batches, version_reader): (
+            Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+            Option<SourceVersionReader>,
+        ) = (Box::new(self.read_pm_batches(engine)?), None);
 
-        // The log stream is newest-first, so `resolve_pm` keeps the first value seen for each
-        // field.
-        resolve_pm(self.read_pm_batches(engine)?, None)
+        let mut metadata_opt = None;
+        let mut protocol_opt = None;
+        for actions_batch in actions_batches {
+            let actions_batch = actions_batch?;
+            let actions = &actions_batch.actions;
+            if metadata_opt.is_none() {
+                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+            }
+            if protocol_opt.is_none() {
+                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+            }
+            // The `checkpoint` array action only appears in a commit; take its embedded P&M for a
+            // field it has at least as new, ranked by version_reader, else by arrival order.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let checkpoint = if actions_batch.is_log_batch {
+                CheckpointAction::try_new_from_data(actions.as_ref())?
+            } else {
+                None
+            };
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            if let Some(checkpoint) = checkpoint {
+                let (use_checkpoint_metadata, use_checkpoint_protocol) = match version_reader {
+                    Some(read_versions) => {
+                        let (protocol_ver, metadata_ver, checkpoint_ver) =
+                            read_versions(actions.as_ref())?;
+                        (
+                            metadata_ver <= checkpoint_ver,
+                            protocol_ver <= checkpoint_ver,
+                        )
+                    }
+                    // If no version_reader then use the checkpoint action if no P&M found on newer
+                    // actions
+                    None => (metadata_opt.is_none(), protocol_opt.is_none()),
+                };
+                if use_checkpoint_metadata {
+                    metadata_opt = Some(checkpoint.metadata().clone());
+                }
+                if use_checkpoint_protocol {
+                    protocol_opt = Some(checkpoint.protocol().clone());
+                }
+            }
+
+            if metadata_opt.is_some() && protocol_opt.is_some() {
+                break;
+            }
+        }
+        Ok((metadata_opt, protocol_opt))
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -278,61 +337,6 @@ impl LogSegment {
 /// the plan produces these; the non-plan stream ranks the checkpoint by arrival order instead.
 type SourceVersionReader =
     fn(&dyn EngineData) -> DeltaResult<(Option<i64>, Option<i64>, Option<i64>)>;
-
-/// Resolves the newest Protocol and Metadata by replaying `batches`.
-fn resolve_pm(
-    batches: impl Iterator<Item = DeltaResult<ActionsBatch>>,
-    #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
-    version_reader: Option<SourceVersionReader>,
-) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-    let mut metadata_opt = None;
-    let mut protocol_opt = None;
-    for actions_batch in batches {
-        let actions_batch = actions_batch?;
-        let actions = &actions_batch.actions;
-        if metadata_opt.is_none() {
-            metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-        }
-        if protocol_opt.is_none() {
-            protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
-        }
-        // The `checkpoint` array action only appears in a commit; take its embedded P&M for a field
-        // it has at least as new, ranked by version_reader, else by arrival order.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let checkpoint = if actions_batch.is_log_batch {
-            CheckpointAction::try_new_from_data(actions.as_ref())?
-        } else {
-            None
-        };
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(checkpoint) = checkpoint {
-            let (use_checkpoint_metadata, use_checkpoint_protocol) = match version_reader {
-                Some(read_versions) => {
-                    let (protocol_ver, metadata_ver, checkpoint_ver) =
-                        read_versions(actions.as_ref())?;
-                    (
-                        metadata_ver <= checkpoint_ver,
-                        protocol_ver <= checkpoint_ver,
-                    )
-                }
-                // If no version_reader then use the checkpoint action if no P&M found on newer
-                // actions
-                None => (metadata_opt.is_none(), protocol_opt.is_none()),
-            };
-            if use_checkpoint_metadata {
-                metadata_opt = Some(checkpoint.metadata().clone());
-            }
-            if use_checkpoint_protocol {
-                protocol_opt = Some(checkpoint.protocol().clone());
-            }
-        }
-
-        if metadata_opt.is_some() && protocol_opt.is_some() {
-            break;
-        }
-    }
-    Ok((metadata_opt, protocol_opt))
-}
 
 /// Reads the `*_version` columns the plan aggregate emits: the version at which the newest
 /// protocol, metaData, and checkpoint action were found (`None` if that action never appeared).
