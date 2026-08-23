@@ -170,8 +170,8 @@ impl LogSegment {
             if protocol_opt.is_none() {
                 protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             }
-            // The `checkpoint` array action only appears in a commit; take its embedded P&M for a
-            // field it has at least as new, ranked by version_reader, else by arrival order.
+            // A checkpoint action carries its own protocol and metadata, so use them when they're
+            // newer than what we've already found.
             #[cfg(feature = "adaptive-metadata-in-dev")]
             let checkpoint = if actions_batch.is_log_batch {
                 CheckpointAction::try_new_from_data(actions.as_ref())?
@@ -189,8 +189,6 @@ impl LogSegment {
                             protocol_ver <= checkpoint_ver,
                         )
                     }
-                    // If no version_reader then use the checkpoint action if no P&M found on newer
-                    // actions
                     None => (metadata_opt.is_none(), protocol_opt.is_none()),
                 };
                 if use_checkpoint_metadata {
