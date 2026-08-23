@@ -247,18 +247,30 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        let checkpoint_schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+        };
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let schema = schema_ref! {
+        let commit_schema = schema_ref! {
             (&PROTOCOL_FIELD),
             (&METADATA_FIELD),
             (&CHECKPOINT_ACTION_FIELD),
         };
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let schema = schema_ref! {
-            (&PROTOCOL_FIELD),
-            (&METADATA_FIELD),
-        };
-        self.read_actions(engine, schema)
+        let commit_schema = checkpoint_schema.clone();
+
+        Ok(self
+            .read_actions_with_projected_checkpoint_actions(
+                engine,
+                commit_schema,
+                checkpoint_schema,
+                None,
+                None,
+                None,
+                None,
+            )?
+            .actions)
     }
 }
 
@@ -276,17 +288,24 @@ fn resolve_pm(
     let mut metadata_opt = None;
     let mut protocol_opt = None;
     for actions_batch in batches {
-        let actions = actions_batch?.actions;
+        let actions_batch = actions_batch?;
+        let actions = &actions_batch.actions;
         if metadata_opt.is_none() {
             metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
         }
         if protocol_opt.is_none() {
             protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
         }
-        // An AMT checkpoint action embeds its own P&M; take it for a field it has at least as new,
-        // ranked by version_reader, else by arrival order.
+        // The `checkpoint` array action only appears in a commit; take its embedded P&M for a field
+        // it has at least as new, ranked by version_reader, else by arrival order.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
+        let checkpoint = if actions_batch.is_log_batch {
+            CheckpointAction::try_new_from_data(actions.as_ref())?
+        } else {
+            None
+        };
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = checkpoint {
             let (use_checkpoint_metadata, use_checkpoint_protocol) = match version_reader {
                 Some(read_versions) => {
                     let (protocol_ver, metadata_ver, checkpoint_ver) =
@@ -296,7 +315,8 @@ fn resolve_pm(
                         protocol_ver <= checkpoint_ver,
                     )
                 }
-                // If no version_reader then use the checkpoint action if no P&M found on newer actions
+                // If no version_reader then use the checkpoint action if no P&M found on newer
+                // actions
                 None => (metadata_opt.is_none(), protocol_opt.is_none()),
             };
             if use_checkpoint_metadata {
@@ -676,17 +696,10 @@ mod tests {
         //
         // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
         //
-        // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- row group skipping is
-        // disabled for parts missing a projected column, so parts 1 and 5 are read regardless.
-        // Part 3 skips normally (four read), but under `adaptive-metadata-in-dev` the projected
-        // `checkpoint` column is also missing from every classic part, so part 3 no longer skips
-        // and all five are read.
-        let expected_parts = if cfg!(feature = "adaptive-metadata-in-dev") {
-            5
-        } else {
-            4
-        };
-        assert_eq!(data.len(), expected_parts);
+        // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- We currently
+        // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
+        // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
+        assert_eq!(data.len(), 4);
     }
 
     // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the
