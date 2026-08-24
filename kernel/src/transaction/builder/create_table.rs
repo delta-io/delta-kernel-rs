@@ -701,25 +701,25 @@ fn validate_extract_table_features_and_properties(
             )));
         }
 
-        // Add to appropriate feature lists based on feature type
-        let needs_domain_metadata = feature == TableFeature::RowTracking;
-        let needs_variant_type = feature == TableFeature::VariantShredding;
-        add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
         // RowTracking requires DomainMetadata as a dependency
-        if needs_domain_metadata {
+        if feature == TableFeature::RowTracking {
             add_feature_to_lists(
                 TableFeature::DomainMetadata,
                 &mut reader_features,
                 &mut writer_features,
             );
         }
-        if needs_variant_type {
+        // VariantShredding requires VariantType as a dependency
+        if feature == TableFeature::VariantShredding {
             add_feature_to_lists(
                 TableFeature::VariantType,
                 &mut reader_features,
                 &mut writer_features,
             );
         }
+
+        // Add to appropriate feature lists based on feature type
+        add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
     }
 
     // Validate remaining delta.* properties against the allow list
