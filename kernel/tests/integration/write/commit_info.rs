@@ -4,13 +4,16 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, RecordBatch, StringArray};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::schema_ref;
+use delta_kernel::transaction::{CommitActions, TransactionOptions};
+use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};
+use test_utils::{set_json_value, setup_test_tables};
 
 use crate::common::write_utils::{
     get_simple_int_schema, validate_timestamp, validate_txn_id, ZERO_UUID,
@@ -28,11 +31,18 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // create a transaction
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_engine_info("default engine");
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(&engine)?
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("default engine"))
+            .build(&engine)?;
 
         // commit!
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(
+            &engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -73,10 +83,17 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_engine_info("default engine");
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(&engine)?
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("default engine"))
+            .build(&engine)?;
 
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(
+            &engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
 
         let commit = store
             .get(&Path::from(format!(
@@ -107,6 +124,55 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         })];
 
         assert_eq!(parsed_commits, expected_commit);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_operation_metadata_is_written_to_commit_info(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_int_schema();
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema, &[], None, "test_table").await?
+    {
+        let options = TransactionOptions::new()
+            .with_engine_info("test-engine")
+            .with_operation_parameters([("mode", "Append"), ("partitionBy", "[]")])?
+            .with_operation_metrics([("numFiles", "3"), ("numOutputRows", "10")])?;
+        let transaction = Snapshot::builder_for(table_url)
+            .build(&engine)?
+            .transaction_builder()
+            .with_options(options)
+            .build(&engine)?;
+
+        transaction
+            .commit(&engine, &FileSystemCommitter::new(), CommitActions::new())?
+            .unwrap_committed();
+
+        let commit = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+        let commit_info: serde_json::Value = serde_json::from_slice(&commit.bytes().await?)?;
+
+        assert_eq!(
+            commit_info["commitInfo"]["operationParameters"]["mode"],
+            "Append"
+        );
+        assert_eq!(
+            commit_info["commitInfo"]["operationParameters"]["partitionBy"],
+            "[]"
+        );
+        assert_eq!(
+            commit_info["commitInfo"]["operationMetrics"]["numFiles"],
+            "3"
+        );
+        assert_eq!(
+            commit_info["commitInfo"]["operationMetrics"]["numOutputRows"],
+            "10"
+        );
     }
     Ok(())
 }
@@ -148,11 +214,21 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
             nullable "operation": STRING,
         };
 
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(&engine)?
+            .transaction_builder()
             .with_operation("WRITE".to_string())
-            .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
+            .with_options(
+                TransactionOptions::new()
+                    .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema),
+            )
+            .build(&engine)?;
 
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(
+            &engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
 
         let commit = store
             .get(&Path::from(format!(

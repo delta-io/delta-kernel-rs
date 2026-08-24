@@ -41,7 +41,7 @@ use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, Operation, TransactionOptions};
 use delta_kernel::{DeltaResult, Snapshot};
 
 #[tokio::main]
@@ -61,18 +61,19 @@ async fn main() -> DeltaResult<()> {
     ])?);
 
     create_table(url.as_str(), schema.clone(), "quick-start/1.0")
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
-        .commit(&engine)?;
+        .build(&engine)?
+        .commit(&engine, &FileSystemCommitter::new(), delta_kernel::transaction::CommitActions::new())?;
     println!("Created table at {url}");
 
     // 2. Write data
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-        .with_operation("INSERT".to_string())
-        .with_engine_info("quick-start/1.0")
-        .with_data_change(true);
+    let txn = snapshot
+        .transaction_builder()
+        .with_operation(Operation::Write)
+        .with_options(TransactionOptions::new().with_engine_info("quick-start/1.0"))
+        .with_data_change(true)
+        .build(&engine)?;
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
@@ -91,10 +92,8 @@ async fn main() -> DeltaResult<()> {
     let file_metadata = engine
         .write_parquet(&data, write_context.as_ref())
         .await?;
-    txn.add_files(file_metadata);
-
     // Commit
-    match txn.commit(&engine)? {
+    match txn.commit(&engine, &FileSystemCommitter::new(), file_metadata.into())? {
         CommitResult::CommittedTransaction(committed) => {
             println!("Committed version {}", committed.commit_version());
         }
@@ -132,8 +131,12 @@ let schema = Arc::new(StructType::try_new(vec![
 ])?);
 
 create_table(url.as_str(), schema.clone(), "quick-start/1.0")
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(
+        &engine,
+        &FileSystemCommitter::new(),
+        delta_kernel::transaction::CommitActions::new(),
+    )?;
 ```
 
 `create_table` returns a builder. You provide:
@@ -141,8 +144,9 @@ create_table(url.as_str(), schema.clone(), "quick-start/1.0")
 - A schema (using kernel's `StructType`)
 - An engine info string (identifies your application)
 
-`.build()` takes the engine and a `Committer`. For local filesystem tables, use
-`FileSystemCommitter`. For catalog-managed tables, you provide your own committer.
+`.build()` takes the engine and freezes the transaction intent. `.commit()` takes the committer;
+for local filesystem tables, use `FileSystemCommitter`. For catalog-managed tables, provide your
+own committer.
 [Catalog-Managed Tables](../catalog_managed/overview.md) covers that topic.
 
 `.commit()` writes version 0 of the table (the initial Protocol and Metadata actions).
@@ -153,10 +157,13 @@ The write flow has four parts:
 
 **Start a transaction:**
 ```rust,ignore
-let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_data_change(true);
+use delta_kernel::transaction::Operation;
+
+let txn = snapshot
+    .transaction_builder()
+    .with_operation(Operation::Write)
+    .with_data_change(true)
+    .build(&engine)?;
 ```
 
 **Build your data as an Arrow RecordBatch and wrap it:**
@@ -179,17 +186,16 @@ let write_context = Arc::new(txn.unpartitioned_write_context()?);
 let file_metadata = engine
     .write_parquet(&data, write_context.as_ref())
     .await?;
-txn.add_files(file_metadata);
 ```
 
 `unpartitioned_write_context()` creates a `BoundWriteContext` with the target directory, schema,
 and stats configuration.
 `write_parquet` writes a Parquet file and returns metadata (path, size, stats) that the
-transaction needs. `add_files` registers that metadata with the transaction.
+transaction needs. Pass that metadata to `commit`.
 
 **Commit:**
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.commit(&engine, &FileSystemCommitter::new(), file_metadata.into())? {
     CommitResult::CommittedTransaction(committed) => { /* success */ }
     CommitResult::ConflictedTransaction(_) => { /* another writer won */ }
     CommitResult::RetryableTransaction(retry) => { /* transient error, retry */ }

@@ -5,13 +5,14 @@ use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
 use delta_kernel::arrow::datatypes::{Int32Type, Int64Type, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{schema_ref, MetadataColumnSpec, SchemaRef};
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, TransactionOptions};
 use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
@@ -20,9 +21,8 @@ use tempfile::{tempdir, TempDir};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    begin_transaction, collect_row_ids, create_default_engine_mt_executor, create_table,
-    engine_store_setup, load_and_begin_transaction, read_actions_from_commit, read_add_infos,
-    read_scan, test_read,
+    collect_row_ids, create_default_engine_mt_executor, create_table, engine_store_setup,
+    load_and_begin_transaction, read_actions_from_commit, read_add_infos, read_scan, test_read,
 };
 use url::Url;
 
@@ -85,8 +85,11 @@ async fn write_data_to_table(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
-    let mut txn =
-        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
+    let txn = Snapshot::builder_for(table_url.clone())
+        .build(engine.as_ref())?
+        .transaction_builder()
+        .with_data_change(true)
+        .build(engine.as_ref())?;
 
     // Write data out by spawning async tasks to simulate executors
     let write_context = Arc::new(txn.unpartitioned_write_context()?);
@@ -96,15 +99,18 @@ async fn write_data_to_table(
         tokio::task::spawn(async move { engine.write_parquet(&data, write_context.as_ref()).await })
     });
 
-    let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-
-    for meta in add_files_metadata {
-        let metadata = meta?;
-        txn.add_files(metadata);
-    }
+    let add_files_metadata = futures::future::join_all(tasks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<DeltaResult<Vec<_>>>()?;
 
     // Commit the transaction
-    txn.commit(engine.as_ref())
+    txn.commit(
+        engine.as_ref(),
+        &FileSystemCommitter::new(),
+        add_files_metadata.into(),
+    )
 }
 
 /// Helper function to create a row-tracking table with a single `number: INTEGER` column.
@@ -625,7 +631,13 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     let txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?;
 
     // Commit without adding any add files
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new()
+        )?
+        .is_committed());
 
     // Fetch and parse the commit
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
@@ -660,12 +672,16 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref())?;
 
     // Create two transactions from the same snapshot (simulating parallel transactions)
-    let mut txn1 = begin_transaction(snapshot1, engine1.as_ref())?
-        .with_engine_info("transaction 1")
-        .with_data_change(true);
-    let mut txn2 = begin_transaction(snapshot2, engine2.as_ref())?
-        .with_engine_info("transaction 2")
-        .with_data_change(true);
+    let txn1 = snapshot1
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("transaction 1"))
+        .with_data_change(true)
+        .build(engine1.as_ref())?;
+    let txn2 = snapshot2
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("transaction 2"))
+        .with_data_change(true)
+        .build(engine2.as_ref())?;
 
     // Prepare data for both transactions
     let data1 = RecordBatch::try_new(
@@ -689,11 +705,12 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
         .write_parquet(&ArrowEngineData::new(data2), write_context2.as_ref())
         .await?;
 
-    txn1.add_files(metadata1);
-    txn2.add_files(metadata2);
-
     // Commit the first transaction - this should succeed
-    let result1 = txn1.commit(engine1.as_ref())?;
+    let result1 = txn1.commit(
+        engine1.as_ref(),
+        &FileSystemCommitter::new(),
+        metadata1.into(),
+    )?;
     match result1 {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(
@@ -714,7 +731,11 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     }
 
     // Commit the second transaction - this should result in a conflict
-    let result2 = txn2.commit(engine2.as_ref())?;
+    let result2 = txn2.commit(
+        engine2.as_ref(),
+        &FileSystemCommitter::new(),
+        metadata2.into(),
+    )?;
     match result2 {
         CommitResult::CommittedTransaction(committed) => {
             panic!(
@@ -963,20 +984,22 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
     // physical index v - 100).
     let mut dv = KernelDeletionVector::new();
     dv.add_deleted_row_indexes(deleted_indexes.iter().copied());
-    let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
     let write_context = txn.unpartitioned_write_context()?;
     let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
 
     let file_path = read_add_infos(snapshot.as_ref(), engine.as_ref())?[0]
         .path
         .clone();
-    txn.update_deletion_vectors(
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.update_deletion_vectors(
         HashMap::from([(file_path, dv_descriptor)]),
         get_scan_files(snapshot.clone(), engine.as_ref())?
             .into_iter()
             .map(Ok),
     )?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+        .unwrap_committed();
 
     // Every survivor keeps the exact row ID it had before.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;

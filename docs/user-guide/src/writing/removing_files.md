@@ -18,7 +18,7 @@ Removing files follows these steps:
 2. Create a `Transaction` from the snapshot
 3. Build a `Scan` and call `scan_metadata()` to get file-level metadata
 4. Modify the selection vector to mark files for removal
-5. Pass the modified `FilteredEngineData` to `Transaction::remove_files()`
+5. Pass the modified `FilteredEngineData` to `CommitActions::remove_files()`
 6. Commit the transaction
 
 ```text
@@ -30,9 +30,9 @@ Snapshot ──> Scan ──> scan_metadata()
                           │
                     Modify selection vector
                           │
-                    txn.remove_files(modified_scan_files)
+                  actions.remove_files(modified_scan_files)
                           │
-                    txn.commit(engine)
+                  txn.commit(engine, &FileSystemCommitter::new(), actions)
 ```
 
 ## Getting file metadata with scan_metadata()
@@ -104,10 +104,10 @@ let files_to_remove = FilteredEngineData::try_new(data, selection_vector)?;
 ## Calling remove_files()
 
 Once you have a `FilteredEngineData` with the correct selection vector, pass
-it to the transaction:
+it to the commit actions:
 
 ```rust,ignore
-txn.remove_files(files_to_remove);
+actions.remove_files(files_to_remove);
 ```
 
 The signature is:
@@ -117,13 +117,12 @@ pub fn remove_files(&mut self, remove_metadata: FilteredEngineData)
 ```
 
 You can call `remove_files()` multiple times to remove files from different
-`scan_metadata()` batches. Each call appends to the transaction's list of
+`scan_metadata()` batches. Each call appends to the action set's list of
 pending removals.
 
 > [!NOTE]
-> `remove_files()` is available on transaction states that produce data files (gated by
-> the `SupportsDataFiles` trait bound). Metadata-only transaction states cannot register
-> file removals.
+> `remove_files()` is available on `CommitActions<ExistingTable>`. Create-table and metadata-only
+> transaction states cannot register file removals.
 
 ## Full example
 
@@ -138,7 +137,7 @@ This example removes the first file from a filesystem-backed table:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::engine_data::FilteredEngineData;
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitActions, CommitResult, Operation};
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -148,13 +147,15 @@ This example removes the first file from a filesystem-backed table:
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
-let mut txn = snapshot
+let txn = snapshot
     .clone()
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("DELETE".to_string());
+    .transaction_builder()
+    .with_operation(Operation::Delete)
+    .build(&engine)?;
 
 // 3. Build a scan and get file metadata
 let scan = snapshot.scan_builder().build()?;
+let mut actions = CommitActions::new();
 
 for metadata in scan.scan_metadata(&engine)? {
     let metadata = metadata?;
@@ -173,11 +174,11 @@ for metadata in scan.scan_metadata(&engine)? {
     let files_to_remove = FilteredEngineData::try_new(data, selection_vector)?;
 
     // 5. Register the files for removal
-    txn.remove_files(files_to_remove);
+    actions.remove_files(files_to_remove);
 }
 
 // 6. Commit the transaction
-match txn.commit(&engine)? {
+match txn.commit(&engine, &FileSystemCommitter::new(), actions)? {
     CommitResult::CommittedTransaction(committed) => {
         println!("Committed version {}", committed.commit_version());
     }

@@ -26,13 +26,13 @@ use crate::{DeltaResult, Error};
 ///   everything (transform, write, partition metadata).
 /// - **Arrow-based custom engines**: write parquet yourself, then call `build_add_file_metadata`
 ///   with the resulting `DataFileMetadata` and this `BoundWriteContext` to produce the Add action
-///   `EngineData` for [`Transaction::add_files`].
+///   `EngineData` for [`CommitActions::add_files`].
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
 /// [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
 /// [`Transaction::unpartitioned_write_context`]: super::Transaction::unpartitioned_write_context
-/// [`Transaction::add_files`]: super::Transaction::add_files
+/// [`CommitActions::add_files`]: super::CommitActions::add_files
 /// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
 #[derive(Debug)]
 pub struct BoundWriteContext {

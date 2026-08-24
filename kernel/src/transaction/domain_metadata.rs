@@ -59,7 +59,7 @@ impl<S> Transaction<S> {
             }
         }
 
-        // Validate USER domain additions (via with_domain_metadata API)
+        // Validate user domain additions configured through TransactionOptions.
         for dm in &self.user_domain_metadata_additions {
             let domain = dm.domain();
 
@@ -79,7 +79,7 @@ impl<S> Transaction<S> {
         }
 
         // No removals allowed for create-table.
-        // Note: CreateTableTransaction does not expose with_domain_metadata_removed(),
+        // Note: CreateTableTransactionBuilder does not expose with_domain_metadata_removed(),
         // so this is a defensive check. See #1768.
         if is_create && !self.user_domain_removals.is_empty() {
             return Err(Error::unsupported(

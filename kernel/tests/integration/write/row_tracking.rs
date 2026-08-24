@@ -47,8 +47,12 @@ async fn test_row_tracking_remove_gate(
     // v0: create table with the requested initial properties.
     kernel_create_table(table_path.as_str(), schema.clone(), "Test/1.0")
         .with_table_properties(create_properties.iter().copied())
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     // Optional v1: inject a metadata-only commit that sets `delta.rowTrackingSuspended=true`.
@@ -83,14 +87,16 @@ async fn test_row_tracking_remove_gate(
         .next()
         .unwrap()?
         .scan_files;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_data_change(true);
-    txn.remove_files(scan_files);
+    let txn = snapshot
+        .transaction_builder()
+        .with_data_change(true)
+        .build(engine.as_ref())?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.remove_files(scan_files);
 
     if expect_err {
         let err = txn
-            .commit(engine.as_ref())
+            .commit(engine.as_ref(), &FileSystemCommitter::new(), actions)
             .expect_err("commit must fail when rowTracking is supported and not suspended");
         let msg = err.to_string();
         assert!(
@@ -98,7 +104,8 @@ async fn test_row_tracking_remove_gate(
             "expected remove-block error mentioning rowTracking, got: {msg}",
         );
     } else {
-        txn.commit(engine.as_ref())?.unwrap_committed();
+        txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+            .unwrap_committed();
     }
     Ok(())
 }

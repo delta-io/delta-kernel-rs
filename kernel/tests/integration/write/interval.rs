@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::schema::{schema_ref, DataType};
-use test_utils::load_and_begin_transaction;
+use delta_kernel::Snapshot;
 
 mod supported {
     use std::collections::HashMap;
@@ -18,6 +18,7 @@ mod supported {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::transaction::create_table::create_table as create_table_transaction;
+    use delta_kernel::transaction::TransactionOptions;
     use rstest::rstest;
     use test_utils::{
         get_column, read_actions_from_commit, test_read, test_table_setup, test_table_setup_mt,
@@ -56,13 +57,20 @@ mod supported {
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
         let snapshot = create_table_transaction(&table_path, schema.clone(), "Test/1.0")
             .with_table_properties([("delta.checkpoint.writeStatsAsStruct", "true")])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref())?
+            .commit(
+                engine.as_ref(),
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new(),
+            )?
             .unwrap_post_commit_snapshot();
         let table_url = snapshot.table_root().clone();
 
-        let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-            .with_engine_info("default engine");
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(engine.as_ref())?
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("default engine"))
+            .build(engine.as_ref())?;
         let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
         let arrow_schema = Arc::new(arrow_schema);
         let nested_fields = match arrow_schema.field_with_name("nested").unwrap().data_type() {
@@ -89,8 +97,13 @@ mod supported {
         let add_files_metadata = engine
             .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
             .await?;
-        txn.add_files(add_files_metadata);
-        let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        let snapshot = txn
+            .commit(
+                engine.as_ref(),
+                &FileSystemCommitter::new(),
+                add_files_metadata.into(),
+            )?
+            .unwrap_post_commit_snapshot();
 
         let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
         let add = &add_actions[0];
@@ -205,8 +218,12 @@ mod supported {
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let snapshot = create_table_transaction(&table_path, schema.clone(), "Test/1.0")
             .with_table_properties([(property_name, property_value)])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref())?
+            .commit(
+                engine.as_ref(),
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new(),
+            )?
             .unwrap_post_commit_snapshot();
 
         let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;

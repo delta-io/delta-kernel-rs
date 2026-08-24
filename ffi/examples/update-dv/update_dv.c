@@ -111,6 +111,7 @@ int main(int argc, char* argv[]) {
   HandleSharedSnapshot snapshot = NULL;
   HandleSharedScan scan_handle = NULL;
   HandleSharedScanMetadataIterator scan_iter = NULL;
+  HandleExclusiveCommitResult commit_result = NULL;
   HandleExclusiveCommittedTransaction committed = NULL;
 
   // === Build engine ===
@@ -218,20 +219,35 @@ int main(int argc, char* argv[]) {
   }
 
   // === Commit ===
-  ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn, engine);
+  ExternResultHandleExclusiveCommitResult commit_res = commit(txn, engine);
   txn = NULL; // consumed by commit
-  if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
+  if (commit_res.tag != OkHandleExclusiveCommitResult) {
     err = (Error*)commit_res.err;
     print_error("commit failed.", err);
     goto cleanup;
   }
-  committed = commit_res.ok;
+  commit_result = commit_res.ok;
+  if (commit_result_kind(&commit_result) != Committed) {
+    fprintf(stderr, "Commit did not succeed; result kind: %d\n",
+            commit_result_kind(&commit_result));
+    goto cleanup;
+  }
+  ExternResultHandleExclusiveCommittedTransaction committed_res =
+      commit_result_into_committed(commit_result, engine);
+  commit_result = NULL; // consumed by commit_result_into_committed
+  if (committed_res.tag != OkHandleExclusiveCommittedTransaction) {
+    err = (Error*)committed_res.err;
+    print_error("Failed to extract committed transaction.", err);
+    goto cleanup;
+  }
+  committed = committed_res.ok;
   printf("Committed DV update at version: %" PRIu64 "\n",
          committed_transaction_version(&committed));
   rc = 0;
 
 cleanup:
   if (err) free_error(err);
+  if (commit_result) free_commit_result(commit_result);
   if (committed) free_committed_transaction(committed);
   if (scan_iter) free_scan_metadata_iter(scan_iter);
   if (scan_handle) free_scan(scan_handle);

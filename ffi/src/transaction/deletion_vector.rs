@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::transaction::Transaction;
+use delta_kernel::transaction::CommitActions;
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_ffi_macros::handle_descriptor;
 
-use super::ExclusiveTransaction;
+use super::{ExclusiveTransaction, FfiTransaction};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::scan::SharedScanMetadataIterator;
@@ -233,7 +233,7 @@ fn dv_descriptor_map_insert_impl(
 /// leaves the transaction unchanged.
 ///
 /// This stages data-changing DV updates by default. Call
-/// [`crate::transaction::set_data_change`] first for maintenance operations that should commit
+/// [`crate::transaction::with_data_change`] first for maintenance operations that should commit
 /// with `dataChange = false`.
 ///
 /// # Safety
@@ -259,13 +259,14 @@ pub unsafe extern "C" fn transaction_update_deletion_vectors(
 }
 
 fn transaction_update_deletion_vectors_impl(
-    txn: &mut Transaction,
+    txn: &mut FfiTransaction,
     dv_map: DvDescriptorMap,
     scan_iter: &crate::scan::ScanMetadataIterator,
 ) -> DeltaResult<()> {
     let mut guard = scan_iter.lock_iter()?;
-    let files_iter = Transaction::scan_metadata_to_engine_data(&mut **guard);
-    txn.update_deletion_vectors(dv_map.inner, files_iter)
+    let files_iter = CommitActions::scan_metadata_to_engine_data(&mut **guard);
+    txn.actions
+        .update_deletion_vectors(dv_map.inner, files_iter)
 }
 
 #[cfg(test)]

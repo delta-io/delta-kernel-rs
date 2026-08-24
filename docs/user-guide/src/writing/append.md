@@ -1,8 +1,8 @@
 # Appending Data
 
 To append data to an existing Delta table, you create a `Transaction` from a
-[Snapshot](../concepts/architecture.md#snapshot), write Parquet files through the engine, register them,
-and commit. For a quick end-to-end example that creates a table and writes data, see
+[Snapshot](../concepts/architecture.md#snapshot), write Parquet files through the engine, collect
+their metadata, and commit. For a quick end-to-end example that creates a table and writes data, see
 [Quick Start: Writing a Table](../getting_started/quick_start_write.md).
 
 ## The write flow
@@ -13,8 +13,7 @@ Appending data to a Delta table follows these steps:
 2. Create a `Transaction` from the snapshot
 3. Get the `BoundWriteContext` from the transaction
 4. [Write Parquet files](#writing-parquet-files) using the engine and `BoundWriteContext`
-5. Register the written files with the transaction via `add_files`
-6. Commit the transaction
+5. Pass the written-file metadata to `commit`
 
 The following example assumes you already have an `engine: DefaultEngine`, which provides
 an async `write_parquet` helper. If you use a custom `Engine`, the step 4
@@ -31,7 +30,7 @@ may differ.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, Operation, TransactionOptions};
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -41,11 +40,12 @@ may differ.
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
-let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+let txn = snapshot
+    .transaction_builder()
+    .with_operation(Operation::Write)
+    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
+    .with_data_change(true)
+    .build(&engine)?;
 
 // 3. Get write context
 let write_context = Arc::new(txn.unpartitioned_write_context()?);
@@ -65,11 +65,8 @@ let file_metadata = engine
     .write_parquet(&data, write_context.as_ref())
     .await?;
 
-// 5. Register the files
-txn.add_files(file_metadata);
-
-// 6. Commit
-match txn.commit(&engine)? {
+// 5. Commit with the file metadata
+match txn.commit(&engine, &FileSystemCommitter::new(), file_metadata.into())? {
     CommitResult::CommittedTransaction(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
@@ -81,23 +78,24 @@ match txn.commit(&engine)? {
 
 ## Creating a transaction
 
-A transaction is created from a snapshot. The snapshot pins the table version you are
-writing against:
+A transaction builder is created from a snapshot. The snapshot pins the table version you are
+writing against, and `build()` freezes the configured intent:
 
 ```rust,ignore
-let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+let txn = snapshot
+    .transaction_builder()
+    .with_operation(Operation::Write)
+    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
+    .with_data_change(true)
+    .build(&engine)?;
 ```
 
 The builder methods:
 
 | Method | Purpose |
 |--------|---------|
-| `with_operation(String)` | Operation name stored in the commit log (e.g. `"INSERT"`, `"MERGE"`) |
-| `with_engine_info(impl Into<String>)` | Identifies your application in the commit log |
+| `with_operation(Operation)` | Operation stored in the commit log; custom names are also supported |
+| `with_options(TransactionOptions)` | Options configured through methods such as `TransactionOptions::with_engine_info()` |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
 ## The BoundWriteContext
@@ -112,6 +110,18 @@ let write_context = txn.unpartitioned_write_context()?;
 // For partitioned tables, pass the partition values for this file
 let write_context = txn.partitioned_write_context(partition_values)?;
 ```
+
+This context belongs to the file-production phase. It is not replaced by, or stored in,
+`PreparedCommit`:
+
+```text
+BoundWriteContext -> Parquet file metadata -> CommitActions -> PreparedCommit
+```
+
+After writers return their metadata, the coordinator collects it in `CommitActions`. Calling
+`txn.commit(engine, committer, actions)` pairs those exact actions with the immutable transaction
+as a `PreparedCommit` and attempts the commit. Retryable and conflicted results retain that
+prepared commit; they do not retain the writer contexts.
 
 For partitioned tables, see
 [Writing to Partitioned Tables](./partitioned_writes.md).
@@ -148,8 +158,7 @@ let file_metadata = engine
 - **`write_context`**: From `unpartitioned_write_context()` or `partitioned_write_context()`
 
 `DefaultEngine::write_parquet` handles the logical-to-physical transformation, generates a unique filename,
-writes the file, collects statistics, and returns file metadata that you pass to
-`txn.add_files()`.
+writes the file, collects statistics, and returns file metadata that you pass to `commit()`.
 
 ### Using a custom engine
 
@@ -158,7 +167,7 @@ If you do not use `DefaultEngine`, write the files yourself. The expected flow i
 1. Evaluate `write_context.logical_to_physical()` to transform your logical data into
    physical data.
 2. Write the physical data under `write_context.write_dir()`, then pass the corresponding
-   add-file metadata to `txn.add_files()`.
+   add-file metadata to `commit()`.
 
 ```rust,ignore
 // Assume: data: Box<dyn EngineData> (logical), engine: impl Engine,
@@ -175,23 +184,28 @@ let physical_data = evaluator.evaluate(data.as_ref())?;
 // 2. Write `physical_data` under `write_context.write_dir()` in whatever way your
 // engine writes Parquet, producing `add_file_metadata` for the written file.
 
-txn.add_files(add_file_metadata);
+txn.commit(
+    engine,
+    &FileSystemCommitter::new(),
+    add_file_metadata.into(),
+)?;
 ```
 
-You can call `add_files` multiple times to write multiple files in one transaction.
+To commit multiple metadata batches, collect them in a `CommitActions` value and call
+`CommitActions::add_files` for each batch before committing.
 
 > [!NOTE]
 > Methods that produce or register data files (`unpartitioned_write_context`,
-> `partitioned_write_context`, `add_files`, `stats_schema`) are gated by the
+> `partitioned_write_context`, `CommitActions::add_files`, `stats_schema`) are gated by the
 > `SupportsDataFiles` trait bound and are available on standard write transactions but not
 > on metadata-only transaction states (such as a future `AlterTable`).
 
 ## Committing
 
-`commit()` consumes the transaction and returns a `CommitResult`:
+`commit()` consumes the transaction and the supplied actions, then returns a `CommitResult`:
 
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.commit(&engine, &FileSystemCommitter::new(), actions)? {
     CommitResult::CommittedTransaction(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
@@ -210,19 +224,20 @@ match txn.commit(&engine)? {
 ## Blind appends
 
 A **blind append** is a write that adds new files without reading or depending on existing
-table state. To mark a transaction as a blind append, call `with_blind_append()` during
-construction:
+table state. To mark a transaction as a blind append, call `with_blind_append()` on its builder:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_blind_append();
+    .transaction_builder()
+    .with_operation(Operation::Write)
+    .with_blind_append()
+    .build(&engine)?;
 ```
 
-Kernel records `isBlindAppend: true` in the commit's `commitInfo` action. This flag
-enables conflict resolution optimizations: two blind appends to the same table can never
-conflict with each other, because neither depends on the other's output.
+Kernel records `isBlindAppend: true` in the commit's `commitInfo` action to describe the append's
+logical independence from existing data. The current API does not automatically rebase concurrent
+blind appends, so a commit-version race can still return `ConflictedTransaction`. The connector
+must resolve that conflict.
 
 Kernel validates the following rules at commit time. If any rule is violated, `commit()`
 returns an error:
@@ -237,19 +252,22 @@ returns an error:
 
 > [!TIP]
 > Mark your transaction as a blind append whenever you are inserting new data without reading
-> the table first. This gives the committer the information it needs to resolve conflicts
-> safely in multi-writer scenarios.
+> the table first. This records the independence needed for safe conflict handling.
 
 ## Custom commit info
 
-Kernel always writes a `commitInfo` action for every commit. To include your own fields in
-that action, call `with_commit_info()` with your custom data and its schema:
+Kernel always writes a `commitInfo` action for every commit. To include your own fields in that
+action, call `TransactionOptions::with_commit_info()` and pass the options to the transaction
+builder:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_commit_info(engine_commit_info, commit_info_schema);
+    .transaction_builder()
+    .with_operation(Operation::Write)
+    .with_options(
+        TransactionOptions::new().with_commit_info(engine_commit_info, commit_info_schema),
+    )
+    .build(&engine)?;
 ```
 
 The `engine_commit_info` argument is a `Box<dyn EngineData>` containing the fields you want
@@ -267,7 +285,7 @@ these fields in your custom commit info:
 | `operationParameters` | Operation parameters (if any) |
 | `kernelVersion` | The Kernel library version |
 | `isBlindAppend` | `true` if `with_blind_append()` was called, omitted otherwise |
-| `engineInfo` | The value from `with_engine_info()` |
+| `engineInfo` | The value from `TransactionOptions::with_engine_info()` |
 | `txnId` | A unique transaction identifier |
 
 Any field in your custom data that shares a name with a Kernel-reserved field is replaced
@@ -280,7 +298,7 @@ A successful commit returns a `CommittedTransaction` with access to a post-commi
 snapshot and post-commit statistics:
 
 ```rust,ignore
-let committed = match txn.commit(&engine)? {
+let committed = match txn.commit(&engine, &FileSystemCommitter::new(), actions)? {
     CommitResult::CommittedTransaction(c) => c,
     _ => panic!("unexpected result"),
 };

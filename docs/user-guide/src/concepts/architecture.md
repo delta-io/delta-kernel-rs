@@ -153,17 +153,32 @@ The advanced path is how you build a distributed connector. See
 
 A `Transaction` writes data to a table. It is built from a snapshot:
 
+```text
+Transaction
+  -> WriteState / BoundWriteContext
+  -> Parquet files and file metadata
+  -> CommitActions
+  -> PreparedCommit
+  -> commit attempt
+```
+
+`BoundWriteContext` is the writer-facing plan: it provides the schemas, partition values, and
+write location needed to produce each Parquet file. The writer returns file metadata, which the
+coordinator collects in `CommitActions`. Kernel pairs those actions with the immutable transaction
+as a `PreparedCommit`; that is the state retained for retry or conflict handling. The
+`BoundWriteContext` itself is not stored in the prepared commit.
+
 ```rust,ignore
-let mut txn = snapshot                              // Arc<Snapshot>
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_data_change(true);
+use delta_kernel::transaction::Operation;
 
-// Write Parquet files, then register their metadata.
-txn.add_files(file_metadata);
+let txn = snapshot                                  // Arc<Snapshot>
+    .transaction_builder()
+    .with_operation(Operation::Write)
+    .with_data_change(true)
+    .build(&engine)?;
 
-// Commit atomically
-match txn.commit(&engine)? {
+// Commit atomically with the metadata produced by the Parquet writer.
+match txn.commit(&engine, &FileSystemCommitter::new(), file_metadata.into())? {
     CommitResult::CommittedTransaction(c) => println!("v{}", c.commit_version()),
     CommitResult::ConflictedTransaction(_) => { /* handle conflict */ }
     CommitResult::RetryableTransaction(_) => { /* retry */ }
@@ -176,7 +191,7 @@ The `file_metadata` argument is an `EngineData` batch that matches
 build that batch from Parquet write results.
 
 > [!NOTE]
-> `with_operation` applies to update transactions (append, delete, etc.). For
+> `with_operation` applies to update transaction builders (append, delete, etc.). For
 > create-table transactions the operation is fixed to `"CREATE TABLE"` and
 > cannot be overridden.
 
@@ -223,8 +238,7 @@ the kernel never touches raw bytes. It works purely with metadata and delegates 
 
 2. WRITE DATA (engine / your code)
    Write Parquet files using the engine. Collect file metadata
-   (path, size, statistics) and register it with the transaction
-   via add_files().
+   (path, size, statistics) in CommitActions via add_files().
 
 3. COMMIT (kernel + committer)
    The kernel assembles the commit actions (CommitInfo, Add files,
