@@ -20,7 +20,7 @@ use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
-use crate::table_changes::{ensure_partition_columns_compatible, CdfMode};
+use crate::table_changes::{CdfMode, TableChangesReadConfiguration};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
@@ -42,84 +42,21 @@ pub(crate) struct TableChangesScanMetadata {
     pub(crate) remove_dvs: Arc<HashMap<String, DvInfo>>,
 }
 
-/// Given an iterator of [`ParsedLogPath`] returns an iterator of [`TableChangesScanMetadata`].
-/// Each row that is selected in the returned `TableChangesScanMetadata.scan_metadata` (according
-/// to the `selection_vector` field) _must_ be processed to complete the scan. Non-selected
-/// rows _must_ be ignored.
+/// Replays change-feed actions and validates each configuration against the range end.
 ///
-/// Note: The [`ParsedLogPath`]s in the `commit_files` iterator must be ordered, contiguous
-/// (JSON) commit files.
-#[cfg(test)]
+/// `commit_files` must contain ordered, contiguous JSON commits. Validation errors may be returned
+/// lazily by the resulting iterator. Each row selected by a returned
+/// [`TableChangesScanMetadata::selection_vector`] must be processed; non-selected rows must be
+/// ignored.
+///
+/// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
+/// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from the
+/// row lineage in `add` and `remove` actions.
 pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
+    read_configuration: &TableChangesReadConfiguration,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
-    table_schema: SchemaRef,
-    physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    table_changes_action_iter_with_read_configuration(
-        engine,
-        start_table_configuration,
-        start_table_configuration,
-        commit_files,
-        table_schema,
-        physical_predicate,
-    )
-}
-
-/// Replays change-data-file actions using the supplied range-end table configuration.
-pub(crate) fn table_changes_action_iter_with_read_configuration(
-    engine: Arc<dyn Engine>,
-    start_table_configuration: &TableConfiguration,
-    read_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
-    table_schema: SchemaRef,
-    physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    // The data-reading (`execute`) path always uses change-data-file semantics.
-    table_changes_action_iter_with_mode_and_read_configuration(
-        engine,
-        start_table_configuration,
-        read_table_configuration,
-        commit_files,
-        table_schema,
-        physical_predicate,
-        CdfMode::ChangeDataFeed,
-    )
-}
-
-/// Replays change-feed actions according to `mode`.
-///
-/// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
-/// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from
-/// row lineage in the data files referenced by `add` and `remove` actions.
-#[cfg(test)]
-pub(crate) fn table_changes_action_iter_with_mode(
-    engine: Arc<dyn Engine>,
-    start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
-    table_schema: SchemaRef,
-    physical_predicate: Option<(PredicateRef, SchemaRef)>,
-    mode: CdfMode,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    table_changes_action_iter_with_mode_and_read_configuration(
-        engine,
-        start_table_configuration,
-        start_table_configuration,
-        commit_files,
-        table_schema,
-        physical_predicate,
-        mode,
-    )
-}
-
-/// Replays change-feed actions using the supplied range-end table configuration.
-pub(crate) fn table_changes_action_iter_with_mode_and_read_configuration(
-    engine: Arc<dyn Engine>,
-    start_table_configuration: &TableConfiguration,
-    read_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
-    table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
@@ -137,7 +74,8 @@ pub(crate) fn table_changes_action_iter_with_mode_and_read_configuration(
         })
         .map(Arc::new);
 
-    let read_table_configuration = read_table_configuration.clone();
+    let table_schema = read_configuration.schema().clone();
+    let read_configuration = read_configuration.clone();
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
@@ -147,7 +85,7 @@ pub(crate) fn table_changes_action_iter_with_mode_and_read_configuration(
                 &mut current_configuration,
                 commit_file,
                 &table_schema,
-                &read_table_configuration,
+                &read_configuration,
                 mode,
             )?;
             scanner.into_scan_batches(engine.clone(), filter.clone())
@@ -178,9 +116,6 @@ pub(crate) fn table_changes_action_iter_with_mode_and_read_configuration(
 ///       nullability, but rejects datatype changes.
 ///     - When column mapping is enabled, ensure that ordered partition columns remain unchanged.
 ///     - Read the in-commit timestamp from `CommitInfo` when that feature is enabled.
-///
-/// Note: We check the protocol, mode-specific table feature, schema compatibility, and partition
-/// columns in phase 1 in order to detect errors and fail early.
 ///
 /// Note: The reader feature [`ReaderFeatures::DeletionVectors`] controls whether the table is
 /// allowed to contain deletion vectors. [`TableProperties`].enable_deletion_vectors only
@@ -227,7 +162,7 @@ impl LogReplayScanner {
         table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
-        read_table_configuration: &TableConfiguration,
+        read_configuration: &TableChangesReadConfiguration,
         mode: CdfMode,
     ) -> DeltaResult<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
@@ -318,9 +253,8 @@ impl LogReplayScanner {
                         commit_file.version
                     )
                 );
-                ensure_partition_columns_compatible(
+                read_configuration.ensure_partition_columns_compatible(
                     table_configuration,
-                    read_table_configuration,
                     commit_file.version,
                 )?;
                 require!(
