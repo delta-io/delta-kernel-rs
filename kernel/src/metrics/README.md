@@ -19,17 +19,19 @@ span-based events reuse small per-field helpers like `MetricId::from_attrs`, eac
 
 ## Failure events
 
-Success and failure are two variants of one event. Emit the success span, then fire `error` on it
-(`#[instrument(err)]` does this on `Err`; an emit helper calls `tracing::info!(error = ...)`). The
-layer sees `error` and flips the event via `MetricEvent::into_failure`.
+Lifecycle metrics have paired success and failure variants. Emit the success span, then fire
+`error` on it (`#[instrument(err)]` does this on `Err`; an emit helper calls
+`tracing::info!(error = ...)`). The layer sees `error` and flips the event via
+`MetricEvent::into_failure`. A lifecycle operation that returns a recoverable result can instead
+record `failure_reason` to select its failure variant.
 
 ## Adding an event
 
-1. Define the struct + `SPAN_NAME` in `events.rs`; add a `MetricEvent` variant and its
-   `into_failure` arm.
-2. For emit, add an `emit_*` helper and a `from_attrs`; register the span name in `on_new_span`
-   (`reporter.rs`).
-3. Make each label a strum enum (`serialize_all = "snake_case"`).
+1. Define the event struct, `SPAN_NAME`, and `from_attrs`, then add its `MetricEvent` variant(s).
+2. Register the span in `on_new_span`.
+3. For an emit-based event, add an `emit_*` helper.
+4. For a lifecycle event, add paired success/failure variants and an `into_failure` mapping.
+5. Make each label a strum enum (`serialize_all = "snake_case"`).
 
 The FFI mirror (`ffi/src/ffi_metrics.rs`) and connectors destructure these structs, so adding a
 field or variant is a breaking change.

@@ -178,10 +178,12 @@ Join the two events by `operation_id` to obtain whole-scan metrics.
 
 ### Storage and file I/O events
 
-These events track low-level I/O operations. The default storage, JSON, and
-Parquet handlers emit them automatically when the metrics layer is installed.
-Unlike snapshot events, these don't carry an `operation_id` because a single
-storage call may serve multiple higher-level operations.
+These events track file I/O at two levels. The default storage, JSON, and
+Parquet handlers emit their handler events automatically when the metrics layer
+is installed. Kernel itself emits the higher-level CRC and `_last_checkpoint`
+events. Unlike snapshot events, none of these events carries an `operation_id`:
+they are process-level measurements, and one handler call may serve multiple
+higher-level operations.
 
 | Event | Fields | What it measures |
 |-------|--------|------------------|
@@ -192,6 +194,13 @@ storage call may serve multiple higher-level operations.
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
 | `CrcReadFailure` | none | A CRC file read or parse failed. The caller falls back to log replay. |
+| `LastCheckpointReadSuccess` | `duration` | One `_last_checkpoint` hint was read and parsed successfully. |
+| `LastCheckpointReadFailure` | `reason`, `duration` | One `_last_checkpoint` read did not produce a usable hint. |
+
+For counters and latency histograms, use `success` as the outcome for
+`LastCheckpointReadSuccess`. For `LastCheckpointReadFailure`, use `reason.as_ref()`: `not_found`
+for an absent hint, `invalid` for an empty or malformed hint, or `error` for an unexpected storage
+or URL error. `unknown` means the recorded failure reason was empty or unrecognized.
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call

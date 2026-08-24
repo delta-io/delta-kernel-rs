@@ -11,9 +11,9 @@ use tracing_subscriber::Layer;
 
 use super::events::{
     storage_metric_from_attrs, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
-    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
-    ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
-    TransactionCommitSuccess, STORAGE_SPAN,
+    LastCheckpointReadSuccess, LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted,
+    ProtocolMetadataLoadSuccess, ScanMetadataCompleted, SetTransactionLoadSuccess,
+    SnapshotBuildSuccess, TransactionCommitSuccess, STORAGE_SPAN,
 };
 
 // ====================================================================
@@ -128,6 +128,9 @@ where
             )),
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
+            )),
+            LastCheckpointReadSuccess::SPAN_NAME => Some(MetricEvent::LastCheckpointReadSuccess(
+                LastCheckpointReadSuccess::from_attrs(attrs),
             )),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
@@ -258,6 +261,9 @@ impl Visit for EventVisitor {
         let Some(event) = self.event.as_mut() else {
             return;
         };
+        if let Some(warning) = event.record_str_warning(field.name(), value) {
+            self.pending_warnings.push(warning);
+        }
         if let Err(span_name) = event.record_str(field.name(), value) {
             self.warn_invalid(field, span_name);
         }
@@ -298,6 +304,7 @@ mod tests {
     use std::io::Error;
     use std::sync::{Arc, Mutex};
 
+    use rstest::rstest;
     use test_utils::{ensure_metrics_compatible_global_subscriber, LogWriter};
     use tracing::field::Empty;
     use tracing::subscriber::with_default;
@@ -308,7 +315,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
+    use crate::metrics::{
+        LastCheckpointReadFailureReason, MetricEvent, WithMetricsReporterLayer as _,
+    };
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     /// Run `f` under a subscriber that layers the metrics layer over an fmt layer capturing to a
@@ -365,6 +374,32 @@ mod tests {
             logs.contains("Invalid field 'bogus' recorded on snap.build span"),
             "an unrecognized .record() field is a declared-field typo and must still warn; got: {logs}"
         );
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::unrecognized("not_a_reason")]
+    fn last_checkpoint_invalid_failure_reason_decodes_as_unknown(#[case] reason: &str) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!(
+                "last_checkpoint.read",
+                report = Empty,
+                failure_reason = Empty,
+            );
+            span.record("failure_reason", reason);
+        }
+
+        let reasons: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::LastCheckpointReadFailure(event) => Some(event.reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, [LastCheckpointReadFailureReason::Unknown]);
     }
 
     // A log line whose field name collides with a real metric field must NOT overwrite the value a
