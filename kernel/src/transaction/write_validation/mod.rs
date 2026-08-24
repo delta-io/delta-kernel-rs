@@ -25,6 +25,13 @@ pub(super) struct FileActionTracker {
 }
 
 impl FileActionTracker {
+    pub(super) fn with_capacity(add_capacity: usize, remove_capacity: usize) -> Self {
+        Self {
+            add_paths: HashMap::with_capacity(add_capacity),
+            remove_paths: HashMap::with_capacity(remove_capacity),
+        }
+    }
+
     fn record_add(&mut self, path: &str, dv_id: Option<String>) -> DeltaResult<()> {
         let Entry::Vacant(entry) = self.add_paths.entry(path.to_owned()) else {
             return Err(Error::generic(format!(
