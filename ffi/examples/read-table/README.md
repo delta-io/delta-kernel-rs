@@ -34,6 +34,9 @@ $ make
 $ ./read_table [path/to/table]
 ```
 
+Pass `-d` to also print the table's column defaults (the `allowColumnDefaults` writer feature)
+after the schema -- see `column_defaults.h`.
+
 ## Windows
 
 For windows, assuming you already have a working cmake + c toolchain:
