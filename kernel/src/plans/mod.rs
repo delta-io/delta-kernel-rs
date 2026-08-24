@@ -39,6 +39,26 @@
 //! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
 //! `SyncPlanExecutor` is a complete reference implementation.
 //!
+//! # Consuming terminal results
+//!
+//! [`PlanExecutor::execute_op`] and [`PlanResult::Data`] provide the generic result contract for
+//! operations whose output is consumed by kernel.
+//!
+//! Some kernel APIs instead return a [`Plan`](ir::plan::Plan) whose terminal rows belong to the
+//! connector. The connector may execute the plan through its ordinary query engine and keep the
+//! result in the engine's native representation instead of adapting it through [`EngineData`] only
+//! to pass it back to itself. [`Scan::declarative_metadata_scan_plan`] is one example: the
+//! connector may consume the live `add` rows from the returned plan itself.
+//!
+//! Connectors should use this native path when they own the result and adapting it through
+//! [`EngineData`] adds no semantic value. The native path must preserve the plan's relational
+//! semantics and declared output schema. Schema validation, streaming behavior, error propagation,
+//! and cancellation must work the same way as they do on the generic path.
+//!
+//! The generic [`PlanExecutor`] path remains required for operations whose results kernel consumes.
+//!
+//! [`Scan::declarative_metadata_scan_plan`]: crate::scan::Scan::declarative_metadata_scan_plan
+//!
 //! # Where to look
 //!
 //! - [`PlanBuilder`] builds plans through a fluent, schema-validating API, each method documenting

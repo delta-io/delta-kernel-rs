@@ -1066,6 +1066,12 @@ impl Scan {
     /// `engine` supplies the plan executor used to inspect checkpoint shape. Returns `None` when
     /// no Delta metadata matches this scan.
     ///
+    /// This method returns the metadata plan without executing it. A connector that consumes the
+    /// resulting live `add` rows may run the plan through the generic
+    /// [`PlanExecutor`](crate::plans::PlanExecutor) interface or its native query engine. The
+    /// native path can keep the engine's batch representation instead of adapting it through
+    /// [`EngineData`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
