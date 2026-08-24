@@ -775,38 +775,6 @@ mod tests {
         ));
     }
 
-    #[rstest]
-    #[case::replace(
-        ProjectionStructPatchBuilder::new(&test_schema())
-            .replace_expr("a", KernelExpr::literal(7i64))
-            .build()
-            .unwrap(),
-        vec!["a", "b"]
-    )]
-    #[case::drop(
-        ProjectionStructPatchBuilder::new(&test_schema()).drop("a").build().unwrap(),
-        vec!["b"]
-    )]
-    #[case::inject(
-        ProjectionStructPatchBuilder::new(&test_schema())
-            .append(
-                StructField::nullable("injected", DataType::LONG),
-                KernelExpr::literal(7i64),
-            )
-            .build()
-            .unwrap(),
-        vec!["a", "b", "injected"]
-    )]
-    fn project_lowers_struct_patch(
-        #[case] project: (SchemaRef, ExpressionRef),
-        #[case] expected_names: Vec<&str>,
-    ) {
-        let input = input_with_schema(test_schema());
-        let (output, expr) = project;
-        let lowered = lower_project_expr(expr, output, &input).unwrap();
-        assert_eq!(output_names(&lowered), expected_names);
-    }
-
     #[test]
     fn project_schema_and_predicate_are_available_to_a_downstream_filter() {
         let parent = input_with_schema(test_schema());
@@ -1126,6 +1094,54 @@ mod tests {
             "|    |   |",
             "|    |   |",
             "+----+---+",
+        ]
+    )]
+    #[case::struct_patch_replace(
+        ProjectionStructPatchBuilder::new(&project_input_schema())
+            .replace_expr("a", kernel_lit(7i64))
+            .build()
+            .unwrap(),
+        &[
+            "+---+---+-------+-------+------------+",
+            "| a | b | flag  | small | nested     |",
+            "+---+---+-------+-------+------------+",
+            "| 7 | 2 | true  | 1     | {value: 7} |",
+            "| 7 |   | false | 2     | {value: 8} |",
+            "| 7 | 4 |       | 3     |            |",
+            "+---+---+-------+-------+------------+",
+        ]
+    )]
+    #[case::struct_patch_drop(
+        ProjectionStructPatchBuilder::new(&project_input_schema())
+            .drop("a")
+            .build()
+            .unwrap(),
+        &[
+            "+---+-------+-------+------------+",
+            "| b | flag  | small | nested     |",
+            "+---+-------+-------+------------+",
+            "| 2 | true  | 1     | {value: 7} |",
+            "|   | false | 2     | {value: 8} |",
+            "| 4 |       | 3     |            |",
+            "+---+-------+-------+------------+",
+        ]
+    )]
+    #[case::struct_patch_inject(
+        ProjectionStructPatchBuilder::new(&project_input_schema())
+            .append(
+                StructField::nullable("injected", DataType::LONG),
+                kernel_lit(7i64),
+            )
+            .build()
+            .unwrap(),
+        &[
+            "+----+---+-------+-------+------------+----------+",
+            "| a  | b | flag  | small | nested     | injected |",
+            "+----+---+-------+-------+------------+----------+",
+            "| 10 | 2 | true  | 1     | {value: 7} | 7        |",
+            "| 20 |   | false | 2     | {value: 8} | 7        |",
+            "|    | 4 |       | 3     |            | 7        |",
+            "+----+---+-------+-------+------------+----------+",
         ]
     )]
     #[case::struct_patch(
