@@ -6,9 +6,7 @@ use itertools::Itertools;
 use rstest::rstest;
 use test_utils::LoggingTest;
 
-use super::{
-    table_changes_action_iter, table_changes_action_iter_with_mode, TableChangesScanMetadata,
-};
+use super::TableChangesScanMetadata;
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{col, lit, BinaryPredicateOp};
@@ -19,9 +17,10 @@ use crate::scan::PhysicalPredicate;
 use crate::schema::{schema, schema_ref, DataType, SchemaRef, StructField};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_changes::test_utils::{
-    row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
+    replay_unmapped_unpartitioned_table_changes, row_tracking_metadata, row_tracking_table_config,
+    test_deletion_vector,
 };
-use crate::table_changes::CdfMode;
+use crate::table_changes::{CdfMode, TableChangesReadConfiguration};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::{
@@ -51,6 +50,23 @@ fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
         .build()
 }
 
+fn table_changes_action_iter(
+    engine: Arc<dyn Engine>,
+    start_table_configuration: &TableConfiguration,
+    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    table_schema: SchemaRef,
+    physical_predicate: Option<(crate::PredicateRef, SchemaRef)>,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    replay_unmapped_unpartitioned_table_changes(
+        engine,
+        start_table_configuration,
+        commit_files,
+        table_schema,
+        physical_predicate,
+        CdfMode::ChangeDataFeed,
+    )
+}
+
 /// Helper to create a Metadata action with the given schema and configuration
 fn metadata_action(schema: SchemaRef, configuration: HashMap<String, String>) -> Action {
     Action::Metadata(
@@ -72,7 +88,7 @@ fn execute_row_tracking(
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)?.into_iter();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = row_tracking_table_config(table_root_url, get_schema());
-    table_changes_action_iter_with_mode(
+    replay_unmapped_unpartitioned_table_changes(
         engine,
         &table_config,
         commits,
@@ -298,40 +314,38 @@ async fn column_mapping_should_succeed() {
         (cm_field("id", DataType::INTEGER, 1)),
         (cm_field("value", DataType::STRING, 2)),
     };
+    let protocol = Protocol::try_new_modern(
+        [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
+        [
+            TableFeature::DeletionVectors,
+            TableFeature::ColumnMapping,
+            TableFeature::ChangeDataFeed,
+        ],
+    )
+    .unwrap();
+    let metadata = Metadata::try_new(
+        None,
+        None,
+        cm_schema,
+        vec![],
+        0,
+        HashMap::from([
+            (
+                "delta.enableDeletionVectors".to_string(),
+                "true".to_string(),
+            ),
+            ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+            ("delta.columnMapping.mode".to_string(), "id".to_string()),
+        ]),
+    )
+    .unwrap();
 
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     mock_table
         .commit([
-            Action::Protocol(
-                Protocol::try_new_modern(
-                    [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
-                    [
-                        TableFeature::DeletionVectors,
-                        TableFeature::ColumnMapping,
-                        TableFeature::ChangeDataFeed,
-                    ],
-                )
-                .unwrap(),
-            ),
-            Action::Metadata(
-                Metadata::try_new(
-                    None,
-                    None,
-                    cm_schema.clone(),
-                    vec![],
-                    0,
-                    HashMap::from([
-                        (
-                            "delta.enableDeletionVectors".to_string(),
-                            "true".to_string(),
-                        ),
-                        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                        ("delta.columnMapping.mode".to_string(), "id".to_string()),
-                    ]),
-                )
-                .unwrap(),
-            ),
+            Action::Protocol(protocol.clone()),
+            Action::Metadata(metadata.clone()),
         ])
         .await;
 
@@ -341,10 +355,19 @@ async fn column_mapping_should_succeed() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, &table_config, commits, cm_schema, None)
-            .unwrap()
-            .try_collect();
+    let read_table_config =
+        TableConfiguration::try_new(metadata, protocol, table_root_url, 0).unwrap();
+    let read_configuration = TableChangesReadConfiguration::new(&read_table_config);
+    let res: DeltaResult<Vec<_>> = super::table_changes_action_iter(
+        engine,
+        &table_config,
+        &read_configuration,
+        commits,
+        None,
+        CdfMode::ChangeDataFeed,
+    )
+    .unwrap()
+    .try_collect();
 
     // Column mapping with CDF should now succeed
     assert!(res.is_ok(), "CDF should now support column mapping");
@@ -1203,13 +1226,13 @@ async fn file_meta_timestamp() {
     let file_meta_ts = commit.location.last_modified;
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let read_table_config = table_config.clone();
+    let read_configuration = TableChangesReadConfiguration::new(&table_config);
     let scanner = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
         commit,
         &get_schema(),
-        &read_table_config,
+        &read_configuration,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1493,13 +1516,13 @@ async fn test_timestamp_with_ict_enabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let read_table_config = table_config.clone();
+    let read_configuration = TableChangesReadConfiguration::new(&table_config);
     let scanner = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
         commit,
         &get_schema(),
-        &read_table_config,
+        &read_configuration,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1546,13 +1569,13 @@ async fn test_timestamp_with_ict_disabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let read_table_config = table_config.clone();
+    let read_configuration = TableChangesReadConfiguration::new(&table_config);
     let scanner = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
         commit.clone(),
         &get_schema(),
-        &read_table_config,
+        &read_configuration,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1606,13 +1629,13 @@ async fn test_timestamp_with_commit_info_not_first() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let read_table_config = table_config.clone();
+    let read_configuration = TableChangesReadConfiguration::new(&table_config);
     let result = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
         commit,
         &get_schema(),
-        &read_table_config,
+        &read_configuration,
         CdfMode::ChangeDataFeed,
     );
 

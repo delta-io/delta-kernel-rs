@@ -5,9 +5,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use url::Url;
 
-use super::log_replay::{
-    table_changes_action_iter_with_read_configuration, TableChangesScanMetadata,
-};
+use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
@@ -168,14 +166,13 @@ impl TableChangesScan {
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
             PhysicalPredicate::None => None,
         };
-        let schema = self.table_changes.end_snapshot.schema();
-        let it = table_changes_action_iter_with_read_configuration(
+        let it = table_changes_action_iter(
             engine,
             &self.table_changes.start_table_config,
-            self.table_changes.end_snapshot.table_configuration(),
+            &self.table_changes.read_configuration,
             commits,
-            schema,
             physical_predicate,
+            CdfMode::ChangeDataFeed,
         )?;
         Ok(Some(it).into_iter().flatten())
     }
