@@ -135,7 +135,7 @@ fn action_presence_witness(action_name: &str) -> Option<ColumnName> {
 /// Each requested action contributes an `IS NOT NULL` presence witness, and the witnesses are
 /// joined with `OR`. Returns `None` if the schema is empty, or if any field lacks a reliable
 /// witness (an action that could occupy a row group the resulting predicate would otherwise skip).
-fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<PredicateRef> {
+pub(crate) fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<PredicateRef> {
     let columns: Vec<ColumnName> = schema
         .fields()
         .map(|field| action_presence_witness(field.name()))
