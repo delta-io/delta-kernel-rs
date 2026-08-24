@@ -144,6 +144,32 @@ fn get_field_id(field: &StructField) -> Option<i32> {
     }
 }
 
+/// Which Delta JSON stat categories a leaf appears in. Gates which sub-fields
+/// [`build_stats_struct`] emits under the filter (see there).
+#[derive(Clone, Copy)]
+struct StatCategories {
+    /// Present in `nullCount` -- backs `value_count`/`null_value_count`.
+    null_count: bool,
+    /// Present in `minValues` -- backs `lower_bound`.
+    min_values: bool,
+    /// Present in `maxValues` -- backs `upper_bound`.
+    max_values: bool,
+}
+
+impl StatCategories {
+    /// All three categories present: the unfiltered gate, keeping every type-eligible sub-field.
+    const ALL: StatCategories = StatCategories {
+        null_count: true,
+        min_values: true,
+        max_values: true,
+    };
+
+    /// Whether the leaf appears in at least one category (i.e. survives the filter).
+    fn any(&self) -> bool {
+        self.null_count || self.min_values || self.max_values
+    }
+}
+
 /// Builds a single column's stats struct, with each stat sub-field's ID an offset from
 /// `base_field_id`:
 /// - offset 1/2: `lower_bound` / `upper_bound` (typed as `bounds_type`)
@@ -156,16 +182,16 @@ fn get_field_id(field: &StructField) -> Option<i32> {
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
 ///
-/// `categories` gates the sub-fields against the Delta stat categories the leaf appears in, as
-/// `[has_nullCount, has_minValues, has_maxValues]`. `None` (the unfiltered path) keeps every
-/// type-eligible sub-field. When `Some`, a sub-field is kept only when a category that backs it is
-/// present: `lower_bound`<-`minValues`, `upper_bound`<-`maxValues`,
-/// `value_count`/`null_value_count`<-`nullCount`, `tight_bounds`/`nan_value_count`<-either bound
-/// category. `avg_value_size_in_bytes` has no backing category and is dropped whenever filtering.
+/// `categories` gates the sub-fields against the Delta stat categories the leaf appears in. `None`
+/// (the unfiltered path) keeps every type-eligible sub-field. When `Some`, a sub-field is kept only
+/// when a category that backs it is present: `lower_bound`<-`minValues`,
+/// `upper_bound`<-`maxValues`, `value_count`/`null_value_count`<-`nullCount`,
+/// `tight_bounds`/`nan_value_count`<-either bound category. `avg_value_size_in_bytes` has no
+/// backing category and is dropped whenever filtering.
 fn build_stats_struct(
     base_field_id: i32,
     bounds_type: &DataType,
-    categories: Option<[bool; 3]>,
+    categories: Option<StatCategories>,
 ) -> StructType {
     let is_variant = matches!(bounds_type, DataType::Variant(_));
     let (has_nan_count, has_size_stats) = match bounds_type {
@@ -177,10 +203,14 @@ fn build_stats_struct(
         _ => (false, false),
     };
 
-    // `unwrap_or([true; 3])` keeps the unfiltered path (`None`) identical to the pre-filter
+    // `StatCategories::ALL` keeps the unfiltered path (`None`) identical to the pre-filter
     // behavior: every category gate below collapses to `true`.
     let filtering = categories.is_some();
-    let [has_null, has_min, has_max] = categories.unwrap_or([true; 3]);
+    let StatCategories {
+        null_count: has_null,
+        min_values: has_min,
+        max_values: has_max,
+    } = categories.unwrap_or(StatCategories::ALL);
     let has_bounds = has_min || has_max;
 
     // (name, type, offset, include) -- filtered in declaration order to preserve field ordering.
@@ -249,7 +279,7 @@ fn build_stats_struct(
 fn leaf_stats_field(
     field: &StructField,
     path: &[String],
-    categories: Option<[bool; 3]>,
+    categories: Option<StatCategories>,
 ) -> DeltaResult<Option<StructField>> {
     // Only leaves carry a field ID that matters for stats. A field ID that is absent, or present
     // but not `i32`-representable, is malformed => error. The spec limits which fields may carry
@@ -296,7 +326,7 @@ fn leaf_stats_field(
         DataType::Variant(_) => {
             build_stats_struct(base_stats_id, &DataType::unshredded_variant(), categories)
         }
-        // Array/map columns carry no leaf stats. 
+        // Array/map columns carry no leaf stats.
         _ => return Ok(None),
     };
 
@@ -390,13 +420,18 @@ impl<'a> CategoryScopes<'a> {
         Ok(CategoryScopes { categories })
     }
 
-    /// Which categories a leaf named `leaf_name` appears in, as `[nullCount, minValues, maxValues]`
-    /// (the [`STAT_CATEGORIES`] order). Every leaf -- variants included -- is a scalar in each
-    /// category (a variant appears in `nullCount` as a scalar `LONG` and is absent from
-    /// `minValues`/`maxValues`), so presence is a same-name field lookup.
-    fn leaf_categories(&self, leaf_name: &str) -> [bool; 3] {
-        self.categories
-            .map(|scope| scope.is_some_and(|s| s.field(leaf_name).is_some()))
+    /// Which categories a leaf named `leaf_name` appears in. Every leaf -- variants included -- is
+    /// a scalar in each category (a variant appears in `nullCount` as a scalar `LONG` and is
+    /// absent from `minValues`/`maxValues`), so presence is a same-name field lookup.
+    fn leaf_categories(&self, leaf_name: &str) -> StatCategories {
+        let [null_count, min_values, max_values] = self
+            .categories
+            .map(|scope| scope.is_some_and(|s| s.field(leaf_name).is_some()));
+        StatCategories {
+            null_count,
+            min_values,
+            max_values,
+        }
     }
 }
 
@@ -443,7 +478,7 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector<'a> {
             // dropped here (before `leaf_stats_field`'s field-id checks); otherwise its category
             // membership gates which stats sub-fields survive.
             let categories = self.filter.map(|s| s.leaf_categories(field.name()));
-            if categories.is_some_and(|c| !c.iter().any(|&present| present)) {
+            if categories.is_some_and(|c| !c.any()) {
                 Ok(())
             } else {
                 leaf_stats_field(field, &self.path, categories)
@@ -1175,7 +1210,11 @@ mod tests {
         field_id: i32,
         categories: &[&str],
     ) -> StructField {
-        let present = STAT_CATEGORIES.map(|c| categories.contains(&c));
+        let present = StatCategories {
+            null_count: categories.contains(&NULL_COUNT),
+            min_values: categories.contains(&MIN_VALUES),
+            max_values: categories.contains(&MAX_VALUES),
+        };
         let base =
             field_id_to_statistics_base(field_id).expect("field id in supported stats range");
         field_with_id(
