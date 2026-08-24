@@ -1,8 +1,8 @@
 name: semver-checks
 
 # Trigger when a PR is opened or changed. This runs with `pull_request` trigger, which means it has
-# only read perms. The adding of the label happens in semver-label.yml via workflow_run which will
-# will look at the status of this job, and always runs in the base-repo context.
+# only read perms. The label update happens in semver-label.yml via workflow_run, which reads the
+# outcome artifact from this workflow and always runs in the base-repo context.
 on:
   pull_request:
     types:
@@ -45,9 +45,9 @@ jobs:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
         with:
-          tool: cargo-semver-checks
+          tool: cargo-semver-checks@0.50.0
       - name: Compute baseline revision
         id: baseline
         shell: bash
@@ -68,7 +68,6 @@ jobs:
           fi
       - name: Run semver check
         id: check
-        continue-on-error: true
         shell: bash
         env:
           BASELINE_REV: ${{ steps.baseline.outputs.rev }}
@@ -76,16 +75,28 @@ jobs:
         # note that this won't run on proc macro/derive crates, so don't need to include
         # delta_kernel_derive etc.
         run: |
-          cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features \
+          set +e
+          cargo-semver-checks -p delta_kernel -p delta_kernel_ffi --all-features \
             --baseline-rev "$BASELINE_REV"
-      # Upload the step outcome as an artifact so semver-label.yml can read it via workflow_run.
-      # steps.check.outcome is the raw result *before* continue-on-error converts it to "success",
-      # so it correctly reflects whether a breaking change was detected.
+          EXIT_CODE=$?
+          set -e
+
+          case "$EXIT_CODE" in
+            0) OUTCOME=success ;;
+            100) OUTCOME=failure ;;
+            *) OUTCOME=error ;;
+          esac
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
+      # Upload the classified outcome as an artifact so semver-label.yml can read it via
+      # workflow_run. Exit code 100 means a SemVer violation; any other nonzero exit means the
+      # check could not complete and must not change the label.
       # Only upload for pull_request events; merge_group runs have no PR to label.
       - name: Save semver outcome
         if: github.event_name == 'pull_request'
         env:
-          SEMVER_OUTCOME: ${{ steps.check.outcome }}
+          SEMVER_OUTCOME: ${{ steps.check.outputs.outcome }}
         run: echo "$SEMVER_OUTCOME" > semver-outcome.txt
       - name: Upload semver outcome
         if: github.event_name == 'pull_request'
@@ -94,3 +105,10 @@ jobs:
           name: semver-outcome
           path: semver-outcome.txt
           retention-days: 1
+      - name: Fail if semver check could not complete
+        if: steps.check.outputs.outcome == 'error'
+        env:
+          SEMVER_EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        run: |
+          echo "::error::cargo-semver-checks failed with exit code ${SEMVER_EXIT_CODE}"
+          exit 1
