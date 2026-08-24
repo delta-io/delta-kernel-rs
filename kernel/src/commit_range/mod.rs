@@ -390,6 +390,16 @@ mod tests {
 
     const VALID_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#;
     const UNSUPPORTED_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#;
+    const VARIANT_SHREDDING_PROTOCOL_LINE: &str = concat!(
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"#,
+        r#""readerFeatures":["variantShredding"],"#,
+        r#""writerFeatures":["variantShredding"]}}"#,
+    );
+    const VARIANT_SHREDDING_WITH_TYPE_PROTOCOL_LINE: &str = concat!(
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"#,
+        r#""readerFeatures":["variantShredding","variantType"],"#,
+        r#""writerFeatures":["variantShredding","variantType"]}}"#,
+    );
     const VALID_METADATA_LINE: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#;
     /// Like [`VALID_METADATA_LINE`] but with a non-empty `configuration` (`foo=bar`), used to
     /// forge a metadata-only change in a later commit.
@@ -635,6 +645,12 @@ mod tests {
         }
     }
 
+    enum ExpectedProtocolValidation {
+        Ok,
+        InvalidProtocol,
+        Unsupported,
+    }
+
     #[rstest::rstest]
     #[case::validates_first_commit_pm(
         vec![
@@ -642,23 +658,33 @@ mod tests {
             (1, METADATA_CONFIG_CHANGE_LINE.to_string()),
         ],
         &[DeltaAction::Add, DeltaAction::Remove],
-        false,
+        ExpectedProtocolValidation::Ok,
     )]
     #[case::rejects_unsupported_protocol(
         vec![(0u64, r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#.to_string())],
         &[DeltaAction::Add],
-        true,
+        ExpectedProtocolValidation::Unsupported,
+    )]
+    #[case::rejects_missing_protocol_dependency(
+        vec![(0u64, VARIANT_SHREDDING_PROTOCOL_LINE.to_string())],
+        &[DeltaAction::Add],
+        ExpectedProtocolValidation::InvalidProtocol,
+    )]
+    #[case::accepts_supported_protocol_dependency(
+        vec![(0u64, VARIANT_SHREDDING_WITH_TYPE_PROTOCOL_LINE.to_string())],
+        &[DeltaAction::Add],
+        ExpectedProtocolValidation::Ok,
     )]
     #[case::skip_when_neither_pm(
         vec![(0u64, r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE"}}"#.to_string())],
         &[DeltaAction::CommitInfo],
-        false,
+        ExpectedProtocolValidation::Ok,
     )]
     #[tokio::test]
     async fn test_protocol_validation_is_commit_driven(
         #[case] commits: Vec<(u64, String)>,
         #[case] actions: &[DeltaAction],
-        #[case] expects_unsupported: bool,
+        #[case] expected: ExpectedProtocolValidation,
     ) {
         let commit_refs: Vec<(u64, &str)> = commits
             .iter()
@@ -673,14 +699,18 @@ mod tests {
             .unwrap();
 
         let result = drain_commits(&range, engine, None, actions);
-        if expects_unsupported {
-            let err = result.expect_err("commit-driven validation must reject");
-            assert!(
-                matches!(err, Error::Unsupported(_)),
-                "expected Error::Unsupported, got: {err:?}",
-            );
-        } else {
-            result.expect("snapshot-less range must drain cleanly");
+        match expected {
+            ExpectedProtocolValidation::Ok => {
+                result.expect("snapshot-less range must drain cleanly");
+            }
+            ExpectedProtocolValidation::InvalidProtocol => assert!(
+                matches!(result, Err(Error::InvalidProtocol(_))),
+                "expected Error::InvalidProtocol, got: {result:?}",
+            ),
+            ExpectedProtocolValidation::Unsupported => assert!(
+                matches!(result, Err(Error::Unsupported(_))),
+                "expected Error::Unsupported, got: {result:?}",
+            ),
         }
     }
 

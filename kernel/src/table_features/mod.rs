@@ -630,7 +630,7 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 static VARIANT_SHREDDING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Supported(TableFeature::VariantType)],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -852,6 +852,47 @@ pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableF
     }
 }
 
+/// Returns whether `protocol` supports `feature`, including legacy version inference.
+pub(crate) fn protocol_supports_feature(protocol: &Protocol, feature: &TableFeature) -> bool {
+    let info = feature.info();
+    let min_legacy_version = info.min_legacy_version.as_ref();
+    let min_reader_version =
+        min_legacy_version.map_or(TABLE_FEATURES_MIN_READER_VERSION, |v| v.reader);
+    let min_writer_version =
+        min_legacy_version.map_or(TABLE_FEATURES_MIN_WRITER_VERSION, |v| v.writer);
+    let has_feature = |features: Option<&[TableFeature]>| {
+        features.is_some_and(|features| features.contains(feature))
+    };
+
+    match info.feature_type {
+        FeatureType::WriterOnly => {
+            if protocol.min_writer_version() < TABLE_FEATURES_MIN_WRITER_VERSION {
+                protocol.min_writer_version() >= min_writer_version
+            } else {
+                has_feature(protocol.writer_features())
+            }
+        }
+        FeatureType::ReaderWriter => {
+            let reader_supported =
+                if protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION {
+                    protocol.min_reader_version() >= min_reader_version
+                } else {
+                    has_feature(protocol.reader_features())
+                        || feature.is_valid_for_legacy_reader(protocol.min_reader_version())
+                };
+            let writer_supported =
+                if protocol.min_writer_version() < TABLE_FEATURES_MIN_WRITER_VERSION {
+                    protocol.min_writer_version() >= min_writer_version
+                } else {
+                    has_feature(protocol.writer_features())
+                };
+
+            reader_supported && writer_supported
+        }
+        FeatureType::Unknown => has_feature(protocol.writer_features()),
+    }
+}
+
 /// Add `feature` to the appropriate feature list(s) for its type, skipping duplicates.
 pub(crate) fn add_feature_to_lists(
     feature: TableFeature,
@@ -939,6 +980,25 @@ pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> DeltaResult<()> {
             }
             KernelSupport::Custom(_) => {}
         }
+        for requirement in feature.info().feature_requirements {
+            match requirement {
+                FeatureRequirement::Supported(dependency) => require!(
+                    protocol_supports_feature(protocol, dependency),
+                    Error::invalid_protocol(format!(
+                        "Feature '{feature}' requires '{dependency}' to be supported"
+                    ))
+                ),
+                FeatureRequirement::NotSupported(dependency) => require!(
+                    !protocol_supports_feature(protocol, dependency),
+                    Error::invalid_protocol(format!(
+                        "Feature '{feature}' requires '{dependency}' to not be supported"
+                    ))
+                ),
+                FeatureRequirement::Enabled(_)
+                | FeatureRequirement::NotEnabled(_)
+                | FeatureRequirement::Custom(_) => {}
+            }
+        }
     }
 
     Ok(())
@@ -1011,6 +1071,22 @@ mod tests {
         Protocol::try_new_modern(
             [TableFeature::DeletionVectors],
             [TableFeature::DeletionVectors],
+        )
+        .unwrap(),
+        ExpectRead::Ok
+    )]
+    #[case::missing_protocol_dependency(
+        Protocol::try_new_modern(
+            [TableFeature::VariantShredding],
+            [TableFeature::VariantShredding],
+        )
+        .unwrap(),
+        ExpectRead::InvalidProtocol
+    )]
+    #[case::supported_protocol_dependency(
+        Protocol::try_new_modern(
+            [TableFeature::VariantShredding, TableFeature::VariantType],
+            [TableFeature::VariantShredding, TableFeature::VariantType],
         )
         .unwrap(),
         ExpectRead::Ok

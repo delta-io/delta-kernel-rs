@@ -30,10 +30,10 @@ use crate::schema::{
 use crate::table_features::validate_geospatial_feature_support;
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
-    get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
-    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
-    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    get_any_level_column_physical_name, protocol_supports_feature,
+    validate_iceberg_compat_if_needed, validate_timestamp_ntz_feature_support, ColumnMappingMode,
+    EnablementCheck, FeatureRequirement, KernelSupport, Operation, TableFeature,
+    LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
@@ -825,71 +825,11 @@ impl TableConfiguration {
         self.is_feature_supported(&TableFeature::RowTracking) && !self.is_row_tracking_suspended()
     }
 
-    /// Returns true if the protocol uses legacy reader version (< 3)
-    #[allow(dead_code)]
-    fn is_legacy_reader_version(&self) -> bool {
-        self.protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION
-    }
-
-    /// Returns true if the protocol uses legacy writer version (< 7)
-    #[allow(dead_code)]
-    fn is_legacy_writer_version(&self) -> bool {
-        self.protocol.min_writer_version() < TABLE_FEATURES_MIN_WRITER_VERSION
-    }
-
-    /// Helper to check if a feature is present in a feature list.
-    fn has_feature(features: Option<&[TableFeature]>, feature: &TableFeature) -> bool {
-        features
-            .map(|features| features.contains(feature))
-            .unwrap_or(false)
-    }
-
     /// Helper method to check if a feature is supported.
     /// This checks protocol versions and feature lists but does NOT check enablement properties.
     #[internal_api]
     pub(crate) fn is_feature_supported(&self, feature: &TableFeature) -> bool {
-        let info = feature.info();
-        let min_legacy_version = info.min_legacy_version.as_ref();
-        let min_reader_version =
-            min_legacy_version.map_or(TABLE_FEATURES_MIN_READER_VERSION, |v| v.reader);
-        let min_writer_version =
-            min_legacy_version.map_or(TABLE_FEATURES_MIN_WRITER_VERSION, |v| v.writer);
-        match info.feature_type {
-            FeatureType::WriterOnly => {
-                if self.is_legacy_writer_version() {
-                    // Legacy writer: protocol writer version meets minimum requirement
-                    self.protocol.min_writer_version() >= min_writer_version
-                } else {
-                    // Table features writer: feature is in writer_features list
-                    Self::has_feature(self.protocol.writer_features(), feature)
-                }
-            }
-            FeatureType::ReaderWriter => {
-                let reader_supported = if self.is_legacy_reader_version() {
-                    // Legacy reader: protocol reader version meets minimum requirement
-                    self.protocol.min_reader_version() >= min_reader_version
-                } else {
-                    // Reader-supported if the feature is in reader_features, or it is a legacy
-                    // ReaderWriter feature (only ColumnMapping) whose minimum reader version is
-                    // met. The second case stays compatible with tables a past delta-spark bug
-                    // created with ReaderWriter features in writerFeatures only, absent from
-                    // readerFeatures.
-                    Self::has_feature(self.protocol.reader_features(), feature)
-                        || feature.is_valid_for_legacy_reader(self.protocol.min_reader_version())
-                };
-
-                let writer_supported = if self.is_legacy_writer_version() {
-                    // Legacy writer: protocol writer version meets minimum requirement
-                    self.protocol.min_writer_version() >= min_writer_version
-                } else {
-                    // Table features writer: feature is in writer_features list
-                    Self::has_feature(self.protocol.writer_features(), feature)
-                };
-
-                reader_supported && writer_supported
-            }
-            FeatureType::Unknown => Self::has_feature(self.protocol.writer_features(), feature),
-        }
+        protocol_supports_feature(&self.protocol, feature)
     }
 
     /// Generic method to check if a feature is enabled.
@@ -1830,33 +1770,43 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_illegal_writer_feature_combination() {
+    #[rstest]
+    #[case::row_tracking(TableFeature::RowTracking, TableFeature::DomainMetadata)]
+    #[case::variant_shredding(TableFeature::VariantShredding, TableFeature::VariantType)]
+    fn feature_requires_protocol_dependency(
+        #[case] feature: TableFeature,
+        #[case] dependency: TableFeature,
+    ) {
         let config = MockTableConfigurationBuilder::new()
             .with_protocol(
                 MockProtocolBuilder::new()
-                    .with_features([TableFeature::RowTracking])
+                    .with_features([feature.clone()])
                     .build(),
             )
             .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
-            "Feature 'rowTracking' requires 'domainMetadata' to be supported",
+            &format!("Feature '{feature}' requires '{dependency}' to be supported"),
         );
     }
 
-    #[test]
-    fn test_row_tracking_with_domain_metadata_requirement() {
+    #[rstest]
+    #[case::row_tracking(TableFeature::RowTracking, TableFeature::DomainMetadata)]
+    #[case::variant_shredding(TableFeature::VariantShredding, TableFeature::VariantType)]
+    fn feature_with_protocol_dependency_is_supported_for_writes(
+        #[case] feature: TableFeature,
+        #[case] dependency: TableFeature,
+    ) {
         let config = MockTableConfigurationBuilder::new()
             .with_protocol(
                 MockProtocolBuilder::new()
-                    .with_features([TableFeature::RowTracking, TableFeature::DomainMetadata])
+                    .with_features([feature, dependency])
                     .build(),
             )
             .build();
         assert!(
             config.ensure_operation_supported(Operation::Write).is_ok(),
-            "RowTracking with DomainMetadata should be supported for writes"
+            "feature with its protocol dependency should be supported for writes"
         );
     }
 
