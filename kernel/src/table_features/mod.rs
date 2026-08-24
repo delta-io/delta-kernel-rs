@@ -563,35 +563,23 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-/// TODO: When type widening is supported on writes, restrict the allowed
-/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg v3
-/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
+/// TODO: Restrict type-widening writes on IcebergCompatV3 tables to the subset permitted by
+/// Iceberg v3 schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
-            "Feature 'typeWidening' is not supported for writes",
-        )),
-    }),
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
-/// TODO: When type widening is supported on writes, restrict the allowed
-/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg
-/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
+/// TODO: Restrict type-widening writes on IcebergCompatV3 tables to the subset permitted by
+/// Iceberg schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
-            "Feature 'typeWidening-preview' is not supported for writes",
-        )),
-    }),
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 

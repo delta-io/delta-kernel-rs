@@ -1782,7 +1782,6 @@ mod test {
             .build();
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
-        // Type Widening is not supported for writes
         let config = MockTableConfigurationBuilder::new()
             .with_protocol(
                 MockProtocolBuilder::new()
@@ -1790,10 +1789,7 @@ mod test {
                     .build(),
             )
             .build();
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            r#"Feature 'typeWidening' is not supported for writes"#,
-        );
+        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
         #[cfg(feature = "geo-type-in-dev")]
         {
