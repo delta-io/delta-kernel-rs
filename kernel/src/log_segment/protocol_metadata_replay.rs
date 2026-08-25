@@ -289,28 +289,19 @@ struct VersionedBatch {
     batch: ActionsBatch,
 }
 
-/// Builds a [`PmCandidate`] per batch, then returns the highest-versioned Protocol and Metadata.
+/// The highest-versioned Protocol and Metadata across all batches.
 fn resolve_pm_batches(
     batches: impl Iterator<Item = DeltaResult<VersionedBatch>>,
 ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-    resolve_pm(batches.map(|batch| {
+    let mut metadata: Option<(i64, Metadata)> = None;
+    let mut protocol: Option<(i64, Protocol)> = None;
+    for batch in batches {
         let VersionedBatch {
             protocol_version,
             metadata_version,
             batch,
         } = batch?;
-        pm_candidate(&batch, protocol_version, metadata_version)
-    }))
-}
-
-/// Returns the highest-versioned Protocol and Metadata across all candidates.
-fn resolve_pm(
-    candidates: impl Iterator<Item = DeltaResult<PmCandidate>>,
-) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-    let mut metadata: Option<(i64, Metadata)> = None;
-    let mut protocol: Option<(i64, Protocol)> = None;
-    for candidate in candidates {
-        let candidate = candidate?;
+        let candidate = pm_candidate(&batch, protocol_version, metadata_version)?;
         metadata = newer(metadata, candidate.metadata);
         protocol = newer(protocol, candidate.protocol);
     }
@@ -325,8 +316,8 @@ fn newer<T>(a: Option<(i64, T)>, b: Option<(i64, T)>) -> Option<(i64, T)> {
     }
 }
 
-/// Returns the `(commit_schema, checkpoint_schema)` used for P&M replay. Commit files also read the
-/// AMT `checkpoint` action; base checkpoint files only have the top-level protocol and metaData.
+/// The commit and checkpoint read schemas for P&M replay; only the commit schema includes the AMT
+/// `checkpoint` action.
 fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
     let checkpoint_schema = schema_ref! {
         (&PROTOCOL_FIELD),
@@ -718,8 +709,6 @@ mod tests {
         assert_eq!(schema.num_fields(), 2);
     }
 
-    // A [`PlanExecutor`] that fails every operation. A test uses it to check that a plan-path
-    // failure surfaces from P&M replay instead of falling back to legacy replay.
     #[cfg(feature = "declarative-plans")]
     struct FailingPlanExecutor;
 
