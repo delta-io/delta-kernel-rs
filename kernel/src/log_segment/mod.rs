@@ -446,7 +446,7 @@ impl LogSegment {
             vec![], // log-tail
             Some(start_version),
             end_version,
-            None, // table-changes does not carry a cancellation token yet
+            None, // table-changes does not thread a cancellation token
         )?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
@@ -502,7 +502,7 @@ impl LogSegment {
             log_tail,
             start_from,
             Some(end_version),
-            None, // timestamp conversion does not carry a cancellation token yet
+            None, // timestamp conversion does not thread a cancellation token
         )?;
 
         // remove gaps - return latest contiguous chunk of commits

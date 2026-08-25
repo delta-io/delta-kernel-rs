@@ -582,8 +582,7 @@ mod tests {
         handler.delete(&missing_url).unwrap();
     }
     // The cancellation-aware overrides feed the racing helper, so an already-cancelled token stops
-    // the operation instead of performing I/O. (The race itself is covered by the
-    // `stream_future_to_cancellable_iter` tests in `lib.rs`.)
+    // the operation instead of performing I/O.
     #[test]
     fn precancelled_token_short_circuits_list_and_read() {
         let (tempdir, _store, handler) = setup_test();
