@@ -132,9 +132,8 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        // Pick the batch source. Plan output is one aggregated row with no arrival order, so we
-        // pass a `version_reader` to reconcile the checkpoint action by version. The raw log stream
-        // is newest-first, so a `None` reader keeps the first value seen for each field instead.
+        // The raw log stream is newest-first, so a `None` reader takes the first value seen. The
+        // plan returns one unordered row, so it compares versions via `version_reader` instead.
         #[cfg(feature = "declarative-plans")]
         #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
         let (actions_batches, version_reader): (
@@ -182,8 +181,8 @@ impl LogSegment {
             if let Some(checkpoint) = checkpoint {
                 let (use_checkpoint_metadata, use_checkpoint_protocol) = match version_reader {
                     Some(read_versions) => {
-                        let (protocol_ver, metadata_ver, checkpoint_ver) =
-                            read_versions(actions.as_ref())?;
+                        let (protocol_ver, metadata_ver) = read_versions(actions.as_ref())?;
+                        let checkpoint_ver = Some(checkpoint.version());
                         (
                             metadata_ver <= checkpoint_ver,
                             protocol_ver <= checkpoint_ver,
@@ -255,7 +254,7 @@ impl LogSegment {
                         column_name!(METADATA_NAME),
                         column_name!("version"),
                     );
-                // Also recover the version each value came from, for the newest-wins merge.
+                // Also recover the top-level P&M versions for the newest-wins merge.
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 let a = a
                     .max_non_null_by(
@@ -278,14 +277,6 @@ impl LogSegment {
                             column_name!("version"),
                         ),
                         "metadata_version",
-                    )
-                    .aggregate_as(
-                        Agg::max_non_null_by(
-                            column_name!("version"),
-                            column_name!(CHECKPOINT_ACTION_NAME),
-                            column_name!("version"),
-                        ),
-                        "checkpoint_version",
                     );
                 a
             })?
@@ -331,22 +322,18 @@ impl LogSegment {
     }
 }
 
-/// Reads the (protocol, metadata, checkpoint) source versions from a plan-aggregated batch. Only
-/// the plan produces these; the non-plan stream ranks the checkpoint by arrival order instead.
-type SourceVersionReader =
-    fn(&dyn EngineData) -> DeltaResult<(Option<i64>, Option<i64>, Option<i64>)>;
+/// Reads the (protocol, metadata) source versions the plan aggregate emits. Only the plan needs
+/// these; the newest-first non-plan stream ranks by order instead.
+type SourceVersionReader = fn(&dyn EngineData) -> DeltaResult<(Option<i64>, Option<i64>)>;
 
-/// Reads the `*_version` columns the plan aggregate emits: the version at which the newest
-/// protocol, metaData, and checkpoint action were found (`None` if that action never appeared).
+/// Reads the `*_version` columns: the version of the newest protocol and metaData (`None` if
+/// absent).
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-fn read_pm_versions(
-    actions: &dyn EngineData,
-) -> DeltaResult<(Option<i64>, Option<i64>, Option<i64>)> {
+fn read_pm_versions(actions: &dyn EngineData) -> DeltaResult<(Option<i64>, Option<i64>)> {
     #[derive(Default)]
     struct PmVersionsVisitor {
         protocol: Option<i64>,
         metadata: Option<i64>,
-        checkpoint: Option<i64>,
     }
     impl RowVisitor for PmVersionsVisitor {
         fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
@@ -355,9 +342,8 @@ fn read_pm_versions(
                     vec![
                         column_name!("protocol_version"),
                         column_name!("metadata_version"),
-                        column_name!("checkpoint_version"),
                     ],
-                    vec![DataType::LONG, DataType::LONG, DataType::LONG],
+                    vec![DataType::LONG, DataType::LONG],
                 )
                     .into()
             });
@@ -371,14 +357,13 @@ fn read_pm_versions(
             if row_count > 0 {
                 self.protocol = getters[0].get_opt(0, "protocol_version")?;
                 self.metadata = getters[1].get_opt(0, "metadata_version")?;
-                self.checkpoint = getters[2].get_opt(0, "checkpoint_version")?;
             }
             Ok(())
         }
     }
     let mut visitor = PmVersionsVisitor::default();
     visitor.visit_rows_of(actions)?;
-    Ok((visitor.protocol, visitor.metadata, visitor.checkpoint))
+    Ok((visitor.protocol, visitor.metadata))
 }
 
 #[cfg(test)]
@@ -494,8 +479,7 @@ mod tests {
         assert!(snapshot.schema().field("id").is_some());
     }
 
-    // The newest action wins for protocol and metadata. Each case runs both replay paths, which
-    // must agree: the non-plan path ranks by arrival order, the plan path by version.
+    // The newest protocol and metadata win. Both replay paths must agree here.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
     #[case::checkpoint_over_full_pm(
