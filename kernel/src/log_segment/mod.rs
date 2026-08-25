@@ -844,38 +844,49 @@ impl LogSegment {
         selected_files
     }
 
-    /// Reads the commit cover, pairing each batch with its file's version so callers can rank
-    /// actions. Batches carry an extra `_file` column beyond `schema` used to map each back to its
-    /// source file.
+    /// Reads commit-cover actions, pairing each batch with its source commit version.
+    /// Adds an internal `_file` metadata column to identify each batch's source file.
     fn versioned_commit_batches(
         &self,
         engine: &dyn Engine,
         schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(i64, ActionsBatch)>> + Send> {
-        let paths = self.find_commit_cover_paths();
-        let version_by_file: HashMap<String, i64> = paths
-            .iter()
-            .map(|path| (path.location.location.to_string(), path.version as i64))
-            .collect();
-        let files: Vec<FileMeta> = paths.into_iter().map(|path| path.location).collect();
+        let commit_files = self.find_commit_cover_paths();
 
-        // One read for all files; the `_file` column maps each batch back to its version.
-        let read_schema = Arc::new(StructType::try_new(schema.fields().cloned().chain(
-            std::iter::once(StructField::create_metadata_column(
-                "_file",
-                MetadataColumnSpec::FilePath,
-            )),
-        ))?);
+        let version_by_path = commit_files
+            .iter()
+            .map(|commit| (commit.location.location.to_string(), commit.version as i64))
+            .collect::<HashMap<_, _>>();
+
+        let files = commit_files
+            .into_iter()
+            .map(|commit| commit.location)
+            .collect::<Vec<_>>();
+
+        let fields =
+            schema
+                .fields()
+                .cloned()
+                .chain(std::iter::once(StructField::create_metadata_column(
+                    "_file",
+                    MetadataColumnSpec::FilePath,
+                )));
+        let schema_with_file_path = Arc::new(StructType::try_new(fields)?);
+
         let batches = engine
             .json_handler()
-            .read_json_files(&files, read_schema, None)?;
+            .read_json_files(&files, schema_with_file_path, None)?;
 
         Ok(batches.map(move |batch| {
             let batch = batch?;
-            let file = commit_file_path(batch.as_ref())?;
-            let version = *version_by_file.get(&file).ok_or_else(|| {
-                Error::internal_error(format!("commit batch from unexpected file {file}"))
+            let file_path = commit_file_path(batch.as_ref())?;
+
+            let version = version_by_path.get(&file_path).copied().ok_or_else(|| {
+                Error::internal_error(format!(
+                    "commit-cover read returned batch from unknown file: {file_path}"
+                ))
             })?;
+
             Ok((version, ActionsBatch::new(batch, true)))
         }))
     }

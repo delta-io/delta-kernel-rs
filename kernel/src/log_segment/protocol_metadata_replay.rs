@@ -276,15 +276,10 @@ impl LogSegment {
     }
 }
 
-/// Protocol and Metadata parsed from one batch, each with the version it was found at.
-///
-/// Under AMT, `checkpoint` holds a checkpoint action. Its Protocol and Metadata use the action's
-/// own `checkpointMetadata.version`, not the version of the commit it came from.
+/// Protocol and Metadata parsed from one batch, each with the version it was found at
 struct PmCandidate {
     protocol: Option<(i64, Protocol)>,
     metadata: Option<(i64, Metadata)>,
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint: Option<CheckpointAction>,
 }
 
 /// A P&M-projected batch with the versions to rank its Protocol and Metadata at.
@@ -316,31 +311,17 @@ fn resolve_pm(
     let mut protocol: Option<(i64, Protocol)> = None;
     for candidate in candidates {
         let candidate = candidate?;
-        take_newer(&mut metadata, candidate.metadata);
-        take_newer(&mut protocol, candidate.protocol);
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(checkpoint) = candidate.checkpoint {
-            let version = checkpoint.version();
-            take_newer(
-                &mut metadata,
-                Some((version, checkpoint.metadata().clone())),
-            );
-            take_newer(
-                &mut protocol,
-                Some((version, checkpoint.protocol().clone())),
-            );
-        }
+        metadata = newer(metadata, candidate.metadata);
+        protocol = newer(protocol, candidate.protocol);
     }
     Ok((metadata.map(|(_, m)| m), protocol.map(|(_, p)| p)))
 }
 
-/// Keeps whichever of `current` and `candidate` has the higher version.
-/// On a tie, `candidate` wins.
-fn take_newer<T>(current: &mut Option<(i64, T)>, candidate: Option<(i64, T)>) {
-    if let Some((version, value)) = candidate {
-        if current.as_ref().is_none_or(|(v, _)| version >= *v) {
-            *current = Some((version, value));
-        }
+/// The higher-versioned of `a` and `b`. On a tie `b` wins, so pass the older offer as `a`.
+fn newer<T>(a: Option<(i64, T)>, b: Option<(i64, T)>) -> Option<(i64, T)> {
+    match (a, b) {
+        (Some(a), Some(b)) if a.0 > b.0 => Some(a),
+        (a, b) => b.or(a),
     }
 }
 
@@ -363,28 +344,51 @@ fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
 }
 
 /// Builds a [`PmCandidate`] from one batch. The top-level protocol and metaData use the versions
-/// the caller passes in (`None` if that action isn't in the batch). The AMT checkpoint action is
-/// only read from log batches, since that's the only place it shows up.
+/// the caller passes in (`None` if that action isn't in the batch). Under AMT, a checkpoint action
+/// in a log batch contributes its nested P&M at its own version, and the newer of the two wins.
 fn pm_candidate(
     batch: &ActionsBatch,
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
 ) -> DeltaResult<PmCandidate> {
     let actions = batch.actions.as_ref();
+    let protocol = Protocol::try_new_from_data(actions)?
+        .zip(protocol_version)
+        .map(|(p, v)| (v, p));
+    let metadata = Metadata::try_new_from_data(actions)?
+        .zip(metadata_version)
+        .map(|(m, v)| (v, m));
+    let (checkpoint_protocol, checkpoint_metadata) = match checkpoint_pm(batch)? {
+        Some((version, p, m)) => (Some((version, p)), Some((version, m))),
+        None => (None, None),
+    };
     Ok(PmCandidate {
-        protocol: Protocol::try_new_from_data(actions)?
-            .zip(protocol_version)
-            .map(|(p, v)| (v, p)),
-        metadata: Metadata::try_new_from_data(actions)?
-            .zip(metadata_version)
-            .map(|(m, v)| (v, m)),
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint: if batch.is_log_batch {
-            CheckpointAction::try_new_from_data(actions)?
-        } else {
-            None
-        },
+        protocol: newer(protocol, checkpoint_protocol),
+        metadata: newer(metadata, checkpoint_metadata),
     })
+}
+
+/// The Protocol and Metadata carried by an AMT checkpoint action in `batch`, at the action's own
+/// `checkpointMetadata.version`. `None` without the feature, or when the batch carries no such
+/// action (checkpoint actions appear only in log batches).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn checkpoint_pm(batch: &ActionsBatch) -> DeltaResult<Option<(i64, Protocol, Metadata)>> {
+    if !batch.is_log_batch {
+        return Ok(None);
+    }
+    let Some(checkpoint) = CheckpointAction::try_new_from_data(batch.actions.as_ref())? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        checkpoint.version(),
+        checkpoint.protocol().clone(),
+        checkpoint.metadata().clone(),
+    )))
+}
+
+#[cfg(not(feature = "adaptive-metadata-in-dev"))]
+fn checkpoint_pm(_batch: &ActionsBatch) -> DeltaResult<Option<(i64, Protocol, Metadata)>> {
+    Ok(None)
 }
 
 /// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits: the
