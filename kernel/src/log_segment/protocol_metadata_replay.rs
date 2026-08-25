@@ -7,7 +7,6 @@ use std::sync::Arc;
 #[cfg(feature = "declarative-plans")]
 use std::sync::LazyLock;
 
-use itertools::Either;
 use tracing::{info, instrument};
 
 use super::LogSegment;
@@ -23,7 +22,6 @@ use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
-use crate::path::LogPathFileType;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::Agg;
 #[cfg(feature = "declarative-plans")]
@@ -33,6 +31,7 @@ use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
 use crate::schema::schema_ref;
+use crate::schema::StructType;
 #[cfg(feature = "declarative-plans")]
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 #[cfg(feature = "declarative-plans")]
@@ -144,19 +143,6 @@ impl LogSegment {
         if let Some(executor) = engine.plan_executor() {
             return resolve_pm(self.plan_pm_candidates(executor.as_ref())?);
         }
-        resolve_pm(self.log_pm_candidates(engine)?)
-    }
-
-    /// Reads the commit cover and then the checkpoint, newest-first, yielding one [`PmCandidate`]
-    /// per batch tagged with the version it came from.
-    fn log_pm_candidates(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<PmCandidate>> + Send> {
-        let checkpoint_schema = schema_ref! {
-            (&PROTOCOL_FIELD),
-            (&METADATA_FIELD),
-        };
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let commit_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -164,34 +150,34 @@ impl LogSegment {
             (&CHECKPOINT_ACTION_FIELD),
         };
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let checkpoint_schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+        };
         let commit_schema = checkpoint_schema.clone();
+        resolve_pm(self.log_pm_candidates(engine, commit_schema, checkpoint_schema)?)
+    }
 
-        let json = engine.json_handler();
+    /// Reads the commit cover and then the checkpoint, newest-first, yielding one [`PmCandidate`]
+    /// per batch tagged with the version it came from.
+    fn log_pm_candidates(
+        &self,
+        engine: &dyn Engine,
+        commit_schema: Arc<StructType>,
+        checkpoint_schema: Arc<StructType>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<PmCandidate>> + Send> {
         let commits = self
-            .find_commit_cover_paths()
-            .into_iter()
-            .flat_map(move |path| {
-                let version = match &path.file_type {
-                    LogPathFileType::CompactedCommit { hi } => *hi as i64,
-                    _ => path.version as i64,
-                };
-                match json.read_json_files(
-                    std::slice::from_ref(&path.location),
-                    commit_schema.clone(),
-                    None,
-                ) {
-                    Ok(batches) => Either::Right(batches.map(move |b| {
-                        pm_candidate_from_batch(&ActionsBatch::new(b?, true), version)
-                    })),
-                    Err(e) => Either::Left(std::iter::once(Err(e))),
-                }
+            .versioned_commit_batches(engine, commit_schema)?
+            .map(|batch| {
+                let (version, batch) = batch?;
+                pm_candidate(&batch, Some(version), Some(version))
             });
 
         let checkpoint_version = self.checkpoint_version.map_or(0, |v| v as i64);
         let checkpoint = self
             .create_checkpoint_stream(engine, checkpoint_schema, None, None, None, None)?
             .actions
-            .map(move |b| pm_candidate_from_batch(&b?, checkpoint_version));
+            .map(move |b| pm_candidate(&b?, Some(checkpoint_version), Some(checkpoint_version)));
 
         Ok(commits.chain(checkpoint))
     }
@@ -382,16 +368,22 @@ fn take_newer<T>(current: &mut Option<(i64, T)>, candidate: Option<(i64, T)>) {
     }
 }
 
-/// Builds a [`PmCandidate`] from one batch, tagging any P&M with `version`. The AMT checkpoint
-/// action is parsed only from log batches, where it can appear.
-fn pm_candidate_from_batch(
+/// Builds a [`PmCandidate`] from one batch, tagging its top-level protocol and metaData with the
+/// versions the caller supplies (`None` when that action is absent from the batch). The AMT
+/// checkpoint action is parsed only from log batches, where it can appear.
+fn pm_candidate(
     batch: &ActionsBatch,
-    candidate_version: i64,
+    protocol_version: Option<i64>,
+    metadata_version: Option<i64>,
 ) -> DeltaResult<PmCandidate> {
     let actions = batch.actions.as_ref();
     Ok(PmCandidate {
-        protocol: Protocol::try_new_from_data(actions)?.map(|p| (candidate_version, p)),
-        metadata: Metadata::try_new_from_data(actions)?.map(|m| (candidate_version, m)),
+        protocol: Protocol::try_new_from_data(actions)?
+            .zip(protocol_version)
+            .map(|(p, v)| (v, p)),
+        metadata: Metadata::try_new_from_data(actions)?
+            .zip(metadata_version)
+            .map(|(m, v)| (v, m)),
         #[cfg(feature = "adaptive-metadata-in-dev")]
         checkpoint: if batch.is_log_batch {
             CheckpointAction::try_new_from_data(actions)?

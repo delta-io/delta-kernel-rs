@@ -808,6 +808,37 @@ impl LogSegment {
         selected_files
     }
 
+    /// Reads each commit-cover file individually, pairing every batch with the version of the file
+    /// it came from (a compacted file uses its `hi`). Unlike [`CommitReader`], which flattens the
+    /// whole commit cover into one stream, this preserves per-file version attribution so callers
+    /// can rank actions by version. Files are yielded newest-first.
+    pub(crate) fn versioned_commit_batches(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(i64, ActionsBatch)>> + Send> {
+        let json = engine.json_handler();
+        Ok(self
+            .find_commit_cover_paths()
+            .into_iter()
+            .flat_map(move |path| {
+                let version = match &path.file_type {
+                    CompactedCommit { hi } => *hi as i64,
+                    _ => path.version as i64,
+                };
+                match json.read_json_files(
+                    std::slice::from_ref(&path.location),
+                    schema.clone(),
+                    None,
+                ) {
+                    Ok(batches) => itertools::Either::Right(
+                        batches.map(move |b| Ok((version, ActionsBatch::new(b?, true)))),
+                    ),
+                    Err(e) => itertools::Either::Left(std::iter::once(Err(e))),
+                }
+            }))
+    }
+
     #[cfg(feature = "declarative-plans")]
     fn version_tagged_scan_files<'a>(
         paths: impl IntoIterator<Item = &'a ParsedLogPath>,
