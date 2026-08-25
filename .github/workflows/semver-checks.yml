@@ -45,7 +45,7 @@ jobs:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
         with:
           tool: cargo-semver-checks@0.50.0
       - name: Compute baseline revision
@@ -82,8 +82,11 @@ jobs:
           set -e
 
           case "$EXIT_CODE" in
+            # No SemVer violations were found.
             0) OUTCOME=success ;;
+            # cargo-semver-checks reserves exit code 100 for detected SemVer violations.
             100) OUTCOME=failure ;;
+            # Any other exit code is a tool error and must not change the label.
             *) OUTCOME=error ;;
           esac
 

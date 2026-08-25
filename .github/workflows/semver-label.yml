@@ -9,14 +9,22 @@ on:
     workflows: ["semver-checks"]
     types: [completed]
 
+concurrency:
+  group: >-
+    semver-label-${{ github.event.workflow_run.head_repository.full_name }}-${{
+      github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
 jobs:
   update_label_if_needed:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       actions: read
-    # Label updates only apply to PRs; merge_group runs have no associated PR to label.
-    if: github.event.workflow_run.event == 'pull_request'
+    # Label updates only apply to successful PR runs. A failed check has no trustworthy result.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
     steps:
       # Resolve PR number from the triggering workflow run's branch. For fork PRs the branch
       # must be prefixed with `<owner>:` so gh pr view can locate it.
@@ -50,16 +58,27 @@ jobs:
       - name: Update breaking-change label
         if: steps.pr-context.outputs.number != ''
         env:
+          CHECKED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr-context.outputs.number }}
         run: |
-          STEP_OUTCOME=$(cat semver-outcome.txt)
-          echo "Semver check outcome: '${STEP_OUTCOME}' for PR #${PR_NUMBER}"
+          SEMVER_OUTCOME=$(cat semver-outcome.txt)
+          echo "Semver check outcome: '${SEMVER_OUTCOME}' for PR #${PR_NUMBER}"
 
-          if [[ "$STEP_OUTCOME" == "failure" ]]; then
+          # Re-read the PR head immediately before mutation so stale workflow runs cannot change
+          # the current label.
+          PR_HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json headRefOid --jq '.headRefOid')
+          if [[ "$CHECKED_HEAD_SHA" != "$PR_HEAD_SHA" ]]; then
+            echo "Semver result is for stale head ${CHECKED_HEAD_SHA}; current head is ${PR_HEAD_SHA}"
+            echo "Leaving labels unchanged"
+            exit 0
+          fi
+
+          if [[ "$SEMVER_OUTCOME" == "failure" ]]; then
             echo "Breaking change detected -- adding 'breaking-change' label to PR #$PR_NUMBER"
             gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "breaking-change"
-          elif [[ "$STEP_OUTCOME" == "success" ]]; then
+          elif [[ "$SEMVER_OUTCOME" == "success" ]]; then
             # Remove the label only if it is currently present; gh pr edit fails on absent labels.
             CURRENT_LABELS=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]')
             echo "Current PR labels: $CURRENT_LABELS"
@@ -69,11 +88,11 @@ jobs:
             else
               echo "Semver check passed -- 'breaking-change' label not present, nothing to do"
             fi
-          elif [[ "$STEP_OUTCOME" == "error" ]]; then
+          elif [[ "$SEMVER_OUTCOME" == "error" ]]; then
             echo "ERROR: semver check did not complete; leaving labels unchanged"
             exit 1
           else
-            echo "ERROR: unexpected semver outcome '${STEP_OUTCOME}' in semver-outcome.txt"
+            echo "ERROR: unexpected semver outcome '${SEMVER_OUTCOME}' in semver-outcome.txt"
             exit 1
           fi
 
