@@ -212,6 +212,8 @@ jobs:
             objects.githubusercontent.com:443
             release-assets.githubusercontent.com:443
             releases.astral.sh:443
+            nodejs.org:443
+            registry.npmjs.org:443
             pypi.org:443
             files.pythonhosted.org:443
             ${{ vars.GATEWAY_HOST }}:443
@@ -259,6 +261,14 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Node.js
+        if: steps.creds.outputs.available == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: .github/omnigent/package-lock.json
+
       - name: Install Omnigent
         if: steps.creds.outputs.available == 'true'
         run: |
@@ -282,6 +292,66 @@ jobs:
             --no-build-isolation \
             -r .github/omnigent/requirements.txt
           echo "$PWD/.omnigent-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install AI reviewer CLIs
+        if: steps.creds.outputs.available == 'true'
+        working-directory: .github/omnigent
+        run: |
+          set -euo pipefail
+          npm ci
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+          export PATH="$PWD/node_modules/.bin:$PATH"
+          node --version
+          npm --version
+          claude --version
+          codex --version
+
+      - name: Validate AI reviewer runtime
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import pathlib
+          import re
+          import shutil
+          import subprocess
+          import sys
+
+          harness_commands = {
+              "claude-sdk": "claude",
+              "codex": "codex",
+          }
+          harnesses = set()
+          for path in pathlib.Path(".github/omnigent/reviewer").rglob("config.yaml"):
+              text = path.read_text()
+              harnesses.update(
+                  re.findall(r"^\s*harness:\s*([A-Za-z0-9_.-]+)\s*$", text, re.MULTILINE)
+              )
+
+          if not harnesses:
+              print("::error::No Omnigent harnesses found.")
+              sys.exit(1)
+
+          unknown = sorted(harnesses - harness_commands.keys())
+          if unknown:
+              print(f"::error::No CLI validation mapping for harnesses: {', '.join(unknown)}")
+              sys.exit(1)
+
+          missing = {
+              harness: command
+              for harness, command in sorted(harness_commands.items())
+              if harness in harnesses and shutil.which(command) is None
+          }
+          if missing:
+              details = ", ".join(f"{harness} -> {command}" for harness, command in missing.items())
+              print(f"::error::Missing required AI reviewer CLIs: {details}")
+              sys.exit(1)
+
+          for command in sorted({harness_commands[harness] for harness in harnesses}):
+              subprocess.run([command, "--version"], check=True)
+
+          print("Validated AI reviewer harnesses: " + ", ".join(sorted(harnesses)))
+          PYEOF
 
       - name: Write Omnigent provider config
         if: steps.creds.outputs.available == 'true'
