@@ -511,6 +511,54 @@ fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTablePropertie
 #[derive(Debug)]
 struct PreColumnMappingResolved;
 
+/// When `delta.enableIcebergCompatV2=true` is set, auto-enables V2's required dependencies in
+/// `validated.properties` (defaulting them when absent, rejecting conflicting values).
+///
+/// Specifically:
+///   * Set `delta.columnMapping.mode` to `name` when absent, reject if it's `none`.
+///   * Reject if `delta.enableIcebergCompatV1` or `delta.enableIcebergCompatV3` is `true`.
+///
+/// Returns a [`PreColumnMappingResolved`] witness that
+/// [`maybe_apply_column_mapping_for_table_create`] requires, ensuring this pass runs first.
+fn maybe_enable_iceberg_compat_v2_dependencies(
+    validated: &mut ValidatedTableProperties,
+) -> DeltaResult<PreColumnMappingResolved> {
+    if !validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2) {
+        return Ok(PreColumnMappingResolved);
+    }
+
+    // Column mapping: require `name` or `id`; default to `name`.
+    match validated
+        .properties
+        .get(COLUMN_MAPPING_MODE)
+        .map(String::as_str)
+    {
+        None => {
+            validated
+                .properties
+                .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        }
+        Some("name") | Some("id") => {}
+        Some(other) => {
+            return Err(Error::generic(format!(
+                "IcebergCompatV2 requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got \
+                 '{other}'"
+            )));
+        }
+    }
+
+    // V1/V3 must not be active.
+    for key in [ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3] {
+        if validated.is_property_true(key) {
+            return Err(Error::generic(format!(
+                "IcebergCompatV2 cannot be enabled together with '{key}'"
+            )));
+        }
+    }
+
+    Ok(PreColumnMappingResolved)
+}
+
 /// When `delta.enableIcebergCompatV3=true` is set, auto-enables V3's required dependencies in
 /// `validated.properties` (defaulting them when absent, rejecting conflicting values).
 ///
@@ -912,6 +960,11 @@ impl CreateTableTransactionBuilder {
         // - Removes feature signals from properties (they shouldn't be stored in metadata)
         // - Returns reader/writer features to add to protocol
         let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
+
+        // When IcebergCompatV2 is enabled, fill in / validate required dependencies before
+        // column mapping is applied so the CM mode is in place. The witness is proven again by
+        // the V3 pass below, which is the one threaded into column mapping.
+        let PreColumnMappingResolved = maybe_enable_iceberg_compat_v2_dependencies(&mut validated)?;
 
         // When IcebergCompatV3 is enabled, fill in / validate required dependencies before
         // column mapping is applied so the CM mode is in place. The returned witness is

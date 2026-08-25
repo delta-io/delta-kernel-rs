@@ -1,10 +1,11 @@
 //! IcebergCompat invariant checks shared across versions.
 //!
-//! Each `delta.enableIcebergCompatV{N}` version owns a submodule (currently only
-//! [`v3`]), and exposes a single
+//! Each `delta.enableIcebergCompatV{N}` version owns a submodule (currently
+//! [`v2`] and [`v3`]), and exposes a single
 //! `pub(crate) const V{N}_VALIDATOR: IcebergCompatValidator`. Callers feed that
 //! constant to [`validate_iceberg_compat_if_needed`].
 
+pub(crate) mod v2;
 pub(crate) mod v3;
 
 use crate::schema::{ColumnMetadataKey, DataType, StructField};
@@ -14,13 +15,15 @@ use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
 
 pub(crate) enum IcebergCompatVersion {
-    // TODO: Add V1, V2 when kernel supports them.
+    // TODO: Add V1 when kernel supports it
+    V2,
     V3,
 }
 
 impl IcebergCompatVersion {
     pub(super) fn as_table_feature(&self) -> TableFeature {
         match self {
+            Self::V2 => TableFeature::IcebergCompatV2,
             Self::V3 => TableFeature::IcebergCompatV3,
         }
     }

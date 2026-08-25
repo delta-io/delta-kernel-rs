@@ -34,7 +34,7 @@ use crate::table_features::{
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
     FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
     MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
+    TABLE_FEATURES_MIN_WRITER_VERSION, V2_VALIDATOR, V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -232,6 +232,7 @@ impl TableConfiguration {
         // Reject tables with geo-typed columns that don't declare the `geospatial` feature.
         #[cfg(feature = "geo-type-in-dev")]
         validate_geospatial_feature_support(&table_config)?;
+        validate_iceberg_compat_if_needed(&table_config, &V2_VALIDATOR)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
 
         Ok(table_config)
@@ -510,15 +511,16 @@ impl TableConfiguration {
     }
 
     /// Whether partition column values must be materialized into data files.
-    /// Returns true when either:
+    /// Returns true when:
     ///   * The [`MaterializePartitionColumns`] writer feature is enabled, or
-    ///   * [`IcebergCompatV3`] is enabled
+    ///   * [`IcebergCompatV2`] or [`IcebergCompatV3`] is enabled
     ///
     /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
     /// [`IcebergCompatV3`]: crate::table_features::TableFeature::IcebergCompatV3
     pub(crate) fn should_materialize_partition_columns(&self) -> bool {
         // TODO(#1125): add IcebergcompatV1/V2 here when they are supported.
         self.is_feature_enabled(&TableFeature::MaterializePartitionColumns)
+            || self.is_feature_enabled(&TableFeature::IcebergCompatV2)
             || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
 
@@ -912,8 +914,8 @@ impl TableConfiguration {
     /// Returns true when the table requires every AddFile to carry a non-null
     /// `stats.numRecords`.
     pub(crate) fn requires_stats_num_records(&self) -> bool {
-        // TODO(#1125): Add icebergCompatV2 to the list when it is supported.
-        self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+        self.is_feature_enabled(&TableFeature::IcebergCompatV2)
+            || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
 
     /// TODO(#2538): Row-tracking is not fully supported for removeFile currently.
