@@ -844,24 +844,18 @@ impl LogSegment {
         selected_files
     }
 
-    /// Reads the commit cover, pairing each batch with the version of the file it came from (a
-    /// compacted file uses its `hi`), so callers can rank actions by version.
-    pub(crate) fn versioned_commit_batches(
+    /// Reads the commit cover, pairing each batch with its file's version so callers can rank
+    /// actions. Batches carry an extra `_file` column beyond `schema` used to map each back to its
+    /// source file.
+    fn versioned_commit_batches(
         &self,
         engine: &dyn Engine,
         schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(i64, ActionsBatch)>> + Send> {
         let paths = self.find_commit_cover_paths();
-        // Version of each commit file, keyed by location.
         let version_by_file: HashMap<String, i64> = paths
             .iter()
-            .map(|path| {
-                let version = match &path.file_type {
-                    CompactedCommit { hi } => *hi as i64,
-                    _ => path.version as i64,
-                };
-                (path.location.location.to_string(), version)
-            })
+            .map(|path| (path.location.location.to_string(), path.version as i64))
             .collect();
         let files: Vec<FileMeta> = paths.into_iter().map(|path| path.location).collect();
 
@@ -895,7 +889,7 @@ impl LogSegment {
             .map(|path| {
                 Ok(ScanFile {
                     meta: path.location.clone(),
-                    file_constants: vec![Scalar::Long(path.version_as_i64()?)],
+                    file_constants: vec![Scalar::Long(crate::version_as_i64(path.version)?)],
                 })
             })
             .collect()

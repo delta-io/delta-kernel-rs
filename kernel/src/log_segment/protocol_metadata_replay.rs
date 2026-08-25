@@ -141,12 +141,11 @@ impl LogSegment {
         resolve_pm_batches(self.read_pm_batches(engine)?)
     }
 
-    /// Reads the P&M-projected commit cover and checkpoint through the declarative plan, one batch
+    /// Reads the P&M-projected commit cover and checkpoint via declarative plan, one batch
     /// per emitted row.
     ///
     /// The plan can't unnest the checkpoint action, so it passes `checkpoint` through as one column
-    /// and emits the newest protocol and metaData versions as separate columns, which
-    /// `read_pm_versions` reads back to rank by version.
+    /// and emits the newest protocol and metaData versions as separate columns.
     #[cfg(feature = "declarative-plans")]
     fn read_pm_batches_via_plan(
         &self,
@@ -227,7 +226,8 @@ impl LogSegment {
                 // Mark the batch as a log batch so `pm_candidate` reads the checkpoint action from
                 // it. The plan already deduped every action into a single row.
                 let batch = ActionsBatch::new(batch?, true);
-                let (protocol_version, metadata_version) = read_pm_versions(batch.actions.as_ref())?;
+                let (protocol_version, metadata_version) =
+                    read_pm_versions(batch.actions.as_ref())?;
                 Ok(VersionedBatch {
                     protocol_version,
                     metadata_version,
@@ -254,9 +254,10 @@ impl LogSegment {
                 })
             });
 
-        // Skip checkpoint parts with no P&M. The base checkpoint's P&M is at the checkpoint
-        // version, which `resolve_pm` treats separately from an AMT checkpoint action.
+        // Skip checkpoint parts with no P&M.
         let predicate = super::checkpoint_action_projection_predicate(&checkpoint_schema);
+        // This is `None` only when the table has no checkpoint, and then the stream below produces
+        // no batches, so no batch is ever tagged with a `None` version.
         let base_checkpoint_version = self.checkpoint_version.map(|v| v as i64);
         let checkpoint = self
             .create_checkpoint_stream(engine, checkpoint_schema, predicate, None, None, None)?
