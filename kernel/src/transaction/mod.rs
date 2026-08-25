@@ -1796,7 +1796,6 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use super::schema_evolution::SchemaOperation;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
     use crate::arrow::array::{
@@ -2177,12 +2176,10 @@ mod tests {
         let (engine, txn, _tempdir) = create_existing_table_txn()?;
 
         let snapshot = txn
-            .with_schema_changes(vec![
-                SchemaOperation::add_column(
-                    StructField::nullable("first_column", DataType::INTEGER),
-                    ColumnName::new(Vec::<String>::new()),
-                )
-            ])?
+            .with_schema_changes(vec![SchemaOperation::add_column(
+                StructField::nullable("first_column", DataType::INTEGER),
+                vec![],
+            )])?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
         assert!(snapshot.schema().contains("first_column"));
@@ -2193,7 +2190,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_schema_changes(vec![SchemaOperation::add_column(
                 StructField::nullable("second_column", DataType::STRING),
-                ColumnName::new(Vec::<String>::new()),
+                vec![],
             )])?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
@@ -2235,11 +2232,11 @@ mod tests {
             .with_schema_changes(vec![
                 SchemaOperation::add_column(
                     StructField::nullable("address", StructType::try_new(vec![])?),
-                    ColumnName::new(Vec::<String>::new()),
+                    vec![],
                 ),
                 SchemaOperation::add_column(
                     StructField::nullable("city", DataType::STRING),
-                    column_name!("address"),
+                    vec![PathSegment::Field("address".to_string())],
                 ),
             ])?
             .commit(engine.as_ref())?
@@ -2269,7 +2266,7 @@ mod tests {
         let snapshot = txn
             .with_schema_changes(vec![SchemaOperation::add_column(
                 StructField::nullable("address", address_type.clone()),
-                ColumnName::new(Vec::<String>::new()),
+                vec![],
             )])?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();

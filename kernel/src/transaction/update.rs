@@ -138,9 +138,9 @@ impl Transaction {
     ///
     /// # Errors
     ///
-    /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are enabled,
-    /// data-file actions have already been staged, or an operation is invalid for the current schema
-    /// or table configuration.
+    /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are
+    /// enabled, data-file actions have already been staged, or an operation is invalid for the
+    /// current schema or table configuration.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn with_schema_changes(

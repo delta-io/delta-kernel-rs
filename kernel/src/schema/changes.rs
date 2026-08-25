@@ -318,16 +318,12 @@ pub(crate) fn evolve_table_config(
         .clone()
         .with_schema(evolved_schema.clone())?
         .fold_with(new_max_column_id, |evolved_metadata, id| {
-            evolved_metadata
-                .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+            evolved_metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
         });
 
     // Validates the evolved metadata against the protocol.
-    let evolved_table_config = TableConfiguration::try_new_with_schema(
-        table_config,
-        evolved_metadata,
-        evolved_schema,
-    )?;
+    let evolved_table_config =
+        TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)?;
     Ok(evolved_table_config)
 }
 
