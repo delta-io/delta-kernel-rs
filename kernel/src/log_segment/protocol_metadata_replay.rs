@@ -131,23 +131,23 @@ impl LogSegment {
 
     /// Replays the log segment for the newest Protocol and Metadata.
     ///
-    /// The declarative-plan and imperative paths both produce [`PmCandidate`]s that [`resolve_pm`]
-    /// resolves identically: newest version wins, and a checkpoint action's nested P&M is ranked at
-    /// its own `checkpointMetadata.version`.
+    /// The plan and non-plan paths both build [`PmCandidate`]s and hand them to [`resolve_pm`],
+    /// which keeps the highest-versioned Protocol and Metadata. A checkpoint action uses its own
+    /// `checkpointMetadata.version`, not the version of the commit it came from.
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         #[cfg(feature = "declarative-plans")]
         if let Some(executor) = engine.plan_executor() {
-            return resolve_pm(self.plan_pm_candidates(executor.as_ref())?);
+            return resolve_pm(self.pm_candidates_from_plan(executor.as_ref())?);
         }
-        resolve_pm(self.identify_pm_candidates(engine)?)
+        resolve_pm(self.pm_candidates(engine)?)
     }
 
-    /// Reads the commit cover and then the checkpoint, yielding one [`PmCandidate`] per batch
-    /// tagged with the version it came from.
-    fn identify_pm_candidates(
+    /// Reads the commit files, then the checkpoint, and returns one [`PmCandidate`] per batch. Each
+    /// candidate uses the version of the file its batch came from.
+    fn pm_candidates(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<PmCandidate>> + Send> {
@@ -159,8 +159,8 @@ impl LogSegment {
                 pm_candidate(&batch, Some(version), Some(version))
             });
 
-        // A base checkpoint's P&M is as of its file version -- distinct from an AMT checkpoint
-        // *action*, which `resolve_pm` ranks at its own `checkpointMetadata.version`.
+        // The checkpoint file's P&M is at the checkpoint version. This is not the same as an AMT
+        // checkpoint action, which `resolve_pm` handles using its own `checkpointMetadata.version`.
         let base_checkpoint_version = self.checkpoint_version.map(|v| v as i64);
         let checkpoint = self
             .create_checkpoint_stream(engine, checkpoint_schema, None, None, None, None)?
@@ -170,14 +170,14 @@ impl LogSegment {
         Ok(commits.chain(checkpoint))
     }
 
-    /// Resolves P&M through the declarative plan, yielding one [`PmCandidate`] per emitted batch.
+    /// Builds one [`PmCandidate`] per batch from the declarative plan.
     ///
-    /// The plan can't unnest the checkpoint action's nested P&M, so it projects `checkpoint` as an
-    /// opaque column and emits the newest protocol and metaData versions in side columns. The
-    /// candidate's P&M versions come from those columns; [`resolve_pm`] reconciles the checkpoint
-    /// action by its own version.
+    /// The plan can't read the Protocol and Metadata out of the nested checkpoint action, so it
+    /// passes `checkpoint` through as one column and computes the newest protocol and metaData
+    /// versions as separate columns. `read_pm_versions` reads those version columns, and
+    /// `resolve_pm` still handles the checkpoint action by its own version.
     #[cfg(feature = "declarative-plans")]
-    fn plan_pm_candidates(
+    fn pm_candidates_from_plan(
         &self,
         executor: &dyn PlanExecutor,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<PmCandidate>> + Send> {
@@ -198,7 +198,7 @@ impl LogSegment {
         let commit_files = self.commit_cover_version_tagged_scan_files()?;
         let commits = PlanBuilder::scan_json(commit_files, &["version"], versioned_schema.clone())?;
 
-        // A checkpoint's parts share one format; scan them with the matching operator.
+        // All parts of a checkpoint have the same format, so pick the scan operator for it.
         let checkpoint = self
             .checkpoint_version_tagged_scan_files()?
             .map(|(file_type, checkpoint_files)| {
@@ -253,10 +253,11 @@ impl LogSegment {
             .execute_op(Operation::QueryPlan(plan))?
             .into_data()?
             .map(|batch| {
-                // The plan deduped every action to one row, so treat the result as a log batch:
-                // that is where `pm_candidate` reads the checkpoint action from.
+                // Mark the batch as a log batch so `pm_candidate` reads the checkpoint action from
+                // it. The plan already deduped every action into a single row.
                 let batch = ActionsBatch::new(batch?, true);
-                let (protocol_version, metadata_version) = read_pm_versions(batch.actions.as_ref())?;
+                let (protocol_version, metadata_version) =
+                    read_pm_versions(batch.actions.as_ref())?;
                 pm_candidate(&batch, protocol_version, metadata_version)
             });
         Ok(candidates)
@@ -283,10 +284,10 @@ impl LogSegment {
     }
 }
 
-/// Protocol and Metadata parsed from one batch, each tagged with the version it was seen at.
+/// Protocol and Metadata parsed from one batch, each with the version it was found at.
 ///
-/// Under AMT, `checkpoint` carries a checkpoint action whose nested P&M is ranked at its own
-/// `checkpointMetadata.version` rather than the version of the commit containing it.
+/// Under AMT, `checkpoint` holds a checkpoint action. Its Protocol and Metadata use the action's
+/// own `checkpointMetadata.version`, not the version of the commit it came from.
 struct PmCandidate {
     protocol: Option<(i64, Protocol)>,
     metadata: Option<(i64, Metadata)>,
@@ -294,7 +295,7 @@ struct PmCandidate {
     checkpoint: Option<CheckpointAction>,
 }
 
-/// Resolves the newest Protocol and Metadata across all candidates, ranked by version.
+/// Returns the highest-versioned Protocol and Metadata across all candidates.
 fn resolve_pm(
     candidates: impl Iterator<Item = DeltaResult<PmCandidate>>,
 ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
@@ -320,7 +321,8 @@ fn resolve_pm(
     Ok((metadata.map(|(_, m)| m), protocol.map(|(_, p)| p)))
 }
 
-/// Replaces `current` when `candidate` is at least as new, keeping the highest version seen.
+/// Keeps whichever of `current` and `candidate` has the higher version.
+/// On a tie, `candidate` wins.
 fn take_newer<T>(current: &mut Option<(i64, T)>, candidate: Option<(i64, T)>) {
     if let Some((version, value)) = candidate {
         if current.as_ref().is_none_or(|(v, _)| version >= *v) {
@@ -329,8 +331,8 @@ fn take_newer<T>(current: &mut Option<(i64, T)>, candidate: Option<(i64, T)>) {
     }
 }
 
-/// The `(commit_schema, checkpoint_schema)` for P&M replay. Commits additionally project the AMT
-/// `checkpoint` action; base checkpoint files only carry top-level protocol and metaData.
+/// Returns the `(commit_schema, checkpoint_schema)` used for P&M replay. Commit files also read the
+/// AMT `checkpoint` action; base checkpoint files only have the top-level protocol and metaData.
 fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
     let checkpoint_schema = schema_ref! {
         (&PROTOCOL_FIELD),
@@ -347,9 +349,9 @@ fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
     (commit_schema, checkpoint_schema)
 }
 
-/// Builds a [`PmCandidate`] from one batch, tagging its top-level protocol and metaData with the
-/// versions the caller supplies (`None` when that action is absent from the batch). The AMT
-/// checkpoint action is parsed only from log batches, where it can appear.
+/// Builds a [`PmCandidate`] from one batch. The top-level protocol and metaData use the versions
+/// the caller passes in (`None` if that action isn't in the batch). The AMT checkpoint action is
+/// only read from log batches, since that's the only place it shows up.
 fn pm_candidate(
     batch: &ActionsBatch,
     protocol_version: Option<i64>,
@@ -372,8 +374,8 @@ fn pm_candidate(
     })
 }
 
-/// Reads the `*_version` columns the plan aggregate emits: the version of the newest protocol and
-/// metaData (`None` if absent).
+/// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits: the
+/// version of the newest protocol and metaData, or `None` if that action wasn't found.
 #[cfg(feature = "declarative-plans")]
 fn read_pm_versions(actions: &dyn EngineData) -> DeltaResult<(Option<i64>, Option<i64>)> {
     #[derive(Default)]
@@ -438,9 +440,8 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     use crate::{DeltaResult, Error};
 
-    // Single-column schema for a `metaData.schemaString`.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    const SCHEMA_STRING: &str =
+    const ONE_COLUMN_SCHEMA_STRING: &str =
         r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}"#;
 
     // Builds a commit line with a `checkpoint` action that carries protocol and metadata at
@@ -489,7 +490,6 @@ mod tests {
         .to_string()
     }
 
-    // Two-column schema, distinct from `SCHEMA_STRING` so a test can tell which metaData won.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     const TWO_COLUMN_SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
 
@@ -506,61 +506,122 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[tokio::test]
     async fn test_load_resolves_pm_from_manifest_commit_checkpoint_action() {
+        check_manifest_commit_checkpoint(non_plan_engine).await;
+        #[cfg(feature = "declarative-plans")]
+        check_manifest_commit_checkpoint(|store| SyncEngine::new_with_store(store)).await;
+    }
+
+    // A single commit whose only P&M is a checkpoint action. The build succeeds only if P&M came
+    // from that action, and the `id` column confirms it used the embedded metaData.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    async fn check_manifest_commit_checkpoint<E: Engine>(
+        make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    ) {
         let store = Arc::new(InMemory::new());
-        let engine = non_plan_engine(store.clone());
         let table_root = url::Url::parse("memory:///").unwrap();
         add_commit(
             table_root.as_str(),
             store.as_ref(),
             0,
-            checkpoint_commit(0, &["adaptiveMetadata-preview"], SCHEMA_STRING),
+            checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
         )
         .await
         .unwrap();
 
-        // The build succeeds only if P&M came from the checkpoint action, and `id` confirms it used
-        // the embedded metaData.
+        let engine = make_engine(store);
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         assert_eq!(snapshot.version(), 0);
         assert!(snapshot.schema().field("id").is_some());
     }
 
-    // The newest protocol and metadata win. Both replay paths must agree here.
+    // The newest protocol and metadata win, ranked by version. Every case runs on both plan/non-plan replay
+    // paths. Each case gives its own expected metaData column count and protocol reader-feature
+    // count so the assertion states what that case is checking.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
-    #[case::checkpoint_over_full_pm(
-        format!("{}\n{}", protocol_commit(1, 2), metadata_commit(SCHEMA_STRING)),
-        checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING)
+    // A newer checkpoint action beats the older top-level protocol and metaData.
+    #[case::newer_checkpoint_beats_older_pm(
+        format!("{}\n{}", protocol_commit(1, 2), metadata_commit(ONE_COLUMN_SCHEMA_STRING)),
+        checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING),
+        2,
+        1
     )]
-    #[case::checkpoint_over_metadata_only(
-        metadata_commit(SCHEMA_STRING),
-        checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING)
+    // A newer checkpoint action's metaData beats the older top-level metaData.
+    #[case::newer_checkpoint_beats_older_metadata(
+        metadata_commit(ONE_COLUMN_SCHEMA_STRING),
+        checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING),
+        2,
+        1
     )]
-    #[case::metadata_over_checkpoint(
-        checkpoint_commit(0, &["adaptiveMetadata-preview"], SCHEMA_STRING),
-        metadata_commit(TWO_COLUMN_SCHEMA_STRING)
+    // A newer top-level metaData beats the older checkpoint action's metaData.
+    #[case::newer_metadata_beats_older_checkpoint(
+        checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
+        metadata_commit(TWO_COLUMN_SCHEMA_STRING),
+        2,
+        1
+    )]
+    // Both protocols are reader v3, so only version ordering can pick the winner. The newer
+    // checkpoint action lists a second reader feature, and that count is what the assertion checks.
+    #[case::newer_checkpoint_protocol_wins(
+        checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
+        checkpoint_commit(1, &["adaptiveMetadata-preview", "deletionVectors"], ONE_COLUMN_SCHEMA_STRING),
+        1,
+        2
     )]
     #[tokio::test]
-    async fn resolve_pm_newest_action_wins(#[case] v0: String, #[case] v1: String) {
-        assert_newest_pm_wins(v0.clone(), v1.clone(), non_plan_engine).await;
-        #[cfg(feature = "declarative-plans")]
-        assert_newest_pm_wins(v0, v1, |store| SyncEngine::new_with_store(store)).await;
+    async fn resolve_pm_newest_action_wins(
+        #[case] v0: String,
+        #[case] v1: String,
+        #[case] expected_fields: usize,
+        #[case] expected_reader_features: usize,
+    ) {
+        assert_newest_pm_wins(v0, v1, expected_fields, expected_reader_features).await;
     }
 
-    // Commits v0 then v1, builds a snapshot with `make_engine`, and checks the winner: v1's
-    // two-column metaData and the checkpoint's adaptive protocol (reader v3).
+    // Runs the check on the non-plan path, then on the plan path when it's compiled in, so every
+    // case is verified against both.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    async fn assert_newest_pm_wins<E: Engine>(
+    async fn assert_newest_pm_wins(
         v0: String,
         v1: String,
+        expected_fields: usize,
+        expected_reader_features: usize,
+    ) {
+        build_and_check_pm(
+            &v0,
+            &v1,
+            expected_fields,
+            expected_reader_features,
+            non_plan_engine,
+        )
+        .await;
+        #[cfg(feature = "declarative-plans")]
+        build_and_check_pm(
+            &v0,
+            &v1,
+            expected_fields,
+            expected_reader_features,
+            |store| SyncEngine::new_with_store(store),
+        )
+        .await;
+    }
+
+    // Commits v0 then v1 with `make_engine`, then checks the resolved metaData column count and the
+    // resolved protocol's reader-feature count.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    async fn build_and_check_pm<E: Engine>(
+        v0: &str,
+        v1: &str,
+        expected_fields: usize,
+        expected_reader_features: usize,
         make_engine: impl FnOnce(Arc<InMemory>) -> E,
     ) {
         let store = Arc::new(InMemory::new());
         let table_root = url::Url::parse("memory:///").unwrap();
-        add_commit(table_root.as_str(), store.as_ref(), 0, v0)
+        add_commit(table_root.as_str(), store.as_ref(), 0, v0.to_string())
             .await
             .unwrap();
-        add_commit(table_root.as_str(), store.as_ref(), 1, v1)
+        add_commit(table_root.as_str(), store.as_ref(), 1, v1.to_string())
             .await
             .unwrap();
 
@@ -568,23 +629,21 @@ mod tests {
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
         assert_eq!(snapshot.version(), 1);
-        let schema = snapshot.schema();
-        assert!(
-            schema.field("name").is_some(),
-            "v1's two-column metaData should win"
-        );
         assert_eq!(
-            schema.num_fields(),
-            2,
-            "resolved metaData should be exactly the two-column schema"
+            snapshot.schema().num_fields(),
+            expected_fields,
+            "resolved metaData should have {expected_fields} column(s)"
         );
+        let protocol = snapshot.table_configuration().protocol();
         assert_eq!(
-            snapshot
-                .table_configuration()
-                .protocol()
-                .min_reader_version(),
+            protocol.min_reader_version(),
             3,
-            "protocol should resolve from the adaptive checkpoint action"
+            "AMT protocol is reader v3"
+        );
+        assert_eq!(
+            protocol.reader_features().map_or(0, |f| f.len()),
+            expected_reader_features,
+            "resolved protocol should have {expected_reader_features} reader feature(s)"
         );
     }
 
@@ -607,7 +666,7 @@ mod tests {
             table_root.as_str(),
             store.as_ref(),
             0,
-            checkpoint_commit(0, &["adaptiveMetadata-preview"], SCHEMA_STRING),
+            checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
         )
         .await
         .unwrap();
@@ -623,7 +682,7 @@ mod tests {
             table_root.as_str(),
             store.as_ref(),
             2,
-            checkpoint_commit(0, &["adaptiveMetadata-preview"], SCHEMA_STRING),
+            checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
         )
         .await
         .unwrap();
