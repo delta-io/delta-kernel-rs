@@ -123,7 +123,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
         self.operations.push(SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field,
         });
         self.transition()
@@ -141,13 +141,13 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
 
     /// Add a new column or nested field to the table schema.
     ///
-    /// `path` identifies the struct that will contain `field`. An empty path targets the table's
-    /// root schema; path segments may traverse nested structs, array elements, map keys, and map
-    /// values.
+    /// `parent` identifies the struct that will contain `field`. An empty parent targets the
+    /// table's root schema; segments may traverse nested structs, array elements, map keys, and
+    /// map values.
     ///
     /// The added field must be nullable (existing data files lack the column and will read NULL),
-    /// must not be a top-level metadata column and must not collide case-insensitively with a
-    /// sibling in the target struct. The path must resolve to a struct.
+    /// must not be a metadata column and must not collide case-insensitively with a
+    /// sibling in the target struct. `parent` must resolve to a struct.
     ///
     /// With column mapping enabled, existing IDs and physical names are preserved and missing
     /// annotations are assigned.
@@ -156,11 +156,11 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     #[internal_api]
     pub(crate) fn add_column_at(
         mut self,
-        path: ColumnName,
+        parent: ColumnName,
         field: StructField,
     ) -> AlterTableTransactionBuilder<Modifying> {
         self.operations
-            .push(SchemaOperation::AddColumn { path, field });
+            .push(SchemaOperation::AddColumn { parent, field });
         self.transition()
     }
 }

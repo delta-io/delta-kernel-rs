@@ -425,6 +425,59 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+// ============================================================================
+// Add column at tests
+// ============================================================================
+
+#[rstest]
+#[tokio::test]
+async fn add_column_at_round_trip(
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "parent": {
+            nullable "existing": INTEGER,
+        },
+    };
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|mode| vec![("delta.columnMapping.mode", mode)])
+        .unwrap_or_default();
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &properties)?;
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("parent"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let parent = reloaded_schema.field("parent").expect("parent must exist");
+    let DataType::Struct(parent) = parent.data_type() else {
+        panic!("parent must remain a struct")
+    };
+    assert!(parent.field("existing").is_some());
+
+    let added = parent.field("added").expect("added field must exist");
+    assert_eq!(added.data_type(), &DataType::STRING);
+    assert!(added.is_nullable());
+    assert_eq!(added.column_mapping_id().is_some(), cm_mode.is_some());
+    assert_eq!(
+        added
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .is_some(),
+        cm_mode.is_some()
+    );
+
+    Ok(())
+}
+
 /// Nested `add_column_at` on a column-mapped table: commit + reload must persist the nested
 /// field's CM id / physical name and advance `maxColumnId`.
 #[rstest]
@@ -480,6 +533,100 @@ async fn add_column_at_nested_struct_with_column_mapping(
         cm_id,
         "table maxColumnId must equal the nested field's assigned id",
     );
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn add_column_at_containers_round_trip(
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    fn target_struct<'a>(schema: &'a StructType, path: &ColumnName) -> &'a StructType {
+        let (first, rest) = path.path().split_first().expect("non-empty path");
+        let mut data_type = schema
+            .field(first)
+            .unwrap_or_else(|| panic!("field '{first}' not found"))
+            .data_type();
+        for segment in rest {
+            data_type = match (segment.as_str(), data_type) {
+                ("element", DataType::Array(array)) => array.element_type(),
+                ("key", DataType::Map(map)) => map.key_type(),
+                ("value", DataType::Map(map)) => map.value_type(),
+                (name, DataType::Struct(parent)) => parent
+                    .field(name)
+                    .unwrap_or_else(|| panic!("field '{name}' not found"))
+                    .data_type(),
+                (segment, data_type) => {
+                    panic!("path segment '{segment}' does not match {data_type}")
+                }
+            };
+        }
+        let DataType::Struct(target) = data_type else {
+            panic!("path '{path}' does not resolve to a struct")
+        };
+        target
+    }
+
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "items": [ nullable {
+            nullable "existing": STRING,
+        } ],
+        nullable "by_key": {
+            { nullable "existing": STRING } => nullable INTEGER
+        },
+        nullable "by_value": {
+            INTEGER => nullable {
+                nullable "existing": STRING,
+            }
+        },
+    };
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|mode| vec![("delta.columnMapping.mode", mode)])
+        .unwrap_or_default();
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &properties)?;
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("items.element"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("by_key.key"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("by_value.value"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    for path in [
+        column_name!("items.element"),
+        column_name!("by_key.key"),
+        column_name!("by_value.value"),
+    ] {
+        let target = target_struct(reloaded_schema.as_ref(), &path);
+        assert!(target.field("existing").is_some());
+
+        let added = target.field("added").expect("added field must exist");
+        assert_eq!(added.data_type(), &DataType::STRING);
+        assert!(added.is_nullable());
+        assert_eq!(added.column_mapping_id().is_some(), cm_mode.is_some());
+        assert_eq!(
+            added
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+                .is_some(),
+            cm_mode.is_some()
+        );
+    }
+
     Ok(())
 }
 

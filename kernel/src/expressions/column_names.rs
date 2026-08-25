@@ -9,7 +9,7 @@ use crate::{DeltaResult, Error};
 
 /// A (possibly nested) column name.
 ///
-/// When recursing into an array element, map key or map value we use
+/// When recursing into an array element, map key or map value use
 /// "element", "key" or "value" respectively.
 ///
 /// # Examples
@@ -18,7 +18,8 @@ use crate::{DeltaResult, Error};
 /// The field named first_name would be represented as ["my_array", "element", "first_name"].
 ///
 /// {id: INT, my_map: MAP<STRING, STRUCT<first_name: STRING, last_name: STRING>>}
-/// The field named first_name would be represented as ["my_map", "key", "first_name"].
+/// The field named first_name would be represented as ["my_map", "value", "first_name"].
+/// The map key would be represented as ["my_map", "key"].
 #[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub struct ColumnName {
     path: Vec<String>,
