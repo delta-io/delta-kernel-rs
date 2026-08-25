@@ -196,9 +196,8 @@ impl LogSegment {
         Ok(commits.chain(checkpoint))
     }
 
-    /// Runs the aggregate plan and yields a [`PmCandidate`] per emitted batch. The plan collapses
-    /// the log into unordered rows, so the P&M versions come from the aggregate's version columns
-    /// rather than batch position.
+    /// Runs the aggregate plan and yields a [`PmCandidate`] per emitted batch. The aggregate emits
+    /// each action's version alongside it, so the candidate's P&M versions come from those columns.
     #[cfg(feature = "declarative-plans")]
     fn plan_pm_candidates(
         &self,
@@ -209,7 +208,6 @@ impl LogSegment {
             let actions = actions.as_ref();
             let (protocol_version, metadata_version) = read_pm_versions(actions)?;
             Ok(PmCandidate {
-                position: i64::MAX,
                 protocol: Protocol::try_new_from_data(actions)?
                     .zip(protocol_version)
                     .map(|(p, v)| (v, p)),
@@ -338,28 +336,25 @@ impl LogSegment {
     }
 }
 
-/// A per-batch Protocol and Metadata instance, tagged with the version each was seen at.
+/// Protocol and Metadata parsed from one batch, each tagged with the version it was seen at.
 ///
-/// `position` is the version of the batch the candidate came from; [`resolve_pm`] uses it to stop
-/// once nothing older can win. Under AMT, `checkpoint` carries a checkpoint action whose nested
-/// P&M is ranked at its own `checkpointMetadata.version`, which may lag `position`.
+/// Under AMT, `checkpoint` carries a checkpoint action whose nested P&M is ranked at its own
+/// `checkpointMetadata.version` rather than the version of the commit containing it.
 struct PmCandidate {
-    candidate_version: i64,
     protocol: Option<(i64, Protocol)>,
     metadata: Option<(i64, Metadata)>,
     #[cfg(feature = "adaptive-metadata-in-dev")]
     checkpoint: Option<CheckpointAction>,
 }
 
-/// Resolves the newest Protocol and Metadata from candidates yielded newest-first.
+/// Resolves the newest Protocol and Metadata across all candidates, ranked by version.
 fn resolve_pm(
     candidates: impl Iterator<Item = DeltaResult<PmCandidate>>,
 ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
-    for pm_candidate in candidates {
-        let candidate = pm_candidate?;
-        let version = candidate.candidate_version;
+    for candidate in candidates {
+        let candidate = candidate?;
         take_newer(&mut metadata, candidate.metadata);
         take_newer(&mut protocol, candidate.protocol);
         #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -373,11 +368,6 @@ fn resolve_pm(
                 &mut protocol,
                 Some((version, checkpoint.protocol().clone())),
             );
-        }
-        if let (Some((m, _)), Some((p, _))) = (&metadata, &protocol) {
-            if *m >= version && *p >= version {
-                break;
-            }
         }
     }
     Ok((metadata.map(|(_, m)| m), protocol.map(|(_, p)| p)))
@@ -394,12 +384,14 @@ fn take_newer<T>(current: &mut Option<(i64, T)>, candidate: Option<(i64, T)>) {
 
 /// Builds a [`PmCandidate`] from one batch, tagging any P&M with `version`. The AMT checkpoint
 /// action is parsed only from log batches, where it can appear.
-fn pm_candidate_from_batch(batch: &ActionsBatch, version: i64) -> DeltaResult<PmCandidate> {
+fn pm_candidate_from_batch(
+    batch: &ActionsBatch,
+    candidate_version: i64,
+) -> DeltaResult<PmCandidate> {
     let actions = batch.actions.as_ref();
     Ok(PmCandidate {
-        candidate_version: version,
-        protocol: Protocol::try_new_from_data(actions)?.map(|p| (version, p)),
-        metadata: Metadata::try_new_from_data(actions)?.map(|m| (version, m)),
+        protocol: Protocol::try_new_from_data(actions)?.map(|p| (candidate_version, p)),
+        metadata: Metadata::try_new_from_data(actions)?.map(|m| (candidate_version, m)),
         #[cfg(feature = "adaptive-metadata-in-dev")]
         checkpoint: if batch.is_log_batch {
             CheckpointAction::try_new_from_data(actions)?
