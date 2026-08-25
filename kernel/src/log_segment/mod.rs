@@ -1,5 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -14,6 +15,7 @@ use crate::actions::{
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
+use crate::engine_data::{GetData, TypedGetData as _};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
@@ -28,13 +30,16 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
-use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{
+    column_name, lazy_schema_ref, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
+    StructField, StructType, ToSchema as _,
+};
 use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
-    Version,
+    DeltaResult, Engine, EngineData, Error, FileMeta, Predicate, PredicateRef, RowVisitor,
+    StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -143,6 +148,37 @@ fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<Predica
     let mut predicates = columns.into_iter().map(Predicate::is_not_null);
     let first = predicates.next()?;
     Some(Arc::new(predicates.fold(first, Predicate::or)))
+}
+
+/// Reads the `_file` metadata column from a commit batch; all rows share one file, so row 0 is
+/// enough.
+fn commit_file_path(data: &dyn EngineData) -> DeltaResult<String> {
+    #[derive(Default)]
+    struct FilePathVisitor {
+        file: Option<String>,
+    }
+    impl RowVisitor for FilePathVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+                LazyLock::new(|| (vec![column_name!("_file")], vec![DataType::STRING]).into());
+            NAMES_AND_TYPES.as_ref()
+        }
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            if self.file.is_none() && row_count > 0 {
+                self.file = getters[0].get_opt(0, "_file")?;
+            }
+            Ok(())
+        }
+    }
+    let mut visitor = FilePathVisitor::default();
+    visitor.visit_rows_of(data)?;
+    visitor
+        .file
+        .ok_or_else(|| Error::internal_error("commit batch missing _file column"))
 }
 
 fn combine_checkpoint_predicates(
@@ -808,35 +844,46 @@ impl LogSegment {
         selected_files
     }
 
-    /// Reads each commit-cover file individually, pairing every batch with the version of the file
-    /// it came from (a compacted file uses its `hi`, the latest version it dedupes to). Unlike
-    /// [`CommitReader`], which flattens the whole commit cover into one stream, this preserves
-    /// per-file version attribution so callers can rank actions by version.
+    /// Reads the commit cover, pairing each batch with the version of the file it came from (a
+    /// compacted file uses its `hi`), so callers can rank actions by version.
     pub(crate) fn versioned_commit_batches(
         &self,
         engine: &dyn Engine,
         schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(i64, ActionsBatch)>> + Send> {
-        let json = engine.json_handler();
-        Ok(self
-            .find_commit_cover_paths()
-            .into_iter()
-            .flat_map(move |path| {
+        let paths = self.find_commit_cover_paths();
+        // Version of each commit file, keyed by location.
+        let version_by_file: HashMap<String, i64> = paths
+            .iter()
+            .map(|path| {
                 let version = match &path.file_type {
                     CompactedCommit { hi } => *hi as i64,
                     _ => path.version as i64,
                 };
-                match json.read_json_files(
-                    std::slice::from_ref(&path.location),
-                    schema.clone(),
-                    None,
-                ) {
-                    Ok(batches) => itertools::Either::Right(
-                        batches.map(move |b| Ok((version, ActionsBatch::new(b?, true)))),
-                    ),
-                    Err(e) => itertools::Either::Left(std::iter::once(Err(e))),
-                }
-            }))
+                (path.location.location.to_string(), version)
+            })
+            .collect();
+        let files: Vec<FileMeta> = paths.into_iter().map(|path| path.location).collect();
+
+        // One read for all files; the `_file` column maps each batch back to its version.
+        let read_schema = Arc::new(StructType::try_new(schema.fields().cloned().chain(
+            std::iter::once(StructField::create_metadata_column(
+                "_file",
+                MetadataColumnSpec::FilePath,
+            )),
+        ))?);
+        let batches = engine
+            .json_handler()
+            .read_json_files(&files, read_schema, None)?;
+
+        Ok(batches.map(move |batch| {
+            let batch = batch?;
+            let file = commit_file_path(batch.as_ref())?;
+            let version = *version_by_file.get(&file).ok_or_else(|| {
+                Error::internal_error(format!("commit batch from unexpected file {file}"))
+            })?;
+            Ok((version, ActionsBatch::new(batch, true)))
+        }))
     }
 
     #[cfg(feature = "declarative-plans")]
