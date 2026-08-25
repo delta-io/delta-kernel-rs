@@ -30,8 +30,7 @@ use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
-use crate::schema::schema_ref;
-use crate::schema::StructType;
+use crate::schema::{schema_ref, StructType};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 #[cfg(feature = "declarative-plans")]
@@ -143,29 +142,16 @@ impl LogSegment {
         if let Some(executor) = engine.plan_executor() {
             return resolve_pm(self.plan_pm_candidates(executor.as_ref())?);
         }
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let commit_schema = schema_ref! {
-            (&PROTOCOL_FIELD),
-            (&METADATA_FIELD),
-            (&CHECKPOINT_ACTION_FIELD),
-        };
-        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let checkpoint_schema = schema_ref! {
-            (&PROTOCOL_FIELD),
-            (&METADATA_FIELD),
-        };
-        let commit_schema = checkpoint_schema.clone();
-        resolve_pm(self.log_pm_candidates(engine, commit_schema, checkpoint_schema)?)
+        resolve_pm(self.identify_pm_candidates(engine)?)
     }
 
-    /// Reads the commit cover and then the checkpoint, newest-first, yielding one [`PmCandidate`]
-    /// per batch tagged with the version it came from.
-    fn log_pm_candidates(
+    /// Reads the commit cover and then the checkpoint, yielding one [`PmCandidate`] per batch
+    /// tagged with the version it came from.
+    fn identify_pm_candidates(
         &self,
         engine: &dyn Engine,
-        commit_schema: Arc<StructType>,
-        checkpoint_schema: Arc<StructType>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<PmCandidate>> + Send> {
+        let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         let commits = self
             .versioned_commit_batches(engine, commit_schema)?
             .map(|batch| {
@@ -173,46 +159,28 @@ impl LogSegment {
                 pm_candidate(&batch, Some(version), Some(version))
             });
 
-        let checkpoint_version = self.checkpoint_version.map_or(0, |v| v as i64);
+        // A base checkpoint's P&M is as of its file version -- distinct from an AMT checkpoint
+        // *action*, which `resolve_pm` ranks at its own `checkpointMetadata.version`.
+        let base_checkpoint_version = self.checkpoint_version.map(|v| v as i64);
         let checkpoint = self
             .create_checkpoint_stream(engine, checkpoint_schema, None, None, None, None)?
             .actions
-            .map(move |b| pm_candidate(&b?, Some(checkpoint_version), Some(checkpoint_version)));
+            .map(move |b| pm_candidate(&b?, base_checkpoint_version, base_checkpoint_version));
 
         Ok(commits.chain(checkpoint))
     }
 
-    /// Runs the aggregate plan and yields a [`PmCandidate`] per emitted batch. The aggregate emits
-    /// each action's version alongside it, so the candidate's P&M versions come from those columns.
+    /// Resolves P&M through the declarative plan, yielding one [`PmCandidate`] per emitted batch.
+    ///
+    /// The plan can't unnest the checkpoint action's nested P&M, so it projects `checkpoint` as an
+    /// opaque column and emits the newest protocol and metaData versions in side columns. The
+    /// candidate's P&M versions come from those columns; [`resolve_pm`] reconciles the checkpoint
+    /// action by its own version.
     #[cfg(feature = "declarative-plans")]
     fn plan_pm_candidates(
         &self,
         executor: &dyn PlanExecutor,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<PmCandidate>> + Send> {
-        Ok(self.read_pm_batches_via_plan(executor)?.map(|batch| {
-            let actions = batch?.actions;
-            let actions = actions.as_ref();
-            let (protocol_version, metadata_version) = read_pm_versions(actions)?;
-            Ok(PmCandidate {
-                protocol: Protocol::try_new_from_data(actions)?
-                    .zip(protocol_version)
-                    .map(|(p, v)| (v, p)),
-                metadata: Metadata::try_new_from_data(actions)?
-                    .zip(metadata_version)
-                    .map(|(m, v)| (v, m)),
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                checkpoint: CheckpointAction::try_new_from_data(actions)?,
-            })
-        }))
-    }
-
-    #[cfg(feature = "declarative-plans")]
-    fn read_pm_batches_via_plan(
-        &self,
-        executor: &dyn PlanExecutor,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // The `checkpoint` action is projected as an opaque column; `replay_for_pm` parses and
-        // reconciles it by version, since the plan can't unnest the nested P&M itself.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -281,12 +249,17 @@ impl LogSegment {
             })?
             .build()?;
 
-        // NOTE: The plan dedupes all actions, so mark all results as coming from checkpoint
-        let batches = executor
+        let candidates = executor
             .execute_op(Operation::QueryPlan(plan))?
             .into_data()?
-            .map(|batch| Ok(ActionsBatch::new(batch?, true)));
-        Ok(Box::new(batches))
+            .map(|batch| {
+                // The plan deduped every action to one row, so treat the result as a log batch:
+                // that is where `pm_candidate` reads the checkpoint action from.
+                let batch = ActionsBatch::new(batch?, true);
+                let (protocol_version, metadata_version) = read_pm_versions(batch.actions.as_ref())?;
+                pm_candidate(&batch, protocol_version, metadata_version)
+            });
+        Ok(candidates)
     }
 
     // Replay the commit log, projecting rows to Protocol and Metadata action columns
@@ -295,19 +268,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let checkpoint_schema = schema_ref! {
-            (&PROTOCOL_FIELD),
-            (&METADATA_FIELD),
-        };
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let commit_schema = schema_ref! {
-            (&PROTOCOL_FIELD),
-            (&METADATA_FIELD),
-            (&CHECKPOINT_ACTION_FIELD),
-        };
-        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let commit_schema = checkpoint_schema.clone();
-
+        let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         Ok(self
             .read_actions_with_projected_checkpoint_actions(
                 engine,
@@ -366,6 +327,24 @@ fn take_newer<T>(current: &mut Option<(i64, T)>, candidate: Option<(i64, T)>) {
             *current = Some((version, value));
         }
     }
+}
+
+/// The `(commit_schema, checkpoint_schema)` for P&M replay. Commits additionally project the AMT
+/// `checkpoint` action; base checkpoint files only carry top-level protocol and metaData.
+fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
+    let checkpoint_schema = schema_ref! {
+        (&PROTOCOL_FIELD),
+        (&METADATA_FIELD),
+    };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    let commit_schema = schema_ref! {
+        (&PROTOCOL_FIELD),
+        (&METADATA_FIELD),
+        (&CHECKPOINT_ACTION_FIELD),
+    };
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    let commit_schema = checkpoint_schema.clone();
+    (commit_schema, checkpoint_schema)
 }
 
 /// Builds a [`PmCandidate`] from one batch, tagging its top-level protocol and metaData with the

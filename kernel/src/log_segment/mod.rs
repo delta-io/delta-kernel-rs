@@ -809,9 +809,9 @@ impl LogSegment {
     }
 
     /// Reads each commit-cover file individually, pairing every batch with the version of the file
-    /// it came from (a compacted file uses its `hi`). Unlike [`CommitReader`], which flattens the
-    /// whole commit cover into one stream, this preserves per-file version attribution so callers
-    /// can rank actions by version. Files are yielded newest-first.
+    /// it came from (a compacted file uses its `hi`, the latest version it dedupes to). Unlike
+    /// [`CommitReader`], which flattens the whole commit cover into one stream, this preserves
+    /// per-file version attribution so callers can rank actions by version.
     pub(crate) fn versioned_commit_batches(
         &self,
         engine: &dyn Engine,
