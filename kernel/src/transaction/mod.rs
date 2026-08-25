@@ -73,6 +73,8 @@ mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
 #[cfg(feature = "internal-api")]
+pub use schema_evolution::SchemaOperation;
+#[cfg(feature = "internal-api")]
 pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]
 mod stats_verifier;
@@ -212,7 +214,7 @@ pub struct Transaction<S = ExistingTable> {
     effective_table_config: TableConfiguration,
     // Whether to emit a Protocol action. True for CREATE TABLE and ALTER TABLE, false otherwise.
     should_emit_protocol: bool,
-    // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    // Whether to emit a Metadata action. True when creating or altering table metadata.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
     operation: Option<String>,
@@ -1678,6 +1680,7 @@ mod tests {
     use rstest::rstest;
     use url::Url;
 
+    use super::schema_evolution::SchemaOperation;
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
@@ -2014,11 +2017,18 @@ mod tests {
         Ok(())
     }
 
+    fn fresh_column_operation() -> SchemaOperation {
+        SchemaOperation::add_column(
+            StructField::nullable("fresh_column", DataType::INTEGER),
+            ColumnName::new(Vec::<String>::new()),
+        )
+    }
+
     #[test]
     fn write_state_reflects_updated_effective_table_config(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, snapshot) = setup_non_dv_table();
-        let mut txn = snapshot
+        let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
@@ -2031,21 +2041,7 @@ mod tests {
             .logical_schema()
             .contains("fresh_column"));
 
-        let evolved_schema = schema_ref! {
-            ..(txn.effective_table_config.logical_schema().fields()),
-            nullable "fresh_column": INTEGER,
-        };
-        let evolved_metadata = txn
-            .effective_table_config
-            .metadata()
-            .clone()
-            .with_schema(evolved_schema.clone())?;
-        let evolved_table_config = TableConfiguration::try_new_with_schema(
-            &txn.effective_table_config,
-            evolved_metadata,
-            evolved_schema,
-        )?;
-        txn.replace_effective_table_config(evolved_table_config);
+        let txn = txn.with_schema_changes(vec![fresh_column_operation()])?;
 
         let updated_write_state = txn.write_state()?;
         let updated_write_context = updated_write_state.unpartitioned_write_context()?;
@@ -2059,6 +2055,124 @@ mod tests {
             .logical_schema()
             .contains("fresh_column"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn schema_changes_are_applied_once_and_persisted_on_commit() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+
+        let snapshot = txn
+            .with_schema_changes(vec![SchemaOperation::add_column(
+                StructField::nullable("first_column", DataType::INTEGER),
+                ColumnName::new(Vec::<String>::new()),
+            )])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert!(snapshot.schema().contains("first_column"));
+
+        // A second transaction starts from the committed schema, so its own change must land on
+        // top of the first one rather than replacing or re-applying it.
+        let snapshot = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_schema_changes(vec![SchemaOperation::add_column(
+                StructField::nullable("second_column", DataType::STRING),
+                ColumnName::new(Vec::<String>::new()),
+            )])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        assert!(snapshot.schema().contains("first_column"));
+        assert!(snapshot.schema().contains("second_column"));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_set_nullable_is_persisted_on_commit() -> DeltaResult<()> {
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+        ])?);
+        let snapshot = create_table("memory:///set_nullable", schema, "test")
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert!(!snapshot.schema().field("id").unwrap().is_nullable());
+
+        let snapshot = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_schema_changes(vec![SchemaOperation::set_nullable(column_name!("id"))])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        assert!(snapshot.schema().field("id").unwrap().is_nullable());
+        assert!(snapshot.schema().field("name").unwrap().is_nullable());
+        Ok(())
+    }
+
+    #[test]
+    fn schema_add_struct_then_nested_field_is_persisted_on_commit() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+        let snapshot = txn
+            .with_schema_changes(vec![
+                SchemaOperation::add_column(
+                    StructField::nullable("address", StructType::try_new(vec![])?),
+                    ColumnName::new(Vec::<String>::new()),
+                ),
+                SchemaOperation::add_column(
+                    StructField::nullable("city", DataType::STRING),
+                    column_name!("address"),
+                ),
+            ])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let schema = snapshot.schema();
+        let address = schema.field("address").unwrap();
+        let DataType::Struct(inner) = address.data_type() else {
+            panic!(
+                "expected address to be a struct, got {:?}",
+                address.data_type()
+            );
+        };
+        let city = inner.field("city").expect("city nested under address");
+        assert_eq!(city.data_type(), &DataType::STRING);
+        assert!(city.is_nullable());
+        Ok(())
+    }
+
+    #[test]
+    fn schema_add_whole_struct_column_is_persisted_on_commit() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+        let address_type = StructType::try_new(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("street", DataType::STRING),
+        ])?;
+        let snapshot = txn
+            .with_schema_changes(vec![SchemaOperation::add_column(
+                StructField::nullable("address", address_type.clone()),
+                ColumnName::new(Vec::<String>::new()),
+            )])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let schema = snapshot.schema();
+        let address = schema.field("address").unwrap();
+        assert!(address.is_nullable());
+        assert_eq!(address.data_type(), &DataType::from(address_type));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_changes_are_rejected_after_staging_data() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        add_dummy_file(&mut txn);
+
+        let result = txn.with_schema_changes(vec![fresh_column_operation()]);
+
+        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
         Ok(())
     }
 

@@ -10,7 +10,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
 use delta_kernel::schema::{
     schema, schema_ref, try_schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
-    SchemaRef, StructField,
+    SchemaRef, StructField, StructType,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -421,6 +421,211 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
         .downcast_ref::<Int32Array>()
         .expect("b is int");
     assert_eq!(b_col.value(0), 100);
+
+    Ok(())
+}
+
+// ============================================================================
+// Add column at tests
+// ============================================================================
+
+#[rstest]
+#[tokio::test]
+async fn add_column_at_round_trip(
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "parent": {
+            nullable "existing": INTEGER,
+        },
+    };
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|mode| vec![("delta.columnMapping.mode", mode)])
+        .unwrap_or_default();
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &properties)?;
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("parent"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let parent = reloaded_schema.field("parent").expect("parent must exist");
+    let DataType::Struct(parent) = parent.data_type() else {
+        panic!("parent must remain a struct")
+    };
+    assert!(parent.field("existing").is_some());
+
+    let added = parent.field("added").expect("added field must exist");
+    assert_eq!(added.data_type(), &DataType::STRING);
+    assert!(added.is_nullable());
+    assert_eq!(added.column_mapping_id().is_some(), cm_mode.is_some());
+    assert_eq!(
+        added
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .is_some(),
+        cm_mode.is_some()
+    );
+
+    Ok(())
+}
+
+/// Nested `add_column_at` on a column-mapped table: commit + reload must persist the nested
+/// field's CM id / physical name and advance `maxColumnId`.
+#[rstest]
+#[tokio::test]
+async fn add_column_at_nested_struct_with_column_mapping(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "address",
+            StructType::try_new(vec![StructField::nullable("city", DataType::STRING)])?,
+        ),
+    ])?);
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max = max_column_id(&snapshot).expect("CM table must have maxColumnId");
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("address"),
+            StructField::nullable("zip", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let zip = reloaded_schema.field_at_path(&["address".to_string(), "zip".to_string()]);
+    let cm_id = zip
+        .column_mapping_id()
+        .expect("nested field must receive a column mapping id");
+    assert!(
+        cm_id > original_max,
+        "nested field id {cm_id} must exceed original max {original_max}"
+    );
+    match zip
+        .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+        .expect("physical name should be assigned")
+    {
+        MetadataValue::String(s) => assert!(s.starts_with("col-")),
+        other => panic!("expected String, got {other:?}"),
+    }
+    assert_eq!(
+        max_column_id(&reloaded).expect("CM table must have maxColumnId"),
+        cm_id,
+        "table maxColumnId must equal the nested field's assigned id",
+    );
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn add_column_at_containers_round_trip(
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    fn target_struct<'a>(schema: &'a StructType, path: &ColumnName) -> &'a StructType {
+        let (first, rest) = path.path().split_first().expect("non-empty path");
+        let mut data_type = schema
+            .field(first)
+            .unwrap_or_else(|| panic!("field '{first}' not found"))
+            .data_type();
+        for segment in rest {
+            data_type = match (segment.as_str(), data_type) {
+                ("element", DataType::Array(array)) => array.element_type(),
+                ("key", DataType::Map(map)) => map.key_type(),
+                ("value", DataType::Map(map)) => map.value_type(),
+                (name, DataType::Struct(parent)) => parent
+                    .field(name)
+                    .unwrap_or_else(|| panic!("field '{name}' not found"))
+                    .data_type(),
+                (segment, data_type) => {
+                    panic!("path segment '{segment}' does not match {data_type}")
+                }
+            };
+        }
+        let DataType::Struct(target) = data_type else {
+            panic!("path '{path}' does not resolve to a struct")
+        };
+        target
+    }
+
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "items": [ nullable {
+            nullable "existing": STRING,
+        } ],
+        nullable "by_key": {
+            { nullable "existing": STRING } => nullable INTEGER
+        },
+        nullable "by_value": {
+            INTEGER => nullable {
+                nullable "existing": STRING,
+            }
+        },
+    };
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|mode| vec![("delta.columnMapping.mode", mode)])
+        .unwrap_or_default();
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &properties)?;
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("items.element"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("by_key.key"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("by_value.value"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    for path in [
+        column_name!("items.element"),
+        column_name!("by_key.key"),
+        column_name!("by_value.value"),
+    ] {
+        let target = target_struct(reloaded_schema.as_ref(), &path);
+        assert!(target.field("existing").is_some());
+
+        let added = target.field("added").expect("added field must exist");
+        assert_eq!(added.data_type(), &DataType::STRING);
+        assert!(added.is_nullable());
+        assert_eq!(added.column_mapping_id().is_some(), cm_mode.is_some());
+        assert_eq!(
+            added
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+                .is_some(),
+            cm_mode.is_some()
+        );
+    }
 
     Ok(())
 }
