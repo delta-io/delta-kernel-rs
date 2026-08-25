@@ -110,7 +110,7 @@ async fn try_main() -> DeltaResult<()> {
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
-        txn = match txn.commit(&engine)? {
+        txn = match txn.commit(&engine, false /* skip_duplicate_validation */)? {
             CommitResult::CommittedTransaction(committed) => break committed,
             CommitResult::ConflictedTransaction(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
@@ -198,7 +198,7 @@ async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) 
     let table_path = table_url.as_str();
     let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
         .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+        .commit(engine, false /* skip_duplicate_validation */)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())

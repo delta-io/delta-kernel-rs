@@ -122,7 +122,7 @@ mod tests {
         let err = snapshot
             .transaction(committer, &engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap_err();
         assert!(matches!(
             err,

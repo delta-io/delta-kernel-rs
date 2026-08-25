@@ -89,7 +89,7 @@ mod supported {
         let _ = create_table(&table_path, schema.clone(), "Test/1.0")
             .with_table_properties(cm_properties(cm_mode))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?;
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
         let table_url = delta_kernel::try_parse_uri(&table_path)?;
         let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;

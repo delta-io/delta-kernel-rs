@@ -1322,7 +1322,7 @@ impl TestTableBuilder {
 
         let mut snapshot = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
             .unwrap_post_commit_snapshot();
 
         let crcs_at = self.log_state.crcs_at();
@@ -1496,7 +1496,7 @@ async fn write_data_commit<E: TaskExecutor>(
         txn.add_files(add_files);
     }
 
-    txn.commit(engine)
+    txn.commit(engine, false /* skip_duplicate_validation */)
 }
 
 /// Generate a single column of data based on its Arrow type.

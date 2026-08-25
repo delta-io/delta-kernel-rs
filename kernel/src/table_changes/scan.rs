@@ -501,7 +501,7 @@ mod tests {
             .with_table_properties([("delta.enableChangeDataFeed", "true")])
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap()
             .unwrap_committed();
 

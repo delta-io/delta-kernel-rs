@@ -181,7 +181,7 @@ impl Transaction {
     /// }
     ///
     /// // Commit the transaction
-    /// txn.commit(engine.as_ref())?;
+    /// txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -266,7 +266,7 @@ impl Transaction {
     /// // ... populate dv_map with file paths and their new DV descriptors ...
     ///
     /// txn.update_deletion_vectors(dv_map, files.into_iter())?;
-    /// txn.commit(engine)?;
+    /// txn.commit(engine, false /* skip_duplicate_validation */)?;
     /// ```
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]

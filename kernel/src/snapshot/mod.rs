@@ -2085,7 +2085,7 @@ mod tests {
 
         let _ = create_table_builder
             .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?;
+            .commit(&engine, false /* skip_duplicate_validation */)?;
 
         let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
         let ts = snapshot.get_timestamp(&engine)?;
@@ -2387,7 +2387,7 @@ mod tests {
                 Box::new(crate::committer::FileSystemCommitter::new()),
             )
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap();
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
         let result = snapshot.get_clustering_column_infos(&engine).unwrap();
@@ -2506,7 +2506,7 @@ mod tests {
             create_table("memory:///", schema, "test")
                 .build(&engine, Box::new(FileSystemCommitter::new()))
                 .unwrap()
-                .commit(&engine)
+                .commit(&engine, false /* skip_duplicate_validation */)
                 .unwrap()
                 .unwrap_committed();
             Snapshot::builder_for("memory:///").build(&engine).unwrap()

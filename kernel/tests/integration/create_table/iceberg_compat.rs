@@ -138,7 +138,7 @@ fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> DeltaResult<()> {
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.icebergCompatV3", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // 1. V3 is in writerFeatures (supported).

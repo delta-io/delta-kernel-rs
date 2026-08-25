@@ -122,7 +122,7 @@ fn setup_clustered_table(
             columns: clustering_cols,
         })
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let snapshot = set_table_properties(
         &table_path,

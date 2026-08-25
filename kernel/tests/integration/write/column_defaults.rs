@@ -705,7 +705,7 @@ async fn test_defaulted_clustering_column_round_trips_with_stats(
     kernel_create_table(&table_path, schema.clone(), "Test/1.0")
         .with_data_layout(DataLayout::clustered(["c"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_committed();
     add_column_defaults_feature_commit(Path::new(&table_path), 1, None)?;
 
@@ -758,7 +758,7 @@ async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
         .with_data_layout(DataLayout::partitioned(["p"]))
         .with_table_properties(table_properties)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_committed();
     add_column_defaults_feature_commit(Path::new(&table_path), 1, None)?;
 

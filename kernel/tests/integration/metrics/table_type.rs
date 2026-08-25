@@ -192,7 +192,7 @@ pub(super) fn create_simple_table(
     };
     builder
         .build(engine, make_committer(catalog_managed))?
-        .commit(engine)?
+        .commit(engine, false /* skip_duplicate_validation */)?
         .unwrap_committed();
     Ok(())
 }

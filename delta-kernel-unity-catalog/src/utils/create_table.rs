@@ -17,7 +17,7 @@
 //! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0")
 //!     .with_table_properties(disk_props)
 //!     .build(engine, committer);
-//! create_table_txn.commit(engine)?;
+//! create_table_txn.commit(engine, false /* skip_duplicate_validation */)?;
 //!
 //! // Step 3: Finalize table in UC
 //! let snapshot = /* load post-commit snapshot at version 0 */;
@@ -218,7 +218,7 @@ mod tests {
             .with_data_layout(data_layout)
             .build(engine, Box::new(TestCatalogCommitter))
             .unwrap()
-            .commit(engine)
+            .commit(engine, false /* skip_duplicate_validation */)
             .unwrap()
             .unwrap_committed();
         let snapshot = Snapshot::builder_for(table_path)
@@ -349,7 +349,7 @@ mod tests {
             .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .with_domain_metadata("myApp.retention".to_string(), r#"{"days":30}"#.to_string())
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap()
             .unwrap_committed();
 
@@ -424,7 +424,7 @@ mod tests {
             .with_table_properties(disk_props)
             .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap();
         let v0_snapshot = Snapshot::builder_for(table_path)
             .with_max_catalog_version(0)
@@ -433,7 +433,7 @@ mod tests {
         let result = v0_snapshot
             .transaction(Box::new(TestCatalogCommitter), &engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap();
         assert!(result.is_committed());
 

@@ -21,7 +21,7 @@
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0")
 //!     .with_table_properties([("myapp.version", "1.0")])
 //!     .build(engine, Box::new(FileSystemCommitter::new()))?
-//!     .commit(engine)?;
+//!     .commit(engine, false /* skip_duplicate_validation */)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -78,7 +78,7 @@ use crate::DeltaResult;
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0")
 ///     .build(engine, Box::new(FileSystemCommitter::new()))?
-///     .commit(engine)?;
+///     .commit(engine, false /* skip_duplicate_validation */)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -118,7 +118,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 ///     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ///
 /// // Commit the transaction to create the table
-/// transaction.commit(&engine)?;
+/// transaction.commit(&engine, false /* skip_duplicate_validation */)?;
 /// # Ok(())
 /// # }
 /// ```

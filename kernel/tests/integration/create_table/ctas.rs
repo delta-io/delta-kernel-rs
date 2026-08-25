@@ -221,7 +221,7 @@ async fn run_ctas_test(
         }
         let result = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?;
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
         match result {
             CommitResult::CommittedTransaction(c) => c
                 .post_commit_snapshot()
@@ -266,7 +266,8 @@ async fn run_ctas_test(
         .await?;
     tgt_txn.add_files(add_meta);
 
-    let commit_result = tgt_txn.commit(engine.as_ref())?;
+    let commit_result =
+        tgt_txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
     let tgt_snapshot = match commit_result {
         CommitResult::CommittedTransaction(c) => c
             .post_commit_snapshot()

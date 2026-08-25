@@ -25,7 +25,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             load_and_begin_transaction(table_url.clone(), &engine)?
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
-                .commit(&engine),
+                .commit(&engine, false /* skip_duplicate_validation */),
             Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
         ));
 
@@ -35,7 +35,9 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .with_transaction_id("app_id2".to_string(), 2);
 
         // commit!
-        assert!(txn.commit(&engine)?.is_committed());
+        assert!(txn
+            .commit(&engine, false /* skip_duplicate_validation */)?
+            .is_committed());
 
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)

@@ -97,7 +97,7 @@ async fn append_only_enforces_data_change_for_file_actions(
             ("delta.enableDeletionVectors", "true"),
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_post_commit_snapshot();
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
     let write_context = txn.unpartitioned_write_context()?;
@@ -110,7 +110,9 @@ async fn append_only_enforces_data_change_for_file_actions(
         )?);
         txn.add_files(engine.write_parquet(&data, &write_context).await?);
     }
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .unwrap_post_commit_snapshot();
 
     let staged_batches = (0..2)
         .map(|index| {
@@ -135,7 +137,7 @@ async fn append_only_enforces_data_change_for_file_actions(
             for scan_files in staged_batches {
                 txn.remove_files(scan_files);
             }
-            txn.commit(engine.as_ref())
+            txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)
         }
         AppendOnlyWrite::DeletionVectorUpdate => {
             let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
@@ -160,7 +162,7 @@ async fn append_only_enforces_data_change_for_file_actions(
                 })
                 .collect();
             txn.update_deletion_vectors(dv_map, staged_batches.into_iter().map(Ok))?;
-            txn.commit(engine.as_ref())
+            txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)
         }
     };
 
@@ -221,6 +223,14 @@ fn selected_scan_file_batch(
         file_action("same.parquet", None),
     ],
     expected_error: Some("multiple AddFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_add_allowed_when_validation_skipped(FileActionUniquenessCase {
+    adds: [
+        file_action("same.parquet", None),
+        file_action("same.parquet", None),
+    ],
+    skip_duplicate_validation: true,
     ..FileActionUniquenessCase::valid()
 })]
 #[case::duplicate_remove(FileActionUniquenessCase {
@@ -395,7 +405,7 @@ async fn commit_validates_file_action_uniqueness(
         )?)),
     )?;
 
-    let result = txn.commit(engine.as_ref());
+    let result = txn.commit(engine.as_ref(), case.skip_duplicate_validation);
     if let Some(expected_error) = case.expected_error {
         assert_result_error_with_message(result, expected_error);
     } else {
@@ -415,6 +425,7 @@ struct FileActionUniquenessCase {
     adds: [FileActionInput; 2],
     removes: SelectedFileActions,
     dv_updates: SelectedFileActions,
+    skip_duplicate_validation: bool,
     expected_error: Option<&'static str>,
 }
 
@@ -439,6 +450,7 @@ impl FileActionUniquenessCase {
                 ],
                 selection_vector: &[true, true],
             },
+            skip_duplicate_validation: false,
             expected_error: None,
         }
     }
@@ -615,7 +627,8 @@ async fn commit_validates_staged_remove_fields(
         ],
     )?;
     txn.add_files(adds);
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .unwrap_committed();
 
     // === Modify staged remove metadata ===
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -650,7 +663,7 @@ async fn commit_validates_staged_remove_fields(
         Box::new(ArrowEngineData::new(corrupted)),
         selection_vector.to_vec(),
     )?);
-    let result = txn.commit(engine.as_ref());
+    let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */);
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
     } else {
@@ -716,7 +729,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 
     txn.remove_files(remove_metadata);
 
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     match result {
         CommitResult::CommittedTransaction(committed) => {
@@ -866,7 +879,7 @@ async fn test_remove_scanned_file_sets_extended_metadata(
 
     let snapshot = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_post_commit_snapshot();
     let snapshot = insert_data(
         snapshot,
@@ -885,7 +898,7 @@ async fn test_remove_scanned_file_sets_extended_metadata(
             missing_fields,
         )?);
     }
-    let commit_result = txn.commit(engine.as_ref());
+    let commit_result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */);
     commit_result?.unwrap_committed();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
 
@@ -997,7 +1010,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
 
     // Commit the transaction
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     match result {
         CommitResult::CommittedTransaction(committed) => {
@@ -1360,7 +1373,10 @@ async fn test_update_deletion_vectors_rejects_corrupted_scan_files(
     }
     txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok))?;
 
-    assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref(), false /* skip_duplicate_validation */),
+        expected_error,
+    );
     Ok(())
 }
 
@@ -1513,7 +1529,7 @@ async fn test_update_deletion_vectors_multiple_files(
     txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
 
     // Commit the transaction
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     match result {
         CommitResult::CommittedTransaction(committed) => {
@@ -1649,7 +1665,9 @@ async fn test_update_deletion_vectors_respects_selection_vector(
             .into_iter()
             .map(Ok),
     )?;
-    setup_txn.commit(engine.as_ref())?.unwrap_committed();
+    setup_txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .unwrap_committed();
 
     let targeted: Vec<String> = target_indexes
         .iter()
@@ -1700,7 +1718,9 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     } else {
         update_result?;
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .unwrap_committed();
     let version = committed.commit_version();
 
     // Read the commit directly from the (in-memory) store.
@@ -1836,7 +1856,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         txn.remove_files(scan_metadata2.scan_files);
 
         // Commit the transaction
-        let result = txn.commit(engine.as_ref());
+        let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */);
 
         match result? {
             CommitResult::CommittedTransaction(committed) => {
@@ -2019,7 +2039,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
         txn.remove_files(FilteredEngineData::try_new(data2, selection_vector2)?);
 
         // Commit the transaction
-        let result = txn.commit(engine.as_ref())?;
+        let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
         match result {
             CommitResult::CommittedTransaction(committed) => {
@@ -2151,7 +2171,9 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             txn.remove_files(scan_metadata?.scan_files);
         }
 
-        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        let committed = txn
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+            .unwrap_committed();
         assert_eq!(committed.commit_version(), expected_commit_version);
 
         let remove_actions =
@@ -2255,7 +2277,8 @@ async fn test_remove_files_partitioned_with_parsed_columns(
             let add_meta = engine.write_parquet(data?.as_ref(), ctx.as_ref()).await?;
             txn.add_files(add_meta);
         }
-        txn.commit(engine.as_ref())?.unwrap_committed();
+        txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+            .unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let mut scan_builder = snapshot
@@ -2271,7 +2294,9 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         for scan_metadata in scan.scan_metadata(engine.as_ref())? {
             txn.remove_files(scan_metadata?.scan_files);
         }
-        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        let committed = txn
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+            .unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
 
         let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;

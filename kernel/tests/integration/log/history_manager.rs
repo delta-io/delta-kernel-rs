@@ -73,14 +73,14 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> DeltaResult<()> {
     let schema = get_simple_int_schema();
     let mut snap = create_table(&table_path, schema, "AtTimestampTest/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_post_commit_snapshot();
 
     // v1..=4: noop commits (each writes a metaData-free, add-free commit JSON).
     for _ in 1..=4 {
         snap = test_utils::begin_transaction(snap.clone(), engine.as_ref())?
             .with_engine_info("AtTimestampTest")
-            .commit(engine.as_ref())?
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
             .unwrap_post_commit_snapshot();
     }
 

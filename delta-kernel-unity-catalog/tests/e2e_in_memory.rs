@@ -124,7 +124,7 @@ fn commit(
         .clone()
         .transaction(Box::new(uc_committer(update_table_client)), engine)?
         .with_operation("WRITE".to_string())
-        .commit(engine)?
+        .commit(engine, false /* skip_duplicate_validation */)?
         .unwrap_post_commit_snapshot())
 }
 
@@ -191,7 +191,7 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     let err = snapshot
         .clone()
         .transaction(committer, &engine)?
-        .commit(&engine)
+        .commit(&engine, false /* skip_duplicate_validation */)
         .unwrap_err();
     assert!(
         matches!(err, delta_kernel::Error::Generic(msg) if msg.contains("Max unpublished commits"))
@@ -264,7 +264,7 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
     create_table(table_uri.as_str(), schema, "delta-kernel-uc-test")
         .with_table_properties(get_required_properties_for_disk(TABLE_ID))
         .build(engine.as_ref(), Box::new(uc_committer(&client)))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_committed();
     client.create_table(TABLE_ID)?;
 

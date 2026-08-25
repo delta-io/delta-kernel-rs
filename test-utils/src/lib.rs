@@ -1179,7 +1179,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
         .await?;
     txn.add_files(add_files_metadata);
 
-    txn.commit(engine.as_ref())
+    txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)
 }
 
 /// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
@@ -1604,7 +1604,7 @@ pub async fn write_batch_to_table(
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_meta);
-    match txn.commit(engine)? {
+    match txn.commit(engine, false /* skip_duplicate_validation */)? {
         delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
             .post_commit_snapshot()
             .expect("Failed to get post_commit_snapshot")
@@ -1737,7 +1737,7 @@ pub fn create_table_and_load_snapshot(
     let _ = create_table(table_path, schema, "Test/1.0")
         .with_table_properties(properties.to_vec())
         .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+        .commit(engine, false /* skip_duplicate_validation */)?;
 
     let table_url = delta_kernel::try_parse_uri(table_path)?;
     Snapshot::builder_for(table_url).build(engine)
@@ -1909,7 +1909,7 @@ pub fn remove_all_and_get_remove_actions(
     for sm in all_scan_metadata {
         txn.remove_files(sm.scan_files);
     }
-    let committed = match txn.commit(engine)? {
+    let committed = match txn.commit(engine, false /* skip_duplicate_validation */)? {
         CommitResult::CommittedTransaction(c) => c,
         _ => panic!("Transaction should be committed"),
     };

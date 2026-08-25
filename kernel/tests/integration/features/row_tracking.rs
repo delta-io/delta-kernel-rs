@@ -104,7 +104,7 @@ async fn write_data_to_table(
     }
 
     // Commit the transaction
-    txn.commit(engine.as_ref())
+    txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)
 }
 
 /// Helper function to create a row-tracking table with a single `number: INTEGER` column.
@@ -628,7 +628,9 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     let txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?;
 
     // Commit without adding any add files
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .is_committed());
 
     // Fetch and parse the commit
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
@@ -696,7 +698,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     txn2.add_files(metadata2);
 
     // Commit the first transaction - this should succeed
-    let result1 = txn1.commit(engine1.as_ref())?;
+    let result1 = txn1.commit(engine1.as_ref(), false /* skip_duplicate_validation */)?;
     match result1 {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(
@@ -717,7 +719,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     }
 
     // Commit the second transaction - this should result in a conflict
-    let result2 = txn2.commit(engine2.as_ref())?;
+    let result2 = txn2.commit(engine2.as_ref(), false /* skip_duplicate_validation */)?;
     match result2 {
         CommitResult::CommittedTransaction(committed) => {
             panic!(
@@ -982,7 +984,8 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
             .into_iter()
             .map(Ok),
     )?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .unwrap_committed();
 
     // Every survivor keeps the exact row ID it had before.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;

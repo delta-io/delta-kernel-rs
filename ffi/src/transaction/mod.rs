@@ -322,8 +322,10 @@ pub unsafe extern "C" fn commit(
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    commit_result_to_committed_handle(
+        txn.commit(engine.as_ref(), false /* skip_duplicate_validation */),
+    )
+    .into_extern_result(&extern_engine)
 }
 
 // ============================================================================
@@ -414,8 +416,10 @@ pub unsafe extern "C" fn create_table_commit(
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    commit_result_to_committed_handle(
+        txn.commit(engine.as_ref(), false /* skip_duplicate_validation */),
+    )
+    .into_extern_result(&extern_engine)
 }
 
 // ============================================================================
@@ -3036,7 +3040,12 @@ mod tests {
             vec![(&data_file_path, parquet_len as i64, 1_000_000, Some(4))],
         )?;
         add_txn.add_files(add_metadata);
-        let _ = add_txn.commit(kernel_engine.as_ref())?.unwrap_committed();
+        let _ = add_txn
+            .commit(
+                kernel_engine.as_ref(),
+                false, /* skip_duplicate_validation */
+            )?
+            .unwrap_committed();
 
         // Build and write a connector-authored DV file deleting rows 1 and 2 (ids 20, 30).
         let mut dv = KernelDeletionVector::new();

@@ -103,7 +103,9 @@ async fn test_create_table_with_row_tracking(
         txn.add_files(add_files);
     }
 
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .unwrap_committed();
     let snapshot = committed
         .post_commit_snapshot()
         .expect("should have snapshot");
@@ -233,7 +235,9 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
     txn.add_files(adds1);
     txn.add_files(adds2);
 
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .unwrap_committed();
     assert_eq!(committed.commit_version(), 0);
 
     let table_url = Url::from_directory_path(&table_path).expect("valid path");
@@ -272,7 +276,7 @@ fn test_create_table_with_row_tracking_and_clustering() -> DeltaResult<()> {
         .with_table_properties([("delta.enableRowTracking", "true")])
         .with_data_layout(DataLayout::clustered(["id"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_committed();
 
     let snapshot = committed
@@ -341,7 +345,9 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
         .await?;
     txn.add_files(add_files);
 
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .unwrap_committed();
     let snapshot = committed
         .post_commit_snapshot()
         .expect("should have snapshot");
@@ -409,7 +415,7 @@ async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() ->
     let _ = create_table(&table_path, super::simple_schema()?, "Test/1.0")
         .with_table_properties([("delta.feature.rowTracking", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let table_url = Url::from_directory_path(&table_path).expect("valid path");
 

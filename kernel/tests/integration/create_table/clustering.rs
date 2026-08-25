@@ -69,7 +69,7 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Delta
         );
     }
 
-    let _ = txn.commit(engine.as_ref())?;
+    let _ = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -107,7 +107,7 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
         .with_data_layout(DataLayout::clustered(["id"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     // Read back using kernel APIs and verify no duplicate features
     let table_url = delta_kernel::try_parse_uri(&table_path)?;

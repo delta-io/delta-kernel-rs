@@ -46,7 +46,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     assert!(txn
         .with_domain_metadata(domain1.to_string(), config1.to_string())
         .with_domain_metadata(domain2.to_string(), config2.to_string())
-        .commit(&engine)?
+        .commit(&engine, false /* skip_duplicate_validation */)?
         .is_committed());
 
     let commit_data = store
@@ -111,7 +111,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     let txn = begin_transaction(snapshot.clone(), &engine)?;
     let res = txn
         .with_domain_metadata("delta.system".to_string(), "config".to_string())
-        .commit(&engine);
+        .commit(&engine, false /* skip_duplicate_validation */);
     assert_result_error_with_message(
         res,
         "Cannot modify domains that start with 'delta.' as those are system controlled",
@@ -122,7 +122,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     let res = txn2
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata("app.config".to_string(), "v2".to_string())
-        .commit(&engine);
+        .commit(&engine, false /* skip_duplicate_validation */);
     assert_result_error_with_message(
         res,
         "Metadata for domain app.config already specified in this transaction",
@@ -156,7 +156,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let res = begin_transaction(snapshot, &engine)?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
-        .commit(&engine);
+        .commit(&engine, false /* skip_duplicate_validation */);
 
     assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
 
@@ -188,7 +188,7 @@ async fn test_remove_domain_metadata_unsupported_writer_feature(
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let res = begin_transaction(snapshot, &engine)?
         .with_domain_metadata_removed("app.config".to_string())
-        .commit(&engine);
+        .commit(&engine, false /* skip_duplicate_validation */);
 
     assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
 
@@ -223,7 +223,7 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
     // removing domain metadata that doesn't exist should NOT write a tombstone
     let _ = txn
         .with_domain_metadata_removed(domain.to_string())
-        .commit(&engine)?;
+        .commit(&engine, false /* skip_duplicate_validation */)?;
 
     let commit_data = store
         .get(&Path::from(format!(
@@ -276,7 +276,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     let err = txn
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata_removed("app.config".to_string())
-        .commit(&engine)
+        .commit(&engine, false /* skip_duplicate_validation */)
         .unwrap_err();
     assert!(err
         .to_string()
@@ -287,7 +287,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     let err = txn2
         .with_domain_metadata_removed("test.domain".to_string())
         .with_domain_metadata("test.domain".to_string(), "v1".to_string())
-        .commit(&engine)
+        .commit(&engine, false /* skip_duplicate_validation */)
         .unwrap_err();
     assert!(err
         .to_string()
@@ -298,7 +298,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     let err = txn3
         .with_domain_metadata_removed("another.domain".to_string())
         .with_domain_metadata_removed("another.domain".to_string())
-        .commit(&engine)
+        .commit(&engine, false /* skip_duplicate_validation */)
         .unwrap_err();
     assert!(err
         .to_string()
@@ -308,7 +308,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     let txn4 = begin_transaction(snapshot.clone(), &engine)?;
     let err = txn4
         .with_domain_metadata_removed("delta.system".to_string())
-        .commit(&engine)
+        .commit(&engine, false /* skip_duplicate_validation */)
         .unwrap_err();
     assert!(err
         .to_string()
@@ -344,13 +344,13 @@ async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error
     let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
     let _ = txn
         .with_domain_metadata(domain.to_string(), configuration.to_string())
-        .commit(&engine)?;
+        .commit(&engine, false /* skip_duplicate_validation */)?;
 
     // txn 2: remove the same domain metadata
     let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
     let _ = txn
         .with_domain_metadata_removed(domain.to_string())
-        .commit(&engine)?;
+        .commit(&engine, false /* skip_duplicate_validation */)?;
 
     // verify removal commit preserves the previous configuration
     let commit_data = store

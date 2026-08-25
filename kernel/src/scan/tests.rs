@@ -348,7 +348,7 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
     create_table(url, schema, "DefaultEngine")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
-        .commit(&engine)
+        .commit(&engine, false /* skip_duplicate_validation */)
         .unwrap()
         .unwrap_committed();
 
@@ -379,7 +379,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     create_table(url, schema, "DefaultEngine")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
-        .commit(&engine)
+        .commit(&engine, false /* skip_duplicate_validation */)
         .unwrap()
         .unwrap_committed();
 

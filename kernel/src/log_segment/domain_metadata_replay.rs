@@ -169,7 +169,7 @@ mod tests {
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
         .with_domain_metadata("domainC".to_string(), "cfgC".to_string())
-        .commit(&engine)
+        .commit(&engine, false /* skip_duplicate_validation */)
         .unwrap();
 
         // Commit 1: add domainA and domainB via an existing-table transaction.
@@ -179,7 +179,7 @@ mod tests {
             .unwrap()
             .with_domain_metadata("domainA".to_string(), "cfgA".to_string())
             .with_domain_metadata("domainB".to_string(), "cfgB".to_string())
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap();
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
@@ -320,7 +320,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_domain_metadata_removed("domainA".to_string())
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap();
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         (engine, snapshot)

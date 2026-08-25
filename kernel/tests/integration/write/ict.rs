@@ -115,7 +115,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
 
     // First commit
-    let commit_result = txn.commit(&engine)?;
+    let commit_result = txn.commit(&engine, false /* skip_duplicate_validation */)?;
     match commit_result {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(
@@ -160,7 +160,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;
 
     // Second commit
-    let commit_result2 = txn2.commit(&engine)?;
+    let commit_result2 = txn2.commit(&engine, false /* skip_duplicate_validation */)?;
     match commit_result2 {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(

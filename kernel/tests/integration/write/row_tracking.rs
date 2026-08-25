@@ -48,7 +48,7 @@ async fn test_row_tracking_remove_gate(
     kernel_create_table(table_path.as_str(), schema.clone(), "Test/1.0")
         .with_table_properties(create_properties.iter().copied())
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_committed();
 
     // Optional v1: inject a metadata-only commit that sets `delta.rowTrackingSuspended=true`.
@@ -90,7 +90,7 @@ async fn test_row_tracking_remove_gate(
 
     if expect_err {
         let err = txn
-            .commit(engine.as_ref())
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)
             .expect_err("commit must fail when rowTracking is supported and not suspended");
         let msg = err.to_string();
         assert!(
@@ -98,7 +98,8 @@ async fn test_row_tracking_remove_gate(
             "expected remove-block error mentioning rowTracking, got: {msg}",
         );
     } else {
-        txn.commit(engine.as_ref())?.unwrap_committed();
+        txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+            .unwrap_committed();
     }
     Ok(())
 }

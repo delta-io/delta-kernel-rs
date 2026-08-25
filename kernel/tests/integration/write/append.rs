@@ -137,7 +137,9 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
             .with_engine_info("default engine");
 
         // Commit without adding any add files
-        assert!(txn.commit(&engine)?.is_committed());
+        assert!(txn
+            .commit(&engine, false /* skip_duplicate_validation */)?
+            .is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -246,7 +248,9 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // commit!
-        assert!(txn.commit(engine.as_ref())?.is_committed());
+        assert!(txn
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+            .is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -429,7 +433,7 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
         txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
 
         let err = txn
-            .commit(engine.as_ref())
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)
             .expect_err(&format!(
                 "commit should reject an add missing required field '{field}'"
             ))
@@ -489,7 +493,7 @@ async fn commit_rejects_add_with_invalid_partition_keys(
     }
     builder
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_post_commit_snapshot();
 
     let data_schema: Arc<ArrowSchema> = Arc::new(
@@ -534,6 +538,9 @@ async fn commit_rejects_add_with_invalid_partition_keys(
     let add = make_add(&txn, "b", 6)?;
     let corrupted = modify_add_file_partition_keys(into_record_batch(add), &modifications);
     txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
-    assert_result_error_with_message(txn.commit(engine.as_ref()), "partitionValues keys");
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref(), false /* skip_duplicate_validation */),
+        "partitionValues keys",
+    );
     Ok(())
 }

@@ -62,7 +62,7 @@ async fn test_create_simple_table() -> DeltaResult<()> {
     // Create table using new API
     let _ = create_table(&table_path, schema.clone(), "DeltaKernel-RS/0.17.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     // Verify table was created
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -120,7 +120,7 @@ async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
 
     let _ = txn
         .with_domain_metadata(domain.to_string(), config.to_string())
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     // Load snapshot and verify domain metadata was persisted
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -170,7 +170,7 @@ async fn test_create_table_already_exists() -> DeltaResult<()> {
     // Create table first time
     let _ = create_table(&table_path, schema.clone(), "UserManagementService/1.2.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     // Try to create again - should fail at build time (table already exists)
     let result = create_table(&table_path, schema.clone(), "UserManagementService/1.2.0")
@@ -191,7 +191,7 @@ async fn test_create_table_empty_schema_succeeds() -> DeltaResult<()> {
 
     create_table(&table_path, schema, "EmptySchemaApp/0.1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_committed();
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -223,7 +223,7 @@ async fn test_create_table_empty_schema_checkpoint_round_trip(
     }
     builder
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_committed();
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -296,7 +296,7 @@ fn test_create_table_with_non_null_columns_auto_enables_invariants(
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let protocol = snapshot.table_configuration().protocol();
@@ -332,7 +332,7 @@ async fn test_create_table_with_invariants_feature_signal_allowed() -> DeltaResu
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.invariants", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let protocol = snapshot.table_configuration().protocol();
@@ -393,7 +393,7 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
     // Create table
     let _ = create_table(&table_path, schema, engine_info)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     // Read the actual Delta log file
     let log_file_path = format!("{table_path}/_delta_log/00000000000000000000.json");
@@ -556,7 +556,7 @@ fn test_create_table_with_feature_signal(
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
         .with_table_properties([(property_key.as_str(), "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let table_config = snapshot.table_configuration();
@@ -605,7 +605,7 @@ fn test_create_table_with_checkpoint_stats_properties(
             ("delta.checkpoint.writeStatsAsStruct", struct_val.as_str()),
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let tp = snapshot.table_properties();
@@ -638,7 +638,7 @@ fn test_create_table_with_enablement_property(
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
         .with_table_properties([(property, value.as_str())])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let table_config = snapshot.table_configuration();
@@ -693,7 +693,7 @@ fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> Delta
 
     if cm_enabled {
         let txn = result?;
-        let _ = txn.commit(engine.as_ref())?;
+        let _ = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
         let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
         assert_eq!(snapshot.version(), 0);

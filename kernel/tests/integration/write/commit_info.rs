@@ -32,7 +32,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
             .with_engine_info("default engine");
 
         // commit!
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(&engine, false /* skip_duplicate_validation */)?;
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -76,7 +76,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
 
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(&engine, false /* skip_duplicate_validation */)?;
 
         let commit = store
             .get(&Path::from(format!(
@@ -152,7 +152,7 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
             .with_operation("WRITE".to_string())
             .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
 
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(&engine, false /* skip_duplicate_validation */)?;
 
         let commit = store
             .get(&Path::from(format!(

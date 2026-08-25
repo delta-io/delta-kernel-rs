@@ -81,7 +81,9 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .is_committed());
 
     // Verify the commit was written correctly
     let commit1 = store
@@ -159,7 +161,9 @@ async fn test_append_timestamp_stats_are_millisecond_truncated(
         .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
         .await?;
     txn.add_files(add_files_metadata);
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .is_committed());
 
     let commit1 = store
         .get(&Path::from(
@@ -339,7 +343,9 @@ async fn test_append_variant(
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -503,7 +509,9 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -569,7 +577,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let _ = kernel_create_table(&table_path, schema.clone(), "test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     // The non-null schema auto-enables the `invariants` writer feature.
@@ -643,7 +651,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         create_add_files_metadata(&add_schema, vec![("file.parquet", 100, 1000, Some(1))])
             .expect("metadata creation should succeed");
     txn.add_files(metadata);
-    txn.commit(engine.as_ref())
+    txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)
         .expect_err("commit should fail for invalid void schema")
 }
 
@@ -897,7 +905,7 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
 
     // Commit with NO add_files — this is a metadata-only operation and should succeed
-    let result = txn.commit(engine.as_ref());
+    let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */);
     assert!(
         result.is_ok(),
         "Metadata-only commit on void-in-array schema should succeed, got: {:?}",

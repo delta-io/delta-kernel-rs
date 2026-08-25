@@ -24,7 +24,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
     }
     let committed = builder
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 
@@ -81,7 +81,7 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
     }
     let committed = builder
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 

@@ -806,7 +806,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let result = txn
             .with_domain_metadata(domain.to_string(), value.to_string())
-            .commit(&engine)?;
+            .commit(&engine, false /* skip_duplicate_validation */)?;
         assert!(result.is_committed());
         Ok(())
     };
@@ -882,7 +882,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let result = txn
         .with_domain_metadata("foo".to_string(), "bar".to_string())
-        .commit(&engine)?;
+        .commit(&engine, false /* skip_duplicate_validation */)?;
     assert!(result.is_committed());
 
     // Verify domain exists before removal
@@ -897,7 +897,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let result = txn
         .with_domain_metadata_removed("foo".to_string())
-        .commit(&engine)?;
+        .commit(&engine, false /* skip_duplicate_validation */)?;
     assert!(result.is_committed());
 
     // Verify domain is gone before checkpoint
@@ -929,7 +929,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         "test",
     )
     .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .commit(&engine, false /* skip_duplicate_validation */)?;
 
     // Version 1
     add_commit(

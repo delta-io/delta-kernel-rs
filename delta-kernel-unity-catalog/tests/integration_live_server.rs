@@ -210,7 +210,7 @@ async fn live_create_table() {
         })
         .build(engine.as_ref(), committer)
         .expect("failed to build create-table transaction")
-        .commit(engine.as_ref())
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)
         .expect("failed to commit create-table transaction")
         .unwrap_committed();
 

@@ -153,7 +153,7 @@ async fn v3_commit_validates_num_records(
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .unwrap()
-        .commit(engine.as_ref())
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)
         .unwrap();
     let snapshot = Snapshot::builder_for(TABLE_ROOT)
         .build(engine.as_ref())
@@ -173,11 +173,17 @@ async fn v3_commit_validates_num_records(
 
     match expected {
         Ok(expected_version) => {
-            let committed = txn.commit(engine.as_ref()).unwrap().unwrap_committed();
+            let committed = txn
+                .commit(engine.as_ref(), false /* skip_duplicate_validation */)
+                .unwrap()
+                .unwrap_committed();
             assert_eq!(committed.commit_version(), expected_version);
         }
         Err(needle) => {
-            let err = txn.commit(engine.as_ref()).unwrap_err().to_string();
+            let err = txn
+                .commit(engine.as_ref(), false /* skip_duplicate_validation */)
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains(needle) && err.contains("part-fake.parquet"),
                 "expected error containing {needle:?} and 'part-fake.parquet', got: {err}",
@@ -258,7 +264,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
         .with_data_layout(DataLayout::partitioned(["region"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .unwrap()
-        .commit(engine.as_ref())
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)
         .unwrap();
 
     // === 4 commits (2 outer iters x 2 partitions), checkpoint, 4 more commits ===

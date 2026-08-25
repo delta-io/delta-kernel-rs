@@ -788,7 +788,7 @@ fn create_interval_partitioned_table(
         .with_data_layout(DataLayout::partitioned(["period"]))
         .with_table_properties(properties)
         .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?
+        .commit(engine, false /* skip_duplicate_validation */)?
         .unwrap_post_commit_snapshot();
     Ok(snapshot)
 }
@@ -815,7 +815,7 @@ fn create_partitioned_table(
     }
     let _ = builder
         .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+        .commit(engine, false /* skip_duplicate_validation */)?;
     Ok(Snapshot::builder_for(table_path).build(engine)?)
 }
 
@@ -1005,7 +1005,7 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         .with_data_layout(DataLayout::partitioned([partition_col]))
         .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let mut txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
         .with_engine_info("default engine");
@@ -1028,7 +1028,9 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     )]))?;
     let result = engine.write_parquet(&data, &write_context).await?;
     txn.add_files(result);
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .is_committed());
 
     let (add, _) = read_single_add(&table_path, 1)?;
     let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
@@ -1085,7 +1087,7 @@ async fn test_materialize_partition_columns_e2e(
             ("delta.columnMapping.mode", cm),
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // Data schema excludes partition columns.
@@ -1127,7 +1129,9 @@ async fn test_materialize_partition_columns_e2e(
             .await?;
         txn.add_files(add);
     }
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?
+        .unwrap_post_commit_snapshot();
 
     // ===== Verify the materialized partition columns from parquet =====
     let logical_schema = snapshot.schema();
@@ -1194,7 +1198,7 @@ async fn test_materialize_all_primitive_partition_types() -> Result<(), Box<dyn 
         .with_data_layout(DataLayout::partitioned(PARTITION_COLS.iter().copied()))
         .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // Data schema excludes partition columns.
@@ -1256,7 +1260,7 @@ async fn test_input_data_with_partition_column_errors(
         .with_data_layout(DataLayout::partitioned([partition_col]))
         .with_table_properties(properties)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
         .with_engine_info("default engine");
@@ -1353,7 +1357,7 @@ async fn test_partition_null_validation(
         .with_data_layout(DataLayout::partitioned(["p"]))
         .with_table_properties(properties)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     let result = begin_transaction(snapshot, engine.as_ref())?

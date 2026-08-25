@@ -195,7 +195,7 @@ impl SupportsDataFiles for CreateTable {}
 /// // stage table changes (right now only commit info)
 /// txn.commit_info(Box::new(ArrowEngineData::new(engine_commit_info)));
 /// // commit! (consume the transaction)
-/// txn.commit(&engine)?;
+/// txn.commit(&engine, false /* skip_duplicate_validation */)?;
 /// ```
 pub struct Transaction<S = ExistingTable> {
     span: tracing::Span,
@@ -346,6 +346,13 @@ impl<S> Transaction<S> {
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
+    ///
+    /// Set `skip_duplicate_file_action_validation` only when the caller guarantees that the
+    /// transaction contains no duplicate AddFile or RemoveFile paths and no AddFile and RemoveFile
+    /// pair with the same path and deletion vector ID.
+    ///
+    /// Duplicate validation builds two maps over all file actions. For 10,000 actions, benchmarks
+    /// measured 39% overhead for local commits and 1-4% for object-store commits.
     #[instrument(
         parent = &self.span,
         name = TRANSACTION_COMMIT_SPAN,
@@ -370,7 +377,11 @@ impl<S> Transaction<S> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
+    pub fn commit(
+        self,
+        engine: &dyn Engine,
+        skip_duplicate_file_action_validation: bool,
+    ) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
 
         // Some table features don't yet support removeFiles. Reject here.
@@ -438,17 +449,21 @@ impl<S> Transaction<S> {
         // each stats column.
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
-        let add_file_count = self
-            .add_files_metadata
-            .iter()
-            .map(|batch| batch.len())
-            .sum::<usize>();
-        let remove_file_count = selected_row_count(&self.remove_files_metadata);
-        let dv_update_count = selected_row_count(&self.dv_matched_files);
-        let mut existing_file_actions = write_validation::FileActionTracker::with_capacity(
-            add_file_count + dv_update_count,
-            remove_file_count + dv_update_count,
-        );
+        let mut existing_file_actions = if skip_duplicate_file_action_validation {
+            write_validation::FileActionTracker::without_duplicate_validation()
+        } else {
+            let add_file_count = self
+                .add_files_metadata
+                .iter()
+                .map(|batch| batch.len())
+                .sum::<usize>();
+            let remove_file_count = selected_row_count(&self.remove_files_metadata);
+            let dv_update_count = selected_row_count(&self.dv_matched_files);
+            write_validation::FileActionTracker::with_capacity(
+                add_file_count + dv_update_count,
+                remove_file_count + dv_update_count,
+            )
+        };
         write_validation::StagedDataValidator::staged_add_file(
             self.effective_table_config.physical_partition_columns(),
             &mut existing_file_actions,
@@ -3066,7 +3081,7 @@ mod tests {
         txn = txn.with_blind_append();
         // No files added — commit should fail with blind append validation
         let err = txn
-            .commit(_engine.as_ref())
+            .commit(_engine.as_ref(), false /* skip_duplicate_validation */)
             .expect_err("Blind append with no adds should fail");
         assert!(
             err.to_string()
@@ -3084,7 +3099,7 @@ mod tests {
         // Blind append with add files should pass validation and proceed to commit.
         // The commit itself may fail due to schema mismatch with the dummy data,
         // but we verify validation (line 415) passes on the Ok path.
-        let result = txn.commit(engine.as_ref());
+        let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */);
         // If it fails, it should NOT be an InvalidTransactionState error
         if let Err(e) = result {
             assert!(
@@ -3105,7 +3120,7 @@ mod tests {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
-        let result = txn.commit(engine.as_ref())?;
+        let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
         assert!(
             matches!(result, CommitResult::RetryableTransaction(_)),
             "Expected RetryableTransaction, got: {result:?}"
@@ -3467,7 +3482,7 @@ mod tests {
         let err = snapshot
             .transaction(committer, &engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -3488,7 +3503,7 @@ mod tests {
         let err = create_table("memory:///", schema, "test-engine")
             .build(&engine, committer)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, false /* skip_duplicate_validation */)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -3596,7 +3611,7 @@ mod tests {
         let mut txn = snapshot.transaction(Box::new(committer), &engine)?;
         add_dummy_file(&mut txn);
 
-        let result = txn.commit(&engine)?;
+        let result = txn.commit(&engine, false /* skip_duplicate_validation */)?;
         assert!(
             matches!(result, CommitResult::ConflictedTransaction(_)),
             "Expected ConflictedTransaction from capturing committer"
@@ -3632,7 +3647,7 @@ mod tests {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
-        let result = txn.commit(engine.as_ref())?;
+        let result = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
         assert!(matches!(result, CommitResult::RetryableTransaction(_)));
         let failure = commit_failure_event(&reporter).expect("commit failure event");
         assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
@@ -3647,7 +3662,9 @@ mod tests {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let mut txn = snapshot.transaction(Box::new(GenericErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
-        assert!(txn.commit(engine.as_ref()).is_err());
+        assert!(txn
+            .commit(engine.as_ref(), false /* skip_duplicate_validation */)
+            .is_err());
         let failure = commit_failure_event(&reporter).expect("commit failure event");
         assert_eq!(failure.reason, CommitFailureReason::Error);
         assert_eq!(failure.table_type, TableType::PathBased);

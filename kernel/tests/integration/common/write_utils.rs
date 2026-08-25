@@ -243,7 +243,7 @@ pub async fn write_data_and_check_result_and_stats(
     }
 
     // commit!
-    match txn.commit(engine.as_ref())? {
+    match txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)? {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(committed.commit_version(), expected_since_commit as Version);
             assert_eq!(
@@ -432,7 +432,7 @@ pub async fn create_dv_table_with_files(
     };
     txn.add_files(metadata);
 
-    let _ = txn.commit(engine.as_ref())?;
+    let _ = txn.commit(engine.as_ref(), false /* skip_duplicate_validation */)?;
 
     let paths: Vec<String> = file_paths.iter().map(|&s| s.to_string()).collect();
     Ok((store, engine, table_url, paths))

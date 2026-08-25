@@ -22,6 +22,7 @@ use crate::{DeltaResult, EngineData, Error};
 pub(super) struct FileActionTracker {
     add_paths: HashMap<String, Option<String>>,
     remove_paths: HashMap<String, Option<String>>,
+    skip_duplicate_validation: bool,
 }
 
 impl FileActionTracker {
@@ -29,10 +30,21 @@ impl FileActionTracker {
         Self {
             add_paths: HashMap::with_capacity(add_capacity),
             remove_paths: HashMap::with_capacity(remove_capacity),
+            skip_duplicate_validation: false,
+        }
+    }
+
+    pub(super) fn without_duplicate_validation() -> Self {
+        Self {
+            skip_duplicate_validation: true,
+            ..Self::default()
         }
     }
 
     fn record_add(&mut self, path: &str, dv_id: Option<String>) -> DeltaResult<()> {
+        if self.skip_duplicate_validation {
+            return Ok(());
+        }
         let Entry::Vacant(entry) = self.add_paths.entry(path.to_owned()) else {
             return Err(Error::generic(format!(
                 "Transaction contains multiple AddFile actions for path '{path}'"
@@ -50,6 +62,9 @@ impl FileActionTracker {
     }
 
     fn record_remove(&mut self, path: &str, dv_id: Option<String>) -> DeltaResult<()> {
+        if self.skip_duplicate_validation {
+            return Ok(());
+        }
         let Entry::Vacant(entry) = self.remove_paths.entry(path.to_owned()) else {
             return Err(Error::generic(format!(
                 "Transaction contains multiple RemoveFile actions for path '{path}'"
@@ -210,6 +225,14 @@ mod tests {
         } else {
             result.expect("valid file-action combination should be accepted");
         }
+    }
+
+    #[test]
+    fn duplicate_validation_can_be_skipped() {
+        let mut tracker = FileActionTracker::without_duplicate_validation();
+
+        tracker.record_add("same", None).unwrap();
+        tracker.record_add("same", None).unwrap();
     }
 
     #[derive(Clone, Copy)]
