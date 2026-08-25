@@ -182,6 +182,8 @@ impl LogSegment {
 
         let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
             .aggregate_ungrouped(|a| {
+                // Emit the newest protocol/metaData and the aliased `version` each sits at; without
+                // the alias both would collide on a `version` column.
                 let a = a
                     .max_non_null_by(
                         column_name!(PROTOCOL_NAME),
