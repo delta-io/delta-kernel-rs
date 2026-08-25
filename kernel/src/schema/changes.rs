@@ -14,7 +14,7 @@ use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    find_max_column_id_in_schema, schema_has_column_mapping_metadata,
+    drop_column_mapping_metadata, find_max_column_id_in_schema, schema_has_column_mapping_metadata,
     strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
     validate_column_mapping_id, ColumnMappingMode,
 };
@@ -208,6 +208,17 @@ pub(crate) fn apply_schema_operations(
                         field.name()
                     )));
                 }
+                // New columns must receive fresh identities rather than reusing caller-supplied
+                // identities that may refer to previously dropped columns.
+                let field_schema = StructType::new_unchecked([field]);
+                let field = drop_column_mapping_metadata(&field_schema)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        Error::internal_error(
+                            "column mapping metadata removal returned an empty schema",
+                        )
+                    })?;
                 let field = if cm_enabled {
                     let id = max_id.as_mut().ok_or_else(|| {
                         Error::invalid_protocol(
@@ -861,38 +872,34 @@ mod tests {
         f
     }
 
-    /// CM-enabled: a connector may pre-populate `delta.columnMapping.id` on the new column,
-    /// even at nested depth. The id is preserved and the missing `physicalName` is filled in,
-    /// matching delta-spark's `assignColumnIdAndPhysicalName`.
     #[rstest]
     #[case::top_level(field_with_id_only("tainted", DataType::STRING, 99))]
     #[case::nested_in_struct(StructField::nullable(
         "outer",
         StructType::try_new(vec![field_with_id_only("inner", DataType::STRING, 99)]).unwrap(),
     ))]
-    fn add_column_with_preexisting_cm_metadata_is_preserved_under_cm(#[case] field: StructField) {
+    fn add_column_replaces_supplied_column_mapping_ids(#[case] field: StructField) {
         let ops = vec![SchemaOperation::AddColumn {
             path: vec![],
             field,
         }];
-        let result = apply_schema_operations(
-            simple_schema(),
-            ops,
-            ColumnMappingMode::Name,
-            Some(2), // current_max_column_id
-        )
-        .unwrap();
+        let result =
+            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
+                .unwrap();
 
-        // The preserved id=99 must surface as the schema's max, even though the persisted
-        // maxColumnId was only 2 going in.
-        assert_eq!(find_max_column_id_in_schema(&result.schema), Some(99));
-        assert_eq!(result.new_max_column_id, Some(99));
+        let ids = result
+            .schema
+            .fields()
+            .last()
+            .expect("added field")
+            .collect_column_mapping_ids();
+        assert!(!ids.contains(&99));
+        assert!(ids.iter().all(|id| *id > 2));
+        assert_eq!(result.new_max_column_id, ids.iter().max().copied());
     }
 
-    /// CM-enabled, only `physicalName` provided: id is allocated as `max_id + 1` and the
-    /// physical name is preserved.
     #[test]
-    fn add_column_with_only_physical_name_allocates_id() {
+    fn add_column_replaces_supplied_physical_name_and_allocates_id() {
         let mut field = StructField::nullable("named", DataType::STRING);
         field.metadata.insert(
             ColumnMetadataKey::ColumnMappingPhysicalName
@@ -909,10 +916,8 @@ mod tests {
                 .unwrap();
         let added = result.schema.field("named").unwrap();
         assert_eq!(get_cm_id(added), 8);
-        assert_eq!(
-            added.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
-            Some(&MetadataValue::String("user-supplied-name".to_string()))
-        );
+        assert_ne!(get_physical_name(added), "user-supplied-name");
+        assert!(get_physical_name(added).starts_with("col-"));
         assert_eq!(result.new_max_column_id, Some(8));
     }
 
@@ -942,9 +947,8 @@ mod tests {
         );
     }
 
-    /// CM-enabled, wrong-typed `delta.columnMapping.id` annotation: error.
     #[test]
-    fn add_column_with_wrong_typed_id_is_rejected() {
+    fn add_column_replaces_non_numeric_column_mapping_id() {
         let mut field = StructField::nullable("bad", DataType::STRING);
         field.metadata.insert(
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
@@ -954,18 +958,12 @@ mod tests {
             path: vec![],
             field,
         }];
-        let err = apply_schema_operations(
-            simple_schema(),
-            ops,
-            ColumnMappingMode::Name,
-            Some(2), // current_max_column_id
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("non-numeric") && err.contains("delta.columnMapping.id"),
-            "error should name the wrong-typed id annotation, got: {err}"
-        );
+        let result =
+            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
+                .unwrap();
+        let added = result.schema.field("bad").unwrap();
+        assert_eq!(get_cm_id(added), 3);
+        assert_eq!(result.new_max_column_id, Some(3));
     }
 
     /// If the persisted `maxColumnId` is stale (smaller than the actual max ID present in

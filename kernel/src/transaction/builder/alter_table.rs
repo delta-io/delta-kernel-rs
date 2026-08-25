@@ -117,8 +117,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// The field must not already exist in the schema (case-insensitive). The field must be
     /// nullable because existing data files do not contain this column and will read NULL for it.
-    /// `field` and any of its nested fields must not carry `delta.columnMapping.id` or
-    /// `delta.columnMapping.physicalName` annotations.
+    /// Any caller-supplied column mapping annotations are replaced with fresh identities.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
@@ -144,6 +143,10 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// `path` identifies the struct that will contain `field`. An empty path targets the table's
     /// root schema; path segments may traverse nested structs, array elements, map keys, and map
     /// values.
+    ///
+    /// The added field must be nullable, must not be a metadata column, and must not collide
+    /// case-insensitively with a sibling in the target struct. Any caller-supplied column mapping
+    /// annotations are replaced with fresh identities.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     #[internal_api]
