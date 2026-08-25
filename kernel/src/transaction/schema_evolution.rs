@@ -8,8 +8,8 @@ use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_features::{
-    find_max_column_id_in_schema, try_assign_flat_column_mapping_info, validate_column_mapping_id,
-    ColumnMappingMode,
+    drop_column_mapping_metadata, find_max_column_id_in_schema,
+    try_assign_flat_column_mapping_info, validate_column_mapping_id, ColumnMappingMode,
 };
 use crate::DeltaResult;
 
@@ -23,11 +23,11 @@ use crate::DeltaResult;
 pub(crate) enum SchemaOperation {
     /// Add a column or nested field to the table schema.
     ///
-    /// The path identifies the struct that will contain `field`. An empty path adds `field` to the
-    /// table's root schema.
+    /// `parent` identifies the struct that will contain `field`. An empty parent adds `field` to
+    /// the table's root schema.
     AddColumn {
-        /// Path to the receiving struct; an empty path selects the root schema.
-        path: ColumnName,
+        /// Receiving struct; empty selects the root schema.
+        parent: ColumnName,
         /// The nullable, non-metadata field to add.
         field: StructField,
     },
@@ -60,15 +60,29 @@ fn set_field_nullable(field: &mut StructType, name: &str) -> DeltaResult<()> {
     Ok(())
 }
 
-/// Resolves `path` to a struct and applies `modifier`.
-///
-/// Field names are matched case-insensitively. Explicit path segments traverse arrays and maps.
+// Helper to modify a nested column. For each component in `path`, locates the matching field,
+// array element, map key, or map value (case-insensitive), then descends into the next nested data
+// type. At the leaf, calls `modifier` to mutate the field in place.
+//
+// `modifier` is expected to mutate the field's nullability, metadata, or `data_type` -- but
+// not its name. Renames need additional handling (IndexMap re-keying + sibling-conflict check)
+// that downstream PRs will introduce alongside the rename caller.
+//
+// Returns an error if a field in the path does not exist or an intermediate field is not a struct.
+//
+// Example:
+//   fields   = [ id: int not null, address: struct { city: string not null, zip: string } ]
+//   path   = ["address", "city"]
+//   modifier = |f| { f.nullable = true; Ok(()) }
+// yields:
+//   [ id: int not null, address: struct { city: string, zip: string } ]
 fn modify_field_at_path(
     data_type: &mut DataType,
     path: &[String],
     modifier: impl FnOnce(&mut StructType) -> DeltaResult<()>,
 ) -> DeltaResult<()> {
     let Some((segment, rest)) = path.split_first() else {
+        // `path` is empty, attempt to modify the current struct.
         let DataType::Struct(parent) = data_type else {
             return Err(Error::schema("path target is not a struct"));
         };
@@ -100,15 +114,21 @@ fn modify_field_at_path(
 pub(crate) struct SchemaEvolutionResult {
     /// The evolved schema after all operations are applied.
     pub schema: SchemaRef,
-    /// The new `delta.columnMapping.maxColumnId`, if it increased.
+    /// If `Some(id)`, `delta.columnMapping.maxColumnId` must be updated to this new value.
+    /// `None` means the property should remain unchanged.
     pub new_max_column_id: Option<i64>,
 }
 
-/// Applies schema operations sequentially, validating each operation against prior changes.
+/// Applies a sequence of schema operations to the given schema, returning a
+/// [`SchemaEvolutionResult`] (see the struct's docs for details).
+///
+/// Operations are applied sequentially: each one validates against and modifies the schema
+/// produced by all preceding operations, not the original input schema.
 ///
 /// # Errors
 ///
-/// Returns an error if an operation or the resulting schema is invalid.
+/// Returns an error if any operation fails validation. The error message identifies which
+/// operation failed and why.
 pub(crate) fn apply_schema_operations(
     mut schema: StructType,
     operations: Vec<SchemaOperation>,
@@ -130,7 +150,8 @@ pub(crate) fn apply_schema_operations(
         })?;
     }
 
-    // Use the schema's maximum when the persisted property is stale.
+    // When column mapping is enabled and the property is set, defensively take the max with
+    // the schema's actual max in case a non-conforming writer left the property stale.
     let mut max_id = if cm_enabled {
         current_max_column_id.map(|cfg| cfg.max(find_max_column_id_in_schema(&schema).unwrap_or(0)))
     } else {
@@ -140,7 +161,13 @@ pub(crate) fn apply_schema_operations(
     for op in operations {
         let mut root = DataType::from(schema);
         match op {
-            SchemaOperation::AddColumn { path, field } => {
+            // Protocol feature checks for the field's data type (e.g. `timestampNtz`) happen
+            // later when the caller builds a new TableConfiguration from the evolved schema --
+            // the alter is rejected if the table doesn't already have the required feature
+            // enabled. This matches Spark, which also rejects with
+            // `DELTA_FEATURES_REQUIRE_MANUAL_ENABLEMENT` and requires the user to enable the
+            // feature explicitly before adding such a column.
+            SchemaOperation::AddColumn { parent, field } => {
                 if field.is_metadata_column() {
                     return Err(Error::schema(format!(
                         "Cannot add column '{}': metadata columns are not allowed in a table schema",
@@ -150,6 +177,9 @@ pub(crate) fn apply_schema_operations(
                 if !matches!(field.data_type, DataType::Primitive(_)) {
                     StructType::ensure_no_metadata_columns_in_field(&field)?;
                 }
+                // Validate field is nullable (Delta protocol requires added columns to be
+                // nullable so existing data files can return NULL for the new column)
+                // NOTE: non-nullable columns depend on invariants feature
                 if !field.is_nullable() {
                     return Err(Error::schema(format!(
                         "Cannot add non-nullable column '{}'. Added columns must be nullable \
@@ -157,8 +187,17 @@ pub(crate) fn apply_schema_operations(
                         field.name()
                     )));
                 }
-                // TODO: Reject caller-supplied column mapping IDs and physical names recursively.
-                // Preserving them can reuse a dropped column's historical identity.
+                // A newly added column must receive a fresh identity; a caller-supplied identity
+                // could refer to a column that was previously dropped.
+                let field_schema = StructType::new_unchecked([field]);
+                let field = drop_column_mapping_metadata(&field_schema)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        Error::internal_error(
+                            "column mapping metadata removal returned an empty schema",
+                        )
+                    })?;
                 let field = if cm_enabled {
                     let id = max_id.as_mut().ok_or_else(|| {
                         Error::invalid_protocol(
@@ -166,11 +205,17 @@ pub(crate) fn apply_schema_operations(
                              is not set in table properties",
                         )
                     })?;
+                    // ALTER TABLE doesn't support icebergCompatV3 yet, so the new field never
+                    // gets `delta.columnMapping.nested.ids` here. Tracking issue:
+                    // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
                     try_assign_flat_column_mapping_info(&field, id)?
                 } else {
+                    // Stray CM metadata on a mapping-disabled table is handled by the AlterTable
+                    // builder, which strips annotations this ALTER newly introduces from the
+                    // evolved schema.
                     field
                 };
-                modify_field_at_path(&mut root, &path, |parent| add_field(parent, field))?;
+                modify_field_at_path(&mut root, parent.path(), |parent| add_field(parent, field))?;
             }
             SchemaOperation::SetNullable { column } => {
                 let (leaf, parent) = column
@@ -194,7 +239,8 @@ pub(crate) fn apply_schema_operations(
 
     validate_schema(&schema, column_mapping_mode)?;
 
-    // `max_id` can only increase; a decrease indicates an internal error.
+    // `max_id` is only ever incremented by `try_assign_flat_column_mapping_info`. If it grew,
+    // the new value must be persisted; if it went backwards, that's a bug.
     let new_max_column_id = match max_id.cmp(&current_max_column_id) {
         Ordering::Greater => max_id,
         Ordering::Equal => None,
@@ -237,14 +283,17 @@ mod tests {
             StructField::not_null(name, DataType::STRING)
         };
         SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field,
         }
     }
 
+    // Builds a struct column whose nested leaf field has the given name. Used to prove that
+    // `validate_schema` (not just the top-level dup check or `StructType::try_new`) is
+    // reached from `apply_schema_operations`.
     fn add_struct_with_nested_leaf(name: &str, leaf_name: &str) -> SchemaOperation {
         SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field: StructField::nullable(name, schema! { nullable (leaf_name): STRING }),
         }
     }
@@ -274,19 +323,19 @@ mod tests {
         StructType::try_new([StructField::nullable("existing", DataType::STRING)]).unwrap()
     }
 
-    fn nested_struct_at<'a>(mut data_type: &'a DataType, path: &[String]) -> &'a StructType {
-        for segment in path {
+    fn nested_struct_at<'a>(mut data_type: &'a DataType, parent: &[String]) -> &'a StructType {
+        for segment in parent {
             data_type = match (segment.as_str(), data_type) {
                 ("element", DataType::Array(array)) => array.element_type(),
                 ("key", DataType::Map(map)) => map.key_type(),
                 ("value", DataType::Map(map)) => map.value_type(),
                 (segment, data_type) => {
-                    panic!("path segment {segment:?} does not match {data_type}")
+                    panic!("parent segment {segment:?} does not match {data_type}")
                 }
             };
         }
         let DataType::Struct(parent) = data_type else {
-            panic!("path does not resolve to a struct");
+            panic!("parent does not resolve to a struct");
         };
         parent
     }
@@ -307,6 +356,8 @@ mod tests {
         }
     }
 
+    // === apply_schema_operations tests ===
+
     #[rstest]
     #[case::dup_exact(simple_schema(), vec![add_col("name", true)], "already exists")]
     #[case::dup_case_insensitive(simple_schema(), vec![add_col("Name", true)], "already exists")]
@@ -318,7 +369,7 @@ mod tests {
     #[case::dup_nested_sibling(
         nested_schema(),
         vec![SchemaOperation::AddColumn {
-            path: column_name!("address"),
+            parent: column_name!("address"),
             field: StructField::nullable("city", DataType::STRING),
         }],
         "already exists"
@@ -337,7 +388,7 @@ mod tests {
     #[case::metadata_column(
         simple_schema(),
         vec![SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field: StructField::create_metadata_column("row_idx", MetadataColumnSpec::RowIndex),
         }],
         "metadata columns are not allowed"
@@ -345,7 +396,7 @@ mod tests {
     #[case::missing_add_parent(
         simple_schema(),
         vec![SchemaOperation::AddColumn {
-            path: column_name!("missing"),
+            parent: column_name!("missing"),
             field: StructField::nullable("added", DataType::STRING),
         }],
         "does not exist"
@@ -353,7 +404,7 @@ mod tests {
     #[case::mismatched_path_segment(
         nested_schema(),
         vec![SchemaOperation::AddColumn {
-            path: ColumnName::new(["id", "element"]),
+            parent: ColumnName::new(["id", "element"]),
             field: StructField::nullable("x", DataType::STRING),
         }],
         "does not match"
@@ -386,6 +437,7 @@ mod tests {
         assert_eq!(&actual, expected_names);
     }
 
+    // === apply_schema_operations: SetNullable tests ===
     #[rstest]
     #[case::struct_parent(
         DataType::from(struct_with_existing_field()),
@@ -413,13 +465,13 @@ mod tests {
     )]
     fn add_column_at_traverses_nested_types(
         #[case] parent_type: DataType,
-        #[case] container_path: ColumnName,
+        #[case] parent_path: ColumnName,
     ) {
         let schema =
             StructType::try_new([StructField::nullable("container", parent_type)]).unwrap();
-        let path = column_name!("container").join(&container_path);
+        let parent = column_name!("container").join(&parent_path);
         let operation = SchemaOperation::AddColumn {
-            path,
+            parent,
             field: StructField::nullable("added", DataType::INTEGER),
         };
 
@@ -427,7 +479,7 @@ mod tests {
             apply_schema_operations(schema, vec![operation], ColumnMappingMode::None, None)
                 .unwrap();
         let container = result.schema.field("container").unwrap();
-        let parent = nested_struct_at(container.data_type(), container_path.path());
+        let parent = nested_struct_at(container.data_type(), parent_path.path());
 
         assert!(parent.field("existing").is_some());
         assert_eq!(
@@ -447,11 +499,11 @@ mod tests {
     ) {
         let ops = vec![
             SchemaOperation::AddColumn {
-                path: ColumnName::new(Vec::<String>::new()),
+                parent: ColumnName::new(Vec::<String>::new()),
                 field: StructField::nullable("parent", struct_with_existing_field()),
             },
             SchemaOperation::AddColumn {
-                path: column_name!("parent"),
+                parent: column_name!("parent"),
                 field: StructField::nullable("child", DataType::INTEGER),
             },
         ];
@@ -502,6 +554,8 @@ mod tests {
         );
     }
 
+    /// Setting a struct itself nullable must not mutate inner fields. Kept separate from the
+    /// `set_nullable_succeeds` rstest because it asserts on inner-field preservation.
     #[test]
     fn set_nullable_preserves_untouched_fields_and_order() {
         let schema = StructType::try_new(vec![
@@ -622,20 +676,20 @@ mod tests {
     fn add_column_with_column_mapping_assigns_id_and_physical_name(
         #[case] mode: ColumnMappingMode,
         #[case] schema: StructType,
-        #[case] path: ColumnName,
+        #[case] parent: ColumnName,
         #[case] name: &str,
         #[case] current_max: i64,
         #[case] expected_id: i64,
     ) {
         let ops = vec![SchemaOperation::AddColumn {
-            path: path.clone(),
+            parent: parent.clone(),
             field: StructField::nullable(name, DataType::STRING),
         }];
         let result = apply_schema_operations(schema, ops, mode, Some(current_max)).unwrap();
 
-        let mut field_path = path.into_inner();
-        field_path.push(name.to_string());
-        let added = result.schema.field_at_path(&field_path);
+        let mut parent_path = parent.into_inner();
+        parent_path.push(name.to_string());
+        let added = result.schema.field_at_path(&parent_path);
 
         assert_eq!(get_cm_id(added), expected_id);
         assert!(get_physical_name(added).starts_with("col-"));
@@ -645,7 +699,7 @@ mod tests {
     #[test]
     fn add_column_without_max_column_id_fails_when_mapping_enabled() {
         let ops = vec![SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field: StructField::nullable("email", DataType::STRING),
         }];
         let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, None)
@@ -654,19 +708,22 @@ mod tests {
         assert!(err.to_string().contains("maxColumnId"));
     }
 
+    /// Multiple columns added in a single ALTER on a CM table: each must get a distinct ID
+    /// (strictly monotone), a distinct physical name, and `new_max_column_id` must advance by
+    /// exactly the number of added columns.
     #[test]
     fn add_multiple_columns_with_column_mapping_assigns_unique_ids() {
         let ops = vec![
             SchemaOperation::AddColumn {
-                path: ColumnName::new(Vec::<String>::new()),
+                parent: ColumnName::new(Vec::<String>::new()),
                 field: StructField::nullable("a", DataType::STRING),
             },
             SchemaOperation::AddColumn {
-                path: ColumnName::new(Vec::<String>::new()),
+                parent: ColumnName::new(Vec::<String>::new()),
                 field: StructField::nullable("b", DataType::STRING),
             },
             SchemaOperation::AddColumn {
-                path: ColumnName::new(Vec::<String>::new()),
+                parent: ColumnName::new(Vec::<String>::new()),
                 field: StructField::nullable("c", DataType::STRING),
             },
         ];
@@ -698,6 +755,9 @@ mod tests {
         })
     }
 
+    /// Adding a complex column on a CM table: every inner struct field reachable through
+    /// Struct/Array/Map recursion must receive a distinct ID greater than the previous max,
+    /// and `new_max_column_id` must advance to the largest assigned ID.
     #[rstest]
     #[case::nested_struct(struct_of_two_primitives(), 3)]
     #[case::array_of_primitive(DataType::from(ArrayType::new(DataType::STRING, true)), 1)]
@@ -719,7 +779,7 @@ mod tests {
         #[case] expected_id_count: usize,
     ) {
         let ops = vec![SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field: StructField::nullable("col", data_type),
         }];
         let result =
@@ -744,14 +804,17 @@ mod tests {
     }
 
     fn field_with_id_only(name: &str, ty: DataType, id: i64) -> StructField {
-        let mut field = StructField::nullable(name, ty);
-        field.metadata.insert(
+        let mut f = StructField::nullable(name, ty);
+        f.metadata.insert(
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
             MetadataValue::Number(id),
         );
-        field
+        f
     }
 
+    /// CM-enabled: a connector may pre-populate `delta.columnMapping.id` on the new column,
+    /// even at nested depth. The id is preserved and the missing `physicalName` is filled in,
+    /// matching delta-spark's `assignColumnIdAndPhysicalName`.
     #[rstest]
     #[case::top_level(field_with_id_only("tainted", DataType::STRING, 99))]
     #[case::nested_in_struct(StructField::nullable(
@@ -760,21 +823,28 @@ mod tests {
             (field_with_id_only("inner", DataType::STRING, 99)),
         },
     ))]
-    fn add_column_with_preexisting_cm_metadata_is_preserved_under_cm(#[case] field: StructField) {
+    fn add_column_replaces_supplied_column_mapping_ids(#[case] field: StructField) {
         let ops = vec![SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field,
         }];
         let result =
             apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
                 .unwrap();
 
-        assert_eq!(find_max_column_id_in_schema(&result.schema), Some(99));
-        assert_eq!(result.new_max_column_id, Some(99));
+        let ids = result
+            .schema
+            .fields()
+            .last()
+            .expect("added field")
+            .collect_column_mapping_ids();
+        assert!(!ids.contains(&99));
+        assert!(ids.iter().all(|id| *id > 2));
+        assert_eq!(result.new_max_column_id, ids.iter().max().copied());
     }
 
     #[test]
-    fn add_column_with_only_physical_name_allocates_id() {
+    fn add_column_replaces_supplied_physical_name_and_allocates_id() {
         let mut field = StructField::nullable("named", DataType::STRING);
         field.metadata.insert(
             ColumnMetadataKey::ColumnMappingPhysicalName
@@ -783,7 +853,7 @@ mod tests {
             MetadataValue::String("user-supplied-name".to_string()),
         );
         let ops = vec![SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field,
         }];
         let result =
@@ -791,20 +861,22 @@ mod tests {
                 .unwrap();
         let added = result.schema.field("named").unwrap();
         assert_eq!(get_cm_id(added), 8);
-        assert_eq!(
-            added.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
-            Some(&MetadataValue::String("user-supplied-name".to_string()))
-        );
+        assert_ne!(get_physical_name(added), "user-supplied-name");
+        assert!(get_physical_name(added).starts_with("col-"));
         assert_eq!(result.new_max_column_id, Some(8));
     }
 
+    /// A persisted `delta.columnMapping.maxColumnId` above the protocol's 32-bit cap is
+    /// rejected before evolution starts, so the allocator never sees an out-of-range seed.
+    /// `i64::MAX` and `i32::MAX + 1` both cross the bound; the negative case ensures the
+    /// `0..=MAX_COLUMN_MAPPING_ID` range is closed on the low end too.
     #[rstest]
     #[case::above_protocol_max(i32::MAX as i64 + 1)]
     #[case::i64_max(i64::MAX)]
     #[case::negative(-1)]
     fn alter_with_out_of_range_persisted_max_column_id_is_rejected(#[case] seed: i64) {
         let ops = vec![SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field: StructField::nullable("anything", DataType::INTEGER),
         }];
         let err =
@@ -821,25 +893,27 @@ mod tests {
     }
 
     #[test]
-    fn add_column_with_wrong_typed_id_is_rejected() {
+    fn add_column_replaces_non_numeric_column_mapping_id() {
         let mut field = StructField::nullable("bad", DataType::STRING);
         field.metadata.insert(
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
             MetadataValue::String("not-a-number".to_string()),
         );
         let ops = vec![SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field,
         }];
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("non-numeric") && err.contains("delta.columnMapping.id"),
-            "error should name the wrong-typed id annotation, got: {err}"
-        );
+        let result =
+            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
+                .unwrap();
+        let added = result.schema.field("bad").unwrap();
+        assert_eq!(get_cm_id(added), 3);
+        assert_eq!(result.new_max_column_id, Some(3));
     }
 
+    /// If the persisted `maxColumnId` is stale (smaller than the actual max ID present in
+    /// the schema), the defensive seed rebases on the schema's max so a newly added column
+    /// cannot collide with an existing field's ID. Matches delta-spark's `findMaxColumnId`.
     #[test]
     fn stale_max_column_id_is_self_healed_by_schema_walk() {
         let mut existing = StructField::nullable("existing", DataType::STRING);
@@ -851,9 +925,10 @@ mod tests {
             (existing),
         };
         let ops = vec![SchemaOperation::AddColumn {
-            path: ColumnName::new(Vec::<String>::new()),
+            parent: ColumnName::new(Vec::<String>::new()),
             field: StructField::nullable("new", DataType::STRING),
         }];
+        // Persisted maxColumnId is stale at 5, but the schema actually contains id=42.
         let result =
             apply_schema_operations(schema, ops, ColumnMappingMode::Name, Some(5)).unwrap();
         let new_id = get_cm_id(result.schema.field("new").unwrap());
