@@ -632,6 +632,7 @@ impl<S> Transaction<S> {
     /// - inCommitTimestamp
     /// - operation
     /// - operationParameters
+    /// - operationMetrics
     /// - kernelVersion
     /// - isBlindAppend
     /// - engineInfo

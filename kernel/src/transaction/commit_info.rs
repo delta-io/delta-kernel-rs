@@ -14,7 +14,7 @@ use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, Into
 fn commit_info_literal_exprs(
     commit_info: CommitInfo,
 ) -> Result<Vec<(&'static str, ExpressionRef)>, Error> {
-    let op_params_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+    let string_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     let literal_exprs = vec![
         ("timestamp", Arc::new(lit(commit_info.timestamp))),
         (
@@ -26,10 +26,20 @@ fn commit_info_literal_exprs(
             "operationParameters",
             Arc::new(match commit_info.operation_parameters {
                 Some(map) => lit(MapData::try_new(
-                    op_params_map_type,
+                    string_map_type.clone(),
                     map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
                 )?),
-                None => null_lit(op_params_map_type),
+                None => null_lit(string_map_type.clone()),
+            }),
+        ),
+        (
+            "operationMetrics",
+            Arc::new(match commit_info.operation_metrics {
+                Some(map) => lit(MapData::try_new(
+                    string_map_type,
+                    map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
+                )?),
+                None => null_lit(string_map_type),
             }),
         ),
         ("kernelVersion", Arc::new(lit(commit_info.kernel_version))),
@@ -262,7 +272,7 @@ mod tests {
         )?;
         let commit_info = commit_info_struct(&result);
 
-        // All CommitInfo fields are appended -- total = 2 engine + 8 CommitInfo.
+        // All CommitInfo fields are appended after the two engine-only fields.
         assert_eq!(
             commit_info.num_columns(),
             2 + CommitInfo::to_schema().fields().count()
@@ -277,6 +287,7 @@ mod tests {
         assert_eq!(get_str(commit_info, "operation"), "WRITE");
         assert!(!get_str(commit_info, "kernelVersion").is_empty());
         assert!(get_map(commit_info, "operationParameters").len() == 0);
+        assert!(get_map(commit_info, "operationMetrics").is_empty());
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
         assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
@@ -295,6 +306,12 @@ mod tests {
         map_builder.values().append_value("stale_value");
         map_builder.append(true).unwrap();
         let stale_op_params = Arc::new(map_builder.finish()) as ArrayRef;
+        let mut metrics_map_builder =
+            MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        metrics_map_builder.keys().append_value("stale_metric");
+        metrics_map_builder.values().append_value("1");
+        metrics_map_builder.append(true).unwrap();
+        let stale_op_metrics = Arc::new(metrics_map_builder.finish()) as ArrayRef;
 
         let (data, schema) = make_engine_commit_info(
             vec![
@@ -304,6 +321,11 @@ mod tests {
                 ArrowField::new(
                     "operationParameters",
                     stale_op_params.data_type().clone(),
+                    true,
+                ),
+                ArrowField::new(
+                    "operationMetrics",
+                    stale_op_metrics.data_type().clone(),
                     true,
                 ),
                 ArrowField::new("kernelVersion", ArrowDataType::Utf8, true),
@@ -316,6 +338,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
                 stale_op_params,
+                stale_op_metrics,
                 Arc::new(StringArray::from(vec!["v0.0.0"])) as ArrayRef,
                 Arc::new(BooleanArray::from(vec![None::<bool>])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["stale_engine"])) as ArrayRef,
@@ -329,12 +352,16 @@ mod tests {
         )?;
         let commit_info = commit_info_struct(&result);
 
-        // All 8 CommitInfo fields are present in the engine schema -- no fields appended.
-        assert_eq!(commit_info.num_columns(), 8);
+        // All CommitInfo fields are present in the engine schema -- no fields appended.
+        assert_eq!(
+            commit_info.num_columns(),
+            CommitInfo::to_schema().fields().count()
+        );
 
         assert_eq!(get_str(commit_info, "operation"), "WRITE");
         assert!(!get_str(commit_info, "kernelVersion").is_empty());
         assert_eq!(get_map(commit_info, "operationParameters").len(), 0);
+        assert!(get_map(commit_info, "operationMetrics").is_empty());
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
         assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
@@ -380,8 +407,7 @@ mod tests {
         assert_eq!(ci.fields()[1].name(), "operation");
         assert_eq!(ci.fields()[2].name(), "myCustomField");
 
-        // Remaining CommitInfo fields (6 not in engine schema) are appended after myCustomField.
-        // Total = 3 engine fields + 6 kernel-only fields.
+        // Remaining CommitInfo fields are appended after myCustomField.
         assert_eq!(
             ci.num_columns(),
             3 + CommitInfo::to_schema().fields().count() - 2

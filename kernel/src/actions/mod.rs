@@ -882,6 +882,9 @@ pub(crate) struct CommitInfo {
     /// Map of arbitrary string key-value pairs that provide additional information about the
     /// operation. This is specified by the engine. For now this is always empty on write.
     pub(crate) operation_parameters: Option<HashMap<String, Option<String>>>,
+    /// Map of arbitrary string key-value pairs that provide operation metrics.
+    /// This is specified by the engine.
+    pub(crate) operation_metrics: Option<HashMap<String, Option<String>>>,
     /// The version of the delta_kernel crate used to write this commit. The kernel will always
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
@@ -907,6 +910,7 @@ impl CommitInfo {
             in_commit_timestamp,
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: Some(HashMap::new()),
+            operation_metrics: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             is_blind_append: is_blind_append.then_some(true),
             engine_info,
@@ -1940,6 +1944,7 @@ mod tests {
                 nullable "inCommitTimestamp": LONG,
                 nullable "operation": STRING,
                 nullable "operationParameters": { STRING => nullable STRING },
+                nullable "operationMetrics": { STRING => nullable STRING },
                 nullable "kernelVersion": STRING,
                 nullable "isBlindAppend": BOOLEAN,
                 nullable "engineInfo": STRING,
@@ -2256,6 +2261,9 @@ mod tests {
         let mut map_builder = create_string_map_builder(true);
         map_builder.append(true).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
+        let mut map_builder = create_string_map_builder(true);
+        map_builder.append(false).unwrap();
+        let operation_metrics = Arc::new(map_builder.finish());
 
         let expected = RecordBatch::try_new(
             record_batch.schema(),
@@ -2264,6 +2272,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![None::<i64>])),
                 Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
                 operation_parameters,
+                operation_metrics,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(BooleanArray::from(vec![None::<bool>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
