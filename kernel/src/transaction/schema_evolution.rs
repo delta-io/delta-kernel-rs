@@ -491,7 +491,8 @@ mod tests {
     /// Second op may target a struct created by the first; under CM, max ID advances across both.
     #[rstest]
     #[case::without_cm(ColumnMappingMode::None, None, None)]
-    #[case::with_cm(ColumnMappingMode::Name, Some(10), Some(13))]
+    #[case::with_name_cm(ColumnMappingMode::Name, Some(10), Some(13))]
+    #[case::with_id_cm(ColumnMappingMode::Id, Some(10), Some(13))]
     fn sequential_add_struct_then_nested_child(
         #[case] mode: ColumnMappingMode,
         #[case] current_max: Option<i64>,
@@ -838,6 +839,7 @@ mod tests {
             .last()
             .expect("added field")
             .collect_column_mapping_ids();
+        // The supplied id is replaced with a fresh one.
         assert!(!ids.contains(&99));
         assert!(ids.iter().all(|id| *id > 2));
         assert_eq!(result.new_max_column_id, ids.iter().max().copied());
