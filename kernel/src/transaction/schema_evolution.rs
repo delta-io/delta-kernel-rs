@@ -60,8 +60,9 @@ fn set_field_nullable(field: &mut StructType, name: &str) -> DeltaResult<()> {
     Ok(())
 }
 
-// Helper to modify a nested column. For each component in `path`, locates the matching field,
-// array element, map key, or map value (case-insensitive), then descends into the next nested data
+// Helper to modify a nested column. For each component in `path`,
+// locates the matching field (case-insensitive), array element, map key, or map value,
+// then descends into the next nested data
 // type. At the leaf, calls `modifier` to mutate the field in place.
 //
 // `modifier` is expected to mutate the field's nullability, metadata, or `data_type` -- but
@@ -72,7 +73,7 @@ fn set_field_nullable(field: &mut StructType, name: &str) -> DeltaResult<()> {
 //
 // Example:
 //   fields   = [ id: int not null, address: struct { city: string not null, zip: string } ]
-//   path   = ["address", "city"]
+//   path     = ["address", "city"]
 //   modifier = |f| { f.nullable = true; Ok(()) }
 // yields:
 //   [ id: int not null, address: struct { city: string, zip: string } ]
