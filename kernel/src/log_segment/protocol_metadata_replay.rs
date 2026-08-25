@@ -129,7 +129,7 @@ impl LogSegment {
         ))
     }
 
-    /// Replays the log segment for Protocol and Metadata
+    /// Replays the log segment for Protocol and Metadata, stopping early once both are found
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
@@ -289,7 +289,7 @@ struct VersionedBatch {
     batch: ActionsBatch,
 }
 
-/// The highest-versioned Protocol and Metadata across all batches.
+/// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
     batches: impl Iterator<Item = DeltaResult<VersionedBatch>>,
 ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
@@ -301,11 +301,22 @@ fn resolve_pm_batches(
             metadata_version,
             batch,
         } = batch?;
+        let batch_version = protocol_version.or(metadata_version);
         let candidate = pm_candidate(&batch, protocol_version, metadata_version)?;
         metadata = newer(metadata, candidate.metadata);
         protocol = newer(protocol, candidate.protocol);
+        // A checkpoint action's P&M can be older than its commit, so check version not presence.
+        if is_final(&protocol, batch_version) && is_final(&metadata, batch_version) {
+            break;
+        }
     }
     Ok((metadata.map(|(_, m)| m), protocol.map(|(_, p)| p)))
+}
+
+/// Whether `winner` is resolved at a version no older than `batch_version`. Batches are read
+/// newest-first, so a winner this new can't be replaced by any older batch still to come.
+fn is_final<T>(winner: &Option<(i64, T)>, batch_version: Option<i64>) -> bool {
+    matches!((winner, batch_version), (Some((v, _)), Some(bv)) if *v >= bv)
 }
 
 /// The higher-versioned of `a` and `b`. On a tie `b` wins, so pass the older offer as `a`.
