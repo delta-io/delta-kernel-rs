@@ -718,7 +718,7 @@ fn get_earliest_published_commit_version(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    // TODO: thread a cancellation token through the history-manager entry points.
+    // TODO(#3188): thread a cancellation token through the history-manager entry points.
     list_delta_log_from_storage(
         engine.storage_handler().as_ref(),
         log_root,
@@ -775,7 +775,7 @@ fn get_earliest_recreatable_commit(
     let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
     let mut earliest_commit_version: Option<Version> = None;
 
-    // TODO: thread a cancellation token through the history-manager entry points.
+    // TODO(#3188): thread a cancellation token through the history-manager entry points.
     let listing = list_delta_log_from_storage(
         engine.storage_handler().as_ref(),
         log_root,
