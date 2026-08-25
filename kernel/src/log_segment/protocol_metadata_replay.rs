@@ -313,8 +313,7 @@ fn resolve_pm_batches(
     Ok((metadata.map(|(_, m)| m), protocol.map(|(_, p)| p)))
 }
 
-/// Whether `winner` is resolved at a version no older than `batch_version`. Batches are read
-/// newest-first, so a winner this new can't be replaced by any older batch still to come.
+/// Whether `winner` is set at a version at least `batch_version`.
 fn is_final<T>(winner: &Option<(i64, T)>, batch_version: Option<i64>) -> bool {
     matches!((winner, batch_version), (Some((v, _)), Some(bv)) if *v >= bv)
 }
