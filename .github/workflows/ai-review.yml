@@ -14,17 +14,13 @@
 #   vars.CODEX_MAINTAINER_MODEL   Codex maintainer-pass model.
 #   vars.DISPROVE_MODEL           GPT disprove-gate model.
 #
-# The review runs automatically in artifact-only mode for non-draft PRs authored
-# by a repo collaborator with write-or-higher permission. It can also be triggered
-# by a /review comment or manual dispatch from an actor with the same access.
-# First rollout defaults to artifact-only. Push a no-op PR-branch update to
-# retrigger the automatic path while this workflow is being validated.
+# The review is manually triggered by a /review comment or workflow dispatch
+# from an actor with write-or-higher permission. First rollout defaults to
+# artifact-only while this workflow is being validated.
 # =============================================================================
 name: AI PR Review
 
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -47,7 +43,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+  group: ai-review-${{ github.event.issue.number || inputs.pr }}
   cancel-in-progress: true
 
 env:
@@ -62,11 +58,6 @@ jobs:
     timeout-minutes: 5
     if: >-
       !cancelled() && (
-        (
-          github.event_name == 'pull_request_target' &&
-          github.event.pull_request.draft == false &&
-          !endsWith(github.event.pull_request.user.login, '[bot]')
-        ) ||
         (
           github.event_name == 'issue_comment' &&
           github.event.issue.pull_request != null &&
@@ -89,9 +80,6 @@ jobs:
         id: trigger
         env:
           ACTOR: ${{ github.actor }}
-          AUTO_DRAFT: ${{ github.event.pull_request.draft }}
-          AUTO_PR: ${{ github.event.pull_request.number }}
-          AUTO_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           DISPATCH_MODE: ${{ inputs.output_mode }}
           DISPATCH_PR: ${{ inputs.pr }}
@@ -104,14 +92,6 @@ jobs:
           mode=artifact
           auth_subject="$ACTOR"
           case "$EVENT_NAME" in
-            pull_request_target)
-              n="$AUTO_PR"
-              auth_subject="$AUTO_PR_AUTHOR"
-              if [ "$AUTO_DRAFT" = "true" ]; then
-                echo "::notice::Skipping draft PR automatic review."
-                skip=true
-              fi
-              ;;
             issue_comment)
               command="$(grep -E '^[[:space:]]*/review([[:space:]]|$)' <<<"$COMMENT_BODY" | head -n1 || true)"
               if [ -z "$command" ]; then
