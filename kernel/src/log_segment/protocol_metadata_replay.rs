@@ -368,27 +368,32 @@ fn pm_candidate(
     })
 }
 
-/// The Protocol and Metadata carried by an AMT checkpoint action in `batch`, at the action's own
-/// `checkpointMetadata.version`. `None` without the feature, or when the batch carries no such
-/// action (checkpoint actions appear only in log batches).
-#[cfg(feature = "adaptive-metadata-in-dev")]
+/// The Protocol and Metadata nested in `batch`'s `checkpoint` action, tagged with the action's own
+/// `checkpointMetadata.version`. Checkpoint actions are only written for AMT manifest commits, so
+/// this is `None` unless `batch` is a log batch that carries one.
 fn checkpoint_pm(batch: &ActionsBatch) -> DeltaResult<Option<(i64, Protocol, Metadata)>> {
-    if !batch.is_log_batch {
-        return Ok(None);
-    }
-    let Some(checkpoint) = CheckpointAction::try_new_from_data(batch.actions.as_ref())? else {
-        return Ok(None);
-    };
-    Ok(Some((
-        checkpoint.version(),
-        checkpoint.protocol().clone(),
-        checkpoint.metadata().clone(),
-    )))
-}
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    {
+        if !batch.is_log_batch {
+            return Ok(None);
+        }
 
-#[cfg(not(feature = "adaptive-metadata-in-dev"))]
-fn checkpoint_pm(_batch: &ActionsBatch) -> DeltaResult<Option<(i64, Protocol, Metadata)>> {
-    Ok(None)
+        let checkpoint = CheckpointAction::try_new_from_data(batch.actions.as_ref())?;
+
+        Ok(checkpoint.map(|checkpoint| {
+            (
+                checkpoint.version(),
+                checkpoint.protocol().clone(),
+                checkpoint.metadata().clone(),
+            )
+        }))
+    }
+
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    {
+        let _ = batch;
+        Ok(None)
+    }
 }
 
 /// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits: the
