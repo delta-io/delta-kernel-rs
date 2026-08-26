@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use datafusion::arrow::array::{Array, AsArray as _, RecordBatch};
 use datafusion::arrow::datatypes::{Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::utils::get_row_at_idx;
 use datafusion::common::DataFusionError;
 use datafusion::datasource::listing::{ListingTableUrl, PartitionedFile};
@@ -20,7 +21,7 @@ use datafusion::execution::context::TaskContext;
 use datafusion::logical_expr::{
     Expr as DFExpr, LogicalPlan as DFLogicalPlan, LogicalPlanBuilder, TableType,
 };
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -259,6 +260,13 @@ impl ExecutionPlan for DynamicScanExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion, DataFusionError>,
+    ) -> Result<TreeNodeRecursion, DataFusionError> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -417,7 +425,6 @@ fn open_file(
         .with_file_group(FileGroup::new(vec![file]))
         .with_projection_indices(Some(table_schema_projection.to_vec()))?
         .with_expr_adapter(Some(Arc::new(KernelParquetExprAdapterFactory)))
-        .with_partitioned_by_file_group(false)
         .build();
     DataSourceExec::from_data_source(config).execute(0, context)
 }

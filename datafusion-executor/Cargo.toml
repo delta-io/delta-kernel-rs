@@ -6,7 +6,7 @@ homepage = "https://delta.io"
 license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 version = "0.26.0"
-rust-version = "1.88"
+rust-version = "1.94"
 
 [workspace]
 
@@ -17,10 +17,10 @@ chrono = "0.4"
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "declarative-plans",
   "vendored-protoc",
-  "arrow-58",
+  "arrow-59",
   "default-engine-base",
 ] }
-datafusion = "54"
+datafusion = "55"
 futures = "0.3"
 itertools = "0.14"
 tokio = { version = "1", features = ["rt"] }

@@ -204,7 +204,6 @@ impl TableProvider for StaticFileProvider {
             .with_projection_indices(projection.cloned())?
             .with_expr_adapter(self.expr_adapter.clone())
             .with_limit(limit)
-            .with_partitioned_by_file_group(false)
             .build();
         Ok(DataSourceExec::from_data_source(config))
     }
@@ -247,14 +246,16 @@ pub(crate) fn build_scan_table_layout(
             file_index += 1;
         }
     }
-    let constant_fields = constant_fields
+    let constant_fields: Vec<_> = constant_fields
         .into_iter()
         .map(|(_, field)| field)
         .collect();
 
     let file_schema = Arc::new(ArrowSchema::new(file_fields));
     (
-        TableSchema::new(file_schema, constant_fields),
+        TableSchema::builder(file_schema)
+            .with_table_partition_cols(constant_fields)
+            .build(),
         output_to_table_indices,
     )
 }

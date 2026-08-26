@@ -542,6 +542,7 @@ mod tests {
     use datafusion::arrow::array::{Array, AsArray, StringArray};
     use datafusion::assert_batches_eq;
     use datafusion::common::DFSchema;
+    use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
     use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
@@ -1103,7 +1104,13 @@ mod tests {
         .unwrap();
 
         let df_schema = DFSchema::try_from(arrow_schema).unwrap();
-        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        let physical = create_physical_expr(
+            &logical,
+            &df_schema,
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .unwrap();
         physical
             .evaluate(&batch)
             .unwrap()
