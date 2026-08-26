@@ -2,16 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::{ArrayRef, AsArray, Int32Array, Int64Array};
-use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Int32Type, Int64Type, Schema as ArrowSchema,
-};
+use delta_kernel::arrow::array::{AsArray, Int32Array, Int64Array, StringArray};
+use delta_kernel::arrow::datatypes::{Int32Type, Int64Type};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::schema::{schema_ref, MetadataColumnSpec};
+use delta_kernel::schema::{schema_ref, MetadataColumnSpec, StructField};
+use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
+use delta_kernel::transaction::WriteMode;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use test_utils::{
     insert_data_with, read_actions_from_commit, read_scan, test_table_setup_mt,
@@ -56,84 +56,96 @@ fn read_stable_values(
     Ok(values)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InvalidPreservingBatch {
-    MissingRowId,
-    MissingRowCommitVersion,
-    NullRowId,
-    NullRowCommitVersion,
-    WrongRowIdType,
-}
-
 #[rstest::rstest]
-#[case::missing_row_id(InvalidPreservingBatch::MissingRowId, "missing configured field")]
-#[case::missing_row_commit_version(
-    InvalidPreservingBatch::MissingRowCommitVersion,
-    "missing configured field"
-)]
-#[case::null_row_id(InvalidPreservingBatch::NullRowId, "contains null values")]
-#[case::null_row_commit_version(
-    InvalidPreservingBatch::NullRowCommitVersion,
-    "contains null values"
-)]
-#[case::wrong_row_id_type(InvalidPreservingBatch::WrongRowIdType, "must have type Int64")]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_preserving_writer_rejects_missing_or_null_stable_values(
-    #[case] invalid_batch: InvalidPreservingBatch,
-    #[case] expected_error: &str,
+async fn test_preserving_write_context_transforms_complete_input(
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Name,
+        ColumnMappingMode::Id
+    )]
+    column_mapping_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = schema_ref! { nullable "number": INTEGER };
+    let schema = schema_ref! {
+        nullable "number": INTEGER,
+        nullable "label": STRING,
+    };
+    let column_mapping_mode = match column_mapping_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Name => "name",
+        ColumnMappingMode::Id => "id",
+    };
     let snapshot = kernel_create_table(table_path.as_str(), schema, "Test/1.0")
-        .with_table_properties([("delta.enableRowTracking", "true")])
+        .with_table_properties([
+            ("delta.enableRowTracking", "true"),
+            ("delta.columnMapping.mode", column_mapping_mode),
+        ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    let write_context = txn.unpartitioned_write_context()?;
-    let row_id_field = write_context
-        .materialized_row_id_field()
-        .expect("row tracking write context must expose row ID field");
-    let row_commit_version_field = write_context
-        .materialized_row_commit_version_field()
-        .expect("row tracking write context must expose row commit version field");
+    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let write_context =
+        txn.unpartitioned_write_context_with_input(WriteMode::PreserveRowTracking)?;
+    let logical_data_schema = write_context.logical_data_schema().clone();
 
-    let mut fields = vec![ArrowField::new("number", ArrowDataType::Int32, true)];
-    let mut columns = vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef];
-    if invalid_batch != InvalidPreservingBatch::MissingRowId {
-        if invalid_batch == InvalidPreservingBatch::WrongRowIdType {
-            fields.push(ArrowField::new(
-                row_id_field.name(),
-                ArrowDataType::Int32,
-                true,
-            ));
-            columns.push(Arc::new(Int32Array::from(vec![0, 1])));
-        } else {
-            fields.push(row_id_field.try_into_arrow()?);
-            let values = match invalid_batch {
-                InvalidPreservingBatch::NullRowId => vec![Some(0), None],
-                _ => vec![Some(0), Some(1)],
-            };
-            columns.push(Arc::new(Int64Array::from(values)));
-        }
-    }
-    if invalid_batch != InvalidPreservingBatch::MissingRowCommitVersion {
-        fields.push(row_commit_version_field.try_into_arrow()?);
-        let values = match invalid_batch {
-            InvalidPreservingBatch::NullRowCommitVersion => vec![Some(0), None],
-            _ => vec![Some(0), Some(0)],
-        };
-        columns.push(Arc::new(Int64Array::from(values)));
-    }
-    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?;
-    let result = engine
-        .write_parquet_preserving_row_tracking(&ArrowEngineData::new(batch), &write_context)
-        .await;
-    let error = result.err().expect("invalid stable values must fail");
-    assert!(
-        error.to_string().contains(expected_error),
-        "unexpected error: {error}"
+    let row_id_index = write_context.physical_data_schema().num_fields() - 2;
+    let row_id_field = write_context
+        .physical_data_schema()
+        .field_at_index(row_id_index)
+        .expect("output row ID field");
+    let row_commit_version_field = write_context
+        .physical_data_schema()
+        .field_at_index(row_id_index + 1)
+        .expect("output row commit version field");
+    assert_eq!(
+        Some(row_id_field.name()),
+        write_context
+            .materialized_row_id_field()
+            .map(StructField::name)
     );
+    assert_eq!(
+        Some(row_commit_version_field.name()),
+        write_context
+            .materialized_row_commit_version_field()
+            .map(StructField::name)
+    );
+    assert!(!row_id_field.is_nullable());
+    assert!(!row_commit_version_field.is_nullable());
+
+    let input = RecordBatch::try_new(
+        Arc::new(logical_data_schema.as_ref().try_into_arrow()?),
+        vec![
+            Arc::new(Int32Array::from(vec![7])),
+            Arc::new(StringArray::from(vec!["value"])),
+            Arc::new(Int64Array::from(vec![101])),
+            Arc::new(Int64Array::from(vec![11])),
+        ],
+    )?;
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        logical_data_schema,
+        write_context.logical_to_physical(),
+        write_context.physical_data_schema().clone().into(),
+    )?;
+    let output =
+        ArrowEngineData::try_from_engine_data(evaluator.evaluate(&ArrowEngineData::new(input))?)?;
+    let output = output.record_batch();
+    let expected_names = write_context
+        .physical_data_schema()
+        .fields()
+        .map(StructField::name)
+        .collect::<Vec<_>>();
+    let output_arrow_schema = output.schema();
+    let actual_names = output_arrow_schema
+        .fields()
+        .iter()
+        .map(|field| field.name())
+        .collect::<Vec<_>>();
+    assert_eq!(actual_names, expected_names);
+    assert_eq!(output.column(0).as_primitive::<Int32Type>().value(0), 7);
+    assert_eq!(output.column(1).as_string::<i32>().value(0), "value");
+    assert_eq!(output.column(2).as_primitive::<Int64Type>().value(0), 101);
+    assert_eq!(output.column(3).as_primitive::<Int64Type>().value(0), 11);
     Ok(())
 }
 
@@ -335,21 +347,12 @@ async fn test_acknowledged_row_tracking_rewrite(
     let mut txn = snapshot
         .transaction(config.committer(), engine.as_ref())?
         .with_data_change(config == RewriteConfig::DataChange);
-    let write_context = txn.unpartitioned_write_context()?;
     let add_metadata = if matches!(config, RewriteConfig::Valid | RewriteConfig::DataChange) {
-        let row_id_field = write_context
-            .materialized_row_id_field()
-            .expect("row tracking write context must expose row ID field");
-        let row_commit_version_field = write_context
-            .materialized_row_commit_version_field()
-            .expect("row tracking write context must expose row commit version field");
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("number", ArrowDataType::Int32, true),
-            row_id_field.try_into_arrow()?,
-            row_commit_version_field.try_into_arrow()?,
-        ]));
+        let write_context =
+            txn.unpartitioned_write_context_with_input(WriteMode::PreserveRowTracking)?;
+        let logical_data_schema = write_context.logical_data_schema().clone();
         let replacement_batch = RecordBatch::try_new(
-            arrow_schema,
+            Arc::new(logical_data_schema.as_ref().try_into_arrow()?),
             vec![
                 Arc::new(Int32Array::from(vec![1, 2, 3])),
                 Arc::new(Int64Array::from(vec![
@@ -365,12 +368,10 @@ async fn test_acknowledged_row_tracking_rewrite(
             ],
         )?;
         engine
-            .write_parquet_preserving_row_tracking(
-                &ArrowEngineData::new(replacement_batch),
-                &write_context,
-            )
+            .write_parquet(&ArrowEngineData::new(replacement_batch), &write_context)
             .await?
     } else {
+        let write_context = txn.unpartitioned_write_context()?;
         let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
         let replacement_batch = RecordBatch::try_new(
             arrow_schema,
@@ -396,7 +397,9 @@ async fn test_acknowledged_row_tracking_rewrite(
     } else {
         txn.remove_files(scan_files);
     }
-    txn.ack_row_tracking_preservation();
+    if !matches!(config, RewriteConfig::Valid | RewriteConfig::DataChange) {
+        txn.ack_row_tracking_preservation();
+    }
 
     if let Some(expected_error) = expected_error {
         let error = txn

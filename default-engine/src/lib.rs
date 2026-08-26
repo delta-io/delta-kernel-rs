@@ -10,10 +10,7 @@ use std::future::Future;
 use std::num::NonZero;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Array as _, ArrayRef};
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
-use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
+use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
@@ -368,15 +365,14 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         self.raw_parquet.clone()
     }
 
-    /// Write `data` as a parquet file using the provided `write_context`.
+    /// Writes `data` as a Parquet file using the provided `write_context`.
     ///
-    /// `data` must not contain partition columns. If the table materializes partition columns (e.g.
-    /// `materializePartitionColumns` or `icebergCompatV3`), this function automatically inserts
-    /// them into the data.
+    /// `data` must match [`WriteContext::logical_data_schema`]. If the table materializes
+    /// partition columns, this method inserts them before writing.
     ///
-    /// The `write_context` must be created by [`Transaction::partitioned_write_context`] or
-    /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
-    /// serialization, and logical-to-physical key translation.
+    /// The write context handles partition values and physical column names.
+    /// Contexts created with `unpartitioned_write_context_with_input` can also retain stable
+    /// row-tracking values supplied in the input.
     ///
     /// [`Transaction::partitioned_write_context`]: delta_kernel::transaction::Transaction::partitioned_write_context
     /// [`Transaction::unpartitioned_write_context`]: delta_kernel::transaction::Transaction::unpartitioned_write_context
@@ -391,106 +387,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             .await
     }
 
-    /// Writes a Parquet file while retaining materialized stable row-tracking values.
-    ///
-    /// `data` must contain the logical table columns accepted by [`Self::write_parquet`] plus the
-    /// two physical fields returned by [`WriteContext::materialized_row_id_field`] and
-    /// [`WriteContext::materialized_row_commit_version_field`]. Both hidden fields must be
-    /// `Int64` arrays with a non-null value for every row. This method maps the logical table
-    /// columns to their physical representation and appends the configured hidden fields to the
-    /// Parquet schema without collecting column statistics for them.
-    ///
-    /// The caller remains responsible for preserving the association between each logical row and
-    /// both stable values before calling the transaction [`ack`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if row tracking is not enabled for the write context, either configured
-    /// hidden field is missing, duplicated, null, or not `Int64`, the input contains unexpected
-    /// fields, or logical-to-physical evaluation or Parquet writing fails.
-    ///
-    /// [`ack`]: delta_kernel::transaction::Transaction::ack_row_tracking_preservation
-    pub async fn write_parquet_preserving_row_tracking(
-        &self,
-        data: &ArrowEngineData,
-        write_context: &WriteContext,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        let row_id_field = write_context.materialized_row_id_field().ok_or_else(|| {
-            Error::unsupported("row-tracking preservation requires row tracking to be enabled")
-        })?;
-        let row_commit_version_field = write_context
-            .materialized_row_commit_version_field()
-            .ok_or_else(|| {
-                Error::unsupported("row-tracking preservation requires row tracking to be enabled")
-            })?;
-        if row_id_field.name() == row_commit_version_field.name() {
-            return Err(Error::generic(
-                "materialized row-tracking fields must have distinct names",
-            ));
-        }
-        for field in [row_id_field, row_commit_version_field] {
-            if write_context.logical_schema().contains(field.name())
-                || write_context.physical_schema().contains(field.name())
-            {
-                return Err(Error::generic(format!(
-                    "materialized row-tracking field '{}' conflicts with a table column",
-                    field.name()
-                )));
-            }
-        }
-
-        let batch = data.record_batch();
-        let row_id_index = unique_field_index(batch, row_id_field.name())?;
-        let row_commit_version_index = unique_field_index(batch, row_commit_version_field.name())?;
-        let expected_fields = write_context.logical_schema().num_fields() + 2;
-        if batch.num_columns() != expected_fields {
-            return Err(Error::generic(format!(
-                "row-tracking-preserving write requires {expected_fields} input fields but \
-                 found {}",
-                batch.num_columns()
-            )));
-        }
-        let row_ids = validated_row_tracking_array(batch, row_id_index, row_id_field.name())?;
-        let row_commit_versions = validated_row_tracking_array(
-            batch,
-            row_commit_version_index,
-            row_commit_version_field.name(),
-        )?;
-
-        let logical_indices = (0..batch.num_columns())
-            .filter(|index| *index != row_id_index && *index != row_commit_version_index)
-            .collect::<Vec<_>>();
-        let logical_batch = batch.project(&logical_indices)?;
-        let logical_data = ArrowEngineData::new(logical_batch);
-        let physical_data = self.evaluate_logical_to_physical(&logical_data, write_context)?;
-        let physical_data = ArrowEngineData::try_from_engine_data(physical_data)?;
-        let physical_batch = physical_data.record_batch();
-
-        let mut fields = physical_batch
-            .schema()
-            .fields()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        fields.push(Arc::new(row_id_field.try_into_arrow()?));
-        fields.push(Arc::new(row_commit_version_field.try_into_arrow()?));
-        let mut columns = physical_batch.columns().to_vec();
-        columns.push(row_ids);
-        columns.push(row_commit_versions);
-        let schema = Arc::new(ArrowSchema::new_with_metadata(
-            fields,
-            physical_batch.schema().metadata().clone(),
-        ));
-        let preserving_batch = RecordBatch::try_new(schema, columns)?;
-
-        self.raw_parquet
-            .write_parquet_file(
-                Box::new(ArrowEngineData::new(preserving_batch)),
-                write_context,
-            )
-            .await
-    }
-
     fn evaluate_logical_to_physical(
         &self,
         data: &ArrowEngineData,
@@ -498,52 +394,14 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
-        let output_schema = write_context.physical_schema();
+        let physical_data_schema = write_context.physical_data_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),
-            output_schema.clone().into(),
+            physical_data_schema.clone().into(),
         )?;
         logical_to_physical_expr.evaluate(data)
     }
-}
-
-fn unique_field_index(batch: &RecordBatch, field_name: &str) -> DeltaResult<usize> {
-    let indices = batch
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, field)| (field.name() == field_name).then_some(index))
-        .collect::<Vec<_>>();
-    match indices.as_slice() {
-        [index] => Ok(*index),
-        [] => Err(Error::missing_data(format!(
-            "row-tracking-preserving write is missing configured field '{field_name}'"
-        ))),
-        _ => Err(Error::generic(format!(
-            "row-tracking-preserving write contains duplicate field '{field_name}'"
-        ))),
-    }
-}
-
-fn validated_row_tracking_array(
-    batch: &RecordBatch,
-    index: usize,
-    field_name: &str,
-) -> DeltaResult<ArrayRef> {
-    let array = batch.column(index);
-    if array.data_type() != &ArrowDataType::Int64 {
-        return Err(Error::generic(format!(
-            "materialized row-tracking field '{field_name}' must have type Int64"
-        )));
-    }
-    if array.null_count() != 0 {
-        return Err(Error::generic(format!(
-            "materialized row-tracking field '{field_name}' contains null values"
-        )));
-    }
-    Ok(array.clone())
 }
 
 /// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values and

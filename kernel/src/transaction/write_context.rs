@@ -39,8 +39,21 @@ pub(super) struct SharedWriteState {
     pub(super) random_prefix_length: NonZero<usize>,
 }
 
-/// A write context for a specific partition or an unpartitioned table. Created by
-/// [`Transaction::partitioned_write_context`] or [`Transaction::unpartitioned_write_context`].
+/// Selects how a write context handles logical data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WriteMode {
+    /// Preserves stable row-tracking values supplied in the canonical metadata columns.
+    ///
+    /// The logical data schema must contain non-null `LONG` fields named `row_id` and
+    /// `row_commit_version`.
+    /// [`WriteContext::logical_to_physical`] renames them to the table's configured materialized
+    /// row-tracking columns.
+    PreserveRowTracking,
+}
+
+/// A write context for a specific partition or an unpartitioned table. Created by a transaction's
+/// write-context methods.
 ///
 /// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
 ///
@@ -48,25 +61,27 @@ pub(super) struct SharedWriteState {
 /// (serialized partition values with physical column names as keys). How you use a
 /// `WriteContext` depends on your engine:
 ///
-/// - **`DefaultEngine` consumers**: pass this to `DefaultEngine::write_parquet` for ordinary writes
-///   or `DefaultEngine::write_parquet_preserving_row_tracking` for acknowledged row-tracking
-///   rewrites.
-/// - **Arrow-based custom engines**: write parquet yourself, then call `build_add_file_metadata`
-///   with the resulting `DataFileMetadata` and this `WriteContext` to produce the Add action
-///   `EngineData` for [`Transaction::add_files`].
+/// - **`DefaultEngine` consumers**: pass this to `DefaultEngine::write_parquet`.
+/// - **Arrow-based custom engines**: evaluate [`WriteContext::logical_to_physical`] with
+///   [`WriteContext::physical_data_schema`], write Parquet, then call `build_add_file_metadata`
+///   with the resulting `DataFileMetadata` and this context.
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
 /// [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
 /// [`Transaction::unpartitioned_write_context`]: super::Transaction::unpartitioned_write_context
+/// [`Transaction::unpartitioned_write_context_with_input`]: super::Transaction::unpartitioned_write_context_with_input
 /// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: WriteContext::physical_partition_values
 #[derive(Debug)]
 pub struct WriteContext {
     pub(super) shared: Arc<SharedWriteState>,
-    /// Transforms logical data to physical data for writing. The logical data must not contain
-    /// any partition columns. The expression injects the partition columns when needed.
+    /// Logical schema accepted by `logical_to_physical`.
+    pub(super) logical_data_schema: SchemaRef,
+    /// Transforms logical data to the schema written to the data file.
     pub(super) logical_to_physical: ExpressionRef,
+    /// Physical schema produced by `logical_to_physical` and written to the data file.
+    pub(super) physical_data_schema: SchemaRef,
     /// Physical column name -> serialized value (`None` = null partition value).
     /// Empty for unpartitioned tables. Ordering for hive-style paths comes from
     /// `shared.logical_partition_columns`, not from this map.
@@ -163,18 +178,17 @@ impl WriteContext {
         url
     }
 
-    /// Returns the schema which connectors' logical data should conform to.
-    pub fn logical_schema(&self) -> &SchemaRef {
-        &self.shared.logical_schema
+    /// Returns the logical data schema accepted by [`Self::logical_to_physical`].
+    pub fn logical_data_schema(&self) -> &SchemaRef {
+        &self.logical_data_schema
     }
 
-    /// Returns the physical schema (partition columns removed if applicable, column mapping
-    /// applied). Partition columns are kept when `materializePartitionColumns` is enabled.
-    pub fn physical_schema(&self) -> &SchemaRef {
-        &self.shared.physical_schema
+    /// Returns the physical data schema produced by [`Self::logical_to_physical`].
+    pub fn physical_data_schema(&self) -> &SchemaRef {
+        &self.physical_data_schema
     }
 
-    /// Returns the expression that transforms logical data to physical data for writing.
+    /// Returns the expression that transforms logical data to physical data.
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
     }
@@ -343,7 +357,9 @@ mod tests {
         });
         WriteContext {
             shared,
+            logical_data_schema: schema.clone(),
             logical_to_physical: Arc::new(Expression::literal(true)),
+            physical_data_schema: schema,
             physical_partition_values: partition_values,
         }
     }

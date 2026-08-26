@@ -1203,10 +1203,10 @@ async fn test_write_context_exposes_configured_materialized_row_tracking_fields(
     assert!(row_commit_version_field.is_nullable());
 
     assert!(!write_context
-        .physical_schema()
+        .physical_data_schema()
         .contains(row_id_field.name()));
     assert!(!write_context
-        .physical_schema()
+        .physical_data_schema()
         .contains(row_commit_version_field.name()));
     Ok(())
 }

@@ -90,8 +90,12 @@ async fn append_only_enforces_data_change_for_file_actions(
         .unwrap_post_commit_snapshot();
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
     let write_context = txn.unpartitioned_write_context()?;
-    let arrow_schema: Arc<ArrowSchema> =
-        Arc::new(write_context.physical_schema().as_ref().try_into_arrow()?);
+    let arrow_schema: Arc<ArrowSchema> = Arc::new(
+        write_context
+            .physical_data_schema()
+            .as_ref()
+            .try_into_arrow()?,
+    );
     for value in [1, 2, 3] {
         let data = ArrowEngineData::new(RecordBatch::try_new(
             arrow_schema.clone(),

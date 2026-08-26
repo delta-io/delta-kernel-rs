@@ -40,8 +40,8 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
 use crate::schema::{
-    lazy_schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder, StructField,
-    StructType,
+    lazy_schema_ref, ArrayType, ColumnDefault, MetadataColumnSpec, SchemaRef,
+    SchemaStructPatchBuilder, StructField, StructType,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -83,7 +83,7 @@ mod write_validation;
 
 use stats_verifier::StatsColumnVerifier;
 use write_context::SharedWriteState;
-pub use write_context::WriteContext;
+pub use write_context::{WriteContext, WriteMode};
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -1008,6 +1008,77 @@ impl Transaction<ExistingTable> {
     pub fn ack_row_tracking_preservation(&mut self) {
         self.row_tracking_preservation_acknowledged = true;
     }
+
+    /// Creates an unpartitioned write context that preserves stable row-tracking values.
+    ///
+    /// The returned context accepts the table's logical fields followed by the canonical non-null
+    /// `LONG` fields `row_id` and `row_commit_version`. It maps the table columns to their physical
+    /// representation and renames both stable-value columns to the table's configured materialized
+    /// row-tracking fields. Creating this context acknowledges the connector's responsibility for
+    /// preserving those values through the rewrite.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table is partitioned, row tracking is not enabled for writes, or a
+    /// canonical row-tracking column conflicts with a table column.
+    pub fn unpartitioned_write_context_with_input(
+        &mut self,
+        write_mode: WriteMode,
+    ) -> DeltaResult<WriteContext> {
+        let mut context = self.unpartitioned_write_context()?;
+        let WriteMode::PreserveRowTracking = write_mode;
+        let row_id_spec = MetadataColumnSpec::RowId;
+        let row_commit_version_spec = MetadataColumnSpec::RowCommitVersion;
+        let row_id_column = row_id_spec.text_value();
+        let row_commit_version_column = row_commit_version_spec.text_value();
+
+        let row_id_field = context
+            .shared
+            .materialized_row_id_field
+            .clone()
+            .ok_or_else(|| {
+                Error::unsupported("row-tracking preservation requires row tracking to be enabled")
+            })?;
+        let row_commit_version_field = context
+            .shared
+            .materialized_row_commit_version_field
+            .clone()
+            .ok_or_else(|| {
+                Error::unsupported("row-tracking preservation requires row tracking to be enabled")
+            })?;
+
+        for input_name in [row_id_column, row_commit_version_column] {
+            require!(
+                !context.logical_data_schema().contains(input_name),
+                Error::schema(format!(
+                    "row-tracking input column '{input_name}' conflicts with a table column"
+                ))
+            );
+        }
+
+        require!(
+            row_id_field.name() != row_commit_version_field.name(),
+            Error::schema("materialized row-tracking fields must have distinct names")
+        );
+
+        context.logical_to_physical = Arc::new(self.generate_logical_to_physical(
+            None,
+            Some((row_id_column, row_commit_version_column)),
+        )?);
+        context.logical_data_schema = Arc::new(context.logical_data_schema().add([
+            StructField::create_metadata_column(row_id_column, row_id_spec),
+            StructField::create_metadata_column(row_commit_version_column, row_commit_version_spec),
+        ])?);
+        context.physical_data_schema = Arc::new(context.physical_data_schema().add([
+            StructField::create_metadata_column(row_id_field.name().clone(), row_id_spec),
+            StructField::create_metadata_column(
+                row_commit_version_field.name().clone(),
+                row_commit_version_spec,
+            ),
+        ])?);
+        self.row_tracking_preservation_acknowledged = true;
+        Ok(context)
+    }
 }
 
 impl<S: SupportsDataFiles> Transaction<S> {
@@ -1076,6 +1147,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     fn generate_logical_to_physical(
         &self,
         partition_values: Option<&HashMap<String, Scalar>>,
+        preserved_row_tracking_columns: Option<(&str, &str)>,
     ) -> DeltaResult<Expression> {
         let logical_schema = self.effective_table_config.logical_schema();
         let mut patch = ExpressionStructPatchBuilder::new();
@@ -1112,7 +1184,14 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 }
             }
         }
-        let patch = add_void_stripping(patch, &logical_schema);
+        let mut patch = add_void_stripping(patch, &logical_schema);
+        if let Some((row_id_column, row_commit_version_column)) = preserved_row_tracking_columns {
+            patch = patch
+                .drop(row_id_column)
+                .drop(row_commit_version_column)
+                .append(col!(row_id_column))
+                .append(col!(row_commit_version_column));
+        }
         Expression::struct_patch(patch)
     }
 
@@ -1294,9 +1373,12 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 .to_string();
             serialized.insert(physical_name, value);
         }
-        let logical_to_physical = Arc::new(self.generate_logical_to_physical(Some(&normalized))?);
+        let logical_to_physical =
+            Arc::new(self.generate_logical_to_physical(Some(&normalized), None)?);
 
         Ok(WriteContext {
+            logical_data_schema: shared.logical_schema.clone(),
+            physical_data_schema: shared.physical_schema.clone(),
             shared,
             logical_to_physical,
             physical_partition_values: serialized,
@@ -1318,8 +1400,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
             shared.logical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
         );
-        let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
+        let logical_to_physical = Arc::new(self.generate_logical_to_physical(None, None)?);
         Ok(WriteContext {
+            logical_data_schema: shared.logical_schema.clone(),
+            physical_data_schema: shared.physical_schema.clone(),
             shared,
             logical_to_physical,
             physical_partition_values: HashMap::new(),
@@ -2259,7 +2343,7 @@ mod tests {
         // while the transaction's effective table config changes.
         let initial_write_context = txn.unpartitioned_write_context()?;
         assert!(!initial_write_context
-            .logical_schema()
+            .logical_data_schema()
             .contains("fresh_column"));
 
         let mut evolved_fields: Vec<StructField> = txn
@@ -2283,13 +2367,13 @@ mod tests {
 
         let updated_write_context = txn.unpartitioned_write_context()?;
         assert!(updated_write_context
-            .logical_schema()
+            .logical_data_schema()
             .contains("fresh_column"));
         assert!(updated_write_context
-            .physical_schema()
+            .physical_data_schema()
             .contains("fresh_column"));
         assert!(!initial_write_context
-            .logical_schema()
+            .logical_data_schema()
             .contains("fresh_column"));
 
         Ok(())
@@ -2435,8 +2519,8 @@ mod tests {
             "letter".to_string(),
             Scalar::String("a".into()),
         )]))?;
-        let logical_schema = write_context.logical_schema();
-        let physical_schema = write_context.physical_schema();
+        let logical_schema = write_context.logical_data_schema();
+        let physical_schema = write_context.physical_data_schema();
 
         // Both schemas exclude partition columns.
         assert!(
@@ -2486,7 +2570,7 @@ mod tests {
         batch: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
         let input_schema = StructType::try_from_arrow(batch.schema())?;
-        let physical_schema = wc.physical_schema();
+        let physical_schema = wc.physical_data_schema();
         let l2p = wc.logical_to_physical();
 
         let handler = ArrowEvaluationHandler;
@@ -2613,7 +2697,7 @@ mod tests {
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        let physical_schema = wc.physical_schema();
+        let physical_schema = wc.physical_data_schema();
         let expected_names: Vec<&str> = physical_schema
             .fields()
             .map(|f| f.name().as_str())
@@ -2638,7 +2722,7 @@ mod tests {
             "./tests/data/partitioned_with_materialize_feature/",
             HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
         )?;
-        let physical_schema = write_context.physical_schema();
+        let physical_schema = write_context.physical_data_schema();
 
         assert!(
             physical_schema.contains("letter"),
@@ -3209,8 +3293,8 @@ mod tests {
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.unpartitioned_write_context().unwrap();
         crate::unit_test_utils::validate_physical_schema_column_mapping(
-            write_context.logical_schema(),
-            write_context.physical_schema(),
+            write_context.logical_data_schema(),
+            write_context.physical_data_schema(),
             mode,
         );
         Ok(())
@@ -3256,8 +3340,8 @@ mod tests {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.unpartitioned_write_context().unwrap();
-        let logical_schema = write_context.logical_schema();
-        let physical_schema = write_context.physical_schema();
+        let logical_schema = write_context.logical_data_schema();
+        let physical_schema = write_context.physical_data_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();
 
         if mode != ColumnMappingMode::None {

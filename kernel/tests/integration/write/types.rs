@@ -588,7 +588,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
 
     // Use the connector-facing physical schema (not the logical one); the logical schema
     // would hide bugs in the logical->physical mapping that engines hit in production.
-    let physical = write_context.physical_schema();
+    let physical = write_context.physical_data_schema();
     let physical_field = physical
         .field("c")
         .expect("physical schema must contain column 'c'");
@@ -870,7 +870,7 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
 
     let wc = txn.unpartitioned_write_context()?;
-    let physical = wc.physical_schema();
+    let physical = wc.physical_data_schema();
 
     // Physical schema should NOT contain void column
     assert_eq!(physical.fields().count(), 2);
@@ -943,7 +943,7 @@ async fn write_context_excludes_nested_void_from_physical_schema(
 
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let wc = txn.unpartitioned_write_context()?;
-    let physical = wc.physical_schema();
+    let physical = wc.physical_data_schema();
 
     // Physical schema struct should NOT contain the void field
     let s_field = physical.field("s").expect("s should exist in physical");
@@ -994,7 +994,7 @@ async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::e
     );
 
     // Physical schema should also not contain void
-    let physical = wc.physical_schema();
+    let physical = wc.physical_data_schema();
     let s_field = physical.field("s").expect("s should exist in physical");
     if let DataType::Struct(inner) = s_field.data_type() {
         assert_eq!(inner.fields().count(), 1);
