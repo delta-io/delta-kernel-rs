@@ -22,12 +22,9 @@ use crate::DeltaResult;
 #[derive(Debug, Clone)]
 pub(crate) enum SchemaOperation {
     /// Add a column or nested field to the table schema.
-    ///
-    /// `parent` identifies the struct that will contain `field`. An empty parent adds `field` to
-    /// the table's root schema.
     AddColumn {
-        /// Receiving struct; empty selects the root schema.
-        parent: ColumnName,
+        /// Receiving struct; `None` selects the root schema.
+        parent: Option<ColumnName>,
         /// The nullable, non-metadata field to add.
         field: StructField,
     },
@@ -216,7 +213,8 @@ pub(crate) fn apply_schema_operations(
                     // evolved schema.
                     field
                 };
-                modify_field_at_path(&mut root, parent.path(), |parent| add_field(parent, field))?;
+                let parent_path = parent.as_ref().map_or(&[][..], ColumnName::path);
+                modify_field_at_path(&mut root, parent_path, |parent| add_field(parent, field))?;
             }
             SchemaOperation::SetNullable { column } => {
                 let (leaf, parent) = column
@@ -284,7 +282,7 @@ mod tests {
             StructField::not_null(name, DataType::STRING)
         };
         SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field,
         }
     }
@@ -294,7 +292,7 @@ mod tests {
     // reached from `apply_schema_operations`.
     fn add_struct_with_nested_leaf(name: &str, leaf_name: &str) -> SchemaOperation {
         SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field: StructField::nullable(name, schema! { nullable (leaf_name): STRING }),
         }
     }
@@ -370,7 +368,7 @@ mod tests {
     #[case::dup_nested_sibling(
         nested_schema(),
         vec![SchemaOperation::AddColumn {
-            parent: column_name!("address"),
+            parent: Some(column_name!("address")),
             field: StructField::nullable("city", DataType::STRING),
         }],
         "already exists"
@@ -389,7 +387,7 @@ mod tests {
     #[case::metadata_column(
         simple_schema(),
         vec![SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field: StructField::create_metadata_column("row_idx", MetadataColumnSpec::RowIndex),
         }],
         "metadata columns are not allowed"
@@ -397,7 +395,7 @@ mod tests {
     #[case::missing_add_parent(
         simple_schema(),
         vec![SchemaOperation::AddColumn {
-            parent: column_name!("missing"),
+            parent: Some(column_name!("missing")),
             field: StructField::nullable("added", DataType::STRING),
         }],
         "does not exist"
@@ -405,7 +403,7 @@ mod tests {
     #[case::mismatched_path_segment(
         nested_schema(),
         vec![SchemaOperation::AddColumn {
-            parent: ColumnName::new(["id", "element"]),
+            parent: Some(ColumnName::new(["id", "element"])),
             field: StructField::nullable("x", DataType::STRING),
         }],
         "does not match"
@@ -472,7 +470,7 @@ mod tests {
             StructType::try_new([StructField::nullable("container", parent_type)]).unwrap();
         let parent = column_name!("container").join(&parent_path);
         let operation = SchemaOperation::AddColumn {
-            parent,
+            parent: Some(parent),
             field: StructField::nullable("added", DataType::INTEGER),
         };
 
@@ -501,11 +499,11 @@ mod tests {
     ) {
         let ops = vec![
             SchemaOperation::AddColumn {
-                parent: ColumnName::new(Vec::<String>::new()),
+                parent: None,
                 field: StructField::nullable("parent", struct_with_existing_field()),
             },
             SchemaOperation::AddColumn {
-                parent: column_name!("parent"),
+                parent: Some(column_name!("parent")),
                 field: StructField::nullable("child", DataType::INTEGER),
             },
         ];
@@ -651,26 +649,12 @@ mod tests {
     // === Column mapping tests ===
 
     #[rstest]
-    #[case::name_mode_root(
-        ColumnMappingMode::Name,
-        simple_schema(),
-        ColumnName::new(Vec::<String>::new()),
-        "email",
-        2,
-        3
-    )]
-    #[case::id_mode_root(
-        ColumnMappingMode::Id,
-        simple_schema(),
-        ColumnName::new(Vec::<String>::new()),
-        "email",
-        5,
-        6
-    )]
+    #[case::name_mode_root(ColumnMappingMode::Name, simple_schema(), None, "email", 2, 3)]
+    #[case::id_mode_root(ColumnMappingMode::Id, simple_schema(), None, "email", 5, 6)]
     #[case::name_mode_nested(
         ColumnMappingMode::Name,
         nested_schema(),
-        column_name!("address"),
+        Some(column_name!("address")),
         "country",
         5,
         6
@@ -678,7 +662,7 @@ mod tests {
     fn add_column_with_column_mapping_assigns_id_and_physical_name(
         #[case] mode: ColumnMappingMode,
         #[case] schema: StructType,
-        #[case] parent: ColumnName,
+        #[case] parent: Option<ColumnName>,
         #[case] name: &str,
         #[case] current_max: i64,
         #[case] expected_id: i64,
@@ -689,7 +673,7 @@ mod tests {
         }];
         let result = apply_schema_operations(schema, ops, mode, Some(current_max)).unwrap();
 
-        let mut parent_path = parent.into_inner();
+        let mut parent_path = parent.map_or_else(Vec::new, ColumnName::into_inner);
         parent_path.push(name.to_string());
         let added = result.schema.field_at_path(&parent_path);
 
@@ -701,7 +685,7 @@ mod tests {
     #[test]
     fn add_column_without_max_column_id_fails_when_mapping_enabled() {
         let ops = vec![SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field: StructField::nullable("email", DataType::STRING),
         }];
         let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, None)
@@ -717,15 +701,15 @@ mod tests {
     fn add_multiple_columns_with_column_mapping_assigns_unique_ids() {
         let ops = vec![
             SchemaOperation::AddColumn {
-                parent: ColumnName::new(Vec::<String>::new()),
+                parent: None,
                 field: StructField::nullable("a", DataType::STRING),
             },
             SchemaOperation::AddColumn {
-                parent: ColumnName::new(Vec::<String>::new()),
+                parent: None,
                 field: StructField::nullable("b", DataType::STRING),
             },
             SchemaOperation::AddColumn {
-                parent: ColumnName::new(Vec::<String>::new()),
+                parent: None,
                 field: StructField::nullable("c", DataType::STRING),
             },
         ];
@@ -781,7 +765,7 @@ mod tests {
         #[case] expected_id_count: usize,
     ) {
         let ops = vec![SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field: StructField::nullable("col", data_type),
         }];
         let result =
@@ -827,7 +811,7 @@ mod tests {
     ))]
     fn add_column_replaces_supplied_column_mapping_ids(#[case] field: StructField) {
         let ops = vec![SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field,
         }];
         let result =
@@ -856,7 +840,7 @@ mod tests {
             MetadataValue::String("user-supplied-name".to_string()),
         );
         let ops = vec![SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field,
         }];
         let result =
@@ -879,7 +863,7 @@ mod tests {
     #[case::negative(-1)]
     fn alter_with_out_of_range_persisted_max_column_id_is_rejected(#[case] seed: i64) {
         let ops = vec![SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field: StructField::nullable("anything", DataType::INTEGER),
         }];
         let err =
@@ -903,7 +887,7 @@ mod tests {
             MetadataValue::String("not-a-number".to_string()),
         );
         let ops = vec![SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field,
         }];
         let result =
@@ -928,7 +912,7 @@ mod tests {
             (existing),
         };
         let ops = vec![SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field: StructField::nullable("new", DataType::STRING),
         }];
         // Persisted maxColumnId is stale at 5, but the schema actually contains id=42.

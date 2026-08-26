@@ -125,13 +125,12 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// The field must not already exist in the schema (case-insensitive). The field must be
     /// nullable because existing data files do not contain this column and will read NULL for it.
-    /// On column-mapping tables, Kernel assigns or preserves column-mapping IDs and physical names
-    /// for the added field.
+    /// On column-mapping tables, Kernel assigns fresh column-mapping IDs and physical names.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
         self.operations.push(SchemaOperation::AddColumn {
-            parent: ColumnName::new(Vec::<String>::new()),
+            parent: None,
             field,
         });
         self.transition()
@@ -166,8 +165,10 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
         parent: ColumnName,
         field: StructField,
     ) -> AlterTableTransactionBuilder<Modifying> {
-        self.operations
-            .push(SchemaOperation::AddColumn { parent, field });
+        self.operations.push(SchemaOperation::AddColumn {
+            parent: Some(parent),
+            field,
+        });
         self.transition()
     }
 }
