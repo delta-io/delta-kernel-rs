@@ -126,7 +126,7 @@ fn lower_aggregate(
     input: &Arc<DFLogicalPlan>,
 ) -> Result<DFLogicalPlan, DataFusionError> {
     let input_schema = input.schema().as_ref();
-    let output_fields: Vec<_> = aggregate.schema.fields().collect();
+    let output_fields = Vec::from_iter(aggregate.schema.fields());
     if aggregate.group_by.is_empty() && aggregate.aggs.is_empty() {
         let arrow_schema: ArrowSchema = aggregate.schema.as_ref().try_into_arrow()?;
         let empty = EmptyRelation {
@@ -304,6 +304,7 @@ mod tests {
         schema, ArrayType, DataType, MapType, SchemaRef, StructField, StructType,
     };
     use delta_kernel::struct_patch::ProjectionStructPatchBuilder;
+    use delta_kernel::PlanBuilder;
     use rstest::rstest;
 
     use super::*;
@@ -337,11 +338,6 @@ mod tests {
     /// An empty input relation with `schema`.
     fn input_with_schema(schema: StructType) -> Arc<DFLogicalPlan> {
         Arc::new(lower_values_node(schema, vec![]).unwrap())
-    }
-
-    fn empty_schema() -> StructType {
-        let fields: Vec<StructField> = Vec::new();
-        StructType::try_new(fields).unwrap()
     }
 
     fn output_names(plan: &DFLogicalPlan) -> Vec<&String> {
@@ -724,6 +720,11 @@ mod tests {
     }
 
     // === Project ===
+
+    fn empty_schema() -> StructType {
+        let fields: Vec<StructField> = Vec::new();
+        StructType::try_new(fields).unwrap()
+    }
 
     /// Lowers a Project over `parent`.
     fn lower_project_expr(
@@ -1419,6 +1420,10 @@ mod tests {
         .unwrap()
     }
 
+    fn lower(builder: PlanBuilder) -> DFLogicalPlan {
+        crate::plan::to_df_plan(&builder.build().unwrap()).unwrap()
+    }
+
     fn test_aggregate() -> KernelAggregate {
         KernelAggregate::ungrouped(Arc::new(aggregate_input_schema()))
             .max(column_name!("value"))
@@ -1475,17 +1480,24 @@ mod tests {
         #[case] expected_ascending: Option<bool>,
         #[values(false, true)] grouped: bool,
     ) {
-        let parent = input_with_schema(aggregate_input_schema());
-        let group_by = grouped.then(|| column_name!("group"));
-        let aggregate = KernelAggregate::group_by(Arc::new(aggregate_input_schema()), group_by)
-            .aggregate_as(agg, "result")
-            .build()
-            .unwrap();
-        let lowered = lower_operator(
-            &KernelOperator::Aggregate(aggregate),
-            std::slice::from_ref(&parent),
+        let parent = PlanBuilder::values(
+            Arc::new(aggregate_input_schema()),
+            vec![vec![
+                "group".into(),
+                "value".into(),
+                "sentinel".into(),
+                1i64.into(),
+            ]],
         )
         .unwrap();
+        let builder = if grouped {
+            parent.aggregate_by([column_name!("group")], |aggregate| {
+                aggregate.aggregate_as(agg, "result")
+            })
+        } else {
+            parent.aggregate_ungrouped(|aggregate| aggregate.aggregate_as(agg, "result"))
+        };
+        let lowered = lower(builder.unwrap());
 
         let expected_names = if grouped {
             vec!["group", "result"]
@@ -1496,7 +1508,6 @@ mod tests {
         let DFLogicalPlan::Aggregate(aggregate) = &lowered else {
             panic!("expected Aggregate, got {lowered:?}");
         };
-        assert!(Arc::ptr_eq(&aggregate.input, &parent));
         let expected_group: Vec<_> = grouped
             .then(|| df_col("group").alias("group"))
             .into_iter()
@@ -1646,17 +1657,9 @@ mod tests {
 
     #[test]
     fn empty_global_aggregate_lowers_to_one_row_relation() {
-        let parent = input_with_schema(test_schema());
-        let aggregate = KernelAggregate {
-            group_by: vec![],
-            aggs: vec![],
-            schema: Arc::new(empty_schema()),
-        };
-        let lowered = lower_operator(
-            &KernelOperator::Aggregate(aggregate),
-            std::slice::from_ref(&parent),
-        )
-        .unwrap();
+        let parent = PlanBuilder::values(Arc::new(test_schema()), vec![]).unwrap();
+        let builder = parent.aggregate_ungrouped(|aggregate| aggregate);
+        let lowered = lower(builder.unwrap());
 
         let DFLogicalPlan::EmptyRelation(empty) = &lowered else {
             panic!("expected EmptyRelation, got {lowered:?}");
@@ -1788,37 +1791,32 @@ mod tests {
             ])
             .unwrap(),
         );
-        let parent = Arc::new(lower_values_node(input_schema.as_ref().clone(), rows).unwrap());
-        let aggregate = KernelAggregate::ungrouped(input_schema)
-            .aggregate_as(KernelAgg::min(column_name!("value")), "min_value")
-            .aggregate_as(KernelAgg::max(column_name!("value")), "max_value")
-            .aggregate_as(KernelAgg::sum(column_name!("number")), "sum_value")
-            .aggregate_as(KernelAgg::count(column_name!("number")), "count_value")
-            .aggregate_as(KernelAgg::count_star(), "row_count")
-            .aggregate_as(
-                KernelAgg::min_non_null_by(
-                    column_name!("value"),
-                    column_name!("sentinel"),
-                    column_name!("key"),
-                ),
-                "min_by_value",
-            )
-            .aggregate_as(
-                KernelAgg::max_non_null_by(
-                    column_name!("value"),
-                    column_name!("sentinel"),
-                    column_name!("key"),
-                ),
-                "max_by_value",
-            )
-            .build()
-            .unwrap();
-
-        let lowered = lower_operator(
-            &KernelOperator::Aggregate(aggregate),
-            std::slice::from_ref(&parent),
-        )
-        .unwrap();
+        let parent = PlanBuilder::values(input_schema, rows).unwrap();
+        let builder = parent.aggregate_ungrouped(|aggregate| {
+            aggregate
+                .aggregate_as(KernelAgg::min(column_name!("value")), "min_value")
+                .aggregate_as(KernelAgg::max(column_name!("value")), "max_value")
+                .aggregate_as(KernelAgg::sum(column_name!("number")), "sum_value")
+                .aggregate_as(KernelAgg::count(column_name!("number")), "count_value")
+                .aggregate_as(KernelAgg::count_star(), "row_count")
+                .aggregate_as(
+                    KernelAgg::min_non_null_by(
+                        column_name!("value"),
+                        column_name!("sentinel"),
+                        column_name!("key"),
+                    ),
+                    "min_by_value",
+                )
+                .aggregate_as(
+                    KernelAgg::max_non_null_by(
+                        column_name!("value"),
+                        column_name!("sentinel"),
+                        column_name!("key"),
+                    ),
+                    "max_by_value",
+                )
+        });
+        let lowered = lower(builder.unwrap());
         assert_eq!(
             output_names(&lowered),
             vec![
@@ -1938,10 +1936,9 @@ mod tests {
                 KernelScalar::Null(DataType::LONG),
             ],
         ];
-        let input_schema = Arc::new(aggregate_input_schema());
-        let parent = Arc::new(lower_values_node(input_schema.as_ref().clone(), rows).unwrap());
-        let aggregate =
-            KernelAggregate::group_by(Arc::clone(&input_schema), [column_name!("group")])
+        let parent = PlanBuilder::values(Arc::new(aggregate_input_schema()), rows).unwrap();
+        let builder = parent.aggregate_by([column_name!("group")], |aggregate| {
+            aggregate
                 .aggregate_as(
                     KernelAgg::min_non_null_by(
                         column_name!("value"),
@@ -1958,14 +1955,8 @@ mod tests {
                     ),
                     "max_value",
                 )
-                .build()
-                .unwrap();
-
-        let lowered = lower_operator(
-            &KernelOperator::Aggregate(aggregate),
-            std::slice::from_ref(&parent),
-        )
-        .unwrap();
+        });
+        let lowered = lower(builder.unwrap());
         let batches = execute(lowered).await.unwrap();
         assert_batches_sorted_eq!(
             &[
