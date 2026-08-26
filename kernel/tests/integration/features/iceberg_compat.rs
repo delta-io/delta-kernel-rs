@@ -198,8 +198,7 @@ async fn v3_commit_validates_num_records(
 ///   auto-enablement of `columnMapping=name` + `rowTracking=true`.
 /// - `max`: maximum feature set we are able to enable through create table, with exceptions for:
 ///   `materializePartitionColumns` (omitted so the partition-materialization check below proves V3
-///   implies it), `typeWidening` (kernel rejects writes against tables declaring it), and
-///   `catalogManaged` (requires a catalog committer).
+///   implies it) and `catalogManaged` (requires a catalog committer).
 #[rstest::rstest]
 #[case::min(
     /* extra_props */ &[],
@@ -213,7 +212,7 @@ async fn v3_commit_validates_num_records(
     // Some features are enabled via schema content (e.g. TS_NTZ) so not in this list.
     /* enable_features */ &[
         "deletionVectors", "inCommitTimestamp", "changeDataFeed", "appendOnly",
-        "v2Checkpoint", "vacuumProtocolCheck", "invariants",
+        "v2Checkpoint", "vacuumProtocolCheck", "invariants", "typeWidening",
     ],
     /* expected_features */ &[READER_WRITER_FEATURES, WRITER_FEATURES],
 )]
@@ -626,6 +625,7 @@ const READER_WRITER_FEATURES: &[&str] = &[
     "columnMapping",
     "deletionVectors",
     "timestampNtz",
+    "typeWidening",
     "v2Checkpoint",
     "vacuumProtocolCheck",
     "variantType",
@@ -651,6 +651,7 @@ const FEATURE_ENABLE_PROPERTY: &[(&str, &str)] = &[
     ("icebergCompatV3", "delta.enableIcebergCompatV3"),
     ("inCommitTimestamp", "delta.enableInCommitTimestamps"),
     ("rowTracking", "delta.enableRowTracking"),
+    ("typeWidening", "delta.enableTypeWidening"),
 ];
 
 /// Returns the `delta.enable*` property name for `feature` if one exists, or `None` if the

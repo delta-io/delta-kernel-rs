@@ -122,7 +122,7 @@ define_sweeps! {
     // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
     //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,
     //       allowColumnDefaults, identityColumns, NTZ/variant (schema-driven),
-    //       catalogManaged, collations for CM=name, typeWidening write support).
+    //       catalogManaged, collations for CM=name).
     // TODO: iceV2+writer (needs icebergCompatV2 + icebergWriterCompatV1).
     // TODO: iceV3 (needs icebergCompatV3).
     feature_set_values = (no_features(), all_features_cm_id(), all_features_cm_name()),
