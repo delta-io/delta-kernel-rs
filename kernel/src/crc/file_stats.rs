@@ -75,6 +75,7 @@ const INCREMENTAL_SAFE_OPS: &[&str] = &[
     "UPDATE",
     "DELETE",
     "OPTIMIZE",
+    "ADD FEATURE",
     "CREATE TABLE",
     "REPLACE TABLE",
     "CREATE TABLE AS SELECT",
