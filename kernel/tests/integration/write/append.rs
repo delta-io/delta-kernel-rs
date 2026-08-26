@@ -367,7 +367,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
+        let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context(None)?);
         let tasks = append_data.into_iter().map(|data| {
             // arc clones
             let engine = engine.clone();
@@ -414,7 +414,7 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )?);
-        let write_context = txn.write_state()?.unpartitioned_write_context()?;
+        let write_context = txn.write_state()?.unpartitioned_write_context(None)?;
 
         // Corrupt the addFile at the second batch.
         let valid_meta = engine.write_parquet(&data, &write_context).await?;

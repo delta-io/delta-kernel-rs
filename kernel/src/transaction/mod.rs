@@ -80,7 +80,7 @@ mod update;
 mod write_state;
 mod write_validation;
 
-pub use bound_write_context::{BoundWriteContext, WriteMode};
+pub use bound_write_context::{BoundWriteContext, RowTrackingMetadataColumns};
 use stats_verifier::StatsColumnVerifier;
 pub use write_state::WriteState;
 
@@ -1017,35 +1017,6 @@ impl Transaction<ExistingTable> {
     /// ```
     pub fn ack_row_tracking_preservation(&mut self) {
         self.row_tracking_preservation_acknowledged = true;
-    }
-
-    /// Creates an unpartitioned write context that preserves stable row-tracking values.
-    ///
-    /// The returned context accepts the table's logical fields followed by the two non-null `LONG`
-    /// fields specified by `write_mode`. It maps the table columns to their physical representation
-    /// and renames both stable-value columns to the table's configured materialized row-tracking
-    /// fields. Creating this context acknowledges the connector's responsibility for preserving
-    /// those values through the rewrite.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table is partitioned, row tracking is not enabled for writes, or a
-    /// requested row-tracking column conflicts with a table column.
-    pub fn unpartitioned_write_context_with_input(
-        &mut self,
-        write_mode: WriteMode<'_>,
-    ) -> DeltaResult<BoundWriteContext> {
-        let table_config = &self.effective_table_config;
-        require!(
-            table_config.should_write_row_tracking()
-                && table_config.table_properties().enable_row_tracking == Some(true),
-            Error::unsupported("row-tracking preservation requires row tracking to be enabled")
-        );
-        let context = self
-            .write_state()?
-            .unpartitioned_write_context_with_input(write_mode)?;
-        self.row_tracking_preservation_acknowledged = true;
-        Ok(context)
     }
 }
 
@@ -2088,7 +2059,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
         let write_state = txn.write_state().unwrap();
-        let write_context = write_state.unpartitioned_write_context().unwrap();
+        let write_context = write_state.unpartitioned_write_context(None).unwrap();
 
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
@@ -2122,7 +2093,7 @@ mod tests {
         // Regression coverage for stale WriteState caching: keep the first context alive
         // while the transaction's effective table config changes.
         let initial_write_state = txn.write_state()?;
-        let initial_write_context = initial_write_state.unpartitioned_write_context()?;
+        let initial_write_context = initial_write_state.unpartitioned_write_context(None)?;
         assert!(!initial_write_context
             .logical_data_schema()
             .contains("fresh_column"));
@@ -2144,7 +2115,7 @@ mod tests {
         txn.replace_effective_table_config(evolved_table_config);
 
         let updated_write_state = txn.write_state()?;
-        let updated_write_context = updated_write_state.unpartitioned_write_context()?;
+        let updated_write_context = updated_write_state.unpartitioned_write_context(None)?;
         assert!(updated_write_context
             .logical_data_schema()
             .contains("fresh_column"));
@@ -2549,7 +2520,7 @@ mod tests {
             write_state
                 .partitioned_write_context(HashMap::from([("x".to_string(), Scalar::Integer(1))]))
         } else {
-            write_state.unpartitioned_write_context()
+            write_state.unpartitioned_write_context(None)
         };
         let err = result.unwrap_err().to_string();
         assert!(
@@ -3082,7 +3053,7 @@ mod tests {
     ) -> DeltaResult<()> {
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
-        let write_context = write_state.unpartitioned_write_context().unwrap();
+        let write_context = write_state.unpartitioned_write_context(None).unwrap();
         crate::unit_test_utils::validate_physical_schema_column_mapping(
             write_context.logical_data_schema(),
             write_context.physical_data_schema(),
@@ -3132,7 +3103,7 @@ mod tests {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
-        let write_context = write_state.unpartitioned_write_context().unwrap();
+        let write_context = write_state.unpartitioned_write_context(None).unwrap();
         let logical_schema = write_context.logical_data_schema();
         let physical_schema = write_context.physical_data_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();

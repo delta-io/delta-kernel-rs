@@ -100,7 +100,7 @@ async fn append_only_enforces_data_change_for_file_actions(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
-    let write_context = txn.write_state()?.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context(None)?;
     let arrow_schema: Arc<ArrowSchema> = Arc::new(
         write_context
             .physical_data_schema()

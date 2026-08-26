@@ -40,7 +40,7 @@ pub unsafe extern "C" fn get_unpartitioned_write_context(
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
     txn.write_state()
-        .and_then(|state| state.unpartitioned_write_context())
+        .and_then(|state| state.unpartitioned_write_context(None))
         .map(|context| Arc::new(context).into())
         .into_extern_result(&engine)
 }
@@ -61,7 +61,7 @@ pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
     txn.write_state()
-        .and_then(|state| state.unpartitioned_write_context())
+        .and_then(|state| state.unpartitioned_write_context(None))
         .map(|context| Arc::new(context).into())
         .into_extern_result(&engine)
 }

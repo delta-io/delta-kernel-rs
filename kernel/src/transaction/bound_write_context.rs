@@ -7,97 +7,21 @@ use url::Url;
 
 use super::WriteState;
 use crate::actions::deletion_vector::DeletionVectorPath;
-use crate::expressions::{ColumnName, ExpressionRef, ExpressionStructPatchBuilder};
+use crate::expressions::{ColumnName, ExpressionRef};
 use crate::partition::hive::{build_partition_path, uri_encode_path};
-use crate::schema::void_utils::add_void_stripping;
-use crate::schema::{MetadataColumnSpec, SchemaRef, StructField};
+use crate::schema::{SchemaRef, StructField};
 use crate::table_features::ColumnMappingMode;
-use crate::utils::require;
-use crate::{DeltaResult, Error, Expression};
+use crate::{DeltaResult, Error};
 
-/// Selects how a write context handles logical data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WriteMode<'a> {
-    /// Preserves stable row-tracking values supplied in the specified logical columns.
-    /// [`BoundWriteContext::logical_to_physical`] renames them to the table's configured
-    /// materialized row-tracking columns.
-    PreserveRowTracking {
-        /// Logical input column containing stable row IDs.
-        row_id_column: &'a str,
-        /// Logical input column containing stable row commit versions.
-        row_commit_version_column: &'a str,
-    },
-}
-
-impl WriteState {
-    pub(super) fn unpartitioned_write_context_with_input(
-        self: &Arc<Self>,
-        write_mode: WriteMode<'_>,
-    ) -> DeltaResult<BoundWriteContext> {
-        let WriteMode::PreserveRowTracking {
-            row_id_column,
-            row_commit_version_column,
-        } = write_mode;
-        let mut context = self.unpartitioned_write_context()?;
-        let row_id_spec = MetadataColumnSpec::RowId;
-        let row_commit_version_spec = MetadataColumnSpec::RowCommitVersion;
-        let materialized_row_id_name = self
-            .materialized_row_id_field
-            .as_ref()
-            .ok_or_else(|| {
-                Error::unsupported("row-tracking preservation requires row tracking to be enabled")
-            })?
-            .name()
-            .clone();
-        let materialized_row_commit_version_name = self
-            .materialized_row_commit_version_field
-            .as_ref()
-            .ok_or_else(|| {
-                Error::unsupported("row-tracking preservation requires row tracking to be enabled")
-            })?
-            .name()
-            .clone();
-
-        for input_name in [row_id_column, row_commit_version_column] {
-            require!(
-                !context.logical_data_schema().contains(input_name),
-                Error::schema(format!(
-                    "row-tracking input column '{input_name}' conflicts with a table column"
-                ))
-            );
-        }
-        require!(
-            row_id_column != row_commit_version_column,
-            Error::schema("row-tracking logical input columns must have distinct names")
-        );
-        require!(
-            materialized_row_id_name != materialized_row_commit_version_name,
-            Error::schema("materialized row-tracking fields must have distinct names")
-        );
-
-        let patch = add_void_stripping(
-            ExpressionStructPatchBuilder::new(),
-            &self.full_logical_schema,
-        )
-        .drop(row_id_column)
-        .drop(row_commit_version_column)
-        .append(Expression::column([row_id_column]))
-        .append(Expression::column([row_commit_version_column]));
-        context.logical_to_physical = Arc::new(Expression::struct_patch(patch)?);
-        context.logical_data_schema = Arc::new(context.logical_data_schema().add([
-            StructField::create_metadata_column(row_id_column, row_id_spec),
-            StructField::create_metadata_column(row_commit_version_column, row_commit_version_spec),
-        ])?);
-        context.physical_data_schema = Arc::new(context.physical_data_schema().add([
-            StructField::create_metadata_column(materialized_row_id_name, row_id_spec),
-            StructField::create_metadata_column(
-                materialized_row_commit_version_name,
-                row_commit_version_spec,
-            ),
-        ])?);
-        Ok(context)
-    }
+/// Names the stable row-tracking columns present in logical write data.
+///
+/// The write context places the row ID before the row commit version when both are present.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowTrackingMetadataColumns<'a> {
+    /// Logical input column containing stable row IDs.
+    pub row_id: Option<&'a str>,
+    /// Logical input column containing stable row commit versions.
+    pub row_commit_version: Option<&'a str>,
 }
 
 /// A write context for a specific partition or an unpartitioned table. Created by a
@@ -115,7 +39,6 @@ impl WriteState {
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
-/// [`Transaction::unpartitioned_write_context_with_input`]: super::Transaction::unpartitioned_write_context_with_input
 /// [`WriteState::partitioned_write_context`]: super::WriteState::partitioned_write_context
 /// [`WriteState::unpartitioned_write_context`]: super::WriteState::unpartitioned_write_context
 /// [`Transaction::add_files`]: super::Transaction::add_files
@@ -351,7 +274,7 @@ impl BoundWriteContext {
     ///
     /// ```rust,ignore
     /// let write_state = transaction.write_state()?;
-    /// let write_context = write_state.unpartitioned_write_context()?;
+    /// let write_context = write_state.unpartitioned_write_context(None)?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// ```
     // TODO(#2357): generate the random prefix internally based on table properties

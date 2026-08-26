@@ -49,7 +49,7 @@ let mut txn = snapshot
 
 // 3. Create write state and bind a write context
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.unpartitioned_write_context(None)?;
 
 // 4. Write Parquet file(s)
 // Assumes the table schema is: name (STRING), age (INTEGER), city (STRING)
@@ -110,7 +110,7 @@ Before writing data, obtain a `WriteState` from the transaction. Bind the state 
 let write_state = txn.write_state()?;
 
 // For unpartitioned tables
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.unpartitioned_write_context(None)?;
 
 // For partitioned tables, pass the partition values for this file
 let write_context = write_state.partitioned_write_context(partition_values)?;
@@ -148,7 +148,7 @@ let file_metadata = engine
 ```
 
 - **`data`**: An `ArrowEngineData` wrapping a `RecordBatch` matching the logical schema
-- **`write_context`**: Bound from a `WriteState` with `unpartitioned_write_context()` or
+- **`write_context`**: Bound from a `WriteState` with `unpartitioned_write_context(None)` or
   `partitioned_write_context()`
 
 `DefaultEngine::write_parquet` handles the logical-to-physical transformation, generates a unique filename,

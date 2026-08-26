@@ -1481,7 +1481,7 @@ async fn write_data_commit<E: TaskExecutor>(
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
         let write_context = if partition_columns.is_empty() {
-            write_state.unpartitioned_write_context()?
+            write_state.unpartitioned_write_context(None)?
         } else {
             let partition_values = generate_partition_values(
                 logical_schema.as_ref(),

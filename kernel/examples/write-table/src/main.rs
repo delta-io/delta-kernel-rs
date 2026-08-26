@@ -94,7 +94,7 @@ async fn try_main() -> DeltaResult<()> {
         .with_data_change(true);
 
     // Write the data using the engine
-    let write_context = txn.write_state()?.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context(None)?;
     let file_metadata = engine.write_parquet(&sample_data, &write_context).await?;
 
     // Add the file metadata to the transaction

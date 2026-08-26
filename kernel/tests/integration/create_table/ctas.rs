@@ -260,7 +260,7 @@ async fn run_ctas_test(
     }
     let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let write_context = tgt_txn.write_state()?.unpartitioned_write_context()?;
+    let write_context = tgt_txn.write_state()?.unpartitioned_write_context(None)?;
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(source_data), &write_context)
         .await?;
