@@ -525,6 +525,8 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 // ReaderWriter features (AlwaysIfSupported)
 #[case("vacuumProtocolCheck", TableFeature::VacuumProtocolCheck, true, true)]
 #[case("v2Checkpoint", TableFeature::V2Checkpoint, true, true)]
+#[case("variantType", TableFeature::VariantType, true, true)]
+#[case("variantShredding", TableFeature::VariantShredding, true, true)]
 // ReaderWriter features (EnabledIf -- feature signal alone does not enable)
 #[case("deletionVectors", TableFeature::DeletionVectors, true, false)]
 #[case("typeWidening", TableFeature::TypeWidening, true, false)]
@@ -580,6 +582,35 @@ fn test_create_table_with_feature_signal(
             "{feature_name} should be in reader features"
         );
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_create_table_with_variant_shredding_has_variant_feature() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+    };
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.feature.variantShredding", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let protocol = snapshot.table_configuration().protocol();
+    let reader_features = protocol
+        .reader_features()
+        .expect("reader features must be present");
+    let writer_features = protocol
+        .writer_features()
+        .expect("writer features must be present");
+
+    assert!(reader_features.contains(&TableFeature::VariantType));
+    assert!(reader_features.contains(&TableFeature::VariantShredding));
+    assert!(writer_features.contains(&TableFeature::VariantType));
+    assert!(writer_features.contains(&TableFeature::VariantShredding));
 
     Ok(())
 }

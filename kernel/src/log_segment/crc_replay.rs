@@ -952,6 +952,7 @@ mod tests {
             vec![],
             None,
             Some(2),
+            None,
         )
         .unwrap();
 
@@ -1029,6 +1030,7 @@ mod tests {
             vec![],
             None,
             Some(0),
+            None,
         )
         .unwrap();
         for base in [0, 5] {
@@ -1059,6 +1061,7 @@ mod tests {
             vec![],
             None,
             Some(1),
+            None,
         )
         .unwrap();
         assert_result_error_with_message(

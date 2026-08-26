@@ -1431,7 +1431,7 @@ fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<()> {
 /// Write a data commit using kernel's transaction + write_parquet path.
 /// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
 /// tables, all rows in a file share the same partition values; for unpartitioned or
-/// clustered tables, uses `unpartitioned_write_context`. Non-partition columns get
+/// clustered tables, binds an unpartitioned write context. Non-partition columns get
 /// varying data derived from version and file index. Partition columns are never nulled
 /// so their data matches the declared partition value; all other nullable columns
 /// (including clustering columns, which kernel permits to be null) get sparse nulls.
@@ -1451,6 +1451,7 @@ async fn write_data_commit<E: TaskExecutor>(
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
+    let write_state = txn.write_state()?;
 
     let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
 
@@ -1480,14 +1481,14 @@ async fn write_data_commit<E: TaskExecutor>(
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
         let write_context = if partition_columns.is_empty() {
-            txn.unpartitioned_write_context()?
+            write_state.unpartitioned_write_context()?
         } else {
             let partition_values = generate_partition_values(
                 logical_schema.as_ref(),
                 partition_columns,
                 partition_seed,
             );
-            txn.partitioned_write_context(partition_values)?
+            write_state.partitioned_write_context(partition_values)?
         };
 
         let add_files = engine

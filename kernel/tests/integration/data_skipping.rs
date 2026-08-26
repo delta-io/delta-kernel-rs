@@ -857,26 +857,33 @@ async fn scan_with_replace_table_schema_change(
             .iter()
             .map(|e| e.num_add_files_seen)
             .sum::<u64>(),
-        4
+        6
     );
     assert_eq!(
         scan_events
             .iter()
-            .map(|e| e.num_active_add_files)
+            .map(|e| e.num_add_files_seen_from_delta_files)
+            .sum::<u64>(),
+        if checkpoint_old_add { 3 } else { 6 }
+    );
+    assert_eq!(
+        scan_events
+            .iter()
+            .map(|e| e.num_selected_add_files)
             .sum::<u64>(),
         expected_active_files
     );
     assert_eq!(
         scan_events
             .iter()
-            .map(|e| e.active_add_files_bytes)
+            .map(|e| e.selected_add_files_bytes)
             .sum::<u64>(),
         expected_active_bytes
     );
     assert_eq!(
         scan_events
             .iter()
-            .map(|e| e.num_remove_files_seen)
+            .map(|e| e.num_remove_files_seen_from_delta_files)
             .sum::<u64>(),
         3
     );

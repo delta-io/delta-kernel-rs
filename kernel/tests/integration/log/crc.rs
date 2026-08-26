@@ -632,7 +632,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
         if v == 3 {
             txn = txn.with_domain_metadata_removed(removed_domain.to_string());
         }
-        let write_context = txn.unpartitioned_write_context()?;
+        let write_context = txn.write_state()?.unpartitioned_write_context()?;
         let adds = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
@@ -818,7 +818,7 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_operation("WRITE".to_string())
             .with_data_change(true);
-        let write_context = txn.unpartitioned_write_context()?;
+        let write_context = txn.write_state()?.unpartitioned_write_context()?;
         let adds = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
@@ -2116,7 +2116,7 @@ async fn commit_data<E: TaskExecutor>(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
     let mut txn = customize(txn);
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     let adds = engine
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;

@@ -534,7 +534,7 @@ impl ScanLogReplayProcessor {
         })
     }
 
-    fn record_active_add_files(
+    fn record_selected_add_files(
         &self,
         selection_vector: &[bool],
         active_add_file_sizes: &[u64],
@@ -549,7 +549,7 @@ impl ScanLogReplayProcessor {
         );
         for (selected, size) in selection_vector.iter().zip(active_add_file_sizes) {
             if *selected {
-                self.metrics.record_active_add_file(*size);
+                self.metrics.record_selected_add_file(*size);
             }
         }
         Ok(())
@@ -593,6 +593,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         &mut self,
         row: usize,
         getters: &[&'b dyn GetData<'b>],
+        selected: bool,
     ) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on
         // action type:
@@ -603,6 +604,13 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.
+        let is_log_batch = self.deduplicator.is_log_batch();
+        if !selected {
+            // Data-skipping predicates keep non-Add rows, so an unselected row is an Add. Count it
+            // without constructing the deduplication key that the predicate made unnecessary.
+            self.metrics.record_add_file_seen(is_log_batch);
+            return Ok(false);
+        }
         let Some(FileActionInfo {
             key: file_key,
             size,
@@ -610,7 +618,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         }) = self.deduplicator.extract_file_action(
             row,
             getters,
-            !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
+            !is_log_batch, // skip_removes. true if this is a checkpoint batch
         )?
         else {
             self.metrics.incr_non_file_actions();
@@ -618,9 +626,9 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         };
 
         if is_add {
-            self.metrics.incr_add_files_seen()
+            self.metrics.record_add_file_seen(is_log_batch);
         } else {
-            self.metrics.incr_remove_files_seen()
+            self.metrics.incr_remove_files_seen_from_delta_files();
         };
 
         // Check both adds and removes (skipping already-seen), but only transform and return adds
@@ -723,9 +731,8 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         );
 
         for row in 0..row_count {
-            if self.selection_vector[row] {
-                self.selection_vector[row] = self.is_valid_add(row, getters)?;
-            }
+            let selected = self.selection_vector[row];
+            self.selection_vector[row] = self.is_valid_add(row, getters, selected)?;
         }
 
         self.metrics
@@ -990,7 +997,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 active_add_file_sizes,
             }
         };
-        self.record_active_add_files(&final_selection, &active_add_file_sizes)?;
+        self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let scan_metadata =
             ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
@@ -1089,7 +1096,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 active_add_file_sizes,
             }
         };
-        self.record_active_add_files(&final_selection, &active_add_file_sizes)?;
+        self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let scan_metadata =
             ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics

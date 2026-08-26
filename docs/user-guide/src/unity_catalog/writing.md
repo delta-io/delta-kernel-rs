@@ -102,7 +102,8 @@ write context, write Parquet files to the table's storage location, and add the
 resulting file metadata to the transaction.
 
 ```rust,ignore
-let write_context = txn.unpartitioned_write_context()?;
+let write_state = txn.write_state()?;
+let write_context = write_state.unpartitioned_write_context()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 ```
@@ -286,7 +287,8 @@ let mut txn = snapshot.clone().transaction(committer, &engine)?
     .with_operation("INSERT".to_string());
 
 // 6. Write data
-let write_context = txn.unpartitioned_write_context()?;
+let write_state = txn.write_state()?;
+let write_context = write_state.unpartitioned_write_context()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 

@@ -1361,8 +1361,13 @@ pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> LogSegmentLoadType
     v.0
 }
 
-/// A `parallel_scan_metadata` scan emits **two** events (one per phase) sharing the same
-/// `operation_id`; `scan_metadata` emits one event with [`ScanType::Full`].
+/// A `scan_metadata` scan emits one event with [`ScanType::Full`] after iterator exhaustion.
+/// Calling [`SequentialScanMetadata::finish`](crate::scan::SequentialScanMetadata::finish) emits
+/// a [`ScanType::SequentialPhase`] event. If it returns parallel work, the caller emits a
+/// [`ScanType::ParallelPhase`] event by calling
+/// [`ParallelState::log_metrics`](crate::scan::ParallelState::log_metrics) after all workers
+/// complete. The two phase events share an `operation_id`. Action counts and timings are
+/// phase-local, while `peak_hash_set_size` is the whole-scan high-water mark.
 #[derive(Debug, Clone)]
 pub struct ScanMetadataCompleted {
     // === Set on span creation ===
@@ -1377,17 +1382,17 @@ pub struct ScanMetadataCompleted {
     pub scan_type: ScanType,
     /// Wall-clock time from scan start to iterator exhaustion.
     pub duration: Duration,
-    /// Add files that entered deduplication. This normally excludes add files filtered by data
-    /// skipping. During parse-error fallback, deduplication runs first, so add files filtered by
-    /// retry-time data skipping are included. See
-    /// [`LogReplayProcessor::process_actions_batch`](crate::log_replay::LogReplayProcessor::process_actions_batch).
+    /// Add actions in replay input before predicate filtering and deduplication. Includes
+    /// checkpoint and delta files.
     pub num_add_files_seen: u64,
+    /// Add actions in delta-file replay input before predicate filtering and deduplication.
+    pub num_add_files_seen_from_delta_files: u64,
     /// Add files that survived log replay (the files the connector reads).
-    pub num_active_add_files: u64,
+    pub num_selected_add_files: u64,
     /// Size in bytes of the files that survived log replay (files to read).
-    pub active_add_files_bytes: u64,
-    /// Remove files seen (from delta/commit files only).
-    pub num_remove_files_seen: u64,
+    pub selected_add_files_bytes: u64,
+    /// Remove actions in delta-file replay input before deduplication.
+    pub num_remove_files_seen_from_delta_files: u64,
     /// Non-file actions seen (protocol, metadata, etc.).
     pub num_non_file_actions: u64,
     /// Files filtered by predicates (data skipping + partition pruning).
@@ -1413,9 +1418,10 @@ impl ScanMetadataCompleted {
             scan_type: ScanType::parse_lenient(&v.scan_type),
             duration: Duration::from_nanos(v.duration_ns),
             num_add_files_seen: v.num_add_files_seen,
-            num_active_add_files: v.num_active_add_files,
-            active_add_files_bytes: v.active_add_files_bytes,
-            num_remove_files_seen: v.num_remove_files_seen,
+            num_add_files_seen_from_delta_files: v.num_add_files_seen_from_delta_files,
+            num_selected_add_files: v.num_selected_add_files,
+            selected_add_files_bytes: v.selected_add_files_bytes,
+            num_remove_files_seen_from_delta_files: v.num_remove_files_seen_from_delta_files,
             num_non_file_actions: v.num_non_file_actions,
             num_predicate_filtered: v.num_predicate_filtered,
             peak_hash_set_size: v.peak_hash_set_size as usize,
@@ -1434,9 +1440,10 @@ impl fmt::Display for ScanMetadataCompleted {
             scan_type,
             duration,
             num_add_files_seen,
-            num_active_add_files,
-            active_add_files_bytes,
-            num_remove_files_seen,
+            num_add_files_seen_from_delta_files,
+            num_selected_add_files,
+            selected_add_files_bytes,
+            num_remove_files_seen_from_delta_files,
             num_non_file_actions,
             num_predicate_filtered,
             peak_hash_set_size,
@@ -1447,9 +1454,12 @@ impl fmt::Display for ScanMetadataCompleted {
             f,
             "ScanMetadataCompleted(id={operation_id}, table_type={table_type}, \
              correlation_id={correlation_id:?}, scan_type={scan_type}, duration={duration:?}, \
-             add_files_seen={num_add_files_seen}, active_add_files={num_active_add_files}, \
-             active_add_files_bytes={active_add_files_bytes}, \
-             remove_files_seen={num_remove_files_seen}, non_file_actions={num_non_file_actions}, \
+             add_files_seen={num_add_files_seen}, \
+             add_files_seen_from_delta_files={num_add_files_seen_from_delta_files}, \
+             selected_add_files={num_selected_add_files}, \
+             selected_add_files_bytes={selected_add_files_bytes}, \
+             remove_files_seen_from_delta_files={num_remove_files_seen_from_delta_files}, \
+             non_file_actions={num_non_file_actions}, \
              predicate_filtered={num_predicate_filtered}, peak_hash_set_size={peak_hash_set_size}, \
              dedup_visitor_time={dedup_visitor_time:?}, predicate_eval_time={predicate_eval_time:?})"
         )
@@ -1464,9 +1474,10 @@ struct ScanMetadataCompletedAttrs {
     scan_type: String,
     duration_ns: u64,
     num_add_files_seen: u64,
-    num_active_add_files: u64,
-    active_add_files_bytes: u64,
-    num_remove_files_seen: u64,
+    num_add_files_seen_from_delta_files: u64,
+    num_selected_add_files: u64,
+    selected_add_files_bytes: u64,
+    num_remove_files_seen_from_delta_files: u64,
     num_non_file_actions: u64,
     num_predicate_filtered: u64,
     peak_hash_set_size: u64,
@@ -1491,9 +1502,14 @@ impl Visit for ScanMetadataCompletedAttrs {
         match field.name() {
             "duration_ns" => self.duration_ns = value,
             "num_add_files_seen" => self.num_add_files_seen = value,
-            "num_active_add_files" => self.num_active_add_files = value,
-            "active_add_files_bytes" => self.active_add_files_bytes = value,
-            "num_remove_files_seen" => self.num_remove_files_seen = value,
+            "num_add_files_seen_from_delta_files" => {
+                self.num_add_files_seen_from_delta_files = value
+            }
+            "num_selected_add_files" => self.num_selected_add_files = value,
+            "selected_add_files_bytes" => self.selected_add_files_bytes = value,
+            "num_remove_files_seen_from_delta_files" => {
+                self.num_remove_files_seen_from_delta_files = value
+            }
             "num_non_file_actions" => self.num_non_file_actions = value,
             "num_predicate_filtered" => self.num_predicate_filtered = value,
             "peak_hash_set_size" => self.peak_hash_set_size = value,
@@ -1720,9 +1736,10 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         scan_type = %e.scan_type,
         duration_ns = e.duration.as_nanos() as u64,
         num_add_files_seen = e.num_add_files_seen,
-        num_active_add_files = e.num_active_add_files,
-        active_add_files_bytes = e.active_add_files_bytes,
-        num_remove_files_seen = e.num_remove_files_seen,
+        num_add_files_seen_from_delta_files = e.num_add_files_seen_from_delta_files,
+        num_selected_add_files = e.num_selected_add_files,
+        selected_add_files_bytes = e.selected_add_files_bytes,
+        num_remove_files_seen_from_delta_files = e.num_remove_files_seen_from_delta_files,
         num_non_file_actions = e.num_non_file_actions,
         num_predicate_filtered = e.num_predicate_filtered,
         peak_hash_set_size = e.peak_hash_set_size as u64,

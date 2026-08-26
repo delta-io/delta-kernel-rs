@@ -243,7 +243,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     // Step 5: Update deletion vectors for first file only
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     let dv_descriptor_1 =
         write_deletion_vector_to_store(&store, &write_context, dv_file1_first, "").await?;
     let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
@@ -280,7 +280,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     // Step 8: Update deletion vectors for both files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
     // Write deletion vectors for both files
     let dv_descriptor_1_second =
@@ -420,7 +420,7 @@ async fn test_dv_update_stats_tight_bound(
     dv.add_deleted_row_indexes([3u64]);
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
 
     let scan_files = get_scan_files(snapshot, engine.as_ref())?;

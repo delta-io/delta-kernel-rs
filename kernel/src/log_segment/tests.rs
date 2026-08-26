@@ -334,6 +334,7 @@ async fn build_snapshot_with_uuid_checkpoint_parquet() {
         vec![], // log_tail
         None,
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -369,6 +370,7 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
         storage.as_ref(),
         log_root,
         vec![], // log_tail
+        None,
         None,
         None,
     )
@@ -422,6 +424,7 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -465,6 +468,7 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
         storage.as_ref(),
         log_root,
         vec![], // log_tail
+        None,
         None,
         None,
     )
@@ -514,6 +518,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
+        None,
         None,
     )
     .unwrap();
@@ -567,6 +572,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -618,6 +624,7 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
+        None,
         None,
     );
     assert_result_error_with_message(
@@ -677,6 +684,7 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
+        None,
         None,
     )
     .unwrap();
@@ -742,6 +750,7 @@ async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
         vec![], // log_tail
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -797,6 +806,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -837,6 +847,7 @@ async fn build_snapshot_without_checkpoints() {
         vec![], // log_tail
         None,
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -857,6 +868,7 @@ async fn build_snapshot_without_checkpoints() {
         vec![], // log_tail
         None,
         Some(2),
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -908,6 +920,7 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -955,6 +968,7 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
+        None,
     )
     .unwrap();
 
@@ -984,7 +998,8 @@ async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5), None)
+            .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -1011,7 +1026,8 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5), None)
+            .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -1920,6 +1936,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         staged_commits_log_tail,
         None,
         segment.version_to_load,
+        None,
     )
     .unwrap()
 }
@@ -1942,6 +1959,7 @@ async fn test_list_log_files_with_version() -> DeltaResult<()> {
         &log_root,
         vec![], // log_tail
         Some(0),
+        None,
         None,
     )?;
     let latest_crc = result.latest_crc_file.unwrap();
@@ -2350,6 +2368,7 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         engine.storage_handler().as_ref(),
         log_root.clone(),
         vec![],
+        None,
         None,
         None,
     )
@@ -2880,6 +2899,7 @@ async fn test_latest_commit_file_field_is_captured() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -2913,6 +2933,7 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -2940,6 +2961,7 @@ async fn test_latest_commit_file_with_no_commits() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -2970,6 +2992,7 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -3002,6 +3025,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -4900,10 +4924,8 @@ fn test_combine_checkpoint_predicates(
     "tags",
     r#"{"checkpointMetadata":{"version":0,"tags":{"key1":"val1","key2":null}}}"#
 )]
-// Known issues: these map fields don't yet have #[allow_null_container_values].
 // commitInfo.operationParameters.description: null
-#[should_panic(expected = "StructArray re-validation failed")]
-#[case::commit_info_operation_parameters_known_issue(
+#[case::commit_info_operation_parameters(
     "commitInfo",
     "operationParameters",
     r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","description":null}}}"#

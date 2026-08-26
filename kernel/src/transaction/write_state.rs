@@ -86,14 +86,17 @@ impl WriteState {
         }
     }
 
-    /// Creates a write context for writing data to a specific partition.
+    /// Creates a write context bound to one partition.
     ///
-    /// The supplied map must contain exactly one entry for every logical partition column. Keys
-    /// are matched case-insensitively and values are validated against the table schema before
-    /// being serialized according to the Delta partition-value rules.
+    /// `partition_values` must contain one typed value for every logical partition column and no
+    /// other keys. Names are matched case-insensitively and normalized to schema case. Values are
+    /// validated, serialized according to the Delta protocol, and keyed by physical column name in
+    /// the returned context. Null-equivalent values require nullable partition columns.
     ///
-    /// Returns an error if the table is not partitioned or if the partition keys or values are
-    /// invalid.
+    /// The context materializes partition columns when required by the table protocol. Input data
+    /// passed to its logical-to-physical expression must omit partition columns.
+    ///
+    /// Returns an error if the table is unpartitioned or the keys or values are invalid.
     pub fn partitioned_write_context(
         self: &Arc<Self>,
         partition_values: HashMap<String, Scalar>,

@@ -665,16 +665,16 @@ async fn empty_create_then_add_column(
             && scan_err.to_string().contains("ALTER TABLE ADD COLUMN"),
         "scan error must point at ALTER TABLE ADD COLUMN, got: {scan_err}"
     );
-    let write_err = v0
+    let write_state_err = v0
         .clone()
         .transaction(committer(), engine.as_ref())?
         .with_engine_info("EmptySchemaApp/0.1.0")
-        .unpartitioned_write_context()
-        .expect_err("unpartitioned_write_context() must reject empty-schema snapshots");
+        .write_state()
+        .expect_err("write_state() must reject empty-schema snapshots");
     assert!(
-        write_err.to_string().contains("empty schema")
-            && write_err.to_string().contains("alter_table"),
-        "write_context error must point at alter_table, got: {write_err}"
+        write_state_err.to_string().contains("empty schema")
+            && write_state_err.to_string().contains("alter_table"),
+        "write_state error must point at alter_table, got: {write_state_err}"
     );
 
     v0.alter_table()
