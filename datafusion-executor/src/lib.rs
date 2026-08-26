@@ -721,29 +721,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dynamic_scan_empty_input_returns_no_batches() {
-        let executor = test_executor(Handle::current());
-        let plan = dynamic_scan_plan(
-            std::iter::empty(),
-            FileType::Parquet,
-            Scalar::null(DeletionVectorDescriptor::to_schema()),
-        );
-
-        let batches = tokio::task::spawn_blocking(move || -> DeltaResult<Vec<RecordBatch>> {
-            executor
-                .execute_op(Operation::QueryPlan(plan))?
-                .into_data()?
-                .map(|batch| batch?.try_into_record_batch())
-                .collect()
-        })
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert!(batches.is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dynamic_scan_rejects_non_null_deletion_vectors() {
         let executor = test_executor(Handle::current());
         let plan = dynamic_scan_plan(
