@@ -157,6 +157,8 @@ fn align_nullable_data_types(kernel_type: &DataType, physical_type: &DataType) -
             let field = align_nullable_field(kernel_field, physical_field, data_type);
             DataType::Map(field, *physical_keys_sorted)
         }
+        // Only align nullability for matching container shapes. Preserve other type differences so
+        // DataFusion can cast compatible types or reject incompatible ones.
         _ => physical_type.clone(),
     }
 }
