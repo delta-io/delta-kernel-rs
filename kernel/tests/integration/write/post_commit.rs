@@ -8,7 +8,7 @@ use delta_kernel::arrow::array::{Int32Array, RecordBatch};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -82,10 +82,10 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_write_parquet_succeed_with_logical_partition_names(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("letter", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "letter": STRING,
+    };
 
     for (table_url, engine, _store, _table_name) in setup_test_tables(
         schema.clone(),
@@ -130,8 +130,9 @@ async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_t
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = begin_transaction(snapshot.clone(), &engine)?.with_engine_info("test");
+        let write_state = txn.write_state()?;
 
-        let result = txn.partitioned_write_context(HashMap::from([(
+        let result = write_state.partitioned_write_context(HashMap::from([(
             "nonexistent".to_string(),
             Scalar::String("val".into()),
         )]));

@@ -5,7 +5,7 @@ use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values};
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{schema_ref, SchemaRef, StructType};
 use crate::{DeltaResult, Error, ExpressionRef};
 
 /// Gets CDF metadata columns from the logical schema and scan file.
@@ -61,11 +61,12 @@ pub(crate) fn scan_file_physical_schema(
     physical_schema: &StructType,
 ) -> SchemaRef {
     if scan_file.scan_type == CdfScanFileType::Cdc {
-        let change_type = StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING);
-        let fields = physical_schema.fields().cloned().chain(Some(change_type));
         // NOTE: We don't validate the fields again because CHANGE_TYPE_COL_NAME should never be
         // used anywhere else
-        StructType::new_unchecked(fields).into()
+        schema_ref! {
+            ..(physical_schema.fields()),
+            not_null CHANGE_TYPE_COL_NAME: STRING,
+        }
     } else {
         physical_schema.clone().into()
     }
@@ -137,25 +138,25 @@ mod tests {
     use crate::scan::state_info::StateInfo;
     use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema, schema_ref, DataType};
     use crate::table_features::ColumnMappingMode;
 
     fn create_test_logical_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("age", DataType::LONG),
-            StructField::nullable("name", DataType::STRING),
-            StructField::nullable("_change_type", DataType::STRING),
-            StructField::nullable("_commit_version", DataType::LONG),
-            StructField::nullable("_commit_timestamp", DataType::TIMESTAMP),
-        ]))
+        schema_ref! {
+            nullable "id": STRING,
+            nullable "age": LONG,
+            nullable "name": STRING,
+            nullable "_change_type": STRING,
+            nullable "_commit_version": LONG,
+            nullable "_commit_timestamp": TIMESTAMP,
+        }
     }
 
     fn create_test_physical_schema() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("name", DataType::STRING),
-        ])
+        schema! {
+            nullable "id": STRING,
+            nullable "name": STRING,
+        }
     }
 
     fn create_test_cdf_scan_file() -> CdfScanFile {
@@ -294,11 +295,11 @@ mod tests {
 
         let logical_schema = create_test_logical_schema();
         // For CDC, physical schema needs _change_type column
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("name", DataType::STRING),
-            StructField::nullable("_change_type", DataType::STRING),
-        ]);
+        let physical_schema = schema! {
+            nullable "id": STRING,
+            nullable "name": STRING,
+            nullable "_change_type": STRING,
+        };
 
         // Request both partition and CDF columns
         let transform_spec = vec![
@@ -396,15 +397,15 @@ mod tests {
         };
 
         // Create a simple schema without CDF metadata columns
-        let logical_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("name", DataType::STRING),
-        ]));
+        let logical_schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "name": STRING,
+        };
 
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("name", DataType::STRING),
-        ]);
+        let physical_schema = schema! {
+            nullable "id": STRING,
+            nullable "name": STRING,
+        };
 
         // Empty transform spec - no transformation needed.
         let transform_spec = vec![];

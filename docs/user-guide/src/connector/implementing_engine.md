@@ -93,7 +93,7 @@ pub trait JsonHandler {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<FileSize>;
 }
 ```
 
@@ -109,7 +109,8 @@ pub trait JsonHandler {
 
 - **`write_json_file`**: Must write newline-delimited JSON (one JSON object per line). Null
   columns should be omitted from the output to save space. The write must be atomic. If
-  `overwrite` is false and the file exists, fail with an error.
+  `overwrite` is false and the file exists, fail with an error. On success, return the exact
+  number of serialized bytes written to the file.
 
 ### Default implementation
 

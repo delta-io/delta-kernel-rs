@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock};
 use super::Transaction;
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_name, ColumnName, MapData, Scalar};
+use crate::expressions::{column_name, lit, null_lit, ColumnName, MapData, Scalar};
 use crate::schema::{schema_ref, ColumnNamesAndTypes, MapType, SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::require;
@@ -69,54 +69,36 @@ fn commit_info_literal_exprs(
     let op_params_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     let tags_present = commit_info.tags.is_some();
     let mut literal_exprs = vec![
-        (
-            "timestamp",
-            Arc::new(Expression::literal(commit_info.timestamp)),
-        ),
+        ("timestamp", Arc::new(lit(commit_info.timestamp))),
         (
             "inCommitTimestamp",
-            Arc::new(Expression::literal(commit_info.in_commit_timestamp)),
+            Arc::new(lit(commit_info.in_commit_timestamp)),
         ),
-        (
-            "operation",
-            Arc::new(Expression::literal(commit_info.operation)),
-        ),
+        ("operation", Arc::new(lit(commit_info.operation))),
         (
             "operationParameters",
-            Arc::new(Expression::literal(
-                match commit_info.operation_parameters {
-                    Some(map) => Scalar::Map(MapData::try_new(
-                        op_params_map_type,
-                        map.into_iter()
-                            .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
-                    )?),
-                    None => Scalar::null(op_params_map_type),
-                },
-            )),
+            Arc::new(match commit_info.operation_parameters {
+                Some(map) => lit(MapData::try_new(
+                    op_params_map_type,
+                    map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
+                )?),
+                None => null_lit(op_params_map_type),
+            }),
         ),
-        (
-            "kernelVersion",
-            Arc::new(Expression::literal(commit_info.kernel_version)),
-        ),
-        (
-            "isBlindAppend",
-            Arc::new(Expression::literal(commit_info.is_blind_append)),
-        ),
-        (
-            "engineInfo",
-            Arc::new(Expression::literal(commit_info.engine_info)),
-        ),
-        ("txnId", Arc::new(Expression::literal(commit_info.txn_id))),
+        ("kernelVersion", Arc::new(lit(commit_info.kernel_version))),
+        ("isBlindAppend", Arc::new(lit(commit_info.is_blind_append))),
+        ("engineInfo", Arc::new(lit(commit_info.engine_info))),
+        ("txnId", Arc::new(lit(commit_info.txn_id))),
     ];
     if let Some(tags) = commit_info.tags {
         let tags_map_type = MapType::new(DataType::STRING, DataType::STRING, false);
         literal_exprs.push((
             "tags",
-            Arc::new(Expression::literal(Scalar::Map(MapData::try_new(
+            Arc::new(lit(MapData::try_new(
                 tags_map_type,
                 tags.into_iter()
                     .map(|(key, value)| (Scalar::String(key), Scalar::String(value))),
-            )?))),
+            )?)),
         ));
     }
     let expected_expr_len = CommitInfo::to_schema().fields().len() - usize::from(!tags_present);
@@ -175,7 +157,7 @@ impl<S> Transaction<S> {
                 // Delta log action format `{ "commitInfo": { merged fields... } }`, consistent
                 // with the None branch which uses `LOG_COMMIT_INFO_SCHEMA`.
                 let wrapped_expr = Expression::struct_from([patch]);
-                let wrapped_schema = schema_ref! { nullable (COMMIT_INFO_NAME): (output_schema) };
+                let wrapped_schema = schema_ref! { nullable COMMIT_INFO_NAME: (output_schema) };
                 let evaluator = engine.evaluation_handler().new_expression_evaluator(
                     engine_commit_info_schema.clone(),
                     Arc::new(wrapped_expr),
@@ -205,7 +187,7 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::{Schema, SchemaRef, StructField, StructType, ToSchema};
+    use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
     use crate::transaction::Transaction;
     use crate::unit_test_utils::load_test_table;
     use crate::utils::FoldWithOption as _;
@@ -529,7 +511,7 @@ mod tests {
     fn test_build_commit_info_empty_engine_schema() -> DeltaResult<()> {
         // A 0-row, 0-column RecordBatch with an empty kernel schema.
         let empty_batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
-        let empty_schema = Arc::new(StructType::new_unchecked(Vec::<StructField>::new()));
+        let empty_schema = schema_ref! {};
         let (engine, txn) = make_txn(Some((
             Box::new(ArrowEngineData::new(empty_batch)),
             empty_schema,

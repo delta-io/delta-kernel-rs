@@ -33,8 +33,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version,
+    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
+    Version,
 };
 
 mod crc_replay;
@@ -140,9 +140,7 @@ fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<Predica
         .fields()
         .map(|field| action_presence_witness(field.name()))
         .collect::<Option<_>>()?;
-    let mut predicates = columns
-        .into_iter()
-        .map(|col| Expression::column(col).is_not_null());
+    let mut predicates = columns.into_iter().map(Predicate::is_not_null);
     let first = predicates.next()?;
     Some(Arc::new(predicates.fold(first, Predicate::or)))
 }
@@ -326,17 +324,20 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
         let build = || {
-            let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
+            let checkpoint_hint =
+                LastCheckpointHint::try_read(storage, &log_root, cancellation_token)?;
             Self::for_snapshot_impl(
                 storage,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
+                cancellation_token,
             )
         };
         let log_segment =
@@ -364,6 +365,7 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
@@ -395,13 +397,20 @@ impl LogSegment {
                 &log_root,
                 log_tail,
                 end_version,
+                cancellation_token,
             )?,
             // Case 3
             (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage, &log_root, log_tail, end,
+                storage,
+                &log_root,
+                log_tail,
+                end,
+                cancellation_token,
             )?,
             // Case 4
-            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            (None, None) => {
+                LogSegmentFiles::list(storage, &log_root, log_tail, None, None, cancellation_token)?
+            }
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
@@ -437,6 +446,7 @@ impl LogSegment {
             vec![], // log-tail
             Some(start_version),
             end_version,
+            None, // table-changes does not thread a cancellation token
         )?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
@@ -492,6 +502,7 @@ impl LogSegment {
             log_tail,
             start_from,
             Some(end_version),
+            None, // timestamp conversion does not thread a cancellation token
         )?;
 
         // remove gaps - return latest contiguous chunk of commits

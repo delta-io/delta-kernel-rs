@@ -1377,12 +1377,14 @@ version = "0.26.0"
 dependencies = [
  "datafusion",
  "delta_kernel",
+ "itertools",
  "rstest",
+ "tokio",
 ]
 
 [[package]]
 name = "delta_kernel"
-version = "0.26.0"
+version = "0.27.1"
 dependencies = [
  "arrow",
  "bytes",
@@ -1414,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.26.0"
+version = "0.27.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3723,6 +3725,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

@@ -20,7 +20,7 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
@@ -39,8 +39,8 @@ use crate::scan::log_replay::{
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    lazy_schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
-    StructType, ToSchema as _,
+    lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
+    StructField, StructType, ToSchema as _,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, Operation};
@@ -76,16 +76,11 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
 /// Discovery restores JSON stats when structured stats cannot satisfy the scan.
 pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let add_schema = Add::to_schema();
-    let fields_no_stats: Vec<_> = add_schema
-        .fields()
-        .filter(|f| f.name() != "stats")
-        .cloned()
-        .collect();
-    let add_no_stats = StructType::new_unchecked(fields_no_stats);
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        ADD_NAME,
-        add_no_stats,
-    )]))
+    schema_ref! {
+        nullable ADD_NAME: {
+            ..(add_schema.fields().filter(|f| f.name() != "stats")),
+        },
+    }
 });
 
 #[allow(unused)]
@@ -118,7 +113,7 @@ pub struct StatsOptions {
     /// the existing JSON is passed through regardless.
     pub(crate) synthesize_json: bool,
 
-    /// Which struct stats columns to emit in `stats_parsed`.
+    /// Which struct stats columns to request in `stats_parsed`.
     pub(crate) struct_stats: StructStats,
 }
 
@@ -131,7 +126,7 @@ pub enum StructStats {
     None,
     /// Emit all indexed stats columns.
     All,
-    /// Emit only the specified stats columns.
+    /// Emit at least the specified stats columns. Predicate-referenced columns may also appear.
     Columns(Vec<ColumnName>),
 }
 
@@ -161,8 +156,8 @@ impl StatsOptions {
         }
     }
 
-    /// Struct stats projected to the specified columns without JSON synthesis. Like
-    /// [`Self::all_struct`] but narrowed to a subset of indexed columns.
+    /// Struct stats for at least the specified columns without JSON synthesis. Predicate-referenced
+    /// columns may also appear because scan paths can retain stats used for data skipping.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
@@ -606,28 +601,20 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
     }
 }
 
-static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    StructType::new_unchecked(vec![StructField::nullable(
-        "add",
-        StructType::new_unchecked(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("partitionValues", partition_values),
-            StructField::not_null("size", DataType::LONG),
-            StructField::nullable("modificationTime", DataType::LONG),
-            StructField::nullable("stats", DataType::STRING),
-            StructField::nullable(
-                "tags",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-            StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
-            StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-            StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
-        ]),
-    )])
-    .into()
-});
+static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable "add": {
+        not_null "path": STRING,
+        not_null "partitionValues": { STRING => nullable STRING },
+        not_null "size": LONG,
+        nullable "modificationTime": LONG,
+        nullable "stats": STRING,
+        nullable "tags": { STRING => nullable STRING },
+        nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
+        nullable BASE_ROW_ID_NAME: LONG,
+        nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
+        nullable CLUSTERING_PROVIDER_NAME: STRING,
+    },
+};
 
 pub(crate) fn restored_add_schema() -> &'static SchemaRef {
     &RESTORED_ADD_SCHEMA
@@ -1079,6 +1066,12 @@ impl Scan {
     /// `engine` supplies the plan executor used to inspect checkpoint shape. Returns `None` when
     /// no Delta metadata matches this scan.
     ///
+    /// This method returns the metadata plan without executing it. A connector that consumes the
+    /// resulting live `add` rows may run the plan through the generic
+    /// [`PlanExecutor`](crate::plans::PlanExecutor) interface or its native query engine. The
+    /// native path can keep the engine's batch representation instead of adapting it through
+    /// [`EngineData`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
@@ -1171,7 +1164,7 @@ impl Scan {
         )?;
 
         let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add"]),
+            prefix: column_name!("add"),
         };
         let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))

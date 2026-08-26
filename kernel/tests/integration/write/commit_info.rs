@@ -7,7 +7,7 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
 use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};
@@ -142,11 +142,11 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
                 Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
             ],
         )?;
-        let engine_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::not_null("myApp", DataType::STRING),
-            StructField::not_null("myVersion", DataType::STRING),
-            StructField::nullable("operation", DataType::STRING),
-        ]));
+        let engine_schema = schema_ref! {
+            not_null "myApp": STRING,
+            not_null "myVersion": STRING,
+            nullable "operation": STRING,
+        };
 
         let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_operation("WRITE".to_string())

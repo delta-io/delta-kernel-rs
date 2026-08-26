@@ -31,38 +31,33 @@ use crate::engine_data::{GetData, TypedGetData as _};
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
-    column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
+    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
+    SchemaRef, StructField,
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
 
-#[allow(clippy::expect_used)]
-static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let base = schema! {
-        // size is the only Add leaf the visitor reads, and it is required, so its presence marks
-        // an Add row.
-        nullable ADD_NAME: { not_null "size": LONG },
-        // remove.size is optional, so we read remove.path (required) to know a row is a Remove
-        // before reading its size.
-        nullable REMOVE_NAME: {
-            not_null "path": STRING,
-            nullable "size": LONG,
-        },
-        (&PROTOCOL_FIELD),
-        (&METADATA_FIELD),
-        (&SET_TRANSACTION_FIELD),
-        (&DOMAIN_METADATA_FIELD),
-        nullable COMMIT_INFO_NAME: {
-            nullable "operation": STRING,
-            nullable "inCommitTimestamp": LONG,
-        },
-    };
-    let with_file = base
-        .add_metadata_column("_file", MetadataColumnSpec::FilePath)
-        .expect("add _file metadata column");
-    Arc::new(with_file)
-});
+static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    // size is the only Add leaf the visitor reads, and it is required, so its presence marks
+    // an Add row.
+    nullable ADD_NAME: { not_null "size": LONG },
+    // remove.size is optional, so we read remove.path (required) to know a row is a Remove
+    // before reading its size.
+    nullable REMOVE_NAME: {
+        not_null "path": STRING,
+        nullable "size": LONG,
+    },
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    nullable COMMIT_INFO_NAME: {
+        nullable "operation": STRING,
+        nullable "inCommitTimestamp": LONG,
+    },
+    (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+};
 
 impl LogSegment {
     /// Try to build the CRC at this segment's `end_version` from the caller's resolved `base` CRC.
@@ -642,16 +637,13 @@ impl RowVisitor for CommitCrcVisitor<'_> {
 /// accumulator needs. `add.size` is the only Add leaf read, and it is required, so its presence
 /// marks an Add row (a checkpoint Add missing `size` errors at read time). A checkpoint has no
 /// `remove` or `commitInfo` to project.
-#[allow(clippy::expect_used)]
-static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(schema! {
-        nullable ADD_NAME: { not_null "size": LONG },
-        (&PROTOCOL_FIELD),
-        (&METADATA_FIELD),
-        (&SET_TRANSACTION_FIELD),
-        (&DOMAIN_METADATA_FIELD),
-    })
-});
+static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable ADD_NAME: { not_null "size": LONG },
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+};
 
 // A checkpoint has no source-specific columns, so its projection is the shared columns.
 
@@ -699,6 +691,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case::safe("WRITE", true)]
+    #[case::streaming_update("STREAMING UPDATE", true)]
     #[case::unsafe_op("ANALYZE STATS", false)]
     fn on_commit_info_classifies_operation(#[case] op: &str, #[case] is_safe: bool) {
         let mut acc = CrcReplayAccumulator::new(None);
@@ -959,6 +952,7 @@ mod tests {
             vec![],
             None,
             Some(2),
+            None,
         )
         .unwrap();
 
@@ -1036,6 +1030,7 @@ mod tests {
             vec![],
             None,
             Some(0),
+            None,
         )
         .unwrap();
         for base in [0, 5] {
@@ -1066,6 +1061,7 @@ mod tests {
             vec![],
             None,
             Some(1),
+            None,
         )
         .unwrap();
         assert_result_error_with_message(

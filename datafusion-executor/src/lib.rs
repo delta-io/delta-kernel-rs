@@ -14,9 +14,13 @@ use datafusion::execution::context::SessionContext;
 use delta_kernel::StorageHandler;
 
 mod expression;
+mod operator;
+mod plan;
+mod predicate;
 mod scalar;
 
 pub use expression::to_df_expr;
+pub use predicate::to_df_predicate_expr;
 pub use scalar::to_df_scalar;
 
 /// Executes kernel declarative plans on DataFusion.

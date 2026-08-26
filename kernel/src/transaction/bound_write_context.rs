@@ -5,77 +5,124 @@ use std::sync::Arc;
 use rand::Rng;
 use url::Url;
 
+use super::WriteState;
 use crate::actions::deletion_vector::DeletionVectorPath;
-use crate::expressions::{ColumnName, ExpressionRef};
+use crate::expressions::{ColumnName, ExpressionRef, ExpressionStructPatchBuilder};
 use crate::partition::hive::{build_partition_path, uri_encode_path};
-use crate::schema::{SchemaRef, StructField};
+use crate::schema::void_utils::add_void_stripping;
+use crate::schema::{MetadataColumnSpec, SchemaRef, StructField};
 use crate::table_features::ColumnMappingMode;
-use crate::{DeltaResult, Error};
-
-/// Table-wide write state shared across all [`WriteContext`] instances created by a
-/// [`Transaction`]. Holds the target directory, schemas, column mapping mode, stats columns,
-/// logical partition column names, and randomized-prefix configuration.
-///
-/// [`Transaction`]: super::Transaction
-#[derive(Debug)]
-pub(super) struct SharedWriteState {
-    pub(super) table_root: Url,
-    /// Logical schema of the data to write: the table schema minus partition columns.
-    pub(super) logical_schema: SchemaRef,
-    pub(super) physical_schema: SchemaRef,
-    pub(super) column_mapping_mode: ColumnMappingMode,
-    pub(super) stats_columns: Vec<ColumnName>,
-    pub(super) materialized_row_id_field: Option<StructField>,
-    pub(super) materialized_row_commit_version_field: Option<StructField>,
-    /// Logical partition column names in metadata-defined order.
-    pub(super) logical_partition_columns: Vec<String>,
-    /// Resolved value of the `delta.randomizeFilePrefixes` table property. When true,
-    /// [`WriteContext::write_dir`] emits a random alphanumeric prefix regardless of column
-    /// mapping mode.
-    pub(super) randomize_file_prefixes: bool,
-    /// Resolved value of the `delta.randomPrefixLength` table property. Drives the length
-    /// of the random prefix in [`WriteContext::write_dir`] for both the column mapping and
-    /// `randomizeFilePrefixes` paths.
-    pub(super) random_prefix_length: NonZero<usize>,
-}
+use crate::utils::require;
+use crate::{DeltaResult, Error, Expression};
 
 /// Selects how a write context handles logical data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum WriteMode {
-    /// Preserves stable row-tracking values supplied in the canonical metadata columns.
-    ///
-    /// The logical data schema must contain non-null `LONG` fields named `row_id` and
-    /// `row_commit_version`.
-    /// [`WriteContext::logical_to_physical`] renames them to the table's configured materialized
-    /// row-tracking columns.
-    PreserveRowTracking,
+pub enum WriteMode<'a> {
+    /// Preserves stable row-tracking values supplied in the specified logical columns.
+    /// [`BoundWriteContext::logical_to_physical`] renames them to the table's configured
+    /// materialized row-tracking columns.
+    PreserveRowTracking {
+        /// Logical input column containing stable row IDs.
+        row_id_column: &'a str,
+        /// Logical input column containing stable row commit versions.
+        row_commit_version_column: &'a str,
+    },
 }
 
-/// A write context for a specific partition or an unpartitioned table. Created by a transaction's
-/// write-context methods.
+impl WriteState {
+    pub(super) fn unpartitioned_write_context_with_input(
+        self: &Arc<Self>,
+        write_mode: WriteMode<'_>,
+    ) -> DeltaResult<BoundWriteContext> {
+        let WriteMode::PreserveRowTracking {
+            row_id_column,
+            row_commit_version_column,
+        } = write_mode;
+        let mut context = self.unpartitioned_write_context()?;
+        let row_id_spec = MetadataColumnSpec::RowId;
+        let row_commit_version_spec = MetadataColumnSpec::RowCommitVersion;
+        let materialized_row_id_name = self
+            .materialized_row_id_field
+            .as_ref()
+            .ok_or_else(|| {
+                Error::unsupported("row-tracking preservation requires row tracking to be enabled")
+            })?
+            .name()
+            .clone();
+        let materialized_row_commit_version_name = self
+            .materialized_row_commit_version_field
+            .as_ref()
+            .ok_or_else(|| {
+                Error::unsupported("row-tracking preservation requires row tracking to be enabled")
+            })?
+            .name()
+            .clone();
+
+        for input_name in [row_id_column, row_commit_version_column] {
+            require!(
+                !context.logical_data_schema().contains(input_name),
+                Error::schema(format!(
+                    "row-tracking input column '{input_name}' conflicts with a table column"
+                ))
+            );
+        }
+        require!(
+            row_id_column != row_commit_version_column,
+            Error::schema("row-tracking logical input columns must have distinct names")
+        );
+        require!(
+            materialized_row_id_name != materialized_row_commit_version_name,
+            Error::schema("materialized row-tracking fields must have distinct names")
+        );
+
+        let patch = add_void_stripping(
+            ExpressionStructPatchBuilder::new(),
+            &self.full_logical_schema,
+        )
+        .drop(row_id_column)
+        .drop(row_commit_version_column)
+        .append(Expression::column([row_id_column]))
+        .append(Expression::column([row_commit_version_column]));
+        context.logical_to_physical = Arc::new(Expression::struct_patch(patch)?);
+        context.logical_data_schema = Arc::new(context.logical_data_schema().add([
+            StructField::create_metadata_column(row_id_column, row_id_spec),
+            StructField::create_metadata_column(row_commit_version_column, row_commit_version_spec),
+        ])?);
+        context.physical_data_schema = Arc::new(context.physical_data_schema().add([
+            StructField::create_metadata_column(materialized_row_id_name, row_id_spec),
+            StructField::create_metadata_column(
+                materialized_row_commit_version_name,
+                row_commit_version_spec,
+            ),
+        ])?);
+        Ok(context)
+    }
+}
+
+/// A write context for a specific partition or an unpartitioned table. Created by a
+/// [`WriteState`](super::WriteState).
 ///
 /// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
 ///
-/// Contains both table-wide state (shared cheaply via `Arc`) and per-partition state
-/// (serialized partition values with physical column names as keys). How you use a
-/// `WriteContext` depends on your engine:
+/// Contains both table-wide state and per-partition state (serialized partition values with
+/// physical column names as keys). How you use a `BoundWriteContext` depends on your engine:
 ///
 /// - **`DefaultEngine` consumers**: pass this to `DefaultEngine::write_parquet`.
-/// - **Arrow-based custom engines**: evaluate [`WriteContext::logical_to_physical`] with
-///   [`WriteContext::physical_data_schema`], write Parquet, then call `build_add_file_metadata`
-///   with the resulting `DataFileMetadata` and this context.
+/// - **Arrow-based custom engines**: evaluate [`BoundWriteContext::logical_to_physical`] with
+///   [`BoundWriteContext::physical_data_schema`], write Parquet, then call
+///   `build_add_file_metadata` with the resulting `DataFileMetadata` and this context.
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
-/// [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
-/// [`Transaction::unpartitioned_write_context`]: super::Transaction::unpartitioned_write_context
 /// [`Transaction::unpartitioned_write_context_with_input`]: super::Transaction::unpartitioned_write_context_with_input
+/// [`WriteState::partitioned_write_context`]: super::WriteState::partitioned_write_context
+/// [`WriteState::unpartitioned_write_context`]: super::WriteState::unpartitioned_write_context
 /// [`Transaction::add_files`]: super::Transaction::add_files
-/// [`physical_partition_values`]: WriteContext::physical_partition_values
+/// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
 #[derive(Debug)]
-pub struct WriteContext {
-    pub(super) shared: Arc<SharedWriteState>,
+pub struct BoundWriteContext {
+    pub(super) write_state: Arc<WriteState>,
     /// Logical schema accepted by `logical_to_physical`.
     pub(super) logical_data_schema: SchemaRef,
     /// Transforms logical data to the schema written to the data file.
@@ -84,14 +131,14 @@ pub struct WriteContext {
     pub(super) physical_data_schema: SchemaRef,
     /// Physical column name -> serialized value (`None` = null partition value).
     /// Empty for unpartitioned tables. Ordering for hive-style paths comes from
-    /// `shared.logical_partition_columns`, not from this map.
+    /// `write_state.logical_partition_columns`, not from this map.
     pub(super) physical_partition_values: HashMap<String, Option<String>>,
 }
 
-impl WriteContext {
+impl BoundWriteContext {
     /// Returns the table root URL.
     pub fn table_root_dir(&self) -> &Url {
-        &self.shared.table_root
+        &self.write_state.table_root
     }
 
     /// Returns the recommended directory URL for writing Parquet data files. Connectors
@@ -125,9 +172,9 @@ impl WriteContext {
     ///
     /// 2. **`add.path` in the Delta log** — keep the URL URI-encoded. After writing the parquet
     ///    file, pass the full (still-encoded) file URL — this URL plus the generated filename — to
-    ///    [`WriteContext::resolve_file_path`] to produce `add.path`. `make_relative` preserves the
-    ///    URI-encoded form, which is what the Delta protocol requires. Arrow-based engines can use
-    ///    `build_add_file_metadata` which handles this step.
+    ///    [`BoundWriteContext::resolve_file_path`] to produce `add.path`. `make_relative` preserves
+    ///    the URI-encoded form, which is what the Delta protocol requires. Arrow-based engines can
+    ///    use `build_add_file_metadata` which handles this step.
     ///
     /// `DefaultEngine::write_parquet` handles both steps automatically via `object_store`
     /// and `build_add_file_metadata`.
@@ -153,19 +200,19 @@ impl WriteContext {
     // TODO(#2436): revisit this API shape. Returning a `Url` forces callers to URI-decode
     // before filesystem writes and keep it encoded for `add.path`, which is unintuitive.
     pub fn write_dir(&self) -> Url {
-        let mut url = self.shared.table_root.clone();
+        let mut url = self.write_state.table_root.clone();
         // A random prefix is used when column mapping is on (to avoid leaking physical
         // UUID column names into paths) or when `delta.randomizeFilePrefixes` is set (to
         // avoid S3 hotspots). When a random prefix is used, the Hive-style partition path
         // is suppressed; partition values are recorded in `add.partitionValues` instead.
-        let should_prefix = self.shared.column_mapping_mode != ColumnMappingMode::None
-            || self.shared.randomize_file_prefixes;
+        let should_prefix = self.write_state.column_mapping_mode != ColumnMappingMode::None
+            || self.write_state.randomize_file_prefixes;
         if should_prefix {
             // The alphanumeric charset is RFC 3986 unreserved, so the prefix is URI-safe
             // as-is and needs no further encoding.
-            let prefix = random_alphanumeric_prefix(self.shared.random_prefix_length);
+            let prefix = random_alphanumeric_prefix(self.write_state.random_prefix_length);
             url.set_path(&format!("{}{}/", url.path(), prefix));
-        } else if !self.shared.logical_partition_columns.is_empty() {
+        } else if !self.write_state.logical_partition_columns.is_empty() {
             // CM=None, no randomization: emit a Hive-style partition path. URI-encode on
             // top of Hive-escaping because the fn-level contract (see doc above) requires
             // callers to URI-decode once before using the URL as a filesystem path. That
@@ -195,14 +242,14 @@ impl WriteContext {
 
     /// The [`ColumnMappingMode`] for this table.
     pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.shared.column_mapping_mode
+        self.write_state.column_mapping_mode
     }
 
     /// Returns the column names that should have statistics collected during writes.
     ///
     /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
     pub fn stats_columns(&self) -> &[ColumnName] {
-        &self.shared.stats_columns
+        &self.write_state.stats_columns
     }
 
     /// Returns the configured physical field that stores stable row IDs.
@@ -210,7 +257,7 @@ impl WriteContext {
     /// Returns `None` when row tracking is not enabled for writes. Connectors preserving row
     /// tracking during a rewrite must write a non-null value for every output row.
     pub fn materialized_row_id_field(&self) -> Option<&StructField> {
-        self.shared.materialized_row_id_field.as_ref()
+        self.write_state.materialized_row_id_field.as_ref()
     }
 
     /// Returns the configured physical field that stores stable row commit versions.
@@ -218,7 +265,9 @@ impl WriteContext {
     /// Returns `None` when row tracking is not enabled for writes. Connectors preserving row
     /// tracking during a rewrite must write a non-null value for every output row.
     pub fn materialized_row_commit_version_field(&self) -> Option<&StructField> {
-        self.shared.materialized_row_commit_version_field.as_ref()
+        self.write_state
+            .materialized_row_commit_version_field
+            .as_ref()
     }
 
     /// Returns the serialized partition values for this write context. Keys are physical
@@ -233,11 +282,11 @@ impl WriteContext {
     /// Only called when column mapping is OFF.
     fn hive_partition_path_suffix(&self) -> String {
         debug_assert!(
-            self.shared.column_mapping_mode == ColumnMappingMode::None,
+            self.write_state.column_mapping_mode == ColumnMappingMode::None,
             "Hive-style paths should only be used when column mapping is OFF"
         );
         let columns: Vec<(&str, Option<&str>)> = self
-            .shared
+            .write_state
             .logical_partition_columns
             .iter()
             .map(|logical_name| {
@@ -269,19 +318,19 @@ impl WriteContext {
     /// Returns an error if the file is not under the table root.
     pub fn resolve_file_path(&self, file_location: &Url) -> DeltaResult<String> {
         let relative = self
-            .shared
+            .write_state
             .table_root
             .make_relative(file_location)
             .ok_or_else(|| {
                 Error::internal_error(format!(
                     "file '{}' is not under table root '{}'",
-                    file_location, self.shared.table_root
+                    file_location, self.write_state.table_root
                 ))
             })?;
         if relative.starts_with("..") {
             return Err(Error::internal_error(format!(
                 "file '{}' is not under table root '{}'",
-                file_location, self.shared.table_root
+                file_location, self.write_state.table_root
             )));
         }
         Ok(relative)
@@ -301,14 +350,15 @@ impl WriteContext {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let write_context = transaction.unpartitioned_write_context()?;
+    /// let write_state = transaction.write_state()?;
+    /// let write_context = write_state.unpartitioned_write_context()?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// ```
     // TODO(#2357): generate the random prefix internally based on table properties
     // (delta.randomizeFilePrefixes / delta.randomPrefixLength) instead of requiring the
     // caller to pass it. Connectors that need custom paths can use table_root_dir() directly.
     pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
-        DeletionVectorPath::new(self.shared.table_root.clone(), random_prefix)
+        DeletionVectorPath::new(self.write_state.table_root.clone(), random_prefix)
     }
 }
 
@@ -331,7 +381,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::Expression;
+    use crate::expressions::lit;
     use crate::schema::schema_ref;
 
     fn make_write_context(
@@ -340,10 +390,11 @@ mod tests {
         partition_values: HashMap<String, Option<String>>,
         randomize_file_prefixes: bool,
         random_prefix_length: usize,
-    ) -> WriteContext {
+    ) -> BoundWriteContext {
         let schema = schema_ref! { nullable "value": INTEGER };
-        let shared = Arc::new(SharedWriteState {
+        let write_state = Arc::new(WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
+            full_logical_schema: schema.clone(),
             logical_schema: schema.clone(),
             physical_schema: schema.clone(),
             column_mapping_mode: cm_mode,
@@ -351,14 +402,15 @@ mod tests {
             materialized_row_id_field: None,
             materialized_row_commit_version_field: None,
             logical_partition_columns: partition_columns,
+            materialize_partition_columns: false,
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)
                 .expect("test prefix length must be > 0"),
         });
-        WriteContext {
-            shared,
+        BoundWriteContext {
+            write_state,
             logical_data_schema: schema.clone(),
-            logical_to_physical: Arc::new(Expression::literal(true)),
+            logical_to_physical: Arc::new(lit(true)),
             physical_data_schema: schema,
             physical_partition_values: partition_values,
         }

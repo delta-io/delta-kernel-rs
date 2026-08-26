@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.26.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.27.1" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
@@ -55,7 +55,7 @@ thiserror = "2"
 prost = { version = "0.13", optional = true }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = "0.3"
-url = "2"
+url = { version = "2", features = ["serde"] }
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 

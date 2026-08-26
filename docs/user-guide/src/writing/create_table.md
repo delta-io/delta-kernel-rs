@@ -161,13 +161,13 @@ treats each string as a single top-level column name. To cluster on a nested col
 construct the `DataLayout::Clustered` variant directly with a multi-segment `ColumnName`:
 
 ```rust,ignore
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::column_name;
 use delta_kernel::transaction::data_layout::DataLayout;
 
 let layout = DataLayout::Clustered {
     columns: vec![
-        ColumnName::new(["region"]),
-        ColumnName::new(["address", "city"]),
+        column_name!("region"),
+        column_name!("address", "city"),
     ],
 };
 ```

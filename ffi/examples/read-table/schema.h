@@ -72,6 +72,13 @@ SchemaItem* add_to_list(SchemaItemList* list, char* name, char* type, bool is_nu
   return &list->list[idx];
 }
 
+bool field_type_needs_free(char* type)
+{
+  return !strncmp(type, "decimal", 7) ||
+         !strncmp(type, "geometry", 8) ||
+         !strncmp(type, "geography", 9);
+}
+
 // print out all items in a list, recursing into any children they may have
 void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int parents_on_last)
 {
@@ -278,6 +285,48 @@ void visit_interval_day_time(void* data,
   visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "interval day to second");
 }
 
+void visit_geometry(void* data,
+                    uintptr_t sibling_list_id,
+                    struct KernelStringSlice name,
+                    bool is_nullable,
+                    const CMetadataMap * metadata,
+                    struct KernelStringSlice crs)
+{
+  SchemaBuilder* builder = data;
+  char* name_ptr = allocate_string(name);
+  size_t type_size = strlen("geometry()") + crs.len + 1;
+  char* type = malloc(type_size * sizeof(char));
+  snprintf(type, type_size, "geometry(%.*s)", (int)crs.len, crs.ptr);
+  PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
+  SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
+  item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
+}
+
+void visit_geography(void* data,
+                     uintptr_t sibling_list_id,
+                     struct KernelStringSlice name,
+                     bool is_nullable,
+                     const CMetadataMap * metadata,
+                     struct KernelStringSlice crs,
+                     struct KernelStringSlice algorithm)
+{
+  SchemaBuilder* builder = data;
+  char* name_ptr = allocate_string(name);
+  size_t type_size = strlen("geography(, )") + crs.len + algorithm.len + 1;
+  char* type = malloc(type_size * sizeof(char));
+  snprintf(
+    type,
+    type_size,
+    "geography(%.*s, %.*s)",
+    (int)crs.len,
+    crs.ptr,
+    (int)algorithm.len,
+    algorithm.ptr);
+  PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
+  SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
+  item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
+}
+
 // free all the data in the builder and the builder itself
 void free_builder(SchemaBuilder* builder)
 {
@@ -288,8 +337,8 @@ void free_builder(SchemaBuilder* builder)
       free(item->name);
       free(item->column_mapping_id); // NULL when the field carried no column-mapping id; free(NULL) is a no-op
       // don't free item->type, those are static strings
-      if (!strncmp(item->type, "decimal", 7)) {
-        // except decimal types, we malloc'd those :)
+      if (field_type_needs_free(item->type)) {
+        // except decimal and geo types, we malloc'd those :)
         free(item->type);
       }
     }
@@ -332,6 +381,8 @@ CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
     .visit_date = visit_date,
     .visit_timestamp = visit_timestamp,
     .visit_timestamp_ntz = visit_timestamp_ntz,
+    .visit_geometry = visit_geometry,
+    .visit_geography = visit_geography,
     .visit_interval_year_month = visit_interval_year_month,
     .visit_interval_day_time = visit_interval_day_time,
     .visit_void = visit_void,

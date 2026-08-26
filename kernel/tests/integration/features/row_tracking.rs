@@ -13,7 +13,9 @@ use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    schema_ref, DataType, MetadataColumnSpec, SchemaRef, StructField, StructType,
+};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
@@ -100,7 +102,7 @@ async fn write_data_to_table(
         load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
 
     // Write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.unpartitioned_write_context()?);
+    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
     let tasks = data.into_iter().map(|data| {
         let engine = engine.clone();
         let write_context = write_context.clone();
@@ -144,10 +146,7 @@ async fn setup_number_table_with_features(
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
     Arc<DynObjectStore>,
 )> {
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "number": INTEGER };
     let (table_url, engine, store) = create_row_tracking_table_with_features(
         tmp_dir,
         name,
@@ -454,10 +453,10 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "name": STRING,
+    };
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_three_transactions", schema.clone()).await?;
@@ -692,15 +691,15 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     )?;
 
     // Write data for both transactions
-    let write_context1 = Arc::new(txn1.unpartitioned_write_context()?);
-    let write_context2 = Arc::new(txn2.unpartitioned_write_context()?);
+    let write_context1 = txn1.write_state()?.unpartitioned_write_context()?;
+    let write_context2 = txn2.write_state()?.unpartitioned_write_context()?;
 
     let metadata1 = engine1
-        .write_parquet(&ArrowEngineData::new(data1), write_context1.as_ref())
+        .write_parquet(&ArrowEngineData::new(data1), &write_context1)
         .await?;
 
     let metadata2 = engine2
-        .write_parquet(&ArrowEngineData::new(data2), write_context2.as_ref())
+        .write_parquet(&ArrowEngineData::new(data2), &write_context2)
         .await?;
 
     txn1.add_files(metadata1);
@@ -779,10 +778,7 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "number": INTEGER };
 
     // Create a table without row tracking
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path())
@@ -1069,7 +1065,7 @@ async fn test_five_file_compaction_preserves_stable_row_tracking_values() -> Del
 
     let mut txn =
         load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(false);
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     let row_id_field = write_context
         .materialized_row_id_field()
         .expect("row tracking write context must expose its materialized row ID field")
@@ -1186,7 +1182,7 @@ async fn test_write_context_exposes_configured_materialized_row_tracking_fields(
     .await?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let txn = begin_transaction(snapshot, engine.as_ref())?;
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
 
     let row_id_field = write_context
         .materialized_row_id_field()
@@ -1290,7 +1286,7 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
     let mut dv = KernelDeletionVector::new();
     dv.add_deleted_row_indexes(deleted_indexes.iter().copied());
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
     let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
 
     let file_path = read_add_infos(snapshot.as_ref(), engine.as_ref())?[0]

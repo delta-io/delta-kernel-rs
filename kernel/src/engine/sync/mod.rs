@@ -35,6 +35,9 @@ mod parquet;
 mod storage;
 
 #[cfg(feature = "declarative-plans")]
+mod aggs;
+
+#[cfg(feature = "declarative-plans")]
 pub(crate) mod plan;
 
 #[cfg(feature = "declarative-plans")]

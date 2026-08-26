@@ -18,6 +18,7 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+use crate::cancellation::{check_cancelled, CancellableIterator, CancellationTokenRef};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -64,17 +65,22 @@ pub(crate) struct LogSegmentFiles {
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
+///
+/// With a `cancellation_token`, the listing becomes cancellable: the engine may interrupt its own
+/// I/O, and the returned iterator is polled against the token so cancellation arrives as a terminal
+/// [`Error::Cancelled`] rather than an early end.
 #[internal_api]
 pub(crate) fn list_delta_log_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Version,
     end_version: Version,
+    cancellation_token: Option<&CancellationTokenRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
     let log_root_str = log_root.to_string();
     let files = storage
-        .list_from(&start_from)?
+        .list_from_with_cancellation(&start_from, cancellation_token.cloned())?
         // The listing is sorted by full path, so nothing relevant follows the first relative path
         // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
         // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
@@ -101,7 +107,11 @@ pub(crate) fn list_delta_log_from_storage(
             Ok(path) => path.version <= end_version,
             Err(_) => true,
         });
-    Ok(files)
+    // Wrap the filtered pipeline so cancellation is checked as the iterator is consumed, outside
+    // the version `take_while` above. Checked inside, a cancelled listing would end with `None` and
+    // be indistinguishable from a complete one; outside, it surfaces as a terminal
+    // `Error::Cancelled`.
+    Ok(CancellableIterator::new(files, cancellation_token.cloned()))
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
@@ -502,6 +512,7 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         debug_assert!(
             log_tail.iter().all(|entry| entry.is_commit()),
@@ -509,7 +520,8 @@ impl LogSegmentFiles {
         );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
+        let fs_iter =
+            list_delta_log_from_storage(storage, log_root, start, end, cancellation_token)?;
 
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut listed_commits = Vec::new();
@@ -568,10 +580,12 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
+        let fs_iter =
+            list_delta_log_from_storage(storage, log_root, start, end, cancellation_token)?;
         Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
     }
 
@@ -588,6 +602,7 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let listed_files = Self::list(
             storage,
@@ -595,11 +610,27 @@ impl LogSegmentFiles {
             log_tail,
             Some(checkpoint_metadata.version),
             end_version,
+            cancellation_token,
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
-            // Kernel should not compensate for corrupt tables, so we fail if we can't find a
-            // checkpoint
+            // The hint names a checkpoint that no longer exists, and because the listing started
+            // at the hinted version, no checkpoint exists at or after it either. The log was
+            // modified out of band: the checkpoint was deleted without clearing the hint, or the
+            // table was dropped and recreated at the same path.
+            //
+            // Kernel fails rather than retrying the listing from version 0, because that recovery
+            // is unsound. Listing only checks that the commits it finds are contiguous, not that
+            // they start at version 0, so two distinct kinds of damage survive as a plausible but
+            // wrong snapshot instead of an error:
+            //   - A deleted log prefix leaves a contiguous suffix with no checkpoint. If commits
+            //     0-40 and the checkpoint are removed but 41.. remain, listing from version 0
+            //     replays 41 as if it were the start of history, dropping every action before it.
+            //   - A recreated table yields a segment mixing files from two different tables. A
+            //     table with a checkpoint at commit 3 is dropped and recreated at the same path;
+            //     the drop leaves commits 0-2 behind, the new table writes its own 0, 1, 2, ...,
+            //     and listing from version 0 sees one contiguous sequence whose low versions belong
+            //     to two different tables and replays it as a single history.
             return Err(Error::invalid_checkpoint(
                 "Had a _last_checkpoint hint but didn't find any checkpoints",
             ));
@@ -650,6 +681,7 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         // Scan backward in 1000-version windows, collecting ALL file types, until a complete
         // checkpoint is found or the log is exhausted.
@@ -660,9 +692,18 @@ impl LogSegmentFiles {
         // [lower, upper - 1].
         let mut upper = end_version + 1;
         while upper > 0 {
+            // Each window is collected eagerly, so check between windows too: a long backward scan
+            // would otherwise keep going after cancellation.
+            check_cancelled(cancellation_token)?;
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
-            let window_files: Vec<_> =
-                list_delta_log_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
+            let window_files: Vec<_> = list_delta_log_from_storage(
+                storage,
+                log_root,
+                lower,
+                upper - 1,
+                cancellation_token,
+            )?
+            .try_collect()?;
 
             found_checkpoint_version = find_complete_checkpoint_version(&window_files);
             windows.push(window_files);

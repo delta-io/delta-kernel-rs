@@ -94,10 +94,8 @@ async fn try_main() -> DeltaResult<()> {
         .with_data_change(true);
 
     // Write the data using the engine
-    let write_context = Arc::new(txn.unpartitioned_write_context()?);
-    let file_metadata = engine
-        .write_parquet(&sample_data, write_context.as_ref())
-        .await?;
+    let write_context = txn.write_state()?.unpartitioned_write_context()?;
+    let file_metadata = engine.write_parquet(&sample_data, &write_context).await?;
 
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);

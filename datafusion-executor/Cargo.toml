@@ -11,13 +11,15 @@ rust-version = "1.88"
 [workspace]
 
 [dependencies]
-delta_kernel = { path = "../kernel", version = "0.26.0", default-features = false, features = [
+delta_kernel = { path = "../kernel", default-features = false, features = [
   "declarative-plans",
   "vendored-protoc",
   "arrow-58",
   "default-engine-base",
 ] }
 datafusion = "54"
+itertools = "0.14"
 
 [dev-dependencies]
 rstest = "0.23"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

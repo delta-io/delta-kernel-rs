@@ -86,8 +86,23 @@ async fn test_preserving_write_context_transforms_complete_input(
         .unwrap_post_commit_snapshot();
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let write_context =
-        txn.unpartitioned_write_context_with_input(WriteMode::PreserveRowTracking)?;
+        txn.unpartitioned_write_context_with_input(WriteMode::PreserveRowTracking {
+            row_id_column: "stable_row_id",
+            row_commit_version_column: "stable_row_commit_version",
+        })?;
     let logical_data_schema = write_context.logical_data_schema().clone();
+    assert_eq!(
+        logical_data_schema
+            .metadata_column(&MetadataColumnSpec::RowId)
+            .map(|field| field.name().as_str()),
+        Some("stable_row_id")
+    );
+    assert_eq!(
+        logical_data_schema
+            .metadata_column(&MetadataColumnSpec::RowCommitVersion)
+            .map(|field| field.name().as_str()),
+        Some("stable_row_commit_version")
+    );
 
     let row_id_index = write_context.physical_data_schema().num_fields() - 2;
     let row_id_field = write_context
@@ -349,7 +364,10 @@ async fn test_acknowledged_row_tracking_rewrite(
         .with_data_change(config == RewriteConfig::DataChange);
     let add_metadata = if matches!(config, RewriteConfig::Valid | RewriteConfig::DataChange) {
         let write_context =
-            txn.unpartitioned_write_context_with_input(WriteMode::PreserveRowTracking)?;
+            txn.unpartitioned_write_context_with_input(WriteMode::PreserveRowTracking {
+                row_id_column: "row_id",
+                row_commit_version_column: "row_commit_version",
+            })?;
         let logical_data_schema = write_context.logical_data_schema().clone();
         let replacement_batch = RecordBatch::try_new(
             Arc::new(logical_data_schema.as_ref().try_into_arrow()?),
@@ -371,7 +389,7 @@ async fn test_acknowledged_row_tracking_rewrite(
             .write_parquet(&ArrowEngineData::new(replacement_batch), &write_context)
             .await?
     } else {
-        let write_context = txn.unpartitioned_write_context()?;
+        let write_context = txn.write_state()?.unpartitioned_write_context()?;
         let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
         let replacement_batch = RecordBatch::try_new(
             arrow_schema,

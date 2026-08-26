@@ -13,7 +13,7 @@ use crate::log_segment::CheckpointReadInfo;
 use crate::scan::log_replay::{scan_action_iter, ScanPartitionValuesOptions, ScanStatsOptions};
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::TransformSpec;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::{schema_ref, SchemaRef};
 use crate::table_features::ColumnMappingMode;
 use crate::unit_test_utils::string_array_to_engine_data;
 use crate::JsonHandler;
@@ -158,8 +158,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
     context: T,
     validate_callback: ScanCallback<T>,
 ) {
-    let logical_schema =
-        logical_schema.unwrap_or_else(|| Arc::new(StructType::new_unchecked(vec![])));
+    let logical_schema = logical_schema.unwrap_or_else(|| schema_ref! {});
     let state_info = Arc::new(StateInfo {
         logical_schema: logical_schema.clone(),
         physical_schema: logical_schema,
