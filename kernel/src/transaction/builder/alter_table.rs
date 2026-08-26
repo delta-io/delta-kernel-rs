@@ -129,10 +129,8 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
-        self.operations.push(SchemaOperation::AddColumn {
-            parent: None,
-            field,
-        });
+        self.operations
+            .push(SchemaOperation::add_col(ColumnName::default(), field));
         self.transition()
     }
 
@@ -165,10 +163,8 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
         parent: ColumnName,
         field: StructField,
     ) -> AlterTableTransactionBuilder<Modifying> {
-        self.operations.push(SchemaOperation::AddColumn {
-            parent: Some(parent),
-            field,
-        });
+        self.operations
+            .push(SchemaOperation::add_col(parent, field));
         self.transition()
     }
 }

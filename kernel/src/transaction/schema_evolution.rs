@@ -32,6 +32,17 @@ pub(crate) enum SchemaOperation {
     SetNullable { column: ColumnName },
 }
 
+impl SchemaOperation {
+    /// Creates an add-column operation under `parent`; an empty parent selects the root schema.
+    pub(crate) fn add_col(parent: impl Into<ColumnName>, field: StructField) -> Self {
+        let parent = parent.into();
+        Self::AddColumn {
+            parent: (!parent.is_empty()).then_some(parent),
+            field,
+        }
+    }
+}
+
 fn add_field(parent: &mut StructType, field: StructField) -> DeltaResult<()> {
     let lowered = field.name().to_lowercase();
     if parent
