@@ -14,8 +14,8 @@ use crate::actions::{
     LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, REMOVE_NAME,
     SIDECAR_NAME,
 };
-use crate::arrow::array::StringArray;
-use crate::engine::arrow_data::ArrowEngineData;
+use crate::arrow::array::{StringArray, StructArray};
+use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
@@ -42,7 +42,7 @@ use crate::schema::{
 };
 use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
-    create_log_path_with_size, string_array_to_engine_data, Action,
+    create_log_path_with_size, load_test_table, string_array_to_engine_data, Action,
 };
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
@@ -5037,4 +5037,50 @@ fn new_for_version_zero_rejects_non_commit_file() {
         create_log_path("memory:///_delta_log/00000000000000000000.checkpoint.parquet");
     let err = super::LogSegment::new_for_version_zero(log_root, checkpoint_path).unwrap_err();
     assert!(err.to_string().contains("non-commit"));
+}
+
+#[test]
+fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, snapshot, _tempdir) = load_test_table("app-txn-no-checkpoint")?;
+    let log_segment = snapshot.log_segment();
+
+    let schema = COMMIT_READ_SCHEMA.clone();
+    let commit_actions = log_segment.read_commit_actions(engine.as_ref(), schema, None)?;
+
+    let mut file_paths = vec![];
+    for result in commit_actions {
+        let ActionsBatch {
+            actions,
+            is_log_batch,
+        } = result?;
+        assert!(is_log_batch);
+
+        let record_batch = actions.try_into_record_batch()?;
+        let add = record_batch.column_by_name("add").unwrap();
+        let add_struct = add.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let path = add_struct
+            .column_by_name("path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let batch_paths = path.iter().flatten().map(ToString::to_string).collect_vec();
+        file_paths.extend(batch_paths);
+    }
+
+    file_paths.sort();
+    let expected_files = vec![
+        "modified=2021-02-01/part-00001-80996595-a345-43b7-b213-e247d6f091f7-c000.snappy.parquet",
+        "modified=2021-02-01/part-00001-8ebcaf8b-0f48-4213-98c9-5c2156d20a7e-c000.snappy.parquet",
+        "modified=2021-02-02/part-00001-9a16b9f6-c12a-4609-a9c4-828eacb9526a-c000.snappy.parquet",
+        "modified=2021-02-02/part-00001-bfac5c74-426e-410f-ab74-21a64e518e9c-c000.snappy.parquet",
+    ];
+    assert_eq!(
+        file_paths, expected_files,
+        "read_commit_actions should find exactly the expected files"
+    );
+
+    Ok(())
 }
