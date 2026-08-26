@@ -15,7 +15,10 @@ pub(crate) use column_mapping::{
 use delta_kernel_derive::internal_api;
 #[cfg(feature = "geo-type-in-dev")]
 pub(crate) use geospatial::validate_geospatial_feature_support;
-pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
+pub(crate) use iceberg_compat::v3::{
+    iceberg_compat_v3_column_defaults_validation, iceberg_compat_v3_type_changes_validation,
+    V3_VALIDATOR,
+};
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};

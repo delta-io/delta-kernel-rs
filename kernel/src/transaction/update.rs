@@ -34,7 +34,8 @@ use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
-    iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
+    iceberg_compat_v3_column_defaults_validation, iceberg_compat_v3_type_changes_validation,
+    Operation, TableFeature,
 };
 use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
@@ -81,6 +82,7 @@ impl Transaction {
         // Surface IcebergCompatV3 interoperability risks without rejecting tables based on
         // kernel parser limitations.
         if effective_table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            iceberg_compat_v3_type_changes_validation(&effective_table_config)?;
             iceberg_compat_v3_column_defaults_validation(&effective_table_config)?;
         }
 
