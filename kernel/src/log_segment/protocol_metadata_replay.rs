@@ -3,11 +3,10 @@
 //! This module contains the methods that perform a lightweight log replay to extract the latest
 //! Protocol and Metadata actions from a [`LogSegment`].
 
-use std::sync::Arc;
-#[cfg(feature = "declarative-plans")]
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use tracing::{info, instrument};
+use url::Url;
 
 use super::LogSegment;
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
@@ -18,24 +17,21 @@ use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
-#[cfg(feature = "declarative-plans")]
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
+use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::Agg;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
-#[cfg(feature = "declarative-plans")]
-use crate::schema::column_name;
-use crate::schema::{schema_ref, StructType};
-#[cfg(feature = "declarative-plans")]
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
-#[cfg(feature = "declarative-plans")]
-use crate::EngineData;
-use crate::{DeltaResult, Engine, Error};
+use crate::schema::{
+    column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
+    StructField, StructType,
+};
+use crate::{DeltaResult, Engine, EngineData, Error, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -129,7 +125,7 @@ impl LogSegment {
         ))
     }
 
-    /// Replays the log segment for Protocol and Metadata, stopping early once both are found
+    /// Replays the log segment for the latest Protocol and Metadata.
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
@@ -141,11 +137,8 @@ impl LogSegment {
         resolve_pm_batches(self.read_pm_batches(engine)?)
     }
 
-    /// Reads the P&M-projected commit cover and checkpoint via declarative plan, one batch
-    /// per emitted row.
-    ///
-    /// The plan can't unnest the checkpoint action, so it passes `checkpoint` through as one column
-    /// and emits the newest protocol and metaData versions as separate columns.
+    /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
+    /// its version.
     #[cfg(feature = "declarative-plans")]
     fn read_pm_batches_via_plan(
         &self,
@@ -182,40 +175,26 @@ impl LogSegment {
 
         let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
             .aggregate_ungrouped(|a| {
-                // Emit the newest protocol/metaData and the aliased `version` each sits at; without
-                // the alias both would collide on a `version` column.
+                let protocol = || column_name!(PROTOCOL_NAME);
+                let metadata = || column_name!(METADATA_NAME);
+                let version = || column_name!("version");
+                // The version aggregates are aliased; unaliased both would be named `version`.
                 let a = a
-                    .max_non_null_by(
-                        column_name!(PROTOCOL_NAME),
-                        column_name!(PROTOCOL_NAME),
-                        column_name!("version"),
-                    )
-                    .max_non_null_by(
-                        column_name!(METADATA_NAME),
-                        column_name!(METADATA_NAME),
-                        column_name!("version"),
-                    )
+                    .max_non_null_by(protocol(), protocol(), version())
+                    .max_non_null_by(metadata(), metadata(), version())
                     .aggregate_as(
-                        Agg::max_non_null_by(
-                            column_name!("version"),
-                            column_name!(PROTOCOL_NAME),
-                            column_name!("version"),
-                        ),
+                        Agg::max_non_null_by(version(), protocol(), version()),
                         "protocol_version",
                     )
                     .aggregate_as(
-                        Agg::max_non_null_by(
-                            column_name!("version"),
-                            column_name!(METADATA_NAME),
-                            column_name!("version"),
-                        ),
+                        Agg::max_non_null_by(version(), metadata(), version()),
                         "metadata_version",
                     );
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 let a = a.max_non_null_by(
                     column_name!(CHECKPOINT_ACTION_NAME),
                     column_name!(CHECKPOINT_ACTION_NAME),
-                    column_name!("version"),
+                    version(),
                 );
                 a
             })?
@@ -225,8 +204,7 @@ impl LogSegment {
             .execute_op(Operation::QueryPlan(plan))?
             .into_data()?
             .map(|batch| {
-                // Mark the batch as a log batch so `pm_candidate` reads the checkpoint action from
-                // it. The plan already deduped every action into a single row.
+                // Mark as a log batch so the checkpoint action is read from it.
                 let batch = ActionsBatch::new(batch?, true);
                 let (protocol_version, metadata_version) =
                     read_pm_versions(batch.actions.as_ref())?;
@@ -239,40 +217,45 @@ impl LogSegment {
         Ok(batches)
     }
 
-    /// Reads the P&M-projected commit cover and checkpoint, pairing each batch with the version its
-    /// P&M is at: a commit uses its file version, the base checkpoint uses the checkpoint version.
+    /// Reads the P&M commit cover and checkpoint, tagging each batch with its version.
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
-        let commits = self
-            .versioned_commit_batches(engine, commit_schema)?
-            .map(|batch| {
-                batch.map(|(version, batch)| VersionedBatch {
-                    protocol_version: Some(version),
-                    metadata_version: Some(version),
-                    batch,
-                })
-            });
-
-        // Skip checkpoint parts with no P&M.
-        let predicate = super::checkpoint_action_projection_predicate(&checkpoint_schema);
-        // This is `None` only when the table has no checkpoint, and then the stream below produces
-        // no batches, so no batch is ever tagged with a `None` version.
-        let base_checkpoint_version = self.checkpoint_version.map(|v| v as i64);
-        let checkpoint = self
-            .create_checkpoint_stream(engine, checkpoint_schema, predicate, None, None, None)?
-            .actions
-            .map(move |b| {
-                Ok(VersionedBatch {
-                    protocol_version: base_checkpoint_version,
-                    metadata_version: base_checkpoint_version,
-                    batch: b?,
-                })
-            });
-
-        Ok(commits.chain(checkpoint))
+        // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
+        let file_column =
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath);
+        let commit_schema = Arc::new(StructType::try_new(
+            commit_schema.fields().cloned().chain([file_column]),
+        )?);
+        let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
+        let batches = self
+            .read_actions_with_projected_checkpoint_actions(
+                engine,
+                commit_schema,
+                checkpoint_schema,
+                None,
+                None,
+                None,
+                None,
+            )?
+            .actions;
+        Ok(batches.map(move |batch| {
+            let batch = batch?;
+            // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
+            let version = if batch.is_log_batch {
+                batch_version(batch.actions.as_ref())? as i64
+            } else {
+                checkpoint_version
+                    .ok_or_else(|| Error::internal_error("checkpoint batch without a version"))?
+            };
+            Ok(VersionedBatch {
+                protocol_version: Some(version),
+                metadata_version: Some(version),
+                batch,
+            })
+        }))
     }
 }
 
@@ -301,7 +284,7 @@ fn resolve_pm_batches(
             metadata_version,
             batch,
         } = batch?;
-        let batch_version = protocol_version.or(metadata_version);
+        let batch_version = protocol_version.max(metadata_version);
         let candidate = pm_candidate(&batch, protocol_version, metadata_version)?;
         metadata = newer(metadata, candidate.metadata);
         protocol = newer(protocol, candidate.protocol);
@@ -313,20 +296,64 @@ fn resolve_pm_batches(
     Ok((metadata.map(|(_, m)| m), protocol.map(|(_, p)| p)))
 }
 
-/// Whether `winner` is set at a version at least `batch_version`.
-fn is_final<T>(winner: &Option<(i64, T)>, batch_version: Option<i64>) -> bool {
-    matches!((winner, batch_version), (Some((v, _)), Some(bv)) if *v >= bv)
+/// Parses the log version from a batch's `_file` metadata column.
+fn batch_version(data: &dyn EngineData) -> DeltaResult<Version> {
+    #[derive(Default)]
+    struct FilePathVisitor {
+        file: Option<String>,
+    }
+    impl RowVisitor for FilePathVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+                LazyLock::new(|| (vec![column_name!("_file")], vec![DataType::STRING]).into());
+            NAMES_AND_TYPES.as_ref()
+        }
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            if self.file.is_none() && row_count > 0 {
+                self.file = getters[0].get_opt(0, "_file")?;
+            }
+            Ok(())
+        }
+    }
+    let mut visitor = FilePathVisitor::default();
+    visitor.visit_rows_of(data)?;
+    let file = visitor
+        .file
+        .ok_or_else(|| Error::internal_error("commit batch missing _file column"))?;
+    let url = Url::parse(&file)
+        .map_err(|e| Error::internal_error(format!("batch has invalid _file {file}: {e}")))?;
+    ParsedLogPath::try_from(url)?
+        .map(|path| path.version)
+        .ok_or_else(|| Error::internal_error(format!("batch from non-log file {file}")))
 }
 
-/// The higher-versioned of `a` and `b`. On a tie `b` wins, so pass the older offer as `a`.
-fn newer<T>(a: Option<(i64, T)>, b: Option<(i64, T)>) -> Option<(i64, T)> {
-    match (a, b) {
-        (Some(a), Some(b)) if a.0 > b.0 => Some(a),
-        (a, b) => b.or(a),
+/// Whether `winner` is set at a version at least `batch_version`.
+fn is_final<T>(winner: &Option<(i64, T)>, batch_version: Option<i64>) -> bool {
+    match (winner, batch_version) {
+        (Some((version, _)), Some(bv)) => *version >= bv,
+        _ => false,
     }
 }
 
-/// The commit and checkpoint read schemas for P&M replay; only the commit schema includes the AMT
+/// The higher-versioned of `a` and `b`; on a tie, `b` wins.
+fn newer<T>(a: Option<(i64, T)>, b: Option<(i64, T)>) -> Option<(i64, T)> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            if b.0 >= a.0 {
+                Some(b)
+            } else {
+                Some(a)
+            }
+        }
+        (a, b) => a.or(b),
+    }
+}
+
+/// The commit and checkpoint read schemas for P&M replay; the commit schema also reads the AMT
 /// `checkpoint` action.
 fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
     let checkpoint_schema = schema_ref! {
@@ -344,21 +371,16 @@ fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
     (commit_schema, checkpoint_schema)
 }
 
-/// Builds a [`PmCandidate`] from one batch. The top-level protocol and metaData use the versions
-/// the caller passes in (`None` if that action isn't in the batch). Under AMT, a checkpoint action
-/// in a log batch contributes its nested P&M at its own version, and the newer of the two wins.
+/// The Protocol and Metadata in `batch`, tagged with the given versions, plus any AMT checkpoint
+/// action's nested P&M at its own version.
 fn pm_candidate(
     batch: &ActionsBatch,
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
 ) -> DeltaResult<PmCandidate> {
     let actions = batch.actions.as_ref();
-    let protocol = Protocol::try_new_from_data(actions)?
-        .zip(protocol_version)
-        .map(|(p, v)| (v, p));
-    let metadata = Metadata::try_new_from_data(actions)?
-        .zip(metadata_version)
-        .map(|(m, v)| (v, m));
+    let protocol = protocol_version.zip(Protocol::try_new_from_data(actions)?);
+    let metadata = metadata_version.zip(Metadata::try_new_from_data(actions)?);
     let (checkpoint_protocol, checkpoint_metadata) = match checkpoint_pm(batch)? {
         Some((version, p, m)) => (Some((version, p)), Some((version, m))),
         None => (None, None),
@@ -369,9 +391,8 @@ fn pm_candidate(
     })
 }
 
-/// The Protocol and Metadata nested in `batch`'s `checkpoint` action, tagged with the action's own
-/// `checkpointMetadata.version`. Checkpoint actions are only written for AMT manifest commits, so
-/// this is `None` unless `batch` is a log batch that carries one.
+/// The Protocol and Metadata nested in `batch`'s `checkpoint` action, at the action's own
+/// `checkpointMetadata.version`.
 fn checkpoint_pm(batch: &ActionsBatch) -> DeltaResult<Option<(i64, Protocol, Metadata)>> {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     {
@@ -397,8 +418,7 @@ fn checkpoint_pm(batch: &ActionsBatch) -> DeltaResult<Option<(i64, Protocol, Met
     }
 }
 
-/// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits: the
-/// version of the newest protocol and metaData, or `None` if that action wasn't found.
+/// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits.
 #[cfg(feature = "declarative-plans")]
 fn read_pm_versions(actions: &dyn EngineData) -> DeltaResult<(Option<i64>, Option<i64>)> {
     #[derive(Default)]

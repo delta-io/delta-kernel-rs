@@ -1,6 +1,5 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
-use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -15,7 +14,6 @@ use crate::actions::{
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
-use crate::engine_data::{GetData, TypedGetData as _};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
@@ -30,16 +28,13 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
-use crate::schema::{
-    column_name, lazy_schema_ref, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
-    StructField, StructType, ToSchema as _,
-};
+use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version,
+    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
+    Version,
 };
 
 mod crc_replay;
@@ -148,37 +143,6 @@ fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<Predica
     let mut predicates = columns.into_iter().map(Predicate::is_not_null);
     let first = predicates.next()?;
     Some(Arc::new(predicates.fold(first, Predicate::or)))
-}
-
-/// Reads the `_file` metadata column from a commit batch; all rows share one file, so row 0 is
-/// enough.
-fn commit_file_path(data: &dyn EngineData) -> DeltaResult<String> {
-    #[derive(Default)]
-    struct FilePathVisitor {
-        file: Option<String>,
-    }
-    impl RowVisitor for FilePathVisitor {
-        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-            static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-                LazyLock::new(|| (vec![column_name!("_file")], vec![DataType::STRING]).into());
-            NAMES_AND_TYPES.as_ref()
-        }
-        fn visit<'a>(
-            &mut self,
-            row_count: usize,
-            getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
-            if self.file.is_none() && row_count > 0 {
-                self.file = getters[0].get_opt(0, "_file")?;
-            }
-            Ok(())
-        }
-    }
-    let mut visitor = FilePathVisitor::default();
-    visitor.visit_rows_of(data)?;
-    visitor
-        .file
-        .ok_or_else(|| Error::internal_error("commit batch missing _file column"))
 }
 
 fn combine_checkpoint_predicates(
@@ -844,53 +808,6 @@ impl LogSegment {
         selected_files
     }
 
-    /// Reads commit-cover actions, pairing each batch with its source commit version.
-    /// Adds an internal `_file` metadata column to identify each batch's source file.
-    fn versioned_commit_batches(
-        &self,
-        engine: &dyn Engine,
-        schema: SchemaRef,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(i64, ActionsBatch)>> + Send> {
-        let commit_files = self.find_commit_cover_paths();
-
-        let version_by_path = commit_files
-            .iter()
-            .map(|commit| (commit.location.location.to_string(), commit.version as i64))
-            .collect::<HashMap<_, _>>();
-
-        let files = commit_files
-            .into_iter()
-            .map(|commit| commit.location)
-            .collect::<Vec<_>>();
-
-        let fields =
-            schema
-                .fields()
-                .cloned()
-                .chain(std::iter::once(StructField::create_metadata_column(
-                    "_file",
-                    MetadataColumnSpec::FilePath,
-                )));
-        let schema_with_file_path = Arc::new(StructType::try_new(fields)?);
-
-        let batches = engine
-            .json_handler()
-            .read_json_files(&files, schema_with_file_path, None)?;
-
-        Ok(batches.map(move |batch| {
-            let batch = batch?;
-            let file_path = commit_file_path(batch.as_ref())?;
-
-            let version = version_by_path.get(&file_path).copied().ok_or_else(|| {
-                Error::internal_error(format!(
-                    "commit-cover read returned batch from unknown file: {file_path}"
-                ))
-            })?;
-
-            Ok((version, ActionsBatch::new(batch, true)))
-        }))
-    }
-
     #[cfg(feature = "declarative-plans")]
     fn version_tagged_scan_files<'a>(
         paths: impl IntoIterator<Item = &'a ParsedLogPath>,
@@ -900,7 +817,7 @@ impl LogSegment {
             .map(|path| {
                 Ok(ScanFile {
                     meta: path.location.clone(),
-                    file_constants: vec![Scalar::Long(crate::version_as_i64(path.version)?)],
+                    file_constants: vec![Scalar::Long(path.version_as_i64()?)],
                 })
             })
             .collect()
