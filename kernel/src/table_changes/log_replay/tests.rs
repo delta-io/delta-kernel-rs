@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -7,8 +8,8 @@ use rstest::rstest;
 use test_utils::LoggingTest;
 
 use super::{
-    group_commit_batches, read_commits_grouped, table_changes_action_iter,
-    table_changes_action_iter_with_mode, LogReplayScanner, PreparePhaseVisitor,
+    read_commit_batches, replay_schema, table_changes_action_iter,
+    table_changes_action_iter_with_mode, CommitBatchIterator, LogReplayScanner,
     TableChangesScanMetadata,
 };
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
@@ -35,7 +36,7 @@ use crate::utils::test_utils::{
     assert_result_error_with_message, install_thread_local_metrics_reporter, Action,
     CapturingReporter, LocalMockTable,
 };
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Predicate, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked([
@@ -203,38 +204,50 @@ fn nullable_file_path_batch(path: Option<&str>) -> Box<dyn EngineData> {
     Box::new(ArrowEngineData::new(batch))
 }
 
-fn prepare_actions_for_commit(
+fn action_batches_for_commit(
     engine: &dyn Engine,
     commit: &ParsedLogPath,
 ) -> Vec<Box<dyn EngineData>> {
-    read_commits_grouped(
-        engine,
-        std::slice::from_ref(commit),
-        &PreparePhaseVisitor::schema(),
-        None,
-    )
-    .unwrap()
-    .pop()
-    .unwrap()
+    read_commit_batches(engine, vec![commit.clone()], replay_schema().unwrap())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .action_batches
+}
+
+fn test_commits(count: u64) -> Vec<ParsedLogPath> {
+    let table_root = url::Url::parse("memory:///").unwrap();
+    (0..count)
+        .map(|version| ParsedLogPath::create_parsed_published_commit(&table_root, version))
+        .collect()
 }
 
 #[test]
 fn groups_multiple_batches_without_shifting_over_empty_commits() {
-    let locations = vec![
-        FileMeta::new(url::Url::parse("memory:///0.json").unwrap(), 0, 0),
-        FileMeta::new(url::Url::parse("memory:///1.json").unwrap(), 0, 0),
-        FileMeta::new(url::Url::parse("memory:///2.json").unwrap(), 0, 0),
-    ];
+    let commits = test_commits(3);
+    let paths = commits
+        .iter()
+        .map(|commit| commit.location.location.to_string())
+        .collect_vec();
     let batches = vec![
-        Ok::<_, Error>(file_path_batch("memory:///0.json", 1)),
-        Ok(file_path_batch("memory:///0.json", 1)),
-        Ok(file_path_batch("memory:///1.json", 0)),
-        Ok(file_path_batch("memory:///2.json", 1)),
+        Ok::<_, Error>(file_path_batch(&paths[0], 1)),
+        Ok(file_path_batch(&paths[0], 1)),
+        Ok(file_path_batch(&paths[1], 0)),
+        Ok(file_path_batch(&paths[2], 1)),
     ];
 
-    let groups = group_commit_batches(&locations, Box::new(batches.into_iter())).unwrap();
+    let grouped_batches: Vec<_> = CommitBatchIterator::new(commits, Box::new(batches.into_iter()))
+        .try_collect()
+        .unwrap();
 
-    assert_eq!(groups.iter().map(Vec::len).collect_vec(), vec![2, 0, 1]);
+    assert_eq!(
+        grouped_batches
+            .iter()
+            .map(|group| group.action_batches.len())
+            .collect_vec(),
+        vec![2, 0, 1]
+    );
 }
 
 #[rstest]
@@ -244,20 +257,40 @@ fn rejects_batch_without_requested_file_path(
     #[case] batch_path: Option<&str>,
     #[case] expected_error: &str,
 ) {
-    let locations = vec![FileMeta::new(
-        url::Url::parse("memory:///requested.json").unwrap(),
-        0,
-        0,
-    )];
+    let commits = test_commits(1);
     let batches = vec![Ok::<_, Error>(nullable_file_path_batch(batch_path))];
 
-    let result = group_commit_batches(&locations, Box::new(batches.into_iter()));
+    let mut commit_batches = CommitBatchIterator::new(commits, Box::new(batches.into_iter()));
+    let result = commit_batches.next().unwrap();
 
     assert_result_error_with_message(result, expected_error);
+    assert!(commit_batches.next().is_none());
+}
+
+#[test]
+fn streams_commit_batches_without_materializing_the_full_range() {
+    let commits = test_commits(3);
+    let batches = commits
+        .iter()
+        .map(|commit| file_path_batch(commit.location.location.as_str(), 1))
+        .collect_vec();
+    let batches_read = Arc::new(AtomicUsize::new(0));
+    let counter = batches_read.clone();
+    let batches = batches.into_iter().map(move |batch| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Ok::<_, Error>(batch)
+    });
+    let mut commit_batches = CommitBatchIterator::new(commits, Box::new(batches));
+
+    let first = commit_batches.next().unwrap().unwrap();
+
+    assert_eq!(first.commit.version, 0);
+    assert_eq!(first.action_batches.len(), 1);
+    assert_eq!(batches_read.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
-async fn batches_each_json_phase_across_the_commit_range() {
+async fn reads_full_commit_range_once() {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine: Arc<dyn Engine> = Arc::new(MeteredDeltaEngine::new(Arc::new(SyncEngine::new())));
@@ -299,7 +332,7 @@ async fn batches_each_json_phase_across_the_commit_range() {
             _ => None,
         })
         .collect_vec();
-    assert_eq!(json_read_file_counts, vec![3, 3]);
+    assert_eq!(json_read_file_counts, vec![3]);
 }
 
 #[tokio::test]
@@ -1387,11 +1420,11 @@ async fn file_meta_timestamp() {
     let file_meta_ts = commit.location.last_modified;
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let prepare_actions = prepare_actions_for_commit(engine.as_ref(), &commit);
+    let action_batches = action_batches_for_commit(engine.as_ref(), &commit);
     let scanner = LogReplayScanner::try_new(
         &mut table_config,
         commit,
-        prepare_actions,
+        action_batches,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     )
@@ -1676,11 +1709,11 @@ async fn test_timestamp_with_ict_enabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let prepare_actions = prepare_actions_for_commit(engine.as_ref(), &commit);
+    let action_batches = action_batches_for_commit(engine.as_ref(), &commit);
     let scanner = LogReplayScanner::try_new(
         &mut table_config,
         commit,
-        prepare_actions,
+        action_batches,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     )
@@ -1728,11 +1761,11 @@ async fn test_timestamp_with_ict_disabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let prepare_actions = prepare_actions_for_commit(engine.as_ref(), &commit);
+    let action_batches = action_batches_for_commit(engine.as_ref(), &commit);
     let scanner = LogReplayScanner::try_new(
         &mut table_config,
         commit.clone(),
-        prepare_actions,
+        action_batches,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     )
@@ -1787,11 +1820,11 @@ async fn test_timestamp_with_commit_info_not_first() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let prepare_actions = prepare_actions_for_commit(engine.as_ref(), &commit);
+    let action_batches = action_batches_for_commit(engine.as_ref(), &commit);
     let result = LogReplayScanner::try_new(
         &mut table_config,
         commit,
-        prepare_actions,
+        action_batches,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     );

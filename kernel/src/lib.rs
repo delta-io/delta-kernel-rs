@@ -683,6 +683,10 @@ pub trait JsonHandler: AsAny {
     ///
     /// Additionally, engines may not merge engine data across file boundaries.
     ///
+    /// If `physical_schema` contains a [`schema::MetadataColumnSpec::FilePath`] column, the handler
+    /// must populate it on every row with `FileMeta::location.to_string()` for the corresponding
+    /// input file.
+    ///
     /// # Parameters
     ///
     /// - `files` - File metadata for files to be read.
