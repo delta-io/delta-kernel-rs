@@ -1,0 +1,17 @@
+Reading table at ../../../../kernel/tests/data/table-with-column-defaults/
+version: 0
+
+Schema:
+├─ id: integer
+├─ status: string
+├─ ts: timestamp
+└─ amount: decimal(10)(2)
+
+Column defaults:
+  to materialize before writing:
+    amount: 4.95
+    status: 'pending'
+    ts: current_timestamp()
+    (3 total)
+
+[No data]

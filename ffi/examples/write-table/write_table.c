@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "column_defaults.h"
 #include "delta_kernel_ffi.h"
 #include "kernel_utils.h"
 
@@ -11,9 +12,15 @@
 // ============================================================================
 //
 // Usage:
-//   ./write_table /path/to/existing/table
+//   ./write_table [-d] /path/to/existing/table
 //
 // The target table must already exist (e.g. created by the `create-table` example).
+//
+// With `-d`, the column-default flow runs before the write context is requested: report every
+// top-level default, then acknowledge them. A table that enables `allowColumnDefaults` and declares
+// a default REQUIRES that acknowledgement -- without it `get_unpartitioned_write_context` fails
+// with `InvalidTransactionStateError`, because kernel never materializes a default and the
+// connector must fill every omitted column itself.
 //
 // Demonstrates the write-path FFI surface:
 //   - transaction(path, engine) to start an existing-table transaction
@@ -41,11 +48,17 @@
 // file and exercise the full add_files -> commit path.
 
 int main(int argc, char* argv[]) {
-  if (argc != 2) {
-    fprintf(stderr, "Usage: %s /path/to/existing/table\n", argv[0]);
+  bool handle_column_defaults = false;
+  int arg = 1;
+  if (arg < argc && strcmp(argv[arg], "-d") == 0) {
+    handle_column_defaults = true;
+    arg++;
+  }
+  if (argc - arg != 1) {
+    fprintf(stderr, "Usage: %s [-d] /path/to/existing/table\n", argv[0]);
     return 1;
   }
-  char* table_path = argv[1];
+  char* table_path = argv[arg];
   printf("Writing empty commit to %s\n", table_path);
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
@@ -92,6 +105,19 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   txn = with_info_res.ok;
+
+  // === Column defaults ===
+  //
+  // Report the table's top-level defaults, then acknowledge them on THIS transaction. The
+  // acknowledgement is what unblocks the write context below; visiting alone does not imply it.
+  if (handle_column_defaults) {
+    if (!print_column_defaults_of(txn, engine)) {
+      free_transaction(txn);
+      free_engine(engine);
+      return 1;
+    }
+    transaction_ack_column_defaults(txn);
+  }
 
   // === Inspect the unpartitioned write context ===
   //

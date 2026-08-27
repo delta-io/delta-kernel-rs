@@ -27,6 +27,7 @@ the caller's memory space.
 
 - `src/lib.rs` -- main FFI entry points and type definitions
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
+- `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
 - `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
@@ -139,6 +140,24 @@ commits into `_delta_log/` via the catalog committer's `publish()` implementatio
 snapshot is borrowed; the committer is consumed (do not free). The caller owns the returned
 snapshot handle. The returned snapshot carries the published watermark (`max_published_version`)
 needed for the next catalog commit; do not continue from the pre-publish post-commit snapshot.
+
+Column defaults (`allowColumnDefaults`) live in `ffi/src/column_default.rs`. The kernel reports
+defaults but never materializes them, so the connector fills every omitted column itself:
+
+```
+transaction()
+  -> transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)
+  -> transaction_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
+                                            // KernelError::InvalidTransactionStateError
+  -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
+```
+
+Both examples demo this via `-d`, sharing `ffi/examples/common/column_defaults.{h,c}`:
+`read-table` reports what a table declares (ctest `read_and_print_column_defaults`), while
+`write-table` runs the full visit -> ack -> write-context -> commit sequence (ctest
+`write_table_column_defaults`) -- the only place the acknowledgement gate is exercised from C,
+since read-table never builds a write context. The ack is recorded per transaction, so a writer
+must visit and ack on the same transaction it later requests the write context from.
 
 Deletion vector update flow:
 

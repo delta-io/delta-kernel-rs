@@ -13,8 +13,14 @@ C FFI example for the write transaction surface. Demonstrates `transaction`,
 $ cargo build -p delta_kernel_ffi
 # from this directory
 $ mkdir build && cd build && cmake .. && make
-$ ./write_table /path/to/existing/table
+$ ./write_table [-d] /path/to/existing/table
 ```
+
+Pass `-d` to run the column-default flow first: report the table's top-level defaults, then
+acknowledge them. A table enabling `allowColumnDefaults` with a declared default *requires* that
+acknowledgement -- without it `get_unpartitioned_write_context` fails with
+`InvalidTransactionStateError`. See `../common/column_defaults.h`; the ctest is
+`write_table_column_defaults`.
 
 # Limitations
 
