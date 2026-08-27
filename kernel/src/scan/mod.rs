@@ -257,13 +257,18 @@ impl ScanBuilder {
         }
     }
 
-    /// Provide [`Schema`] for columns to select from the [`Snapshot`].
+    /// Provides a [`Schema`] for columns to select from the [`Snapshot`].
     ///
     /// A table with columns `[a, b, c]` could have a scan which reads only the first
-    /// two columns by using the schema `[a, b]`.
+    /// two columns by using the schema `[a, b]`. Build table-backed projections with
+    /// [`Snapshot::schema`]'s [`Schema::project`] method so the projected fields retain their
+    /// authoritative type, nullability, and column-mapping metadata. [`Self::build`] returns a
+    /// schema error if a projected partition field conflicts with the snapshot schema.
     ///
     /// [`Schema`]: crate::schema::Schema
+    /// [`Schema::project`]: crate::schema::Schema::project
     /// [`Snapshot`]: crate::snapshot::Snapshot
+    /// [`Snapshot::schema`]: crate::snapshot::Snapshot::schema
     pub fn with_schema(mut self, logical_read_schema: SchemaRef) -> Self {
         self.logical_read_schema = Some(logical_read_schema);
         self

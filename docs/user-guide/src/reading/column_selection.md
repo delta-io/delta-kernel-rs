@@ -1,7 +1,7 @@
-# Column Selection
+# Column selection
 
-By default a scan reads all columns from a table. You can select a subset of columns
-(projection pushdown) so the engine only reads the data you need.
+To read a subset of table columns, build a projection from the current `Snapshot` schema
+and pass it to the `ScanBuilder`.
 
 ## Projecting columns
 
@@ -33,6 +33,11 @@ let scan = snapshot
 
 The returned data will contain only the projected columns, in the order you specified.
 Requesting a column that does not exist in the table schema returns an error.
+
+Always derive table-backed projections from the current `Snapshot`. `project()` copies each
+field's type, nullability, and column-mapping metadata. If a projected partition field
+conflicts with the authoritative field, `build()` returns a schema error that directs you
+back to `Schema::project()`.
 
 ## Reordering columns
 

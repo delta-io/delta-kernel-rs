@@ -9,7 +9,7 @@ use tracing::{debug, enabled, warn, Level};
 use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
-use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
+use crate::scan::transform_spec::{FieldTransformSpec, PartitionColumnSource, TransformSpec};
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
@@ -262,10 +262,21 @@ impl StateInfo {
                 // Classifier has handled this field via a transformation, just push it and move on
                 transform_spec.push(spec);
             } else if partition_columns.contains(logical_field.name()) {
+                let authoritative_field = validate_projected_partition_field(
+                    logical_field,
+                    table_configuration,
+                    column_mapping_mode,
+                )?;
                 // push the transform for this partition column
                 transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
                     field_index: index,
                     insert_after: last_physical_field.clone(),
+                    partition_source: Some(PartitionColumnSource {
+                        physical_name: authoritative_field
+                            .physical_name(column_mapping_mode)
+                            .to_string(),
+                        data_type: authoritative_field.data_type().clone(),
+                    }),
                 });
             } else {
                 // Regular field field or a metadata column, figure out which and handle it
@@ -468,6 +479,86 @@ impl StateInfo {
     }
 }
 
+fn validate_projected_partition_field<'a>(
+    projected_field: &StructField,
+    table_configuration: &'a TableConfiguration,
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<&'a StructField> {
+    let authoritative_field = table_configuration
+        .logical_schema_ref()
+        .field(projected_field.name())
+        .ok_or_else(|| {
+            Error::internal_error(format!(
+                "Partition field '{}' is absent from the authoritative table schema",
+                projected_field.name()
+            ))
+        })?;
+
+    if projected_field.data_type() != authoritative_field.data_type() {
+        return Err(invalid_partition_projection(
+            projected_field,
+            format!(
+                "expected type {:?}, found {:?}",
+                authoritative_field.data_type(),
+                projected_field.data_type()
+            ),
+        ));
+    }
+    if projected_field.is_nullable() != authoritative_field.is_nullable() {
+        return Err(invalid_partition_projection(
+            projected_field,
+            format!(
+                "expected nullable={}, found nullable={}",
+                authoritative_field.is_nullable(),
+                projected_field.is_nullable()
+            ),
+        ));
+    }
+
+    if column_mapping_mode != ColumnMappingMode::None {
+        let projected_annotations = projected_field
+            .validate_and_extract_existing_column_mapping_annotations()
+            .map_err(|error| invalid_partition_projection(projected_field, error.to_string()))?;
+        let authoritative_annotations = authoritative_field
+            .validate_and_extract_existing_column_mapping_annotations()
+            .map_err(|error| {
+                Error::internal_error(format!(
+                    "Invalid column mapping metadata on authoritative field '{}': {error}",
+                    authoritative_field.name()
+                ))
+            })?;
+
+        if projected_annotations.id != authoritative_annotations.id {
+            return Err(invalid_partition_projection(
+                projected_field,
+                format!(
+                    "expected delta.columnMapping.id {:?}, found {:?}",
+                    authoritative_annotations.id, projected_annotations.id
+                ),
+            ));
+        }
+        if projected_annotations.physical_name != authoritative_annotations.physical_name {
+            return Err(invalid_partition_projection(
+                projected_field,
+                format!(
+                    "expected delta.columnMapping.physicalName {:?}, found {:?}",
+                    authoritative_annotations.physical_name, projected_annotations.physical_name
+                ),
+            ));
+        }
+    }
+
+    Ok(authoritative_field)
+}
+
+fn invalid_partition_projection(field: &StructField, reason: impl std::fmt::Display) -> Error {
+    Error::schema(format!(
+        "Projected partition field '{}' does not match the authoritative table schema: {reason}. \
+         Build the projection from the scan's authoritative schema with Schema::project",
+        field.name()
+    ))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashMap;
@@ -660,6 +751,7 @@ pub(crate) mod tests {
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index,
                 insert_after,
+                ..
             } => {
                 assert_eq!(*field_index, 1); // Index of "date" in logical schema
                 assert_eq!(insert_after, &Some("id".to_string())); // After "id" which is physical
@@ -698,6 +790,7 @@ pub(crate) mod tests {
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index,
                 insert_after,
+                ..
             } => {
                 assert_eq!(*field_index, 1); // Index of "part1"
                 assert_eq!(insert_after, &Some("col1".to_string()));
@@ -710,6 +803,7 @@ pub(crate) mod tests {
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index,
                 insert_after,
+                ..
             } => {
                 assert_eq!(*field_index, 3); // Index of "part2"
                 assert_eq!(insert_after, &Some("col2".to_string()));
@@ -770,6 +864,7 @@ pub(crate) mod tests {
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index,
                 insert_after,
+                ..
             } => {
                 assert_eq!(*field_index, 0); // Index of "date"
                 assert_eq!(insert_after, &None); // No physical field before it, so prepend
@@ -800,6 +895,160 @@ pub(crate) mod tests {
                 MetadataValue::String(physical_name.into()),
             ),
         ])
+    }
+
+    #[derive(Clone, Copy)]
+    enum PartitionProjectionMutation {
+        Canonical,
+        UnrelatedMetadata,
+        MissingMappingMetadata,
+        MalformedId,
+        MalformedPhysicalName,
+        WrongId,
+        WrongPhysicalName,
+        WrongType,
+        WrongNullability,
+        OtherPartitionIdentity,
+    }
+
+    #[rstest]
+    #[case::canonical(PartitionProjectionMutation::Canonical, None)]
+    #[case::unrelated_metadata(PartitionProjectionMutation::UnrelatedMetadata, None)]
+    #[case::missing_mapping_metadata(
+        PartitionProjectionMutation::MissingMappingMetadata,
+        Some("expected delta.columnMapping.id Some(1), found None")
+    )]
+    #[case::malformed_id(
+        PartitionProjectionMutation::MalformedId,
+        Some("non-numeric `delta.columnMapping.id` annotation")
+    )]
+    #[case::malformed_physical_name(
+        PartitionProjectionMutation::MalformedPhysicalName,
+        Some("non-string `delta.columnMapping.physicalName` annotation")
+    )]
+    #[case::wrong_id(
+        PartitionProjectionMutation::WrongId,
+        Some("expected delta.columnMapping.id Some(1), found Some(9)")
+    )]
+    #[case::wrong_physical_name(
+        PartitionProjectionMutation::WrongPhysicalName,
+        Some("expected delta.columnMapping.physicalName Some(\"part-physical\"), found Some(\"wrong\")")
+    )]
+    #[case::wrong_type(
+        PartitionProjectionMutation::WrongType,
+        Some("expected type Primitive(String), found Primitive(Integer)")
+    )]
+    #[case::wrong_nullability(
+        PartitionProjectionMutation::WrongNullability,
+        Some("expected nullable=true, found nullable=false")
+    )]
+    #[case::other_partition_identity(
+        PartitionProjectionMutation::OtherPartitionIdentity,
+        Some("expected delta.columnMapping.id Some(1), found Some(2)")
+    )]
+    fn column_mapped_partition_projection_must_match_snapshot(
+        #[values(ColumnMappingMode::Name, ColumnMappingMode::Id)] mode: ColumnMappingMode,
+        #[case] mutation: PartitionProjectionMutation,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let authoritative_schema = schema_ref! {
+            (cm_field("part", 1, "part-physical", DataType::STRING)),
+            (cm_field("other_part", 2, "other-physical", DataType::STRING)),
+        };
+        let table_configuration = MockTableConfigurationBuilder::new()
+            .with_schema(authoritative_schema)
+            .with_partition_columns(["part", "other_part"])
+            .with_column_mapping(mode)
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
+            .build();
+
+        let mut projected_field = cm_field("part", 1, "part-physical", DataType::STRING);
+        match mutation {
+            PartitionProjectionMutation::Canonical => {}
+            PartitionProjectionMutation::UnrelatedMetadata => {
+                projected_field.metadata.insert(
+                    "comment".to_string(),
+                    MetadataValue::String("caller annotation".to_string()),
+                );
+            }
+            PartitionProjectionMutation::MissingMappingMetadata => {
+                projected_field = StructField::nullable("part", DataType::STRING);
+            }
+            PartitionProjectionMutation::MalformedId => {
+                projected_field.metadata.insert(
+                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                    MetadataValue::String("one".to_string()),
+                );
+            }
+            PartitionProjectionMutation::MalformedPhysicalName => {
+                projected_field.metadata.insert(
+                    ColumnMetadataKey::ColumnMappingPhysicalName
+                        .as_ref()
+                        .to_string(),
+                    MetadataValue::Number(1),
+                );
+            }
+            PartitionProjectionMutation::WrongId => {
+                projected_field.metadata.insert(
+                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                    MetadataValue::Number(9),
+                );
+            }
+            PartitionProjectionMutation::WrongPhysicalName => {
+                projected_field.metadata.insert(
+                    ColumnMetadataKey::ColumnMappingPhysicalName
+                        .as_ref()
+                        .to_string(),
+                    MetadataValue::String("wrong".to_string()),
+                );
+            }
+            PartitionProjectionMutation::WrongType => {
+                projected_field.data_type = DataType::INTEGER;
+            }
+            PartitionProjectionMutation::WrongNullability => {
+                projected_field.nullable = false;
+            }
+            PartitionProjectionMutation::OtherPartitionIdentity => {
+                projected_field = cm_field("part", 2, "other-physical", DataType::STRING);
+            }
+        }
+
+        let projected_schema = Arc::new(StructType::try_new([projected_field]).unwrap());
+        let result = StateInfo::try_new(
+            projected_schema,
+            table_configuration.logical_schema(),
+            &table_configuration,
+            None,
+            &StatsOptions::default(),
+            &PartitionValuesOptions::default(),
+            (),
+        );
+
+        if let Some(expected_error) = expected_error {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error: {error}"
+            );
+            assert!(
+                error.to_string().contains(
+                    "Build the projection from the scan's authoritative schema with Schema::project"
+                ),
+                "unexpected error: {error}"
+            );
+        } else {
+            let state_info = result.unwrap();
+            let transform_spec = state_info.transform_spec.unwrap();
+            let FieldTransformSpec::MetadataDerivedColumn {
+                partition_source: Some(source),
+                ..
+            } = &transform_spec[0]
+            else {
+                panic!("Expected partition source in MetadataDerivedColumn transform")
+            };
+            assert_eq!(source.physical_name, "part-physical");
+            assert_eq!(source.data_type, DataType::STRING);
+        }
     }
 
     #[test]

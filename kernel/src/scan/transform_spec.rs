@@ -23,6 +23,15 @@ use crate::{DeltaResult, Error};
 // description for that concept.
 pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 
+/// Authoritative information for reading a table partition column from file metadata.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct PartitionColumnSource {
+    /// Physical key used by `partitionValues`.
+    pub(crate) physical_name: String,
+    /// Table data type used to parse the serialized partition value.
+    pub(crate) data_type: DataType,
+}
+
 /// Describes a single field transformation to apply when converting physical data to logical
 /// schema.
 ///
@@ -58,6 +67,10 @@ pub(crate) enum FieldTransformSpec {
         field_index: usize,
         /// Insert after this physical column (None = prepend)
         insert_after: Option<String>,
+        /// Snapshot-derived partition metadata. Absent for non-partition metadata columns and
+        /// serialized transforms that omit the source.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partition_source: Option<PartitionColumnSource>,
     },
     /// Insert or reorder a dynamic column that may be physical or metadata-derived.
     /// Used for CDF's _change_type column which requires different handling per file type.
@@ -77,14 +90,20 @@ pub(crate) fn parse_partition_value(
     logical_schema: &SchemaRef,
     partition_values: &HashMap<String, String>,
     column_mapping_mode: ColumnMappingMode,
+    partition_source: Option<&PartitionColumnSource>,
 ) -> DeltaResult<(usize, (String, Scalar))> {
-    let Some(field) = logical_schema.field_at_index(field_idx) else {
-        return Err(Error::InternalError(format!(
-            "out of bounds partition column field index {field_idx}"
-        )));
+    let (name, data_type) = match partition_source {
+        Some(source) => (source.physical_name.as_str(), &source.data_type),
+        None => {
+            let Some(field) = logical_schema.field_at_index(field_idx) else {
+                return Err(Error::InternalError(format!(
+                    "out of bounds partition column field index {field_idx}"
+                )));
+            };
+            (field.physical_name(column_mapping_mode), field.data_type())
+        }
     };
-    let name = field.physical_name(column_mapping_mode);
-    let partition_value = parse_partition_value_raw(partition_values.get(name), field.data_type())?;
+    let partition_value = parse_partition_value_raw(partition_values.get(name), data_type)?;
     Ok((field_idx, (name.to_string(), partition_value)))
 }
 
@@ -98,14 +117,17 @@ pub(crate) fn parse_partition_values(
     transform_spec
         .iter()
         .filter_map(|field_transform| match field_transform {
-            FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => {
-                Some(parse_partition_value(
-                    *field_index,
-                    logical_schema,
-                    partition_values,
-                    column_mapping_mode,
-                ))
-            }
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index,
+                partition_source,
+                ..
+            } => Some(parse_partition_value(
+                *field_index,
+                logical_schema,
+                partition_values,
+                column_mapping_mode,
+                partition_source.as_ref(),
+            )),
             FieldTransformSpec::DynamicColumn { .. }
             | FieldTransformSpec::StaticInsert { .. }
             | FieldTransformSpec::GenerateRowId { .. }
@@ -150,6 +172,7 @@ pub(crate) fn get_transform_expr(
             MetadataDerivedColumn {
                 field_index,
                 insert_after,
+                ..
             } => {
                 let Some((_, partition_value)) = metadata_values.remove(field_index) else {
                     return Err(Error::MissingData(format!(
@@ -244,8 +267,70 @@ mod tests {
         };
         let partition_values = HashMap::new();
 
-        let result = parse_partition_value(5, &schema, &partition_values, ColumnMappingMode::None);
+        let result =
+            parse_partition_value(5, &schema, &partition_values, ColumnMappingMode::None, None);
         assert_result_error_with_message(result, "out of bounds");
+    }
+
+    #[test]
+    fn test_parse_partition_value_uses_authoritative_source() {
+        let schema = schema_ref! {
+            nullable "projected_key": STRING,
+        };
+        let partition_values = HashMap::from([("authoritative_key".to_string(), "42".to_string())]);
+        let source = PartitionColumnSource {
+            physical_name: "authoritative_key".to_string(),
+            data_type: DataType::LONG,
+        };
+
+        let (_, (name, value)) = parse_partition_value(
+            0,
+            &schema,
+            &partition_values,
+            ColumnMappingMode::Name,
+            Some(&source),
+        )
+        .unwrap();
+
+        assert_eq!(name, "authoritative_key");
+        assert_eq!(value, Scalar::Long(42));
+    }
+
+    #[test]
+    fn metadata_derived_column_deserializes_without_partition_source() {
+        let transform: FieldTransformSpec = serde_json::from_value(serde_json::json!({
+            "MetadataDerivedColumn": {
+                "field_index": 1,
+                "insert_after": null
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            transform,
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index: 1,
+                insert_after: None,
+                partition_source: None,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_derived_column_round_trips_partition_source() {
+        let transform = FieldTransformSpec::MetadataDerivedColumn {
+            field_index: 1,
+            insert_after: Some("id".to_string()),
+            partition_source: Some(PartitionColumnSource {
+                physical_name: "part-physical".to_string(),
+                data_type: DataType::STRING,
+            }),
+        };
+
+        let serialized = serde_json::to_string(&transform).unwrap();
+        let deserialized = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(transform, deserialized);
     }
 
     // Tests for parse_partition_values function
@@ -260,6 +345,7 @@ mod tests {
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index: 1,
                 insert_after: Some("id".to_string()),
+                partition_source: None,
             },
             FieldTransformSpec::StaticDrop {
                 field_name: "unused".to_string(),
@@ -267,6 +353,7 @@ mod tests {
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index: 0,
                 insert_after: None,
+                partition_source: None,
             },
             FieldTransformSpec::DynamicColumn {
                 field_index: 2,
@@ -382,6 +469,7 @@ mod tests {
         let transform_spec = vec![FieldTransformSpec::MetadataDerivedColumn {
             field_index: 0,
             insert_after: None,
+            partition_source: None,
         }];
         let partition_values = HashMap::new(); // Missing required partition value
 
@@ -535,6 +623,7 @@ mod tests {
         let transform_spec = vec![FieldTransformSpec::MetadataDerivedColumn {
             field_index: 1,
             insert_after: Some("id".to_string()),
+            partition_source: None,
         }];
 
         let physical_schema = schema! { nullable "id": STRING };

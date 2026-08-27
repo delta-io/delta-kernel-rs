@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::vec;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::{ArrayRef, AsArray as _, RecordBatch, TimestampMicrosecondArray};
+use delta_kernel::arrow::array::{
+    Array as _, ArrayRef, AsArray as _, RecordBatch, TimestampMicrosecondArray,
+};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
@@ -1023,7 +1025,8 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     // Partition-only predicate: category = 'A' prunes the category=B file
     Arc::new(Pred::eq(col!("category"), lit("A"))),
     None,
-    1
+    1,
+    false
 )]
 #[case::mixed_partition_and_data(
     // Mixed predicate: category = 'A' OR val > 'z'. Category=A kept by partition match.
@@ -1033,7 +1036,8 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
         Pred::gt(col!("val"), lit("z")),
     )),
     None,
-    1
+    1,
+    false
 )]
 #[case::predicate_on_unprojected_data_column(
     // Project only "category"; predicate references unprojected "val" (logical) whose
@@ -1041,7 +1045,8 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     // schema and prune both files: max(phys_val)='z' is NOT > 'z'.
     Arc::new(Pred::gt(col!("val"), lit("z"))),
     Some(vec!["category"]),
-    0
+    0,
+    false
 )]
 #[case::predicate_on_unprojected_partition_column(
     // Project only "val"; predicate references unprojected partition column "category"
@@ -1049,13 +1054,21 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     // using the physical partition name, keeping only the category=A file.
     Arc::new(Pred::eq(col!("category"), lit("A"))),
     Some(vec!["val"]),
-    1
+    1,
+    false
+)]
+#[case::bare_projected_partition_column(
+    Arc::new(Pred::eq(col!("category"), lit("A"))),
+    Some(vec!["category", "val"]),
+    1,
+    true
 )]
 #[tokio::test]
 async fn test_partition_pruning_with_column_mapping(
     #[case] predicate: Arc<Pred>,
     #[case] select_cols: Option<Vec<&'static str>>,
     #[case] expected_files: usize,
+    #[case] bare_projection: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![("phys_val", vec!["x", "y", "z"].into_arrow_array())])?;
 
@@ -1102,15 +1115,41 @@ async fn test_partition_pruning_with_column_mapping(
     // Predicates use logical column names -- kernel must map to physical names. The
     // optional projection narrows the output schema; when set, the predicate may still
     // reference columns outside it
-    let projection = select_cols
-        .as_ref()
-        .map(|cols| snapshot.schema().project(cols))
-        .transpose()?;
-    let scan = snapshot
+    let projection = if bare_projection {
+        let val = snapshot
+            .schema()
+            .field("val")
+            .cloned()
+            .ok_or("missing val field")?;
+        Some(Arc::new(Schema::try_new([
+            StructField::nullable("category", DataType::STRING),
+            val,
+        ])?))
+    } else {
+        select_cols
+            .as_ref()
+            .map(|cols| snapshot.schema().project(cols))
+            .transpose()?
+    };
+    let scan_result = snapshot
         .scan_builder()
         .with_schema_opt(projection)
         .with_predicate(predicate)
-        .build()?;
+        .build();
+    if bare_projection {
+        let error = match scan_result {
+            Ok(_) => return Err("bare column-mapped partition projection must fail".into()),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(
+                "Build the projection from the scan's authoritative schema with Schema::project"
+            ),
+            "unexpected error: {error}"
+        );
+        return Ok(());
+    }
+    let scan = scan_result?;
 
     let stream = scan.execute(engine)?;
     let mut files_scanned = 0;
@@ -1131,6 +1170,10 @@ async fn test_partition_pruning_with_column_mapping(
                 );
                 let category_col = result_batch.column(category_idx).as_string::<i32>();
                 for i in 0..result_batch.num_rows() {
+                    assert!(
+                        !category_col.is_null(i),
+                        "category row {i} must not be null"
+                    );
                     assert_eq!(category_col.value(i), "A");
                 }
             }

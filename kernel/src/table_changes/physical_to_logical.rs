@@ -215,6 +215,7 @@ mod tests {
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index: 4, // _commit_version
                 insert_after: Some("id".to_string()),
+                partition_source: None,
             },
         ];
 
@@ -305,6 +306,7 @@ mod tests {
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index: 1, // age partition
                 insert_after: Some("id".to_string()),
+                partition_source: None,
             },
             FieldTransformSpec::DynamicColumn {
                 field_index: 3, // _change_type - physical in CDC files
