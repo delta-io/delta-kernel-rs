@@ -371,8 +371,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// partition columns, this method inserts them before writing.
     ///
     /// The write context handles partition values and physical column names.
-    /// Contexts created with `unpartitioned_write_context(Some(...))` can also retain stable
-    /// row-tracking values supplied in the input.
+    /// Contexts configured with row-tracking columns can also retain stable values supplied in the
+    /// input.
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,

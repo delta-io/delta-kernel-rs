@@ -87,7 +87,7 @@ async fn main() -> DeltaResult<()> {
 
     // Write Parquet and add file metadata to the transaction
     let write_state = txn.write_state()?;
-    let write_context = write_state.unpartitioned_write_context(None)?;
+    let write_context = write_state.write_context_builder().build()?;
     let data = ArrowEngineData::new(batch);
     let file_metadata = engine
         .write_parquet(&data, &write_context)
@@ -177,7 +177,7 @@ let data = ArrowEngineData::new(batch);
 **Write the Parquet file and collect file metadata:**
 ```rust,ignore
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context(None)?;
+let write_context = write_state.write_context_builder().build()?;
 let file_metadata = engine
     .write_parquet(&data, &write_context)
     .await?;
@@ -185,7 +185,7 @@ txn.add_files(file_metadata);
 ```
 
 `write_state()` captures the transaction's table-wide write configuration.
-`unpartitioned_write_context(None)` binds that state into a `BoundWriteContext` with the target
+`write_context_builder().build()` binds that state into a `BoundWriteContext` with the target
 directory, schema, and stats configuration.
 `write_parquet` writes a Parquet file and returns metadata (path, size, stats) that the
 transaction needs. `add_files` registers that metadata with the transaction.

@@ -80,9 +80,9 @@ mod update;
 mod write_state;
 mod write_validation;
 
-pub use bound_write_context::{BoundWriteContext, RowTrackingMetadataColumns};
+pub use bound_write_context::BoundWriteContext;
 use stats_verifier::StatsColumnVerifier;
-pub use write_state::WriteState;
+pub use write_state::{RowTrackingMetadataColumns, WriteContextBuilder, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -1145,8 +1145,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// or it can be encoded and transported to distributed writers. Each context retains a
     /// reference to the same immutable state. All table-wide write validation runs before the
     /// state is returned so a writer does not begin producing files for a table that kernel cannot
-    /// write to safely. Call [`WriteState::unpartitioned_write_context`] for an unpartitioned table
-    /// or [`WriteState::partitioned_write_context`] for each partition being written.
+    /// write to safely. Use [`WriteState::write_context_builder`] to bind partition values and
+    /// logical metadata columns for each output file.
     ///
     /// The state captures the transaction configuration when this method is called. If the
     /// transaction is subsequently modified, call this method again to capture the updated
@@ -2059,7 +2059,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
         let write_state = txn.write_state().unwrap();
-        let write_context = write_state.unpartitioned_write_context(None).unwrap();
+        let write_context = write_state.write_context_builder().build().unwrap();
 
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
@@ -2093,7 +2093,7 @@ mod tests {
         // Regression coverage for stale WriteState caching: keep the first context alive
         // while the transaction's effective table config changes.
         let initial_write_state = txn.write_state()?;
-        let initial_write_context = initial_write_state.unpartitioned_write_context(None)?;
+        let initial_write_context = initial_write_state.write_context_builder().build()?;
         assert!(!initial_write_context
             .logical_data_schema()
             .contains("fresh_column"));
@@ -2115,7 +2115,7 @@ mod tests {
         txn.replace_effective_table_config(evolved_table_config);
 
         let updated_write_state = txn.write_state()?;
-        let updated_write_context = updated_write_state.unpartitioned_write_context(None)?;
+        let updated_write_context = updated_write_state.write_context_builder().build()?;
         assert!(updated_write_context
             .logical_data_schema()
             .contains("fresh_column"));
@@ -2271,10 +2271,13 @@ mod tests {
             .with_engine_info("default engine");
 
         let write_state = txn.write_state()?;
-        let write_context = write_state.partitioned_write_context(HashMap::from([(
-            "letter".to_string(),
-            Scalar::String("a".into()),
-        )]))?;
+        let write_context = write_state
+            .write_context_builder()
+            .with_partition_values(HashMap::from([(
+                "letter".to_string(),
+                Scalar::String("a".into()),
+            )]))
+            .build()?;
         let logical_schema = write_context.logical_data_schema();
         let physical_schema = write_context.physical_data_schema();
 
@@ -2316,7 +2319,10 @@ mod tests {
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let write_state = txn.write_state()?;
-        let wc = write_state.partitioned_write_context(partition_values)?;
+        let wc = write_state
+            .write_context_builder()
+            .with_partition_values(partition_values)
+            .build()?;
         Ok((snapshot, wc))
     }
 
@@ -2423,12 +2429,15 @@ mod tests {
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
         let write_state = txn.write_state()?;
-        let wc = write_state.partitioned_write_context(HashMap::from([
-            ("p1".to_string(), Scalar::String("aa".into())),
-            ("p2".to_string(), Scalar::Integer(7)),
-            ("p3".to_string(), Scalar::String("cc".into())),
-            ("p4".to_string(), Scalar::Integer(9)),
-        ]))?;
+        let wc = write_state
+            .write_context_builder()
+            .with_partition_values(HashMap::from([
+                ("p1".to_string(), Scalar::String("aa".into())),
+                ("p2".to_string(), Scalar::Integer(7)),
+                ("p3".to_string(), Scalar::String("cc".into())),
+                ("p4".to_string(), Scalar::Integer(9)),
+            ]))
+            .build()?;
 
         // Input excludes partition columns but keeps the void column, in logical schema
         // order: [d1, v, d2].
@@ -2493,21 +2502,21 @@ mod tests {
         Ok(())
     }
 
-    /// Using the wrong write context method for the table's partitioning returns an error.
+    /// Partition values must match the table's partitioning.
     #[rstest]
-    #[case::partitioned_on_unpartitioned(
+    #[case::values_on_unpartitioned(
         "./tests/data/table-without-dv-small/",
         true,
         "not partitioned"
     )]
-    #[case::unpartitioned_on_partitioned(
+    #[case::missing_values_on_partitioned(
         "./tests/data/basic_partitioned/",
         false,
         "table is partitioned"
     )]
-    fn test_wrong_write_context_method_returns_error(
+    fn test_write_context_builder_requires_matching_partition_values(
         #[case] table_path: &str,
-        #[case] call_partitioned: bool,
+        #[case] provide_partition_values: bool,
         #[case] expected_msg: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
@@ -2516,11 +2525,13 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let write_state = txn.write_state()?;
-        let result = if call_partitioned {
+        let result = if provide_partition_values {
             write_state
-                .partitioned_write_context(HashMap::from([("x".to_string(), Scalar::Integer(1))]))
+                .write_context_builder()
+                .with_partition_values(HashMap::from([("x".to_string(), Scalar::Integer(1))]))
+                .build()
         } else {
-            write_state.unpartitioned_write_context(None)
+            write_state.write_context_builder().build()
         };
         let err = result.unwrap_err().to_string();
         assert!(
@@ -3053,7 +3064,7 @@ mod tests {
     ) -> DeltaResult<()> {
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
-        let write_context = write_state.unpartitioned_write_context(None).unwrap();
+        let write_context = write_state.write_context_builder().build().unwrap();
         crate::unit_test_utils::validate_physical_schema_column_mapping(
             write_context.logical_data_schema(),
             write_context.physical_data_schema(),
@@ -3103,7 +3114,7 @@ mod tests {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
-        let write_context = write_state.unpartitioned_write_context(None).unwrap();
+        let write_context = write_state.write_context_builder().build().unwrap();
         let logical_schema = write_context.logical_data_schema();
         let physical_schema = write_context.physical_data_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();

@@ -103,7 +103,7 @@ resulting file metadata to the transaction.
 
 ```rust,ignore
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context(None)?;
+let write_context = write_state.write_context_builder().build()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 ```
@@ -288,7 +288,7 @@ let mut txn = snapshot.clone().transaction(committer, &engine)?
 
 // 6. Write data
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context(None)?;
+let write_context = write_state.write_context_builder().build()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 

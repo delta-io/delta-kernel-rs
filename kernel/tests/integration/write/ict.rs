@@ -65,7 +65,7 @@ async fn generate_and_add_data_file(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = txn.write_state()?.unpartitioned_write_context(None)?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let file_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;

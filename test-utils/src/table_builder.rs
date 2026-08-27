@@ -1481,14 +1481,17 @@ async fn write_data_commit<E: TaskExecutor>(
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
         let write_context = if partition_columns.is_empty() {
-            write_state.unpartitioned_write_context(None)?
+            write_state.write_context_builder().build()?
         } else {
             let partition_values = generate_partition_values(
                 logical_schema.as_ref(),
                 partition_columns,
                 partition_seed,
             );
-            write_state.partitioned_write_context(partition_values)?
+            write_state
+                .write_context_builder()
+                .with_partition_values(partition_values)
+                .build()?
         };
 
         let add_files = engine

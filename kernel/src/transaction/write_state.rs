@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use super::{BoundWriteContext, RowTrackingMetadataColumns};
+use super::BoundWriteContext;
 use crate::expressions::{lit, ColumnName, ExpressionStructPatchBuilder, Scalar};
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
@@ -59,6 +59,66 @@ pub struct WriteState {
     pub(super) random_prefix_length: NonZero<usize>,
 }
 
+/// Names row-tracking metadata columns present in the connector's logical write data.
+///
+/// These are connector-chosen logical names. The write context maps them to the table's configured
+/// physical column names and places the row ID before the row commit version when both are present.
+/// A `None` field means the logical input omits that value and the physical output omits its
+/// materialized column.
+///
+/// The Delta protocol permits a materialized column to be omitted when all its values would be
+/// null. Rewrites that preserve a value differing from the new file's default must provide the
+/// corresponding metadata column.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowTrackingMetadataColumns<'a> {
+    /// Logical input column whose non-null values preserve stable row IDs.
+    pub row_id: Option<&'a str>,
+    /// Logical input column whose non-null values preserve stable row commit versions.
+    pub row_commit_version: Option<&'a str>,
+}
+
+/// Builds a [`BoundWriteContext`] from table-wide write state.
+///
+/// Use [`with_partition_values`](Self::with_partition_values) for one output partition and
+/// [`with_row_tracking_columns`](Self::with_row_tracking_columns) when the logical input contains
+/// stable row-tracking values.
+#[derive(Debug)]
+pub struct WriteContextBuilder<'a> {
+    write_state: &'a Arc<WriteState>,
+    partition_values: Option<HashMap<String, Scalar>>,
+    row_tracking_columns: Option<RowTrackingMetadataColumns<'a>>,
+}
+
+impl<'a> WriteContextBuilder<'a> {
+    /// Binds one typed value for each logical partition column.
+    ///
+    /// Names are matched case-insensitively and normalized to schema case. The map must contain
+    /// every partition column and no other keys.
+    pub fn with_partition_values(mut self, partition_values: HashMap<String, Scalar>) -> Self {
+        self.partition_values = Some(partition_values);
+        self
+    }
+
+    /// Includes row-tracking metadata columns from the logical input data.
+    pub fn with_row_tracking_columns(
+        mut self,
+        row_tracking_columns: RowTrackingMetadataColumns<'a>,
+    ) -> Self {
+        self.row_tracking_columns = Some(row_tracking_columns);
+        self
+    }
+
+    /// Builds a write context for the configured partition and logical input columns.
+    ///
+    /// Returns an error when partition values do not match the table layout, a partitioned table
+    /// has no bound values, or row-tracking columns conflict with the table schema or
+    /// configuration.
+    pub fn build(self) -> DeltaResult<BoundWriteContext> {
+        self.write_state
+            .build_write_context(self.partition_values, self.row_tracking_columns)
+    }
+}
+
 #[derive(Serialize)]
 struct WriteStateWire<'a> {
     version: u32,
@@ -72,6 +132,47 @@ struct DecodedWriteStateWire {
 }
 
 impl WriteState {
+    /// Creates a builder for a write context.
+    pub fn write_context_builder(self: &Arc<Self>) -> WriteContextBuilder<'_> {
+        WriteContextBuilder {
+            write_state: self,
+            partition_values: None,
+            row_tracking_columns: None,
+        }
+    }
+
+    /// Encodes this write state as opaque, versioned JSON bytes for transport.
+    ///
+    /// The bytes are tied to this delta-kernel version. Do not inspect them or persist them across
+    /// kernel upgrades.
+    ///
+    /// Returns an error if any field cannot be serialized.
+    pub fn encode(&self) -> DeltaResult<Vec<u8>> {
+        Ok(serde_json::to_vec(&WriteStateWire {
+            version: WRITE_STATE_FORMAT_VERSION,
+            write_state: self,
+        })?)
+    }
+
+    /// Decodes shared write state from JSON bytes produced by [`encode`](Self::encode).
+    ///
+    /// The bytes must use the current write-state format version. Cross-version decoding is not
+    /// supported.
+    ///
+    /// Returns an error if the bytes contain an unsupported format version or do not contain a
+    /// valid serialized write state.
+    pub fn decode(bytes: &[u8]) -> DeltaResult<Arc<Self>> {
+        let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
+        require!(
+            wire.version == WRITE_STATE_FORMAT_VERSION,
+            Error::generic(format!(
+                "unsupported write state format version {}; expected {}",
+                wire.version, WRITE_STATE_FORMAT_VERSION
+            ))
+        );
+        Ok(Arc::new(wire.write_state))
+    }
+
     pub(super) fn new(
         table_config: &TableConfiguration,
         stats_columns: Vec<ColumnName>,
@@ -109,239 +210,163 @@ impl WriteState {
         })
     }
 
-    /// Creates a write context bound to one partition.
-    ///
-    /// `partition_values` must contain one typed value for every logical partition column and no
-    /// other keys. Names are matched case-insensitively and normalized to schema case. Values are
-    /// validated, serialized according to the Delta protocol, and keyed by physical column name in
-    /// the returned context. Null-equivalent values require nullable partition columns.
-    ///
-    /// The context materializes partition columns when required by the table protocol. Input data
-    /// passed to its logical-to-physical expression must omit partition columns.
-    ///
-    /// Returns an error if the table is unpartitioned or the keys or values are invalid.
-    pub fn partitioned_write_context(
+    fn build_write_context(
         self: &Arc<Self>,
-        partition_values: HashMap<String, Scalar>,
+        partition_values: Option<HashMap<String, Scalar>>,
+        row_tracking_columns: Option<RowTrackingMetadataColumns<'_>>,
     ) -> DeltaResult<BoundWriteContext> {
+        let is_partitioned = !self.logical_partition_columns.is_empty();
         require!(
-            !self.logical_partition_columns.is_empty(),
-            Error::generic("table is not partitioned; use unpartitioned_write_context(None)")
+            is_partitioned || partition_values.is_none(),
+            Error::generic("table is not partitioned; partition values are not allowed")
         );
-        let normalized = validate_partition_values(
-            &self.logical_partition_columns,
-            &self.full_logical_schema,
-            partition_values,
-        )?;
+        require!(
+            !is_partitioned || partition_values.is_some(),
+            Error::generic("table is partitioned; partition values are required")
+        );
+        let normalized = partition_values
+            .map(|partition_values| {
+                validate_partition_values(
+                    &self.logical_partition_columns,
+                    &self.full_logical_schema,
+                    partition_values,
+                )
+            })
+            .transpose()?;
 
-        let mut serialized = HashMap::with_capacity(normalized.len());
-        for logical_name in &self.logical_partition_columns {
-            let scalar = normalized.get(logical_name).ok_or_else(|| {
-                Error::internal_error(format!(
-                    "partition column '{logical_name}' missing after validation"
-                ))
-            })?;
-            let value = serialize_partition_value(scalar)?;
-            let physical_name = self
-                .full_logical_schema
-                .field(logical_name)
-                .ok_or_else(|| {
+        let mut serialized = HashMap::with_capacity(normalized.as_ref().map_or(0, HashMap::len));
+        if let Some(normalized) = &normalized {
+            for logical_name in &self.logical_partition_columns {
+                let scalar = normalized.get(logical_name).ok_or_else(|| {
                     Error::internal_error(format!(
-                        "partition column '{logical_name}' not found in schema after validation"
+                        "partition column '{logical_name}' missing after validation"
                     ))
-                })?
-                .physical_name(self.column_mapping_mode)
-                .to_string();
-            serialized.insert(physical_name, value);
+                })?;
+                let value = serialize_partition_value(scalar)?;
+                let physical_name = self
+                    .full_logical_schema
+                    .field(logical_name)
+                    .ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "partition column '{logical_name}' not found in schema after validation"
+                        ))
+                    })?
+                    .physical_name(self.column_mapping_mode)
+                    .to_string();
+                serialized.insert(physical_name, value);
+            }
         }
-        let logical_to_physical = Arc::new(self.generate_logical_to_physical(Some(&normalized))?);
+
+        let (logical_data_schema, physical_data_schema) = match row_tracking_columns {
+            None => (self.logical_schema.clone(), self.physical_schema.clone()),
+            Some(row_tracking_columns) => {
+                for input_name in [
+                    row_tracking_columns.row_id,
+                    row_tracking_columns.row_commit_version,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    require!(
+                        !self.full_logical_schema.contains(input_name),
+                        Error::schema(format!(
+                            "row-tracking input column '{input_name}' conflicts with a table column"
+                        ))
+                    );
+                }
+
+                if let (Some(row_id), Some(row_commit_version)) = (
+                    row_tracking_columns.row_id,
+                    row_tracking_columns.row_commit_version,
+                ) {
+                    require!(
+                        row_id != row_commit_version,
+                        Error::schema(
+                            "row-tracking logical input columns must have distinct names"
+                        )
+                    );
+                }
+
+                let materialized_row_id_name = row_tracking_columns
+                    .row_id
+                    .map(|_| {
+                        self.materialized_row_id_field.as_ref().ok_or_else(|| {
+                            Error::unsupported(
+                                "row ID input requires row tracking to be enabled for writes",
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .map(StructField::name);
+                let materialized_row_commit_version_name = row_tracking_columns
+                    .row_commit_version
+                    .map(|_| {
+                        self.materialized_row_commit_version_field
+                            .as_ref()
+                            .ok_or_else(|| {
+                                Error::unsupported(
+                                    "row commit version input requires row tracking for writes",
+                                )
+                            })
+                    })
+                    .transpose()?
+                    .map(StructField::name);
+
+                if let (Some(row_id), Some(row_commit_version)) = (
+                    materialized_row_id_name,
+                    materialized_row_commit_version_name,
+                ) {
+                    require!(
+                        row_id != row_commit_version,
+                        Error::schema("materialized row-tracking fields must have distinct names")
+                    );
+                }
+
+                let logical_data_schema = self.logical_schema.add(
+                    [
+                        row_tracking_columns
+                            .row_id
+                            .map(|name| nullable_metadata_column(name, MetadataColumnSpec::RowId)),
+                        row_tracking_columns.row_commit_version.map(|name| {
+                            nullable_metadata_column(name, MetadataColumnSpec::RowCommitVersion)
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )?;
+                let physical_data_schema = self.physical_schema.add(
+                    [
+                        materialized_row_id_name
+                            .map(|name| nullable_metadata_column(name, MetadataColumnSpec::RowId)),
+                        materialized_row_commit_version_name.map(|name| {
+                            nullable_metadata_column(name, MetadataColumnSpec::RowCommitVersion)
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )?;
+                (
+                    Arc::new(logical_data_schema),
+                    Arc::new(physical_data_schema),
+                )
+            }
+        };
 
         Ok(BoundWriteContext {
             write_state: Arc::clone(self),
-            logical_data_schema: self.logical_schema.clone(),
-            logical_to_physical,
-            physical_data_schema: self.physical_schema.clone(),
+            logical_data_schema,
+            logical_to_physical: Arc::new(
+                self.generate_logical_to_physical(normalized.as_ref(), row_tracking_columns)?,
+            ),
+            physical_data_schema,
             physical_partition_values: serialized,
         })
-    }
-
-    /// Creates a write context for writing data to an unpartitioned table.
-    ///
-    /// When `row_tracking_columns` is present, the context accepts the requested row-tracking
-    /// metadata columns after the table columns. A row ID precedes a row commit version when both
-    /// are requested.
-    ///
-    /// Returns an error if the table has partition columns, a requested metadata column conflicts
-    /// with a table column, or metadata is requested while row tracking is not enabled for writes.
-    pub fn unpartitioned_write_context(
-        self: &Arc<Self>,
-        row_tracking_columns: Option<RowTrackingMetadataColumns<'_>>,
-    ) -> DeltaResult<BoundWriteContext> {
-        require!(
-            self.logical_partition_columns.is_empty(),
-            Error::generic("table is partitioned; use partitioned_write_context() instead")
-        );
-        let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
-        let mut context = BoundWriteContext {
-            write_state: Arc::clone(self),
-            logical_data_schema: self.logical_schema.clone(),
-            logical_to_physical,
-            physical_data_schema: self.physical_schema.clone(),
-            physical_partition_values: HashMap::new(),
-        };
-        let Some(row_tracking_columns) = row_tracking_columns else {
-            return Ok(context);
-        };
-
-        for input_name in [
-            row_tracking_columns.row_id,
-            row_tracking_columns.row_commit_version,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            require!(
-                !context.logical_data_schema().contains(input_name),
-                Error::schema(format!(
-                    "row-tracking input column '{input_name}' conflicts with a table column"
-                ))
-            );
-        }
-
-        if let (Some(row_id), Some(row_commit_version)) = (
-            row_tracking_columns.row_id,
-            row_tracking_columns.row_commit_version,
-        ) {
-            require!(
-                row_id != row_commit_version,
-                Error::schema("row-tracking logical input columns must have distinct names")
-            );
-        }
-
-        let materialized_row_id_name = match row_tracking_columns.row_id {
-            Some(_) => Some(
-                self.materialized_row_id_field
-                    .as_ref()
-                    .ok_or_else(|| {
-                        Error::unsupported(
-                            "row ID input requires row tracking to be enabled for writes",
-                        )
-                    })?
-                    .name()
-                    .clone(),
-            ),
-            None => None,
-        };
-        let materialized_row_commit_version_name = match row_tracking_columns.row_commit_version {
-            Some(_) => Some(
-                self.materialized_row_commit_version_field
-                    .as_ref()
-                    .ok_or_else(|| {
-                        Error::unsupported(
-                            "row commit version input requires row tracking for writes",
-                        )
-                    })?
-                    .name()
-                    .clone(),
-            ),
-            None => None,
-        };
-
-        if let (Some(row_id), Some(row_commit_version)) = (
-            materialized_row_id_name.as_deref(),
-            materialized_row_commit_version_name.as_deref(),
-        ) {
-            require!(
-                row_id != row_commit_version,
-                Error::schema("materialized row-tracking fields must have distinct names")
-            );
-        }
-
-        let mut patch = add_void_stripping(
-            ExpressionStructPatchBuilder::new(),
-            &self.full_logical_schema,
-        );
-        if let Some(row_id) = row_tracking_columns.row_id {
-            patch = patch.drop(row_id).append(Expression::column([row_id]));
-        }
-        if let Some(row_commit_version) = row_tracking_columns.row_commit_version {
-            patch = patch
-                .drop(row_commit_version)
-                .append(Expression::column([row_commit_version]));
-        }
-        context.logical_to_physical = Arc::new(Expression::struct_patch(patch)?);
-        context.logical_data_schema = Arc::new(
-            context.logical_data_schema().add(
-                [
-                    row_tracking_columns.row_id.map(|name| {
-                        StructField::create_metadata_column(name, MetadataColumnSpec::RowId)
-                    }),
-                    row_tracking_columns.row_commit_version.map(|name| {
-                        StructField::create_metadata_column(
-                            name,
-                            MetadataColumnSpec::RowCommitVersion,
-                        )
-                    }),
-                ]
-                .into_iter()
-                .flatten(),
-            )?,
-        );
-        context.physical_data_schema = Arc::new(
-            context.physical_data_schema().add(
-                [
-                    materialized_row_id_name.map(|name| {
-                        StructField::create_metadata_column(name, MetadataColumnSpec::RowId)
-                    }),
-                    materialized_row_commit_version_name.map(|name| {
-                        StructField::create_metadata_column(
-                            name,
-                            MetadataColumnSpec::RowCommitVersion,
-                        )
-                    }),
-                ]
-                .into_iter()
-                .flatten(),
-            )?,
-        );
-        Ok(context)
-    }
-
-    /// Encodes this write state as opaque, versioned JSON bytes for transport.
-    ///
-    /// The bytes are tied to this delta-kernel version. Do not inspect them or persist them across
-    /// kernel upgrades.
-    ///
-    /// Returns an error if any field cannot be serialized.
-    pub fn encode(&self) -> DeltaResult<Vec<u8>> {
-        Ok(serde_json::to_vec(&WriteStateWire {
-            version: WRITE_STATE_FORMAT_VERSION,
-            write_state: self,
-        })?)
-    }
-
-    /// Decodes shared write state from JSON bytes produced by [`encode`](Self::encode).
-    ///
-    /// The bytes must use the current write-state format version. Cross-version decoding is not
-    /// supported.
-    ///
-    /// Returns an error if the bytes contain an unsupported format version or do not contain a
-    /// valid serialized write state.
-    pub fn decode(bytes: &[u8]) -> DeltaResult<Arc<Self>> {
-        let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
-        require!(
-            wire.version == WRITE_STATE_FORMAT_VERSION,
-            Error::generic(format!(
-                "unsupported write state format version {}; expected {}",
-                wire.version, WRITE_STATE_FORMAT_VERSION
-            ))
-        );
-        Ok(Arc::new(wire.write_state))
     }
 
     fn generate_logical_to_physical(
         &self,
         partition_values: Option<&HashMap<String, Scalar>>,
+        row_tracking_columns: Option<RowTrackingMetadataColumns<'_>>,
     ) -> DeltaResult<Expression> {
         let mut patch = ExpressionStructPatchBuilder::new();
         if self.materialize_partition_columns {
@@ -372,9 +397,25 @@ impl WriteState {
                 }
             }
         }
-        let patch = add_void_stripping(patch, &self.full_logical_schema);
+        let mut patch = add_void_stripping(patch, &self.full_logical_schema);
+        if let Some(row_tracking_columns) = row_tracking_columns {
+            if let Some(row_id) = row_tracking_columns.row_id {
+                patch = patch.drop(row_id).append(Expression::column([row_id]));
+            }
+            if let Some(row_commit_version) = row_tracking_columns.row_commit_version {
+                patch = patch
+                    .drop(row_commit_version)
+                    .append(Expression::column([row_commit_version]));
+            }
+        }
         Expression::struct_patch(patch)
     }
+}
+
+fn nullable_metadata_column(name: impl Into<String>, spec: MetadataColumnSpec) -> StructField {
+    let mut field = StructField::create_metadata_column(name, spec);
+    field.nullable = true;
+    field
 }
 
 #[cfg(test)]
@@ -464,8 +505,16 @@ mod tests {
         assert_eq!(decoded.logical_schema, original.logical_schema);
 
         let values = || HashMap::from([("year".to_string(), Scalar::Integer(2024))]);
-        let original_context = original.partitioned_write_context(values()).unwrap();
-        let decoded_context = decoded.partitioned_write_context(values()).unwrap();
+        let original_context = original
+            .write_context_builder()
+            .with_partition_values(values())
+            .build()
+            .unwrap();
+        let decoded_context = decoded
+            .write_context_builder()
+            .with_partition_values(values())
+            .build()
+            .unwrap();
 
         assert!(Arc::ptr_eq(&original, &original_context.write_state));
         assert!(Arc::ptr_eq(&decoded, &decoded_context.write_state));

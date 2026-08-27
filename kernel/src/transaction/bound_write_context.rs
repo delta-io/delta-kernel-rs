@@ -13,21 +13,8 @@ use crate::schema::{SchemaRef, StructField};
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
-/// Names the stable row-tracking columns present in logical write data.
-///
-/// The write context places the row ID before the row commit version when both are present.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RowTrackingMetadataColumns<'a> {
-    /// Logical input column containing stable row IDs.
-    pub row_id: Option<&'a str>,
-    /// Logical input column containing stable row commit versions.
-    pub row_commit_version: Option<&'a str>,
-}
-
 /// A write context for a specific partition or an unpartitioned table. Created by a
-/// [`WriteState`](super::WriteState).
-///
-/// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
+/// [`WriteContextBuilder`](super::WriteContextBuilder).
 ///
 /// Contains both table-wide state and per-partition state (serialized partition values with
 /// physical column names as keys). How you use a `BoundWriteContext` depends on your engine:
@@ -39,8 +26,6 @@ pub struct RowTrackingMetadataColumns<'a> {
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
-/// [`WriteState::partitioned_write_context`]: super::WriteState::partitioned_write_context
-/// [`WriteState::unpartitioned_write_context`]: super::WriteState::unpartitioned_write_context
 /// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
 #[derive(Debug)]
@@ -177,16 +162,14 @@ impl BoundWriteContext {
 
     /// Returns the configured physical field that stores stable row IDs.
     ///
-    /// Returns `None` when row tracking is not enabled for writes. Connectors preserving row
-    /// tracking during a rewrite must write a non-null value for every output row.
+    /// Returns `None` when row tracking is not enabled for writes.
     pub fn materialized_row_id_field(&self) -> Option<&StructField> {
         self.write_state.materialized_row_id_field.as_ref()
     }
 
     /// Returns the configured physical field that stores stable row commit versions.
     ///
-    /// Returns `None` when row tracking is not enabled for writes. Connectors preserving row
-    /// tracking during a rewrite must write a non-null value for every output row.
+    /// Returns `None` when row tracking is not enabled for writes.
     pub fn materialized_row_commit_version_field(&self) -> Option<&StructField> {
         self.write_state
             .materialized_row_commit_version_field
@@ -274,7 +257,7 @@ impl BoundWriteContext {
     ///
     /// ```rust,ignore
     /// let write_state = transaction.write_state()?;
-    /// let write_context = write_state.unpartitioned_write_context(None)?;
+    /// let write_context = write_state.write_context_builder().build()?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// ```
     // TODO(#2357): generate the random prefix internally based on table properties

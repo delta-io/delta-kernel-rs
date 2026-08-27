@@ -25,7 +25,7 @@ async fn write_batch_to_table_simple(
     data: RecordBatch,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = begin_transaction(snapshot.clone(), engine)?.with_engine_info("test");
-    let write_context = txn.write_state()?.unpartitioned_write_context(None)?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
@@ -75,7 +75,7 @@ async fn test_multiple_files_in_commit_all_use_relative_paths(
         create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
 
     let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?.with_engine_info("test");
-    let write_context = txn.write_state()?.unpartitioned_write_context(None)?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     for values in [vec![1, 2], vec![3, 4]] {
         let add_meta = engine
             .write_parquet(
@@ -136,7 +136,7 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
 
     let mut txn = create_table_txn(table_url.as_str(), schema.clone(), "test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-    let write_context = txn.write_state()?.unpartitioned_write_context(None)?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine
         .write_parquet(
             &ArrowEngineData::new(simple_id_batch(&schema, vec![10, 20])),

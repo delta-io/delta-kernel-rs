@@ -2,15 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::{ArrayRef, AsArray, Int32Array, Int64Array, StringArray};
+use delta_kernel::arrow::array::{Array, ArrayRef, AsArray, Int32Array, Int64Array, StringArray};
 use delta_kernel::arrow::datatypes::{Int32Type, Int64Type};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{schema_ref, MetadataColumnSpec, StructField};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::RowTrackingMetadataColumns;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use test_utils::{
@@ -88,12 +90,14 @@ async fn test_preserving_write_context_transforms_complete_input(
         .unwrap_post_commit_snapshot();
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let write_state = txn.write_state()?;
-    let base_context = write_state.unpartitioned_write_context(None)?;
-    let write_context =
-        write_state.unpartitioned_write_context(Some(RowTrackingMetadataColumns {
+    let base_context = write_state.write_context_builder().build()?;
+    let write_context = write_state
+        .write_context_builder()
+        .with_row_tracking_columns(RowTrackingMetadataColumns {
             row_id: include_row_id.then_some("stable_row_id"),
             row_commit_version: include_row_commit_version.then_some("stable_row_commit_version"),
-        }))?;
+        })
+        .build()?;
     let logical_data_schema = write_context.logical_data_schema().clone();
     assert_eq!(
         logical_data_schema
@@ -108,6 +112,18 @@ async fn test_preserving_write_context_transforms_complete_input(
         include_row_commit_version.then_some("stable_row_commit_version")
     );
     assert_eq!(
+        logical_data_schema
+            .metadata_column(&MetadataColumnSpec::RowId)
+            .map(StructField::is_nullable),
+        include_row_id.then_some(true)
+    );
+    assert_eq!(
+        logical_data_schema
+            .metadata_column(&MetadataColumnSpec::RowCommitVersion)
+            .map(StructField::is_nullable),
+        include_row_commit_version.then_some(true)
+    );
+    assert_eq!(
         write_context
             .physical_data_schema()
             .metadata_column(&MetadataColumnSpec::RowId)
@@ -116,6 +132,20 @@ async fn test_preserving_write_context_transforms_complete_input(
             .then(|| write_context.materialized_row_id_field())
             .flatten()
             .map(StructField::name),
+    );
+    assert_eq!(
+        write_context
+            .physical_data_schema()
+            .metadata_column(&MetadataColumnSpec::RowId)
+            .map(StructField::is_nullable),
+        include_row_id.then_some(true)
+    );
+    assert_eq!(
+        write_context
+            .physical_data_schema()
+            .metadata_column(&MetadataColumnSpec::RowCommitVersion)
+            .map(StructField::is_nullable),
+        include_row_commit_version.then_some(true)
     );
     assert_eq!(
         write_context
@@ -222,6 +252,84 @@ async fn test_preserving_write_context_transforms_complete_input(
     Ok(())
 }
 
+#[rstest::rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_partitioned_write_context_materializes_partition_and_row_tracking_columns(
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Name,
+        ColumnMappingMode::Id
+    )]
+    column_mapping_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let column_mapping_mode = match column_mapping_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Name => "name",
+        ColumnMappingMode::Id => "id",
+    };
+    let snapshot = kernel_create_table(
+        table_path.as_str(),
+        schema_ref! {
+            nullable "number": INTEGER,
+            nullable "part": STRING,
+        },
+        "Test/1.0",
+    )
+    .with_data_layout(DataLayout::partitioned(["part"]))
+    .with_table_properties([
+        ("delta.enableRowTracking", "true"),
+        ("delta.columnMapping.mode", column_mapping_mode),
+        ("delta.feature.materializePartitionColumns", "supported"),
+    ])
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let write_context = txn
+        .write_state()?
+        .write_context_builder()
+        .with_partition_values(HashMap::from([(
+            "part".to_string(),
+            Scalar::String("a".into()),
+        )]))
+        .with_row_tracking_columns(RowTrackingMetadataColumns {
+            row_id: Some("stable_row_id"),
+            row_commit_version: Some("stable_row_commit_version"),
+        })
+        .build()?;
+    let logical_data_schema = write_context.logical_data_schema().clone();
+    let input = RecordBatch::try_new(
+        Arc::new(logical_data_schema.as_ref().try_into_arrow()?),
+        vec![
+            Arc::new(Int32Array::from(vec![7, 8])),
+            Arc::new(Int64Array::from(vec![Some(101), None])),
+            Arc::new(Int64Array::from(vec![None, Some(11)])),
+        ],
+    )?;
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        logical_data_schema,
+        write_context.logical_to_physical(),
+        write_context.physical_data_schema().clone().into(),
+    )?;
+    let output =
+        ArrowEngineData::try_from_engine_data(evaluator.evaluate(&ArrowEngineData::new(input))?)?;
+    let output = output.record_batch();
+
+    assert_eq!(output.num_columns(), 4);
+    let numbers = output.column(0).as_primitive::<Int32Type>();
+    assert_eq!(numbers.values(), &[7, 8]);
+    assert_eq!(output.column(1).as_string::<i32>().value(0), "a");
+    assert_eq!(output.column(1).as_string::<i32>().value(1), "a");
+    let row_ids = output.column(2).as_primitive::<Int64Type>();
+    assert_eq!(row_ids.value(0), 101);
+    assert!(row_ids.is_null(1));
+    let row_commit_versions = output.column(3).as_primitive::<Int64Type>();
+    assert!(row_commit_versions.is_null(0));
+    assert_eq!(row_commit_versions.value(1), 11);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_preserving_write_context_rejects_duplicate_metadata_column_names(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -239,10 +347,12 @@ async fn test_preserving_write_context_rejects_duplicate_metadata_column_names(
 
     assert_result_error_with_message(
         txn.write_state()?
-            .unpartitioned_write_context(Some(RowTrackingMetadataColumns {
+            .write_context_builder()
+            .with_row_tracking_columns(RowTrackingMetadataColumns {
                 row_id: Some("stable_value"),
                 row_commit_version: Some("stable_value"),
-            })),
+            })
+            .build(),
         "row-tracking logical input columns must have distinct names",
     );
     Ok(())
@@ -262,9 +372,11 @@ async fn test_write_context_without_metadata_does_not_require_row_tracking(
     .unwrap_post_commit_snapshot();
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     let write_state = txn.write_state()?;
-    let base_context = write_state.unpartitioned_write_context(None)?;
-    let context =
-        write_state.unpartitioned_write_context(Some(RowTrackingMetadataColumns::default()))?;
+    let base_context = write_state.write_context_builder().build()?;
+    let context = write_state
+        .write_context_builder()
+        .with_row_tracking_columns(RowTrackingMetadataColumns::default())
+        .build()?;
 
     assert_eq!(
         context.logical_data_schema(),
@@ -476,12 +588,14 @@ async fn test_acknowledged_row_tracking_rewrite(
         .transaction(config.committer(), engine.as_ref())?
         .with_data_change(config == RewriteConfig::DataChange);
     let add_metadata = if matches!(config, RewriteConfig::Valid | RewriteConfig::DataChange) {
-        let write_context =
-            txn.write_state()?
-                .unpartitioned_write_context(Some(RowTrackingMetadataColumns {
-                    row_id: Some("row_id"),
-                    row_commit_version: Some("row_commit_version"),
-                }))?;
+        let write_context = txn
+            .write_state()?
+            .write_context_builder()
+            .with_row_tracking_columns(RowTrackingMetadataColumns {
+                row_id: Some("row_id"),
+                row_commit_version: Some("row_commit_version"),
+            })
+            .build()?;
         let logical_data_schema = write_context.logical_data_schema().clone();
         let replacement_batch = RecordBatch::try_new(
             Arc::new(logical_data_schema.as_ref().try_into_arrow()?),
@@ -503,7 +617,7 @@ async fn test_acknowledged_row_tracking_rewrite(
             .write_parquet(&ArrowEngineData::new(replacement_batch), &write_context)
             .await?
     } else {
-        let write_context = txn.write_state()?.unpartitioned_write_context(None)?;
+        let write_context = txn.write_state()?.write_context_builder().build()?;
         let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
         let replacement_batch = RecordBatch::try_new(
             arrow_schema,
