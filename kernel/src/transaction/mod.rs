@@ -245,8 +245,7 @@ pub struct Transaction<S = ExistingTable> {
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
     column_defaults_acknowledged: bool,
-    // Whether the connector asserted that an acknowledged rewrite materialized both stable
-    // row-tracking values for every replacement row.
+    // Whether the connector acknowledged its row-tracking preservation responsibilities.
     row_tracking_preservation_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
@@ -361,7 +360,7 @@ impl<S> Transaction<S> {
         let commit_start = Instant::now();
 
         if self.row_tracking_preservation_acknowledged {
-            self.validate_acknowledged_row_tracking_rewrite()?;
+            self.validate_row_tracking_preservation_acknowledgement()?;
         } else if !self.remove_files_metadata.is_empty() {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;
@@ -597,7 +596,7 @@ impl<S> Transaction<S> {
         );
     }
 
-    fn validate_acknowledged_row_tracking_rewrite(&self) -> DeltaResult<()> {
+    fn validate_row_tracking_preservation_acknowledgement(&self) -> DeltaResult<()> {
         let table_config = &self.effective_table_config;
         require!(
             table_config.table_properties().enable_row_tracking == Some(true)
@@ -609,24 +608,23 @@ impl<S> Transaction<S> {
         );
         require!(
             !table_config.is_catalog_managed(),
-            Error::unsupported("row-tracking rewrites on catalog-managed tables")
+            Error::unsupported(
+                "row-tracking preservation acknowledgement on catalog-managed tables"
+            )
         );
         require!(
             !table_config.is_feature_enabled(&TableFeature::IcebergCompatV3),
-            Error::unsupported("row-tracking rewrites on icebergCompatV3 tables")
-        );
-        require!(
-            !self.data_change,
-            Error::generic("acknowledged row-tracking rewrites require dataChange=false")
+            Error::unsupported(
+                "row-tracking preservation acknowledgement on icebergCompatV3 tables"
+            )
         );
         require!(
             self.dv_matched_files.is_empty(),
-            Error::unsupported("deletion-vector updates in acknowledged row-tracking rewrites")
+            Error::unsupported(
+                "deletion-vector updates with row-tracking preservation acknowledgement"
+            )
         );
-        write_validation::validate_row_tracking_rewrite(
-            &self.add_files_metadata,
-            &self.remove_files_metadata,
-        )
+        Ok(())
     }
 
     /// Set the data change flag.
@@ -998,13 +996,15 @@ impl<S> Transaction<S> {
 impl Transaction<ExistingTable> {
     /// Acknowledges connector responsibility for preserving stable row-tracking values.
     ///
-    /// The connector must materialize every output row's stable row ID and stable row commit
-    /// version into the configured hidden Parquet fields, retaining their association through
-    /// partitioning, slicing, batching, and encoding. Commit requires enabled, unsuspended row
-    /// tracking and `dataChange=false`. Replacement Adds must exactly cover eligible source
-    /// Removes and satisfy all row-tracking metadata requirements. Deletion-vector updates,
-    /// catalog-managed tables, and `icebergCompatV3` are unsupported. Kernel validates the staged
-    /// Add and Remove structure but does not read the output Parquet files.
+    /// The connector must preserve stable row IDs for updated or copied rows and stable row commit
+    /// versions for copied rows. It must write preserved values to the configured hidden Parquet
+    /// fields and retain their association through partitioning, slicing, batching, and encoding.
+    /// Transactions that remove files from a row-tracking table must call this regardless of their
+    /// `dataChange` value.
+    ///
+    /// Commit requires enabled, unsuspended row tracking. Deletion-vector updates, catalog-managed
+    /// tables, and `icebergCompatV3` are unsupported. Kernel records the acknowledgement without
+    /// reading the output Parquet files.
     ///
     /// This acknowledgement is unavailable for create-table transactions:
     ///

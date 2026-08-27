@@ -484,7 +484,7 @@ async fn test_row_tracking_remove_gate(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RewriteConfig {
-    Valid,
+    NoDataChange,
     DataChange,
     Disabled,
     Suspended,
@@ -525,15 +525,15 @@ fn collect_scan_path(paths: &mut Vec<String>, scan_file: delta_kernel::scan::sta
 }
 
 #[rstest::rstest]
-#[case::valid(RewriteConfig::Valid, None)]
-#[case::data_change_true(RewriteConfig::DataChange, Some("dataChange=false"))]
+#[case::data_change_false(RewriteConfig::NoDataChange, None)]
+#[case::data_change_true(RewriteConfig::DataChange, None)]
 #[case::disabled(RewriteConfig::Disabled, Some("enabled and not suspended"))]
 #[case::suspended(RewriteConfig::Suspended, Some("enabled and not suspended"))]
 #[case::catalog_managed(RewriteConfig::CatalogManaged, Some("catalog-managed"))]
 #[case::iceberg_v3(RewriteConfig::IcebergV3, Some("icebergCompatV3"))]
 #[case::dv_update(RewriteConfig::DvUpdate, Some("deletion-vector updates"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_acknowledged_row_tracking_rewrite(
+async fn test_row_tracking_preservation_acknowledgement(
     #[case] config: RewriteConfig,
     #[case] expected_error: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -584,10 +584,14 @@ async fn test_acknowledged_row_tracking_rewrite(
         .expect("source file scan metadata")?;
     let source_paths = scan_metadata.visit_scan_files(Vec::new(), collect_scan_path)?;
     let scan_files = scan_metadata.scan_files;
+    let data_change = config == RewriteConfig::DataChange;
     let mut txn = snapshot
         .transaction(config.committer(), engine.as_ref())?
-        .with_data_change(config == RewriteConfig::DataChange);
-    let add_metadata = if matches!(config, RewriteConfig::Valid | RewriteConfig::DataChange) {
+        .with_data_change(data_change);
+    let add_metadata = if matches!(
+        config,
+        RewriteConfig::NoDataChange | RewriteConfig::DataChange
+    ) {
         let write_context = txn
             .write_state()?
             .write_context_builder()
@@ -648,7 +652,7 @@ async fn test_acknowledged_row_tracking_rewrite(
     if let Some(expected_error) = expected_error {
         let error = txn
             .commit(engine.as_ref())
-            .expect_err("malformed acknowledged rewrite must fail");
+            .expect_err("unsupported row-tracking acknowledgement must fail");
         assert!(
             error.to_string().contains(expected_error),
             "unexpected error: {error}"
@@ -665,14 +669,14 @@ async fn test_acknowledged_row_tracking_rewrite(
 
     let adds = read_actions_from_commit(&table_url, 2, "add")?;
     assert_eq!(adds.len(), 1);
-    assert_eq!(adds[0]["dataChange"], false);
+    assert_eq!(adds[0]["dataChange"], data_change);
     assert_eq!(adds[0]["baseRowId"], 3);
     assert_eq!(adds[0]["defaultRowCommitVersion"], 2);
     assert!(adds[0]["deletionVector"].is_null());
 
     let removes = read_actions_from_commit(&table_url, 2, "remove")?;
     assert_eq!(removes.len(), 1);
-    assert_eq!(removes[0]["dataChange"], false);
+    assert_eq!(removes[0]["dataChange"], data_change);
     assert_eq!(removes[0]["baseRowId"], 0);
     assert_eq!(removes[0]["defaultRowCommitVersion"], 1);
 

@@ -9,10 +9,7 @@
 mod addfile;
 mod dv;
 mod removefile;
-mod row_tracking;
 mod utils;
-
-pub(crate) use row_tracking::validate_row_tracking_rewrite;
 
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
