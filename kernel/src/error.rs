@@ -203,7 +203,10 @@ pub enum Error {
     #[error("No table version found.")]
     MissingVersion,
 
-    /// A specific version for the Delta table is missing or unavailable for a log operation.
+    /// A table version required by a log operation is unavailable.
+    ///
+    /// For an interior gap, this is the first missing version. If the log ends before a requested
+    /// endpoint, this is the requested endpoint.
     #[error("Table version {0} is missing or unavailable for this log operation.")]
     MissingVersionAt(Version),
 
@@ -286,7 +289,8 @@ pub enum Error {
     #[error("Invalid log path: {0}")]
     InvalidLogPath(String),
 
-    /// The files assembled for a log segment violate its structural requirements.
+    /// The assembled log segment is inconsistent with its declared file kinds, ordering, or
+    /// version bounds. Malformed checkpoint file sets use [`Error::InvalidCheckpoint`].
     #[error("Invalid log segment: {0}")]
     InvalidLogSegment(String),
 
@@ -423,6 +427,10 @@ impl Error {
     }
     pub(crate) fn invalid_log_path(msg: impl ToString) -> Self {
         Self::InvalidLogPath(msg.to_string())
+    }
+
+    pub(crate) fn invalid_log_segment(msg: impl ToString) -> Self {
+        Self::InvalidLogSegment(msg.to_string())
     }
 
     pub fn internal_error(msg: impl ToString) -> Self {
