@@ -134,7 +134,30 @@ impl LogSegment {
             })
             .transpose()?;
         let delta = self.build_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
-        Ok(base_crc.clone().apply(delta, self.end_version))
+        let crc = base_crc.clone().apply(delta, self.end_version);
+        // Reverse replay doesn't read the AMT `checkpoint` action, so it misses P&M carried only
+        // there. Re-resolve through the version-aware reader.
+        // TODO: this re-reads `(base_crc.version, end_version]`; a single-pass replay would avoid it.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let crc = self.reresolve_crc_pm(engine, base_crc, crc)?;
+        Ok(crc)
+    }
+
+    /// Overwrite `crc`'s P&M with the version-aware resolution over this segment, seeded by
+    /// `base_crc`, so an AMT `checkpoint` action's P&M (which reverse replay does not read) is
+    /// ranked correctly against top-level actions.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn reresolve_crc_pm(
+        &self,
+        engine: &dyn Engine,
+        base_crc: &Crc,
+        mut crc: Crc,
+    ) -> DeltaResult<Crc> {
+        let base = Arc::new(base_crc.clone());
+        let (metadata, protocol, _) = self.read_protocol_metadata(engine, Some(&base))?;
+        crc.metadata = metadata;
+        crc.protocol = protocol;
+        Ok(crc)
     }
 
     /// Build a Complete base [`Crc`] at `checkpoint_version` from this segment's checkpoint files.

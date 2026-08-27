@@ -136,6 +136,17 @@ fn metadata(m: Metadata) -> serde_json::Value {
     json!({"metaData": serde_json::to_value(&m).unwrap()})
 }
 
+// A `checkpoint` action carrying `p` and `m` at `checkpoint_version`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn amt_checkpoint_action(checkpoint_version: i64, p: Protocol, m: Metadata) -> Value {
+    json!({ "checkpoint": [
+        { "checkpointMetadata": { "version": checkpoint_version } },
+        { "contentRoot": { "path": "metadata/root.parquet", "sizeInBytes": 1, "version": checkpoint_version } },
+        { "protocol": serde_json::to_value(&p).unwrap() },
+        { "metaData": serde_json::to_value(&m).unwrap() },
+    ] })
+}
+
 fn add(path: &str, size: i64) -> serde_json::Value {
     json!({"add": {
         "path": path,
@@ -698,6 +709,43 @@ async fn test_get_m_from_newer_delta_over_older_crc() {
         .build()
         .await
         .assert_p_m(None, &protocol_b(), &metadata_a());
+}
+
+// A checkpoint action is ranked by its nested version, so it beats the CRC only when strictly
+// newer.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest]
+#[case::lagging_defers_to_crc(0, protocol_b(), metadata_b())]
+#[case::equal_defers_to_crc(1, protocol_b(), metadata_b())]
+#[case::newer_beats_crc(2, protocol_c(), metadata_a())]
+#[tokio::test]
+async fn test_crc_ranks_amt_checkpoint_action_by_nested_version(
+    #[case] checkpoint_version: i64,
+    #[case] expected_protocol: Protocol,
+    #[case] expected_metadata: Metadata,
+) {
+    CrcReadTest::new()
+        .commit(
+            0,
+            [
+                commit_info(DEFAULT_OPERATION, None),
+                protocol(protocol_a()),
+                metadata(metadata_a()),
+            ],
+        )
+        .commit(1, [commit_info(DEFAULT_OPERATION, None)])
+        .crc(1, protocol_b(), metadata_b(), None)
+        .commit(
+            2,
+            [amt_checkpoint_action(
+                checkpoint_version,
+                protocol_c(),
+                metadata_a(),
+            )],
+        )
+        .build()
+        .await
+        .assert_p_m(None, &expected_protocol, &expected_metadata);
 }
 
 #[tokio::test]

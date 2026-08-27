@@ -95,6 +95,14 @@ impl LogSegment {
             );
             let pruned = self.segment_after_version(crc.version);
             let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine)?;
+            // Drop a pruned winner at or below the CRC version: a lagging AMT checkpoint action
+            // can sit there, and the CRC is newer.
+            let metadata_opt = metadata_opt
+                .filter(|(v, _)| *v > crc.version as i64)
+                .map(|(_, m)| m);
+            let protocol_opt = protocol_opt
+                .filter(|(v, _)| *v > crc.version as i64)
+                .map(|(_, p)| p);
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -105,7 +113,7 @@ impl LogSegment {
                 ));
             }
 
-            // Case 2(b): P&M incomplete from pruned replay, use the CRC.
+            // Case 2(b): P&M incomplete or older than the CRC, use the CRC.
             // Use `or_else` so any newer P or M found in the pruned replay takes priority
             // over the (older) CRC values.
             info!("P&M fallback to CRC (no P&M changes after CRC version)");
@@ -119,17 +127,14 @@ impl LogSegment {
         // Case 3: Full P&M log replay.
         let (metadata_opt, protocol_opt) = self.replay_for_pm(engine)?;
         Ok((
-            metadata_opt,
-            protocol_opt,
+            metadata_opt.map(|(_, m)| m),
+            protocol_opt.map(|(_, p)| p),
             ProtocolMetadataSource::FullReplay,
         ))
     }
 
-    /// Replays the log segment for the latest Protocol and Metadata.
-    fn replay_for_pm(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+    /// Replays the log segment for the latest Protocol and Metadata, each with its version.
+    fn replay_for_pm(&self, engine: &dyn Engine) -> DeltaResult<ResolvedPm> {
         #[cfg(feature = "declarative-plans")]
         if let Some(executor) = engine.plan_executor() {
             return resolve_pm_batches(self.read_pm_batches_via_plan(executor.as_ref())?);
@@ -259,6 +264,9 @@ impl LogSegment {
     }
 }
 
+/// Metadata and Protocol, each tagged with the version it was found at.
+type ResolvedPm = (Option<(i64, Metadata)>, Option<(i64, Protocol)>);
+
 /// Protocol and Metadata parsed from one batch, each with the version it was found at
 struct PmCandidate {
     protocol: Option<(i64, Protocol)>,
@@ -275,7 +283,7 @@ struct VersionedBatch {
 /// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
     batches: impl Iterator<Item = DeltaResult<VersionedBatch>>,
-) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+) -> DeltaResult<ResolvedPm> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
     for batch in batches {
@@ -293,7 +301,7 @@ fn resolve_pm_batches(
             break;
         }
     }
-    Ok((metadata.map(|(_, m)| m), protocol.map(|(_, p)| p)))
+    Ok((metadata, protocol))
 }
 
 /// Parses the log version from a batch's `_file` metadata column.
