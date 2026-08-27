@@ -136,6 +136,34 @@ fn metadata(m: Metadata) -> serde_json::Value {
     json!({"metaData": serde_json::to_value(&m).unwrap()})
 }
 
+// The AMT protocol carried by the CRC (adaptiveMetadata-preview + deletionVectors).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn amt_protocol_crc() -> Protocol {
+    Protocol::try_new_modern(
+        ["adaptiveMetadata-preview", "deletionVectors"],
+        ["adaptiveMetadata-preview", "deletionVectors"],
+    )
+    .unwrap()
+}
+
+// The AMT protocol carried by the checkpoint action (a superset, so it's distinguishable).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn amt_protocol_checkpoint() -> Protocol {
+    Protocol::try_new_modern(
+        [
+            "adaptiveMetadata-preview",
+            "deletionVectors",
+            "timestampNtz",
+        ],
+        [
+            "adaptiveMetadata-preview",
+            "deletionVectors",
+            "timestampNtz",
+        ],
+    )
+    .unwrap()
+}
+
 // A `checkpoint` action carrying `p` and `m` at `checkpoint_version`.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn amt_checkpoint_action(checkpoint_version: i64, p: Protocol, m: Metadata) -> Value {
@@ -711,41 +739,41 @@ async fn test_get_m_from_newer_delta_over_older_crc() {
         .assert_p_m(None, &protocol_b(), &metadata_a());
 }
 
-// A checkpoint action is ranked by its nested version, so it beats the CRC only when strictly
-// newer.
+// A lagging checkpoint action (nested version below the CRC) must not override the CRC's newer
+// P&M in a CRC-seeded pruned replay. v1 changes P&M via top-level actions (matching the CRC); v2
+// is a manifest commit whose checkpoint action snapshots the older v0 P&M.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[rstest]
-#[case::lagging_defers_to_crc(0, protocol_b(), metadata_b())]
-#[case::equal_defers_to_crc(1, protocol_b(), metadata_b())]
-#[case::newer_beats_crc(2, protocol_c(), metadata_a())]
 #[tokio::test]
-async fn test_crc_ranks_amt_checkpoint_action_by_nested_version(
-    #[case] checkpoint_version: i64,
-    #[case] expected_protocol: Protocol,
-    #[case] expected_metadata: Metadata,
-) {
+async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
     CrcReadTest::new()
         .commit(
             0,
             [
                 commit_info(DEFAULT_OPERATION, None),
-                protocol(protocol_a()),
+                protocol(amt_protocol_checkpoint()),
                 metadata(metadata_a()),
             ],
         )
-        .commit(1, [commit_info(DEFAULT_OPERATION, None)])
-        .crc(1, protocol_b(), metadata_b(), None)
+        .commit(
+            1,
+            [
+                commit_info(DEFAULT_OPERATION, None),
+                protocol(amt_protocol_crc()),
+                metadata(metadata_b()),
+            ],
+        )
+        .crc(1, amt_protocol_crc(), metadata_b(), None)
         .commit(
             2,
             [amt_checkpoint_action(
-                checkpoint_version,
-                protocol_c(),
+                0,
+                amt_protocol_checkpoint(),
                 metadata_a(),
             )],
         )
         .build()
         .await
-        .assert_p_m(None, &expected_protocol, &expected_metadata);
+        .assert_p_m(None, &amt_protocol_crc(), &metadata_b());
 }
 
 #[tokio::test]
