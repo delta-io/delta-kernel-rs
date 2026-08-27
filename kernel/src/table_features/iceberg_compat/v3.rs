@@ -10,7 +10,9 @@ use crate::schema::PrimitiveType::{
     Binary, Boolean, Byte, Date, Decimal, Double, Float, Integer, Long, Short,
     String as StringType, Timestamp, TimestampNtz,
 };
-use crate::schema::{try_collect_column_defaults, DataType, MetadataValue, StructField};
+use crate::schema::{
+    try_collect_column_defaults, ColumnMetadataKey, DataType, MetadataValue, StructField,
+};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
@@ -23,9 +25,12 @@ pub(crate) const V3_VALIDATOR: IcebergCompatValidator = IcebergCompatValidator {
     checks: V3_CHECKS,
 };
 
-const V3_CHECKS: &[IcebergCompatCheck] = &[check_v3_supported_types, check_no_legacy_nested_ids];
-
-const TYPE_CHANGES_METADATA_KEY: &str = "delta.typeChanges";
+const V3_CHECKS: &[IcebergCompatCheck] = &[
+    IcebergCompatCheck::always(check_v3_supported_types),
+    IcebergCompatCheck::always(check_no_legacy_nested_ids),
+    IcebergCompatCheck::write_only(iceberg_compat_v3_type_changes_validation),
+    IcebergCompatCheck::write_only(iceberg_compat_v3_column_defaults_validation),
+];
 
 fn is_v3_supported_type(dt: &DataType) -> bool {
     matches!(
@@ -108,19 +113,20 @@ struct TypeChangesValidator {
 
 impl TypeChangesValidator {
     fn validate_field_type_changes(&self, field: &StructField) -> DeltaResult<()> {
-        let Some(metadata) = field.metadata().get(TYPE_CHANGES_METADATA_KEY) else {
+        let type_changes_key = ColumnMetadataKey::TypeChanges.as_ref();
+        let Some(metadata) = field.metadata().get(type_changes_key) else {
             return Ok(());
         };
         let path = self.path.join(".");
         let MetadataValue::Other(value) = metadata else {
             return Err(Error::schema(format!(
-                "Field '{path}' has a non-array `{TYPE_CHANGES_METADATA_KEY}` annotation: \
+                "Field '{path}' has a non-array `{type_changes_key}` annotation: \
                  {metadata}"
             )));
         };
         let type_changes: Vec<TypeChange> = serde_json::from_value(value.clone()).map_err(|e| {
             Error::schema(format!(
-                "Field '{path}' has an invalid `{TYPE_CHANGES_METADATA_KEY}` annotation: {e}"
+                "Field '{path}' has an invalid `{type_changes_key}` annotation: {e}"
             ))
         })?;
         for type_change in type_changes {
@@ -400,7 +406,7 @@ mod type_change_tests {
 
     fn field_with_type_change(name: &str, from_type: &str, to_type: &str) -> StructField {
         StructField::nullable(name, DataType::STRING).add_metadata([(
-            super::TYPE_CHANGES_METADATA_KEY,
+            ColumnMetadataKey::TypeChanges.as_ref(),
             MetadataValue::Other(json!([{
                 "fromType": from_type,
                 "toType": to_type,
@@ -472,25 +478,48 @@ mod type_change_tests {
         );
     }
 
-    #[test]
-    fn v3_type_change_validation_reports_nested_field_path() {
-        let table_configuration = table_config_with_schema(schema! {
+    #[rstest]
+    #[case::nested_struct(
+        schema! {
             nullable "s": {
                 (field_with_type_change("inner", "integer", "double")),
             },
-        });
+        },
+        "s.inner",
+    )]
+    #[case::array_element_struct(
+        schema! {
+            nullable "arr": [ nullable {
+                (field_with_type_change("inner", "integer", "double")),
+            } ],
+        },
+        "arr.element.inner",
+    )]
+    #[case::map_value_struct(
+        schema! {
+            nullable "m": { STRING => nullable {
+                (field_with_type_change("inner", "integer", "double")),
+            } },
+        },
+        "m.value.inner",
+    )]
+    fn v3_type_change_validation_reports_field_path(
+        #[case] schema: StructType,
+        #[case] expected_path: &str,
+    ) {
+        let table_configuration = table_config_with_schema(schema);
 
         let err = iceberg_compat_v3_type_changes_validation(&table_configuration)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("s.inner"), "unexpected error: {err}");
+        assert!(err.contains(expected_path), "unexpected error: {err}");
     }
 
     #[test]
     fn v3_type_change_validation_rejects_malformed_type_change_metadata() {
         let table_configuration = table_config_with_schema(schema! {
             (StructField::nullable("a", DataType::STRING).add_metadata([(
-                super::TYPE_CHANGES_METADATA_KEY,
+                ColumnMetadataKey::TypeChanges.as_ref(),
                 MetadataValue::String("not an array".to_string()),
             )])),
         });
@@ -499,7 +528,7 @@ mod type_change_tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("non-array") && err.contains(super::TYPE_CHANGES_METADATA_KEY),
+            err.contains("non-array") && err.contains(ColumnMetadataKey::TypeChanges.as_ref()),
             "unexpected error: {err}"
         );
     }

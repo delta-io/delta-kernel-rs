@@ -15,11 +15,10 @@ pub(crate) use column_mapping::{
 use delta_kernel_derive::internal_api;
 #[cfg(feature = "geo-type-in-dev")]
 pub(crate) use geospatial::validate_geospatial_feature_support;
-pub(crate) use iceberg_compat::v3::{
-    iceberg_compat_v3_column_defaults_validation, iceberg_compat_v3_type_changes_validation,
-    V3_VALIDATOR,
+pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::{
+    validate_iceberg_compat_if_needed, IcebergCompatValidationContext,
 };
-pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -449,6 +448,7 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 ///
 /// Spec: <https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md>
 ///
+/// TODO(#2492): Implement the schema-evolution requirements for IcebergCompatV3.
 /// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
 ///
 /// Requirements to enforce when the corresponding write paths are supported:
@@ -569,6 +569,9 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
+    // TODO(#2492): When type widening is supported on ALTER TABLE, restrict the allowed widenings
+    // on IcebergCompatV3 tables to the subset permitted by Iceberg V3 schema-evolution rules.
+    // Ref: <https://iceberg.apache.org/spec/#schema-evolution>
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
@@ -577,6 +580,9 @@ static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
+    // TODO(#2492): When type widening is supported on ALTER TABLE, restrict the allowed widenings
+    // on IcebergCompatV3 tables to the subset permitted by Iceberg V3 schema-evolution rules.
+    // Ref: <https://iceberg.apache.org/spec/#schema-evolution>
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };

@@ -141,6 +141,101 @@ async fn snapshot_blocked_when_v3_schema_has_legacy_nested_ids() {
     );
 }
 
+#[tokio::test]
+async fn v3_invalid_type_change_blocks_writes_but_not_snapshot_loading() {
+    let (storage, engine) = make_default_engine_and_store();
+    let schema = schema! {
+        (StructField::nullable("a", DataType::STRING).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::from(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::from("col-1"),
+            ),
+            (
+                ColumnMetadataKey::TypeChanges.as_ref(),
+                MetadataValue::Other(serde_json::json!([{
+                    "fromType": "integer",
+                    "toType": "double",
+                    "tableVersion": 1,
+                }])),
+            ),
+        ])),
+    };
+    let schema_string = serde_json::to_string(&schema).unwrap();
+
+    let commit = [
+        serde_json::json!({
+            "commitInfo": {
+                "timestamp": 1587968586154_i64,
+                "operation": "CREATE TABLE",
+                "operationParameters": {},
+                "isBlindAppend": true,
+            }
+        }),
+        serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [
+                    "columnMapping",
+                    "typeWidening",
+                ],
+                "writerFeatures": [
+                    "icebergCompatV3",
+                    "columnMapping",
+                    "rowTracking",
+                    "domainMetadata",
+                    "typeWidening",
+                ],
+            }
+        }),
+        serde_json::json!({
+            "metaData": {
+                "id": "deadbeef-1234-5678-abcd-000000000002",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": schema_string,
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.enableIcebergCompatV3": "true",
+                    "delta.columnMapping.mode": "name",
+                    "delta.enableRowTracking": "true",
+                    "delta.enableTypeWidening": "true",
+                    "delta.rowTracking.materializedRowIdColumnName": "_row_id",
+                    "delta.rowTracking.materializedRowCommitVersionColumnName":
+                        "_row_commit_version",
+                    "delta.columnMapping.maxColumnId": "1",
+                },
+                "createdTime": 1234567890000_i64,
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|action| serde_json::to_string(&action).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n");
+    add_commit(TABLE_ROOT, storage.as_ref(), 0, commit)
+        .await
+        .unwrap();
+
+    let snapshot = Snapshot::builder_for(TABLE_ROOT)
+        .build(engine.as_ref())
+        .unwrap();
+    let err = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("icebergCompatV3 does not support type change")
+            && err.contains("a")
+            && err.contains("integer")
+            && err.contains("double"),
+        "unexpected error: {err}",
+    );
+}
+
 #[rstest::rstest]
 #[case::missing_num_records(None/* num_records */, Err("'stats.numRecords' is required"))]
 #[case::with_num_records(Some(3), Ok(1))]
