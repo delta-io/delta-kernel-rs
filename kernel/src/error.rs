@@ -199,16 +199,13 @@ pub enum Error {
     #[error("Expected is missing: {0}")]
     MissingData(String),
 
-    /// A version for the delta table could not be found in the log
-    #[error("No table version found.")]
-    MissingVersion,
-
-    /// A table version required by a log operation is unavailable.
+    /// One or more table versions required by a log operation are unavailable.
     ///
-    /// For an interior gap, this is the first missing version. If the log ends before a requested
-    /// endpoint, this is the requested endpoint.
-    #[error("Table version {0} is missing or unavailable for this log operation.")]
-    MissingVersionAt(Version),
+    /// The payload is the first missing version when it can be determined. It is [`None`] when no
+    /// version can be inferred, such as when the operation has no explicit target and the log
+    /// contains no versions.
+    #[error("{}", MissingVersionDisplay(.0))]
+    MissingVersion(Option<Version>),
 
     /// An error occurred while working with deletion vectors
     #[error("Deletion Vector error: {0}")]
@@ -359,6 +356,20 @@ pub enum Error {
     /// exhaustion. See [`CancellableIterator`](crate::cancellation) for the enforced contract.
     #[error("Operation cancelled")]
     Cancelled,
+}
+
+struct MissingVersionDisplay<'a>(&'a Option<Version>);
+
+impl std::fmt::Display for MissingVersionDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(version) => write!(
+                f,
+                "Table version {version} is missing or unavailable for this log operation."
+            ),
+            None => f.write_str("No table version found."),
+        }
+    }
 }
 
 // Convenience constructors for Error types that take a String argument

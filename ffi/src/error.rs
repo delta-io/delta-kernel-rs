@@ -103,8 +103,7 @@ impl From<Error> for KernelError {
             Error::MissingColumn(_) => KernelError::MissingColumnError,
             Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
             Error::MissingData(_) => KernelError::MissingDataError,
-            Error::MissingVersion => KernelError::MissingVersionError,
-            Error::MissingVersionAt(_) => KernelError::MissingVersionError,
+            Error::MissingVersion(_) => KernelError::MissingVersionError,
             Error::DeletionVector(_) => KernelError::DeletionVectorError,
             Error::InvalidUrl(_) => KernelError::InvalidUrlError,
             Error::MalformedJson(_) => KernelError::MalformedJsonError,
@@ -326,7 +325,7 @@ impl From<EngineExecError> for Error {
             KernelError::SchemaError => Error::Schema(message),
             KernelError::InvalidTransactionStateError => Error::InvalidTransactionState(message),
             code @ KernelError::MissingVersionError => {
-                messageless_error(code, message, Error::MissingVersion)
+                messageless_error(code, message, Error::MissingVersion(None))
             }
             code @ KernelError::MissingMetadataError => {
                 messageless_error(code, message, Error::MissingMetadata)
@@ -388,8 +387,13 @@ mod error_code_tests {
 
     #[test]
     fn log_segment_errors_have_stable_ffi_mappings() {
+        let missing_version = Error::MissingVersion(Some(7));
         assert_eq!(
-            KernelError::from(Error::MissingVersionAt(7)),
+            missing_version.to_string(),
+            "Table version 7 is missing or unavailable for this log operation."
+        );
+        assert_eq!(
+            KernelError::from(missing_version),
             KernelError::MissingVersionError
         );
         assert_eq!(
@@ -412,8 +416,8 @@ mod tests {
     }
 
     /// Each code should translate into its matching kernel error variant (preserving the message),
-    /// unit variants drop the message, and unmapped codes fall back to a generic error that retains
-    /// both the original code and message.
+    /// payloads unavailable through FFI drop the message, and unmapped codes fall back to a generic
+    /// error that retains both the original code and message.
     #[rstest]
     #[case::file_not_found(KernelError::FileNotFoundError, "File not found: boom")]
     #[case::schema(KernelError::SchemaError, "Schema error: boom")]
@@ -421,7 +425,10 @@ mod tests {
     #[case::generic(KernelError::GenericError, "Generic delta kernel error: boom")]
     #[case::invalid_expr(KernelError::InvalidExpression, "Invalid expression evaluation: boom")]
     #[case::invalid_log_segment(KernelError::InvalidLogSegment, "Invalid log segment: boom")]
-    #[case::unit_missing_version(KernelError::MissingVersionError, "No table version found.")]
+    #[case::missing_version_without_payload(
+        KernelError::MissingVersionError,
+        "No table version found."
+    )]
     #[case::fallback_io(
         KernelError::IOErrorError,
         "Generic delta kernel error: engine execution error (IOErrorError): boom"

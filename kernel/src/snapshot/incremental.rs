@@ -268,7 +268,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(requested_version) => Err(Error::MissingVersionAt(requested_version)),
+                Some(_) => Err(Error::MissingVersion(Some(existing_snapshot_version + 1))),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 None => Ok(NewSegment::Unchanged),
             };
@@ -1109,7 +1109,7 @@ mod tests {
             Snapshot::builder_from(base_snapshot.clone())
                 .at_version(1)
                 .build(&engine),
-            Err(Error::MissingVersionAt(1))
+            Err(Error::MissingVersion(Some(1)))
         ));
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
@@ -1175,9 +1175,9 @@ mod tests {
             .build(&engine)?;
         assert!(matches!(
             Snapshot::builder_from(base_snapshot.clone())
-                .at_version(2)
+                .at_version(4)
                 .build(&engine),
-            Err(Error::MissingVersionAt(2))
+            Err(Error::MissingVersion(Some(2)))
         ));
 
         // ii. commits have (new protocol, no metadata)
@@ -2210,7 +2210,7 @@ mod tests {
         let result = Snapshot::builder_from(base)
             .at_version(9)
             .build(ctx.engine.as_ref());
-        assert!(matches!(result, Err(Error::MissingVersionAt(9))));
+        assert!(matches!(result, Err(Error::MissingVersion(Some(4)))));
 
         let events = reporter.events();
         let failure = events

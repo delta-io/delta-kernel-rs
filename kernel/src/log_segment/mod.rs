@@ -482,7 +482,7 @@ impl LogSegment {
                 .ascending_commit_files()
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
-            Error::MissingVersionAt(start_version)
+            Error::MissingVersion(Some(start_version))
         );
         LogSegment::try_new(listed_files, log_root, end_version, None)
     }
@@ -523,6 +523,9 @@ impl LogSegment {
             Some(end_version),
             None, // timestamp conversion does not thread a cancellation token
         )?;
+        if listed_commits.ascending_commit_files().is_empty() {
+            return Err(Error::MissingVersion(Some(end_version)));
+        }
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = listed_commits.ascending_commit_files_mut();
@@ -1361,12 +1364,18 @@ impl LogSegment {
     }
 
     pub(crate) fn validate_published(&self) -> DeltaResult<()> {
-        require!(
-            self.listed
-                .max_published_version
-                .is_some_and(|v| v == self.end_version),
-            Error::MissingVersionAt(self.end_version)
-        );
+        if self
+            .listed
+            .max_published_version
+            .is_none_or(|version| version != self.end_version)
+        {
+            let first_unpublished_version = match self.listed.max_published_version {
+                Some(version) if version < self.end_version => version + 1,
+                Some(_) => self.end_version,
+                None => 0,
+            };
+            return Err(Error::MissingVersion(Some(first_unpublished_version)));
+        }
         Ok(())
     }
 
@@ -1612,7 +1621,7 @@ fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()
     for pair in commits.windows(2) {
         let expected_version = pair[0].version + 1;
         if expected_version != pair[1].version {
-            return Err(Error::MissingVersionAt(expected_version));
+            return Err(Error::MissingVersion(Some(expected_version)));
         }
     }
     Ok(())
@@ -1631,7 +1640,7 @@ fn validate_checkpoint_commit_gap(
         let expected_version = checkpoint_version + 1;
         require!(
             expected_version == first_commit.version,
-            Error::MissingVersionAt(expected_version)
+            Error::MissingVersion(Some(expected_version))
         );
     }
     Ok(())
@@ -1648,18 +1657,15 @@ fn validate_end_version(
     checkpoint_parts: &[ParsedLogPath],
     end_version: Option<Version>,
 ) -> DeltaResult<Version> {
+    let first_missing_version = end_version.map(|_| 0);
     let effective_version = commits
         .last()
         .or(checkpoint_parts.first())
-        .ok_or_else(|| {
-            end_version
-                .map(Error::MissingVersionAt)
-                .unwrap_or(Error::MissingVersion)
-        })?
+        .ok_or(Error::MissingVersion(first_missing_version))?
         .version;
     if let Some(end_version) = end_version {
         if effective_version < end_version {
-            return Err(Error::MissingVersionAt(end_version));
+            return Err(Error::MissingVersion(Some(effective_version + 1)));
         }
         if effective_version > end_version {
             return Err(Error::invalid_log_segment(format!(

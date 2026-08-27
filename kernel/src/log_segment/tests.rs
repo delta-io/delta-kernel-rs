@@ -1112,14 +1112,23 @@ async fn test_non_contiguous_log() {
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
-    assert!(matches!(log_segment_res, Err(Error::MissingVersionAt(1))));
+    assert!(matches!(
+        log_segment_res,
+        Err(Error::MissingVersion(Some(1)))
+    ));
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
-    assert!(matches!(log_segment_res, Err(Error::MissingVersionAt(1))));
+    assert!(matches!(
+        log_segment_res,
+        Err(Error::MissingVersion(Some(1)))
+    ));
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
-    assert!(matches!(log_segment_res, Err(Error::MissingVersionAt(1))));
+    assert!(matches!(
+        log_segment_res,
+        Err(Error::MissingVersion(Some(1)))
+    ));
 }
 
 #[tokio::test]
@@ -2478,11 +2487,34 @@ fn test_validate_listed_log_file_invalid_commit_sequence(
     assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
 }
 
-#[test]
-fn test_validate_empty_log_segment_without_requested_version() {
+#[rstest]
+#[case::latest(None, None)]
+#[case::specific_version(Some(9), Some(0))]
+fn test_validate_empty_log_segment(
+    #[case] end_version: Option<Version>,
+    #[case] expected: Option<Version>,
+) {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    let result = LogSegment::try_new(LogSegmentFiles::default(), log_root, None, None);
-    assert!(matches!(result, Err(Error::MissingVersion)));
+    let result = LogSegment::try_new(LogSegmentFiles::default(), log_root, end_version, None);
+    assert!(matches!(result, Err(Error::MissingVersion(version)) if version == expected));
+}
+
+#[test]
+fn test_validate_truncated_log_segment_reports_first_missing_version() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let result = LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![
+                create_log_path("file:///_delta_log/00000000000000000001.json"),
+                create_log_path("file:///_delta_log/00000000000000000002.json"),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        Some(4),
+        None,
+    );
+    assert!(matches!(result, Err(Error::MissingVersion(Some(3)))));
 }
 
 #[test]
@@ -2502,7 +2534,7 @@ fn test_validate_checkpoint_commit_gap_reports_first_missing_version() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::MissingVersionAt(2))));
+    assert!(matches!(result, Err(Error::MissingVersion(Some(2)))));
 }
 
 #[test]
@@ -2895,7 +2927,7 @@ async fn for_timestamp_conversion_no_commit_files() {
 
     let res =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
-    assert!(matches!(res, Err(Error::MissingVersionAt(0))));
+    assert!(matches!(res, Err(Error::MissingVersion(Some(0)))));
 }
 
 #[tokio::test]
@@ -3089,7 +3121,7 @@ fn test_log_segment_contiguous_commit_files() {
         LogSegmentFiles {
             ascending_commit_files: vec![
                 create_log_path("file:///_delta_log/00000000000000000001.json"),
-                create_log_path("file:///_delta_log/00000000000000000003.json"),
+                create_log_path("file:///_delta_log/00000000000000000004.json"),
             ],
             ..Default::default()
         },
@@ -3097,7 +3129,7 @@ fn test_log_segment_contiguous_commit_files() {
         None,
         None,
     );
-    assert!(matches!(log_segment, Err(Error::MissingVersionAt(2))));
+    assert!(matches!(log_segment, Err(Error::MissingVersion(Some(2)))));
 }
 
 /// `checkpoint_sidecars()` distinguishes "the matched hint lists zero sidecars" (`Some(&[])`) from
