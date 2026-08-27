@@ -95,8 +95,8 @@ impl LogSegment {
             );
             let pruned = self.segment_after_version(crc.version);
             let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine)?;
-            // Drop a pruned winner at or below the CRC version: a lagging AMT checkpoint action
-            // can sit there, and the CRC is newer.
+            // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
+            // carry it, and the CRC's P&M is at least as new.
             let metadata_opt = metadata_opt
                 .filter(|(v, _)| *v > crc.version as i64)
                 .map(|(_, m)| m);
