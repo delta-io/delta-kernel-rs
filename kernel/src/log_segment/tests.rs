@@ -2453,55 +2453,26 @@ fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
     assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
 }
 
-#[test]
-fn test_validate_listed_log_file_out_of_order_commit_files() {
+#[rstest]
+#[case::out_of_order(&[3, 1], None)]
+#[case::duplicate_versions(&[1, 1], None)]
+#[case::gap_before_out_of_order(&[0, 2, 1], None)]
+#[case::newer_than_requested_end(&[1, 2], Some(1))]
+fn test_validate_listed_log_file_invalid_commit_sequence(
+    #[case] versions: &[Version],
+    #[case] end_version: Option<Version>,
+) {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![
-                create_log_path("file:///_delta_log/00000000000000000003.json"),
-                create_log_path("file:///_delta_log/00000000000000000001.json"),
-            ],
+            ascending_commit_files: versions
+                .iter()
+                .map(|version| create_log_path(&format!("file:///_delta_log/{version:020}.json")))
+                .collect(),
             ..Default::default()
         },
         log_root,
-        None,
-        None,
-    );
-    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
-}
-
-#[test]
-fn test_validate_listed_log_file_duplicate_commit_versions() {
-    let log_root = Url::parse("file:///_delta_log/").unwrap();
-    let result = LogSegment::try_new(
-        LogSegmentFiles {
-            ascending_commit_files: vec![
-                create_log_path("file:///_delta_log/00000000000000000001.json"),
-                create_log_path("file:///_delta_log/00000000000000000001.json"),
-            ],
-            ..Default::default()
-        },
-        log_root,
-        None,
-        None,
-    );
-    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
-}
-
-#[test]
-fn test_validate_listed_log_file_newer_than_requested_end_version() {
-    let log_root = Url::parse("file:///_delta_log/").unwrap();
-    let result = LogSegment::try_new(
-        LogSegmentFiles {
-            ascending_commit_files: vec![
-                create_log_path("file:///_delta_log/00000000000000000001.json"),
-                create_log_path("file:///_delta_log/00000000000000000002.json"),
-            ],
-            ..Default::default()
-        },
-        log_root,
-        Some(1),
+        end_version,
         None,
     );
     assert!(matches!(result, Err(Error::InvalidLogSegment(_))));

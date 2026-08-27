@@ -268,11 +268,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(requested_version) => Err(Error::Generic(format!(
-                    "Requested snapshot version {requested_version} is not available: \
-                     no new commits were found after existing snapshot version \
-                     {existing_snapshot_version}"
-                ))),
+                Some(requested_version) => Err(Error::MissingVersionAt(requested_version)),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 None => Ok(NewSegment::Unchanged),
             };
@@ -1110,8 +1106,10 @@ mod tests {
         assert_eq!(snapshot, expected);
         // version exceeds latest version of the table = err
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
-            Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is not available: no new commits were found after existing snapshot version 0"
+            Snapshot::builder_from(base_snapshot.clone())
+                .at_version(1)
+                .build(&engine),
+            Err(Error::MissingVersionAt(1))
         ));
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
@@ -2212,7 +2210,7 @@ mod tests {
         let result = Snapshot::builder_from(base)
             .at_version(9)
             .build(ctx.engine.as_ref());
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::MissingVersionAt(9))));
 
         let events = reporter.events();
         let failure = events

@@ -73,6 +73,7 @@ pub enum KernelError {
     RowTrackingChangeFeedUnsupported = 44,
     CancelledError = 45,
     InvalidTransactionStateError = 46,
+    /// The selected log files violate their declared kinds, ordering, or version bounds.
     InvalidLogSegment = 47,
 }
 

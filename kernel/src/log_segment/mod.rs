@@ -1527,12 +1527,12 @@ impl LogSegment {
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
     for (i, f) in compactions.iter().enumerate() {
         let LogPathFileType::CompactedCommit { hi } = f.file_type else {
-            return Err(Error::InvalidLogSegment(
-                "ascending_compaction_files contains non-compaction file".to_string(),
+            return Err(Error::invalid_log_segment(
+                "ascending_compaction_files contains non-compaction file",
             ));
         };
         if f.version > hi {
-            return Err(Error::InvalidLogSegment(format!(
+            return Err(Error::invalid_log_segment(format!(
                 "compaction file has start version {} > end version {}",
                 f.version, hi
             )));
@@ -1542,7 +1542,7 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
             // CompactedCommit since the type error will be caught then.
             if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
                 if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
-                    return Err(Error::InvalidLogSegment(format!(
+                    return Err(Error::invalid_log_segment(format!(
                         "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
                     )));
                 }
@@ -1590,8 +1590,8 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
 fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for f in commits {
         if !f.is_commit() {
-            return Err(Error::InvalidLogSegment(
-                "ascending_commit_files contains non-commit file".to_string(),
+            return Err(Error::invalid_log_segment(
+                "ascending_commit_files contains non-commit file",
             ));
         }
     }
@@ -1599,13 +1599,17 @@ fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
 }
 
 fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+    if let Some(pair) = commits
+        .windows(2)
+        .find(|pair| pair[0].version >= pair[1].version)
+    {
+        return Err(Error::invalid_log_segment(format!(
+            "ascending_commit_files is not sorted: {:?} -> {:?}",
+            pair[0], pair[1]
+        )));
+    }
+
     for pair in commits.windows(2) {
-        if pair[0].version >= pair[1].version {
-            return Err(Error::InvalidLogSegment(format!(
-                "ascending_commit_files is not sorted: {:?} -> {:?}",
-                pair[0], pair[1]
-            )));
-        }
         let expected_version = pair[0].version + 1;
         if expected_version != pair[1].version {
             return Err(Error::MissingVersionAt(expected_version));
@@ -1658,7 +1662,7 @@ fn validate_end_version(
             return Err(Error::MissingVersionAt(end_version));
         }
         if effective_version > end_version {
-            return Err(Error::InvalidLogSegment(format!(
+            return Err(Error::invalid_log_segment(format!(
                 "effective version {effective_version} is newer than requested end version {end_version}"
             )));
         }
