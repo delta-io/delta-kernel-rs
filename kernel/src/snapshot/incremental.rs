@@ -1176,8 +1176,10 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
-            Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
+            Snapshot::builder_from(base_snapshot.clone())
+                .at_version(2)
+                .build(&engine),
+            Err(Error::MissingVersionAt(2))
         ));
 
         // ii. commits have (new protocol, no metadata)

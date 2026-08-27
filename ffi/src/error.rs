@@ -73,6 +73,7 @@ pub enum KernelError {
     RowTrackingChangeFeedUnsupported = 44,
     CancelledError = 45,
     InvalidTransactionStateError = 46,
+    InvalidLogSegment = 47,
 }
 
 impl From<Error> for KernelError {
@@ -102,6 +103,7 @@ impl From<Error> for KernelError {
             Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
             Error::MissingData(_) => KernelError::MissingDataError,
             Error::MissingVersion => KernelError::MissingVersionError,
+            Error::MissingVersionAt(_) => KernelError::MissingVersionError,
             Error::DeletionVector(_) => KernelError::DeletionVectorError,
             Error::InvalidUrl(_) => KernelError::InvalidUrlError,
             Error::MalformedJson(_) => KernelError::MalformedJsonError,
@@ -124,6 +126,7 @@ impl From<Error> for KernelError {
             } => Self::from(*source),
             Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
             Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
+            Error::InvalidLogSegment(_) => KernelError::InvalidLogSegment,
             Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
@@ -315,6 +318,7 @@ impl From<EngineExecError> for Error {
             KernelError::InvalidStructDataError => Error::InvalidStructData(message),
             KernelError::InvalidExpression => Error::InvalidExpressionEvaluation(message),
             KernelError::InvalidLogPath => Error::InvalidLogPath(message),
+            KernelError::InvalidLogSegment => Error::InvalidLogSegment(message),
             KernelError::FileAlreadyExists => Error::FileAlreadyExists(message),
             KernelError::UnsupportedError => Error::Unsupported(message),
             KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
@@ -380,6 +384,19 @@ mod error_code_tests {
         );
         assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
     }
+
+    #[test]
+    fn log_segment_errors_have_stable_ffi_mappings() {
+        assert_eq!(
+            KernelError::from(Error::MissingVersionAt(7)),
+            KernelError::MissingVersionError
+        );
+        assert_eq!(
+            KernelError::from(Error::InvalidLogSegment("invalid".to_string())),
+            KernelError::InvalidLogSegment
+        );
+        assert_eq!(KernelError::InvalidLogSegment as i32, 47);
+    }
 }
 
 #[cfg(all(test, feature = "declarative-plans"))]
@@ -402,6 +419,7 @@ mod tests {
     #[case::unsupported(KernelError::UnsupportedError, "Unsupported: boom")]
     #[case::generic(KernelError::GenericError, "Generic delta kernel error: boom")]
     #[case::invalid_expr(KernelError::InvalidExpression, "Invalid expression evaluation: boom")]
+    #[case::invalid_log_segment(KernelError::InvalidLogSegment, "Invalid log segment: boom")]
     #[case::unit_missing_version(KernelError::MissingVersionError, "No table version found.")]
     #[case::fallback_io(
         KernelError::IOErrorError,

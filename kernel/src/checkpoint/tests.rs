@@ -646,7 +646,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::Error::Generic(e) if e == "Log segment is not published"
+        crate::Error::MissingVersionAt(1)
     ));
     Ok(())
 }

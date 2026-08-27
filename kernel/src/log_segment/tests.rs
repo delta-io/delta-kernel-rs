@@ -1112,26 +1112,14 @@ async fn test_non_contiguous_log() {
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
-    // check the error message up to the timestamp
-    let expected_error_pattern = "Generic delta kernel error: Expected contiguous commit files, \
-        but found gap: ParsedLogPath { location: FileMeta { location: Url { scheme: \"memory\", \
-        cannot_be_a_base: false, username: \"\", password: None, host: None, port: None, path: \
-        \"/_delta_log/00000000000000000000.json\", query: None, fragment: None }, last_modified:";
-    assert_result_error_with_message(log_segment_res, expected_error_pattern);
+    assert!(matches!(log_segment_res, Err(Error::MissingVersionAt(1))));
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
-    assert_result_error_with_message(
-        log_segment_res,
-        "Generic delta kernel error: Expected the first commit to have version 1",
-    );
+    assert!(matches!(log_segment_res, Err(Error::MissingVersionAt(1))));
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
-    assert_result_error_with_message(
-        log_segment_res,
-        "Generic delta kernel error: LogSegment end version 0 not the same as the specified end \
-        version 1",
-    );
+    assert!(matches!(log_segment_res, Err(Error::MissingVersionAt(1))));
 }
 
 #[tokio::test]
@@ -2421,7 +2409,7 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
 #[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_out_of_order_compaction_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             ascending_commit_files: vec![create_log_path(
                 "file:///_delta_log/00000000000000000001.json",
@@ -2439,14 +2427,14 @@ fn test_validate_listed_log_file_out_of_order_compaction_files() {
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
 }
 
 #[test]
 fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![
                 create_log_path(
@@ -2461,14 +2449,14 @@ fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
 }
 
 #[test]
 fn test_validate_listed_log_file_out_of_order_commit_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             ascending_commit_files: vec![
                 create_log_path("file:///_delta_log/00000000000000000003.json"),
@@ -2479,8 +2467,71 @@ fn test_validate_listed_log_file_out_of_order_commit_files() {
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
+}
+
+#[test]
+fn test_validate_listed_log_file_duplicate_commit_versions() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let result = LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![
+                create_log_path("file:///_delta_log/00000000000000000001.json"),
+                create_log_path("file:///_delta_log/00000000000000000001.json"),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    );
+    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
+}
+
+#[test]
+fn test_validate_listed_log_file_newer_than_requested_end_version() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let result = LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![
+                create_log_path("file:///_delta_log/00000000000000000001.json"),
+                create_log_path("file:///_delta_log/00000000000000000002.json"),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        Some(1),
+        None,
+    );
+    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
+}
+
+#[test]
+fn test_validate_empty_log_segment_without_requested_version() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let result = LogSegment::try_new(LogSegmentFiles::default(), log_root, None, None);
+    assert!(matches!(result, Err(Error::MissingVersion)));
+}
+
+#[test]
+fn test_validate_checkpoint_commit_gap_reports_first_missing_version() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let result = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path(
+                "file:///_delta_log/00000000000000000001.checkpoint.parquet",
+            )],
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000003.json",
+            )],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    );
+    assert!(matches!(result, Err(Error::MissingVersionAt(2))));
 }
 
 #[test]
@@ -2558,7 +2609,7 @@ fn test_try_new_crc_older_than_checkpoint_is_err() {
 #[test]
 fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(
                 "file:///_delta_log/00000000000000000010.json",
@@ -2568,15 +2619,15 @@ fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
 }
 
 #[test]
 fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
     // Two parts that agree on version but claim num_parts=3 (count mismatch: 2 != 3)
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![
                 create_log_path(
@@ -2591,15 +2642,15 @@ fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
 }
 
 #[test]
 fn test_validate_listed_log_file_single_multipart_checkpoint_num_parts_mismatch() {
     // A single checkpoint file that claims num_parts=2: the count (1) disagrees with num_parts
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(
                 "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000002.parquet",
@@ -2609,15 +2660,15 @@ fn test_validate_listed_log_file_single_multipart_checkpoint_num_parts_mismatch(
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
 }
 
 #[test]
 fn test_validate_listed_log_file_multiple_single_part_checkpoints() {
     // Two ClassicCheckpoints at the same version: n=2 but neither is a MultiPartCheckpoint
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![
                 create_log_path("file:///_delta_log/00000000000000000010.checkpoint.parquet"),
@@ -2628,14 +2679,14 @@ fn test_validate_listed_log_file_multiple_single_part_checkpoints() {
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
 }
 
 #[test]
 fn test_validate_listed_log_file_commit_files_contains_non_commit() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             ascending_commit_files: vec![create_log_path(
                 "file:///_delta_log/00000000000000000010.checkpoint.parquet",
@@ -2645,15 +2696,15 @@ fn test_validate_listed_log_file_commit_files_contains_non_commit() {
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
 }
 
 #[test]
 #[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             ascending_commit_files: vec![create_log_path(
                 "file:///_delta_log/00000000000000000002.json",
@@ -2666,8 +2717,8 @@ fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
 }
 
 #[test]
@@ -2675,7 +2726,7 @@ fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
 fn test_validate_listed_log_file_compaction_start_exceeds_end() {
     // A compaction file where the start version is greater than the end version
     let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
+    let result = LogSegment::try_new(
         LogSegmentFiles {
             ascending_commit_files: vec![create_log_path(
                 "file:///_delta_log/00000000000000000005.json",
@@ -2688,8 +2739,8 @@ fn test_validate_listed_log_file_compaction_start_exceeds_end() {
         log_root,
         None,
         None,
-    )
-    .is_err());
+    );
+    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
 }
 
 #[tokio::test]
@@ -2873,7 +2924,7 @@ async fn for_timestamp_conversion_no_commit_files() {
 
     let res =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
-    assert_result_error_with_message(res, "Generic delta kernel error: No files in log segment");
+    assert!(matches!(res, Err(Error::MissingVersionAt(0))));
 }
 
 #[tokio::test]
@@ -3075,19 +3126,7 @@ fn test_log_segment_contiguous_commit_files() {
         None,
         None,
     );
-    assert_result_error_with_message(
-        log_segment,
-        "Generic delta kernel error: Expected contiguous commit files, but found gap: \
-        ParsedLogPath { location: FileMeta { location: Url { scheme: \
-        \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/_delta_log/00000000000000000001.json\", query: None, fragment: None }, last_modified: \
-        0, size: 0 }, filename: \"00000000000000000001.json\", extension: \"json\", version: 1, \
-        file_type: Commit } -> ParsedLogPath { location: FileMeta { location: Url { scheme: \
-        \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/_delta_log/00000000000000000003.json\", query: None, fragment: None }, last_modified: \
-        0, size: 0 }, filename: \"00000000000000000003.json\", extension: \"json\", version: 3, \
-        file_type: Commit }",
-    );
+    assert!(matches!(log_segment, Err(Error::MissingVersionAt(2))));
 }
 
 /// `checkpoint_sidecars()` distinguishes "the matched hint lists zero sidecars" (`Some(&[])`) from

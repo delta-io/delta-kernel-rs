@@ -203,6 +203,10 @@ pub enum Error {
     #[error("No table version found.")]
     MissingVersion,
 
+    /// A specific version for the Delta table is missing or unavailable for a log operation.
+    #[error("Table version {0} is missing or unavailable for this log operation.")]
+    MissingVersionAt(Version),
+
     /// An error occurred while working with deletion vectors
     #[error("Deletion Vector error: {0}")]
     DeletionVector(String),
@@ -281,6 +285,10 @@ pub enum Error {
     /// Unable to parse the name of a log path
     #[error("Invalid log path: {0}")]
     InvalidLogPath(String),
+
+    /// The files assembled for a log segment violate its structural requirements.
+    #[error("Invalid log segment: {0}")]
+    InvalidLogSegment(String),
 
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]
