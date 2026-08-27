@@ -275,7 +275,8 @@ mod tests {
     use super::*;
     use crate::actions::visitors::{AddVisitor, RemoveVisitor};
     use crate::actions::{Add, Remove};
-    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::arrow::array::{Array, AsArray, MapArray, StringArray};
+    use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::RowVisitor;
     use crate::object_store::memory::InMemory;
@@ -354,6 +355,207 @@ mod tests {
             1,
             "v=1 has exactly one remove"
         );
+    }
+
+    #[tokio::test]
+    async fn test_commits_project_commit_info_operation_metrics() {
+        let commit = r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationMetrics":{"numFiles":"1","numOutputRows":"2"}}}"#;
+        let (engine, table_root) = engine_with_commits(&[(0, commit)]).await;
+
+        let range = CommitRange::builder_for(table_root, 0)
+            .with_end_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+
+        let mut commit_iter = range
+            .commits(engine.clone(), None, &[DeltaAction::CommitInfo])
+            .unwrap();
+        let commit = commit_iter.next().expect("v=0 commit").unwrap();
+        let mut batches = commit.get_actions(engine.as_ref()).unwrap();
+        let record_batch = batches
+            .next()
+            .expect("commit action batch")
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+
+        let commit_info = record_batch
+            .column_by_name("commitInfo")
+            .expect("commitInfo column")
+            .as_struct_opt()
+            .expect("commitInfo should be a struct");
+        let operation_metrics = commit_info
+            .column_by_name("operationMetrics")
+            .expect("commitInfo.operationMetrics column")
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("operationMetrics should be a map");
+
+        let entries = operation_metrics.value(0);
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("operationMetrics keys should be strings");
+        let values = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("operationMetrics values should be strings");
+        let metrics: HashMap<_, _> = (0..entries.len())
+            .map(|idx| (keys.value(idx), values.value(idx)))
+            .collect();
+
+        assert_eq!(metrics.get("numFiles"), Some(&"1"));
+        assert_eq!(metrics.get("numOutputRows"), Some(&"2"));
+        assert!(batches.next().is_none(), "single-line commit has one batch");
+        assert!(commit_iter.next().is_none(), "single-commit range");
+    }
+
+    #[tokio::test]
+    async fn test_commits_project_commit_info_map_value_shapes() {
+        let commits = [
+            (
+                0,
+                r#"{"commitInfo":{"timestamp":1000,"operation":"CREATE TABLE","operationParameters":{"description":null,"partitionBy":"[]","statsOnLoad":false},"operationMetrics":{}}}"#,
+            ),
+            (
+                1,
+                r#"{"commitInfo":{"timestamp":1001,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numFiles":"1","numOutputRows":"2"}}}"#,
+            ),
+            (
+                2,
+                r#"{"commitInfo":{"timestamp":1002,"operation":"WRITE","operationParameters":{"mode":"Append"}}}"#,
+            ),
+            (
+                3,
+                r#"{"commitInfo":{"timestamp":1003,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":null}}"#,
+            ),
+        ];
+        let (engine, table_root) = engine_with_commits(&commits).await;
+
+        let range = CommitRange::builder_for(table_root, 0)
+            .with_end_version(3)
+            .build(engine.as_ref())
+            .unwrap();
+
+        let mut commit_iter = range
+            .commits(engine.clone(), None, &[DeltaAction::CommitInfo])
+            .unwrap();
+
+        let commit = commit_iter.next().expect("v=0 commit").unwrap();
+        let commit_info = single_commit_info_batch(&commit, engine.as_ref());
+        let operation_parameters = commit_info_map(&commit_info, "operationParameters");
+        assert_eq!(operation_parameters.get("description"), Some(&None));
+        assert_eq!(
+            operation_parameters.get("partitionBy"),
+            Some(&Some("[]".to_string()))
+        );
+        assert_eq!(
+            operation_parameters.get("statsOnLoad"),
+            Some(&Some("false".to_string()))
+        );
+
+        let operation_metrics = commit_info
+            .column_by_name("operationMetrics")
+            .expect("commitInfo.operationMetrics column")
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("operationMetrics should be a map");
+        assert_eq!(operation_metrics.value(0).len(), 0);
+
+        let commit = commit_iter.next().expect("v=1 commit").unwrap();
+        let commit_info = single_commit_info_batch(&commit, engine.as_ref());
+        let operation_metrics = commit_info_map(&commit_info, "operationMetrics");
+        assert_eq!(
+            operation_metrics.get("numFiles"),
+            Some(&Some("1".to_string()))
+        );
+        assert_eq!(
+            operation_metrics.get("numOutputRows"),
+            Some(&Some("2".to_string()))
+        );
+
+        let commit = commit_iter.next().expect("v=2 commit").unwrap();
+        let commit_info = single_commit_info_batch(&commit, engine.as_ref());
+        let operation_metrics = commit_info
+            .column_by_name("operationMetrics")
+            .expect("commitInfo.operationMetrics column")
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("operationMetrics should be a map");
+        assert!(
+            operation_metrics.is_null(0),
+            "absent operationMetrics should project as a null map"
+        );
+
+        let commit = commit_iter.next().expect("v=3 commit").unwrap();
+        let commit_info = single_commit_info_batch(&commit, engine.as_ref());
+        let operation_metrics = commit_info
+            .column_by_name("operationMetrics")
+            .expect("commitInfo.operationMetrics column")
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("operationMetrics should be a map");
+        assert!(
+            operation_metrics.is_null(0),
+            "explicit null operationMetrics should project as a null map"
+        );
+        assert!(commit_iter.next().is_none(), "four-commit range");
+    }
+
+    fn single_commit_info_batch(
+        commit: &CommitAction,
+        engine: &dyn Engine,
+    ) -> crate::arrow::array::StructArray {
+        let mut batches = commit.get_actions(engine).unwrap();
+        let record_batch = batches
+            .next()
+            .expect("commit action batch")
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+        assert!(batches.next().is_none(), "single-line commit has one batch");
+        record_batch
+            .column_by_name("commitInfo")
+            .expect("commitInfo column")
+            .as_struct_opt()
+            .expect("commitInfo should be a struct")
+            .clone()
+    }
+
+    fn commit_info_map(
+        commit_info: &crate::arrow::array::StructArray,
+        field_name: &str,
+    ) -> HashMap<String, Option<String>> {
+        let map = commit_info
+            .column_by_name(field_name)
+            .unwrap_or_else(|| panic!("commitInfo.{field_name} column"))
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap_or_else(|| panic!("{field_name} should be a map"));
+        let entries = map.value(0);
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("{field_name} keys should be strings"));
+        let values = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("{field_name} values should be strings"));
+
+        (0..entries.len())
+            .map(|idx| {
+                let value = if values.is_null(idx) {
+                    None
+                } else {
+                    Some(values.value(idx).to_string())
+                };
+                (keys.value(idx).to_string(), value)
+            })
+            .collect()
     }
 
     /// Build an in-memory engine pre-loaded with `commits` (each `(version, body)` pair becomes
