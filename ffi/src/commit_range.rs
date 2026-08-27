@@ -590,7 +590,7 @@ mod tests {
             ))
         };
         let result = unsafe { commit_range_builder_build(builder) };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, KernelError::MissingVersionError, None);
 
         unsafe { free_engine(engine) }
         Ok(())
