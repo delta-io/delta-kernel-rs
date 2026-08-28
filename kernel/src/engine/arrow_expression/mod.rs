@@ -246,6 +246,8 @@ impl ArrayData {
 #[derive(Debug)]
 pub struct ArrowEvaluationHandler;
 
+// TODO(#3210): Align expression analysis and evaluation with Kernel's standard expression
+// contract.
 impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_expression_evaluator(
         &self,

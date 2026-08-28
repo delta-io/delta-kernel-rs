@@ -18,7 +18,9 @@ Failure to find a permitted type is an analysis error.
 
 Kernel does not implicitly parse `STRING` as a number or Boolean. For example, `long_col + '1'`,
 `long_col = '1'`, and `COALESCE(long_col, '0')` are outside the contract. An evaluator may accept
-such expressions as an extension, but their behavior is not portable.
+such expressions as an extension, but their behavior is not portable. Conformance fixtures mark
+these inputs as extension boundaries: rejection is valid, but acceptance is not a conformance
+failure and does not give the result portable semantics.
 
 `VOID` is the type of an untyped null. `VOID` and `T` have common type `T`; inputs that are all
 `VOID` retain that type. Identical scalar types have themselves as their common type. The following

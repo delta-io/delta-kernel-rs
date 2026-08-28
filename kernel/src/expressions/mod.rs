@@ -32,7 +32,10 @@ mod sql;
 pub(crate) use self::sql::parse_sql;
 
 #[doc = include_str!("semantics.md")]
-pub mod semantics {}
+pub mod semantics {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub mod conformance;
+}
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
