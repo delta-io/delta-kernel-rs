@@ -2,7 +2,6 @@
 //! leaf (file actions inline, including multi-part), or manifest (which references sidecar files).
 //! When stats are requested, also reports whether the checkpoint has compatible parsed stats.
 //! Driven through a [`PlanExecutor`].
-
 // No in-crate caller yet; following PRs will use this.
 #![allow(dead_code)]
 
@@ -82,7 +81,12 @@ impl CheckpointShape {
                 // The `sidecar` column may still be all-null (not a manifest), so scan it to
                 // confirm whether a sidecar is actually present.
                 match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
-                    Some(sidecar) => Self::try_new_manifest(exec, sidecar, stats_schema),
+                    Some(sidecar) => Self::try_new_manifest(
+                        exec,
+                        sidecar,
+                        stats_schema,
+                        segment.checkpoint_hint_sidecar_file_schema(),
+                    ),
                     None => Ok(Self::try_new_leaf(Some(cp_schema), stats_schema)),
                 }
             }
@@ -91,7 +95,12 @@ impl CheckpointShape {
             // hence no parsed stats.
             FileType::Json => {
                 match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
-                    Some(sidecar) => Self::try_new_manifest(exec, sidecar, stats_schema),
+                    Some(sidecar) => Self::try_new_manifest(
+                        exec,
+                        sidecar,
+                        stats_schema,
+                        segment.checkpoint_hint_sidecar_file_schema(),
+                    ),
                     None => Ok(Self::try_new_leaf(None, stats_schema)),
                 }
             }
@@ -113,7 +122,12 @@ impl CheckpointShape {
         match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
             Some([sidecar, ..]) => {
                 let sidecar_meta = sidecar.to_filemeta(&segment.log_root)?;
-                let result = Self::try_new_manifest(exec, sidecar_meta, stats_schema)?;
+                let result = Self::try_new_manifest(
+                    exec,
+                    sidecar_meta,
+                    stats_schema,
+                    segment.checkpoint_hint_sidecar_file_schema(),
+                )?;
                 Ok(Some(result))
             }
             Some([]) => {
@@ -135,18 +149,29 @@ impl CheckpointShape {
     }
 
     /// Build the shape for a manifest checkpoint. Its file actions and their stats live in the
-    /// sidecars, so probe a sidecar's (parquet) footer -- but only when stats were requested. All
-    /// sidecars of a checkpoint share one schema, so probing the first is sufficient.
+    /// sidecars, so we need a sidecar's schema to answer the stats-compatibility question -- but
+    /// only when stats were requested. All sidecars of a checkpoint share one schema, so any one is
+    /// sufficient.
+    ///
+    /// If the `_last_checkpoint` hint carries a `sidecarFileSchema`, we can use it directly.
+    /// Otherwise we must read the sidecar's footer to get the schema.
     fn try_new_manifest(
         exec: &dyn PlanExecutor,
         sidecar: FileMeta,
         stats_schema: Option<&SchemaRef>,
+        hint_sidecar_schema: Option<SchemaRef>,
     ) -> DeltaResult<CheckpointShape> {
         let parsed_stats_schema = match stats_schema {
             Some(stats_schema) => {
-                let footer_schema = exec.read_parquet_footer(sidecar)?.schema;
-                LogSegment::schema_has_compatible_stats_parsed(footer_schema.as_ref(), stats_schema)
-                    .then(|| stats_schema.clone())
+                let sidecar_schema = match hint_sidecar_schema {
+                    Some(schema) => schema,
+                    None => exec.read_parquet_footer(sidecar)?.schema,
+                };
+                LogSegment::schema_has_compatible_stats_parsed(
+                    sidecar_schema.as_ref(),
+                    stats_schema,
+                )
+                .then(|| stats_schema.clone())
             }
             None => None,
         };
@@ -211,11 +236,16 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS};
+    use crate::actions::{
+        CheckpointMetadata, Sidecar, ADD_NAME, MAX_VALUES, MIN_VALUES, NUM_RECORDS,
+        SIDECAR_FILE_SCHEMA_TAG, STATS_PARSED,
+    };
     use crate::engine::sync::plan::SyncPlanExecutor;
+    use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
+    use crate::log_segment_files::LogSegmentFiles;
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{schema, schema_ref};
-    use crate::unit_test_utils::load_test_table;
+    use crate::unit_test_utils::{create_log_path, create_log_path_with_size, load_test_table};
 
     /// Counts ops by kind and delegates to `SyncPlanExecutor`, to assert which I/O the fast path
     /// performs.
@@ -400,10 +430,6 @@ mod tests {
     /// empty sidecar list, so this synthetic segment is the only way to exercise the leaf fast
     /// path.
     fn segment_with_empty_sidecars_hint(extension: &str) -> LogSegment {
-        use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
-        use crate::log_segment_files::LogSegmentFiles;
-        use crate::unit_test_utils::{create_log_path, create_log_path_with_size};
-
         let (_store, log_root) = crate::checkpoint::tests::new_in_memory_store();
         let selected = format!(
             "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.{extension}"
@@ -479,6 +505,155 @@ mod tests {
         assert_eq!(
             exec.footer_reads.load(Ordering::Relaxed),
             expected_footer_reads
+        );
+    }
+
+    /// Builds a segment whose applicable hint lists one sidecar and carries a `checkpointMetadata`
+    /// action with a synthetic `sidecarFileSchema` tag, exercising the footer-read short-circuit.
+    /// When `compatible`, the tagged schema's `add.stats_parsed` matches [`probe_stats_schema`];
+    /// otherwise `add` has no `stats_parsed` field at all, so the compatibility check fails.
+    fn segment_with_manifest_hint(extension: &str, compatible: bool) -> LogSegment {
+        let columns = || schema! { nullable "id": LONG, nullable "value": STRING };
+        let stats_parsed = schema! {
+            nullable NUM_RECORDS: LONG,
+            nullable MIN_VALUES: (columns()),
+            nullable MAX_VALUES: (columns()),
+        };
+        let add = if compatible {
+            schema! { nullable STATS_PARSED: (stats_parsed) }
+        } else {
+            schema! { nullable "path": STRING }
+        };
+        let sidecar_file_schema =
+            serde_json::to_string(&schema! { nullable ADD_NAME: (add) }).unwrap();
+        let tags = std::collections::HashMap::from([(
+            SIDECAR_FILE_SCHEMA_TAG.to_string(),
+            sidecar_file_schema,
+        )]);
+
+        let (_store, log_root) = crate::checkpoint::tests::new_in_memory_store();
+        let selected = format!(
+            "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.{extension}"
+        );
+        let checkpoint_file = log_root.join(&selected).unwrap().to_string();
+        let commit = create_log_path(log_root.join("00000000000000000002.json").unwrap().as_str());
+        LogSegment::try_new(
+            LogSegmentFiles {
+                checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
+                ascending_commit_files: vec![commit.clone()],
+                latest_commit_file: Some(commit),
+                ..Default::default()
+            },
+            log_root,
+            None,
+            Some(LastCheckpointHint {
+                version: 1,
+                v2_checkpoint: Some(LastCheckpointV2 {
+                    path: selected,
+                    sidecar_files: Some(vec![Sidecar {
+                        path: "sidecar-1.parquet".to_string(),
+                        size_in_bytes: 1,
+                        modification_time: 0,
+                        tags: None,
+                    }]),
+                    non_file_actions: Some(vec![HintAction::CheckpointMetadata(
+                        CheckpointMetadata {
+                            version: 1,
+                            tags: Some(tags),
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+    }
+
+    /// A manifest hint carrying a `sidecarFileSchema` answers the stats-compatibility question from
+    /// the hint alone: the checkpoint classifies as a manifest, parsed stats are reported per the
+    /// hint schema's compatibility, and no sidecar footer is read (nor is the checkpoint drained).
+    #[rstest]
+    #[case::compatible_parquet("parquet", true, true)]
+    #[case::compatible_json("json", true, true)]
+    #[case::incompatible_parquet("parquet", false, false)]
+    #[case::incompatible_json("json", false, false)]
+    fn manifest_hint_sidecar_file_schema_skips_footer_read(
+        #[case] extension: &str,
+        #[case] compatible: bool,
+        #[case] expect_parsed: bool,
+    ) {
+        let segment = segment_with_manifest_hint(extension, compatible);
+        let root = &segment.listed.checkpoint_parts[0].location;
+        let file_type = match extension {
+            "json" => FileType::Json,
+            _ => FileType::Parquet,
+        };
+        let stats_schema = probe_stats_schema();
+        let exec = CountingExecutor::new();
+
+        let shape = CheckpointShape::from_v2_checkpoint_hint(
+            &exec,
+            &segment,
+            root,
+            file_type,
+            Some(&stats_schema),
+        )
+        .unwrap()
+        .expect("a sidecar-listing hint must classify as a manifest");
+
+        assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
+        assert_eq!(shape.parsed_stats_schema.is_some(), expect_parsed);
+        if expect_parsed {
+            assert_eq!(shape.parsed_stats_schema.as_ref(), Some(&stats_schema));
+        }
+        assert_eq!(
+            exec.footer_reads.load(Ordering::Relaxed),
+            0,
+            "sidecarFileSchema hint must skip the sidecar footer read"
+        );
+        assert_eq!(
+            exec.query_scans.load(Ordering::Relaxed),
+            0,
+            "the hint fast path must not drain the checkpoint"
+        );
+    }
+
+    /// The hint schema must yield the same stats-compatibility verdict as reading the sidecar's
+    /// actual parquet footer, so substituting it is behavior-preserving. Uses a real table whose
+    /// parquet sidecars carry compatible struct stats.
+    #[test]
+    fn manifest_hint_schema_matches_footer_read_result() {
+        let (_engine, snapshot, _tempdir) =
+            load_test_table("v2-parquet-sidecars-struct-stats-only").unwrap();
+        let exec = SyncPlanExecutor::default();
+        let stats_schema = probe_stats_schema();
+        let segment = snapshot.log_segment();
+
+        // Full resolution reads the sidecar footer to answer compatibility.
+        let footer_shape =
+            CheckpointShape::try_new(&exec, snapshot.as_ref(), Some(&stats_schema)).unwrap();
+        assert_eq!(footer_shape.checkpoint_type, CheckpointType::Manifest);
+
+        // Read that same footer schema ourselves and feed it as the hint schema.
+        let sidecar = segment
+            .checkpoint_hint_sidecars()
+            .and_then(|s| s.first())
+            .expect("table's hint lists sidecars")
+            .to_filemeta(&segment.log_root)
+            .unwrap();
+        let footer_schema = exec.read_parquet_footer(sidecar.clone()).unwrap().schema;
+        let hinted = CheckpointShape::try_new_manifest(
+            &exec,
+            sidecar,
+            Some(&stats_schema),
+            Some(footer_schema),
+        )
+        .unwrap();
+
+        assert_eq!(
+            hinted.parsed_stats_schema, footer_shape.parsed_stats_schema,
+            "hint-schema verdict must match the footer-read verdict"
         );
     }
 }
