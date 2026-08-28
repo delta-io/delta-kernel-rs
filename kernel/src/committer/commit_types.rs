@@ -215,7 +215,7 @@ impl CommitMetadata {
 
     /// Returns the effective protocol for this commit. Prefers new_protocol (create-table / ALTER
     /// TABLE), falling back to the read snapshot's protocol.
-    pub(crate) fn effective_protocol(&self) -> DeltaResult<&Protocol> {
+    pub fn effective_protocol(&self) -> DeltaResult<&Protocol> {
         let pm = &self.protocol_metadata;
         pm.new_protocol
             .as_ref()
@@ -229,7 +229,7 @@ impl CommitMetadata {
 
     /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
     /// TABLE), falling back to the read snapshot's metadata.
-    pub(crate) fn effective_metadata(&self) -> DeltaResult<&Metadata> {
+    pub fn effective_metadata(&self) -> DeltaResult<&Metadata> {
         let pm = &self.protocol_metadata;
         pm.new_metadata
             .as_ref()
@@ -452,5 +452,23 @@ mod tests {
         assert!(protocol_metadata.read_metadata().is_some());
         assert!(protocol_metadata.new_protocol().is_some());
         assert!(protocol_metadata.new_metadata().is_some());
+
+        let commit_metadata = CommitMetadata::new(
+            LogRoot::new(Url::parse("s3://my-bucket/path/to/table/").unwrap()).unwrap(),
+            1,
+            CommitType::PathBasedWrite,
+            0,
+            Some(0),
+            protocol_metadata,
+            vec![],
+        );
+        assert!(std::ptr::eq(
+            commit_metadata.effective_protocol().unwrap(),
+            commit_metadata.protocol_metadata().new_protocol().unwrap()
+        ));
+        assert!(std::ptr::eq(
+            commit_metadata.effective_metadata().unwrap(),
+            commit_metadata.protocol_metadata().new_metadata().unwrap()
+        ));
     }
 }

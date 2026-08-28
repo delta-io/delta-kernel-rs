@@ -322,8 +322,7 @@ impl Default for Format {
     Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData,
 )]
 #[serde(rename_all = "camelCase")]
-#[internal_api]
-pub(crate) struct Metadata {
+pub struct Metadata {
     /// Unique identifier for this table
     id: String,
     /// User-provided identifier for this table
@@ -564,10 +563,9 @@ impl IntoEngineData for Metadata {
 // validated by `try_new`, like the JSON-replay path. Otherwise a CRC file could load a malformed
 // feature shape that log replay would reject.
 #[serde(rename_all = "camelCase", try_from = "ProtocolRaw")]
-#[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
-pub(crate) struct Protocol {
+pub struct Protocol {
     /// The minimum version of the Delta read protocol that a client must implement
     /// in order to correctly read this table
     min_reader_version: i32,
@@ -1523,8 +1521,7 @@ pub(crate) struct CheckpointMetadata {
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, IntoEngineData,
 )]
-#[internal_api]
-pub(crate) struct DomainMetadata {
+pub struct DomainMetadata {
     domain: String,
     configuration: String,
     removed: bool,
@@ -1557,18 +1554,16 @@ impl DomainMetadata {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
     }
 
-    #[internal_api]
-    pub(crate) fn domain(&self) -> &str {
+    pub fn domain(&self) -> &str {
         &self.domain
     }
 
-    #[internal_api]
-    pub(crate) fn configuration(&self) -> &str {
+    pub fn configuration(&self) -> &str {
         &self.configuration
     }
 
     /// Returns `true` if this action is a tombstone (marking domain removal).
-    pub(crate) fn is_removed(&self) -> bool {
+    pub fn is_removed(&self) -> bool {
         self.removed
     }
 }
