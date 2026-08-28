@@ -3,6 +3,7 @@ name: test-coverage-reviewer
 description: 'Assesses whether tests cover new/changed logic paths.'
 executor:
   type: omnigent
+  model: default
   config:
     harness: claude-sdk
 prompt: |
