@@ -7,17 +7,37 @@
 
 ### 🏗️ Breaking changes
 
-1. Simpler parquet masking ([#2879])
-2. Use lit, define and use null_lit, remove redundant helpers ([#3135])
-3. Emit geometry/geography over the FFI schema visitor ([#3113])
-4. Pass column field parts as a structured array over the FFI ([#3111])
-5. Add imperative distributed writes ([#3089])
-6. Add AMT stats schema generation ([#3091])
-7. Reduce write-path allocation churn ([#3166])
-8. Fix ScanMetrics parity with java kernel ([#3169])
-9. Remove write context apis on transaction ([#3151])
-10. Preserve outer-list nullability on column reorder ([#3170])
-11. Prototype AI PR review workflow ([#3096])
+1. Replace NULL-literal helper methods ([#3135])
+   - `Expression::null_literal(data_type)` and `Predicate::null_literal()` are removed. Use
+     `null_lit(data_type)` and `Predicate::NULL`, respectively.
+2. Add geospatial callbacks to the FFI schema visitor ([#3113])
+   - `EngineSchemaVisitor` gains required `visit_geometry` and `visit_geography` callbacks,
+     changing its C struct layout. Rebuild bindings and initialize both callbacks; geography also
+     receives the edge-interpolation algorithm.
+3. Pass structured column paths across the FFI ([#3111])
+   - `visit_expression_column` and `EngineExpressionVisitor::visit_column` now take
+     `(parts, parts_len)` instead of one dot-joined string. Regenerate bindings and pass one
+     non-empty `KernelStringSlice` per path component.
+4. Reshape write-context APIs ([#3089], [#3151])
+   - `WriteContext` is renamed to `BoundWriteContext`, and context creation moves from
+     `Transaction` to `WriteState`. Call `transaction.write_state()?` once, then create
+     partitioned or unpartitioned contexts from that state.
+5. Make cancellation tokens downcastable ([#3155])
+   - `CancellationToken` now extends `AsAny`, requiring implementations to be `'static`.
+     Existing owned tokens need no changes; implementations borrowing non-static data must own
+     that state instead.
+6. Rename and redefine scan metadata metrics ([#3169])
+   - `num_remove_files_seen`, `num_active_add_files`, and `active_add_files_bytes` become
+     `num_remove_files_seen_from_delta_files`, `num_selected_add_files`, and
+     `selected_add_files_bytes`. `num_add_files_seen` now counts replay-input Adds before
+     filtering and deduplication. The FFI struct layout also changes.
+7. Return serialized sizes from JSON writes ([#3063])
+   - `JsonHandler::write_json_file` now returns `DeltaResult<FileSize>` instead of
+     `DeltaResult<()>`. Custom engines must return the exact number of serialized bytes written.
+8. Change projected commit-info maps ([#3168], [#3190])
+   - `CommitRange` projections add `operationMetrics`, and values in both operation maps are now
+     nullable. `Transaction::with_commit_info` also overrides `operationMetrics`, so an
+     engine-supplied value with that name is no longer persisted.
 
 ### 🚀 Features / new APIs
 
@@ -26,24 +46,23 @@
 3. Expose FileStats histogram over FFI ([#3115])
 4. Allow delta.checkpointPolicy in CREATE TABLE ([#3145])
 5. Re-export UC wire models from unity-catalog-delta-rest-client ([#3143])
-6. Make CancellationToken downcastable to recover the caller's token ([#3155])
-7. Allow round tripping checkpoint actions  ([#3093])
+6. Allow round tripping checkpoint actions  ([#3093])
+7. Generate AMT statistics schemas ([#3091])
 8. Allow create table with variant/variantShredding feature ([#3177])
 9. Add cancellation-aware StorageHandler list and read ([#3156])
 10. Introduce plan and scalar + filter operator conversion ([#3079])
 11. Lower project operator ([#3094])
 12. Implement aggregator operator ([#3102])
+13. Support type-widening writes ([#3183])
 
 ### 🐛 Bug Fixes
 
 1. Allow incremental CRC replay for streaming updates ([#3132])
-2. Report exact JSON write sizes ([#3063])
-3. Silence no-default internal dead-code warnings ([#3140])
-4. Block dv + addFile + dataChange txn when cdf enabled ([#3068])
-5. Check read/write support before writing checkpoint/checksum ([#3138])
-6. Omit recursive for REST offset listings ([#3161])
-7. Allow nullable commit info operation parameters ([#3168])
-8. Expose commit info operation metrics ([#3190])
+2. Silence no-default internal dead-code warnings ([#3140])
+3. Block dv + addFile + dataChange txn when cdf enabled ([#3068])
+4. Check read/write support before writing checkpoint/checksum ([#3138])
+5. Omit recursive for REST offset listings ([#3161])
+6. Preserve outer-list nullability on column reorder ([#3170])
 
 ### 📚 Documentation
 
@@ -53,20 +72,26 @@
 4. Cross-cloud testing for engine changes ([#3172])
 5. Document connector-native plan results ([#3182])
 
+### ⚡ Performance
+
+1. Reduce write-path allocation churn ([#3166])
+
 ### 🚜 Refactor
 
-1. Use schema macros for declarative schemas ([#3127])
-2. Use explicit StructField nullability constructors ([#3139])
-3. *(test)* Add TableConfigBuilder to simplify unit test boilerplate ([#3134])
-4. Remove cm witness in create table ([#3180])
+1. Simplify parquet masking ([#2879])
+2. Use schema macros for declarative schemas ([#3127])
+3. Use explicit StructField nullability constructors ([#3139])
+4. *(test)* Add TableConfigBuilder to simplify unit test boilerplate ([#3134])
+5. Remove cm witness in create table ([#3180])
 
 ### ⚙️ Chores/CI
 
 1. Isolate kernel no-default-features check ([#3124])
 2. Clean up no-default check aliases ([#3141])
 3. Fix new warnings from clippy upgrade ([#3164])
-4. Prevent semver tool failures from adding breaking-change labels ([#3186])
-5. Install AI reviewer CLIs ([#3187])
+4. Prototype an opt-in AI pull-request review workflow ([#3096])
+5. Prevent semver tool failures from adding breaking-change labels ([#3186])
+6. Install AI reviewer CLIs ([#3187])
 
 
 [#3124]: https://github.com/delta-io/delta-kernel-rs/pull/3124
@@ -114,6 +139,7 @@
 [#3190]: https://github.com/delta-io/delta-kernel-rs/pull/3190
 [#3094]: https://github.com/delta-io/delta-kernel-rs/pull/3094
 [#3102]: https://github.com/delta-io/delta-kernel-rs/pull/3102
+[#3183]: https://github.com/delta-io/delta-kernel-rs/pull/3183
 
 
 
