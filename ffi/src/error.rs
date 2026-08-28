@@ -73,8 +73,8 @@ pub enum KernelError {
     RowTrackingChangeFeedUnsupported = 44,
     CancelledError = 45,
     InvalidTransactionStateError = 46,
-    /// The selected log files violate their declared kinds, ordering, or version bounds.
     InvalidLogSegment = 47,
+    UnpublishedVersionError = 48,
 }
 
 impl From<Error> for KernelError {
@@ -103,7 +103,8 @@ impl From<Error> for KernelError {
             Error::MissingColumn(_) => KernelError::MissingColumnError,
             Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
             Error::MissingData(_) => KernelError::MissingDataError,
-            Error::MissingVersion(_) => KernelError::MissingVersionError,
+            Error::EmptyLog | Error::MissingVersion(_) => KernelError::MissingVersionError,
+            Error::UnpublishedVersion(_) => KernelError::UnpublishedVersionError,
             Error::DeletionVector(_) => KernelError::DeletionVectorError,
             Error::InvalidUrl(_) => KernelError::InvalidUrlError,
             Error::MalformedJson(_) => KernelError::MalformedJsonError,
@@ -325,7 +326,7 @@ impl From<EngineExecError> for Error {
             KernelError::SchemaError => Error::Schema(message),
             KernelError::InvalidTransactionStateError => Error::InvalidTransactionState(message),
             code @ KernelError::MissingVersionError => {
-                messageless_error(code, message, Error::MissingVersion(None))
+                messageless_error(code, message, Error::EmptyLog)
             }
             code @ KernelError::MissingMetadataError => {
                 messageless_error(code, message, Error::MissingMetadata)
@@ -357,7 +358,8 @@ impl From<EngineExecError> for Error {
             | KernelError::ChangeDataFeedIncompatibleSchema
             | KernelError::RowTrackingChangeFeedUnsupported
             | KernelError::LiteralExpressionTransformError
-            | KernelError::LogHistoryError) => {
+            | KernelError::LogHistoryError
+            | KernelError::UnpublishedVersionError) => {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
             }
             #[cfg(feature = "default-engine-base")]
@@ -387,7 +389,7 @@ mod error_code_tests {
 
     #[test]
     fn log_segment_errors_have_stable_ffi_mappings() {
-        let missing_version = Error::MissingVersion(Some(7));
+        let missing_version = Error::MissingVersion(7);
         assert_eq!(
             missing_version.to_string(),
             "Table version 7 is missing or unavailable for this log operation."
@@ -397,10 +399,19 @@ mod error_code_tests {
             KernelError::MissingVersionError
         );
         assert_eq!(
+            KernelError::from(Error::EmptyLog),
+            KernelError::MissingVersionError
+        );
+        assert_eq!(
+            KernelError::from(Error::UnpublishedVersion(7)),
+            KernelError::UnpublishedVersionError
+        );
+        assert_eq!(
             KernelError::from(Error::InvalidLogSegment("invalid".to_string())),
             KernelError::InvalidLogSegment
         );
         assert_eq!(KernelError::InvalidLogSegment as i32, 47);
+        assert_eq!(KernelError::UnpublishedVersionError as i32, 48);
     }
 }
 
@@ -415,9 +426,8 @@ mod tests {
         EngineExecError { etype, message }
     }
 
-    /// Each code should translate into its matching kernel error variant (preserving the message),
-    /// payloads unavailable through FFI drop the message, and unmapped codes fall back to a generic
-    /// error that retains both the original code and message.
+    /// Variants that cannot preserve their original message across FFI reconstruct from their
+    /// default `Display`; unmapped codes retain the original code and message.
     #[rstest]
     #[case::file_not_found(KernelError::FileNotFoundError, "File not found: boom")]
     #[case::schema(KernelError::SchemaError, "Schema error: boom")]
@@ -436,6 +446,10 @@ mod tests {
     #[case::fallback_row_tracking(
         KernelError::RowTrackingChangeFeedUnsupported,
         "Generic delta kernel error: engine execution error (RowTrackingChangeFeedUnsupported): boom"
+    )]
+    #[case::fallback_unpublished_version(
+        KernelError::UnpublishedVersionError,
+        "Generic delta kernel error: engine execution error (UnpublishedVersionError): boom"
     )]
     fn engine_exec_error_maps_kernel_error_code(
         #[case] etype: KernelError,

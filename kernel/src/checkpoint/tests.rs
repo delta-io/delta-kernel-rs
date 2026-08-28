@@ -646,7 +646,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::Error::MissingVersion(Some(1))
+        crate::Error::UnpublishedVersion(1)
     ));
     Ok(())
 }
