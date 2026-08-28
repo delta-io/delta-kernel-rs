@@ -1067,16 +1067,18 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
     Ok(())
 }
 
-/// Caller-supplied column-mapping metadata is removed before mode-specific handling. Mapping modes
-/// assign fresh metadata, while `None` mode leaves the added field unannotated.
+/// The ALTER strip is `None`-mode-only. Adding a column with pre-populated column-mapping metadata
+/// preserves it when mapping is enabled (`id` / `name`, delta-spark's
+/// `assignColumnIdAndPhysicalName` keeps existing ids) and strips it only in `None` mode.
 #[rstest]
-#[case::none(ColumnMappingMode::None, &[])]
-#[case::id(ColumnMappingMode::Id, &[("delta.columnMapping.mode", "id")])]
-#[case::name(ColumnMappingMode::Name, &[("delta.columnMapping.mode", "name")])]
+#[case::none(ColumnMappingMode::None, &[], false)]
+#[case::id(ColumnMappingMode::Id, &[("delta.columnMapping.mode", "id")], true)]
+#[case::name(ColumnMappingMode::Name, &[("delta.columnMapping.mode", "name")], true)]
 #[tokio::test]
-async fn add_column_replaces_supplied_cm_metadata_in_all_modes(
+async fn add_column_strip_is_none_mode_only(
     #[case] expected_mode: ColumnMappingMode,
     #[case] properties: &[(&str, &str)],
+    #[case] annotation_kept: bool,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
@@ -1086,6 +1088,7 @@ async fn add_column_replaces_supplied_cm_metadata_in_all_modes(
         expected_mode
     );
 
+    // A well-formed id+physicalName pair so enabled modes have valid metadata to preserve.
     let field = fixtures::cm_field("added", 99, "phys-added", DataType::STRING);
     snapshot
         .alter_table()
@@ -1096,18 +1099,11 @@ async fn add_column_replaces_supplied_cm_metadata_in_all_modes(
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let added = reloaded.schema().field("added").unwrap().clone();
-    match expected_mode {
-        ColumnMappingMode::None => {
-            assert!(added.column_mapping_id().is_none());
-            assert!(added
-                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-                .is_none());
-        }
-        ColumnMappingMode::Id | ColumnMappingMode::Name => {
-            assert_ne!(added.column_mapping_id(), Some(99));
-            assert_ne!(physical_name_for_field(&added), "phys-added");
-        }
-    }
+    assert_eq!(
+        added.column_mapping_id().is_some(),
+        annotation_kept,
+        "column mapping id under {expected_mode:?} mode"
+    );
     Ok(())
 }
 
@@ -1201,7 +1197,9 @@ async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dy
 }
 
 // ============================================================================
-// ALTER TABLE ADD COLUMN replaces pre-populated column mapping metadata.
+// ALTER TABLE ADD COLUMN preserves / fills pre-populated column mapping metadata
+// (delta-spark parity per `DeltaColumnMapping.assignColumnIdAndPhysicalName`).
+// See https://github.com/delta-io/delta-kernel-rs/issues/2377.
 // ============================================================================
 
 fn cm_id_for_field(field: &StructField) -> i64 {
@@ -1217,10 +1215,12 @@ fn physical_name_for_field(field: &StructField) -> &str {
     }
 }
 
-/// ADD COLUMN replaces a supplied column-mapping ID and physical name with a fresh identity.
+/// ADD COLUMN with both `delta.columnMapping.id` and `delta.columnMapping.physicalName`
+/// pre-populated: the connector-supplied metadata is preserved verbatim. `maxColumnId`
+/// advances to the supplied id when it exceeds the existing max.
 #[rstest]
 #[tokio::test]
-async fn add_column_replaces_complete_cm_metadata(
+async fn add_column_preserves_complete_cm_metadata(
     #[values("name", "id")] cm_mode: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -1232,9 +1232,10 @@ async fn add_column_replaces_complete_cm_metadata(
     )?;
     let original_max = max_column_id(&snapshot).expect("CM table must have maxColumnId");
 
+    // Supplied id is well above the table's max so we can verify maxColumnId follows it.
     let supplied_id = original_max + 100;
     let field = fixtures::cm_field(
-        "replaced",
+        "preserved",
         supplied_id,
         "user-supplied-physical",
         DataType::STRING,
@@ -1249,21 +1250,22 @@ async fn add_column_replaces_complete_cm_metadata(
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let schema = reloaded.schema();
-    let added = schema.field("replaced").unwrap();
-    assert_eq!(cm_id_for_field(added), original_max + 1);
-    assert_ne!(physical_name_for_field(added), "user-supplied-physical");
-    assert!(physical_name_for_field(added).starts_with("col-"));
+    let added = schema.field("preserved").unwrap();
+    assert_eq!(cm_id_for_field(added), supplied_id);
+    assert_eq!(physical_name_for_field(added), "user-supplied-physical");
     assert_eq!(
         max_column_id(&reloaded).expect("CM table must have maxColumnId"),
-        original_max + 1
+        supplied_id
     );
     Ok(())
 }
 
-/// ADD COLUMN replaces a supplied physical name and allocates a fresh ID.
+/// ADD COLUMN with only `delta.columnMapping.physicalName` supplied: kernel allocates
+/// `id = old maxColumnId + 1`, preserves the user-provided physical name, and bumps
+/// `maxColumnId` to the new id.
 #[rstest]
 #[tokio::test]
-async fn add_column_replaces_supplied_physical_name(
+async fn add_column_with_only_physical_name_allocates_id(
     #[values("name", "id")] cm_mode: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -1289,8 +1291,7 @@ async fn add_column_replaces_supplied_physical_name(
     let schema = reloaded.schema();
     let added = schema.field("named_only").unwrap();
     assert_eq!(cm_id_for_field(added), original_max + 1);
-    assert_ne!(physical_name_for_field(added), "phys-named-only");
-    assert!(physical_name_for_field(added).starts_with("col-"));
+    assert_eq!(physical_name_for_field(added), "phys-named-only");
     assert_eq!(
         max_column_id(&reloaded).expect("CM table must have maxColumnId"),
         original_max + 1
@@ -1298,10 +1299,13 @@ async fn add_column_replaces_supplied_physical_name(
     Ok(())
 }
 
-/// ADD COLUMN replaces a supplied ID and allocates a fresh physical name.
+/// ADD COLUMN with only `delta.columnMapping.id` supplied: id is preserved, missing
+/// `physicalName` is filled with `col-<uuid>`.
 #[rstest]
 #[tokio::test]
-async fn add_column_replaces_supplied_id(#[values("name", "id")] cm_mode: &str) -> DeltaResult<()> {
+async fn add_column_with_only_id_fills_physical_name(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -1324,23 +1328,25 @@ async fn add_column_replaces_supplied_id(#[values("name", "id")] cm_mode: &str) 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let schema = reloaded.schema();
     let added = schema.field("id_only").unwrap();
-    assert_eq!(cm_id_for_field(added), original_max + 1);
-    assert_ne!(cm_id_for_field(added), supplied_id);
+    assert_eq!(cm_id_for_field(added), supplied_id);
     assert!(
         physical_name_for_field(added).starts_with("col-"),
-        "physical name should be allocated as col-<uuid>, got {}",
+        "physical name should be filled with col-<uuid>, got {}",
         physical_name_for_field(added)
     );
     assert_eq!(
         max_column_id(&reloaded).expect("CM table must have maxColumnId"),
-        original_max + 1
+        supplied_id
     );
     Ok(())
 }
 
-/// ADD COLUMN replaces a supplied ID below `maxColumnId` with the next fresh identity.
+/// ADD COLUMN where the supplied `id` is *less than* the existing `maxColumnId` but does
+/// not collide with any existing field's id: succeeds, with the supplied id preserved
+/// verbatim and `maxColumnId` unchanged. Matches delta-spark; diverges from the Java Kernel
+/// proposal in https://github.com/delta-io/delta/pull/4520, which would reject this.
 #[tokio::test]
-async fn add_column_replaces_supplied_id_below_max_column_id() -> DeltaResult<()> {
+async fn add_column_with_id_below_max_column_id_succeeds() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Pre-populate the table with sparse ids (1, 100) using the create-table preserve path.
@@ -1359,6 +1365,7 @@ async fn add_column_replaces_supplied_id_below_max_column_id() -> DeltaResult<()
         100
     );
 
+    // Now add a new column with id=50, which is well below maxColumnId=100 and not used.
     let field = fixtures::cm_field("inserted_below_max", 50, "phys-inserted", DataType::STRING);
 
     snapshot
@@ -1371,19 +1378,21 @@ async fn add_column_replaces_supplied_id_below_max_column_id() -> DeltaResult<()
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let schema = reloaded.schema();
     let added = schema.field("inserted_below_max").unwrap();
-    assert_eq!(cm_id_for_field(added), 101);
-    assert_ne!(physical_name_for_field(added), "phys-inserted");
-    assert!(physical_name_for_field(added).starts_with("col-"));
+    assert_eq!(cm_id_for_field(added), 50);
+    assert_eq!(physical_name_for_field(added), "phys-inserted");
+    // maxColumnId stays at 100 because the supplied id (50) didn't exceed it.
     assert_eq!(
         max_column_id(&reloaded).expect("CM table must have maxColumnId"),
-        101
+        100
     );
     Ok(())
 }
 
-/// ADD COLUMN replaces a supplied ID that collides with an existing field's identity.
+/// ADD COLUMN where the supplied `id` collides with an existing field's id: fails. The
+/// duplicate-id check happens when the alter builder constructs the new
+/// `TableConfiguration` via `make_physical`.
 #[tokio::test]
-async fn add_column_replaces_supplied_id_colliding_with_existing_field() -> DeltaResult<()> {
+async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -1402,30 +1411,38 @@ async fn add_column_replaces_supplied_id_colliding_with_existing_field() -> Delt
 
     let field = fixtures::cm_field("colliding", existing_id, "phys-colliding", DataType::STRING);
 
-    snapshot
+    let err = snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
-
-    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    let added = reloaded.schema().field("colliding").unwrap().clone();
-    assert_ne!(cm_id_for_field(&added), existing_id);
-    assert_ne!(physical_name_for_field(&added), "phys-colliding");
+        .build(engine.as_ref(), committer())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Duplicate column mapping ID") && err.contains(&existing_id.to_string()),
+        "expected duplicate-id error naming id {existing_id}, got: {err}"
+    );
     Ok(())
 }
 
-/// On a mapping-disabled table with residual column-mapping metadata, ALTER preserves metadata on
-/// existing fields but strips it from newly added fields.
+/// A mapping-disabled table that already carries residual `delta.columnMapping.*` annotations is
+/// left untouched by an ALTER: the pre-existing annotation on `value` survives, and whatever the
+/// added column carries is persisted verbatim -- kernel strips only annotations a commit newly
+/// introduces into a *clean* table, so an already-dirty table is never rewritten (matching
+/// delta-spark). The clean-table strip is covered by
+/// `add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped`.
+///
+/// Cases: adding a clean column (stays clean) and adding a stray-annotated column (annotation
+/// left in place, not stripped).
 #[rstest]
-#[case::clean_column(StructField::nullable("added", DataType::STRING))]
+#[case::clean_column(StructField::nullable("added", DataType::STRING), None)]
 #[case::introduced_stray(
-    field_with_stray_key("added", &ColumnMetadataKey::ColumnMappingId, DataType::STRING)
+    field_with_stray_key("added", &ColumnMetadataKey::ColumnMappingId, DataType::STRING),
+    Some(99)
 )]
 #[tokio::test]
-async fn add_column_on_stale_table_preserves_existing_metadata(
+async fn add_column_on_stale_table_leaves_schema_untouched(
     #[case] added_field: StructField,
+    #[case] expected_added_cm_id: Option<i64>,
 ) -> DeltaResult<()> {
     let (store, engine, table_url) = engine_store_setup("alter_stale_cm", None);
 
@@ -1461,6 +1478,11 @@ async fn add_column_on_stale_table_preserves_existing_metadata(
 
     // The pre-existing annotation on the untouched `value` field survives verbatim.
     assert_eq!(schema.field("value").unwrap().column_mapping_id(), Some(2));
-    assert!(schema.field("added").unwrap().column_mapping_id().is_none());
+    // The added column is persisted verbatim -- clean stays clean, stray annotation is left in
+    // place (not stripped, because the table was already dirty).
+    assert_eq!(
+        schema.field("added").unwrap().column_mapping_id(),
+        expected_added_cm_id
+    );
     Ok(())
 }
