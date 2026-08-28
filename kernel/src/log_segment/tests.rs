@@ -1112,23 +1112,14 @@ async fn test_non_contiguous_log() {
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
-    assert!(matches!(
-        log_segment_res,
-        Err(Error::MissingVersion(Some(1)))
-    ));
+    assert!(matches!(log_segment_res, Err(Error::MissingVersion(1))));
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
-    assert!(matches!(
-        log_segment_res,
-        Err(Error::MissingVersion(Some(1)))
-    ));
+    assert!(matches!(log_segment_res, Err(Error::MissingVersion(1))));
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
-    assert!(matches!(
-        log_segment_res,
-        Err(Error::MissingVersion(Some(1)))
-    ));
+    assert!(matches!(log_segment_res, Err(Error::MissingVersion(1))));
 }
 
 #[tokio::test]
@@ -2488,15 +2479,12 @@ fn test_validate_listed_log_file_invalid_commit_sequence(
 }
 
 #[rstest]
-#[case::latest(None, None)]
-#[case::specific_version(Some(9), Some(0))]
-fn test_validate_empty_log_segment(
-    #[case] end_version: Option<Version>,
-    #[case] expected: Option<Version>,
-) {
+#[case::latest(None)]
+#[case::specific_version(Some(9))]
+fn test_validate_empty_log_segment(#[case] end_version: Option<Version>) {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(LogSegmentFiles::default(), log_root, end_version, None);
-    assert!(matches!(result, Err(Error::MissingVersion(version)) if version == expected));
+    assert!(matches!(result, Err(Error::EmptyLog)));
 }
 
 #[test]
@@ -2514,7 +2502,7 @@ fn test_validate_truncated_log_segment_reports_first_missing_version() {
         Some(4),
         None,
     );
-    assert!(matches!(result, Err(Error::MissingVersion(Some(3)))));
+    assert!(matches!(result, Err(Error::MissingVersion(3))));
 }
 
 #[test]
@@ -2534,7 +2522,7 @@ fn test_validate_checkpoint_commit_gap_reports_first_missing_version() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::MissingVersion(Some(2)))));
+    assert!(matches!(result, Err(Error::MissingVersion(2))));
 }
 
 #[test]
@@ -2927,7 +2915,7 @@ async fn for_timestamp_conversion_no_commit_files() {
 
     let res =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
-    assert!(matches!(res, Err(Error::MissingVersion(Some(0)))));
+    assert!(matches!(res, Err(Error::EmptyLog)));
 }
 
 #[tokio::test]
@@ -3129,7 +3117,7 @@ fn test_log_segment_contiguous_commit_files() {
         None,
         None,
     );
-    assert!(matches!(log_segment, Err(Error::MissingVersion(Some(2)))));
+    assert!(matches!(log_segment, Err(Error::MissingVersion(2))));
 }
 
 /// `checkpoint_sidecars()` distinguishes "the matched hint lists zero sidecars" (`Some(&[])`) from
@@ -3476,6 +3464,42 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
 // ============================================================================
 // max_published_version tests
 // ============================================================================
+
+#[rstest]
+#[case::staged_only(&[], &[0, 1, 2], None, Some(0))]
+#[case::published_prefix(&[0, 1, 2], &[3, 4, 5], None, Some(3))]
+#[case::checkpoint_with_staged_tail(&[], &[6, 7, 8], Some(5), Some(6))]
+#[case::checkpoint_supersedes_older_commits(
+    &[0, 1, 2, 3, 4],
+    &[6, 7, 8],
+    Some(5),
+    Some(6)
+)]
+#[case::checkpoint_only(&[], &[], Some(5), None)]
+#[tokio::test]
+async fn validate_published_uses_checkpoint_and_commit_watermarks(
+    #[case] published_commit_versions: &[Version],
+    #[case] staged_commit_versions: &[Version],
+    #[case] checkpoint_version: Option<Version>,
+    #[case] expected: Option<Version>,
+) {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions,
+        staged_commit_versions,
+        checkpoint_version,
+        ..Default::default()
+    })
+    .await;
+
+    let result = log_segment.validate_published();
+    match expected {
+        Some(expected) => assert!(matches!(
+            result,
+            Err(Error::UnpublishedVersion(version)) if version == expected
+        )),
+        None => assert!(result.is_ok()),
+    }
+}
 
 #[tokio::test]
 async fn test_max_published_version_only_published_commits() {

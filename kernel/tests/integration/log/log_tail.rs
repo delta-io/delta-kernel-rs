@@ -459,7 +459,7 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
         .with_log_tail(log_tail)
         .build(engine.as_ref());
 
-    assert!(matches!(result, Err(Error::MissingVersion(Some(3)))));
+    assert!(matches!(result, Err(Error::MissingVersion(3))));
 
     Ok(())
 }

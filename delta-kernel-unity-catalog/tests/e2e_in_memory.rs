@@ -234,7 +234,7 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
 
     let snapshot = commit(&snapshot, &update_table_client, &engine)?;
     let err = snapshot.checkpoint(&engine, None).unwrap_err();
-    assert!(matches!(err, delta_kernel::Error::MissingVersion(Some(1))));
+    assert!(matches!(err, delta_kernel::Error::UnpublishedVersion(1)));
     Ok(())
 }
 

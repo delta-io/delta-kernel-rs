@@ -442,7 +442,7 @@ fn invalid_range_end_before_start() {
 #[test]
 fn invalid_range_start_after_last_version_of_table() {
     let res = read_cdf_for_table("cdf-table-simple", 3, 4, None);
-    assert!(matches!(res, Err(Error::MissingVersion(Some(3)))));
+    assert!(matches!(res, Err(Error::MissingVersion(3))));
 }
 
 #[test]
