@@ -77,6 +77,9 @@ impl RowVisitor for SelectionVectorVisitor {
 pub(crate) static PROTOCOL_LEAVES: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| Protocol::to_schema().leaves(PROTOCOL_NAME));
 
+/// Number of leaf getters that make up a deletion vector descriptor.
+const DELETION_VECTOR_GETTER_COUNT: usize = 5;
+
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct ProtocolVisitor {
@@ -520,12 +523,19 @@ impl RowVisitor for DomainMetadataVisitor {
     }
 }
 
-/// Get a DV out of some engine data. The caller is responsible for slicing the `getters` slice such
-/// that the first element contains the `storageType` element of the deletion vector.
+/// Get a DV out of some engine data. The caller slices `getters` so it starts with the
+/// deletion-vector leaves, beginning at `storageType`.
 pub(crate) fn visit_deletion_vector_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<DeletionVectorDescriptor>> {
+    if getters.len() < DELETION_VECTOR_GETTER_COUNT {
+        return Err(Error::InternalError(format!(
+            "Wrong number of DeletionVectorVisitor getters: {}",
+            getters.len()
+        )));
+    }
+
     let storage_type_opt: Option<String> =
         getters[0].get_opt(row_index, "remove.deletionVector.storageType")?;
     if let Some(storage_type_str) = storage_type_opt {
@@ -954,6 +964,22 @@ mod tests {
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{action_batch, parse_json_batch};
     use crate::Engine;
+
+    #[rstest::rstest]
+    #[case::empty(0)]
+    #[case::too_few(4)]
+    fn visit_deletion_vector_rejects_too_few_getters(#[case] getter_count: usize) {
+        let null_getter = ();
+        let getters = vec![&null_getter as &dyn GetData<'_>; getter_count];
+
+        let err = visit_deletion_vector_at(0, &getters).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Wrong number of DeletionVectorVisitor getters"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn test_parse_protocol() -> DeltaResult<()> {
