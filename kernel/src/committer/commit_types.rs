@@ -53,7 +53,7 @@ impl CommitType {
 /// The protocol and metadata state for this commit. Groups the read snapshot state (if any)
 /// and the new state being committed (if any).
 #[derive(Debug)]
-pub(crate) struct CommitProtocolMetadata {
+pub struct CommitProtocolMetadata {
     /// Existing table protocol from read snapshot. `None` for create-table.
     read_protocol: Option<Protocol>,
     /// Existing table metadata from read snapshot. `None` for create-table.
@@ -92,6 +92,26 @@ impl CommitProtocolMetadata {
             new_protocol,
             new_metadata,
         })
+    }
+
+    /// Returns the protocol read by the transaction, or `None` for table creation.
+    pub fn read_protocol(&self) -> Option<&Protocol> {
+        self.read_protocol.as_ref()
+    }
+
+    /// Returns the metadata read by the transaction, or `None` for table creation.
+    pub fn read_metadata(&self) -> Option<&Metadata> {
+        self.read_metadata.as_ref()
+    }
+
+    /// Returns the protocol written by the transaction, if it changed.
+    pub fn new_protocol(&self) -> Option<&Protocol> {
+        self.new_protocol.as_ref()
+    }
+
+    /// Returns the metadata written by the transaction, if it changed.
+    pub fn new_metadata(&self) -> Option<&Metadata> {
+        self.new_metadata.as_ref()
     }
 }
 
@@ -181,6 +201,16 @@ impl CommitMetadata {
     /// The root URL of the table being committed to.
     pub fn table_root(&self) -> &Url {
         self.log_root.table_root()
+    }
+
+    /// Returns the protocol and metadata state read and written by this transaction.
+    pub fn protocol_metadata(&self) -> &CommitProtocolMetadata {
+        &self.protocol_metadata
+    }
+
+    /// Returns the domain metadata additions and removals written by this transaction.
+    pub fn domain_metadata_changes(&self) -> &[DomainMetadata] {
+        &self.domain_metadata_changes
     }
 
     /// Returns the effective protocol for this commit. Prefers new_protocol (create-table / ALTER
@@ -363,6 +393,17 @@ mod tests {
         // in_commit_timestamp
         assert_eq!(commit_metadata.in_commit_timestamp(), 1234);
         assert_eq!(commit_metadata.max_published_version(), Some(42));
+        assert!(commit_metadata
+            .protocol_metadata()
+            .read_protocol()
+            .is_some());
+        assert!(commit_metadata
+            .protocol_metadata()
+            .read_metadata()
+            .is_some());
+        assert!(commit_metadata.protocol_metadata().new_protocol().is_none());
+        assert!(commit_metadata.protocol_metadata().new_metadata().is_none());
+        assert!(commit_metadata.domain_metadata_changes().is_empty());
 
         // published commit path
         let published_path = commit_metadata.published_commit_path().unwrap();
@@ -392,5 +433,24 @@ mod tests {
             .and_then(|s| s.strip_suffix(".json"))
             .expect("Staged path should have expected format");
         uuid::Uuid::parse_str(uuid_str).expect("Staged path should contain a valid UUID");
+    }
+
+    #[test]
+    fn test_commit_protocol_metadata_changes() {
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let metadata =
+            Metadata::try_new(None, None, schema_ref! {}, vec![], 0, HashMap::new()).unwrap();
+        let protocol_metadata = CommitProtocolMetadata::try_new(
+            Some(protocol.clone()),
+            Some(metadata.clone()),
+            Some(protocol),
+            Some(metadata),
+        )
+        .unwrap();
+
+        assert!(protocol_metadata.read_protocol().is_some());
+        assert!(protocol_metadata.read_metadata().is_some());
+        assert!(protocol_metadata.new_protocol().is_some());
+        assert!(protocol_metadata.new_metadata().is_some());
     }
 }
