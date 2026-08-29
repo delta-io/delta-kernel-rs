@@ -197,9 +197,11 @@ impl RowIndexBuilder {
 ///   via `ArrowSchema::new`).
 ///
 /// **Type validation.** `apply_schema_to_struct` runs `ensure_data_types(.., Full)` at every
-/// primitive leaf. This is safe because `reorder_struct_array` above has already resolved every
+/// primitive leaf. On this path `reorder_struct_array` above has already resolved every
 /// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
-/// are `Identical` to the kernel target.
+/// are `Identical` to the kernel target and the leaf cast is a no-op. Note that `apply_schema` has
+/// other callers (the expression evaluator) with no such pre-cast step, so it resolves
+/// `NeedsCast` itself rather than relying on this invariant.
 ///
 /// **Cost.** O(F) per batch where F is the total number of fields (including nested). Row data
 /// (Arrow buffers, offsets, null buffers) is shared via `Arc` and never copied.
@@ -649,7 +651,7 @@ fn get_indices(
                         DataTypeCompat::Nested => {
                             return Err(Error::internal_error(
                                 "Comparing nested types in get_indices",
-                            ))
+                            ));
                         }
                     }
                     found_fields.insert(requested_field.name());
