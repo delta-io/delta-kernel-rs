@@ -7,7 +7,9 @@ use itertools::Itertools;
 use tracing::debug;
 
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
-use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
+use crate::arrow::array::{
+    self, ArrayBuilder, ArrayRef, RecordBatch, RecordBatchOptions, StructArray,
+};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -15,12 +17,15 @@ use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::{DataType, PrimitiveType, SchemaRef};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructType};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
 pub mod evaluate_expression;
 pub mod opaque;
+
+#[cfg(test)]
+mod conformance_tests;
 
 #[cfg(test)]
 mod tests;
@@ -256,7 +261,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
-            _input_schema: schema,
+            input_schema: schema,
             expression,
             output_type,
         }))
@@ -334,16 +339,19 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
         let arrays: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
 
-        Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            arrow_schema,
-            arrays,
-        )?)))
+        Ok(Box::new(ArrowEngineData::new(
+            RecordBatch::try_new_with_options(
+                arrow_schema,
+                arrays,
+                &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+            )?,
+        )))
     }
 }
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    _input_schema: SchemaRef,
+    input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
 }
@@ -351,6 +359,11 @@ pub struct DefaultExpressionEvaluator {
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
+        validate_direct_project_assignments(
+            &self.input_schema,
+            &self.expression,
+            &self.output_type,
+        )?;
         let batch = extract_record_batch(batch)?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
@@ -385,6 +398,122 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         };
 
         Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+}
+
+/// Validates contract-level assignments for Project fields that directly reference a column or
+/// literal. Valid assignments that need an unimplemented conversion return `Unsupported`; invalid
+/// assignments return `InvalidExpressionEvaluation`. Complex expressions require full analysis.
+fn validate_direct_project_assignments(
+    input_schema: &StructType,
+    expression: &Expression,
+    output_type: &DataType,
+) -> DeltaResult<()> {
+    let (Expression::Struct(expressions, _), DataType::Struct(output_schema)) =
+        (expression, output_type)
+    else {
+        return Ok(());
+    };
+
+    let mut unsupported_assignment = None;
+    for (expression, target) in expressions.iter().zip(output_schema.fields()) {
+        let source = match expression.as_ref() {
+            Expression::Column(name) => input_schema.fields_of_path(name).ok().and_then(|fields| {
+                fields.last().map(|field| {
+                    (
+                        field.data_type().clone(),
+                        fields.iter().any(|field| field.is_nullable()),
+                    )
+                })
+            }),
+            Expression::Literal(value) => Some((value.data_type(), value.is_null())),
+            _ => None,
+        };
+        let Some((source_type, source_nullable)) = source else {
+            continue;
+        };
+
+        // Input schemas are not flow-sensitive: a preceding filter may prove that a nullable
+        // column is non-null before this projection reaches the evaluator.
+        if source_type == *target.data_type() {
+            continue;
+        }
+
+        let assignment = format!(
+            "Project assignment from {source_type}{} to {}{}",
+            if source_nullable { " (nullable)" } else { "" },
+            target.data_type(),
+            if target.is_nullable() {
+                " (nullable)"
+            } else {
+                ""
+            }
+        );
+        if source_nullable && !target.is_nullable()
+            || !is_valid_project_assignment(&source_type, target.data_type())
+        {
+            return Err(Error::invalid_expression(assignment));
+        }
+        unsupported_assignment.get_or_insert(assignment);
+    }
+    if let Some(assignment) = unsupported_assignment {
+        return Err(Error::unsupported(format!(
+            "Arrow evaluator does not yet support {assignment}"
+        )));
+    }
+    Ok(())
+}
+
+/// Returns whether Kernel's Project contract permits assigning `source` to `target` without an
+/// explicit cast. This tests semantic validity, not whether the Arrow evaluator implements the
+/// required conversion.
+fn is_valid_project_assignment(source: &DataType, target: &DataType) -> bool {
+    use DataType::*;
+    use PrimitiveType::*;
+
+    if source == target {
+        return true;
+    }
+    match (source, target) {
+        (Primitive(Void), _) => true,
+        (Primitive(Byte), Primitive(Short | Integer | Long | Float | Double))
+        | (Primitive(Short), Primitive(Integer | Long | Float | Double))
+        | (Primitive(Integer), Primitive(Long | Double))
+        | (Primitive(Float), Primitive(Double))
+        | (Primitive(Date), Primitive(TimestampNtz)) => true,
+        (Primitive(source), Primitive(Decimal(target))) => {
+            let source_precision = match source {
+                Byte => 3,
+                Short => 5,
+                Integer => 10,
+                Long => 20,
+                Decimal(source) if target.scale() >= source.scale() => {
+                    source.precision() - source.scale()
+                }
+                _ => return false,
+            };
+            target.precision() - target.scale() >= source_precision
+        }
+        (Array(source), Array(target)) => {
+            (!source.contains_null() || target.contains_null())
+                && is_valid_project_assignment(source.element_type(), target.element_type())
+        }
+        (Map(source), Map(target)) => {
+            (!source.value_contains_null || target.value_contains_null)
+                && is_valid_project_assignment(source.key_type(), target.key_type())
+                && is_valid_project_assignment(source.value_type(), target.value_type())
+        }
+        (Struct(source), Struct(target)) => {
+            source.fields().len() == target.fields().len()
+                && source
+                    .fields()
+                    .zip(target.fields())
+                    .all(|(source, target)| {
+                        (!source.is_nullable() || target.is_nullable())
+                            && is_valid_project_assignment(source.data_type(), target.data_type())
+                    })
+        }
+        _ => false,
     }
 }
 
