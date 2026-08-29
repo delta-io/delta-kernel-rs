@@ -22,6 +22,9 @@ mod predicate;
 mod scalar;
 mod utils;
 
+#[cfg(test)]
+mod conformance_tests;
+
 pub use expression::to_df_expr;
 pub use predicate::to_df_predicate_expr;
 pub use scalar::to_df_scalar;

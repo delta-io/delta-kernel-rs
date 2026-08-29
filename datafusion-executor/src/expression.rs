@@ -2,15 +2,22 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
-use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use datafusion::arrow::array::{
+    new_null_array, ArrayRef, AsArray, Float64Builder, RecordBatch, StructArray,
+};
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, Field, FieldRef, Schema as ArrowSchema,
+};
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::utils::take_function_args;
-use datafusion::common::{Column as DFColumn, DataFusionError, ScalarValue as DFScalarValue};
+use datafusion::common::{
+    Column as DFColumn, DFSchema, DataFusionError, ScalarValue as DFScalarValue,
+};
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
 use datafusion::functions_nested::expr_fn::make_array;
 use datafusion::logical_expr::{
-    binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs,
-    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, ExprSchemable, Operator,
+    ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -113,22 +120,122 @@ pub(crate) fn to_df_struct_columns(
     }
 }
 
-/// Lowers an arithmetic binary expression (`Plus`/`Minus`/`Multiply`/`Divide`) to an
-/// `Expr::BinaryExpr`. Comparison and `IN` operators are modeled as predicates, not expressions,
-/// so they never reach this arm.
+/// Lowers an arithmetic binary expression. Comparison and `IN` operators are modeled as
+/// predicates, not expressions, so they never reach this arm.
 fn binary_expr_to_df_expr(
     binary: &BinaryExpression,
     input_schema: &StructType,
 ) -> DeltaResult<DFExpr> {
+    let left = to_df_expr(&binary.left, input_schema, None)?;
+    let right = to_df_expr(&binary.right, input_schema, None)?;
     let op = match binary.op {
         BinaryExpressionOp::Plus => Operator::Plus,
         BinaryExpressionOp::Minus => Operator::Minus,
         BinaryExpressionOp::Multiply => Operator::Multiply,
-        BinaryExpressionOp::Divide => Operator::Divide,
+        BinaryExpressionOp::Divide => return divide_to_df_expr(left, right, input_schema),
     };
-    let left = to_df_expr(&binary.left, input_schema, None)?;
-    let right = to_df_expr(&binary.right, input_schema, None)?;
     Ok(binary_expr(left, op, right))
+}
+
+/// Lowers decimal division to DataFusion's decimal operator and all other numeric division to a
+/// checked `DOUBLE` UDF. The UDF supplies Kernel's fractional result type and zero-divisor error
+/// for integral and floating-point inputs.
+fn divide_to_df_expr(
+    left: DFExpr,
+    right: DFExpr,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
+    let arrow_schema: ArrowSchema = input_schema.try_into_arrow()?;
+    let df_schema = DFSchema::try_from(arrow_schema).map_err(Error::generic_err)?;
+    let left_type = left.get_type(&df_schema).map_err(Error::generic_err)?;
+    let right_type = right.get_type(&df_schema).map_err(Error::generic_err)?;
+
+    if left_type == ArrowDataType::Null && right_type == ArrowDataType::Null {
+        return Err(Error::invalid_expression(
+            "division cannot infer a numeric type from two untyped nulls",
+        ));
+    }
+    let decimal_or_null = |data_type: &ArrowDataType| {
+        matches!(
+            data_type,
+            ArrowDataType::Decimal128(_, _) | ArrowDataType::Null
+        )
+    };
+    if decimal_or_null(&left_type)
+        && decimal_or_null(&right_type)
+        && (matches!(left_type, ArrowDataType::Decimal128(_, _))
+            || matches!(right_type, ArrowDataType::Decimal128(_, _)))
+    {
+        return Ok(binary_expr(left, Operator::Divide, right));
+    }
+
+    let udf = ScalarUDF::new_from_impl(StandardDivisionUdf::new());
+    Ok(udf.call(vec![left, right]))
+}
+
+/// Checked non-decimal division for Kernel's standard expression contract.
+#[derive(Debug, PartialEq, Eq)]
+struct StandardDivisionUdf {
+    signature: Signature,
+}
+
+impl std::hash::Hash for StandardDivisionUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+    }
+}
+
+impl StandardDivisionUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::exact(
+                vec![ArrowDataType::Float64, ArrowDataType::Float64],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for StandardDivisionUdf {
+    fn name(&self) -> &str {
+        "kernel_divide"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+        Ok(ArrowDataType::Float64)
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef, DataFusionError> {
+        let nullable = args.arg_fields.iter().any(|field| field.is_nullable());
+        Ok(Field::new(self.name(), ArrowDataType::Float64, nullable).into())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        let num_rows = args.number_rows;
+        let [left, right] = take_function_args(self.name(), args.args)?;
+        let left = left.into_array(num_rows)?;
+        let right = right.into_array(num_rows)?;
+        let left = left.as_primitive::<datafusion::arrow::datatypes::Float64Type>();
+        let right = right.as_primitive::<datafusion::arrow::datatypes::Float64Type>();
+        let mut result = Float64Builder::with_capacity(num_rows);
+        for (left, right) in left.iter().zip(right) {
+            match (left, right) {
+                (None, _) | (_, None) => result.append_null(),
+                (Some(_), Some(0.0)) => {
+                    return Err(DataFusionError::ArrowError(
+                        Box::new(ArrowError::DivideByZero),
+                        None,
+                    ));
+                }
+                (Some(left), Some(right)) => result.append_value(left / right),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(result.finish())))
+    }
 }
 
 /// Lowers a variadic expression: `Coalesce` to `coalesce(..)` and `Array` to `make_array(..)`, each
@@ -601,7 +708,7 @@ mod tests {
     #[case::plus(col!("a") + lit(1i64), "a + Int64(1)")]
     #[case::minus(col!("a") - lit(1i64), "a - Int64(1)")]
     #[case::multiply(col!("a") * lit(2i64), "a * Int64(2)")]
-    #[case::divide(col!("a") / lit(2i64), "a / Int64(2)")]
+    #[case::divide(col!("a") / lit(2i64), "kernel_divide(a, Int64(2))")]
     fn arithmetic_binary_lowers_to_binary_expr(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
@@ -614,7 +721,7 @@ mod tests {
     )]
     #[case::nested_field_and_all_ops(
         (col!("a.b.c") * lit(5i64) - (col!("b") + col!("x"))) / lit(20i64),
-        "(get_field(a, Utf8(\"b\"), Utf8(\"c\")) * Int64(5) - b + x) / Int64(20)"
+        "kernel_divide(get_field(a, Utf8(\"b\"), Utf8(\"c\")) * Int64(5) - b + x, Int64(20))"
     )]
     fn nested_arithmetic_lowers_to_operator_tree(
         #[case] kernel: KernelExpr,

@@ -93,6 +93,8 @@ optional = true
 [features]
 # no default features
 default = []
+# exposes executor-independent expression fixtures to downstream test harnesses
+expression-conformance-tests = []
 # internal-api will make everything marked #[internal_api] public.
 internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).

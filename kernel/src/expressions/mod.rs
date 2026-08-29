@@ -33,7 +33,7 @@ pub(crate) use self::sql::parse_sql;
 
 #[doc = include_str!("semantics.md")]
 pub mod semantics {
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(any(test, feature = "test-utils", feature = "expression-conformance-tests"))]
     pub mod conformance;
 }
 

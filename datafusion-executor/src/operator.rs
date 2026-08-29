@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::Schema as ArrowSchema;
+use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
 use datafusion::functions_aggregate::first_last::first_value_udaf;
@@ -22,12 +22,14 @@ use datafusion::logical_expr::{
     LogicalPlanBuilder, Projection as DFProjection,
 };
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
-use delta_kernel::expressions::{ColumnName as KernelColumnName, Scalar as KernelScalar};
+use delta_kernel::expressions::{
+    ColumnName as KernelColumnName, Expression as KernelExpression, Scalar as KernelScalar,
+};
 use delta_kernel::plans::ir::nodes::{
     Agg as KernelAgg, Aggregate as KernelAggregate, Filter as KernelFilter,
     Operator as KernelOperator, Project as KernelProject, Values as KernelValues,
 };
-use delta_kernel::schema::{StructField, StructType};
+use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
 
 use crate::expression::to_df_struct_columns;
 use crate::predicate::to_df_predicate_expr;
@@ -97,6 +99,7 @@ fn lower_project(
     input: &Arc<DFLogicalPlan>,
 ) -> Result<DFLogicalPlan, DataFusionError> {
     let input_schema: StructType = input.schema().as_arrow().try_into_kernel()?;
+    validate_direct_project_assignments(&input_schema, &project.expr, project.schema.as_ref())?;
     let arrow_schema: ArrowSchema = project.schema.as_ref().try_into_arrow()?;
     let df_schema = Arc::new(DFSchema::try_from(arrow_schema)?);
     let columns = to_df_struct_columns(&project.expr, &input_schema, project.schema.as_ref())
@@ -106,13 +109,125 @@ fn lower_project(
         .into_iter()
         .zip(project.schema.fields())
         .map(|((name, expr), field)| {
+            let source_arrow = expr.get_type(input.schema())?;
             let target = field.data_type().try_into_arrow()?;
+            if source_arrow != target {
+                let source: DataType = (&source_arrow).try_into_kernel()?;
+                if source != *field.data_type()
+                    && !is_valid_project_assignment(&source, field.data_type())
+                {
+                    return Err(invalid_project_assignment(&source, field.data_type()));
+                }
+            }
             let expr = expr.cast_to(&target, input.schema())?.alias(name);
             Ok(expr)
         })
         .collect();
     let projection = DFProjection::try_new_with_schema(exprs?, Arc::clone(input), df_schema)?;
     Ok(DFLogicalPlan::Projection(projection))
+}
+
+/// Rejects invalid Project assignments whose source type is available without general expression
+/// analysis. Complex expressions remain DataFusion's responsibility.
+fn validate_direct_project_assignments(
+    input_schema: &StructType,
+    expression: &KernelExpression,
+    output_schema: &StructType,
+) -> Result<(), DataFusionError> {
+    let KernelExpression::Struct(expressions, _) = expression else {
+        return Ok(());
+    };
+
+    for (expression, target) in expressions.iter().zip(output_schema.fields()) {
+        let source = match expression.as_ref() {
+            KernelExpression::Column(name) => {
+                input_schema.fields_of_path(name).ok().and_then(|fields| {
+                    fields.last().map(|field| {
+                        (
+                            field.data_type().clone(),
+                            fields.iter().any(|field| field.is_nullable()),
+                        )
+                    })
+                })
+            }
+            KernelExpression::Literal(value) => Some((value.data_type(), value.is_null())),
+            _ => None,
+        };
+        let Some((source, source_nullable)) = source else {
+            continue;
+        };
+
+        // Top-level input nullability is not flow-sensitive: an earlier Filter may have removed
+        // nulls before this Project. Nested nullability remains part of DataType and is validated.
+        let source_arrow: ArrowDataType = (&source).try_into_arrow()?;
+        let target_arrow: ArrowDataType = target.data_type().try_into_arrow()?;
+        if source == *target.data_type() || source_arrow == target_arrow {
+            continue;
+        }
+        if source_nullable && !target.is_nullable()
+            || !is_valid_project_assignment(&source, target.data_type())
+        {
+            return Err(invalid_project_assignment(&source, target.data_type()));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_project_assignment(source: &DataType, target: &DataType) -> DataFusionError {
+    DataFusionError::External(Box::new(delta_kernel::Error::invalid_expression(format!(
+        "Project cannot assign {source} to {target} without an explicit cast"
+    ))))
+}
+
+/// Returns whether Kernel permits assigning `source` to `target` without an explicit cast.
+fn is_valid_project_assignment(source: &DataType, target: &DataType) -> bool {
+    use DataType::*;
+    use PrimitiveType::*;
+
+    if source == target {
+        return true;
+    }
+    match (source, target) {
+        (Primitive(Void), _) => true,
+        (Primitive(Byte), Primitive(Short | Integer | Long | Float | Double))
+        | (Primitive(Short), Primitive(Integer | Long | Float | Double))
+        | (Primitive(Integer), Primitive(Long | Double))
+        | (Primitive(Float), Primitive(Double))
+        | (Primitive(Date), Primitive(TimestampNtz)) => true,
+        (Primitive(source), Primitive(Decimal(target))) => {
+            let source_precision = match source {
+                Byte => 3,
+                Short => 5,
+                Integer => 10,
+                Long => 20,
+                Decimal(source) if target.scale() >= source.scale() => {
+                    source.precision() - source.scale()
+                }
+                _ => return false,
+            };
+            target.precision() - target.scale() >= source_precision
+        }
+        (Array(source), Array(target)) => {
+            (!source.contains_null() || target.contains_null())
+                && is_valid_project_assignment(source.element_type(), target.element_type())
+        }
+        (Map(source), Map(target)) => {
+            (!source.value_contains_null || target.value_contains_null)
+                && is_valid_project_assignment(source.key_type(), target.key_type())
+                && is_valid_project_assignment(source.value_type(), target.value_type())
+        }
+        (Struct(source), Struct(target)) => {
+            source.fields().len() == target.fields().len()
+                && source
+                    .fields()
+                    .zip(target.fields())
+                    .all(|(source, target)| {
+                        (!source.is_nullable() || target.is_nullable())
+                            && is_valid_project_assignment(source.data_type(), target.data_type())
+                    })
+        }
+        _ => false,
+    }
 }
 
 /// Lowers an [`Aggregate`](KernelAggregate) to a DataFusion aggregate over its input.
@@ -995,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn project_rejects_uncastable_output_type() {
+    fn project_rejects_invalid_output_assignment() {
         let parent = input_with_schema(test_schema());
         let output =
             StructType::try_new([StructField::nullable("a", DataType::unshredded_variant())])
@@ -1003,11 +1118,8 @@ mod tests {
         let err =
             lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap_err();
         let message = err.to_string();
-        assert!(matches!(&err, DataFusionError::Plan(_)), "{message}");
-        assert!(
-            message.contains("Cannot automatically convert"),
-            "{message}"
-        );
+        assert!(matches!(&err, DataFusionError::External(_)), "{message}");
+        assert!(message.contains("without an explicit cast"), "{message}");
     }
 
     #[rstest]
@@ -1088,7 +1200,7 @@ mod tests {
                 col!("a") * col!("b"),
             ),
             (
-                StructField::nullable("quotient", DataType::LONG),
+                StructField::nullable("quotient", DataType::DOUBLE),
                 col!("a") / col!("b"),
             ),
         ]),
@@ -1096,7 +1208,7 @@ mod tests {
             "+-----+------------+---------+----------+",
             "| sum | difference | product | quotient |",
             "+-----+------------+---------+----------+",
-            "| 12  | 8          | 20      | 5        |",
+            "| 12  | 8          | 20      | 5.0      |",
             "|     |            |         |          |",
             "|     |            |         |          |",
             "+-----+------------+---------+----------+",
@@ -1307,20 +1419,17 @@ mod tests {
         assert_batches_eq!(expected, &batches);
     }
 
-    #[tokio::test]
-    async fn project_rejects_invalid_cast_value_during_execution() {
+    #[test]
+    fn project_rejects_implicit_string_parsing() {
         let input = StructType::try_new([StructField::nullable("a", DataType::STRING)]).unwrap();
         let parent = Arc::new(
             lower_values_node(input, vec![vec![KernelScalar::String("abc".into())]]).unwrap(),
         );
         let output = StructType::try_new([StructField::nullable("a", DataType::INTEGER)]).unwrap();
-        let lowered =
-            lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap();
-
-        let err = execute(lowered).await.unwrap_err();
+        let err =
+            lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Cannot cast string 'abc' to value of Int32 type"),
+            err.to_string().contains("without an explicit cast"),
             "{err}"
         );
     }
