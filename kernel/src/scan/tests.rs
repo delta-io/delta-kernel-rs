@@ -667,6 +667,81 @@ fn test_scan_metadata_from_same_version() {
     assert_eq!(new_files.len(), 1);
 }
 
+#[test_log::test]
+fn test_scan_metadata_from_projects_cached_typed_stats_for_narrower_scan() {
+    let path = fs::canonicalize(PathBuf::from(
+        "./tests/data/v1-single-part-struct-stats-only/",
+    ))
+    .unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let version = snapshot.version();
+
+    // Materialize a predicate-free cache with every typed stats column. This checkpoint has no
+    // JSON stats, so replay cannot succeed by falling back to JSON parsing.
+    let cached_scan = Arc::clone(&snapshot)
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+    let cached_metadata: Vec<Box<dyn EngineData>> = cached_scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| {
+            let data = scan_files.apply_selection_vector().unwrap();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+            let json_stats = batch.column_by_name("stats").unwrap();
+            let typed_stats = batch.column_by_name(STATS_PARSED).unwrap();
+            assert_eq!(json_stats.null_count(), batch.num_rows());
+            assert_eq!(typed_stats.null_count(), 0);
+            Box::new(ArrowEngineData::from(batch)) as Box<dyn EngineData>
+        })
+        .try_collect()
+        .unwrap();
+    assert_eq!(
+        cached_metadata.iter().map(|data| data.len()).sum::<usize>(),
+        5
+    );
+
+    // A fresh scan is the oracle for a narrower predicate and stats schema.
+    let predicate: PredicateRef = Arc::new(Pred::gt(col!("id"), lit(3i64)));
+    let stats_options = StatsOptions::struct_columns(vec![column_name!("id")]);
+    let fresh_scan = Arc::clone(&snapshot)
+        .scan_builder()
+        .with_predicate(predicate.clone())
+        .with_stats(stats_options.clone())
+        .build()
+        .unwrap();
+    let mut fresh_paths = get_files_for_scan(fresh_scan, engine.as_ref()).unwrap();
+    assert_eq!(fresh_paths.len(), 2);
+
+    // Replay the same predicate from the broader typed cache.
+    let replay_scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats(stats_options)
+        .build()
+        .unwrap();
+    let mut replayed_paths = Vec::new();
+    for metadata in replay_scan
+        .scan_metadata_from(engine.as_ref(), version, cached_metadata, None)
+        .unwrap()
+    {
+        replayed_paths = metadata
+            .unwrap()
+            .visit_scan_files(replayed_paths, |paths, file| {
+                paths.push(file.path.to_string());
+            })
+            .unwrap();
+    }
+
+    // Compare exact files rather than only the number selected.
+    fresh_paths.sort_unstable();
+    replayed_paths.sort_unstable();
+    assert_eq!(replayed_paths, fresh_paths);
+}
+
 // reading v0 with 3 files.
 // updating to v1 with 3 more files added.
 #[test_log::test]
