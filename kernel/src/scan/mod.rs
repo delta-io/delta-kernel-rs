@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
-use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
+use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter, STATS_PARSED_NAME};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -20,7 +20,9 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
+use crate::expressions::{
+    column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, Predicate, PredicateRef,
+};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
@@ -40,7 +42,7 @@ use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
-    StructField, StructType, ToSchema as _,
+    SchemaStructPatchBuilder, StructField, StructType, ToSchema as _,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
@@ -966,13 +968,93 @@ impl Scan {
             )));
         }
 
-        // in order to be processed by our log replay, we must re-shape the existing scan metadata
-        // back into shape as we read it from the log. Since it is already reconciled data,
-        // we treat it as if it originated from a checkpoint.
+        let mut existing_data = existing_data.into_iter().peekable();
+        // A cached scan may contain a broader typed stats struct. Reuse it only when every leaf
+        // needed by this scan is present; otherwise log replay falls back to the JSON stats field.
+        let stats_schema = self
+            .state_info
+            .physical_stats_schema
+            .as_ref()
+            .filter(|schema| {
+                let leaves = schema.leaves(Some(STATS_PARSED_NAME));
+                existing_data.peek().is_some_and(|data| {
+                    leaves
+                        .as_ref()
+                        .0
+                        .iter()
+                        .all(|column| data.has_field(column))
+                })
+            });
+        // Cached scan metadata stores typed stats in a top-level field. Declare that field only
+        // when the cache contains every stats leaf needed by the current scan.
+        let cached_metadata_schema = Arc::new(
+            SchemaStructPatchBuilder::new()
+                .fold_with(stats_schema, |patch, schema| {
+                    patch.append(StructField::nullable(
+                        STATS_PARSED_NAME,
+                        schema.as_ref().clone(),
+                    ))
+                })
+                .build(scan_row_schema().as_ref())?,
+        );
+        // Log replay treats cached rows like checkpoint Add actions, where typed stats are nested
+        // under `add` instead of stored at the top level.
+        let checkpoint_add_schema = Arc::new(
+            SchemaStructPatchBuilder::new()
+                .fold_with(stats_schema, |patch, schema| {
+                    patch.append_at(
+                        [ADD_NAME],
+                        StructField::nullable(STATS_PARSED_NAME, schema.as_ref().clone()),
+                    )
+                })
+                .build(restored_add_schema())?,
+        );
+
+        // In order to be processed by our log replay, re-shape the existing scan metadata back
+        // into the form read from a checkpoint. A broader cached stats struct is projected to the
+        // narrower schema required by the current scan.
+        let transform_expr = match stats_schema {
+            Some(schema) => {
+                fn project_stats_to_schema(root: ColumnName, schema: &StructType) -> Expression {
+                    let fields = schema.fields().map(|field| {
+                        let column = root.join(&ColumnName::new([field.name()]));
+                        match field.data_type() {
+                            DataType::Struct(schema) => project_stats_to_schema(column, schema),
+                            _ => Expression::from(column),
+                        }
+                    });
+                    Expression::struct_with_nullability_from(
+                        fields,
+                        Expression::from_pred(Expression::from(root.clone()).is_not_null()),
+                    )
+                }
+
+                let fields = [
+                    column_expr_ref!("path"),
+                    column_expr_ref!("fileConstantValues.partitionValues"),
+                    column_expr_ref!("size"),
+                    column_expr_ref!("modificationTime"),
+                    column_expr_ref!("stats"),
+                    column_expr_ref!("fileConstantValues.tags"),
+                    column_expr_ref!("deletionVector"),
+                    column_expr_ref!("fileConstantValues.baseRowId"),
+                    column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+                    column_expr_ref!("fileConstantValues.clusteringProvider"),
+                    Arc::new(project_stats_to_schema(
+                        column_name!(STATS_PARSED_NAME),
+                        schema,
+                    )),
+                ];
+                Arc::new(Expression::struct_from([Arc::new(
+                    Expression::struct_from(fields),
+                )]))
+            }
+            None => get_scan_metadata_transform_expr(),
+        };
         let transform = engine.evaluation_handler().new_expression_evaluator(
-            scan_row_schema(),
-            get_scan_metadata_transform_expr(),
-            restored_add_schema().clone().into(),
+            cached_metadata_schema,
+            transform_expr,
+            checkpoint_add_schema.clone().into(),
         )?;
         let apply_transform = move |data: Box<dyn EngineData>| {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
@@ -982,15 +1064,14 @@ impl Scan {
 
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
-        // Since we're only processing existing data (no checkpoint), we use the base schema
-        // and no stats_parsed optimization.
+        // Since the existing data is already reconciled, treat it as checkpoint data.
         if existing_version == self.snapshot.version() {
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-                actions: existing_data.into_iter().map(apply_transform),
+                actions: existing_data.map(apply_transform),
                 checkpoint_info: CheckpointReadInfo {
-                    has_stats_parsed: false,
+                    has_stats_parsed: stats_schema.is_some(),
                     has_partition_values_parsed: false,
-                    checkpoint_read_schema: restored_add_schema().clone(),
+                    checkpoint_read_schema: checkpoint_add_schema,
                 },
             };
             return Ok(Box::new(
@@ -1022,8 +1103,8 @@ impl Scan {
             None, // No checkpoint in this incremental segment
         )?;
 
-        // For incremental reads, new_log_segment has no checkpoint but we use the
-        // checkpoint schema returned by the function for consistency.
+        // The incremental segment has no checkpoint. Its checkpoint schema is unused because all
+        // of its batches are commits; the existing data below supplies the checkpoint-shaped rows.
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
@@ -1039,10 +1120,12 @@ impl Scan {
             None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-            actions: result
-                .actions
-                .chain(existing_data.into_iter().map(apply_transform)),
-            checkpoint_info: result.checkpoint_info,
+            actions: result.actions.chain(existing_data.map(apply_transform)),
+            checkpoint_info: CheckpointReadInfo {
+                has_stats_parsed: stats_schema.is_some(),
+                has_partition_values_parsed: false,
+                checkpoint_read_schema: checkpoint_add_schema,
+            },
         };
 
         Ok(Box::new(self.scan_metadata_inner(
