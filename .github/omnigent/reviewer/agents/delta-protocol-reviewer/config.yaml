@@ -1,6 +1,7 @@
 spec_version: 1
 name: delta-protocol-reviewer
 description: 'Audits changes for Delta protocol compliance.'
+skills: none
 executor:
   type: omnigent
   model: default

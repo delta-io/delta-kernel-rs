@@ -56,6 +56,10 @@ concurrency:
 
 env:
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  HARNESS_CODEX_DISABLE_NATIVE_TOOLS: "1"
+  HARNESS_CODEX_ENABLE_WEB_SEARCH: "0"
+  # This Omnigent mode runs Claude unwrapped with native tools disabled.
+  OMNIGENT_CLAUDE_SDK_NO_SANDBOX: "1"
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
@@ -336,6 +340,27 @@ jobs:
           claude --version
           codex --version
 
+      - name: Disable reviewer host skills
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import pathlib
+
+          import yaml
+
+          paths = list(pathlib.Path(".github/omnigent/reviewer").rglob("config.yaml"))
+          if not paths:
+              raise SystemExit("No Omnigent reviewer configs found.")
+
+          for path in paths:
+              config = yaml.safe_load(path.read_text())
+              config["skills"] = "none"
+              path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+          print(f"Disabled host skills for {len(paths)} AI reviewer configs.")
+          PYEOF
+
       - name: Validate AI reviewer runtime
         if: steps.creds.outputs.available == 'true'
         run: |
@@ -347,6 +372,31 @@ jobs:
           import subprocess
           import sys
 
+          import yaml
+          from omnigent.inner import codex_harness
+          from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
+          from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+          if not codex_harness._parse_truthy(
+              "HARNESS_CODEX_DISABLE_NATIVE_TOOLS", default=False
+          ):
+              print("::error::Codex native tools are not disabled.")
+              sys.exit(1)
+          if codex_harness._parse_truthy("HARNESS_CODEX_ENABLE_WEB_SEARCH", default=True):
+              print("::error::Codex web search is not disabled.")
+              sys.exit(1)
+
+          claude_runtime = prepare_claude_cli_path(
+              shutil.which("claude"),
+              OSEnvSpec(
+                  type="caller_process",
+                  sandbox=OSEnvSandboxSpec(type="none"),
+              ),
+          )
+          if claude_runtime.enable_native_tools:
+              print("::error::Claude native tools are not disabled.")
+              sys.exit(1)
+
           harness_commands = {
               "claude-sdk": "claude",
               "codex": "codex",
@@ -354,6 +404,10 @@ jobs:
           harnesses = set()
           for path in pathlib.Path(".github/omnigent/reviewer").rglob("config.yaml"):
               text = path.read_text()
+              config = yaml.safe_load(text)
+              if config.get("skills") != "none":
+                  print(f"::error::{path} must set 'skills: none'.")
+                  sys.exit(1)
               harnesses.update(
                   re.findall(r"^\s*harness:\s*([A-Za-z0-9_.-]+)\s*$", text, re.MULTILINE)
               )

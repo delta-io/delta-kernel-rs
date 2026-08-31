@@ -7,6 +7,7 @@ description: >-
   disprove gate over candidate findings, then consolidates into one review.
   Ported from the repo's local /kernel-review reviewer roster; writes no code
   and posts nothing itself -- the workflow posts the consolidated review.
+skills: none
 
 # The orchestrator brain runs on the claude-sdk harness against the configured
 # gateway (see ~/.omnigent/config.yaml written by the workflow). It only plans,

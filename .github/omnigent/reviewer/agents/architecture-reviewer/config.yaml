@@ -1,6 +1,7 @@
 spec_version: 1
 name: architecture-reviewer
 description: 'Reviews the SHAPE of a change: abstractions, API surface, bloat.'
+skills: none
 executor:
   type: omnigent
   model: default
