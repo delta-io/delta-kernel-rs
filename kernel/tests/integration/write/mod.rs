@@ -7,6 +7,7 @@ mod column_defaults;
 mod column_mapping;
 mod commit_info;
 mod domain_metadata;
+mod external_root_manifest;
 mod ict;
 mod interval;
 mod nested_field_ids;
