@@ -103,7 +103,8 @@ impl UpdateTableClient for FfiUCCommitClient {
 
             match (self.commit_callback)(self.context, c_commit_request) {
                 OptionalValue::Some(e) => {
-                    let boxed_str = unsafe { e.into_inner() }; // get the string back into Box<String>
+                    let boxed_str = unsafe { e.into_inner() }; // get the string back into
+                                                               // Box<String>
                     let s: String = *boxed_str; // move back onto the stack
                     Err(unity_catalog_delta_client_api::Error::Generic(s))
                 }

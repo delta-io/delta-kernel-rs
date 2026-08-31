@@ -925,8 +925,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see comment there,
-              // however this test works if run individually.
+    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see
+              // comment there, however this test works if run individually.
     fn test_enable_event_tracing() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();

@@ -2400,7 +2400,8 @@ mod tests {
         assert_eq!(get_column!(rb, names[0], StringArray).value(0), "aa"); // p1 (prepended)
         assert_eq!(get_column!(rb, names[1], Int32Array).value(0), 7); // p2 (prepended)
         assert_eq!(get_column!(rb, names[2], Int32Array).value(0), 10); // d1
-        assert_eq!(get_column!(rb, names[3], StringArray).value(0), "cc"); // p3 (after d1, void skipped)
+        assert_eq!(get_column!(rb, names[3], StringArray).value(0), "cc"); // p3 (after d1, void
+                                                                           // skipped)
         assert_eq!(get_column!(rb, names[4], Int32Array).value(0), 9); // p4 (after d1)
         assert_eq!(get_column!(rb, names[5], Int32Array).value(0), 20); // d2
         Ok(())
