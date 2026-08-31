@@ -47,6 +47,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
@@ -362,7 +363,7 @@ jobs:
           print("Validated AI reviewer harnesses: " + ", ".join(sorted(harnesses)))
           PYEOF
 
-      - name: Write Omnigent provider config
+      - name: Write AI reviewer provider config
         if: steps.creds.outputs.available == 'true'
         env:
           CLAUDE_MAINTAINER_MODEL: ${{ vars.CLAUDE_MAINTAINER_MODEL }}
@@ -376,15 +377,17 @@ jobs:
           python3 -c "
           import json, os, pathlib
           gw = os.environ['GATEWAY_BASE_URL'].rstrip('/')
-          model = os.environ.get('MODEL') or 'claude-opus-4-1'
+          model = os.environ.get('MODEL') or 'databricks-claude-opus-4-8'
           claude_maintainer_model = os.environ.get('CLAUDE_MAINTAINER_MODEL') or model
-          codex_maintainer_model = os.environ.get('CODEX_MAINTAINER_MODEL') or 'gpt-5-codex'
-          disprove_model = os.environ.get('DISPROVE_MODEL') or 'gpt-5-6-sol'
+          codex_maintainer_model = (
+              os.environ.get('CODEX_MAINTAINER_MODEL') or 'databricks-gpt-5-3-codex'
+          )
+          disprove_model = os.environ.get('DISPROVE_MODEL') or 'databricks-gpt-5-6-sol'
           cfg = {
               'providers': {
                   'gateway': {
                       'kind': 'gateway',
-                      'default': ['anthropic'],
+                      'default': ['anthropic', 'openai'],
                       'anthropic': {
                           'base_url': gw + '/anthropic',
                           'api_key_ref': 'env:LLM_API_KEY',
@@ -394,8 +397,9 @@ jobs:
                           },
                       },
                       'openai': {
-                          'base_url': gw + '/openai',
+                          'base_url': gw,
                           'api_key_ref': 'env:LLM_API_KEY',
+                          'wire_api': 'responses',
                           'models': {
                               'maintainer-codex': codex_maintainer_model,
                               'disprove': disprove_model,
@@ -421,12 +425,14 @@ jobs:
           import pathlib
           import yaml
 
-          model = os.environ.get("MODEL") or "claude-opus-4-1"
+          model = os.environ.get("MODEL") or "databricks-claude-opus-4-8"
           replacements = {
               "default": model,
               "maintainer-claude": os.environ.get("CLAUDE_MAINTAINER_MODEL") or model,
-              "maintainer-codex": os.environ.get("CODEX_MAINTAINER_MODEL") or "gpt-5-codex",
-              "disprove": os.environ.get("DISPROVE_MODEL") or "gpt-5-6-sol",
+              "maintainer-codex": (
+                  os.environ.get("CODEX_MAINTAINER_MODEL") or "databricks-gpt-5-3-codex"
+              ),
+              "disprove": os.environ.get("DISPROVE_MODEL") or "databricks-gpt-5-6-sol",
           }
 
           for path in pathlib.Path(".github/omnigent/reviewer").rglob("config.yaml"):
@@ -506,7 +512,14 @@ jobs:
           IMPORTANT: your output is posted verbatim as a PR comment unless this
           run is artifact-only. Output ONLY the final consolidated review, with
           no narration or status updates. Begin your response with the exact
-          marker <!-- AI_REVIEW_START --> on its own line, then the review.
+          marker <!-- AI_REVIEW_START --> on its own line, then the review. End
+          with the exact marker <!-- AI_REVIEW_END --> on its own line.
+
+          Emit those markers only if every dispatched reviewer completed
+          successfully and every required disprove gate returned a verdict. If
+          either fails, output <!-- AI_REVIEW_INCOMPLETE --> and a concise
+          reason without the start or end markers. Do not downgrade a finding
+          to bypass a failed gate.
 
           ## PR Diff
 
@@ -537,7 +550,7 @@ jobs:
         run: |
           set -euo pipefail
           prompt=$(cat /tmp/review_prompt.txt)
-          model="${MODEL:-claude-opus-4-1}"
+          model="${MODEL:-databricks-claude-opus-4-8}"
 
           export ANTHROPIC_AUTH_TOKEN="$LLM_API_KEY"
           export ANTHROPIC_BASE_URL="${GATEWAY_BASE_URL%/}/anthropic"
@@ -546,14 +559,14 @@ jobs:
           export ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
           export ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
           export OPENAI_API_KEY="$LLM_API_KEY"
-          export OPENAI_BASE_URL="${GATEWAY_BASE_URL%/}/openai"
+          export OPENAI_BASE_URL="${GATEWAY_BASE_URL%/}"
 
           set +e
           omnigent run .github/omnigent/reviewer/ \
             -p "$prompt" \
             --no-session \
             2>review-stderr.log \
-            | tee /tmp/review_output.txt
+            | tee /tmp/review_raw_output.txt
           review_status="${PIPESTATUS[0]}"
           set -e
 
@@ -566,15 +579,13 @@ jobs:
 
           python3 -c "
           import pathlib
-          import re
-          raw = pathlib.Path('/tmp/review_output.txt').read_text(errors='replace')
-          sentinel = '<!-- AI_REVIEW_START -->'
-          idx = raw.find(sentinel)
-          if idx >= 0:
-              cleaned = raw[idx + len(sentinel):].lstrip('\n')
-          else:
-              m = re.search(r'^#{1,6} ', raw, re.MULTILINE)
-              cleaned = raw[m.start():] if m else ''
+          raw = pathlib.Path('/tmp/review_raw_output.txt').read_text(errors='replace')
+          start = '<!-- AI_REVIEW_START -->'
+          end = '<!-- AI_REVIEW_END -->'
+          start_idx = raw.find(start)
+          end_idx = raw.find(end, start_idx + len(start)) if start_idx >= 0 else -1
+          body = raw[start_idx + len(start):end_idx].strip() if end_idx >= 0 else ''
+          cleaned = body + '\n' if body else ''
           pathlib.Path('/tmp/review_output.txt').write_text(cleaned[:60000])
           "
 
@@ -590,7 +601,11 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           set -euo pipefail
-          if [ -n "$LLM_API_KEY" ] && grep -qF "$LLM_API_KEY" /tmp/review_output.txt 2>/dev/null; then
+          if [ -n "$LLM_API_KEY" ] && grep -qF "$LLM_API_KEY" \
+            review-stderr.log /tmp/review_raw_output.txt /tmp/review_output.txt 2>/dev/null; then
+            : > review-stderr.log
+            : > /tmp/review_raw_output.txt
+            : > /tmp/review_output.txt
             echo "::error::Review output contains LLM_API_KEY; aborting publish."
             exit 1
           fi
@@ -606,9 +621,10 @@ jobs:
             exit 1
           fi
           if [ ! -s /tmp/review_output.txt ]; then
-            echo "::error::AI review produced no publishable output."
+            echo "::error::AI review was incomplete or produced no publishable output."
             exit 1
           fi
+          rm -f /tmp/review_raw_output.txt
 
       - name: Post review comment
         if: >-
@@ -657,6 +673,7 @@ jobs:
           name: ai-review-${{ needs.authorize.outputs.pr_number }}-${{ github.run_id }}
           path: |
             review-stderr.log
+            /tmp/review_raw_output.txt
             /tmp/review_output.txt
           retention-days: 7
           if-no-files-found: ignore
