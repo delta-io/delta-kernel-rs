@@ -492,8 +492,8 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{
-        LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId,
-        ProtocolMetadataLoadSuccess, ProtocolMetadataSource,
+        LogSegmentLoadSuccess, MetricEvent, MetricId, ProtocolMetadataLoadSuccess,
+        ProtocolMetadataSource, SnapshotLoadType,
     };
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
@@ -1975,10 +1975,10 @@ mod tests {
         let events = reporter.events();
         let pm = protocol_metadata_load(&events);
         assert_eq!(pm.source, expected_source);
-        assert_eq!(pm.load_type, LogSegmentLoadType::Full);
+        assert_eq!(pm.load_type, SnapshotLoadType::Full);
 
         let seg = log_segment_load(&events);
-        assert_eq!(seg.load_type, LogSegmentLoadType::Full);
+        assert_eq!(seg.load_type, SnapshotLoadType::Full);
         // The v0-v3 table has 4 commits, no checkpoint or compaction.
         assert_eq!(seg.num_commit_files, 4);
         assert_eq!(seg.num_checkpoint_files, 0);
@@ -2051,9 +2051,9 @@ mod tests {
         let events = reporter.events();
         let pm = protocol_metadata_load(&events);
         assert_eq!(pm.source, expected_source);
-        assert_eq!(pm.load_type, LogSegmentLoadType::Incremental);
+        assert_eq!(pm.load_type, SnapshotLoadType::Incremental);
         let seg = log_segment_load(&events);
-        assert_eq!(seg.load_type, LogSegmentLoadType::Incremental);
+        assert_eq!(seg.load_type, SnapshotLoadType::Incremental);
         Ok(())
     }
 
@@ -2182,7 +2182,7 @@ mod tests {
                 _ => None,
             })
             .expect("expected a LogSegmentLoadFailure");
-        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
+        assert_eq!(failure.load_type, SnapshotLoadType::Incremental);
         assert!(
             !events
                 .iter()
@@ -2220,7 +2220,7 @@ mod tests {
                 _ => None,
             })
             .expect("expected a LogSegmentLoadFailure");
-        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
+        assert_eq!(failure.load_type, SnapshotLoadType::Incremental);
         assert!(
             !events
                 .iter()
@@ -2258,11 +2258,11 @@ mod tests {
         let events = reporter.events();
         assert_eq!(
             log_segment_load(&events).load_type,
-            LogSegmentLoadType::Incremental
+            SnapshotLoadType::Incremental
         );
         assert_eq!(
             protocol_metadata_load(&events).load_type,
-            LogSegmentLoadType::Incremental
+            SnapshotLoadType::Incremental
         );
         Ok(())
     }

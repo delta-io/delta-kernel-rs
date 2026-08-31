@@ -10,6 +10,7 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::to_json_bytes;
+use delta_kernel::metrics::SnapshotLoadType;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
@@ -19,7 +20,7 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
-use test_utils::{insert_data, test_table_setup, test_table_setup_mt};
+use test_utils::{insert_data, test_table_setup, test_table_setup_mt, SnapshotCompletionStatus};
 use url::Url;
 
 use super::{
@@ -44,7 +45,12 @@ fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
     let (engine, reporter, _guard) = measuring_engine(table.store().clone());
     let _snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(
+        reporter
+            .snapshot_completions
+            .get(&(SnapshotCompletionStatus::Success, SnapshotLoadType::Full)),
+        1
+    );
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 2);
     assert_eq!(reporter.checkpoint_files.get(), 0);
@@ -87,7 +93,12 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(
+        reporter
+            .snapshot_completions
+            .get(&(SnapshotCompletionStatus::Success, SnapshotLoadType::Full)),
+        1
+    );
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 1); // only tail commit (v2)
     assert_eq!(reporter.checkpoint_files.get(), 1);
@@ -124,7 +135,12 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> 
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(
+        reporter
+            .snapshot_completions
+            .get(&(SnapshotCompletionStatus::Success, SnapshotLoadType::Full)),
+        1
+    );
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 0);
     assert_eq!(reporter.checkpoint_files.get(), 1);
@@ -182,7 +198,12 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
     let (engine, reporter, _guard) = measuring_engine(store);
     let _snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(
+        reporter
+            .snapshot_completions
+            .get(&(SnapshotCompletionStatus::Success, SnapshotLoadType::Full)),
+        1
+    );
     assert_eq!(reporter.log_segment_loads.get(), 1);
     // ascending_commit_files contains all 4 individual .json files (0, 1, 2, 3)
     assert_eq!(reporter.commit_files.get(), 4);
@@ -215,7 +236,12 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
     let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_root).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(
+        reporter
+            .snapshot_completions
+            .get(&(SnapshotCompletionStatus::Success, SnapshotLoadType::Full)),
+        1
+    );
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 1);
     assert_eq!(reporter.checkpoint_files.get(), 0);
@@ -301,7 +327,12 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
         expected_crc_version
     );
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(
+        reporter
+            .snapshot_completions
+            .get(&(SnapshotCompletionStatus::Success, SnapshotLoadType::Full)),
+        1
+    );
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 3); // v0, v1, v2
 
@@ -346,7 +377,12 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(
+        reporter
+            .snapshot_completions
+            .get(&(SnapshotCompletionStatus::Success, SnapshotLoadType::Full)),
+        1
+    );
     assert_eq!(reporter.log_segment_loads.get(), 1);
     // Checkpoint at v1 -- listing starts from v2; tail is v2, v3, v4
     assert_eq!(reporter.commit_files.get(), 3);

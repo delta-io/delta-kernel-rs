@@ -30,11 +30,13 @@ Built via `Snapshot::builder_for(url).build(engine)` (latest version) or
 `.at_version(v).build(engine)` (specific version). For catalog-managed tables,
 `.with_log_tail(commits)` supplies recent unpublished commits from the catalog and
 `.with_max_catalog_version(v)` caps the snapshot at the latest catalog-ratified version.
+Under `internal-api`, `.with_snapshot_hint(hint)` validates complete caller-supplied state without
+engine log I/O; the connector supplies the version's freshness status.
 
 **Snapshot loading internals:**
-1. **LogSegment** (`kernel/src/log_segment/`): discovers commits + checkpoints for the
-   requested version, replays Protocol and Metadata (`protocol_metadata_replay.rs`), and
-   replays domain metadata (`domain_metadata_replay.rs`)
+1. Ordinary builds discover commits and checkpoints through **LogSegment**
+   (`kernel/src/log_segment/`) and resolve Protocol, Metadata, and domain metadata through CRC
+   state or log replay. Snapshot-hint builds validate and assemble the supplied state instead.
 2. **Log replay** (`kernel/src/log_replay/`): file-action deduplication via
    `FileActionDeduplicator` and `LogReplayProcessor` trait (distinct from Protocol/Metadata
    replay above)

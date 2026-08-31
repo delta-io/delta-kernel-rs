@@ -210,6 +210,7 @@ impl LogSegment {
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
         validate_commit_file_types(&listed_files.ascending_commit_files)?;
         validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
+        validate_and_canonicalize_latest_commit_file(&mut listed_files)?;
 
         // Filter commits before/at checkpoint version
         let checkpoint_version =
@@ -229,7 +230,7 @@ impl LogSegment {
             &listed_files.checkpoint_parts,
             end_version,
         )?;
-        validate_latest_commit_file(&listed_files, effective_version)?;
+        validate_latest_commit_file_version(&listed_files, effective_version)?;
         validate_crc(
             listed_files.latest_crc_file.as_ref(),
             checkpoint_version,
@@ -1508,12 +1509,28 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
     Ok(())
 }
 
+pub(crate) fn validate_log_path_fields(listed_files: &LogSegmentFiles) -> DeltaResult<()> {
+    for path in listed_files.iter_all_paths() {
+        let reparsed = ParsedLogPath::try_from(path.location.clone())?
+            .ok_or_else(|| Error::invalid_log_path(path.location.location.as_str()))?;
+        require!(
+            reparsed == *path,
+            Error::invalid_log_path(format!(
+                "Parsed log path fields do not match its location: {}",
+                path.location.location
+            ))
+        );
+    }
+    Ok(())
+}
+
 fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
     if parts.is_empty() {
         return Ok(());
     }
     let n = parts.len();
     let first_version = parts[0].version;
+    let mut seen_part_numbers = vec![false; n];
     for p in parts {
         if !p.is_checkpoint() {
             return Err(Error::generic(
@@ -1526,7 +1543,27 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
             ));
         }
         match p.file_type {
-            LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts as usize == n => {}
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts,
+            } if num_parts > 1 && num_parts as usize == n => {
+                let index = usize::try_from(part_num)
+                    .ok()
+                    .and_then(|part_num| part_num.checked_sub(1))
+                    .filter(|part_num| *part_num < n)
+                    .ok_or_else(|| {
+                        Error::invalid_checkpoint(format!(
+                            "multi-part checkpoint part number {part_num} is outside 1..={n}"
+                        ))
+                    })?;
+                require!(
+                    !seen_part_numbers[index],
+                    Error::invalid_checkpoint(format!(
+                        "multi-part checkpoint contains duplicate part number {part_num}"
+                    ))
+                );
+                seen_part_numbers[index] = true;
+            }
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } => {
                 return Err(Error::generic(format!(
                     "multi-part checkpoint part count mismatch: slice has {n} parts but num_parts field says {num_parts}"
@@ -1556,7 +1593,7 @@ fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
 
 fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for pair in commits.windows(2) {
-        if pair[0].version + 1 != pair[1].version {
+        if pair[0].version.checked_add(1) != Some(pair[1].version) {
             return Err(Error::generic(format!(
                 "Expected contiguous commit files, but found gap: {:?} -> {:?}",
                 pair[0], pair[1]
@@ -1577,7 +1614,7 @@ fn validate_checkpoint_commit_gap(
 ) -> DeltaResult<()> {
     if let (Some(checkpoint_version), Some(first_commit)) = (checkpoint_version, commits.first()) {
         require!(
-            checkpoint_version + 1 == first_commit.version,
+            checkpoint_version.checked_add(1) == Some(first_commit.version),
             Error::InvalidCheckpoint(format!(
                 "Gap between checkpoint version {checkpoint_version} and next commit {}",
                 first_commit.version
@@ -1614,20 +1651,45 @@ fn validate_end_version(
     Ok(effective_version)
 }
 
-/// Validates the `latest_commit_file` field of a [`LogSegmentFiles`]. Enforces:
+/// Validates and canonicalizes the `latest_commit_file` field of a [`LogSegmentFiles`]. Enforces:
 ///
 /// 1. If `ascending_commit_files` is non-empty, `latest_commit_file` must be `Some`.
-/// 2. If `latest_commit_file` is `Some`, its version must equal `effective_version`.
-fn validate_latest_commit_file(
-    listed: &LogSegmentFiles,
-    effective_version: Version,
-) -> DeltaResult<()> {
+/// 2. If `latest_commit_file` is `Some`, it must be a commit.
+/// 3. If the unfiltered replay tail is non-empty, `latest_commit_file` must logically identify its
+///    final commit. Location and file metadata are not part of logical identity because callers may
+///    use equivalent path representations.
+///
+/// A successful logical match replaces `latest_commit_file` with the replay-tail object so later
+/// reads use its canonical location and metadata.
+fn validate_and_canonicalize_latest_commit_file(listed: &mut LogSegmentFiles) -> DeltaResult<()> {
     require!(
         listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
         Error::internal_error(
             "latest_commit_file must be Some when ascending_commit_files is non-empty"
         )
     );
+    if let Some(commit) = &listed.latest_commit_file {
+        require!(
+            commit.is_commit(),
+            Error::invalid_log_path("latest_commit_file is not a commit")
+        );
+        if let Some(last) = listed.ascending_commit_files.last() {
+            require!(
+                commit.file_type == last.file_type
+                    && commit.version == last.version
+                    && commit.filename == last.filename,
+                Error::invalid_log_path("latest_commit_file differs from replay tail")
+            );
+            listed.latest_commit_file = Some(last.clone());
+        }
+    }
+    Ok(())
+}
+
+fn validate_latest_commit_file_version(
+    listed: &LogSegmentFiles,
+    effective_version: Version,
+) -> DeltaResult<()> {
     if let Some(commit) = &listed.latest_commit_file {
         require!(
             commit.version == effective_version,
@@ -1650,6 +1712,10 @@ fn validate_crc(
     let Some(crc) = crc else {
         return Ok(());
     };
+    require!(
+        crc.file_type == LogPathFileType::Crc,
+        Error::invalid_log_path("latest_crc_file contains a non-CRC path")
+    );
     if let Some(checkpoint_version) = checkpoint_version {
         require!(
             crc.version >= checkpoint_version,

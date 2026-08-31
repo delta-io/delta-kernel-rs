@@ -323,27 +323,39 @@ impl fmt::Display for MetricEvent {
 
 pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 
-/// The kind of log-segment load: a full listing from the base up to the target, or an
-/// incremental listing of the commits above an existing segment.
+/// How the snapshot was constructed.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    EnumString,
+    StrumDisplay,
+    AsRefStr,
+    IntoStaticStr,
 )]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
-pub enum LogSegmentLoadType {
+pub enum SnapshotLoadType {
     /// The segment was listed from its base (a checkpoint, else version 0) up to the target. A
     /// fresh snapshot build (`LogSegment::for_snapshot`) reads this way.
     Full,
     /// The segment was listed as a delta above an existing base. An incremental snapshot update
     /// (`Snapshot::try_new_from`) reads only the commits above the existing snapshot.
     Incremental,
+    /// The snapshot was constructed from complete caller-supplied state without asking the engine
+    /// to list or read Delta log files.
+    SnapshotHint,
     /// Decode fell back here because the span's `load_type` field was unset or unrecognized.
     /// Kernel never emits this deliberately.
     #[default]
     Unknown,
 }
 
-impl LogSegmentLoadType {
+impl SnapshotLoadType {
     fn parse_or_unknown(s: &str) -> Self {
         if s.is_empty() {
             return Self::Unknown;
@@ -365,7 +377,7 @@ pub struct LogSegmentLoadSuccess {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
     pub num_commit_files: u64,
     pub num_checkpoint_files: u64,
     pub num_compaction_files: u64,
@@ -395,7 +407,7 @@ impl LogSegmentLoadSuccess {
             operation_id: MetricId::nil(),
             correlation_id: None,
             table_type: TableType::from_catalog_managed(false),
-            load_type: LogSegmentLoadType::default(),
+            load_type: SnapshotLoadType::default(),
             num_commit_files: 0,
             num_checkpoint_files: 0,
             num_compaction_files: 0,
@@ -421,7 +433,7 @@ impl Visit for LogSegmentLoadSuccess {
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
             CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
-            "load_type" => self.load_type = LogSegmentLoadType::parse_or_unknown(value),
+            "load_type" => self.load_type = SnapshotLoadType::parse_or_unknown(value),
             _ => {}
         }
     }
@@ -481,7 +493,7 @@ pub struct LogSegmentLoadFailure {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 }
 
 impl fmt::Display for LogSegmentLoadFailure {
@@ -542,7 +554,7 @@ pub struct ProtocolMetadataLoadSuccess {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
     pub source: ProtocolMetadataSource,
     pub duration: Duration,
 }
@@ -557,7 +569,7 @@ impl ProtocolMetadataLoadSuccess {
             operation_id: MetricId::nil(),
             correlation_id: None,
             table_type: TableType::from_catalog_managed(false),
-            load_type: LogSegmentLoadType::default(),
+            load_type: SnapshotLoadType::default(),
             source: ProtocolMetadataSource::Unknown,
             duration: Duration::ZERO,
         }
@@ -580,7 +592,7 @@ impl Visit for ProtocolMetadataLoadSuccess {
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
             CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
-            "load_type" => self.load_type = LogSegmentLoadType::parse_or_unknown(value),
+            "load_type" => self.load_type = SnapshotLoadType::parse_or_unknown(value),
             "pm_source" => self.source = ProtocolMetadataSource::parse_or_unknown(value),
             _ => {}
         }
@@ -626,7 +638,7 @@ pub struct ProtocolMetadataLoadFailure {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 }
 
 impl fmt::Display for ProtocolMetadataLoadFailure {
@@ -655,7 +667,7 @@ pub struct SnapshotBuildSuccess {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 
     // === Set during span lifetime ===
     pub version: u64,
@@ -722,7 +734,7 @@ pub struct SnapshotBuildFailure {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 }
 
 impl fmt::Display for SnapshotBuildFailure {
@@ -1273,7 +1285,7 @@ pub struct SnapshotLoadMetricContext {
     pub(crate) operation_id: MetricId,
     pub(crate) correlation_id: Option<Arc<str>>,
     pub(crate) is_catalog_managed: bool,
-    pub(crate) load_type: LogSegmentLoadType,
+    pub(crate) load_type: SnapshotLoadType,
 }
 
 #[cfg(test)]
@@ -1285,7 +1297,7 @@ impl SnapshotLoadMetricContext {
             operation_id: MetricId::nil(),
             correlation_id: None,
             is_catalog_managed: false,
-            load_type: LogSegmentLoadType::default(),
+            load_type: SnapshotLoadType::default(),
         }
     }
 }
@@ -1345,13 +1357,13 @@ pub(crate) fn correlation_id_from_attrs(attrs: &Attributes<'_>) -> Option<Arc<st
     v.0
 }
 
-pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> LogSegmentLoadType {
+pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> SnapshotLoadType {
     #[derive(Default)]
-    struct V(LogSegmentLoadType);
+    struct V(SnapshotLoadType);
     impl Visit for V {
         fn record_str(&mut self, field: &Field, value: &str) {
             if field.name() == "load_type" {
-                self.0 = LogSegmentLoadType::parse_or_unknown(value);
+                self.0 = SnapshotLoadType::parse_or_unknown(value);
             }
         }
         fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
@@ -1926,27 +1938,28 @@ mod tests {
     }
 
     #[rstest]
-    #[case::full(LogSegmentLoadType::Full, "full")]
-    #[case::incremental(LogSegmentLoadType::Incremental, "incremental")]
-    #[case::unknown(LogSegmentLoadType::Unknown, "unknown")]
-    fn log_segment_load_type_serializes_to_wire_name_and_parses_back(
-        #[case] load_type: LogSegmentLoadType,
+    #[case::full(SnapshotLoadType::Full, "full")]
+    #[case::incremental(SnapshotLoadType::Incremental, "incremental")]
+    #[case::snapshot_hint(SnapshotLoadType::SnapshotHint, "snapshot_hint")]
+    #[case::unknown(SnapshotLoadType::Unknown, "unknown")]
+    fn snapshot_load_type_serializes_to_wire_name_and_parses_back(
+        #[case] load_type: SnapshotLoadType,
         #[case] wire: &str,
     ) {
         let serialized: &'static str = load_type.into();
         assert_eq!(serialized, wire);
-        assert_eq!(LogSegmentLoadType::from_str(wire).unwrap(), load_type);
+        assert_eq!(SnapshotLoadType::from_str(wire).unwrap(), load_type);
     }
 
     #[rstest]
-    #[case::known("incremental", LogSegmentLoadType::Incremental)]
-    #[case::empty_maps_to_unknown("", LogSegmentLoadType::Unknown)]
-    #[case::unrecognized_maps_to_unknown("totally_unknown", LogSegmentLoadType::Unknown)]
-    fn log_segment_load_type_parse_or_unknown(
+    #[case::known("incremental", SnapshotLoadType::Incremental)]
+    #[case::empty_maps_to_unknown("", SnapshotLoadType::Unknown)]
+    #[case::unrecognized_maps_to_unknown("totally_unknown", SnapshotLoadType::Unknown)]
+    fn snapshot_load_type_parse_or_unknown(
         #[case] value: &str,
-        #[case] expected: LogSegmentLoadType,
+        #[case] expected: SnapshotLoadType,
     ) {
-        assert_eq!(LogSegmentLoadType::parse_or_unknown(value), expected);
+        assert_eq!(SnapshotLoadType::parse_or_unknown(value), expected);
     }
 
     #[rstest]
@@ -2028,7 +2041,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: Some("snap-req-3".into()),
-            load_type: LogSegmentLoadType::Incremental,
+            load_type: SnapshotLoadType::Incremental,
             version: 0,
             duration: Duration::default(),
         };
@@ -2038,6 +2051,6 @@ mod tests {
             panic!("expected SnapshotBuildFailure");
         };
         assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
-        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
+        assert_eq!(failure.load_type, SnapshotLoadType::Incremental);
     }
 }
