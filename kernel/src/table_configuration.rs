@@ -32,9 +32,10 @@ use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
-    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION, V2_VALIDATOR, V3_VALIDATOR,
+    FeatureType, IcebergCompatValidationContext, KernelSupport, Operation, TableFeature,
+    LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V2_VALIDATOR,
+    V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -232,8 +233,16 @@ impl TableConfiguration {
         // Reject tables with geo-typed columns that don't declare the `geospatial` feature.
         #[cfg(feature = "geo-type-in-dev")]
         validate_geospatial_feature_support(&table_config)?;
-        validate_iceberg_compat_if_needed(&table_config, &V2_VALIDATOR)?;
-        validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
+        validate_iceberg_compat_if_needed(
+            &table_config,
+            &V2_VALIDATOR,
+            IcebergCompatValidationContext::TableConfiguration,
+        )?;
+        validate_iceberg_compat_if_needed(
+            &table_config,
+            &V3_VALIDATOR,
+            IcebergCompatValidationContext::TableConfiguration,
+        )?;
 
         Ok(table_config)
     }
@@ -1784,7 +1793,6 @@ mod test {
             .build();
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
-        // Type Widening is not supported for writes
         let config = MockTableConfigurationBuilder::new()
             .with_protocol(
                 MockProtocolBuilder::new()
@@ -1792,10 +1800,7 @@ mod test {
                     .build(),
             )
             .build();
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            r#"Feature 'typeWidening' is not supported for writes"#,
-        );
+        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
         #[cfg(feature = "geo-type-in-dev")]
         {

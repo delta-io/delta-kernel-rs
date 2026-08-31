@@ -3,6 +3,7 @@ name: architecture-reviewer
 description: 'Reviews the SHAPE of a change: abstractions, API surface, bloat.'
 executor:
   type: omnigent
+  model: default
   config:
     harness: claude-sdk
 prompt: |

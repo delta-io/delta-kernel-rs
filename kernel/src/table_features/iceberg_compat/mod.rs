@@ -3,7 +3,7 @@
 //! Each `delta.enableIcebergCompatV{N}` version owns a submodule (currently
 //! [`v2`] and [`v3`]), and exposes a single
 //! `pub(crate) const V{N}_VALIDATOR: IcebergCompatValidator`. Callers feed that
-//! constant to [`validate_iceberg_compat_if_needed`].
+//! constant and the validation context to [`validate_iceberg_compat_if_needed`].
 
 pub(crate) mod v2;
 pub(crate) mod v3;
@@ -29,8 +29,46 @@ impl IcebergCompatVersion {
     }
 }
 
+type IcebergCompatCheckFn = fn(&TableConfiguration) -> DeltaResult<()>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergCompatValidationContext {
+    TableConfiguration,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IcebergCompatCheckMode {
+    Always,
+    WriteOnly,
+}
+
 /// A single invariant that must hold when an icebergCompat version is enabled.
-pub(crate) type IcebergCompatCheck = fn(&TableConfiguration) -> DeltaResult<()>;
+pub(crate) struct IcebergCompatCheck {
+    mode: IcebergCompatCheckMode,
+    check: IcebergCompatCheckFn,
+}
+
+impl IcebergCompatCheck {
+    pub(super) const fn always(check: IcebergCompatCheckFn) -> Self {
+        Self {
+            mode: IcebergCompatCheckMode::Always,
+            check,
+        }
+    }
+
+    pub(super) const fn write_only(check: IcebergCompatCheckFn) -> Self {
+        Self {
+            mode: IcebergCompatCheckMode::WriteOnly,
+            check,
+        }
+    }
+
+    fn runs_in(&self, context: IcebergCompatValidationContext) -> bool {
+        self.mode == IcebergCompatCheckMode::Always
+            || context == IcebergCompatValidationContext::Write
+    }
+}
 
 /// Pairs an [`IcebergCompatVersion`] with the ordered list of invariants that
 /// run when that version is enabled.
@@ -42,12 +80,15 @@ pub(crate) struct IcebergCompatValidator {
 pub(crate) fn validate_iceberg_compat_if_needed(
     tc: &TableConfiguration,
     validator: &IcebergCompatValidator,
+    context: IcebergCompatValidationContext,
 ) -> DeltaResult<()> {
     if !tc.is_feature_enabled(&validator.version.as_table_feature()) {
         return Ok(());
     }
     for check in validator.checks {
-        check(tc)?;
+        if check.runs_in(context) {
+            (check.check)(tc)?;
+        }
     }
     Ok(())
 }

@@ -3,6 +3,7 @@ name: delta-protocol-reviewer
 description: 'Audits changes for Delta protocol compliance.'
 executor:
   type: omnigent
+  model: default
   config:
     harness: claude-sdk
 prompt: |

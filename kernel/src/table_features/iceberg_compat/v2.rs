@@ -16,7 +16,10 @@ pub(crate) const V2_VALIDATOR: IcebergCompatValidator = IcebergCompatValidator {
     checks: V2_CHECKS,
 };
 
-const V2_CHECKS: &[IcebergCompatCheck] = &[check_v2_supported_types, check_no_legacy_nested_ids];
+const V2_CHECKS: &[IcebergCompatCheck] = &[
+    IcebergCompatCheck::always(check_v2_supported_types),
+    IcebergCompatCheck::always(check_no_legacy_nested_ids),
+];
 
 fn is_v2_supported_type(dt: &DataType) -> bool {
     matches!(

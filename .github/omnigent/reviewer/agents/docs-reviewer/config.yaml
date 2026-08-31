@@ -3,6 +3,7 @@ name: docs-reviewer
 description: 'Checks docs/comments are accurate and consistent with code.'
 executor:
   type: omnigent
+  model: default
   config:
     harness: claude-sdk
 prompt: |

@@ -458,7 +458,8 @@ mod tests {
     #[case("'2024-01-01 12:34:56'", "zoneless")]
     #[case("TIMESTAMP '2024-01-01 12:34:56'", "zoneless")]
     #[case("'2024-06-15T14:30:00+05:00'", "offset")]
-    #[case("'2024-06-15T14:30:00+00:00'", "offset")] // +00:00 is UTC-valued but dropped, so rejected
+    #[case("'2024-06-15T14:30:00+00:00'", "offset")] // +00:00 is UTC-valued but dropped, so
+                                                     // rejected
     fn timestamp_ltz_rejection_distinguishes_zoneless_from_offset(
         #[case] sql: &str,
         #[case] needle: &str,
@@ -491,7 +492,8 @@ mod tests {
     #[rstest]
     #[case("TIMESTAMP_NTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP)] // NTZ keyword, LTZ target
     #[case("TIMESTAMP '2024-01-01 12:34:56'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ target
-    #[case("TIMESTAMP_LTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ target
+    #[case("TIMESTAMP_LTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ
+                                                                             // target
     fn rejects_mismatched_timestamp_keyword(#[case] sql: &str, #[case] ty: DataType) {
         let result = parse_sql(sql, &ty);
         assert!(
@@ -508,7 +510,8 @@ mod tests {
     #[case("'2024-06-15T14:30:00Z'", "2024-06-15 14:30:00")]
     #[case("TIMESTAMP '2024-06-15T14:30:00.456Z'", "2024-06-15 14:30:00.456")]
     #[case("TIMESTAMP_LTZ '2024-06-15T14:30:00Z'", "2024-06-15 14:30:00")] // explicit LTZ spelling
-    #[case("TIMESTAMP_LTZ'1970-01-01T00:00:00.123Z'", "1970-01-01 00:00:00.123")] // butted against quote
+    #[case("TIMESTAMP_LTZ'1970-01-01T00:00:00.123Z'", "1970-01-01 00:00:00.123")] // butted against
+                                                                                  // quote
     fn iso_8601_form_accepted_only_for_timestamp(#[case] sql: &str, #[case] equivalent: &str) {
         let got = parse_sql(sql, &DataType::TIMESTAMP).unwrap();
         assert_eq!(got, lit(Scalar::Timestamp(ts_micros(equivalent))));
