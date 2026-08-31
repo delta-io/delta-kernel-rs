@@ -2034,7 +2034,8 @@ mod tests {
                 false,
             ),
         ];
-        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from version 0
+        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from
+                                                                           // version 0
 
         // Create commit without ICT despite being enabled (corrupt case)
         let commit_missing_ict = [create_commit_info(1234567890, None)];

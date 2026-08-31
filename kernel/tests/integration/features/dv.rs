@@ -275,7 +275,8 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     dv_file1_second.add_deleted_row_indexes([FILE1_SECOND_DELETE_INDEX]); // Additional deletion
 
     let mut dv_file2 = KernelDeletionVector::new();
-    dv_file2.add_deleted_row_indexes(FILE2_DELETE_INDEXES); // Delete rows at indices 2 and 5 (ids 12, 15)
+    dv_file2.add_deleted_row_indexes(FILE2_DELETE_INDEXES); // Delete rows at indices 2 and 5 (ids
+                                                            // 12, 15)
 
     // Step 8: Update deletion vectors for both files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
