@@ -21,7 +21,9 @@ use crate::log_replay::{
     ParallelLogReplayProcessor,
 };
 use crate::log_segment::CheckpointReadInfo;
-use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::scan::transform_spec::{
+    get_transform_expr, parse_partition_values, FileRowTrackingMetadata, TransformSpec,
+};
 use crate::schema::{
     lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
@@ -189,8 +191,9 @@ impl ScanLogReplayProcessor {
     const ADD_SIZE_INDEX: usize = 2; // Position of "add.size" in getters
     const ADD_DV_START_INDEX: usize = 3; // Start position of add deletion vector columns
     const BASE_ROW_ID_INDEX: usize = 6; // Position of add.baseRowId in getters
-    const REMOVE_PATH_INDEX: usize = 7; // Position of "remove.path" in getters
-    const REMOVE_DV_START_INDEX: usize = 8; // Start position of remove deletion vector columns
+    const DEFAULT_ROW_COMMIT_VERSION_INDEX: usize = 7;
+    const REMOVE_PATH_INDEX: usize = 8; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 9; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
     pub(crate) fn new(
@@ -599,8 +602,8 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // action type:
         // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
         //   3-5
-        // - For Remove actions (in log batches only): path is at index 7, followed by DV fields at
-        //   indexes 8-10
+        // - For Remove actions (in log batches only): path is at index 8, followed by DV fields at
+        //   indexes 9-11
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.
@@ -658,6 +661,9 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         if !self.state_info.skip_row_transforms {
             let base_row_id: Option<i64> =
                 getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
+            let default_row_commit_version: Option<i64> = getters
+                [ScanLogReplayProcessor::DEFAULT_ROW_COMMIT_VERSION_INDEX]
+                .get_opt(row, "add.defaultRowCommitVersion")?;
             let patch_expr = self
                 .state_info
                 .transform_spec
@@ -667,7 +673,10 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
                         transform_spec,
                         partition_values,
                         &self.state_info.physical_schema,
-                        base_row_id,
+                        FileRowTrackingMetadata {
+                            base_row_id,
+                            default_row_commit_version,
+                        },
                     )
                 })
                 .transpose()?;
@@ -698,6 +707,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
                 (LONG, column_name!("add.baseRowId")),
+                (LONG, column_name!("add.defaultRowCommitVersion")),
                 (STRING, column_name!("remove.path")),
                 (STRING, column_name!("remove.deletionVector.storageType")),
                 (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
@@ -721,7 +731,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let start = std::time::Instant::now();
 
         let is_log_batch = self.deduplicator.is_log_batch();
-        let expected_getters = if is_log_batch { 11 } else { 7 };
+        let expected_getters = if is_log_batch { 12 } else { 8 };
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
@@ -1175,7 +1185,7 @@ mod tests {
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
-        add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
+        add_batch_for_row_tracking, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
@@ -1394,7 +1404,7 @@ mod tests {
             "row_indexes_for_row_id_0",
         );
 
-        let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
+        let batch = vec![add_batch_for_row_tracking(get_commit_schema().clone())];
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
@@ -1433,6 +1443,61 @@ mod tests {
                 panic!("Should have been a StructPatch expression");
             }
         }
+    }
+
+    #[test]
+    fn test_row_commit_version_patch() -> DeltaResult<()> {
+        let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            ROW_TRACKING_FEATURES,
+            [
+                ("delta.enableRowTracking", "true"),
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "row_commit_version_col",
+                ),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+            vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
+        )?;
+        let batch = add_batch_for_row_tracking(get_commit_schema().clone());
+        let (iter, _metrics) = scan_action_iter(
+            &SyncEngine::new(),
+            [Ok(ActionsBatch::new(batch, true))].into_iter(),
+            Arc::new(state_info),
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )?;
+
+        for scan_metadata in iter {
+            let transforms = scan_metadata?.scan_file_transforms;
+            assert_eq!(transforms.len(), 1);
+            let Some(Expr::StructPatch(patch)) = transforms[0].as_ref().map(Arc::as_ref) else {
+                panic!("Expected a StructPatch expression");
+            };
+            let row_commit_version_patch = patch
+                .field_patches
+                .get("row_commit_version_col")
+                .expect("Should have row_commit_version_col patch");
+            assert_eq!(
+                row_commit_version_patch.insertions,
+                [Arc::new(Expr::coalesce([
+                    col!("row_commit_version_col"),
+                    lit(5i64),
+                ]))]
+            );
+        }
+        Ok(())
     }
 
     #[test]

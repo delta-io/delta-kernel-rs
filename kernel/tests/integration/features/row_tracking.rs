@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
-use delta_kernel::arrow::datatypes::{Int32Type, Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field, Int32Type, Int64Type, Schema as ArrowSchema,
+};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -20,9 +22,10 @@ use tempfile::{tempdir, TempDir};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    begin_transaction, collect_row_ids, create_default_engine_mt_executor, create_table,
-    engine_store_setup, load_and_begin_transaction, read_actions_from_commit, read_add_infos,
-    read_scan, test_read,
+    add_commit, begin_transaction, collect_row_ids, create_default_engine_mt_executor,
+    create_table, engine_store_setup, get_materialized_row_tracking_column_names,
+    load_and_begin_transaction, read_actions_from_commit, read_add_infos, read_scan,
+    record_batch_to_bytes, test_read,
 };
 use url::Url;
 
@@ -866,6 +869,19 @@ fn read_row_id_scan(
     read_scan(&scan, engine)
 }
 
+fn read_row_commit_version_scan(
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn delta_kernel::Engine>,
+) -> DeltaResult<Vec<RecordBatch>> {
+    let scan_schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("row_commit_version", MetadataColumnSpec::RowCommitVersion)?,
+    );
+    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
+    read_scan(&scan, engine)
+}
+
 /// Basic read: write one file with 3 rows, verify row IDs are sequential starting from 0.
 #[tokio::test]
 async fn test_read_row_ids_basic() -> DeltaResult<()> {
@@ -886,6 +902,101 @@ async fn test_read_row_ids_basic() -> DeltaResult<()> {
     row_ids.sort_unstable();
     assert_eq!(row_ids, vec![0, 1, 2], "Row IDs must be sequential from 0");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_read_row_commit_versions_use_add_action_defaults() -> DeltaResult<()> {
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_commit_versions").await?;
+
+    let first_commit = generate_data(schema.clone(), [vec![int32_array(vec![10, 20])]])?;
+    write_data_to_table(&table_url, engine.clone(), first_commit)
+        .await?
+        .unwrap_committed();
+    let second_commit = generate_data(schema, [vec![int32_array(vec![30])]])?;
+    write_data_to_table(&table_url, engine.clone(), second_commit)
+        .await?
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let batches = read_row_commit_version_scan(snapshot, engine)?;
+    let mut actual = HashMap::new();
+    for batch in batches {
+        let numbers = batch
+            .column_by_name("number")
+            .expect("number column not found")
+            .as_primitive::<Int32Type>();
+        let row_commit_versions = batch
+            .column_by_name("row_commit_version")
+            .expect("row_commit_version column not found")
+            .as_primitive::<Int64Type>();
+        for row in 0..batch.num_rows() {
+            actual.insert(numbers.value(row), row_commit_versions.value(row));
+        }
+    }
+
+    assert_eq!(actual, HashMap::from([(10, 1), (20, 1), (30, 2)]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_read_row_commit_versions_prefer_materialized_values(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp_dir = tempdir()?;
+    let (_schema, table_url, engine, store) =
+        setup_number_table(&tmp_dir, "test_read_materialized_row_commit_versions").await?;
+    let materialized_column_name = get_materialized_row_tracking_column_names(&table_url, 0)?
+        .row_commit_version_column_name
+        .ok_or_else(|| Error::generic("Materialized Row Commit Version column name not found"))?;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("number", ArrowDataType::Int32, true),
+            Field::new(&materialized_column_name, ArrowDataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(Int64Array::from(vec![Some(7), None])),
+        ],
+    )?;
+    let parquet_bytes = record_batch_to_bytes(&batch);
+    let parquet_size = parquet_bytes.len();
+    let data_path = "materialized-row-commit-versions.parquet";
+    let data_url = table_url.join(data_path)?;
+    store
+        .put(&Path::from_url_path(data_url.path())?, parquet_bytes.into())
+        .await?;
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        format!(
+            r#"{{"domainMetadata":{{"domain":"delta.rowTracking","configuration":"{{\"rowIdHighWaterMark\":1}}","removed":false}}}}
+{{"add":{{"path":"{data_path}","partitionValues":{{}},"size":{},"modificationTime":0,"dataChange":true,"baseRowId":0,"defaultRowCommitVersion":1}}}}"#,
+            parquet_size
+        ),
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let batches = read_row_commit_version_scan(snapshot, engine)?;
+    let mut actual = HashMap::new();
+    for batch in batches {
+        let numbers = batch
+            .column_by_name("number")
+            .expect("number column not found")
+            .as_primitive::<Int32Type>();
+        let row_commit_versions = batch
+            .column_by_name("row_commit_version")
+            .expect("row_commit_version column not found")
+            .as_primitive::<Int64Type>();
+        for row in 0..batch.num_rows() {
+            actual.insert(numbers.value(row), row_commit_versions.value(row));
+        }
+    }
+
+    assert_eq!(actual, HashMap::from([(10, 7), (20, 1)]));
     Ok(())
 }
 
@@ -1088,7 +1199,8 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
     Ok(())
 }
 
-/// After checkpoint: row IDs survive a checkpoint and new writes continue from the high watermark.
+/// Row IDs and Row Commit Versions survive a checkpoint, and later writes continue from the high
+/// watermark.
 ///
 /// Uses a multi-threaded runtime and `TokioMultiThreadExecutor` for checkpoint because
 /// `checkpoint()` consumes a lazy iterator inside a `block_on()` future where each item read
@@ -1097,7 +1209,7 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
 /// instead, which requires a multi-threaded runtime to delegate work to other workers.
 /// Writes use the standard `TokioBackgroundExecutor` engine, matching all other tests in this file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
+async fn test_read_row_tracking_values_after_checkpoint() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir()?;
     let (schema, table_url, engine, _store) =
@@ -1117,7 +1229,7 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
 
     // Fresh snapshot loaded from the checkpoint must return the same row IDs.
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
-    let batches = read_row_id_scan(fresh_snapshot, mt_engine.clone())?;
+    let batches = read_row_id_scan(fresh_snapshot.clone(), mt_engine.clone())?;
 
     let mut ids_after_ckpt = collect_row_ids(&batches);
     ids_after_ckpt.sort_unstable();
@@ -1126,6 +1238,16 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
         vec![0, 1, 2],
         "Row IDs must be unchanged after loading from checkpoint"
     );
+
+    let row_commit_version_batches =
+        read_row_commit_version_scan(fresh_snapshot, mt_engine.clone())?;
+    for batch in row_commit_version_batches {
+        let row_commit_versions = batch
+            .column_by_name("row_commit_version")
+            .expect("row_commit_version column not found")
+            .as_primitive::<Int64Type>();
+        assert!(row_commit_versions.iter().all(|version| version == Some(1)));
+    }
 
     // Write 2 more rows -> must continue from watermark, no resets or duplicates.
     let data2 = generate_data(schema.clone(), [vec![int32_array(vec![4, 5])]])?;
