@@ -30,6 +30,8 @@ pub use partition_value::{
     partition_value_map_new, ExclusivePartitionValueMap,
 };
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::engine_funcs::FileMeta;
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::scan::EngineSchema;
@@ -273,6 +275,42 @@ fn with_domain_metadata_removed_impl(
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
+}
+
+/// Commits `file` as this transaction's root manifest.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[no_mangle]
+pub unsafe extern "C" fn with_external_root_manifest(
+    txn: Handle<ExclusiveTransaction>,
+    file: &FileMeta,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_external_root_manifest_impl(*txn, file).into_extern_result(&engine)
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn with_external_root_manifest_impl(
+    txn: Transaction,
+    file: &FileMeta,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
+    let location = Url::parse(path)?;
+    let size = file
+        .size
+        .try_into()
+        .map_err(|_| delta_kernel::Error::generic("manifest size does not fit a FileSize"))?;
+    let delta_file = delta_kernel::FileMeta {
+        location,
+        last_modified: file.last_modified,
+        size,
+    };
+    Ok(Box::new(txn.with_external_root_manifest(delta_file)?).into())
 }
 
 /// Add file metadata to the transaction for files that have been written. The metadata contains
@@ -2180,6 +2218,37 @@ mod tests {
 
         unsafe { free_schema(snap_schema) };
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn test_with_external_root_manifest_requires_the_feature(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_external_root_manifest", None);
+        let (table_path, engine, builder) = create_table_builder(
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        build_and_commit(builder, &engine);
+
+        let table_path_str = table_path.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+
+        let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
+        let file = FileMeta {
+            path: kernel_string_slice!(manifest_path),
+            last_modified: 0,
+            size: 1024,
+        };
+        let result = unsafe { with_external_root_manifest(txn, &file, engine.shallow_copy()) };
+        assert!(matches!(result, ExternResult::Err(_)));
+
         unsafe { free_engine(engine) };
         Ok(())
     }

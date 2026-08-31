@@ -1346,6 +1346,15 @@ fn is_scheme_char(ch: char, position: usize) -> bool {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl ContentRoot {
+    /// Builds a reference to a root manifest at `path`, `size_in_bytes`, reflecting `version`.
+    pub(crate) fn new(path: String, size_in_bytes: i64, version: i64) -> Self {
+        ContentRoot {
+            path,
+            size_in_bytes,
+            version,
+        }
+    }
+
     /// Convert this root manifest reference into a [`FileMeta`] for engine I/O.
     ///
     /// A `path` with a URI scheme is absolute and used as-is; otherwise it is resolved relative to

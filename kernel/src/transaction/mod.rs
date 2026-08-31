@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LOG_CHECKPOINT_SCHEMA;
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
@@ -16,6 +18,8 @@ use crate::actions::{
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::crc::merge_domain_metadata;
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
@@ -71,6 +75,8 @@ pub use alter_table::AlterTableTransaction;
 mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod external_root_manifest;
 pub(crate) mod schema_evolution;
 #[cfg(feature = "internal-api")]
 pub mod stats_verifier;
@@ -81,6 +87,8 @@ mod write_state;
 mod write_validation;
 
 pub use bound_write_context::BoundWriteContext;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use external_root_manifest::ExternalRootManifest;
 use stats_verifier::StatsColumnVerifier;
 pub use write_state::WriteState;
 
@@ -252,6 +260,9 @@ pub struct Transaction<S = ExistingTable> {
     dv_matched_files: Vec<FilteredEngineData>,
     // Count of files whose deletion vector was updated.
     num_dv_updates: usize,
+    // Caller-supplied root manifest to commit, set via with_external_root_manifest().
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    external_root_manifest: Option<ExternalRootManifest>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -383,6 +394,8 @@ impl<S> Transaction<S> {
         self.validate_blind_append_semantics()?;
         self.validate_append_only_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.validate_external_root_manifest_semantics()?;
 
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
@@ -487,6 +500,56 @@ impl<S> Transaction<S> {
         let remove_actions =
             self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
 
+        // Step 6b: checkpoint action for an external root manifest commit, if configured.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let checkpoint_action = self
+            .external_root_manifest
+            .as_ref()
+            .map(|external_root| {
+                let read_snapshot = self.read_snapshot()?;
+                let (domain_metadata, transactions, existing_checkpoint_action) =
+                    read_snapshot.scan_non_content_metadata(engine)?;
+
+                let mut domain_metadata: HashMap<String, DomainMetadata> = domain_metadata
+                    .into_iter()
+                    .map(|dm| (dm.domain().to_string(), dm))
+                    .collect();
+                merge_domain_metadata(
+                    &mut domain_metadata,
+                    dm_changes
+                        .iter()
+                        .cloned()
+                        .map(|dm| (dm.domain().to_string(), dm)),
+                );
+                let domain_metadata: Vec<DomainMetadata> = domain_metadata.into_values().collect();
+
+                let mut transactions: HashMap<String, SetTransaction> = transactions
+                    .into_iter()
+                    .map(|txn| (txn.app_id.clone(), txn))
+                    .collect();
+                transactions.extend(
+                    self.set_transactions
+                        .iter()
+                        .cloned()
+                        .map(|txn| (txn.app_id.clone(), txn)),
+                );
+                let transactions: Vec<SetTransaction> = transactions.into_values().collect();
+
+                let action = external_root.checkpoint_action(
+                    existing_checkpoint_action.as_ref(),
+                    read_snapshot.version(),
+                    commit_version,
+                    self.effective_table_config.protocol().clone(),
+                    self.effective_table_config.metadata().clone(),
+                    domain_metadata,
+                    transactions,
+                )?;
+                action.into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), engine)
+            })
+            .transpose()?;
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let checkpoint_action: Option<Box<dyn EngineData>> = None;
+
         // Build the action chain
         // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata
         // -> removes For existing table: CommitInfo -> adds -> txns -> domain_metadata ->
@@ -494,6 +557,7 @@ impl<S> Transaction<S> {
         let actions = iter::once(commit_info_action)
             .chain(protocol_action.map(Ok))
             .chain(metadata_action.map(Ok))
+            .chain(checkpoint_action.map(Ok))
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
@@ -786,6 +850,19 @@ impl<S> Transaction<S> {
             Error::invalid_transaction_state("Blind append cannot update deletion vectors")
         );
 
+        Ok(())
+    }
+
+    /// Validate that an external root manifest commit has no file actions.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn validate_external_root_manifest_semantics(&self) -> DeltaResult<()> {
+        if self.external_root_manifest.is_none() {
+            return Ok(());
+        }
+        require!(
+            !self.has_data_file_actions(),
+            Error::generic("external root manifest commit cannot include file actions")
+        );
         Ok(())
     }
 
@@ -2876,6 +2953,37 @@ mod tests {
         add_dummy_file(&mut txn);
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn dummy_external_root_manifest() -> DeltaResult<ExternalRootManifest> {
+        Ok(ExternalRootManifest {
+            file: FileMeta {
+                location: Url::parse("memory:///table/metadata/root-v1.parquet")?,
+                last_modified: 0,
+                size: 1024,
+            },
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_validate_external_root_manifest_success() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn.external_root_manifest = Some(dummy_external_root_manifest()?);
+        txn.validate_external_root_manifest_semantics()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_validate_external_root_manifest_rejects_file_actions() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn.external_root_manifest = Some(dummy_external_root_manifest()?);
+        add_dummy_file(&mut txn);
+        let result = txn.validate_external_root_manifest_semantics();
+        assert!(result.is_err());
         Ok(())
     }
 

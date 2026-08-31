@@ -16,6 +16,8 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use super::external_root_manifest::ExternalRootManifest;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
@@ -38,6 +40,8 @@ use crate::table_features::{
     V3_VALIDATOR,
 };
 use crate::utils::current_time_ms;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::FileMeta;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -109,6 +113,8 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            external_root_manifest: None,
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })
@@ -146,6 +152,14 @@ impl Transaction {
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
+    }
+
+    /// Commits `file` as the table's root manifest.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub fn with_external_root_manifest(mut self, file: FileMeta) -> DeltaResult<Self> {
+        let commit = ExternalRootManifest::new(file, self.read_snapshot()?)?;
+        self.external_root_manifest = Some(commit);
+        Ok(self)
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to

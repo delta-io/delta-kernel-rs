@@ -10,6 +10,13 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::visitors::{DomainMetadataVisitor, SetTransactionVisitor};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{
+    CheckpointAction, SetTransaction, CHECKPOINT_ACTION_FIELD, DOMAIN_METADATA_FIELD,
+    SET_TRANSACTION_FIELD,
+};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -30,12 +37,16 @@ use crate::metrics::{
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::schema::StructType;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::RowVisitor as _;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
 mod builder;
@@ -743,6 +754,76 @@ impl Snapshot {
             .into_values()
             .filter(|domain| !domain.is_internal())
             .collect())
+    }
+
+    /// Domain metadata, set transactions, and the latest checkpoint action on this snapshot.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn scan_non_content_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<(
+        Vec<DomainMetadata>,
+        Vec<SetTransaction>,
+        Option<CheckpointAction>,
+    )> {
+        let crc = self.crc_at_version();
+        let domain_metadata_from_crc = crc.and_then(|crc| match &crc.domain_metadata_state {
+            DomainMetadataState::Complete(map) => Some(map.values().cloned().collect()),
+            DomainMetadataState::Partial(_) => None,
+        });
+        let transactions_from_crc = crc.and_then(|crc| match &crc.set_transaction_state {
+            SetTransactionState::Complete(map) => Some(map.values().cloned().collect()),
+            SetTransactionState::Partial(_) => None,
+        });
+
+        // TODO: once Snapshot caches checkpoint_action like protocol/metadata, read it from
+        // there instead of always scanning for it here.
+        let mut fields = vec![CHECKPOINT_ACTION_FIELD.clone()];
+        let mut domain_metadata_visitor = domain_metadata_from_crc.is_none().then(|| {
+            fields.push(DOMAIN_METADATA_FIELD.clone());
+            DomainMetadataVisitor::new(None)
+        });
+        let mut set_transaction_visitor = transactions_from_crc.is_none().then(|| {
+            fields.push(SET_TRANSACTION_FIELD.clone());
+            SetTransactionVisitor::new(None)
+        });
+
+        let schema = StructType::try_new(fields)?.into();
+        let mut checkpoint_action = None;
+        for batch in self.log_segment().read_actions(engine, schema)? {
+            let batch = batch?;
+            let data = batch.actions.as_ref();
+            if checkpoint_action.is_none() {
+                checkpoint_action = CheckpointAction::try_new_from_data(data)?;
+            }
+            if let Some(visitor) = domain_metadata_visitor.as_mut() {
+                visitor.visit_rows_of(data)?;
+            }
+            if let Some(visitor) = set_transaction_visitor.as_mut() {
+                visitor.visit_rows_of(data)?;
+            }
+        }
+
+        let domain_metadata = match (domain_metadata_from_crc, domain_metadata_visitor) {
+            (Some(domain_metadata), _) => domain_metadata,
+            (None, Some(visitor)) => visitor.into_domain_metadatas().into_values().collect(),
+            (None, None) => {
+                return Err(Error::internal_error(
+                    "domain metadata visitor was not built",
+                ))
+            }
+        };
+        let transactions = match (transactions_from_crc, set_transaction_visitor) {
+            (Some(transactions), _) => transactions,
+            (None, Some(visitor)) => visitor.set_transactions.into_values().collect(),
+            (None, None) => {
+                return Err(Error::internal_error(
+                    "set transaction visitor was not built",
+                ))
+            }
+        };
+
+        Ok((domain_metadata, transactions, checkpoint_action))
     }
 
     /// Returns file-level statistics, or `None` if this snapshot has no CRC at its version (none
