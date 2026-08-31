@@ -38,6 +38,10 @@
    - `CommitRange` projections add `operationMetrics`, and values in both operation maps are now
      nullable. `Transaction::with_commit_info` also overrides `operationMetrics`, so an
      engine-supplied value with that name is no longer persisted.
+9. Simplify Parquet masking APIs ([#2879])
+   - `get_requested_indices` and `generate_mask` are no longer exposed under `internal-api`. Call
+     `parquet_read_plan(requested_schema, file_metadata)` instead; it returns the reorder indices
+     and optional projection mask in one step.
 
 ### 🚀 Features / new APIs
 
@@ -78,11 +82,10 @@
 
 ### 🚜 Refactor
 
-1. Simplify parquet masking ([#2879])
-2. Use schema macros for declarative schemas ([#3127])
-3. Use explicit StructField nullability constructors ([#3139])
-4. *(test)* Add TableConfigBuilder to simplify unit test boilerplate ([#3134])
-5. Remove cm witness in create table ([#3180])
+1. Use schema macros for declarative schemas ([#3127])
+2. Use explicit StructField nullability constructors ([#3139])
+3. *(test)* Add TableConfigBuilder to simplify unit test boilerplate ([#3134])
+4. Remove cm witness in create table ([#3180])
 
 ### ⚙️ Chores/CI
 
