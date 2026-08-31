@@ -413,7 +413,8 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
     let crc_v2 = write_and_verify_crc(snapshot_v2, &table_path, engine.as_ref());
     let stats_v2 = crc_v2.file_stats().unwrap();
     assert_eq!(stats_v2.num_files(), 2); // <--- 2 files added
-    assert!(stats_v2.table_size_bytes() > stats_v1.table_size_bytes()); // <--- size is greater than after first insert
+    assert!(stats_v2.table_size_bytes() > stats_v1.table_size_bytes()); // <--- size is greater than
+                                                                        // after first insert
 
     // ===== WHEN: Remove all files =====
     let scan = snapshot_v2.clone().scan_builder().build()?;
