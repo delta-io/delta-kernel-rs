@@ -228,7 +228,7 @@ impl From<&DynamicScan> for proto_plan::DynamicScanNode {
             path_column: Some((&node.path_column).into()),
             file_size_column: Some((&node.file_size_column).into()),
             last_modified_column: Some((&node.last_modified_column).into()),
-            dv_column: Some((&node.dv_column).into()),
+            dv_column: node.dv_column.as_ref().map(Into::into),
         }
     }
 }
@@ -1309,7 +1309,7 @@ mod tests {
             path_column: column_name!("path"),
             file_size_column: column_name!("size"),
             last_modified_column: column_name!("filemod"),
-            dv_column: column_name!("dv"),
+            dv_column: Some(column_name!("dv")),
         }),
         "dynamic_scan"
     )]
@@ -1428,6 +1428,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn from_dynamic_scan_omits_dv_column_when_none() {
+        let input_schema = schema_ref! {
+            not_null "path": STRING,
+            not_null "size": LONG,
+            not_null "filemod": LONG,
+            nullable "c": INTEGER,
+        };
+        let node = DynamicScan::try_new(
+            &input_schema,
+            sample_dynamic_scan_output_schema(),
+            FileType::Parquet,
+            Url::parse("memory:///base/").unwrap(),
+            ["c"],
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+            None,
+        )
+        .unwrap();
+        assert!(proto_plan::DynamicScanNode::from(&node).dv_column.is_none());
+    }
+
     #[rstest]
     #[case(
         FileType::Json,
@@ -1453,7 +1476,7 @@ mod tests {
             column_name!("path"),
             column_name!("size"),
             column_name!("filemod"),
-            column_name!("dv"),
+            Some(column_name!("dv")),
         )?;
         let proto = proto_plan::DynamicScanNode::from(&node);
         assert!(proto.schema.is_some());

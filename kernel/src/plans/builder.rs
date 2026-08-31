@@ -1111,7 +1111,7 @@ mod tests {
             column_name!("path"),
             column_name!("size"),
             column_name!("filemod"),
-            column_name!("dv"),
+            Some(column_name!("dv")),
         )
     }
 
@@ -1179,6 +1179,23 @@ mod tests {
         vals(input).dynamic_scan(dynamic_scan)
     }
 
+    #[test]
+    fn dynamic_scan_accepts_no_dv_column() {
+        let input = dynamic_scan_input_missing("dv");
+        let node = DynamicScan::try_new(
+            &input,
+            dynamic_scan_output_schema(),
+            FileType::Parquet,
+            url::Url::parse("memory:///").unwrap(),
+            ["version"],
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+            None,
+        );
+        assert!(node.is_ok(), "None dv should validate: {:?}", node.err());
+    }
+
     #[rstest::rstest]
     #[case::path("path", 0)]
     #[case::size("size", 1)]
@@ -1218,7 +1235,7 @@ mod tests {
             path_column,
             file_size_column,
             last_modified_column,
-            column_name!("dv"),
+            Some(column_name!("dv")),
         )
         .and_then(|dynamic_scan| vals(input).dynamic_scan(dynamic_scan));
 
@@ -1254,7 +1271,7 @@ mod tests {
             column_name!("path"),
             column_name!("size"),
             column_name!("filemod"),
-            column_name!("metadata.dv"),
+            Some(column_name!("metadata.dv")),
         )
         .unwrap();
     }
@@ -1360,7 +1377,7 @@ mod tests {
             column_name!("path"),
             column_name!("size"),
             column_name!("filemod"),
-            column_name!("dv"),
+            Some(column_name!("dv")),
         )
     })]
     #[case::base_url_without_trailing_slash("must be hierarchical and end in `/`", || {
@@ -1374,7 +1391,7 @@ mod tests {
             column_name!("path"),
             column_name!("size"),
             column_name!("filemod"),
-            column_name!("dv"),
+            Some(column_name!("dv")),
         )
     })]
     fn dynamic_scan_constructor_rejects_invalid_configuration(
