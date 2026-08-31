@@ -1,3 +1,4 @@
+use delta_kernel::snapshot::SnapshotHintError;
 use delta_kernel::{DeltaResult, Error};
 use tracing::warn;
 
@@ -76,6 +77,7 @@ pub enum KernelError {
     InvalidLogSegment = 47,
     UnpublishedVersionError = 48,
     EmptyLogError = 49,
+    InvalidSnapshotHint = 50,
 }
 
 impl From<Error> for KernelError {
@@ -130,6 +132,7 @@ impl From<Error> for KernelError {
             Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
             Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
             Error::InvalidLogSegment(_) => KernelError::InvalidLogSegment,
+            Error::SnapshotHint(_) => KernelError::InvalidSnapshotHint,
             Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
@@ -322,6 +325,11 @@ impl From<EngineExecError> for Error {
             KernelError::InvalidExpression => Error::InvalidExpressionEvaluation(message),
             KernelError::InvalidLogPath => Error::InvalidLogPath(message),
             KernelError::InvalidLogSegment => Error::InvalidLogSegment(message),
+            KernelError::InvalidSnapshotHint => SnapshotHintError::Connector {
+                message,
+                source: None,
+            }
+            .into(),
             KernelError::FileAlreadyExists => Error::FileAlreadyExists(message),
             KernelError::UnsupportedError => Error::Unsupported(message),
             KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
@@ -441,6 +449,18 @@ mod error_code_tests {
         assert_eq!(empty_log.to_string(), "No table version found.");
         assert!(matches!(empty_log, Error::EmptyLog));
     }
+
+    #[test]
+    fn invalid_snapshot_hint_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            KernelError::from(Error::from(SnapshotHintError::Connector {
+                message: "invalid".to_string(),
+                source: None,
+            })),
+            KernelError::InvalidSnapshotHint
+        );
+        assert_eq!(KernelError::InvalidSnapshotHint as i32, 50);
+    }
 }
 
 #[cfg(all(test, feature = "declarative-plans"))]
@@ -464,6 +484,7 @@ mod tests {
     #[case::invalid_expr(KernelError::InvalidExpression, "Invalid expression evaluation: boom")]
     #[case::invalid_log_segment(KernelError::InvalidLogSegment, "Invalid log segment: boom")]
     #[case::empty_log(KernelError::EmptyLogError, "No table version found.")]
+    #[case::invalid_snapshot_hint(KernelError::InvalidSnapshotHint, "Invalid snapshot hint: boom")]
     #[case::fallback_io(
         KernelError::IOErrorError,
         "Generic delta kernel error: engine execution error (IOErrorError): boom"

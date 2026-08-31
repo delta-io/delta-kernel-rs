@@ -299,6 +299,11 @@ pub enum Error {
     #[error("Invalid log segment: {0}")]
     InvalidLogSegment(String),
 
+    /// Snapshot-hint-specific validation failed. General builder, path, protocol, and metadata
+    /// failures retain their existing error categories.
+    #[error(transparent)]
+    SnapshotHint(#[from] Box<crate::snapshot::SnapshotHintError>),
+
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]
     FileAlreadyExists(String),
