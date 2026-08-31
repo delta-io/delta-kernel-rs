@@ -157,7 +157,10 @@ impl Transaction {
     /// Commits `file` as the table's root manifest.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub fn with_external_root_manifest(mut self, file: FileMeta) -> DeltaResult<Self> {
-        let commit = ExternalRootManifest::new(file, self.read_snapshot()?)?;
+        let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
+            Error::internal_error("read_snapshot() called on create-table transaction")
+        })?;
+        let commit = ExternalRootManifest::new(file, read_snapshot)?;
         self.external_root_manifest = Some(commit);
         Ok(self)
     }

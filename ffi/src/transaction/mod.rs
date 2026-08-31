@@ -2253,6 +2253,59 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn test_with_external_root_manifest_commits_a_checkpoint_action(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_external_root_manifest_success", None);
+        let schema = schema_ref! { nullable "id": INTEGER };
+        test_utils::create_table_with_column_mapping_mode(
+            store.clone(),
+            table_url.clone(),
+            schema,
+            &[],
+            true,
+            vec![
+                "columnMapping",
+                "deletionVectors",
+                "adaptiveMetadata-preview",
+            ],
+            vec![
+                "columnMapping",
+                "deletionVectors",
+                "rowTracking",
+                "domainMetadata",
+                "inCommitTimestamp",
+                "adaptiveMetadata-preview",
+            ],
+            "id",
+        )
+        .await?;
+
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let table_path = table_url.to_string();
+        let table_path_str = table_path.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+
+        let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
+        let file = FileMeta {
+            path: kernel_string_slice!(manifest_path),
+            last_modified: 0,
+            size: 1024,
+        };
+        let txn =
+            ok_or_panic(unsafe { with_external_root_manifest(txn, &file, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let version = unsafe { version_and_free(committed) };
+        assert_eq!(version, 1);
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
     /// Reads the v0 commit file (`_delta_log/00..00.json`) of a freshly created table.
     async fn read_v0_commit(store: &Arc<DynObjectStore>, table_url: &Url) -> String {
         let path = table_url

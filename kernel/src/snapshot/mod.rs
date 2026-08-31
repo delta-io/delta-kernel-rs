@@ -766,27 +766,41 @@ impl Snapshot {
         Vec<SetTransaction>,
         Option<CheckpointAction>,
     )> {
+        // Domain metadata/set transactions each come from exactly one source: an at-version CRC
+        // (`Complete`), or a log scan. Modeling this as an enum rather than two correlated
+        // `Option`s makes that mutual exclusion a type-level fact instead of a runtime invariant.
+        enum DomainMetadataSource {
+            FromCrc(Vec<DomainMetadata>),
+            Scan(DomainMetadataVisitor),
+        }
+        enum SetTransactionSource {
+            FromCrc(Vec<SetTransaction>),
+            Scan(SetTransactionVisitor),
+        }
+
         let crc = self.crc_at_version();
-        let domain_metadata_from_crc = crc.and_then(|crc| match &crc.domain_metadata_state {
-            DomainMetadataState::Complete(map) => Some(map.values().cloned().collect()),
-            DomainMetadataState::Partial(_) => None,
-        });
-        let transactions_from_crc = crc.and_then(|crc| match &crc.set_transaction_state {
-            SetTransactionState::Complete(map) => Some(map.values().cloned().collect()),
-            SetTransactionState::Partial(_) => None,
-        });
 
         // TODO: once Snapshot caches checkpoint_action like protocol/metadata, read it from
         // there instead of always scanning for it here.
         let mut fields = vec![CHECKPOINT_ACTION_FIELD.clone()];
-        let mut domain_metadata_visitor = domain_metadata_from_crc.is_none().then(|| {
-            fields.push(DOMAIN_METADATA_FIELD.clone());
-            DomainMetadataVisitor::new(None)
-        });
-        let mut set_transaction_visitor = transactions_from_crc.is_none().then(|| {
-            fields.push(SET_TRANSACTION_FIELD.clone());
-            SetTransactionVisitor::new(None)
-        });
+        let mut domain_metadata_source = match crc.map(|crc| &crc.domain_metadata_state) {
+            Some(DomainMetadataState::Complete(map)) => {
+                DomainMetadataSource::FromCrc(map.values().cloned().collect())
+            }
+            _ => {
+                fields.push(DOMAIN_METADATA_FIELD.clone());
+                DomainMetadataSource::Scan(DomainMetadataVisitor::new(None))
+            }
+        };
+        let mut set_transaction_source = match crc.map(|crc| &crc.set_transaction_state) {
+            Some(SetTransactionState::Complete(map)) => {
+                SetTransactionSource::FromCrc(map.values().cloned().collect())
+            }
+            _ => {
+                fields.push(SET_TRANSACTION_FIELD.clone());
+                SetTransactionSource::Scan(SetTransactionVisitor::new(None))
+            }
+        };
 
         let schema = StructType::try_new(fields)?.into();
         let mut checkpoint_action = None;
@@ -796,31 +810,23 @@ impl Snapshot {
             if checkpoint_action.is_none() {
                 checkpoint_action = CheckpointAction::try_new_from_data(data)?;
             }
-            if let Some(visitor) = domain_metadata_visitor.as_mut() {
+            if let DomainMetadataSource::Scan(visitor) = &mut domain_metadata_source {
                 visitor.visit_rows_of(data)?;
             }
-            if let Some(visitor) = set_transaction_visitor.as_mut() {
+            if let SetTransactionSource::Scan(visitor) = &mut set_transaction_source {
                 visitor.visit_rows_of(data)?;
             }
         }
 
-        let domain_metadata = match (domain_metadata_from_crc, domain_metadata_visitor) {
-            (Some(domain_metadata), _) => domain_metadata,
-            (None, Some(visitor)) => visitor.into_domain_metadatas().into_values().collect(),
-            (None, None) => {
-                return Err(Error::internal_error(
-                    "domain metadata visitor was not built",
-                ))
+        let domain_metadata = match domain_metadata_source {
+            DomainMetadataSource::FromCrc(domain_metadata) => domain_metadata,
+            DomainMetadataSource::Scan(visitor) => {
+                visitor.into_domain_metadatas().into_values().collect()
             }
         };
-        let transactions = match (transactions_from_crc, set_transaction_visitor) {
-            (Some(transactions), _) => transactions,
-            (None, Some(visitor)) => visitor.set_transactions.into_values().collect(),
-            (None, None) => {
-                return Err(Error::internal_error(
-                    "set transaction visitor was not built",
-                ))
-            }
+        let transactions = match set_transaction_source {
+            SetTransactionSource::FromCrc(transactions) => transactions,
+            SetTransactionSource::Scan(visitor) => visitor.set_transactions.into_values().collect(),
         };
 
         Ok((domain_metadata, transactions, checkpoint_action))

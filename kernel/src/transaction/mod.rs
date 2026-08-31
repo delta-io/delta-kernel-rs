@@ -506,7 +506,7 @@ impl<S> Transaction<S> {
             .external_root_manifest
             .as_ref()
             .map(|external_root| {
-                let read_snapshot = self.read_snapshot()?;
+                let read_snapshot = external_root.read_snapshot.as_ref();
                 let (domain_metadata, transactions, existing_checkpoint_action) =
                     read_snapshot.scan_non_content_metadata(engine)?;
 
@@ -2957,13 +2957,16 @@ mod tests {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn dummy_external_root_manifest() -> DeltaResult<ExternalRootManifest> {
+    fn dummy_external_root_manifest(
+        read_snapshot: SnapshotRef,
+    ) -> DeltaResult<ExternalRootManifest> {
         Ok(ExternalRootManifest {
             file: FileMeta {
                 location: Url::parse("memory:///table/metadata/root-v1.parquet")?,
                 last_modified: 0,
                 size: 1024,
             },
+            read_snapshot,
         })
     }
 
@@ -2971,7 +2974,8 @@ mod tests {
     #[test]
     fn test_validate_external_root_manifest_success() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.external_root_manifest = Some(dummy_external_root_manifest()?);
+        let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
+        txn.external_root_manifest = Some(dummy_external_root_manifest(read_snapshot)?);
         txn.validate_external_root_manifest_semantics()?;
         Ok(())
     }
@@ -2980,7 +2984,8 @@ mod tests {
     #[test]
     fn test_validate_external_root_manifest_rejects_file_actions() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.external_root_manifest = Some(dummy_external_root_manifest()?);
+        let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
+        txn.external_root_manifest = Some(dummy_external_root_manifest(read_snapshot)?);
         add_dummy_file(&mut txn);
         let result = txn.validate_external_root_manifest_semantics();
         assert!(result.is_err());
