@@ -36,6 +36,7 @@ on:
         type: choice
         options:
           - artifact
+          - summary
           - collapsed
           - comment
 
@@ -104,10 +105,11 @@ jobs:
                 case "$word" in
                   /review) ;;
                   artifact|dark) mode=artifact ;;
+                  summary) mode=summary ;;
                   collapsed) mode=collapsed ;;
                   comment) mode=comment ;;
                   *)
-                    echo "::error::Unknown /review option '$word'. Use artifact, collapsed, or comment."
+                    echo "::error::Unknown /review option '$word'. Use artifact, summary, collapsed, or comment."
                     exit 1
                     ;;
                 esac
@@ -128,7 +130,7 @@ jobs:
             exit 1
           fi
           case "$mode" in
-            artifact|collapsed|comment) ;;
+            artifact|summary|collapsed|comment) ;;
             *) echo "::error::Invalid output mode '$mode'."; exit 1 ;;
           esac
 
@@ -629,7 +631,10 @@ jobs:
       - name: Post review comment
         if: >-
           steps.review.outputs.review_text != '' &&
-          needs.authorize.outputs.output_mode != 'artifact'
+          (
+            needs.authorize.outputs.output_mode == 'collapsed' ||
+            needs.authorize.outputs.output_mode == 'comment'
+          )
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           OUTPUT_MODE: ${{ needs.authorize.outputs.output_mode }}
@@ -659,6 +664,24 @@ jobs:
 
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
           echo "Posted review comment."
+
+      - name: Publish review summary
+        if: >-
+          steps.review.outputs.review_text != '' &&
+          needs.authorize.outputs.output_mode == 'summary'
+        env:
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          REVIEW_TEXT: ${{ steps.review.outputs.review_text }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## AI Review for PR #${PR_NUMBER}"
+            echo ""
+            echo "_Draft - human review required._"
+            echo ""
+            echo "$REVIEW_TEXT"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Published review to the workflow summary."
 
       - name: Upload review artifact
         if: >-
