@@ -609,8 +609,7 @@ async fn incompatible_schemas_fail() {
     };
     assert_incompatible_schema(schema, get_schema()).await;
 
-    // NOTE: Once type widening is supported, this should not return an error.
-    //
+    // CDF schema compatibility does not apply type-widening rules.
     // The CDF schema has fields: `id: long` and `value: string`.
     // This commit has schema with fields: `id: int` and `value: string`.
     let cdf_schema = schema_ref! {

@@ -45,6 +45,8 @@ pub(crate) use domain_metadata_replay::DomainMetadataMap;
 
 #[cfg(test)]
 mod crc_tests;
+#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
+mod protocol_metadata_replay_amt_tests;
 #[cfg(test)]
 mod tests;
 

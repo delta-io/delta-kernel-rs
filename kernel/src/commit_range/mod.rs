@@ -47,6 +47,7 @@
 mod actions;
 mod builder;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 pub use actions::{CommitAction, DeltaAction};
@@ -59,9 +60,10 @@ use crate::actions::{
     SIDECAR_FIELD,
 };
 use crate::path::ParsedLogPath;
-use crate::schema::{SchemaRef, StructField, StructType};
+use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Engine, Error, Version};
 
 /// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
@@ -250,17 +252,59 @@ impl Iterator for CommitActionsIterator {
 
 /// Build the nullable [`StructField`] that represents this action kind in the read schema.
 fn action_to_field(action: &DeltaAction) -> StructField {
-    match action {
-        DeltaAction::Add => ADD_FIELD.clone(),
-        DeltaAction::Remove => REMOVE_FIELD.clone(),
-        DeltaAction::Metadata => METADATA_FIELD.clone(),
-        DeltaAction::Protocol => PROTOCOL_FIELD.clone(),
-        DeltaAction::CommitInfo => COMMIT_INFO_FIELD.clone(),
-        DeltaAction::Cdc => CDC_FIELD.clone(),
-        DeltaAction::DomainMetadata => DOMAIN_METADATA_FIELD.clone(),
-        DeltaAction::SetTxn => SET_TRANSACTION_FIELD.clone(),
-        DeltaAction::CheckpointMetadata => CHECKPOINT_METADATA_FIELD.clone(),
-        DeltaAction::Sidecar => SIDECAR_FIELD.clone(),
+    NullableActionTransform
+        .transform_struct_field(match action {
+            DeltaAction::Add => &ADD_FIELD,
+            DeltaAction::Remove => &REMOVE_FIELD,
+            DeltaAction::Metadata => &METADATA_FIELD,
+            DeltaAction::Protocol => &PROTOCOL_FIELD,
+            DeltaAction::CommitInfo => &COMMIT_INFO_FIELD,
+            DeltaAction::Cdc => &CDC_FIELD,
+            DeltaAction::DomainMetadata => &DOMAIN_METADATA_FIELD,
+            DeltaAction::SetTxn => &SET_TRANSACTION_FIELD,
+            DeltaAction::CheckpointMetadata => &CHECKPOINT_METADATA_FIELD,
+            DeltaAction::Sidecar => &SIDECAR_FIELD,
+        })
+        .into_owned()
+}
+
+struct NullableActionTransform;
+
+impl<'a> SchemaTransform<'a> for NullableActionTransform {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+        let data_type = self.transform(&field.data_type);
+        match data_type {
+            Cow::Borrowed(_) if field.is_nullable() => Cow::Borrowed(field),
+            data_type => Cow::Owned(StructField {
+                name: field.name.clone(),
+                data_type: data_type.into_owned(),
+                nullable: true,
+                metadata: field.metadata.clone(),
+            }),
+        }
+    }
+
+    fn transform_array(&mut self, array: &'a ArrayType) -> Cow<'a, ArrayType> {
+        let element_type = self.transform_array_element(array.element_type());
+        match element_type {
+            Cow::Borrowed(_) if array.contains_null() => Cow::Borrowed(array),
+            element_type => Cow::Owned(ArrayType::new(element_type.into_owned(), true)),
+        }
+    }
+
+    fn transform_map(&mut self, map: &'a MapType) -> Cow<'a, MapType> {
+        let key_type = self.transform_map_key(map.key_type());
+        let value_type = self.transform_map_value(map.value_type());
+        match (key_type, value_type) {
+            (Cow::Borrowed(_), Cow::Borrowed(_)) if map.value_contains_null() => Cow::Borrowed(map),
+            (key_type, value_type) => Cow::Owned(MapType::new(
+                key_type.into_owned(),
+                value_type.into_owned(),
+                true,
+            )),
+        }
     }
 }
 
@@ -275,7 +319,7 @@ mod tests {
     use super::*;
     use crate::actions::visitors::{AddVisitor, RemoveVisitor};
     use crate::actions::{Add, Remove};
-    use crate::arrow::array::{Array, AsArray, MapArray, StringArray};
+    use crate::arrow::array::{Array, AsArray, MapArray, StringArray, StructArray};
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::RowVisitor;
@@ -502,6 +546,53 @@ mod tests {
             "explicit null operationMetrics should project as a null map"
         );
         assert!(commit_iter.next().is_none(), "four-commit range");
+    }
+
+    #[tokio::test]
+    async fn test_commits_project_nullable_children_for_absent_actions() {
+        let commit = r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE"}}
+{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1,"modificationTime":1000,"dataChange":true}}"#;
+        let (engine, table_root) = engine_with_commits(&[(0, commit)]).await;
+
+        let range = CommitRange::builder_for(table_root, 0)
+            .with_end_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+
+        let mut commit_iter = range
+            .commits(
+                engine.clone(),
+                None,
+                &[DeltaAction::CommitInfo, DeltaAction::Add],
+            )
+            .unwrap();
+        let commit = commit_iter.next().expect("v=0 commit").unwrap();
+        let mut batches = commit.get_actions(engine.as_ref()).unwrap();
+        let record_batch = batches
+            .next()
+            .expect("commit action batch")
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+
+        let add = record_batch
+            .column_by_name("add")
+            .expect("add column")
+            .as_struct_opt()
+            .expect("add should be a struct");
+        assert_eq!(add.len(), 2);
+        assert!(add.is_null(0), "first row is commitInfo, so add is null");
+        assert!(add.is_valid(1), "second row is add");
+
+        StructArray::try_new(
+            add.fields().clone(),
+            add.columns().to_vec(),
+            add.nulls().cloned(),
+        )
+        .expect("nullable action children should revalidate");
+
+        assert!(batches.next().is_none(), "two-line commit has one batch");
+        assert!(commit_iter.next().is_none(), "single-commit range");
     }
 
     fn single_commit_info_batch(

@@ -53,7 +53,7 @@ impl CommitType {
 /// The protocol and metadata state for this commit. Groups the read snapshot state (if any)
 /// and the new state being committed (if any).
 #[derive(Debug)]
-pub(crate) struct CommitProtocolMetadata {
+pub struct CommitProtocolMetadata {
     /// Existing table protocol from read snapshot. `None` for create-table.
     read_protocol: Option<Protocol>,
     /// Existing table metadata from read snapshot. `None` for create-table.
@@ -92,6 +92,26 @@ impl CommitProtocolMetadata {
             new_protocol,
             new_metadata,
         })
+    }
+
+    /// Returns the protocol read by the transaction, or `None` for table creation.
+    pub fn read_protocol(&self) -> Option<&Protocol> {
+        self.read_protocol.as_ref()
+    }
+
+    /// Returns the metadata read by the transaction, or `None` for table creation.
+    pub fn read_metadata(&self) -> Option<&Metadata> {
+        self.read_metadata.as_ref()
+    }
+
+    /// Returns the protocol written by the transaction, if it changed.
+    pub fn new_protocol(&self) -> Option<&Protocol> {
+        self.new_protocol.as_ref()
+    }
+
+    /// Returns the metadata written by the transaction, if it changed.
+    pub fn new_metadata(&self) -> Option<&Metadata> {
+        self.new_metadata.as_ref()
     }
 }
 
@@ -183,9 +203,19 @@ impl CommitMetadata {
         self.log_root.table_root()
     }
 
+    /// Returns the protocol and metadata state read and written by this transaction.
+    pub fn protocol_metadata(&self) -> &CommitProtocolMetadata {
+        &self.protocol_metadata
+    }
+
+    /// Returns the domain metadata additions and removals written by this transaction.
+    pub fn domain_metadata_changes(&self) -> &[DomainMetadata] {
+        &self.domain_metadata_changes
+    }
+
     /// Returns the effective protocol for this commit. Prefers new_protocol (create-table / ALTER
     /// TABLE), falling back to the read snapshot's protocol.
-    pub(crate) fn effective_protocol(&self) -> DeltaResult<&Protocol> {
+    pub fn effective_protocol(&self) -> DeltaResult<&Protocol> {
         let pm = &self.protocol_metadata;
         pm.new_protocol
             .as_ref()
@@ -199,7 +229,7 @@ impl CommitMetadata {
 
     /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
     /// TABLE), falling back to the read snapshot's metadata.
-    pub(crate) fn effective_metadata(&self) -> DeltaResult<&Metadata> {
+    pub fn effective_metadata(&self) -> DeltaResult<&Metadata> {
         let pm = &self.protocol_metadata;
         pm.new_metadata
             .as_ref()
@@ -363,6 +393,17 @@ mod tests {
         // in_commit_timestamp
         assert_eq!(commit_metadata.in_commit_timestamp(), 1234);
         assert_eq!(commit_metadata.max_published_version(), Some(42));
+        assert!(commit_metadata
+            .protocol_metadata()
+            .read_protocol()
+            .is_some());
+        assert!(commit_metadata
+            .protocol_metadata()
+            .read_metadata()
+            .is_some());
+        assert!(commit_metadata.protocol_metadata().new_protocol().is_none());
+        assert!(commit_metadata.protocol_metadata().new_metadata().is_none());
+        assert!(commit_metadata.domain_metadata_changes().is_empty());
 
         // published commit path
         let published_path = commit_metadata.published_commit_path().unwrap();
@@ -392,5 +433,42 @@ mod tests {
             .and_then(|s| s.strip_suffix(".json"))
             .expect("Staged path should have expected format");
         uuid::Uuid::parse_str(uuid_str).expect("Staged path should contain a valid UUID");
+    }
+
+    #[test]
+    fn test_commit_protocol_metadata_changes() {
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let metadata =
+            Metadata::try_new(None, None, schema_ref! {}, vec![], 0, HashMap::new()).unwrap();
+        let protocol_metadata = CommitProtocolMetadata::try_new(
+            Some(protocol.clone()),
+            Some(metadata.clone()),
+            Some(protocol),
+            Some(metadata),
+        )
+        .unwrap();
+
+        assert!(protocol_metadata.read_protocol().is_some());
+        assert!(protocol_metadata.read_metadata().is_some());
+        assert!(protocol_metadata.new_protocol().is_some());
+        assert!(protocol_metadata.new_metadata().is_some());
+
+        let commit_metadata = CommitMetadata::new(
+            LogRoot::new(Url::parse("s3://my-bucket/path/to/table/").unwrap()).unwrap(),
+            1,
+            CommitType::PathBasedWrite,
+            0,
+            Some(0),
+            protocol_metadata,
+            vec![],
+        );
+        assert!(std::ptr::eq(
+            commit_metadata.effective_protocol().unwrap(),
+            commit_metadata.protocol_metadata().new_protocol().unwrap()
+        ));
+        assert!(std::ptr::eq(
+            commit_metadata.effective_metadata().unwrap(),
+            commit_metadata.protocol_metadata().new_metadata().unwrap()
+        ));
     }
 }
