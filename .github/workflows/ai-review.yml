@@ -14,13 +14,15 @@
 #   vars.CODEX_MAINTAINER_MODEL   Codex maintainer-pass model.
 #   vars.DISPROVE_MODEL           GPT disprove-gate model.
 #
-# The review is manually triggered by a /review comment or workflow dispatch
-# from an actor with write-or-higher permission. First rollout defaults to
-# artifact-only while this workflow is being validated.
+# Ready PRs from authors with write-or-higher permission are reviewed
+# automatically and published to the workflow summary. Authorized actors can
+# also trigger a review manually with a /review comment or workflow dispatch.
 # =============================================================================
 name: AI PR Review
 
 on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -44,7 +46,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: ai-review-${{ github.event.issue.number || inputs.pr }}
+  group: >-
+    ai-review-${{
+      github.event.pull_request.number ||
+      github.event.issue.number ||
+      inputs.pr
+    }}
   cancel-in-progress: true
 
 env:
@@ -65,6 +72,10 @@ jobs:
           github.event.issue.pull_request != null &&
           contains(github.event.comment.body, '/review') &&
           !endsWith(github.actor, '[bot]')
+        ) ||
+        (
+          github.event_name == 'pull_request_target' &&
+          github.event.pull_request.draft == false
         ) ||
         github.event_name == 'workflow_dispatch'
       )
@@ -87,6 +98,8 @@ jobs:
           DISPATCH_PR: ${{ inputs.pr }}
           EVENT_NAME: ${{ github.event_name }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
 
@@ -114,6 +127,11 @@ jobs:
                     ;;
                 esac
               done
+              ;;
+            pull_request_target)
+              n="$PR_NUMBER"
+              mode=summary
+              auth_subject="$PR_AUTHOR"
               ;;
             workflow_dispatch)
               n="$DISPATCH_PR"
@@ -511,11 +529,11 @@ jobs:
           catches, and do not restate the diff. "No blocking issues" is a fine
           review.
 
-          IMPORTANT: your output is posted verbatim as a PR comment unless this
-          run is artifact-only. Output ONLY the final consolidated review, with
-          no narration or status updates. Begin your response with the exact
-          marker <!-- AI_REVIEW_START --> on its own line, then the review. End
-          with the exact marker <!-- AI_REVIEW_END --> on its own line.
+          IMPORTANT: your output is published verbatim to the selected review
+          destination. Output ONLY the final consolidated review, with no
+          narration or status updates. Begin your response with the exact marker
+          <!-- AI_REVIEW_START --> on its own line, then the review. End with the
+          exact marker <!-- AI_REVIEW_END --> on its own line.
 
           Emit those markers only if every dispatched reviewer completed
           successfully and every required disprove gate returned a verdict. If
