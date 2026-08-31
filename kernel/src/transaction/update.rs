@@ -16,6 +16,8 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use super::external_root_manifest::ExternalRootManifest;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
@@ -39,6 +41,8 @@ use crate::table_features::{
 };
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::utils::{current_time_ms, require};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::FileMeta;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -112,6 +116,8 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            external_root_manifest: None,
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })
@@ -239,6 +245,14 @@ impl Transaction {
             ));
         }
         self.provided_row_tracking_high_water_mark = Some(high_water_mark);
+        Ok(self)
+    }
+
+    /// Commits `file` as the table's root manifest.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub fn with_external_root_manifest(mut self, file: FileMeta) -> DeltaResult<Self> {
+        let commit = ExternalRootManifest::new(file, self.read_snapshot()?)?;
+        self.external_root_manifest = Some(commit);
         Ok(self)
     }
 
