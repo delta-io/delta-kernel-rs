@@ -23,7 +23,6 @@ use crate::{DeltaResult, Error};
 // description for that concept.
 pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 
-/// File metadata used to reconstruct stable row tracking values.
 #[derive(Debug, Default)]
 pub(crate) struct FileRowTrackingMetadata {
     pub(crate) base_row_id: Option<i64>,
@@ -161,12 +160,11 @@ pub(crate) fn get_transform_expr(
                 patch.replace(field_name.clone(), expr)
             }
             GenerateRowCommitVersion { field_name } => {
-                let missing_default = Error::missing_data(
-                    "Missing defaultRowCommitVersion for Row Commit Version reconstruction",
-                );
                 let default_row_commit_version = row_tracking_metadata
                     .default_row_commit_version
-                    .ok_or(missing_default)?;
+                    .ok_or(Error::missing_data(
+                    "Missing defaultRowCommitVersion for Row Commit Version reconstruction",
+                ))?;
                 let expr = Arc::new(Expression::coalesce([
                     Expression::column([field_name]),
                     lit(default_row_commit_version),

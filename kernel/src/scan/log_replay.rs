@@ -185,13 +185,13 @@ struct RetryTransformAndDataSkipOutput {
 
 impl ScanLogReplayProcessor {
     // These index positions correspond to the order of columns defined in
-    // `selected_column_names_and_types()`
+    // `AddRemoveDedupVisitor::selected_column_names_and_types()`
     const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
     const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
     const ADD_SIZE_INDEX: usize = 2; // Position of "add.size" in getters
     const ADD_DV_START_INDEX: usize = 3; // Start position of add deletion vector columns
     const BASE_ROW_ID_INDEX: usize = 6; // Position of add.baseRowId in getters
-    const DEFAULT_ROW_COMMIT_VERSION_INDEX: usize = 7;
+    const DEFAULT_ROW_COMMIT_VERSION_INDEX: usize = 7; // Position of add.defaultRowCommitVersion in getters
     const REMOVE_PATH_INDEX: usize = 8; // Position of "remove.path" in getters
     const REMOVE_DV_START_INDEX: usize = 9; // Start position of remove deletion vector columns
 
@@ -1181,7 +1181,8 @@ mod tests {
     use crate::log_segment::CheckpointReadInfo;
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
-        assert_transform_spec, get_simple_state_info, get_state_info, ROW_TRACKING_FEATURES,
+        assert_transform_spec, get_simple_state_info, get_state_info, RowTrackingState,
+        ROW_TRACKING_FEATURES,
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
@@ -1445,35 +1446,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_row_commit_version_patch() -> DeltaResult<()> {
+    #[rstest]
+    #[case::supported_not_enabled(RowTrackingState::SupportedNotEnabled)]
+    #[case::enabled(RowTrackingState::Enabled)]
+    #[case::suspended(RowTrackingState::Suspended)]
+    fn test_row_commit_version_patch(
+        #[case] row_tracking_state: RowTrackingState,
+    ) -> DeltaResult<()> {
         let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
         let state_info = get_state_info(
             schema,
             vec![],
             None,
-            ROW_TRACKING_FEATURES,
-            [
-                ("delta.enableRowTracking", "true"),
-                (
-                    "delta.rowTracking.materializedRowIdColumnName",
-                    "row_id_col",
-                ),
-                (
-                    "delta.rowTracking.materializedRowCommitVersionColumnName",
-                    "row_commit_version_col",
-                ),
-            ]
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect(),
+            row_tracking_state.features(),
+            row_tracking_state.properties(),
             vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
-        )?;
+        );
+        if row_tracking_state != RowTrackingState::Enabled {
+            assert_result_error_with_message(
+                state_info,
+                "Row commit versions are not enabled on this table",
+            );
+            return Ok(());
+        }
+
         let batch = add_batch_for_row_tracking(get_commit_schema().clone());
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             [Ok(ActionsBatch::new(batch, true))].into_iter(),
-            Arc::new(state_info),
+            Arc::new(state_info?),
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),

@@ -22,15 +22,17 @@ use tempfile::{tempdir, TempDir};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    add_commit, begin_transaction, collect_row_ids, create_default_engine_mt_executor,
-    create_table, engine_store_setup, get_materialized_row_tracking_column_names,
-    load_and_begin_transaction, read_actions_from_commit, read_add_infos, read_scan,
-    record_batch_to_bytes, test_read,
+    add_commit, assert_result_error_with_message, begin_transaction, collect_row_ids,
+    create_default_engine_mt_executor, create_table, create_table_and_load_snapshot,
+    engine_store_setup, get_materialized_row_tracking_column_names, load_and_begin_transaction,
+    read_actions_from_commit, read_add_infos, read_scan, record_batch_to_bytes, test_read,
+    test_table_setup,
 };
 use url::Url;
 
 use crate::common::write_utils::{
-    create_dv_update_transaction, get_scan_files, write_deletion_vector_to_store,
+    create_dv_update_transaction, get_scan_files, set_table_properties,
+    write_deletion_vector_to_store,
 };
 
 /// Helper function to create a simple table with row tracking enabled.
@@ -905,11 +907,44 @@ async fn test_read_row_ids_basic() -> DeltaResult<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowTrackingTestCase {
+    Enabled,
+    Unsupported,
+    Supported,
+    Suspended,
+}
+
+impl RowTrackingTestCase {
+    fn create_table_properties(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            // Create-table rejects suspension, so suspend this case after writing.
+            Self::Enabled | Self::Suspended => &[("delta.enableRowTracking", "true")],
+            Self::Supported => &[("delta.feature.rowTracking", "supported")],
+            Self::Unsupported => &[],
+        }
+    }
+}
+
+#[rstest]
+#[case::enabled(RowTrackingTestCase::Enabled)]
+#[case::unsupported(RowTrackingTestCase::Unsupported)]
+#[case::supported(RowTrackingTestCase::Supported)]
+#[case::suspended(RowTrackingTestCase::Suspended)]
 #[tokio::test]
-async fn test_read_row_commit_versions_use_add_action_defaults() -> DeltaResult<()> {
-    let tmp_dir = tempdir()?;
-    let (schema, table_url, engine, _store) =
-        setup_number_table(&tmp_dir, "test_read_row_commit_versions").await?;
+async fn test_read_row_commit_versions_use_add_action_defaults(
+    #[case] test_case: RowTrackingTestCase,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! { nullable "number": INTEGER };
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| Error::generic("Failed to convert table path to URL"))?;
+    create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        test_case.create_table_properties(),
+    )?;
 
     let first_commit = generate_data(schema.clone(), [vec![int32_array(vec![10, 20])]])?;
     write_data_to_table(&table_url, engine.clone(), first_commit)
@@ -920,10 +955,31 @@ async fn test_read_row_commit_versions_use_add_action_defaults() -> DeltaResult<
         .await?
         .unwrap_committed();
 
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let batches = read_row_commit_version_scan(snapshot, engine)?;
+    let snapshot = if test_case == RowTrackingTestCase::Suspended {
+        set_table_properties(
+            &table_path,
+            &table_url,
+            engine.as_ref(),
+            2, /* current_version */
+            &[
+                ("delta.enableRowTracking", "false"),
+                ("delta.rowTrackingSuspended", "true"),
+            ],
+        )?
+    } else {
+        Snapshot::builder_for(table_url).build(engine.as_ref())?
+    };
+    let batches = read_row_commit_version_scan(snapshot, engine);
+    if test_case != RowTrackingTestCase::Enabled {
+        assert_result_error_with_message(
+            batches,
+            "Row commit versions are not enabled on this table",
+        );
+        return Ok(());
+    }
+
     let mut actual = HashMap::new();
-    for batch in batches {
+    for batch in batches? {
         let numbers = batch
             .column_by_name("number")
             .expect("number column not found")
@@ -1199,8 +1255,8 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
     Ok(())
 }
 
-/// Row IDs and Row Commit Versions survive a checkpoint, and later writes continue from the high
-/// watermark.
+/// Row IDs and Row Commit Versions survive a checkpoint, and Row IDs from later writes continue
+/// from the high watermark.
 ///
 /// Uses a multi-threaded runtime and `TokioMultiThreadExecutor` for checkpoint because
 /// `checkpoint()` consumes a lazy iterator inside a `block_on()` future where each item read

@@ -72,7 +72,8 @@ struct MetadataInfo<'a> {
     /// the materializedRowIdColumnName extracted from the table config if row ids are requested,
     /// or None if they are not requested
     materialized_row_id_column_name: Option<&'a String>,
-    /// The physical column containing materialized Row Commit Versions, when requested.
+    /// the materializedRowCommitVersionColumnName extracted from the table config if row commit
+    /// versions are requested, or None if they are not requested
     materialized_row_commit_version_column_name: Option<&'a String>,
 }
 
@@ -331,8 +332,8 @@ impl StateInfo {
                             metadata_info.materialized_row_commit_version_column_name
                         else {
                             return Err(Error::internal_error(
-                                "A materialized Row Commit Version column name must be available \
-                                 when selecting Row Commit Versions",
+                                "missing materialized Row Commit Version column name when row \
+                                 tracking is enabled",
                             ));
                         };
 
@@ -814,6 +815,46 @@ pub(crate) mod tests {
     pub(crate) const ROW_TRACKING_FEATURES: &[TableFeature] =
         &[TableFeature::RowTracking, TableFeature::DomainMetadata];
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RowTrackingState {
+        Unsupported,
+        SupportedNotEnabled,
+        Enabled,
+        Suspended,
+    }
+
+    impl RowTrackingState {
+        pub(crate) fn features(self) -> &'static [TableFeature] {
+            match self {
+                Self::Unsupported => &[],
+                Self::SupportedNotEnabled | Self::Enabled | Self::Suspended => {
+                    ROW_TRACKING_FEATURES
+                }
+            }
+        }
+
+        pub(crate) fn properties(self) -> HashMap<String, String> {
+            let mut properties = get_string_map(&[
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "row_commit_version_col",
+                ),
+            ]);
+            if self == Self::Enabled {
+                properties.insert("delta.enableRowTracking".to_string(), "true".to_string());
+            }
+            if self == Self::Suspended {
+                properties.insert("delta.enableRowTracking".to_string(), "false".to_string());
+                properties.insert("delta.rowTrackingSuspended".to_string(), "true".to_string());
+            }
+            properties
+        }
+    }
+
     fn get_string_map(slice: &[(&str, &str)]) -> HashMap<String, String> {
         slice
             .iter()
@@ -983,7 +1024,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn invalid_rowtracking_config() {
+    fn invalid_row_id_config() {
         let schema = schema_ref! { nullable "id": STRING };
 
         // Row IDs requested but row tracking not enabled → error
@@ -1010,21 +1051,33 @@ pub(crate) mod tests {
             res,
             "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
         );
+    }
 
+    #[rstest]
+    #[case::unsupported(RowTrackingState::Unsupported)]
+    #[case::supported_not_enabled(RowTrackingState::SupportedNotEnabled)]
+    #[case::suspended(RowTrackingState::Suspended)]
+    fn request_row_commit_versions_requires_enabled_row_tracking(
+        #[case] row_tracking_state: RowTrackingState,
+    ) {
         let schema = schema_ref! { nullable "id": STRING };
         let res = get_state_info(
-            schema.clone(),
+            schema,
             vec![],
             None,
-            &[],
-            HashMap::new(),
+            row_tracking_state.features(),
+            row_tracking_state.properties(),
             vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
         );
         assert_result_error_with_message(
             res,
             "Unsupported: Row commit versions are not enabled on this table",
         );
+    }
 
+    #[test]
+    fn request_row_commit_versions_requires_materialized_column_name() {
+        let schema = schema_ref! { nullable "id": STRING };
         let res = get_state_info(
             schema,
             vec![],
