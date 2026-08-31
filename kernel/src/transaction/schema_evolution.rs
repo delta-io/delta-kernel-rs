@@ -18,7 +18,6 @@ use crate::DeltaResult;
 /// Operations are validated and applied in order during
 /// [`apply_schema_operations`]. Each operation sees the schema state after all prior operations
 /// have been applied.
-#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub(crate) enum SchemaOperation {
     /// Add a column or nested field to the table schema.
