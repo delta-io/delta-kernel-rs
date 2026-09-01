@@ -983,11 +983,7 @@ jobs:
         id: app-token
         if: >-
           steps.review.outputs.review_text != '' &&
-          vars.OMNIGENT_BOT_APP_ID != '' &&
-          (
-            needs.authorize.outputs.output_mode == 'collapsed' ||
-            needs.authorize.outputs.output_mode == 'comment'
-          )
+          vars.OMNIGENT_BOT_APP_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
           client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
@@ -1066,6 +1062,7 @@ jobs:
           steps.creds.outputs.available == 'true' &&
           steps.context.outcome == 'success'
         env:
+          BOT_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.context.outputs.head_sha }}
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
@@ -1106,10 +1103,19 @@ jobs:
                   then "Draft - human review required.\n\n" + $summary
                   else $summary
                   end
+                  + "\n\n---\n[Workflow run](" + $details_url + ")"
                 )
               }
             }' > /tmp/check-run.json
 
-          gh api --method POST "repos/${REPO}/check-runs" \
-            --input /tmp/check-run.json --silent
-          echo "Published non-blocking check for PR #${PR_NUMBER} at ${HEAD_SHA}."
+          if [ -n "$BOT_TOKEN" ] && \
+             GH_TOKEN="$BOT_TOKEN" gh api --method POST "repos/${REPO}/check-runs" \
+               --input /tmp/check-run.json --silent; then
+            printf 'Published neutral check as Omnigent App for PR #%s at %s.\n' \
+              "$PR_NUMBER" "$HEAD_SHA"
+          else
+            gh api --method POST "repos/${REPO}/check-runs" \
+              --input /tmp/check-run.json --silent
+            printf 'Published neutral check as GitHub Actions for PR #%s at %s.\n' \
+              "$PR_NUMBER" "$HEAD_SHA"
+          fi

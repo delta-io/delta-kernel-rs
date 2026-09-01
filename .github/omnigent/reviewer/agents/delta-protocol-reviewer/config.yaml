@@ -18,7 +18,8 @@ prompt: |
 
   ## References
 
-  - **delta-kernel-rs** - primary Rust Delta kernel implementation; use only the project context and diff supplied by the orchestrator
+  - **delta-kernel-rs** - primary Rust Delta kernel implementation; use the supplied
+    project context and diff plus the bounded read-only PR source tools when needed
   - **Delta protocol spec** - the source of truth; cross-check `PROTOCOL.md` in the read-only Delta checkout without retrieving external content
   - **delta-spark** - use the read-only Delta checkout through the source tools to cross-reference implementation behavior and protocol RFCs
 

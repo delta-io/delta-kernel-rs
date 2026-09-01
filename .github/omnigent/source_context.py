@@ -68,10 +68,16 @@ def _read_text(path: Path) -> str:
 def _iter_files(root: Path, target: Path) -> Iterator[Path]:
     candidates = [target] if target.is_file() else target.rglob("*")
     for candidate in candidates:
-        if ".git" in candidate.relative_to(root).parts or candidate.is_symlink():
+        relative = candidate.relative_to(root)
+        if ".git" in relative.parts or candidate.is_symlink():
             continue
-        if candidate.is_file():
-            yield candidate
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if resolved.is_file():
+            yield resolved
 
 
 @tool

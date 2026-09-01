@@ -28,6 +28,10 @@ def test_read_list_and_search_are_confined_to_source_roots(tmp_path: Path) -> No
     secret = tmp_path / "secret.txt"
     secret.write_text("do not expose\n")
     (pr_root / "outside").symlink_to(secret)
+    secret_dir = tmp_path / "secret-dir"
+    secret_dir.mkdir()
+    (secret_dir / "hidden.txt").write_text("directory symlink secret\n")
+    (pr_root / "outside-dir").symlink_to(secret_dir, target_is_directory=True)
 
     os.environ["PR_SOURCE_ROOT"] = str(pr_root)
     os.environ["DELTA_SOURCE_ROOT"] = str(delta_root)
@@ -39,3 +43,5 @@ def test_read_list_and_search_are_confined_to_source_roots(tmp_path: Path) -> No
     )
     assert source_context.read_source_file("pr", "../secret.txt").startswith("Error:")
     assert source_context.read_source_file("pr", "outside").startswith("Error:")
+    assert "outside-dir" not in source_context.list_source_files("pr")
+    assert source_context.search_source_code("pr", "directory symlink secret") == ""
