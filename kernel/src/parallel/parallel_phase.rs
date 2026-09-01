@@ -130,6 +130,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::log_replay::FileActionKey;
@@ -1086,6 +1087,56 @@ mod tests {
             "parallel workflow should return the same files as single-node scan_metadata"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_struct_stats_output_survives_serde() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+        let scan = snapshot
+            .scan_builder()
+            .with_stats(StatsOptions::all_struct())
+            .build()?;
+        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
+        for result in sequential.by_ref() {
+            result?;
+        }
+        let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? else {
+            panic!("expected a parallel checkpoint phase");
+        };
+
+        let state = Arc::new(ParallelState::from_bytes(
+            engine.as_ref(),
+            &state.into_bytes()?,
+        )?);
+        let parallel = ParallelScanMetadata::try_new(engine, state, files)?;
+        let mut selected_files = 0;
+        for result in parallel {
+            let metadata = result?;
+            let (data, selection) = metadata.scan_files.into_parts();
+            let data = ArrowEngineData::try_from_engine_data(data)?;
+            let batch = data.record_batch();
+            let stats_parsed = batch
+                .column_by_name("stats_parsed")
+                .expect("structured stats output")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("stats_parsed struct");
+            let stats = batch
+                .column_by_name("stats")
+                .expect("JSON stats placeholder")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("stats string");
+            for (row, selected) in selection.into_iter().enumerate() {
+                if selected {
+                    assert!(stats_parsed.is_valid(row));
+                    assert!(stats.is_null(row));
+                    selected_files += 1;
+                }
+            }
+        }
+        assert!(selected_files > 0);
         Ok(())
     }
 

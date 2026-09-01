@@ -2057,6 +2057,43 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
     );
 }
 
+#[test]
+fn parallel_scan_manifest_read_is_unfiltered() {
+    let path = std::fs::canonicalize(PathBuf::from(
+        "./tests/data/v2-parquet-sidecars-struct-stats-only/",
+    ))
+    .unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = Arc::new(DelegatingEngine::new(sync).with_parquet_handler(recorder.clone()));
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    recorder.take_reads();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::gt(col!("id"), lit(2i64))))
+        .build()
+        .unwrap();
+    let mut sequential = scan.parallel_scan_metadata(engine).unwrap();
+    for result in sequential.by_ref() {
+        result.unwrap();
+    }
+    sequential.finish().unwrap();
+
+    let reads = recorder.take_reads();
+    assert!(
+        reads.iter().any(|read| {
+            read.files.iter().any(|file| {
+                let location = file.location.as_str();
+                location.contains(".checkpoint.") && !location.contains("/_sidecars/")
+            }) && read.physical_schema.field("sidecar").is_some()
+                && read.predicate.is_none()
+        }),
+        "expected an unfiltered checkpoint manifest read, got {reads:#?}"
+    );
+}
+
 #[rstest]
 #[case::exact_case("id")]
 #[case::case_divergent("ID")]

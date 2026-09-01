@@ -14,13 +14,14 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
+use crate::actions::ADD_NAME;
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, Error, FileMeta};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -98,7 +99,6 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// - `engine`: Engine for reading files
     /// - `commit_read_schema`: Projection for JSON commit actions
     /// - `checkpoint_read_schema`: Projection for the checkpoint manifest
-    /// - `checkpoint_predicate`: Optional conservative checkpoint pruning predicate
     #[internal_api]
     pub(crate) fn try_new(
         processor: P,
@@ -106,7 +106,6 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         engine: Arc<dyn Engine>,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        checkpoint_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Self> {
         let commit_phase = Some(CommitReader::try_new(
             engine.as_ref(),
@@ -118,13 +117,23 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
         let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
-            [single_part] => Some(CheckpointManifestReader::try_new_with_options(
-                engine,
-                single_part,
-                log_segment.log_root.clone(),
-                checkpoint_read_schema,
-                checkpoint_predicate,
-            )?),
+            [single_part] => {
+                let add_projection =
+                    checkpoint_read_schema
+                        .field(ADD_NAME)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::internal_error(
+                                "checkpoint manifest read schema must contain an Add field",
+                            )
+                        })?;
+                Some(CheckpointManifestReader::try_new(
+                    engine,
+                    single_part,
+                    log_segment.log_root.clone(),
+                    add_projection,
+                )?)
+            }
             _ => None,
         };
 

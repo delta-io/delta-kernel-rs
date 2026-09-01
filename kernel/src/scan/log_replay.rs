@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
-use super::{
-    PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA, COMMIT_READ_SCHEMA_NO_JSON_STATS,
-};
+use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
@@ -158,7 +156,7 @@ pub struct ScanLogReplayProcessor {
     /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     /// Projection from the internal pruning schema to connector-visible scan metadata.
-    output_transform: Arc<dyn ExpressionEvaluator>,
+    output_transform: Option<Arc<dyn ExpressionEvaluator>>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -251,33 +249,26 @@ impl ScanLogReplayProcessor {
 
         let stats_schema_for_transform = state_info.stats_schema_for_transform().cloned();
         let partition_schema_for_transform = state_info.physical_partition_schema.clone();
-        let commit_read_schema = if emit_json || state_info.physical_stats_schema.is_some() {
-            COMMIT_READ_SCHEMA.clone()
-        } else {
-            COMMIT_READ_SCHEMA_NO_JSON_STATS.clone()
-        };
+        let commit_read_schema = state_info.commit_read_schema(emit_json);
 
         let internal_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
             partition_schema_for_transform.clone(),
-        )?;
-        let requested_partition_schema = partition_values_options
-            .parsed_struct
-            .then(|| state_info.physical_partition_schema.clone())
-            .flatten();
-        let requested_output_schema = scan_row_schema_with_parsed_columns(
-            state_info.output_stats_schema.clone(),
-            requested_partition_schema,
         )?;
         let (projected_schema, output_projection) = build_scan_output_projection(
             internal_schema.as_ref(),
             state_info.output_stats_schema.as_deref(),
             partition_values_options.parsed_struct,
         )?;
-        require!(
-            projected_schema == requested_output_schema,
-            Error::internal_error("scan output projection produced an unexpected schema")
-        );
+        let output_transform = if projected_schema == internal_schema {
+            None
+        } else {
+            Some(engine.evaluation_handler().new_expression_evaluator(
+                internal_schema.clone(),
+                output_projection,
+                projected_schema.into(),
+            )?)
+        };
 
         // Create data skipping filter that reads stats_parsed and partitionValues_parsed
         // from the transformed batch. This avoids double JSON parsing -- the transform parses
@@ -327,11 +318,7 @@ impl ScanLogReplayProcessor {
                 ),
                 internal_schema.clone().into(),
             )?,
-            output_transform: engine.evaluation_handler().new_expression_evaluator(
-                internal_schema,
-                output_projection,
-                projected_schema.into(),
-            )?,
+            output_transform,
             seen_file_keys,
             state_info,
             stats_options,
@@ -826,8 +813,6 @@ fn drop_unrequested_fields<'a>(
             projection =
                 drop_unrequested_fields(projection, input_child, requested_child, child_path);
         }
-        // The caller verifies the projected schema against the requested schema, so mismatched
-        // struct nesting is reported as an internal error after this projection is built.
     }
     projection
 }
@@ -1054,9 +1039,10 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
-        let output = self
-            .output_transform
-            .evaluate(transformed_actions.as_ref())?;
+        let output = match &self.output_transform {
+            Some(transform) => transform.evaluate(transformed_actions.as_ref())?,
+            None => transformed_actions,
+        };
         let scan_metadata = ScanMetadata::try_new(output, final_selection, row_transform_exprs)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
@@ -1155,9 +1141,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
-        let output = self
-            .output_transform
-            .evaluate(transformed_actions.as_ref())?;
+        let output = match &self.output_transform {
+            Some(transform) => transform.evaluate(transformed_actions.as_ref())?,
+            None => transformed_actions,
+        };
         let scan_metadata = ScanMetadata::try_new(output, final_selection, row_transform_exprs)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
@@ -1214,7 +1201,8 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
+        build_scan_output_projection, get_add_transform_expr, scan_action_iter,
+        scan_row_schema_with_parsed_columns, InternalScanState, ScanLogReplayProcessor,
         ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
     use crate::actions::get_commit_schema;
@@ -1869,6 +1857,34 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_legacy_stats_options() {
+        let options: ScanStatsOptions =
+            serde_json::from_value(serde_json::json!({ "synthesize_json": false })).unwrap();
+        assert!(!options.emit_json);
+
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
+        let state = InternalScanState {
+            logical_schema: schema.clone(),
+            physical_schema: schema,
+            predicate_schema: None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schema: None,
+            output_stats_schema: None,
+            stats_options: ScanStatsOptions { emit_json: false },
+            partition_values_options: ScanPartitionValuesOptions::default(),
+            physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: false,
+        };
+        let mut value = serde_json::to_value(state).unwrap();
+        value.as_object_mut().unwrap().remove("stats_options");
+        let state: InternalScanState = serde_json::from_value(value).unwrap();
+        assert!(state.stats_options.emit_json);
+    }
+
+    #[test]
     fn deserialize_serializable_scan_state_with_extra_fields_fails() {
         let state = SerializableScanState {
             predicate: None,
@@ -1938,6 +1954,45 @@ mod tests {
             found_add = true;
         }
         assert!(found_add);
+    }
+
+    #[test]
+    fn output_projection_recurses_into_nested_stats() {
+        let internal_stats = schema_ref! {
+            nullable "minValues": {
+                nullable "nested": {
+                    nullable "kept": LONG,
+                    nullable "dropped": LONG,
+                },
+            },
+        };
+        let requested_stats = schema_ref! {
+            nullable "minValues": {
+                nullable "nested": {
+                    nullable "kept": LONG,
+                },
+            },
+        };
+        let internal = scan_row_schema_with_parsed_columns(Some(internal_stats), None).unwrap();
+        let (projected, _) =
+            build_scan_output_projection(&internal, Some(&requested_stats), false).unwrap();
+
+        let DataType::Struct(stats) = projected.field("stats_parsed").unwrap().data_type() else {
+            panic!("stats_parsed must be a struct");
+        };
+        let DataType::Struct(min_values) = stats.field("minValues").unwrap().data_type() else {
+            panic!("minValues must be a struct");
+        };
+        let DataType::Struct(nested) = min_values.field("nested").unwrap().data_type() else {
+            panic!("nested stats must be a struct");
+        };
+        assert_eq!(
+            nested
+                .fields()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept"]
+        );
     }
 
     /// Verify that Remove actions are not pruned by data skipping. The transform reads from

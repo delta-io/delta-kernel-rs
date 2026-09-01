@@ -10,7 +10,10 @@ use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
-use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
+use crate::scan::{
+    PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats, COMMIT_READ_SCHEMA,
+    COMMIT_READ_SCHEMA_NO_JSON_STATS,
+};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
@@ -208,6 +211,20 @@ fn build_data_skipping_schemas(
 }
 
 impl StateInfo {
+    /// Whether action reads must carry JSON or structured statistics.
+    pub(crate) fn reads_stats(&self, emit_json: bool) -> bool {
+        emit_json || self.physical_stats_schema.is_some()
+    }
+
+    /// Selects the commit action schema consumed by the scan replay transform.
+    pub(crate) fn commit_read_schema(&self, emit_json: bool) -> SchemaRef {
+        if self.reads_stats(emit_json) {
+            COMMIT_READ_SCHEMA.clone()
+        } else {
+            COMMIT_READ_SCHEMA_NO_JSON_STATS.clone()
+        }
+    }
+
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///

@@ -12,12 +12,13 @@ use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
+    add_schema_without_json_stats, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME,
+    STATS, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
-    Predicate,
+    col, column_name, joined_column_expr, lit, null_lit, ColumnName, Expression as Expr,
+    ExpressionRef, Predicate, UnaryExpressionOp,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
@@ -37,7 +38,6 @@ use crate::{DeltaResult, Error, PlanBuilder};
 // materialize them as one top-level `file_action_key` column that are used by the plan's
 // aggregate and anti-join operators.
 const FILE_ACTION_KEY: &str = "file_action_key";
-const STATS: &str = "stats";
 const PARTITION_VALUES: &str = "partitionValues";
 const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
 // Generated partition pruning predicates reference this to retain removes.
@@ -171,6 +171,7 @@ impl Scan {
             .filter(col!("add.path").is_not_null())?
             .project_patch(|patch| {
                 patch
+                    .with_synthesized_add_json_stats(self.stats.emit_json)
                     .with_parsed_add_stats(physical_stats)
                     .with_parsed_add_partition_values(physical_partitions)
                     .append(
@@ -399,12 +400,11 @@ fn sidecar_actions(
 // === Helpers ===
 
 fn add_read_schema(include_json_stats: bool) -> StructType {
-    StructType::new_unchecked(
-        ADD_SCHEMA
-            .fields()
-            .filter(|field| include_json_stats || field.name() != STATS)
-            .cloned(),
-    )
+    if include_json_stats {
+        ADD_SCHEMA.clone()
+    } else {
+        add_schema_without_json_stats()
+    }
 }
 
 /// Read schema for JSON actions tagged with their log version.
@@ -471,6 +471,9 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
 }
 
 trait ProjectionStructPatchBuilderExt<'a> {
+    /// Synthesizes JSON stats from a checkpoint's native parsed stats when needed.
+    fn with_synthesized_add_json_stats(self, emit_json: bool) -> Self;
+
     /// Parses add stats, preferring a compatible parsed field.
     ///
     /// When `physical_stats` is present, the input must contain either
@@ -483,6 +486,22 @@ trait ProjectionStructPatchBuilderExt<'a> {
 }
 
 impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
+    fn with_synthesized_add_json_stats(self, emit_json: bool) -> Self {
+        if emit_json
+            && self
+                .input_schema()
+                .contains_col([ADD_NAME, STATS_PARSED_NAME])
+        {
+            let stats = Expr::coalesce([
+                col!(ADD_NAME, STATS),
+                Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED)),
+            ]);
+            self.replace_expr_at([ADD_NAME], STATS, stats)
+        } else {
+            self
+        }
+    }
+
     fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self {
         let has_stats_parsed = self
             .input_schema()

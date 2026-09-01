@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+use crate::actions::{add_schema_without_json_stats, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
@@ -68,11 +68,8 @@ pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&REMOVE_FIELD),
 };
 pub(crate) static COMMIT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let add_schema = Add::to_schema();
     schema_ref! {
-        nullable ADD_NAME: {
-            ..(add_schema.fields().filter(|f| f.name() != "stats")),
-        },
+        nullable ADD_NAME: (add_schema_without_json_stats()),
         (&REMOVE_FIELD),
     }
 });
@@ -83,11 +80,8 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
 /// Initial checkpoint projection without JSON `add.stats`.
 /// Discovery restores JSON stats when structured stats cannot satisfy the scan.
 pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let add_schema = Add::to_schema();
     schema_ref! {
-        nullable ADD_NAME: {
-            ..(add_schema.fields().filter(|f| f.name() != "stats")),
-        },
+        nullable ADD_NAME: (add_schema_without_json_stats()),
     }
 });
 
@@ -691,15 +685,11 @@ impl std::fmt::Debug for Scan {
 impl Scan {
     /// Whether the checkpoint action stream must carry statistics for output or pruning.
     fn reads_stats(&self) -> bool {
-        self.stats.emit_json || self.state_info.physical_stats_schema.is_some()
+        self.state_info.reads_stats(self.stats.emit_json)
     }
 
     fn commit_read_schema(&self) -> SchemaRef {
-        if self.reads_stats() {
-            COMMIT_READ_SCHEMA.clone()
-        } else {
-            COMMIT_READ_SCHEMA_NO_JSON_STATS.clone()
-        }
+        self.state_info.commit_read_schema(self.stats.emit_json)
     }
 
     fn checkpoint_read_options(&self) -> (SchemaRef, Option<PredicateRef>, Option<&StructType>) {
@@ -1205,14 +1195,12 @@ impl Scan {
             self.replay_options(),
             self.partition_values_options(),
         )?;
-        let checkpoint_predicate = self.build_actions_meta_predicate();
         let sequential = SequentialPhase::try_new(
             processor,
             self.snapshot.log_segment(),
             engine.clone(),
             self.commit_read_schema(),
             checkpoint_read_schema,
-            checkpoint_predicate,
         )?;
 
         Ok(SequentialScanMetadata::new(
