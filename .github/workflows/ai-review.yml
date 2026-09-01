@@ -838,8 +838,38 @@ jobs:
           start_count = raw.count(start)
           end_count = raw.count(end)
           if start_count != 1 or end_count != 1:
-              if "<!-- AI_REVIEW_INCOMPLETE -->" in raw:
+              incomplete = "<!-- AI_REVIEW_INCOMPLETE -->"
+              if incomplete in raw:
+                  reason = raw.rsplit(incomplete, 1)[-1].lower()
+                  known_agents = (
+                      "architecture-reviewer",
+                      "delta-protocol-reviewer",
+                      "disprove-reviewer",
+                      "docs-reviewer",
+                      "maintainer-claude-reviewer",
+                      "maintainer-codex-reviewer",
+                      "test-coverage-reviewer",
+                  )
+                  known_categories = {
+                      "dispatch": ("dispatch", "spawn", "session"),
+                      "model": ("model", "provider", "gateway"),
+                      "timeout": ("timeout", "timed out"),
+                      "tool": ("tool", "source"),
+                  }
+                  agents = [name for name in known_agents if name in reason]
+                  categories = [
+                      category
+                      for category, terms in known_categories.items()
+                      if any(term in reason for term in terms)
+                  ]
+                  safe_details = []
+                  if agents:
+                      safe_details.append("agents=" + ",".join(agents))
+                  if categories:
+                      safe_details.append("categories=" + ",".join(categories))
                   detail = "the reviewer reported an incomplete run"
+                  if safe_details:
+                      detail += " (" + "; ".join(safe_details) + ")"
               elif "<!-- AI_REVIEW_START -->" in raw or "<!-- AI_REVIEW_END -->" in raw:
                   detail = "the reviewer used legacy fixed markers"
               else:
