@@ -472,7 +472,8 @@ jobs:
 
           reviewer = load(reviewer_root, expand_env=False)
           standalone_prompt = reviewer_contract.partition("\n---\n\n")[2].strip()
-          if not standalone_prompt or standalone_prompt != reviewer.prompt.strip():
+          configured_prompt = (reviewer.instructions or "").strip()
+          if not standalone_prompt or standalone_prompt != configured_prompt:
               print("::error::REVIEW.md and config.yaml reviewer prompts must match.")
               sys.exit(1)
           checked_in_agents = {
