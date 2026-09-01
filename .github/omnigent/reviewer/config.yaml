@@ -148,7 +148,7 @@ guardrails:
       function:
         path: omnigent.inner.nessie.policies.spawn_bounds
         arguments:
-          max_dispatches_per_turn: 6
+          max_dispatches_per_turn: 7
           dispatch_tools: [sys_session_send]
     headless_subagent_purpose_guard:
       type: function
