@@ -66,10 +66,11 @@ impl PlanExecutor for FfiPlanExecutor {
         let plan_result =
             match out {
                 EngineExecResult::Success(plan) => plan,
-                EngineExecResult::Failure(err) => return Err(err.into()),
+                EngineExecResult::Failure(err) => return Err(KernelError::from(err).into()),
                 EngineExecResult::Uninit => return Err(KernelError::internal_error(
                     "FFI engine returned from execute_op upcall without writing the plan result",
-                )),
+                )
+                .into()),
             };
         match plan_result {
             CPlanResult::Unit => Ok(PlanResult::Unit),
@@ -198,7 +199,11 @@ mod tests {
             panic!("execute_op should surface the engine failure");
         };
         assert!(
-            matches!(err, KernelError::Unsupported(ref msg) if msg == "kaboom"),
+            matches!(
+                err,
+                delta_kernel::Error::Kernel(KernelError::Unsupported(ref msg))
+                    if msg == "kaboom"
+            ),
             "expected KernelError::Unsupported(\"kaboom\"), got {err:?}"
         );
     }
@@ -316,7 +321,10 @@ mod tests {
             panic!("invalid schema proto bytes should fail to decode");
         };
         assert!(
-            matches!(err, KernelError::GenericError { .. }),
+            matches!(
+                err,
+                delta_kernel::Error::Kernel(KernelError::GenericError { .. })
+            ),
             "expected a proto decode error, got {err:?}"
         );
     }

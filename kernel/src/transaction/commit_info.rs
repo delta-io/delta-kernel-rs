@@ -5,7 +5,10 @@ use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
 use crate::expressions::{lit, null_lit, MapData, Scalar};
 use crate::schema::{schema_ref, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::{DataType, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, KernelError};
+use crate::{
+    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
+    KernelError,
+};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -13,7 +16,7 @@ use crate::{DataType, Engine, EngineData, Expression, ExpressionRef, IntoEngineD
 /// inserting kernel-only fields after the last engine field.
 fn commit_info_literal_exprs(
     commit_info: CommitInfo,
-) -> Result<Vec<(&'static str, ExpressionRef)>, KernelError> {
+) -> DeltaResult<Vec<(&'static str, ExpressionRef)>> {
     let string_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     let literal_exprs = vec![
         ("timestamp", Arc::new(lit(commit_info.timestamp))),
@@ -50,7 +53,7 @@ fn commit_info_literal_exprs(
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
         return Err(KernelError::Generic(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
-            If CommitInfo field was added/removed, please update Expression::Literal in this function and update the with_commit_info doc comment", literal_exprs.len())));
+            If CommitInfo field was added/removed, please update Expression::Literal in this function and update the with_commit_info doc comment", literal_exprs.len())).into());
     }
     Ok(literal_exprs)
 }
@@ -60,7 +63,7 @@ impl<S> Transaction<S> {
         &self,
         engine: &dyn Engine,
         kernel_commit_info: CommitInfo,
-    ) -> Result<Box<dyn EngineData>, KernelError> {
+    ) -> DeltaResult<Box<dyn EngineData>> {
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();

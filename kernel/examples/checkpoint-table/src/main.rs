@@ -49,11 +49,17 @@ async fn write_data<W: AsyncFileWriter>(
     batch_iter: &mut ActionReconciliationIterator,
     parquet_writer: &mut AsyncArrowWriter<W>,
 ) -> DeltaResult<()> {
-    parquet_writer.write(first_batch).await?;
+    parquet_writer
+        .write(first_batch)
+        .await
+        .map_err(KernelError::from)?;
     for data_res in batch_iter {
         let data = data_res?.apply_selection_vector()?;
         let batch = data.try_into_record_batch()?;
-        parquet_writer.write(&batch).await?;
+        parquet_writer
+            .write(&batch)
+            .await
+            .map_err(KernelError::from)?;
     }
     Ok(())
 }
@@ -90,7 +96,7 @@ async fn try_main() -> DeltaResult<()> {
         // we'll use the first batch to determine the schema
         let first = batch_iter.next();
         let Some(first) = first else {
-            return Err(KernelError::generic("No batches in checkpoint data"));
+            return Err(KernelError::generic("No batches in checkpoint data").into());
         };
         // Note that with `FilteredEngineData` it's important to `apply_selection_vector` to remove
         // any filtered out rows. It's also possible to use `into_parts` to get the
@@ -104,9 +110,10 @@ async fn try_main() -> DeltaResult<()> {
         println!("--unsafe-i-know-what-im-doing not specified, just doing a dry run");
         // this block just writes the checkpoint to a blackhole
         let mut parquet_writer =
-            AsyncArrowWriter::try_new(BlackholeWriter::default(), first_batch.schema(), None)?;
+            AsyncArrowWriter::try_new(BlackholeWriter::default(), first_batch.schema(), None)
+                .map_err(KernelError::from)?;
         write_data(&first_batch, batch_iter, &mut parquet_writer).await?;
-        parquet_writer.finish().await?;
+        parquet_writer.finish().await.map_err(KernelError::from)?;
         let blackhole_writer = parquet_writer.into_inner();
         println!(
             "Would have written a checkpoint as:\n\tpath: {checkpoint_path}\n\tsize: {}",

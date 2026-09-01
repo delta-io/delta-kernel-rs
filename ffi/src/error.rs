@@ -1,4 +1,4 @@
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::{DeltaResult, Error, KernelError};
 use tracing::warn;
 
 use crate::handle::Handle;
@@ -150,6 +150,15 @@ impl From<KernelError> for FFIKernelError {
             KernelError::LogHistory(_) => FFIKernelError::LogHistoryError,
             KernelError::Cancelled => FFIKernelError::CancelledError,
             _ => FFIKernelError::UnknownError,
+        }
+    }
+}
+
+impl From<Error> for FFIKernelError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Kernel(error) => error.into(),
+            _ => Self::UnknownError,
         }
     }
 }

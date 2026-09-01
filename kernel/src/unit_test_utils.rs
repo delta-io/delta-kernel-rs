@@ -1171,7 +1171,7 @@ fn resolve_test_table_path(table_name: &str) -> DeltaResult<(PathBuf, Option<Tem
 /// Copies a test-table fixture into a writable temporary directory.
 pub(crate) fn copy_test_table(table_name: &str) -> DeltaResult<(Url, TempDir)> {
     let (source, _source_tempdir) = resolve_test_table_path(table_name)?;
-    let tempdir = tempfile::tempdir()?;
+    let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
     let table_path = tempdir.path().join(table_name);
     copy_directory(&source, &table_path)
         .map_err(|e| KernelError::generic(format!("Failed to copy test table: {e}")))?;

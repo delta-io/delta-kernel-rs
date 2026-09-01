@@ -122,7 +122,8 @@ fn filter_batches_with_predicate(
             // Evaluate predicate to get boolean selection array
             let selection = evaluate_predicate(predicate, &batch, false)?;
             // Filter the batch using the selection
-            let filtered = filter_record_batch(&batch, &selection)?;
+            let filtered =
+                filter_record_batch(&batch, &selection).map_err(delta_kernel::KernelError::from)?;
             Ok(filtered)
         })
         .collect()

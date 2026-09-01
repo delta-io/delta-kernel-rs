@@ -756,7 +756,7 @@ impl From<&MetadataValue> for proto_schema::MetadataValue {
 // === Schema from Proto ===
 
 impl TryFrom<proto_schema::StructType> for StructType {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: proto_schema::StructType) -> DeltaResult<Self> {
         let fields = proto
             .fields
@@ -768,7 +768,7 @@ impl TryFrom<proto_schema::StructType> for StructType {
 }
 
 impl TryFrom<proto_schema::StructField> for StructField {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(proto: proto_schema::StructField) -> DeltaResult<Self> {
         let data_type = proto
@@ -777,7 +777,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
         let metadata = proto
             .metadata
             .into_iter()
-            .map(|(key, value)| Ok::<_, KernelError>((key, MetadataValue::try_from(value)?)))
+            .map(|(key, value)| -> DeltaResult<_> { Ok((key, MetadataValue::try_from(value)?)) })
             .collect::<DeltaResult<std::collections::HashMap<_, _>>>()?;
         Ok(StructField {
             name: proto.name,
@@ -789,7 +789,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
 }
 
 impl TryFrom<proto_schema::DataType> for DataType {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: proto_schema::DataType) -> DeltaResult<Self> {
         let kind = proto
             .kind
@@ -807,7 +807,7 @@ impl TryFrom<proto_schema::DataType> for DataType {
 }
 
 impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: proto_schema::PrimitiveType) -> DeltaResult<Self> {
         let kind = proto
             .kind
@@ -834,7 +834,7 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::IntervalYearMonth => PrimitiveType::IntervalYearMonth,
                     Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
                     Simple::Unspecified => {
-                        return Err(KernelError::schema("SimplePrimitiveType is unspecified"))
+                        return Err(KernelError::schema("SimplePrimitiveType is unspecified").into())
                     }
                 }
             }
@@ -853,7 +853,8 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
             PrimitiveTypeKind::Geometry(_) | PrimitiveTypeKind::Geography(_) => {
                 return Err(KernelError::schema(
                     "geometry/geography types require the 'geo-type-in-dev' feature",
-                ))
+                )
+                .into())
             }
         };
         Ok(primitive)
@@ -861,7 +862,7 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
 }
 
 impl TryFrom<proto_schema::DecimalType> for DecimalType {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: proto_schema::DecimalType) -> DeltaResult<Self> {
         let precision = u8::try_from(proto.precision).map_err(|_| {
             KernelError::invalid_decimal(format!("precision out of range: {}", proto.precision))
@@ -875,7 +876,7 @@ impl TryFrom<proto_schema::DecimalType> for DecimalType {
 
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeometryType> for GeometryType {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: proto_schema::GeometryType) -> DeltaResult<Self> {
         GeometryType::try_new(&proto.crs)
     }
@@ -883,7 +884,7 @@ impl TryFrom<proto_schema::GeometryType> for GeometryType {
 
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeographyType> for GeographyType {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: proto_schema::GeographyType) -> DeltaResult<Self> {
         let algorithm = EdgeAlgo::try_from(proto.algorithm)
             .map_err(|_| {
@@ -899,7 +900,7 @@ impl TryFrom<proto_schema::GeographyType> for GeographyType {
 
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: EdgeAlgo) -> DeltaResult<Self> {
         let algorithm = match proto {
             EdgeAlgo::Spherical => EdgeInterpolationAlgorithm::Spherical,
@@ -910,7 +911,8 @@ impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
             EdgeAlgo::Unspecified => {
                 return Err(KernelError::invalid_geo_params(
                     "EdgeInterpolationAlgorithm is unspecified",
-                ))
+                )
+                .into())
             }
         };
         Ok(algorithm)
@@ -918,7 +920,7 @@ impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
 }
 
 impl TryFrom<proto_schema::ArrayType> for ArrayType {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: proto_schema::ArrayType) -> DeltaResult<Self> {
         let element_type = proto
             .element_type
@@ -931,7 +933,7 @@ impl TryFrom<proto_schema::ArrayType> for ArrayType {
 }
 
 impl TryFrom<proto_schema::MapType> for MapType {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: proto_schema::MapType) -> DeltaResult<Self> {
         let key_type = proto
             .key_type
@@ -948,7 +950,7 @@ impl TryFrom<proto_schema::MapType> for MapType {
 }
 
 impl TryFrom<proto_schema::MetadataValue> for MetadataValue {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(proto: proto_schema::MetadataValue) -> DeltaResult<Self> {
         let value = proto
             .value
@@ -958,7 +960,7 @@ impl TryFrom<proto_schema::MetadataValue> for MetadataValue {
             MetadataValueKind::String(s) => MetadataValue::String(s),
             MetadataValueKind::Boolean(b) => MetadataValue::Boolean(b),
             MetadataValueKind::OtherJson(json) => {
-                MetadataValue::Other(serde_json::from_str(&json)?)
+                MetadataValue::Other(serde_json::from_str(&json).map_err(crate::KernelError::from)?)
             }
         };
         Ok(metadata)

@@ -52,7 +52,8 @@ pub fn to_df_scalar(scalar: &KernelScalar) -> DeltaResult<DFScalarValue> {
         KernelScalar::IntervalYearMonth(_) | KernelScalar::IntervalDayTime(_) => {
             return Err(KernelError::unsupported(
                 "interval scalars are not supported in the DataFusion executor",
-            ))
+            )
+            .into())
         }
         KernelScalar::Null(data_type) => datatype_to_df_null_scalar(data_type)?,
     })
@@ -60,8 +61,11 @@ pub fn to_df_scalar(scalar: &KernelScalar) -> DeltaResult<DFScalarValue> {
 
 /// Builds a typed-null `DFScalarValue` from a kernel type.
 fn datatype_to_df_null_scalar(data_type: &KernelDataType) -> DeltaResult<DFScalarValue> {
-    let arrow_type: ArrowDataType = data_type.try_into_arrow()?;
-    arrow_type.try_into().map_err(KernelError::generic_err)
+    let arrow_type: ArrowDataType = data_type.try_into_arrow().map_err(KernelError::from)?;
+    arrow_type
+        .try_into()
+        .map_err(KernelError::generic_err)
+        .map_err(delta_kernel::Error::from)
 }
 
 /// Builds a `DFScalarValue::List` holding a single list row of the converted elements.
@@ -69,7 +73,10 @@ fn array_to_df_scalar(data: &KernelArrayData) -> DeltaResult<DFScalarValue> {
     let elements: DeltaResult<Vec<DFScalarValue>> =
         data.array_elements().iter().map(to_df_scalar).collect();
     // Name the list's element field from kernel's own ArrayType->Arrow conversion
-    let element_field: ArrowField = data.array_type().try_into_arrow()?;
+    let element_field: ArrowField = data
+        .array_type()
+        .try_into_arrow()
+        .map_err(KernelError::from)?;
     let element_array = df_scalars_to_arrow_array(elements?, element_field.data_type())?;
     let list = SingleRowListArrayBuilder::new(element_array)
         .with_field(&element_field)
@@ -81,23 +88,27 @@ fn array_to_df_scalar(data: &KernelArrayData) -> DeltaResult<DFScalarValue> {
 fn struct_to_df_scalar(data: &KernelStructData) -> DeltaResult<DFScalarValue> {
     let mut builder = ScalarStructBuilder::new();
     for (field, value) in data.fields().iter().zip(data.values()) {
-        let arrow_field: ArrowField = field.try_into_arrow()?;
+        let arrow_field: ArrowField = field.try_into_arrow().map_err(KernelError::from)?;
         builder = builder.with_scalar(arrow_field, to_df_scalar(value)?);
     }
-    builder.build().map_err(KernelError::generic_err)
+    builder
+        .build()
+        .map_err(KernelError::generic_err)
+        .map_err(delta_kernel::Error::from)
 }
 
 /// Builds a `DFScalarValue::Map` holding a single map row of the converted key/value pairs.
 fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<DFScalarValue> {
     let map_type = data.map_type();
-    let entries_field: ArrowField = map_type.try_into_arrow()?;
+    let entries_field: ArrowField = map_type.try_into_arrow().map_err(KernelError::from)?;
     let ArrowDataType::Struct(kv_fields) = entries_field.data_type() else {
-        return Err(KernelError::generic("map entries type is not a struct"));
+        return Err(KernelError::generic("map entries type is not a struct").into());
     };
     let [key_field, value_field] = kv_fields.as_ref() else {
         return Err(KernelError::generic(
             "map entries struct must have exactly a key and value field",
-        ));
+        )
+        .into());
     };
 
     let pairs = data.pairs();
@@ -126,7 +137,9 @@ fn df_scalars_to_arrow_array(
     if scalars.is_empty() {
         Ok(new_empty_array(arrow_type))
     } else {
-        DFScalarValue::iter_to_array(scalars).map_err(KernelError::generic_err)
+        DFScalarValue::iter_to_array(scalars)
+            .map_err(KernelError::generic_err)
+            .map_err(delta_kernel::Error::from)
     }
 }
 

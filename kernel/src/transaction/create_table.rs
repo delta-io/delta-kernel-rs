@@ -111,7 +111,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 ///     StructField::nullable("name", DataType::STRING),
 /// ])?);
 ///
-/// let url = url::Url::parse("file:///tmp/my_table")?;
+/// let url = delta_kernel::try_parse_uri("file:///tmp/my_table")?;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///
 /// let transaction = create_table("/tmp/my_table", schema, "MyApp/1.0")

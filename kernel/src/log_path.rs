@@ -58,13 +58,14 @@ impl LogPath {
     pub fn staged_commit_url(table_root: Url, filename: &str) -> DeltaResult<Url> {
         // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
         if !table_root.path().ends_with('/') {
-            return Err(KernelError::invalid_table_location(table_root));
+            return Err(KernelError::invalid_table_location(table_root).into());
         }
         table_root
             .join("_delta_log/")
             .and_then(|url| url.join("_staged_commits/"))
             .and_then(|url| url.join(filename))
             .map_err(|_| KernelError::invalid_table_location(table_root))
+            .map_err(crate::Error::from)
     }
 }
 
@@ -107,7 +108,10 @@ mod test {
         let filename = "00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json";
         let err =
             LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap_err();
-        assert!(matches!(err, KernelError::InvalidTableLocation(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::InvalidTableLocation(_))
+        ));
 
         // filename with path separators
         let table_root = Url::from_str("s3://my-bucket/my-table/").unwrap();

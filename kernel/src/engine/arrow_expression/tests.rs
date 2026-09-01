@@ -660,7 +660,7 @@ impl OpaqueLessThanOp {
         };
 
         let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::INTEGER));
-        Ok(op_fn(&eval(left)?, &eval(right)?)?)
+        Ok(op_fn(&eval(left)?, &eval(right)?).map_err(KernelError::from)?)
     }
 }
 
@@ -1482,7 +1482,7 @@ fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
         Box::new(crate::arrow::array::BinaryBuilder::new());
     let err = Scalar::append_null(builder.as_mut(), &dt, 1).unwrap_err();
     assert!(
-        matches!(err, KernelError::Unsupported(_)),
+        matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
         "expected Unsupported, got: {err:?}"
     );
 }

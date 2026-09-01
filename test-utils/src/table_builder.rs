@@ -1370,7 +1370,7 @@ impl TestTableBuilder {
             LastCheckpointHintState::Present => {}
             LastCheckpointHintState::Missing => match store.delete(&resolved_hint_path).await {
                 Ok(()) | Err(ObjectStoreError::NotFound { .. }) => {}
-                Err(e) => return Err(delta_kernel::KernelError::from(e)),
+                Err(e) => return Err(delta_kernel::KernelError::from(e).into()),
             },
             LastCheckpointHintState::Stale => {
                 // Restore the hint bytes captured after the lowest checkpoint write.
@@ -2020,7 +2020,9 @@ mod tests {
         block_on_sync(move || async move {
             crate::read_metadata_configuration_from_store(store.as_ref(), version)
                 .await
-                .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))
+                .map_err(|e| {
+                    delta_kernel::Error::from(delta_kernel::KernelError::generic(e.to_string()))
+                })
         })
     }
 
@@ -2632,11 +2634,11 @@ mod tests {
         let bytes = match store.get(path).await {
             Ok(r) => r.bytes().await.map_err(delta_kernel::KernelError::from)?,
             Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(delta_kernel::KernelError::from(e)),
+            Err(e) => return Err(delta_kernel::KernelError::from(e).into()),
         };
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))
+        serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            delta_kernel::Error::from(delta_kernel::KernelError::generic(e.to_string()))
+        })
     }
 
     /// Read and parse the `_last_checkpoint` hint, if present.
@@ -2647,7 +2649,9 @@ mod tests {
             match try_read_json(&store, &path).await? {
                 Some(parsed) => {
                     let version = parsed["version"].as_u64().ok_or_else(|| {
-                        delta_kernel::KernelError::generic("hint missing `version` field")
+                        delta_kernel::Error::from(delta_kernel::KernelError::generic(
+                            "hint missing `version` field",
+                        ))
                     })?;
                     Ok(Some(HintFile { version }))
                 }
@@ -2662,7 +2666,9 @@ mod tests {
         block_on_sync(move || async move {
             let path = Path::from(format!("_delta_log/{version:020}.crc"));
             try_read_json(&store, &path).await?.ok_or_else(|| {
-                delta_kernel::KernelError::generic(format!("CRC at v={version} missing"))
+                delta_kernel::Error::from(delta_kernel::KernelError::generic(format!(
+                    "CRC at v={version} missing"
+                )))
             })
         })
     }

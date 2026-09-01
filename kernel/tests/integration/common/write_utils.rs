@@ -28,7 +28,7 @@ use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::{BoundWriteContext, CommitResult, Transaction};
-use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
+use delta_kernel::{DeltaResult, Engine, KernelError, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
@@ -218,9 +218,15 @@ pub async fn write_data_and_check_result_and_stats(
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
         let data = RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
+            Arc::new(
+                schema
+                    .as_ref()
+                    .try_into_arrow()
+                    .map_err(KernelError::from)?,
+            ),
             vec![Arc::new(Int32Array::from(data.to_vec()))],
-        )?;
+        )
+        .map_err(KernelError::from)?;
         Ok(Box::new(ArrowEngineData::new(data)))
     });
 

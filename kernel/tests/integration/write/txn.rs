@@ -26,7 +26,8 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
                 .commit(&engine),
-            Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
+            Err(delta_kernel::Error::Kernel(KernelError::Generic(msg)))
+                if msg == "app_id app_id1 already exists in transaction"
         ));
 
         let txn = load_and_begin_transaction(table_url.clone(), &engine)?

@@ -24,7 +24,7 @@ use delta_kernel::table_features::{
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaResult, KernelError};
 use rstest::rstest;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup, test_table_setup_mt};
@@ -145,7 +145,8 @@ async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
     );
 
     // Parse and verify the JSON contents
-    let parsed: Value = serde_json::from_str(retrieved_config.as_ref().unwrap())?;
+    let parsed: Value =
+        serde_json::from_str(retrieved_config.as_ref().unwrap()).map_err(KernelError::from)?;
     assert_eq!(parsed["version"], 1);
     assert_eq!(parsed["enabled"], true);
 

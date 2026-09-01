@@ -443,7 +443,8 @@ impl ScanLogReplayProcessor {
                 let Some(predicate_schema) = internal_state.predicate_schema else {
                     return Err(KernelError::generic(
                         "Invalid serialized internal state. Expected predicate schema.",
-                    ));
+                    )
+                    .into());
                 };
                 PhysicalPredicate::Some(predicate, predicate_schema)
             }
@@ -947,7 +948,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ KernelError::ParseError(_, _)) => {
+                Err(crate::Error::Kernel(err @ KernelError::ParseError(_, _))) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
@@ -1043,7 +1044,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ KernelError::ParseError(_, _)) => {
+                Err(crate::Error::Kernel(err @ KernelError::ParseError(_, _))) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }

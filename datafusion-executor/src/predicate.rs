@@ -44,10 +44,12 @@ pub fn to_df_predicate_expr(
         }
         KernelPredicate::Opaque(_) => Err(KernelError::unsupported(
             "cannot convert an engine-defined Opaque predicate",
-        )),
+        )
+        .into()),
         KernelPredicate::Unknown(name) => Err(KernelError::unsupported(format!(
             "cannot convert Unknown predicate {name:?}"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -116,7 +118,8 @@ fn in_to_df_predicate_expr(
     let KernelExpression::Literal(_) = value else {
         return Err(KernelError::unsupported(
             "converting an IN predicate requires a literal left-hand side",
-        ));
+        )
+        .into());
     };
     let value = to_df_expr(value, input_schema, None)?;
     let membership =
@@ -126,7 +129,8 @@ fn in_to_df_predicate_expr(
             _ => return Err(KernelError::unsupported(
                 "converting an IN predicate requires a literal array or an array-typed column on \
                  the right-hand side",
-            )),
+            )
+            .into()),
         };
     Ok(membership.is_true())
 }
@@ -159,7 +163,8 @@ fn array_has_expr(
     let DataType::Array(_) = input_schema.field_at(name)?.data_type else {
         return Err(KernelError::unsupported(
             "converting an IN predicate against a column requires an array-typed column",
-        ));
+        )
+        .into());
     };
     Ok(array_has(to_df_expr(column, input_schema, None)?, value))
 }

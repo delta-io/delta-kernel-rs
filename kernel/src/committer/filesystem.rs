@@ -54,7 +54,7 @@ impl Committer for FileSystemCommitter {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(KernelError::FileAlreadyExists(_)) => {
+            Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
                 info!(
                     conflicting_version = version,
                     "Filesystem commit conflict: target version already exists"
@@ -75,7 +75,8 @@ impl Committer for FileSystemCommitter {
         if !publish_metadata.commits_to_publish().is_empty() {
             return Err(KernelError::generic(
                 "The FilesystemCommitter does not support publishing catalog commits.",
-            ));
+            )
+            .into());
         }
         Ok(())
     }
@@ -127,7 +128,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::KernelError::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
+            crate::Error::Kernel(crate::KernelError::Generic(e))
+                if e.contains("This table is catalog-managed and requires a catalog committer.")
         ));
     }
 

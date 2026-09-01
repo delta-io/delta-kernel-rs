@@ -30,7 +30,8 @@ mod tests;
 impl Scalar {
     /// Convert scalar to arrow array.
     pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
-        let data_type = ArrowDataType::try_from_kernel(&self.data_type())?;
+        let data_type =
+            ArrowDataType::try_from_kernel(&self.data_type()).map_err(crate::KernelError::from)?;
         let mut builder = array::make_builder(&data_type, num_rows);
         self.append_to(&mut builder, num_rows)?;
         Ok(builder.finish())
@@ -141,7 +142,7 @@ impl Scalar {
                         key.append_to(builder.keys(), 1)?;
                         val.append_to(builder.values(), 1)?;
                     }
-                    builder.append(true)?;
+                    builder.append(true).map_err(crate::KernelError::from)?;
                 }
             }
             Null(data_type) => Self::append_null(builder, data_type, num_rows)?,
@@ -210,23 +211,21 @@ impl Scalar {
                     builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
                 // TODO: Can be removed after https://github.com/apache/arrow-rs/pull/9432
                 for _ in 0..num_rows {
-                    builder.append(false)?;
+                    builder.append(false).map_err(crate::KernelError::from)?;
                 }
             }
             DataType::VOID => append_nulls_as!(array::NullBuilder),
             DataType::Variant(_) => {
-                return Err(KernelError::unsupported(
-                    "Variant is not supported as scalar yet.",
-                ));
+                return Err(
+                    KernelError::unsupported("Variant is not supported as scalar yet.").into(),
+                );
             }
             // Intervals are exposed as their physical integer (i32 months / i64 microseconds).
             DataType::INTERVAL_YEAR_MONTH => append_nulls_as!(array::Int32Builder),
             DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
-                return Err(KernelError::unsupported(
-                    "Geo is not supported as scalar yet.",
-                ));
+                return Err(KernelError::unsupported("Geo is not supported as scalar yet.").into());
             }
         }
         Ok(())
@@ -236,7 +235,8 @@ impl Scalar {
 impl ArrayData {
     /// Convert kernel [`ArrayData`] to an Arrow [`ArrayRef`] of the equivalent type.
     pub fn to_arrow(&self) -> DeltaResult<ArrayRef> {
-        let arrow_data_type = ArrowDataType::try_from_kernel(self.array_type().element_type())?;
+        let arrow_data_type = ArrowDataType::try_from_kernel(self.array_type().element_type())
+            .map_err(crate::KernelError::from)?;
 
         let elements = self.array_elements();
         let mut builder = array::make_builder(&arrow_data_type, elements.len());
@@ -284,8 +284,16 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         let arrays = fields
             .map(|field| Scalar::Null(field.data_type().clone()).to_array(1))
             .try_collect()?;
-        let record_batch =
-            RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into_arrow()?), arrays)?;
+        let record_batch = RecordBatch::try_new(
+            Arc::new(
+                output_schema
+                    .as_ref()
+                    .try_into_arrow()
+                    .map_err(crate::KernelError::from)?,
+            ),
+            arrays,
+        )
+        .map_err(crate::KernelError::from)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 
@@ -294,7 +302,12 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         schema: SchemaRef,
         rows: &[&[Scalar]],
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+        let arrow_schema: Arc<ArrowSchema> = Arc::new(
+            schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(crate::KernelError::from)?,
+        );
         if rows.is_empty() {
             return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
                 arrow_schema,
@@ -310,7 +323,8 @@ impl EvaluationHandler for ArrowEvaluationHandler {
                     row_idx,
                     row.len(),
                     num_fields
-                )));
+                ))
+                .into());
             }
         }
 
@@ -337,10 +351,9 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
         let arrays: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
 
-        Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            arrow_schema,
-            arrays,
-        )?)))
+        Ok(Box::new(ArrowEngineData::new(
+            RecordBatch::try_new(arrow_schema, arrays).map_err(crate::KernelError::from)?,
+        )))
     }
 }
 
@@ -381,9 +394,11 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             (expr, output_type) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
                 let array_ref = apply_schema_to(&array_ref, output_type)?;
-                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
+                let arrow_type = ArrowDataType::try_from_kernel(output_type)
+                    .map_err(crate::KernelError::from)?;
                 let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
-                RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
+                RecordBatch::try_new(Arc::new(schema), vec![array_ref])
+                    .map_err(crate::KernelError::from)?
             }
         };
 
@@ -415,7 +430,8 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
             ArrowDataType::Boolean,
             true,
         )]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
+            .map_err(crate::KernelError::from)?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }

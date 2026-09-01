@@ -20,7 +20,7 @@ use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
-use crate::{DeltaResult, Engine, PredicateRef, Snapshot};
+use crate::{DeltaResult, Engine, KernelError, PredicateRef, Snapshot};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
@@ -52,7 +52,7 @@ fn normalized_metadata_batch(
     if let Some(partitions) = partitions_parsed {
         columns.push(("partitionValues_parsed", partitions));
     }
-    Ok(RecordBatch::try_from_iter(columns)?)
+    Ok(RecordBatch::try_from_iter(columns).map_err(KernelError::from)?)
 }
 
 fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<RecordBatch>> {
@@ -62,7 +62,8 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<Recor
         let batch = filter_record_batch(
             &data.try_into_record_batch()?,
             &BooleanArray::from(selection),
-        )?;
+        )
+        .map_err(KernelError::from)?;
         if batch.num_rows() == 0 {
             continue;
         }
@@ -137,7 +138,9 @@ fn assert_metadata_eq(
     context: &str,
 ) -> DeltaResult<()> {
     fn sorted_pretty_lines(batches: &[RecordBatch]) -> DeltaResult<Vec<String>> {
-        let formatted = pretty_format_batches(batches)?.to_string();
+        let formatted = pretty_format_batches(batches)
+            .map_err(KernelError::from)?
+            .to_string();
         let mut lines: Vec<_> = formatted.lines().map(str::to_string).collect();
         let len = lines.len();
         if len > 3 {
@@ -168,6 +171,7 @@ fn without_columns(batches: &[RecordBatch], excluded: &[&str]) -> DeltaResult<Ve
                     .filter(|(field, _)| !excluded.contains(&field.name().as_str()))
                     .map(|(field, column)| (field.name(), column.clone())),
             )
+            .map_err(KernelError::from)
             .map_err(Into::into)
         })
         .collect()
@@ -828,7 +832,9 @@ fn declarative_metadata_partition_is_null_keeps_null_partition() -> DeltaResult<
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
-    let formatted = pretty_format_batches(&actual)?.to_string();
+    let formatted = pretty_format_batches(&actual)
+        .map_err(KernelError::from)?
+        .to_string();
 
     assert_eq!(metadata_row_count(&actual), 1, "{formatted}");
     let batch = actual.first().expect("null partition metadata");
@@ -887,23 +893,28 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Delta
             .as_any()
             .downcast_ref::<StructArray>()
             .expect("add struct");
-        projected.push(RecordBatch::try_from_iter([
-            (
-                "stats",
-                add.column_by_name(STATS_PARSED)
-                    .expect("add.stats_parsed")
-                    .clone(),
-            ),
-            (
-                "partitionValues",
-                add.column_by_name(PARTITION_VALUES_PARSED)
-                    .expect("add.partitionValues_parsed")
-                    .clone(),
-            ),
-        ])?);
+        projected.push(
+            RecordBatch::try_from_iter([
+                (
+                    "stats",
+                    add.column_by_name(STATS_PARSED)
+                        .expect("add.stats_parsed")
+                        .clone(),
+                ),
+                (
+                    "partitionValues",
+                    add.column_by_name(PARTITION_VALUES_PARSED)
+                        .expect("add.partitionValues_parsed")
+                        .clone(),
+                ),
+            ])
+            .map_err(KernelError::from)?,
+        );
     }
 
-    let formatted = pretty_format_batches(&projected)?.to_string();
+    let formatted = pretty_format_batches(&projected)
+        .map_err(KernelError::from)?
+        .to_string();
     let mut actual_rows: Vec<_> = formatted
         .lines()
         .filter(|line| line.starts_with("| {numRecords:"))
@@ -968,7 +979,9 @@ fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> 
         .with_predicate(Arc::new(col!("int").gt(lit(0i64))))
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
-    let formatted = pretty_format_batches(&actual)?.to_string();
+    let formatted = pretty_format_batches(&actual)
+        .map_err(KernelError::from)?
+        .to_string();
 
     assert_eq!(metadata_row_count(&actual), 1, "{formatted}");
     let path = actual[0]
@@ -1083,6 +1096,9 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Delt
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();
 
-    assert!(matches!(err, crate::KernelError::Unsupported(_)));
+    assert!(matches!(
+        err,
+        crate::Error::Kernel(KernelError::Unsupported(_))
+    ));
     Ok(())
 }

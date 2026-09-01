@@ -528,7 +528,8 @@ impl Snapshot {
         if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
             return Err(KernelError::generic(
                 "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
-            ));
+            )
+            .into());
         }
 
         self.get_domain_metadata_internal(domain, engine)
@@ -786,7 +787,7 @@ impl Snapshot {
                     "Invalid state: snapshot at version {} has ICT enablement version {} in the future",
                     self.version(),
                     enablement_version
-                )));
+                )).into());
             }
         }
 
@@ -798,7 +799,8 @@ impl Snapshot {
                     return Err(KernelError::generic(format!(
                         "In-Commit Timestamp not found in CRC file at version {}",
                         self.version()
-                    )));
+                    ))
+                    .into());
                 }
             }
         }
@@ -809,9 +811,7 @@ impl Snapshot {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
                 Ok(Some(ict))
             }
-            None => Err(KernelError::generic(
-                "Last commit file not found in log segment",
-            )),
+            None => Err(KernelError::generic("Last commit file not found in log segment").into()),
         }
     }
 
@@ -843,7 +843,8 @@ impl Snapshot {
                         "Last commit file not found in log segment for version {} \
                          (ICT disabled): cannot read filesystem modification timestamp",
                         self.version()
-                    ))),
+                    ))
+                    .into()),
                 }
             }
             InCommitTimestampEnablement::Enabled { .. } => self
@@ -860,7 +861,8 @@ impl Snapshot {
                         but get_in_commit_timestamp returned None",
                         self.version()
                     ))
-                }),
+                })
+                .map_err(crate::Error::from),
         }
     }
 
@@ -1009,7 +1011,7 @@ impl Snapshot {
                 )?);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
-            Err(KernelError::FileAlreadyExists(_)) => {
+            Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
                 info!(
                     "Another writer beat us to writing CRC file at {}",
                     crc_path.location
@@ -1161,7 +1163,7 @@ impl Snapshot {
                 if !v2_supported {
                     return Err(KernelError::checkpoint_write(
                         "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
-                    ));
+                    ).into());
                 }
                 if let V2CheckpointConfig::WithSidecar {
                     file_actions_per_sidecar_hint: Some(0),
@@ -1169,7 +1171,8 @@ impl Snapshot {
                 {
                     return Err(KernelError::checkpoint_write(
                         "file_actions_per_sidecar_hint must be greater than 0",
-                    ));
+                    )
+                    .into());
                 }
             }
             Some(CheckpointSpec::V1) if v2_supported => {
@@ -1177,7 +1180,7 @@ impl Snapshot {
                 // v2Checkpoint See <https://github.com/delta-io/delta-kernel-rs/issues/2454>.
                 return Err(KernelError::unsupported(
                     "Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint",
-                ));
+                ).into());
             }
             _ => {}
         }
@@ -1197,7 +1200,7 @@ impl Snapshot {
 
         let info = match write_result {
             Ok(info) => info,
-            Err(KernelError::FileAlreadyExists(_)) => {
+            Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
                 // NOTE: Per write_parquet_file's documentation, it should silently overwrite
                 // existing files, so we log a warning but still return the correct result.
                 warn!(
@@ -1446,7 +1449,9 @@ mod tests {
         // Create a log segment with only checkpoint and no commit file (simulating scenario
         // where a checkpoint exists but the commit file has been cleaned up)
         let checkpoint_parts = vec![ParsedLogPath::try_from(crate::FileMeta {
-            location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
+            location: url
+                .join("_delta_log/00000000000000000000.checkpoint.parquet")
+                .map_err(KernelError::from)?,
             last_modified: 0,
             size: 100,
         })?
@@ -1457,8 +1462,12 @@ mod tests {
             ..Default::default()
         };
 
-        let log_segment =
-            LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
+        let log_segment = LogSegment::try_new(
+            listed_files,
+            url.join("_delta_log/").map_err(KernelError::from)?,
+            Some(0),
+            None,
+        )?;
 
         Snapshot::new_with_crc(
             log_segment,
@@ -1755,8 +1764,10 @@ mod tests {
         let err = snapshot
             .get_domain_metadata("delta.domain3", &engine)
             .unwrap_err();
-        assert!(matches!(err, KernelError::Generic(msg) if
-                msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+        assert!(
+            matches!(err, crate::Error::Kernel(KernelError::Generic(msg)) if
+                msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain")
+        );
 
         // Test get_domain_metadata_internal
         assert_eq!(
@@ -1970,7 +1981,7 @@ mod tests {
         // When ICT is enabled but commit file is not found in log segment,
         // get_in_commit_timestamp should return an error
 
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///").map_err(KernelError::from)?;
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
 
@@ -2053,12 +2064,16 @@ mod tests {
         let checkpoint: RecordBatch = checkpoint.into();
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)?;
-        writer.write(&checkpoint)?;
-        writer.close()?;
+        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)
+            .map_err(KernelError::from)?;
+        writer.write(&checkpoint).map_err(KernelError::from)?;
+        writer.close().map_err(KernelError::from)?;
 
         let checkpoint_path = delta_path_for_version(1, "checkpoint.parquet");
-        store.put(&checkpoint_path, buffer.into()).await?;
+        store
+            .put(&checkpoint_path, buffer.into())
+            .await
+            .map_err(KernelError::from)?;
 
         // Create 00000000000000000001.json with ICT
         let expected_ict = 1587968586200i64;
@@ -2123,7 +2138,7 @@ mod tests {
     async fn test_get_timestamp_errors_when_commit_file_missing(
         #[case] ict_enabled: bool,
     ) -> DeltaResult<()> {
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///").map_err(KernelError::from)?;
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
 

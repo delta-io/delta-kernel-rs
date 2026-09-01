@@ -439,7 +439,9 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
                 // NB: we `use` here to avoid polluting the caller's namespace
                 use delta_kernel::EvaluationHandlerExtension as _;
                 let values = [
-                    #(self.#field_idents.try_into()?),*
+                    #(self.#field_idents
+                        .try_into()
+                        .map_err(delta_kernel::KernelError::from)?),*
                 ];
                 let evaluator = engine.evaluation_handler();
                 evaluator.create_one(schema, &values)
@@ -540,9 +542,9 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         where
             #struct_name: delta_kernel::schema::ToSchema,
             #(#field_types:
-                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::KernelError>,)*
+                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::Error>,)*
         {
-            type Error = delta_kernel::KernelError;
+            type Error = delta_kernel::Error;
 
             fn try_from(
                 value: delta_kernel::expressions::StructData,
@@ -565,17 +567,17 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         where
             #struct_name: TryFrom<
                 delta_kernel::expressions::StructData,
-                Error = delta_kernel::KernelError,
+                Error = delta_kernel::Error,
             >,
         {
-            type Error = delta_kernel::KernelError;
+            type Error = delta_kernel::Error;
 
             fn try_from(
                 value: delta_kernel::expressions::Scalar,
             ) -> delta_kernel::DeltaResult<Self> {
                 match value {
                     delta_kernel::expressions::Scalar::Struct(data) => data.try_into(),
-                    other => Err(other.conversion_error(stringify!(#struct_name))),
+                    other => Err(other.conversion_error(stringify!(#struct_name)).into()),
                 }
             }
         }

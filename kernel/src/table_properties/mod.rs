@@ -303,7 +303,7 @@ impl Default for DataSkippingNumIndexedCols {
 }
 
 impl TryFrom<&str> for DataSkippingNumIndexedCols {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let num: i64 = value.parse().map_err(|_| {

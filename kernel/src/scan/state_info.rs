@@ -91,7 +91,8 @@ fn validate_metadata_columns<'a>(
             return Err(KernelError::Schema(format!(
                 "Metadata column names must not match partition columns: {}",
                 metadata_column.name()
-            )));
+            ))
+            .into());
         }
         match metadata_column.get_metadata_column_spec() {
             Some(MetadataColumnSpec::RowIndex) => {
@@ -99,9 +100,9 @@ fn validate_metadata_columns<'a>(
             }
             Some(MetadataColumnSpec::RowId) => {
                 if table_configuration.table_properties().enable_row_tracking != Some(true) {
-                    return Err(KernelError::unsupported(
-                        "Row ids are not enabled on this table",
-                    ));
+                    return Err(
+                        KernelError::unsupported("Row ids are not enabled on this table").into(),
+                    );
                 }
                 let row_id_col = table_configuration
                     .metadata()
@@ -301,7 +302,7 @@ impl StateInfo {
                         else {
                             return Err(KernelError::internal_error(
                                 "Should always return a materialized_row_id_column_name if selecting row ids"
-                            ));
+                            ).into());
                         };
 
                         read_fields.push(StructField::nullable(row_id_col_name, DataType::LONG));
@@ -311,9 +312,9 @@ impl StateInfo {
                         });
                     }
                     Some(MetadataColumnSpec::RowCommitVersion) => {
-                        return Err(KernelError::unsupported(
-                            "Row commit versions not supported",
-                        ));
+                        return Err(
+                            KernelError::unsupported("Row commit versions not supported").into(),
+                        );
                     }
                     Some(MetadataColumnSpec::RowIndex)
                     | Some(MetadataColumnSpec::FilePath)
@@ -331,7 +332,7 @@ impl StateInfo {
                             return Err(KernelError::Schema(format!(
                                 "Metadata column names must not match physical columns, but logical column '{}' has physical name '{}'",
                                 logical_field.name(), physical_name,
-                            )));
+                            )).into());
                         }
                         last_physical_field = Some(physical_name);
                         read_fields.push(physical_field);

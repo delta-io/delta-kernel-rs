@@ -297,9 +297,9 @@ impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
 /// [`TryFrom`].
 impl<T> TryFrom<Values> for Vec<T>
 where
-    T: TryFrom<StructData, Error = KernelError> + ToSchema,
+    T: TryFrom<StructData, Error = crate::Error> + ToSchema,
 {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(Values { schema, rows }: Values) -> DeltaResult<Self> {
         rows.into_iter()
@@ -508,7 +508,8 @@ impl DynamicScan {
             return Err(KernelError::generic(format!(
                 "dynamic scan: base URL `{}` must be hierarchical and end in `/`",
                 self.base_url
-            )));
+            ))
+            .into());
         }
 
         Self::validate_required_column(input_schema, &self.path_column, &DataType::STRING)?;
@@ -529,9 +530,7 @@ impl DynamicScan {
                 ))
             })?;
         let Some((field, _ancestors)) = fields.split_last() else {
-            return Err(KernelError::internal_error(
-                "fields_of_path returned no fields",
-            ));
+            return Err(KernelError::internal_error("fields_of_path returned no fields").into());
         };
         let expected = &*DELETION_VECTOR_DATA_TYPE;
         if field.data_type() != expected {
@@ -539,13 +538,15 @@ impl DynamicScan {
                 "dynamic scan: deletion-vector column `{}` must have type {expected}, found {}",
                 self.dv_column,
                 field.data_type()
-            )));
+            ))
+            .into());
         }
         if !field.is_nullable() {
             return Err(KernelError::generic(format!(
                 "dynamic scan: deletion-vector column `{}` must be nullable",
                 self.dv_column
-            )));
+            ))
+            .into());
         }
 
         Ok(())
@@ -558,20 +559,20 @@ impl DynamicScan {
     ) -> DeltaResult<()> {
         let fields = schema.fields_of_path(column)?;
         let Some((field, ancestors)) = fields.split_last() else {
-            return Err(KernelError::internal_error(
-                "fields_of_path returned no fields",
-            ));
+            return Err(KernelError::internal_error("fields_of_path returned no fields").into());
         };
         if field.data_type() != expected_type {
             return Err(KernelError::generic(format!(
                 "dynamic scan: column `{column}` must have type {expected_type}, found {}",
                 field.data_type()
-            )));
+            ))
+            .into());
         }
         if field.is_nullable() || ancestors.iter().any(|field| field.is_nullable()) {
             return Err(KernelError::generic(format!(
                 "dynamic scan: required column `{column}` is nullable"
-            )));
+            ))
+            .into());
         }
         Ok(())
     }
@@ -587,23 +588,27 @@ impl DynamicScan {
                     "dynamic scan file_constant source: column `{name}` not found; schema has \
                      {:?}",
                     Vec::from_iter(input_schema.fields().map(|field| field.name())),
-                )));
+                ))
+                .into());
             };
             if input_field.is_metadata_column() {
                 return Err(KernelError::generic(format!(
                     "dynamic scan file_constant source: column `{name}` is a metadata column"
-                )));
+                ))
+                .into());
             }
             let Some(output_field) = output_schema.field(name) else {
                 return Err(KernelError::generic(format!(
                     "dynamic scan file_constant: column `{name}` not found; schema has {:?}",
                     Vec::from_iter(output_schema.fields().map(|field| field.name())),
-                )));
+                ))
+                .into());
             };
             if output_field.is_metadata_column() {
                 return Err(KernelError::generic(format!(
                     "dynamic scan file_constant: column `{name}` is a metadata column"
-                )));
+                ))
+                .into());
             }
             if input_field.data_type() != output_field.data_type()
                 || input_field.is_nullable() != output_field.is_nullable()
@@ -611,7 +616,8 @@ impl DynamicScan {
                 return Err(KernelError::generic(format!(
                     "dynamic scan file_constant: column `{name}` must have the same type and \
                      nullability in input and output"
-                )));
+                ))
+                .into());
             }
         }
         Ok(())
@@ -1026,7 +1032,7 @@ impl AggregateBuilder {
 }
 
 impl TryFrom<AggregateBuilder> for Aggregate {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(builder: AggregateBuilder) -> DeltaResult<Self> {
         builder.build()

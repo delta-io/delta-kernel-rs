@@ -56,7 +56,8 @@ pub(super) fn parse(tokens: Vec<Token>) -> DeltaResult<Comparison> {
     if parser.advance().is_some() {
         return Err(KernelError::generic(
             "unexpected trailing input: only a single comparison is supported",
-        ));
+        )
+        .into());
     }
     Ok(comparison)
 }
@@ -91,7 +92,7 @@ impl Parser {
             Some(Token::Eq) => CmpOp::Eq,
             Some(Token::Ne) => CmpOp::Ne,
             Some(Token::NullSafeEq) => CmpOp::NullSafeEq,
-            other => return Err(expected("a comparison operator", other)),
+            other => return Err(expected("a comparison operator", other).into()),
         };
         Ok(op)
     }
@@ -109,12 +110,12 @@ impl Parser {
                 let sign = if sign == Token::Minus { '-' } else { '+' };
                 match self.advance() {
                     Some(Token::Number(raw)) => Ok(Operand::Literal(format!("{sign}{raw}"))),
-                    other => Err(expected(&format!("a number after '{sign}'"), other)),
+                    other => Err(expected(&format!("a number after '{sign}'"), other).into()),
                 }
             }
             Some(Token::Number(raw)) | Some(Token::Literal(raw)) => Ok(Operand::Literal(raw)),
             Some(Token::Ident(first)) => self.parse_column_path(first),
-            other => Err(expected("a column or literal", other)),
+            other => Err(expected("a column or literal", other).into()),
         }
     }
 
@@ -125,7 +126,7 @@ impl Parser {
             self.advance();
             match self.advance() {
                 Some(Token::Ident(segment)) => path.push(segment),
-                other => return Err(expected("an identifier after '.'", other)),
+                other => return Err(expected("an identifier after '.'", other).into()),
             }
         }
         Ok(Operand::Column(ColumnName::new(path)))

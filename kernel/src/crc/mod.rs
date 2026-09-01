@@ -170,7 +170,7 @@ struct CrcRaw {
 impl Crc {
     /// Parse a `.crc` file body. `version` comes from the filename (the body does not carry it).
     pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> DeltaResult<Self> {
-        let raw: CrcRaw = serde_json::from_slice(bytes)?;
+        let raw: CrcRaw = serde_json::from_slice(bytes).map_err(crate::KernelError::from)?;
         // Per the Delta protocol spec, numMetadata and numProtocol MUST be 1 in any CRC file.
         // Reject malformed files at the deserialization boundary so callers can trust the value.
         for (name, value) in [
@@ -180,7 +180,8 @@ impl Crc {
             if value != 1 {
                 return Err(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected 1, got {value}"
-                )));
+                ))
+                .into());
             }
         }
         // A CRC file on disk is by definition complete; we never deserialize a degraded state.
@@ -223,13 +224,14 @@ impl Crc {
 
 /// Fails for non-`Complete` file stats: a degraded CRC has no well-defined on-disk shape.
 impl TryFrom<&Crc> for CrcRaw {
-    type Error = KernelError;
+    type Error = crate::Error;
     fn try_from(crc: &Crc) -> Result<Self, Self::Error> {
         let FileStatsState::Complete(stats) = &crc.file_stats_state else {
             return Err(KernelError::ChecksumWriteUnsupported(format!(
                 "Cannot serialize CRC with {:?} file stats",
                 crc.file_stats_state
-            )));
+            ))
+            .into());
         };
         Ok(CrcRaw {
             table_size_bytes: stats.table_size_bytes,
@@ -761,7 +763,10 @@ mod tests {
         };
         let err = CrcRaw::try_from(&crc).unwrap_err();
         assert!(
-            matches!(err, crate::KernelError::ChecksumWriteUnsupported(_)),
+            matches!(
+                err,
+                crate::Error::Kernel(crate::KernelError::ChecksumWriteUnsupported(_))
+            ),
             "expected ChecksumWriteUnsupported, got: {err:?}"
         );
     }

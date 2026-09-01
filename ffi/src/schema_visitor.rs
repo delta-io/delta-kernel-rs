@@ -52,15 +52,13 @@ pub fn extract_kernel_schema(
         .ok_or_else(|| KernelError::schema("Nonexistent id passed to extract_kernel_schema"))?;
     let DataType::Struct(struct_type) = schema_element.data_type else {
         warn!("Final returned id was not a struct, schema is invalid");
-        return Err(KernelError::schema(
-            "Final returned id was not a struct, schema is invalid",
-        ));
+        return Err(
+            KernelError::schema("Final returned id was not a struct, schema is invalid").into(),
+        );
     };
     if !state.elements.is_empty() {
         warn!("Didn't consume all visited fields, schema is invalid.");
-        Err(KernelError::schema(
-            "Didn't consume all visited fields, schema is invalid.",
-        ))
+        Err(KernelError::schema("Didn't consume all visited fields, schema is invalid.").into())
     } else {
         Ok(*struct_type)
     }
@@ -408,7 +406,7 @@ pub unsafe extern "C" fn visit_field_struct(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str: Result<&str, KernelError> = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let name_str: DeltaResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
     visit_field_struct_impl(state, name_str, field_ids, nullable)
@@ -423,9 +421,11 @@ fn create_struct_data_type(
     let field_vec = field_ids
         .iter()
         .map(|&field_id| {
-            unwrap_field(state, field_id).ok_or_else(|| {
-                KernelError::generic(format!("Invalid field ID {field_id} in struct"))
-            })
+            unwrap_field(state, field_id)
+                .ok_or_else(|| {
+                    KernelError::generic(format!("Invalid field ID {field_id} in struct"))
+                })
+                .map_err(delta_kernel::Error::from)
         })
         .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -524,7 +524,7 @@ fn visit_field_map_impl(
     })?;
 
     if key_field.nullable {
-        return Err(KernelError::generic("Delta Map keys may not be nullable"));
+        return Err(KernelError::generic("Delta Map keys may not be nullable").into());
     }
 
     let value_field = unwrap_field(state, value_type_id).ok_or_else(|| {
@@ -585,7 +585,8 @@ fn create_variant_data_type(
     else {
         return Err(KernelError::generic(format!(
             "Invalid variant struct ID {struct_type_id} - must be DataType::Struct"
-        )));
+        ))
+        .into());
     };
     Ok(DataType::Variant(variant_struct))
 }

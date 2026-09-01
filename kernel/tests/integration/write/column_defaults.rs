@@ -304,7 +304,7 @@ async fn write_state_acknowledgement_depends_on_column_defaults(
             .expect_err("inspecting defaults must not implicitly acknowledge them");
         assert!(matches!(
             &error,
-            delta_kernel::KernelError::InvalidTransactionState(_)
+            delta_kernel::Error::Kernel(delta_kernel::KernelError::InvalidTransactionState(_))
         ));
         assert!(error.to_string().contains("ack_column_defaults"));
 

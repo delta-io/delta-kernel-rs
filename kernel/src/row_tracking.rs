@@ -64,18 +64,19 @@ impl RowTrackingDomainMetadata {
         Ok(snapshot
             .get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
             .map(|config| serde_json::from_str::<Self>(&config))
-            .transpose()?
+            .transpose()
+            .map_err(crate::KernelError::from)?
             .map(|metadata| metadata.row_id_high_water_mark))
     }
 }
 
 impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
-    type Error = crate::KernelError;
+    type Error = crate::Error;
 
     fn try_from(metadata: RowTrackingDomainMetadata) -> DeltaResult<Self> {
         Ok(DomainMetadata::new(
             ROW_TRACKING_DOMAIN_NAME.to_string(),
-            serde_json::to_string(&metadata)?,
+            serde_json::to_string(&metadata).map_err(crate::KernelError::from)?,
         ))
     }
 }
@@ -318,8 +319,9 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip() -> DeltaResult<()> {
         let original = RowTrackingDomainMetadata::new(-42);
-        let json = serde_json::to_string(&original)?;
-        let deserialized: RowTrackingDomainMetadata = serde_json::from_str(&json)?;
+        let json = serde_json::to_string(&original).map_err(KernelError::from)?;
+        let deserialized: RowTrackingDomainMetadata =
+            serde_json::from_str(&json).map_err(KernelError::from)?;
 
         assert_eq!(
             original.row_id_high_water_mark,

@@ -47,9 +47,9 @@ impl LogSegment {
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
-            (None, Some(_), _) => Err(KernelError::MissingMetadata),
-            (Some(_), None, _) => Err(KernelError::MissingProtocol),
-            (None, None, _) => Err(KernelError::MissingMetadataAndProtocol),
+            (None, Some(_), _) => Err(KernelError::MissingMetadata.into()),
+            (Some(_), None, _) => Err(KernelError::MissingProtocol.into()),
+            (None, None, _) => Err(KernelError::MissingMetadataAndProtocol.into()),
         }
     }
 
@@ -342,6 +342,7 @@ fn batch_version(data: &dyn EngineData) -> DeltaResult<Version> {
     ParsedLogPath::try_from(url)?
         .map(|path| path.version)
         .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
+        .map_err(crate::Error::from)
 }
 
 /// Whether `winner` is set at a version at least `batch_version`.
@@ -496,7 +497,7 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
         fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-            Err(KernelError::generic("plan executor deliberately failed"))
+            Err(KernelError::generic("plan executor deliberately failed").into())
         }
     }
 

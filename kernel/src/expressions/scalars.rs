@@ -420,7 +420,8 @@ impl Scalar {
         let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
             return Err(KernelError::generic(format!(
                 "Failed to create millisecond timestamp from {millis}"
-            )));
+            ))
+            .into());
         };
         Ok(Self::Timestamp(timestamp.timestamp_micros()))
     }
@@ -778,12 +779,12 @@ macro_rules! impl_try_from_scalar {
     ( $(($variant:ident, $rust_type:ty)),* $(,)? ) => {
         $(
             impl TryFrom<Scalar> for $rust_type {
-                type Error = KernelError;
+                type Error = crate::Error;
 
                 fn try_from(scalar: Scalar) -> DeltaResult<Self> {
                     match scalar {
                         Scalar::$variant(value) => Ok(value.into()),
-                        other => Err(other.conversion_error(stringify!($rust_type))),
+                        other => Err(other.conversion_error(stringify!($rust_type)).into()),
                     }
                 }
             }
@@ -809,8 +810,8 @@ impl_try_from_scalar!(
 
 /// Null becomes `None` when its typed null matches `T::to_data_type`; anything else must convert
 /// to `T`.
-impl<T: TryFrom<Scalar, Error = KernelError> + ToDataType> TryFrom<Scalar> for Option<T> {
-    type Error = KernelError;
+impl<T: TryFrom<Scalar, Error = crate::Error> + ToDataType> TryFrom<Scalar> for Option<T> {
+    type Error = crate::Error;
 
     fn try_from(scalar: Scalar) -> DeltaResult<Self> {
         match scalar {
@@ -830,9 +831,9 @@ impl<T: TryFrom<Scalar, Error = KernelError> + ToDataType> TryFrom<Scalar> for O
 /// Extracts an array scalar's elements. Use `Vec<Option<T>>` for arrays that contain nulls.
 impl<T> TryFrom<Scalar> for Vec<T>
 where
-    T: GetStructField + TryFrom<Scalar, Error = KernelError>,
+    T: GetStructField + TryFrom<Scalar, Error = crate::Error>,
 {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(scalar: Scalar) -> DeltaResult<Self> {
         let array: ArrayData = scalar.try_into()?;
@@ -868,11 +869,11 @@ where
 /// Extracts a map scalar's entries. Use `HashMap<K, Option<V>>` for maps with null values.
 impl<K, V> TryFrom<Scalar> for HashMap<K, V>
 where
-    K: TryFrom<Scalar, Error = KernelError> + Eq + Hash,
-    V: GetStructField + TryFrom<Scalar, Error = KernelError>,
+    K: TryFrom<Scalar, Error = crate::Error> + Eq + Hash,
+    V: GetStructField + TryFrom<Scalar, Error = crate::Error>,
     K: ToDataType,
 {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(scalar: Scalar) -> DeltaResult<Self> {
         let map: MapData = scalar.try_into()?;
@@ -2089,7 +2090,7 @@ mod tests {
     /// `TryFrom<Scalar>` must invert `Into<Scalar>` and produce the expected data type.
     fn assert_round_trip<T>(value: T, expected_type: impl Into<DataType>)
     where
-        T: Clone + Debug + PartialEq + Into<Scalar> + TryFrom<Scalar, Error = KernelError>,
+        T: Clone + Debug + PartialEq + Into<Scalar> + TryFrom<Scalar, Error = crate::Error>,
     {
         let scalar: Scalar = value.clone().into();
         assert_eq!(scalar.data_type(), expected_type.into());

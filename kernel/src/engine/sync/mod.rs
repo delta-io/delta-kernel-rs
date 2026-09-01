@@ -123,13 +123,14 @@ pub(super) fn resolve_scope(
     if let Some(store) = default_store {
         let mut base_url = url.clone();
         base_url.set_path("/");
-        let path = Path::from_url_path(url.path())?;
+        let path = Path::from_url_path(url.path()).map_err(KernelError::from)?;
         return Ok((store.clone(), base_url, path));
     }
     if url.scheme() != "file" {
         return Err(KernelError::generic(format!(
             "SyncEngine without an explicit store can only access file:// URLs, got: {url}"
-        )));
+        ))
+        .into());
     }
     let file_path = url
         .to_file_path()
@@ -162,7 +163,8 @@ pub(super) fn resolve_scope(
     }));
     let base_url = Url::from_directory_path(&prefix)
         .map_err(|()| KernelError::generic(format!("Could not URL-encode prefix {prefix:?}")))?;
-    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&prefix)?);
+    let store: Arc<DynObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(&prefix).map_err(KernelError::from)?);
     Ok((store, base_url, path))
 }
 
@@ -172,8 +174,8 @@ pub(super) fn get_bytes(
     location: &Url,
 ) -> DeltaResult<Bytes> {
     let (store, _, path) = resolve_scope(default_store, location)?;
-    let get_result = futures::executor::block_on(store.get(&path))?;
-    Ok(futures::executor::block_on(get_result.bytes())?)
+    let get_result = futures::executor::block_on(store.get(&path)).map_err(KernelError::from)?;
+    Ok(futures::executor::block_on(get_result.bytes()).map_err(KernelError::from)?)
 }
 
 /// Write `data` to `location` via [`resolve_scope`].
@@ -192,7 +194,7 @@ pub(super) fn put_bytes(
         if let Ok(file_path) = location.to_file_path() {
             if let Some(parent) = file_path.parent() {
                 if !parent.exists() {
-                    std::fs::create_dir_all(parent)?;
+                    std::fs::create_dir_all(parent).map_err(KernelError::from)?;
                 }
             }
         }

@@ -151,14 +151,15 @@ pub(crate) fn build_checkpoint_read_schema(
     transform_add_schema(base_schema, |add_struct| {
         // Validate fields aren't already present
         if add_struct.field(STATS_PARSED_FIELD).is_some() {
-            return Err(KernelError::generic(
-                "stats_parsed field already exists in Add schema",
-            ));
+            return Err(
+                KernelError::generic("stats_parsed field already exists in Add schema").into(),
+            );
         }
         if partition_schema.is_some() && add_struct.field(PARTITION_VALUES_PARSED_FIELD).is_some() {
             return Err(KernelError::generic(
                 "partitionValues_parsed field already exists in Add schema",
-            ));
+            )
+            .into());
         }
         SchemaStructPatchBuilder::new()
             .insert_after(
@@ -252,7 +253,8 @@ fn transform_add_schema(
         return Err(KernelError::generic(format!(
             "Expected 'add' field to be a struct type, got {:?}",
             add_field.data_type
-        )));
+        ))
+        .into());
     };
 
     let modified_add = transform_fn(add_struct)?;

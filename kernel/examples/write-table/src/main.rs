@@ -106,14 +106,15 @@ async fn try_main() -> DeltaResult<()> {
         if retries > 5 {
             return Err(KernelError::generic(
                 "Exceeded maximum 5 retries for committing transaction",
-            ));
+            )
+            .into());
         }
         txn = match txn.commit(&engine)? {
             CommitResult::CommittedTransaction(committed) => break committed,
             CommitResult::ConflictedTransaction(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
                 println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
-                return Err(KernelError::generic("Commit failed"));
+                return Err(KernelError::generic("Commit failed").into());
             }
             CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
@@ -160,12 +161,13 @@ async fn create_or_get_base_snapshot(
 fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
     let fields = schema_str
         .split(',')
-        .map(|field| {
+        .map(|field| -> DeltaResult<_> {
             let parts: Vec<&str> = field.split(':').collect();
             if parts.len() != 2 {
                 return Err(KernelError::generic(format!(
                     "Invalid field specification: {field}. Expected format: field_name:data_type"
-                )));
+                ))
+                .into());
             }
 
             let (name, data_type) = (parts[0].trim(), parts[1].trim());
@@ -179,7 +181,8 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
                 _ => {
                     return Err(KernelError::generic(format!(
                         "Unsupported data type: {data_type}"
-                    )));
+                    ))
+                    .into());
                 }
             };
 
@@ -240,14 +243,19 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
                 return Err(KernelError::generic(format!(
                     "Unsupported data type for sample data: {:?}",
                     field.data_type()
-                )));
+                ))
+                .into());
             }
         };
         columns.push(column);
     }
 
-    let arrow_schema = schema.as_ref().try_into_arrow()?;
-    let record_batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
+    let arrow_schema = schema
+        .as_ref()
+        .try_into_arrow()
+        .map_err(KernelError::from)?;
+    let record_batch =
+        RecordBatch::try_new(Arc::new(arrow_schema), columns).map_err(KernelError::from)?;
 
     Ok(ArrowEngineData::new(record_batch))
 }
@@ -265,6 +273,6 @@ async fn read_and_display_data(
         .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
 
-    print_batches(&batches)?;
+    print_batches(&batches).map_err(KernelError::from)?;
     Ok(())
 }

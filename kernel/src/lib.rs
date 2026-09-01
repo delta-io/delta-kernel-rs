@@ -191,7 +191,7 @@ use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, KernelError};
+pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error, KernelError};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
@@ -215,6 +215,7 @@ pub(crate) fn version_as_i64(version: Version) -> DeltaResult<i64> {
     version
         .try_into()
         .map_err(|_| KernelError::generic(format!("Delta log version {version} exceeds i64::MAX")))
+        .map_err(crate::Error::from)
 }
 
 pub type FileSize = u64;
@@ -253,12 +254,13 @@ impl PartialOrd for FileMeta {
 }
 
 impl TryFrom<DirEntry> for FileMeta {
-    type Error = KernelError;
+    type Error = Error;
 
     fn try_from(ent: DirEntry) -> DeltaResult<FileMeta> {
-        let metadata = ent.metadata()?;
+        let metadata = ent.metadata().map_err(crate::KernelError::from)?;
         let last_modified = metadata
-            .modified()?
+            .modified()
+            .map_err(crate::KernelError::from)?
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|_| {
                 KernelError::generic("Failed to convert file timestamp to milliseconds")
@@ -293,6 +295,7 @@ impl FileMeta {
     pub(crate) fn size_as_i64(&self) -> DeltaResult<i64> {
         i64::try_from(self.size)
             .map_err(|_| KernelError::generic(format!("file size {} exceeds i64::MAX", self.size)))
+            .map_err(crate::Error::from)
     }
 }
 
@@ -1165,6 +1168,7 @@ pub trait Engine: AsAny {
     fn require_plan_executor(&self) -> DeltaResult<Arc<dyn PlanExecutor>> {
         self.plan_executor()
             .ok_or_else(|| KernelError::unsupported("this engine does not provide a PlanExecutor"))
+            .map_err(Error::from)
     }
 }
 

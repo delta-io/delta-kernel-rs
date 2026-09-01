@@ -10,7 +10,7 @@
 //! # use std::sync::Arc;
 //! # use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 //! # use delta_kernel::expressions::{col, lit};
-//! # use delta_kernel::{Engine, KernelError, Predicate, Snapshot, SnapshotRef};
+//! # use delta_kernel::{Engine, Predicate, Snapshot, SnapshotRef};
 //! # use delta_kernel::table_changes::TableChanges;
 //! # let path = "./tests/data/table-with-cdf";
 //! let url = delta_kernel::try_parse_uri(path)?;
@@ -34,7 +34,7 @@
 //!
 //! // Execute the table changes scan to get a fallible iterator of `Box<dyn EngineData>`s
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
-//! # Ok::<(), KernelError>(())
+//! # Ok::<(), delta_kernel::Error>(())
 //! ```
 use std::sync::{Arc, LazyLock};
 
@@ -157,11 +157,11 @@ impl CdfMode {
     /// Maps a reader-support failure on a protocol update to the mode-specific error.
     pub(crate) fn protocol_support_error(
         self,
-        underlying: KernelError,
+        underlying: crate::Error,
         version: Version,
-    ) -> KernelError {
+    ) -> crate::Error {
         match self {
-            CdfMode::ChangeDataFeed => KernelError::change_data_feed_unsupported(version),
+            CdfMode::ChangeDataFeed => KernelError::change_data_feed_unsupported(version).into(),
             CdfMode::RowTracking => underlying,
         }
     }
@@ -211,13 +211,13 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  Get `TableChanges` for versions 0 to 1 (inclusive)
 ///  ```rust
 ///  # use test_utils::delta_kernel_default_engine::{storage::store_from_url, DefaultEngineBuilder};
-///  # use delta_kernel::{KernelError, SnapshotRef};
+///  # use delta_kernel::SnapshotRef;
 ///  # use delta_kernel::table_changes::TableChanges;
 ///  # let path = "./tests/data/table-with-cdf";
 ///  let url = delta_kernel::try_parse_uri(path)?;
 ///  # let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///  let table_changes = TableChanges::try_new(url, &engine, 0, Some(1))?;
-///  # Ok::<(), KernelError>(())
+///  # Ok::<(), delta_kernel::Error>(())
 ///  ````
 /// For more details, see the following sections of the protocol:
 /// - [Add CDC File](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-cdc-file)
@@ -314,7 +314,9 @@ impl TableChanges {
         end_version: Option<Version>,
         mode: CdfMode,
     ) -> DeltaResult<Self> {
-        let log_root = table_root.join("_delta_log/")?;
+        let log_root = table_root
+            .join("_delta_log/")
+            .map_err(crate::KernelError::from)?;
         let log_segment = LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
@@ -385,7 +387,9 @@ impl TableChanges {
         let start_schema = start_snapshot.schema();
         let end_schema = end_snapshot.schema();
         if !mode.schemas_compatible(start_schema.as_ref(), end_schema.as_ref()) {
-            return Err(mode.boundary_schema_error(start_schema.as_ref(), end_schema.as_ref()));
+            return Err(mode
+                .boundary_schema_error(start_schema.as_ref(), end_schema.as_ref())
+                .into());
         }
 
         let schema = try_schema! {
@@ -440,6 +444,7 @@ impl TableChanges {
                     "A row-tracking TableChanges is missing its materialized row ID column name",
                 )
             })
+            .map_err(crate::Error::from)
     }
 
     /// Returns the physical Parquet column that stores materialized row commit versions.
@@ -460,6 +465,7 @@ impl TableChanges {
                      column name",
                 )
             })
+            .map_err(crate::Error::from)
     }
 
     fn row_tracking_table_properties(
@@ -522,7 +528,8 @@ impl TableChanges {
             return Err(KernelError::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \
                  the TableChanges with TableChanges::try_new_row_tracking_cdf_listing",
-            ));
+            )
+            .into());
         }
 
         let commits = self.log_segment.listed.ascending_commit_files.clone();
@@ -613,7 +620,9 @@ mod tests {
             );
             assert!(matches!(
                 res,
-                Err(KernelError::ChangeDataFeedUnsupported(_))
+                Err(crate::Error::Kernel(
+                    KernelError::ChangeDataFeedUnsupported(_)
+                ))
             ))
         }
     }
@@ -626,7 +635,10 @@ mod tests {
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
-        assert!(matches!(table_changes_res, Err(KernelError::Generic(msg)) if msg == expected_msg));
+        assert!(matches!(
+            table_changes_res,
+            Err(crate::Error::Kernel(KernelError::Generic(msg))) if msg == expected_msg
+        ));
     }
 
     #[test]
@@ -665,7 +677,7 @@ mod tests {
         );
         let res = table_changes.scan_file_listing(engine, TableChangesListingMode::AllChanges);
         assert!(
-            matches!(res, Err(KernelError::Unsupported(_))),
+            matches!(res, Err(crate::Error::Kernel(KernelError::Unsupported(_)))),
             "scan_file_listing on a cdc-file TableChanges must return an unsupported error"
         );
     }
@@ -706,7 +718,12 @@ mod tests {
         let url = delta_kernel::try_parse_uri(path).unwrap();
         let res = TableChanges::try_new_row_tracking_cdf_listing(url, engine.as_ref(), 0, Some(1));
         assert!(
-            matches!(&res, Err(KernelError::RowTrackingChangeFeedUnsupported(_))),
+            matches!(
+                &res,
+                Err(crate::Error::Kernel(
+                    KernelError::RowTrackingChangeFeedUnsupported(_)
+                ))
+            ),
             "expected a row-tracking-disabled error, got {res:?}"
         );
     }
@@ -757,7 +774,9 @@ mod tests {
         assert!(
             matches!(
                 &res,
-                Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+                Err(crate::Error::Kernel(
+                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+                ))
             ),
             "expected an incompatible start schema to be rejected, got {res:?}"
         );

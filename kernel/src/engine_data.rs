@@ -36,7 +36,8 @@ impl FilteredEngineData {
                 "Selection vector is larger than data length: {} > {}",
                 selection_vector.len(),
                 data.len()
-            )));
+            ))
+            .into());
         }
         Ok(Self {
             data,
@@ -257,7 +258,7 @@ macro_rules! impl_default_get {
         $(
             fn $name(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
                 debug!("Asked for type {} on {field_name}, but using default error impl.", stringify!($typ));
-                Err(KernelError::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace())
+                Err(KernelError::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace().into())
             }
         )*
     };
@@ -330,6 +331,7 @@ pub trait TypedGetData<'a, T> {
             KernelError::MissingData(format!("Data missing for field {field_name}"))
                 .with_backtrace()
         })
+        .map_err(crate::Error::from)
     }
 }
 

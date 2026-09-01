@@ -122,7 +122,8 @@ pub fn build_uc_create_table_request(
             "build_uc_create_table_request is only valid for version 0 (table creation) \
              snapshots, but snapshot is at version {}",
             snapshot.version()
-        )));
+        ))
+        .into());
     }
 
     let columns = serde_json::to_value(snapshot.schema().as_ref())

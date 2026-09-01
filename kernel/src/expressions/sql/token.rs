@@ -125,7 +125,7 @@ pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
                 } else if chars.next_if_eq(&'<').is_some() {
                     Token::Ge
                 } else {
-                    return Err(unexpected('!', sql));
+                    return Err(unexpected('!', sql).into());
                 };
                 tokens.push(tok);
             }
@@ -153,7 +153,7 @@ pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
             c if c.is_ascii_alphabetic() || c == '_' => {
                 tokens.push(classify_word(&mut chars, sql)?)
             }
-            _ => return Err(unexpected(c, sql)),
+            _ => return Err(unexpected(c, sql).into()),
         }
     }
     Ok(tokens)
@@ -179,7 +179,8 @@ fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Stri
     if chars.next_if_eq(&'\'').is_none() {
         return Err(KernelError::generic(format!(
             "string literal must start with a quote in {sql}"
-        )));
+        ))
+        .into());
     }
     let mut out = String::from('\'');
     loop {
@@ -195,9 +196,9 @@ fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Stri
             }
             Some(c) => out.push(c),
             None => {
-                return Err(KernelError::generic(format!(
-                    "unterminated string literal in {sql}"
-                )))
+                return Err(
+                    KernelError::generic(format!("unterminated string literal in {sql}")).into(),
+                )
             }
         }
     }

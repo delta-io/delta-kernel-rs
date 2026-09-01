@@ -154,7 +154,7 @@ fn try_main() -> DeltaResult<()> {
             // simply gather up all batches
             record_batch_rx.iter().collect()
         };
-        print_batches(&batches)?;
+        print_batches(&batches).map_err(delta_kernel::KernelError::from)?;
         Ok(())
     })
 }

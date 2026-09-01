@@ -86,18 +86,16 @@ pub(crate) fn validate_clustering_columns(
 
     // Structural validation: at least one column required
     if columns.is_empty() {
-        return Err(KernelError::generic(
-            "Clustering requires at least one column",
-        ));
+        return Err(KernelError::generic("Clustering requires at least one column").into());
     }
 
     // Validate each column and check for duplicates
     let mut seen = HashSet::new();
     for col in columns {
         if !seen.insert(col) {
-            return Err(KernelError::generic(format!(
-                "Duplicate clustering column: '{col}'"
-            )));
+            return Err(
+                KernelError::generic(format!("Duplicate clustering column: '{col}'")).into(),
+            );
         }
 
         let field = schema.field_at(col)?;
@@ -108,7 +106,8 @@ pub(crate) fn validate_clustering_columns(
                     "Clustering column '{col}' has unsupported type '{dt}'. \
                      Supported types: Byte, Short, Integer, Long, Float, Double, \
                      Decimal, Date, Timestamp, TimestampNtz, String"
-                )));
+                ))
+                .into());
             }
         }
     }
@@ -142,7 +141,8 @@ pub(crate) fn create_clustering_domain_metadata(columns: &[ColumnName]) -> Domai
 ///
 /// Returns `Ok(columns)` if the configuration is valid, or an error if malformed.
 pub(crate) fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
-    let metadata: ClusteringDomainMetadata = serde_json::from_str(json_str)?;
+    let metadata: ClusteringDomainMetadata =
+        serde_json::from_str(json_str).map_err(crate::KernelError::from)?;
     Ok(metadata
         .clustering_columns
         .into_iter()

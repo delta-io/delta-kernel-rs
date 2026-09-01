@@ -284,7 +284,8 @@ impl Scan {
             (true, false) => {
                 return Err(KernelError::internal_error(
                     "JSON stats were requested, but add.stats is missing from the metadata schema",
-                ));
+                )
+                .into());
             }
             (false, true) => projection.drop(STATS),
         };
@@ -318,7 +319,8 @@ impl Scan {
                 return Err(KernelError::internal_error(
                     "parsed partition values were requested, but add.partitionValues_parsed is \
                      missing",
-                ));
+                )
+                .into());
             }
             (None, true) => projection.drop(PARTITION_VALUES_PARSED),
             (None, false) => projection,
@@ -378,7 +380,9 @@ fn sidecar_actions(
         &SIDECAR_FILE_META_SCHEMA,
         action_schema,
         FileType::Parquet,
-        log_root.join("_sidecars/")?,
+        log_root
+            .join("_sidecars/")
+            .map_err(crate::KernelError::from)?,
         [VERSION],
         column_name!(FILE_PATH),
         column_name!(FILE_SIZE),
@@ -732,13 +736,15 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(add), Arc::new(Int64Array::from(vec![0i64]))],
-        )?;
+        )
+        .map_err(KernelError::from)?;
 
         let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, None)?;
-        writer.write(&batch)?;
-        writer.close()?;
-        futures::executor::block_on(store.put(&Path::from(path), buf.into()))?;
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).map_err(KernelError::from)?;
+        writer.write(&batch).map_err(KernelError::from)?;
+        writer.close().map_err(KernelError::from)?;
+        futures::executor::block_on(store.put(&Path::from(path), buf.into()))
+            .map_err(KernelError::from)?;
         Ok(())
     }
 
@@ -905,7 +911,8 @@ mod tests {
 "#
                     .into(),
                 )
-                .await?;
+                .await
+                .map_err(KernelError::from)?;
             store
                 .put(
                     &Path::from("_delta_log/00000000000000000001.json"),
@@ -913,7 +920,8 @@ mod tests {
 "#
                     .into(),
                 )
-                .await?;
+                .await
+                .map_err(KernelError::from)?;
             DeltaResult::<()>::Ok(())
         })?;
 
@@ -993,7 +1001,7 @@ mod tests {
             .execute_op(PlanOperation::QueryPlan(plan))?
             .into_data()?;
         let actual_rows = batches.try_fold(0, |rows, batch| {
-            Ok::<_, crate::KernelError>(rows + batch?.try_into_record_batch()?.num_rows())
+            Ok::<_, crate::Error>(rows + batch?.try_into_record_batch()?.num_rows())
         })?;
         assert_eq!(actual_rows, expected_rows);
         Ok(())

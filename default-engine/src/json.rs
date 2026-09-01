@@ -114,7 +114,7 @@ async fn read_json_files_impl(
             let tagged = batch_stream
                 .map(move |result| fixup_json_read(result?, &reorder_indices, &file_path))
                 .boxed();
-            Ok::<_, KernelError>(tagged)
+            Ok::<_, delta_kernel::Error>(tagged)
         }
     });
 
@@ -142,7 +142,7 @@ async fn write_json_file_impl(
         PutMode::Create
     };
 
-    let path = Path::from_url_path(path.path())?;
+    let path = Path::from_url_path(path.path()).map_err(delta_kernel::KernelError::from)?;
     let result = store.put_opts(&path, buffer.into(), put_mode.into()).await;
     result.map_err(|e| match e {
         object_store::Error::AlreadyExists { .. } => {
@@ -216,15 +216,22 @@ async fn open_json_file(
     batch_size: usize,
     file_meta: FileMeta,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
-    let path = Path::from_url_path(file_meta.location.path())?;
-    let result = store.get(&path).await?;
+    let path =
+        Path::from_url_path(file_meta.location.path()).map_err(delta_kernel::KernelError::from)?;
+    let result = store
+        .get(&path)
+        .await
+        .map_err(delta_kernel::KernelError::from)?;
     let builder = ReaderBuilder::new(schema)
         .with_batch_size(batch_size)
         .with_coerce_primitive(true);
     match result.payload {
         GetResultPayload::File(file, _) => {
-            let reader = builder.build(BufReader::new(file))?;
-            let reader = futures::stream::iter(reader).map_err(KernelError::from);
+            let reader = builder
+                .build(BufReader::new(file))
+                .map_err(delta_kernel::KernelError::from)?;
+            let reader = futures::stream::iter(reader)
+                .map_err(|error| delta_kernel::Error::from(KernelError::from(error)));
 
             // Emit exactly one error, then stop the stream. We check seen_error BEFORE
             // updating it so the first error passes through, but subsequent items don't.
@@ -240,8 +247,10 @@ async fn open_json_file(
             Ok(reader.boxed())
         }
         GetResultPayload::Stream(s) => {
-            let mut decoder = builder.build_decoder()?;
-            let mut input = s.map_err(KernelError::from);
+            let mut decoder = builder
+                .build_decoder()
+                .map_err(delta_kernel::KernelError::from)?;
+            let mut input = s.map_err(|error| delta_kernel::Error::from(KernelError::from(error)));
             let mut buffered = Bytes::new();
             let s = futures::stream::poll_fn(move |cx| {
                 loop {
@@ -261,7 +270,7 @@ async fn open_json_file(
                     // should be included in the next call to [`Self::decode`]
                     let decoded = match decoder.decode(buffered.as_ref()) {
                         Ok(decoded) => decoded,
-                        Err(e) => return Poll::Ready(Some(Err(e.into()))),
+                        Err(e) => return Poll::Ready(Some(Err(KernelError::from(e).into()))),
                     };
 
                     let read = buffered.len();
@@ -271,7 +280,13 @@ async fn open_json_file(
                     }
                 }
 
-                Poll::Ready(decoder.flush().map_err(KernelError::from).transpose())
+                Poll::Ready(
+                    decoder
+                        .flush()
+                        .map_err(KernelError::from)
+                        .map_err(delta_kernel::Error::from)
+                        .transpose(),
+                )
             });
             Ok(s.boxed())
         }
@@ -843,8 +858,8 @@ mod tests {
             DataType::Utf8,
             true,
         )]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+            .map_err(KernelError::from)?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 
@@ -853,13 +868,14 @@ mod tests {
         store: &Arc<InMemory>,
         path: &Path,
     ) -> DeltaResult<Vec<serde_json::Value>> {
-        let content = store.get(path).await?;
-        let file_bytes = content.bytes().await?;
-        let file_string =
-            String::from_utf8(file_bytes.to_vec()).map_err(|e| object_store::Error::Generic {
+        let content = store.get(path).await.map_err(KernelError::from)?;
+        let file_bytes = content.bytes().await.map_err(KernelError::from)?;
+        let file_string = String::from_utf8(file_bytes.to_vec()).map_err(|e| {
+            KernelError::from(object_store::Error::Generic {
                 store: "memory",
                 source: Box::new(e),
-            })?;
+            })
+        })?;
         let json: Vec<_> = serde_json::Deserializer::from_str(&file_string)
             .into_iter::<serde_json::Value>()
             .flatten()
@@ -881,7 +897,8 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);
-        let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
+        let path = Url::parse("memory:///test/data/00000000000000000001.json")
+            .map_err(KernelError::from)?;
         let object_path = Path::from("/test/data/00000000000000000001.json");
 
         // First write with no existing file
@@ -911,7 +928,7 @@ mod tests {
         } else {
             // Verify the second write fails with FileAlreadyExists error
             match result {
-                Err(KernelError::FileAlreadyExists(err_path)) => {
+                Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(err_path))) => {
                     assert_eq!(err_path, object_path.to_string());
                 }
                 _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),

@@ -301,7 +301,8 @@ impl LogReplayScanner {
                 return Err(KernelError::generic(format!(
                     "In-commit timestamp is enabled but not found in commit at version {}",
                     commit_file.version
-                )));
+                ))
+                .into());
             };
             in_commit_timestamp
         } else {

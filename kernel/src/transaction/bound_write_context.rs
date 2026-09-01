@@ -224,7 +224,8 @@ impl BoundWriteContext {
             return Err(KernelError::internal_error(format!(
                 "file '{}' is not under table root '{}'",
                 file_location, self.write_state.table_root
-            )));
+            ))
+            .into());
         }
         Ok(relative)
     }

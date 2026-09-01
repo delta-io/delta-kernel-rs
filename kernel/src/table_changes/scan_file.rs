@@ -171,7 +171,8 @@ impl TableChangesFileAction {
                 "Row-tracking change feed listing unexpectedly produced a cdc scan file: \
                  path={}, version={}",
                 scan_file.path, scan_file.commit_version
-            ))),
+            ))
+            .into()),
         }
     }
 }

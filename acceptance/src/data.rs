@@ -21,26 +21,36 @@ use crate::{TestCaseInfo, TestResult};
 
 pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
-    let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
-    let files: Vec<_> = store.list(None).try_collect().await?;
+    let store = Arc::new(
+        LocalFileSystem::new_with_prefix(&expected_root)
+            .map_err(delta_kernel::KernelError::from)?,
+    );
+    let files: Vec<_> = store
+        .list(None)
+        .try_collect()
+        .await
+        .map_err(delta_kernel::KernelError::from)?;
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {
         if let Some(ext) = meta.location.extension() {
             if ext == "parquet" {
                 let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+                let builder = ParquetRecordBatchStreamBuilder::new(reader)
+                    .await
+                    .map_err(delta_kernel::KernelError::from)?;
                 if schema.is_none() {
                     schema = Some(builder.schema().clone());
                 }
-                let mut stream = builder.build()?;
+                let mut stream = builder.build().map_err(delta_kernel::KernelError::from)?;
                 while let Some(batch) = stream.next().await {
-                    batches.push(batch?);
+                    batches.push(batch.map_err(delta_kernel::KernelError::from)?);
                 }
             }
         }
     }
-    let all_data = concat_batches(&schema.unwrap(), &batches)?;
+    let all_data =
+        concat_batches(&schema.unwrap(), &batches).map_err(delta_kernel::KernelError::from)?;
     Ok(all_data)
 }
 
@@ -52,7 +62,8 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) -> DeltaResult<(
             "Schema mismatch:\nActual: {:?}\nExpected: {:?}",
             schema_stripped.fields(),
             golden_stripped.fields()
-        )));
+        ))
+        .into());
     }
     Ok(())
 }
@@ -87,7 +98,8 @@ pub fn assert_data_matches(
     result_schema: &SchemaRef,
     expected: RecordBatch,
 ) -> DeltaResult<()> {
-    let all_data = concat_batches(result_schema, result.iter())?;
+    let all_data =
+        concat_batches(result_schema, result.iter()).map_err(delta_kernel::KernelError::from)?;
 
     // Validate schemas match
     assert_schema_fields_match(all_data.schema().as_ref(), expected.schema().as_ref())?;
@@ -119,7 +131,8 @@ pub fn assert_data_matches(
             "Data mismatch:\nExpected:\n{}\nActual:\n{}",
             expected_lines.join("\n"),
             actual_lines.join("\n")
-        )));
+        ))
+        .into());
     }
 
     Ok(())

@@ -87,7 +87,8 @@ impl ArrowFFIData {
         let sa: StructArray = batch.into();
         let array_data: ArrayData = sa.into();
         let array = FFI_ArrowArray::new(&array_data);
-        let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
+        let schema = FFI_ArrowSchema::try_from(array_data.data_type())
+            .map_err(delta_kernel::KernelError::from)?;
         Ok(Self { array, schema })
     }
 }
@@ -170,7 +171,8 @@ unsafe fn get_engine_data_impl(
     schema: &FFI_ArrowSchema,
 ) -> DeltaResult<Handle<ExclusiveEngineData>> {
     let array_data = unsafe { arrow::array::ffi::from_ffi(array, schema) };
-    let record_batch: RecordBatch = StructArray::from(array_data?).into();
+    let record_batch: RecordBatch =
+        StructArray::from(array_data.map_err(delta_kernel::KernelError::from)?).into();
     let arrow_engine_data: ArrowEngineData = record_batch.into();
     let engine_data: Box<dyn EngineData> = Box::new(arrow_engine_data);
     Ok(engine_data.into())

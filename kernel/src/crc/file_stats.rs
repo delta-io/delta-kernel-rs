@@ -165,9 +165,11 @@ impl FileStatsDelta {
 /// Read a file `size` (a non-negative byte count stored as `i64`) as `u64`, erroring on a
 /// negative size (corrupt input).
 pub(crate) fn size_to_u64(size: i64) -> DeltaResult<u64> {
-    u64::try_from(size).map_err(|_| {
-        KernelError::internal_error(format!("File size must be non-negative, got {size}"))
-    })
+    u64::try_from(size)
+        .map_err(|_| {
+            KernelError::internal_error(format!("File size must be non-negative, got {size}"))
+        })
+        .map_err(crate::Error::from)
 }
 
 /// Visitor that extracts the `size` column from file metadata and updates a shared histogram.

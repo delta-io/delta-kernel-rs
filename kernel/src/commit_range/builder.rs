@@ -65,7 +65,9 @@ impl CommitRangeBuilder {
     /// on the filesystem.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
-        let log_root = table_root.join("_delta_log/")?;
+        let log_root = table_root
+            .join("_delta_log/")
+            .map_err(crate::KernelError::from)?;
 
         let start_version = self.start_version;
         let end_version = self.end_version;
@@ -87,7 +89,8 @@ impl CommitRangeBuilder {
             return Err(KernelError::generic(format!(
                 "end_version ({end_version}) cannot exceed snapshot version ({})",
                 log_segment.end_version
-            )));
+            ))
+            .into());
         }
 
         // Snapshot's log segment may extend past [start, end]; filter to the requested range.
@@ -137,7 +140,8 @@ fn validate_version_range(start: Version, end: Version) -> DeltaResult<()> {
     if start > end {
         return Err(KernelError::generic(format!(
             "start_version ({start}) must be <= end_version ({end})",
-        )));
+        ))
+        .into());
     }
 
     Ok(())
@@ -157,7 +161,8 @@ fn validate_start_version_available(
     Err(KernelError::generic(format!(
         "start_version {start_version} is not available in the snapshot's log segment \
          (earliest available commit: {earliest_available_commit})",
-    )))
+    ))
+    .into())
 }
 
 fn validate_number_of_commit_files(
@@ -170,7 +175,7 @@ fn validate_number_of_commit_files(
     if expected != actual {
         return Err(KernelError::generic(format!(
             "The number of commit files: {actual} does not match the expected range (start_version: {start}, end_version: {end}): expected {expected} commit files",
-        )));
+        )).into());
     }
     Ok(())
 }

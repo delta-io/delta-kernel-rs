@@ -363,7 +363,8 @@ impl Metadata {
             return Err(KernelError::Schema(format!(
                 "Table schema must not contain metadata columns. Found metadata column: '{}'",
                 metadata_field.name
-            )));
+            ))
+            .into());
         }
 
         Ok(Self {
@@ -375,7 +376,7 @@ impl Metadata {
             // both for legacy reasons and to enable possible support for other formats in the
             // future (See delta-io/delta#87).
             format: Format::default(),
-            schema_string: serde_json::to_string(&schema)?,
+            schema_string: serde_json::to_string(&schema).map_err(crate::KernelError::from)?,
             partition_columns,
             created_time: Some(created_time),
             configuration,
@@ -440,25 +441,27 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
-        serde_json::from_str(&self.schema_string).map_err(|error| {
-            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
-            // matching.
-            if error.is_syntax()
-                && error
-                    .to_string()
-                    .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
-            {
-                KernelError::schema(format!(
+        serde_json::from_str(&self.schema_string)
+            .map_err(|error| {
+                // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
+                // matching.
+                if error.is_syntax()
+                    && error
+                        .to_string()
+                        .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
+                {
+                    KernelError::schema(format!(
                     "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
                      serde_json's recursion limit: {error}"
                 ))
-                .with_backtrace()
-            } else if is_unsupported_delta_type_error(&error) {
-                KernelError::schema(error.to_string()).with_backtrace()
-            } else {
-                error.into()
-            }
-        })
+                    .with_backtrace()
+                } else if is_unsupported_delta_type_error(&error) {
+                    KernelError::schema(error.to_string()).with_backtrace()
+                } else {
+                    error.into()
+                }
+            })
+            .map_err(crate::Error::from)
     }
 
     #[internal_api]
@@ -481,7 +484,7 @@ impl Metadata {
     /// Returns an error if schema serialization fails.
     pub(crate) fn with_schema(self, schema: SchemaRef) -> DeltaResult<Self> {
         Ok(Self {
-            schema_string: serde_json::to_string(&schema)?,
+            schema_string: serde_json::to_string(&schema).map_err(crate::KernelError::from)?,
             ..self
         })
     }
@@ -595,7 +598,7 @@ struct ProtocolRaw {
 }
 
 impl TryFrom<ProtocolRaw> for Protocol {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(protocol: ProtocolRaw) -> DeltaResult<Self> {
         Protocol::try_new(
@@ -720,7 +723,7 @@ impl Protocol {
                          listed in writer features, but {offending:?} is not \
                          (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
                          minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version})"
-                    )));
+                    )).into());
                 }
 
                 // Every ReaderWriter feature in writerFeatures must also appear in readerFeatures.
@@ -755,7 +758,7 @@ impl Protocol {
                              writerFeatures={writer_features:?}, \
                              minReaderVersion={min_reader_version}, \
                              minWriterVersion={min_writer_version})"
-                        )));
+                        )).into());
                     }
                 }
                 // Reached only once the whole writer list is known valid.
@@ -789,7 +792,7 @@ impl Protocol {
                          no reader features present \
                          (writerFeatures={writer_features:?}, minReaderVersion={min_reader_version}, \
                          minWriterVersion={min_writer_version})"
-                    )));
+                    )).into());
                 }
                 Ok(())
             }
@@ -1481,11 +1484,14 @@ pub(crate) struct Sidecar {
 /// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
 /// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
 fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
-    bytes.try_into().map_err(|_| {
-        KernelError::generic(format!(
-            "Failed to convert {context} size {bytes} to FileSize"
-        ))
-    })
+    bytes
+        .try_into()
+        .map_err(|_| {
+            KernelError::generic(format!(
+                "Failed to convert {context} size {bytes} to FileSize"
+            ))
+        })
+        .map_err(crate::Error::from)
 }
 
 impl Sidecar {
@@ -1495,7 +1501,11 @@ impl Sidecar {
     /// the "_sidecars/" folder and the given sidecar path.
     pub(crate) fn to_filemeta(&self, log_root: &Url) -> DeltaResult<FileMeta> {
         Ok(FileMeta {
-            location: log_root.join("_sidecars/")?.join(&self.path)?,
+            location: log_root
+                .join("_sidecars/")
+                .map_err(crate::KernelError::from)?
+                .join(&self.path)
+                .map_err(crate::KernelError::from)?,
             last_modified: self.modification_time,
             size: to_file_size(self.size_in_bytes, "sidecar")?,
         })
@@ -1729,8 +1739,8 @@ mod tests {
                 ),
             );
             let error = match result.unwrap_err() {
-                KernelError::Backtraced { source, .. } => *source,
-                error => error,
+                crate::Error::Kernel(KernelError::Backtraced { source, .. }) => *source,
+                crate::Error::Kernel(error) => error,
             };
             assert!(matches!(error, KernelError::Schema(_)));
         } else {
@@ -1785,8 +1795,8 @@ mod tests {
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
         // checking the underlying error.
         let error = match metadata.parse_schema().unwrap_err() {
-            KernelError::Backtraced { source, .. } => *source,
-            error => error,
+            crate::Error::Kernel(KernelError::Backtraced { source, .. }) => *source,
+            crate::Error::Kernel(error) => error,
         };
         match expected_error {
             "MalformedJson" => {
@@ -2015,7 +2025,7 @@ mod tests {
                     reader_features,
                     writer_features
                 ),
-                Err(KernelError::InvalidProtocol(_)),
+                Err(crate::Error::Kernel(KernelError::InvalidProtocol(_))),
             ));
         }
     }
@@ -2088,7 +2098,8 @@ mod tests {
             assert!(
                 matches!(
                     &res,
-                    Err(KernelError::InvalidProtocol(error)) if error.to_string().contains(error_msg)
+                    Err(crate::Error::Kernel(KernelError::InvalidProtocol(error)))
+                        if error.to_string().contains(error_msg)
                 ),
                 "Expected message containing:\t{error_msg}\nBut got:{res:?}\n"
             );

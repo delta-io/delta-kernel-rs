@@ -134,14 +134,24 @@ fn assert_midstream_failure(engine: Arc<dyn Engine>, mock_table: &LocalMockTable
     // Reading commits 0-1 should fail
     let res_v0_v1 = execute_table_changes(engine.clone(), mock_table, 0, Some(1));
     assert!(
-        matches!(res_v0_v1, Err(KernelError::ChangeDataFeedUnsupported(_))),
+        matches!(
+            res_v0_v1,
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedUnsupported(_)
+            ))
+        ),
         "Reading versions 0-1 should fail"
     );
 
     // Reading just commit 1 should also fail
     let res_v1 = execute_table_changes(engine, mock_table, 1, Some(1));
     assert!(
-        matches!(res_v1, Err(KernelError::ChangeDataFeedUnsupported(_))),
+        matches!(
+            res_v1,
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedUnsupported(_)
+            ))
+        ),
         "Reading version 1 alone should fail"
     );
 }
@@ -153,7 +163,7 @@ fn get_segment(
     end_version: impl Into<Option<Version>>,
 ) -> DeltaResult<Vec<ParsedLogPath>> {
     let table_root = url::Url::from_directory_path(path).unwrap();
-    let log_root = table_root.join("_delta_log/")?;
+    let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
     let log_segment = LogSegment::for_table_changes(
         engine.storage_handler().as_ref(),
         log_root,
@@ -239,7 +249,9 @@ async fn cdf_not_enabled() {
 
     assert!(matches!(
         res,
-        Err(KernelError::ChangeDataFeedUnsupported(_))
+        Err(crate::Error::Kernel(
+            KernelError::ChangeDataFeedUnsupported(_)
+        ))
     ));
 }
 
@@ -277,7 +289,9 @@ async fn unsupported_reader_feature() {
 
     assert!(matches!(
         res,
-        Err(KernelError::ChangeDataFeedUnsupported(_))
+        Err(crate::Error::Kernel(
+            KernelError::ChangeDataFeedUnsupported(_)
+        ))
     ));
 }
 
@@ -405,7 +419,12 @@ async fn row_tracking_unavailable_midstream_fails(#[case] properties: &[(&str, &
 
     let res = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
     assert!(
-        matches!(&res, Err(KernelError::RowTrackingChangeFeedUnsupported(1))),
+        matches!(
+            &res,
+            Err(crate::Error::Kernel(
+                KernelError::RowTrackingChangeFeedUnsupported(1)
+            ))
+        ),
         "expected row tracking to be unavailable at version 1, got {res:?}"
     );
 }
@@ -459,7 +478,9 @@ async fn row_tracking_schema_compatibility(
         assert!(
             matches!(
                 &res,
-                Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+                Err(crate::Error::Kernel(
+                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+                ))
             ),
             "expected incompatible-schema error, got {res:?}"
         );
@@ -559,7 +580,10 @@ async fn row_tracking_protocol_failure_preserves_the_underlying_error() {
 
     let result = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
     assert!(
-        matches!(&result, Err(KernelError::Unsupported(_))),
+        matches!(
+            &result,
+            Err(crate::Error::Kernel(KernelError::Unsupported(_)))
+        ),
         "expected the protocol support error, got {result:?}"
     );
 }
@@ -597,7 +621,9 @@ async fn incompatible_schemas_fail() {
 
         assert!(matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ));
     }
 
@@ -725,7 +751,9 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for adding nullable column"
     );
@@ -745,7 +773,9 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for type widening"
     );
@@ -765,7 +795,9 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for nullability change"
     );

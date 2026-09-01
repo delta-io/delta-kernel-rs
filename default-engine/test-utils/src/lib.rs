@@ -47,6 +47,7 @@ pub fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| KernelError::generic(format!("System time before Unix epoch: {e}")))
+        .map_err(delta_kernel::Error::from)
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
@@ -54,6 +55,7 @@ pub fn current_time_ms() -> DeltaResult<i64> {
     let duration = current_time_duration()?;
     i64::try_from(duration.as_millis())
         .map_err(|_| KernelError::generic("Current timestamp exceeds i64 millisecond range"))
+        .map_err(delta_kernel::Error::from)
 }
 
 /// Assert that `res` is an `Err` whose `Display` contains `message`.

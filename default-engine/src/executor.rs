@@ -179,7 +179,10 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(KernelError::join_failure))
+            Box::pin(
+                tokio::task::spawn_blocking(task)
+                    .map_err(|error| delta_kernel::Error::from(KernelError::join_failure(error))),
+            )
         }
 
         fn enter(&self) -> EnterGuard<'_> {
@@ -304,7 +307,10 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(KernelError::join_failure))
+            Box::pin(
+                tokio::task::spawn_blocking(task)
+                    .map_err(|error| delta_kernel::Error::from(KernelError::join_failure(error))),
+            )
         }
 
         fn enter(&self) -> EnterGuard<'_> {

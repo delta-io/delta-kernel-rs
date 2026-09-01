@@ -17,7 +17,7 @@ use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{DeltaResult, KernelError, Snapshot};
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -29,26 +29,32 @@ use url::Url;
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
-    let store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
-    let files = store.list(None).try_collect::<Vec<_>>().await?;
+    let store = Arc::new(LocalFileSystem::new_with_prefix(path).map_err(KernelError::from)?);
+    let files = store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(KernelError::from)?;
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {
         if let Some(ext) = meta.location.extension() {
             if ext == "parquet" {
                 let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+                let builder = ParquetRecordBatchStreamBuilder::new(reader)
+                    .await
+                    .map_err(KernelError::from)?;
                 if schema.is_none() {
                     schema = Some(builder.schema().clone());
                 }
-                let mut stream = builder.build()?;
+                let mut stream = builder.build().map_err(KernelError::from)?;
                 while let Some(batch) = stream.next().await {
-                    batches.push(batch?);
+                    batches.push(batch.map_err(KernelError::from)?);
                 }
             }
         }
     }
-    let all_data = concat_batches(&schema.unwrap(), &batches)?;
+    let all_data = concat_batches(&schema.unwrap(), &batches).map_err(KernelError::from)?;
     Ok(all_data)
 }
 
@@ -81,13 +87,13 @@ fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
             }),
         }
     }
-    let indices = lexsort_to_indices(&sort_columns, None)?;
+    let indices = lexsort_to_indices(&sort_columns, None).map_err(KernelError::from)?;
     let columns = batch
         .columns()
         .iter()
         .map(|c| take(c, &indices, None).unwrap())
         .collect();
-    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+    Ok(RecordBatch::try_new(batch.schema(), columns).map_err(KernelError::from)?)
 }
 
 // Ensure that two sets of  fields have the same names, and dict_is_ordered

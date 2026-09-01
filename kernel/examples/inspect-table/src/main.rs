@@ -120,7 +120,8 @@ impl RowVisitor for LogVisitor {
             return Err(KernelError::InternalError(format!(
                 "Wrong number of LogVisitor getters: {}, expected {expected}",
                 getters.len()
-            )));
+            ))
+            .into());
         }
         let (add_start, add_end) = self.offsets[ADD_NAME];
         let (remove_start, remove_end) = self.offsets[REMOVE_NAME];

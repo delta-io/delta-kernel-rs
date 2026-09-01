@@ -16,7 +16,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaResult, KernelError};
 use rstest::rstest;
 use test_utils::{
     add_commit, column_mapping_fixtures as fixtures, create_table as create_test_table,
@@ -1250,7 +1250,9 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
         (StructField::nullable("value", DataType::INTEGER)
             .add_metadata([("delta.columnMapping.id", MetadataValue::Number(2))])),
     };
-    let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?).unwrap();
+    let escaped =
+        serde_json::to_string(&serde_json::to_string(&stale_schema).map_err(KernelError::from)?)
+            .unwrap();
     // v0 written directly to bypass create_table validation (which strips stale annotations).
     let v0 = format!(
         r#"{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}

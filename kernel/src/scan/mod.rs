@@ -387,7 +387,8 @@ impl ScanBuilder {
             return Err(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
-            ));
+            )
+            .into());
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
@@ -483,7 +484,8 @@ impl PhysicalPredicate {
             // columns are missing/invalid. Just blow up instead of trying to handle it gracefully.
             return Err(KernelError::missing_column(format!(
                 "Predicate references unknown column: {unresolved}"
-            )));
+            ))
+            .into());
         }
         let Some(schema) = schema_opt else {
             // The predicate doesn't statically skip all files, and it doesn't reference any columns
@@ -922,7 +924,8 @@ impl Scan {
                 "existing_version {} is greater than current version {}",
                 existing_version,
                 self.snapshot.version()
-            )));
+            ))
+            .into());
         }
 
         // in order to be processed by our log replay, we must re-shape the existing scan metadata
@@ -1187,12 +1190,11 @@ impl Scan {
     /// # use delta_kernel::{Engine, DeltaResult};
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
-    /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
     /// # fn main() -> DeltaResult<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-    /// let table_root = Url::parse("file:///path/to/table")?;
+    /// let table_root = delta_kernel::try_parse_uri("file:///path/to/table")?;
     ///
     /// // Build a snapshot
     /// let snapshot = Snapshot::builder_for(table_root.clone())
@@ -1240,7 +1242,8 @@ impl Scan {
             return Err(KernelError::unsupported(
                 "cancellation is not supported by parallel_scan_metadata; \
                  use scan_metadata for a cancellable scan",
-            ));
+            )
+            .into());
         }
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
@@ -1289,7 +1292,8 @@ impl Scan {
                 "Scan::execute is not supported when the scan was built with \
                  without_row_transforms; use scan_metadata for listing and read data with your \
                  own reader",
-            ));
+            )
+            .into());
         }
 
         fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
@@ -1318,7 +1322,7 @@ impl Scan {
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
-                let file_path = table_root.join(&scan_file.path)?;
+                let file_path = table_root.join(&scan_file.path).map_err(crate::KernelError::from)?;
                 let mut selection_vector = scan_file
                     .dv_info
                     .get_selection_vector(engine.as_ref(), &table_root)?;
@@ -1354,7 +1358,7 @@ impl Scan {
                          bug -- the handler's read_parquet_files must return at least one batch for \
                          each requested file that contains rows.",
                         scan_file.path
-                    )));
+                    )).into());
                 }
 
                 let engine = engine.clone(); // Arc clone

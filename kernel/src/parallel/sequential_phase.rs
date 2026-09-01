@@ -149,9 +149,9 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     #[internal_api]
     pub(crate) fn finish(self) -> DeltaResult<AfterSequential<P>> {
         if !self.is_finished {
-            return Err(KernelError::generic(
-                "Must exhaust iterator before calling finish()",
-            ));
+            return Err(
+                KernelError::generic("Must exhaust iterator before calling finish()").into(),
+            );
         }
 
         let parallel_files = match self.checkpoint_manifest_phase {

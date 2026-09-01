@@ -80,7 +80,7 @@ pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::
     // Race even the initial stream-producing future against cancellation.
     let stream = match block_on_or_cancelled(&task_executor, token.clone(), stream_future) {
         Some(result) => result?,
-        None => return Err(KernelError::Cancelled),
+        None => return Err(KernelError::Cancelled.into()),
     };
     Ok(Box::new(CancellableStreamIterator {
         stream: Some(stream),
@@ -163,7 +163,7 @@ impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStrea
             }
             // Cancelled: `stream` was moved into the (now-dropped) future, releasing buffered
             // work. Emit one terminal error; the taken `self.stream` stays `None`, fusing us.
-            None => Some(Err(KernelError::Cancelled)),
+            None => Some(Err(KernelError::Cancelled.into())),
         }
     }
 }
@@ -379,7 +379,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         write_context: &BoundWriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
-        let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
+        let input_schema = Schema::try_from_arrow(data.record_batch().schema())
+            .map_err(delta_kernel::KernelError::from)?;
         let output_schema = write_context.physical_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
@@ -604,7 +605,10 @@ mod tests {
             firing.cancel();
         });
 
-        assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
+        assert!(matches!(
+            iter.next(),
+            Some(Err(delta_kernel::Error::Kernel(KernelError::Cancelled)))
+        ));
         assert!(
             iter.next().is_none(),
             "iterator must fuse after cancellation"

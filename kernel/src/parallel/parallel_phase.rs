@@ -153,7 +153,7 @@ mod tests {
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
     use crate::utils::FoldWithOption as _;
-    use crate::{PredicateRef, SnapshotRef};
+    use crate::{KernelError, PredicateRef, SnapshotRef};
 
     // ============================================================
     // Test helpers for focused ParallelPhase tests
@@ -169,11 +169,15 @@ mod tests {
         let record_batch = batch.record_batch();
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
-        writer.write(record_batch)?;
-        writer.close()?;
+        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)
+            .map_err(KernelError::from)?;
+        writer.write(record_batch).map_err(KernelError::from)?;
+        writer.close().map_err(KernelError::from)?;
 
-        store.put(&Path::from(path), buffer.into()).await?;
+        store
+            .put(&Path::from(path), buffer.into())
+            .await
+            .map_err(KernelError::from)?;
 
         Ok(())
     }
@@ -231,7 +235,7 @@ mod tests {
         expected_paths: &[&str],
     ) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///").map_err(KernelError::from)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create sidecar with add actions
@@ -257,7 +261,7 @@ mod tests {
 
         // Create FileMeta for the sidecar
         let file_meta = FileMeta {
-            location: url.join(sidecar_path)?,
+            location: url.join(sidecar_path).map_err(KernelError::from)?,
             last_modified: 0,
             size: get_file_size(&store, sidecar_path).await,
         };
@@ -318,7 +322,7 @@ mod tests {
     async fn test_parallel_phase_multiple_sidecars() -> DeltaResult<()> {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///").map_err(KernelError::from)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create two sidecars
@@ -342,12 +346,12 @@ mod tests {
 
         let file_metas = vec![
             FileMeta {
-                location: url.join(sidecar1_path)?,
+                location: url.join(sidecar1_path).map_err(KernelError::from)?,
                 last_modified: 0,
                 size: get_file_size(&store, sidecar1_path).await,
             },
             FileMeta {
-                location: url.join(sidecar2_path)?,
+                location: url.join(sidecar2_path).map_err(KernelError::from)?,
                 last_modified: 0,
                 size: get_file_size(&store, sidecar2_path).await,
             },

@@ -51,7 +51,8 @@ pub(super) fn create_sidecar_action_batch(
         return Err(KernelError::internal_error(format!(
             "expected sidecar field to be struct, got {:?}",
             sidecar_field.data_type()
-        )));
+        ))
+        .into());
     };
     let sidecar_fields: Vec<StructField> = sidecar_struct.fields().cloned().collect();
     // Per-row data template (follows checkpoint data schema, all fields null). Each sidecar row is
@@ -173,12 +174,14 @@ impl SidecarSplitter {
         if !add_field.is_nullable() {
             return Err(KernelError::checkpoint_write(format!(
                 "Checkpoint data schema '{ADD_NAME}' field must be nullable"
-            )));
+            ))
+            .into());
         }
         if !remove_field.is_nullable() {
             return Err(KernelError::checkpoint_write(format!(
                 "Checkpoint data schema '{REMOVE_NAME}' field must be nullable"
-            )));
+            ))
+            .into());
         }
         let sidecar_output_schema = Arc::new(try_schema! {
             (add_field),
@@ -309,7 +312,8 @@ impl SingleSidecarDataIterator {
         if max_file_actions_hint == 0 {
             return Err(KernelError::checkpoint_write(
                 "max_file_actions_hint must be greater than 0",
-            ));
+            )
+            .into());
         }
         Ok(Self {
             splitter,
@@ -336,7 +340,8 @@ impl Iterator for SingleSidecarDataIterator {
             Err(e) => {
                 return Some(Err(KernelError::internal_error(format!(
                     "sidecar splitter lock poisoned: {e}"
-                ))))
+                ))
+                .into()))
             }
         };
         match splitter.next_file_actions_batch() {

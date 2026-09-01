@@ -71,20 +71,17 @@ impl std::error::Error for ScalarConversionError {}
 ///
 /// Other error variants are returned unchanged: a field's `TryFrom<Scalar>` implementation may
 /// report a failure unrelated to scalar shape, and this helper must not reclassify it.
-pub(crate) fn add_scalar_path_context(
-    error: KernelError,
-    element: impl Into<String>,
-) -> KernelError {
+pub(crate) fn add_scalar_path_context(error: Error, element: impl Into<String>) -> Error {
     match error {
-        KernelError::ScalarConversion(error) => {
-            KernelError::ScalarConversion(error.add_path_context(element))
+        Error::Kernel(KernelError::ScalarConversion(error)) => {
+            KernelError::ScalarConversion(error.add_path_context(element)).into()
         }
         other => other,
     }
 }
 
-/// A [`std::result::Result`] that has [`KernelError`] as the error variant.
-pub type DeltaResult<T, E = KernelError> = std::result::Result<T, E>;
+/// A [`std::result::Result`] returned by Delta Kernel operations.
+pub type DeltaResult<T> = std::result::Result<T, Error>;
 
 /// A boxed, `Send` iterator of [`DeltaResult<T>`] items.
 ///
@@ -95,6 +92,15 @@ pub type DeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + 
 /// `'static` counterpart to [`DeltaResultIterator`] for cases where the iterator does not
 /// reference borrowed data.
 pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
+
+/// An error returned by a Delta Kernel operation.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// A failure originating in kernel implementation code.
+    #[error(transparent)]
+    Kernel(#[from] KernelError),
+}
 
 /// All the types of errors that the kernel can run into
 #[non_exhaustive]
@@ -530,10 +536,14 @@ impl From<object_store::Error> for KernelError {
     }
 }
 
-/// This impl is needed so the `?` operator can auto-convert `Result<T, Infallible>` to
-/// `DeltaResult<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
-/// their error type, and this allows those results to be propagated with `?` in functions
-/// returning `DeltaResult`. The match is unreachable since `Infallible` has no variants.
+/// Allows `?` to propagate infallible conversions into a [`DeltaResult`].
+impl From<Infallible> for Error {
+    fn from(value: Infallible) -> Self {
+        match value {}
+    }
+}
+
+/// Allows `?` to propagate infallible conversions into kernel-only results.
 impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}

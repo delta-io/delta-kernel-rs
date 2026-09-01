@@ -177,14 +177,19 @@ async fn write_multi_row_group_parquet_to_store(
         .schema();
 
     let mut buffer = vec![];
-    let mut writer = ArrowWriter::try_new(&mut buffer, schema, None)?;
+    let mut writer = ArrowWriter::try_new(&mut buffer, schema, None).map_err(KernelError::from)?;
     for batch in &batches {
-        writer.write(batch.record_batch())?;
-        writer.flush()?;
+        writer
+            .write(batch.record_batch())
+            .map_err(KernelError::from)?;
+        writer.flush().map_err(KernelError::from)?;
     }
-    writer.close()?;
+    writer.close().map_err(KernelError::from)?;
 
-    store.put(&Path::from(path), buffer.into()).await?;
+    store
+        .put(&Path::from(path), buffer.into())
+        .await
+        .map_err(KernelError::from)?;
     Ok(())
 }
 
@@ -288,7 +293,8 @@ async fn write_json_to_store(
 
     store
         .put(&Path::from(checkpoint_path), content.into())
-        .await?;
+        .await
+        .map_err(KernelError::from)?;
 
     Ok(())
 }
@@ -1163,7 +1169,7 @@ fn test_sidecar_to_filemeta_valid_paths(
     #[case] input_path: &str,
     #[case] expected_url: &str,
 ) -> DeltaResult<()> {
-    let log_root = Url::parse("file:///var/_delta_log/")?;
+    let log_root = Url::parse("file:///var/_delta_log/").map_err(KernelError::from)?;
     let sidecar = Sidecar {
         path: expected_url.to_string(),
         modification_time: 0,
@@ -1335,7 +1341,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     .await?;
 
     let checkpoint_one_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(KernelError::from)?
         .to_string();
 
     let v2_checkpoint_read_schema = LOG_METADATA_SCHEMA.clone();
@@ -1406,8 +1413,14 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
     let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
 
-    let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
-    let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
+    let checkpoint_one_file = log_root
+        .join(checkpoint_part_1)
+        .map_err(KernelError::from)?
+        .to_string();
+    let checkpoint_two_file = log_root
+        .join(checkpoint_part_2)
+        .map_err(KernelError::from)?
+        .to_string();
 
     let v2_checkpoint_read_schema = CHECKPOINT_READ_SCHEMA.clone();
 
@@ -1468,7 +1481,8 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     .await?;
 
     let checkpoint_one_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(KernelError::from)?
         .to_string();
 
     // Get the actual file size for proper footer reading
@@ -1561,7 +1575,10 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     )
     .await?;
 
-    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let checkpoint_file = log_root
+        .join(checkpoint_name)
+        .map_err(KernelError::from)?
+        .to_string();
     let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
 
     let log_segment = LogSegment::try_new(
@@ -1623,7 +1640,10 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResu
     )
     .await?;
 
-    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let checkpoint_file = log_root
+        .join(checkpoint_name)
+        .map_err(KernelError::from)?
+        .to_string();
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_file)],
@@ -1687,7 +1707,10 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
         checkpoint_name,
     )
     .await?;
-    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let checkpoint_file = log_root
+        .join(checkpoint_name)
+        .map_err(KernelError::from)?
+        .to_string();
     let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
 
     let log_segment = LogSegment::try_new(
@@ -1740,7 +1763,10 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     )
     .await?;
 
-    let checkpoint_one_file = log_root.join(filename)?.to_string();
+    let checkpoint_one_file = log_root
+        .join(filename)
+        .map_err(KernelError::from)?
+        .to_string();
 
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
@@ -1823,7 +1849,8 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     .await?;
 
     let checkpoint_file_path = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(KernelError::from)?
         .to_string();
 
     // Get the actual file size for proper footer reading
@@ -3098,8 +3125,16 @@ fn test_log_segment_contiguous_commit_files() {
 fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
     let (_store, log_root) = new_in_memory_store();
     let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
-    let checkpoint_file = log_root.join(selected)?.to_string();
-    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let checkpoint_file = log_root
+        .join(selected)
+        .map_err(KernelError::from)?
+        .to_string();
+    let commit = create_log_path(
+        log_root
+            .join("00000000000000000002.json")
+            .map_err(KernelError::from)?
+            .as_str(),
+    );
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
@@ -3148,7 +3183,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     .await?;
 
     let checkpoint_rel = "00000000000000000001.checkpoint.parquet";
-    let checkpoint_file = log_root.join(checkpoint_rel)?.to_string();
+    let checkpoint_file = log_root
+        .join(checkpoint_rel)
+        .map_err(KernelError::from)?
+        .to_string();
     let cp_size = get_file_size(&store, &format!("_delta_log/{checkpoint_rel}")).await;
 
     let hint_schema: SchemaRef = schema_ref! {
@@ -3156,7 +3194,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     };
 
     // Build a commit that uses v1 checkpoint and a hint that describes a different schema
-    let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
+    let commit_v2_path = log_root
+        .join("00000000000000000002.json")
+        .map_err(KernelError::from)?
+        .to_string();
     let commit_v2 = create_log_path(&commit_v2_path);
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -3225,7 +3266,10 @@ async fn test_get_file_actions_schema_v2_identity_filter(
     // Schema actually written to the selected (leaf, no-sidecar) V2 checkpoint footer.
     let footer_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
     add_checkpoint_to_store(&store, add_batch_simple(footer_schema.clone()), selected).await?;
-    let checkpoint_file = log_root.join(selected)?.to_string();
+    let checkpoint_file = log_root
+        .join(selected)
+        .map_err(KernelError::from)?
+        .to_string();
     let cp_size = get_file_size(&store, &format!("_delta_log/{selected}")).await;
 
     // A distinct hint schema so we can tell whether the hint or the footer was used.
@@ -3234,7 +3278,10 @@ async fn test_get_file_actions_schema_v2_identity_filter(
     };
     let hint_name = if identity_matches { selected } else { other };
 
-    let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
+    let commit_v2_path = log_root
+        .join("00000000000000000002.json")
+        .map_err(KernelError::from)?
+        .to_string();
     let commit_v2 = create_log_path(&commit_v2_path);
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -3316,8 +3363,14 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
     let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
     let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
 
-    let cp1_file = log_root.join(checkpoint_part_1)?.to_string();
-    let cp2_file = log_root.join(checkpoint_part_2)?.to_string();
+    let cp1_file = log_root
+        .join(checkpoint_part_1)
+        .map_err(KernelError::from)?
+        .to_string();
+    let cp2_file = log_root
+        .join(checkpoint_part_2)
+        .map_err(KernelError::from)?
+        .to_string();
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -3545,7 +3598,8 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     .await?;
 
     let checkpoint_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(KernelError::from)?
         .to_string();
     let checkpoint_size =
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
@@ -4134,7 +4188,8 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
     .await?;
 
     let checkpoint_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(KernelError::from)?
         .to_string();
     let checkpoint_size =
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
@@ -4208,7 +4263,8 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
     .await?;
 
     let checkpoint_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(KernelError::from)?
         .to_string();
     let checkpoint_size =
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;

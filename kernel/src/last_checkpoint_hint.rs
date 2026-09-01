@@ -181,7 +181,9 @@ impl LastCheckpointHint {
     /// Returns the path of the `_last_checkpoint` file given the log root of a table.
     #[internal_api]
     pub(crate) fn path(log_root: &Url) -> DeltaResult<Url> {
-        Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
+        Ok(log_root
+            .join(LAST_CHECKPOINT_FILE_NAME)
+            .map_err(crate::KernelError::from)?)
     }
 
     /// Try reading the `_last_checkpoint` file.
@@ -211,7 +213,7 @@ impl LastCheckpointHint {
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
-            Some(Err(KernelError::FileNotFound(_))) => {
+            Some(Err(crate::Error::Kernel(KernelError::FileNotFound(_)))) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
@@ -766,6 +768,9 @@ mod tests {
         let token: CancellationTokenRef =
             std::sync::Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled());
         let result = LastCheckpointHint::try_read(&NoIoStorageHandler, &log_root, Some(&token));
-        assert!(matches!(result, Err(KernelError::Cancelled)));
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel(KernelError::Cancelled))
+        ));
     }
 }

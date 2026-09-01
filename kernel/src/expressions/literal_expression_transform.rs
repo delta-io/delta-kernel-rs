@@ -51,10 +51,15 @@ pub(crate) fn literal_expression_transform<'a>(
         scalars: scalars.into_iter(),
         stack: Vec::new(),
     };
-    transform.transform_struct(schema)?;
+    transform
+        .transform_struct(schema)
+        .map_err(crate::KernelError::from)?;
     match transform.scalars.next() {
-        Some(s) => Err(Error::ExcessScalars(s.clone()).into()),
-        None => transform.stack.pop().ok_or(Error::EmptyStack.into()),
+        Some(s) => Err(crate::KernelError::from(Error::ExcessScalars(s.clone())).into()),
+        None => transform
+            .stack
+            .pop()
+            .ok_or_else(|| crate::KernelError::from(Error::EmptyStack).into()),
     }
 }
 

@@ -39,8 +39,15 @@ pub(super) fn try_create_from_json(
     let reorder_indices = build_json_reorder_indices(&schema)?;
     let json = ReaderBuilder::new(json_schema)
         .with_coerce_primitive(true)
-        .build(BufReader::new(Cursor::new(data)))?
-        .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
+        .build(BufReader::new(Cursor::new(data)))
+        .map_err(KernelError::from)?
+        .map(move |data| {
+            fixup_json_read(
+                data.map_err(KernelError::from)?,
+                &reorder_indices,
+                &file_location,
+            )
+        });
     Ok(json)
 }
 
@@ -102,14 +109,14 @@ mod tests {
             ArrowDataType::Utf8,
             true,
         )]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+            .map_err(KernelError::from)?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 
     // Helper function to read and parse JSON file
     fn read_json_file(path: &Path) -> DeltaResult<Vec<serde_json::Value>> {
-        let file = std::fs::read_to_string(path)?;
+        let file = std::fs::read_to_string(path).map_err(KernelError::from)?;
         let json: Vec<_> = serde_json::Deserializer::from_str(&file)
             .into_iter::<serde_json::Value>()
             .flatten()
@@ -159,7 +166,10 @@ mod tests {
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error
-            assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_)))
+            ));
         }
 
         Ok(())

@@ -323,7 +323,7 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
 
     let batch_struct_array: StructArray = record_batch.into();
     let array_data: ArrayData = batch_struct_array.into_data();
-    let (out_array, out_schema) = to_ffi(&array_data)?;
+    let (out_array, out_schema) = to_ffi(&array_data).map_err(delta_kernel::KernelError::from)?;
     Ok(Box::into_raw(Box::new(ArrowFFIData {
         array: out_array,
         schema: out_schema,

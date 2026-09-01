@@ -192,7 +192,10 @@ impl FfiAuthHeaderProvider {
             (self.callback)(self.context, out, self.allocate_error);
             let ttl = ((*out).ttl_ms != 0).then(|| Duration::from_millis((*out).ttl_ms));
             let pairs = take_auth_pairs_from_c(out)?;
-            Ok((headers_from_pairs(pairs)?, ttl))
+            Ok((
+                headers_from_pairs(pairs).map_err(delta_kernel::KernelError::from)?,
+                ttl,
+            ))
         }
     }
 }
@@ -223,7 +226,8 @@ unsafe fn take_auth_pairs_from_c(headers: *mut CAuthHeaders) -> DeltaResult<Vec<
     if count > AUTH_MAX_NUM_HEADERS {
         return Err(KernelError::generic(format!(
             "auth header count {count} exceeds max {AUTH_MAX_NUM_HEADERS}"
-        )));
+        ))
+        .into());
     }
 
     let mut pairs = Vec::with_capacity(count);
@@ -278,7 +282,7 @@ fn copy_optional_string(slice: &KernelStringSlice) -> DeltaResult<String> {
 fn copy_required_string(slice: &KernelStringSlice, field: &str) -> DeltaResult<String> {
     let value = copy_optional_string(slice)?;
     if value.is_empty() {
-        return Err(KernelError::generic(format!("`{field}` must be non-empty")));
+        return Err(KernelError::generic(format!("`{field}` must be non-empty")).into());
     }
     Ok(value)
 }
@@ -306,7 +310,10 @@ pub(crate) fn build_rest_object_store(
                 k.strip_prefix(REST_BUILDER_OPTION_HEADER_PREFIX)
                     .map(|name| (name.to_string(), v.clone()))
             });
-            Arc::new(StaticHeaderProvider::from_pairs(header_pairs)?)
+            Arc::new(
+                StaticHeaderProvider::from_pairs(header_pairs)
+                    .map_err(delta_kernel::KernelError::from)?,
+            )
         }
     };
 
@@ -349,7 +356,7 @@ pub(crate) fn build_rest_object_store(
 
     // Validate every option before building the client: constructing the reqwest/rustls client
     // initializes a crypto provider, which is minutes of work under the Miri interpreter.
-    let client = build_rest_client(&tls)?;
+    let client = build_rest_client(&tls).map_err(delta_kernel::KernelError::from)?;
 
     Ok(Arc::new(
         RestObjectStore::new(base_url.to_string(), client, auth, Arc::new(config))
@@ -366,7 +373,8 @@ fn parse_bool_option(key: &str, value: Option<&String>) -> DeltaResult<bool> {
             "false" => Ok(false),
             other => Err(KernelError::generic(format!(
                 "invalid {key} `{other}`: expected `true` or `false`"
-            ))),
+            ))
+            .into()),
         },
     }
 }

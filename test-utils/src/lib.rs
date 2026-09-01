@@ -455,7 +455,12 @@ pub(crate) fn resolve_table_path(
     relative: &Path,
 ) -> DeltaResult<Path> {
     let url = try_parse_uri(table_root)?;
-    Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
+    Ok(Path::from_url_path(
+        url.join(relative.as_ref())
+            .map_err(delta_kernel::KernelError::from)?
+            .path(),
+    )
+    .map_err(delta_kernel::KernelError::from)?)
 }
 
 /// Write a Delta commit JSON file at the given version into `store`.
@@ -930,7 +935,8 @@ pub fn schema_with_column_defaults(
         return Err(KernelError::generic(format!(
             "column defaults reference unknown top-level columns: {:?}",
             column_defaults.into_keys().collect::<Vec<_>>()
-        )));
+        ))
+        .into());
     }
 
     Ok(Arc::new(StructType::try_new(augmented_fields)?))
@@ -1101,7 +1107,8 @@ pub async fn insert_data_with<E: TaskExecutor>(
     data_change: bool,
     is_blind_append: bool,
 ) -> DeltaResult<CommitResult> {
-    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())
+        .map_err(delta_kernel::KernelError::from)?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let mut txn = snapshot

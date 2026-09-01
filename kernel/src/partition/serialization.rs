@@ -101,7 +101,8 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
             Err(KernelError::generic(format!(
                 "cannot serialize partition value: type {:?} is not a valid partition column type",
                 value.data_type()
-            )))
+            ))
+            .into())
         }
     }
 }
@@ -171,17 +172,20 @@ fn format_date(days: i32) -> DeltaResult<String> {
         .ok_or_else(|| {
             KernelError::generic(format!("date value {days} days from epoch is out of range"))
         })
+        .map_err(crate::Error::from)
 }
 
 /// Converts microseconds since epoch to a [`DateTime`], returning an error if out of range.
 fn micros_to_datetime(micros: i64, label: &str) -> DeltaResult<DateTime<Utc>> {
     let secs = micros.div_euclid(1_000_000);
     let subsec_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
-    DateTime::from_timestamp(secs, subsec_nanos).ok_or_else(|| {
-        KernelError::generic(format!(
-            "{label} value {micros} microseconds from epoch is out of range"
-        ))
-    })
+    DateTime::from_timestamp(secs, subsec_nanos)
+        .ok_or_else(|| {
+            KernelError::generic(format!(
+                "{label} value {micros} microseconds from epoch is out of range"
+            ))
+        })
+        .map_err(crate::Error::from)
 }
 
 /// Formats a timestamp (microseconds since epoch) as ISO 8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ".
@@ -246,6 +250,7 @@ fn format_binary(bytes: &[u8]) -> DeltaResult<String> {
         .map_err(|e| {
             KernelError::generic(format!("binary partition value is not valid UTF-8: {e}"))
         })
+        .map_err(crate::Error::from)
 }
 
 #[cfg(test)]

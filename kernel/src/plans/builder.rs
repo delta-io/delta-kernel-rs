@@ -33,7 +33,7 @@
 //! let plan = scan.build()?;
 //! let [node] = plan.nodes.as_slice() else { panic!("expected one node") };
 //! assert!(matches!(&node.op, Operator::Values(values) if values.rows.is_empty()));
-//! # Ok::<(), delta_kernel::KernelError>(())
+//! # Ok::<(), delta_kernel::Error>(())
 //! ```
 
 use std::collections::HashMap;
@@ -153,7 +153,7 @@ impl PlanBuilder {
                     file.file_constants,
                     cols.len(),
                     cols,
-                )));
+                )).into());
             }
         }
         check_file_constant_columns(&schema, &cols, "scan file_constant_columns")?;
@@ -188,7 +188,7 @@ impl PlanBuilder {
     /// # use delta_kernel::schema::{DataType, StructField, StructType};
     /// let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
     /// let plan = PlanBuilder::values(schema, vec![vec![1.into()], vec![2.into()]])?.build()?;
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn values(schema: impl Into<SchemaRef>, rows: Vec<Vec<Scalar>>) -> DeltaResult<Self> {
         let schema = schema.into();
@@ -199,7 +199,8 @@ impl PlanBuilder {
                     "values: row {i} has {} value(s) {row:?} but schema has {width} field(s) {:?}",
                     row.len(),
                     Vec::from_iter(schema.fields().map(|f| f.name())),
-                )));
+                ))
+                .into());
             }
         }
         Ok(Values::new(schema, rows).into())
@@ -232,7 +233,7 @@ impl PlanBuilder {
     /// assert!(PlanBuilder::values_from(std::iter::empty::<Row>())
     ///     .build_opt()?
     ///     .is_none());
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     #[internal_api]
     pub(crate) fn values_from<T>(rows: impl IntoIterator<Item = T>) -> Self
@@ -256,7 +257,7 @@ impl PlanBuilder {
     /// let plan = PlanBuilder::values(schema, vec![vec![1.into()], vec![2.into()]])?
     ///     .filter(col!("id").is_not_null())?
     ///     .build()?;
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn filter(self, predicate: impl Into<PredicateRef>) -> DeltaResult<Self> {
         let predicate = predicate.into();
@@ -288,7 +289,7 @@ impl PlanBuilder {
     /// let plan = PlanBuilder::values(input, vec![vec![1.into(), "a".into()]])?
     ///     .project(Expression::struct_from([col!("id")]), out)?
     ///     .build()?;
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn project(
         self,
@@ -336,7 +337,7 @@ impl PlanBuilder {
     /// column is absent from its input schema, or two output columns would share a name.
     pub fn aggregate(
         self,
-        aggregate: impl TryInto<Aggregate, Error = KernelError>,
+        aggregate: impl TryInto<Aggregate, Error = crate::Error>,
     ) -> DeltaResult<Self> {
         let aggregate = aggregate.try_into()?;
         let schema = Arc::clone(&aggregate.schema);
@@ -381,7 +382,7 @@ impl PlanBuilder {
     /// let plan = PlanBuilder::values(schema, vec![vec![1.into(), 7i64.into()]])?
     ///     .aggregate_by([column_name!("id")], |a| a.max(column_name!("version")))?
     ///     .build()?;
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn aggregate_by(
         self,
@@ -414,7 +415,7 @@ impl PlanBuilder {
     /// let plan = PlanBuilder::values(schema, vec![vec![1.into(), 7i64.into()]])?
     ///     .aggregate_ungrouped(|a| a.max(column_name!("version")))?
     ///     .build()?;
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn aggregate_ungrouped(
         self,
@@ -443,7 +444,7 @@ impl PlanBuilder {
     /// let allow = PlanBuilder::values(schema, vec![vec![2.into()]])?;
     /// // Probe rows whose `id` appears in `allow`.
     /// let plan = probe.semi_join(allow, [column_name!("id")], [column_name!("id")])?.build()?;
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn semi_join(
         self,
@@ -480,7 +481,8 @@ impl PlanBuilder {
                  they must match in length.",
                 probe_keys.len(),
                 build_keys.len(),
-            )));
+            ))
+            .into());
         }
         check_columns_resolve(self.schema(), &probe_keys, "join probe")?;
         check_columns_resolve(build.schema(), &build_keys, "join build")?;
@@ -520,21 +522,20 @@ impl PlanBuilder {
     /// let a = PlanBuilder::values(Arc::clone(&schema), vec![vec![1.into()]])?;
     /// let b = PlanBuilder::values(schema, vec![vec![2.into()]])?;
     /// let plan = PlanBuilder::union_all([a, b])?.build()?;
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn union_all(inputs: impl IntoIterator<Item = PlanBuilder>) -> DeltaResult<Self> {
         let inputs = Vec::from_iter(inputs);
         let Some(schema) = inputs.first().map(|b| Arc::clone(b.schema())) else {
-            return Err(KernelError::generic(
-                "union_all: requires at least one input",
-            ));
+            return Err(KernelError::generic("union_all: requires at least one input").into());
         };
         if let Some(i) = inputs.iter().position(|b| b.schema() != &schema) {
             return Err(KernelError::generic(format!(
                 "union_all: input {i} has a schema differing from input 0: {:?} vs {:?}",
                 inputs[i].schema(),
                 schema,
-            )));
+            ))
+            .into());
         }
         let mut present = Vec::from_iter(inputs.into_iter().filter_map(|b| match b.0 {
             PlanBuilderRoot::Present(node) => Some(node),
@@ -638,12 +639,14 @@ fn check_file_constant_columns<'a>(
             return Err(KernelError::generic(format!(
                 "{ctx}: column `{name}` not found; schema has {:?}",
                 Vec::from_iter(schema.fields().map(|f| f.name())),
-            )));
+            ))
+            .into());
         };
         if field.is_metadata_column() {
             return Err(KernelError::generic(format!(
                 "{ctx}: column `{name}` is a metadata column"
-            )));
+            ))
+            .into());
         }
     }
     Ok(())

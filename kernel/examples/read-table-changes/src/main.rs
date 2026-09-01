@@ -40,6 +40,6 @@ fn main() -> DeltaResult<()> {
         .execute(Arc::new(engine))?
         .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
-    print_batches(&batches)?;
+    print_batches(&batches).map_err(delta_kernel::KernelError::from)?;
     Ok(())
 }

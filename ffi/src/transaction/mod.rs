@@ -136,12 +136,14 @@ fn commit_result_to_committed_handle<S>(
         CommitResult::CommittedTransaction(committed) => Ok(Box::new(committed).into()),
         CommitResult::RetryableTransaction(_) => Err(delta_kernel::KernelError::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
-        )),
+        )
+        .into()),
         CommitResult::ConflictedTransaction(conflicted) => {
             Err(delta_kernel::KernelError::Generic(format!(
                 "commit conflict at version {}",
                 conflicted.conflict_version()
-            )))
+            ))
+            .into())
         }
     }
 }
@@ -2434,7 +2436,8 @@ mod tests {
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let builder = unsafe { *builder_handle.into_inner() };
-        let layout: DeltaResult<DataLayout> = Err(delta_kernel::KernelError::generic("bad column"));
+        let layout: DeltaResult<DataLayout> =
+            Err(delta_kernel::KernelError::generic("bad column").into());
         let result = create_table_builder_with_data_layout_impl(builder, layout);
         assert!(result.is_err());
         unsafe { free_engine(engine) };
@@ -3164,7 +3167,7 @@ mod tests {
         let scan_after = snapshot.scan_builder().build()?;
         let total: usize = scan_after
             .execute(kernel_engine.clone())?
-            .map(|r| Ok::<_, delta_kernel::KernelError>(r?.len()))
+            .map(|r| Ok::<_, delta_kernel::Error>(r?.len()))
             .sum::<Result<_, _>>()?;
         assert_eq!(total, 2, "expected 2 surviving rows");
 

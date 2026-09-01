@@ -85,19 +85,22 @@ impl StatsColumnVerifier {
             return Err(KernelError::stats_validation(format!(
                 "Required column '{column}' is missing 'nullCount' statistics for files: [{}]",
                 missing_null_count.join(", ")
-            )));
+            ))
+            .into());
         }
         if !missing_min.is_empty() {
             return Err(KernelError::stats_validation(format!(
                 "Required column '{column}' is missing 'minValues' statistics for files: [{}]",
                 missing_min.join(", ")
-            )));
+            ))
+            .into());
         }
         if !missing_max.is_empty() {
             return Err(KernelError::stats_validation(format!(
                 "Required column '{column}' is missing 'maxValues' statistics for files: [{}]",
                 missing_max.join(", ")
-            )));
+            ))
+            .into());
         }
         Ok(())
     }
@@ -193,11 +196,13 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
             Err(KernelError::unsupported(format!(
                 "Interval types are not supported for stats validation: {dt}"
-            )))
+            ))
+            .into())
         }
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => Err(
-            KernelError::unsupported(format!("Unsupported data type for stats validation: {dt}")),
+            KernelError::unsupported(format!("Unsupported data type for stats validation: {dt}"))
+                .into(),
         ),
         &DataType::VOID
         | DataType::Struct(_)
@@ -205,7 +210,8 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         | DataType::Map(_)
         | DataType::Variant(_) => Err(KernelError::internal_error(format!(
             "Unsupported data type for stats validation: {dt}"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -236,13 +242,15 @@ fn is_stat_present<'b>(
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
             Err(KernelError::unsupported(format!(
                 "Interval types are not supported for stats presence check: {data_type}"
-            )))
+            ))
+            .into())
         }
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
             Err(KernelError::unsupported(format!(
                 "Unsupported data type for stats presence check: {data_type}"
-            )))
+            ))
+            .into())
         }
         &DataType::VOID
         | DataType::Struct(_)
@@ -250,7 +258,8 @@ fn is_stat_present<'b>(
         | DataType::Map(_)
         | DataType::Variant(_) => Err(KernelError::internal_error(format!(
             "Unsupported data type for stats presence check: {data_type}"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -321,7 +330,8 @@ pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> D
         return Err(KernelError::stats_validation(format!(
             "'stats.numRecords' is required for this table (see \
              `TableConfiguration::requires_stats_num_records`), but is missing for file '{path}'",
-        )));
+        ))
+        .into());
     }
     Ok(())
 }

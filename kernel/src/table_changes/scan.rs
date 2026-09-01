@@ -115,7 +115,8 @@ impl TableChangesScanBuilder {
             return Err(KernelError::unsupported(
                 "A row-tracking TableChanges cannot be scanned for data; use \
                  TableChanges::scan_file_listing instead",
-            ));
+            )
+            .into());
         }
         // Predicates may reference any column in the full CDF-extended schema even when
         // `with_schema` narrows the output. Resolve predicate columns against the full schema
@@ -273,7 +274,9 @@ fn read_scan_file(
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
-    let location = table_root.join(&scan_file.path)?;
+    let location = table_root
+        .join(&scan_file.path)
+        .map_err(crate::KernelError::from)?;
     let file = FileMeta {
         last_modified: 0,
         size: match scan_file.size {

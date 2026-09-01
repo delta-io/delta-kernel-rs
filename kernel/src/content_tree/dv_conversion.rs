@@ -35,7 +35,8 @@ pub(crate) fn extract_deletion_vector_content(
             return Err(KernelError::DeletionVector(
                 "Inline deletion vectors are not supported. They must be persisted first."
                     .to_string(),
-            ));
+            )
+            .into());
         }
     };
     // Add 8 bytes to convert from Delta's size to Iceberg's size (full blob): Delta's

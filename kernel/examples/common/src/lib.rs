@@ -135,27 +135,36 @@ pub fn get_engine(
         use ObjectStoreScheme::*;
         let url_str = url.to_string();
         let store: Arc<DynObjectStore> = match scheme {
-            AmazonS3 => Arc::new(AmazonS3Builder::from_env().with_url(url_str).build()?),
+            AmazonS3 => Arc::new(
+                AmazonS3Builder::from_env()
+                    .with_url(url_str)
+                    .build()
+                    .map_err(delta_kernel::KernelError::from)?,
+            ),
             GoogleCloudStorage => Arc::new(
                 GoogleCloudStorageBuilder::from_env()
                     .with_url(url_str)
-                    .build()?,
+                    .build()
+                    .map_err(delta_kernel::KernelError::from)?,
             ),
             MicrosoftAzure => Arc::new(
                 MicrosoftAzureBuilder::from_env()
                     .with_url(url_str)
-                    .build()?,
+                    .build()
+                    .map_err(delta_kernel::KernelError::from)?,
             ),
             Local | Memory | Http => {
                 return Err(delta_kernel::KernelError::Generic(format!(
                     "Scheme {scheme:?} doesn't support getting credentials from environment"
-                )));
+                ))
+                .into());
             }
             _ => {
                 // scheme is non-exhaustive
                 return Err(delta_kernel::KernelError::Generic(format!(
                     "Unknown schema {scheme:?} doesn't support getting credentials from environment"
-                )));
+                ))
+                .into());
             }
         };
         Ok(DefaultEngineBuilder::new(Arc::new(store)).build())

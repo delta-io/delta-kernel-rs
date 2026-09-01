@@ -66,7 +66,8 @@ impl SchemaValidator {
             Err(KernelError::generic(format!(
                 "Schema validation failed:\n- {}",
                 self.errors.join("\n- ")
-            )))
+            ))
+            .into())
         }
     }
 }
@@ -125,14 +126,15 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
 /// of column mapping mode.
 fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
     if name.is_empty() {
-        return Err(KernelError::generic("Column name cannot be empty"));
+        return Err(KernelError::generic("Column name cannot be empty").into());
     }
     if cm_enabled {
         // Newlines break metadata serialization regardless of column mapping mode.
         if name.contains('\n') {
             return Err(KernelError::generic(format!(
                 "Column name '{name}' contains a newline character, which is not allowed"
-            )));
+            ))
+            .into());
         }
     } else if name.contains(INVALID_PARQUET_CHARS) {
         let invalid: Vec<char> = name
@@ -143,7 +145,8 @@ fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
             "Column name '{name}' contains invalid character(s) {invalid:?} that are not \
              allowed in Parquet column names. \
              Enable column mapping to use special characters in column names."
-        )));
+        ))
+        .into());
     }
     Ok(())
 }

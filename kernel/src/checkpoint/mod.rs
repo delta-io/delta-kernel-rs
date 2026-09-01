@@ -81,7 +81,7 @@
 //! // Finalize the checkpoint by passing the stats
 //! writer.finalize(engine, &last_checkpoint_stats)?;
 //!
-//! # Ok::<_, KernelError>(())
+//! # Ok::<_, delta_kernel::Error>(())
 //! ```
 //!
 //! ## Warning
@@ -200,7 +200,8 @@ impl LastCheckpointHintStats {
             return Err(KernelError::checkpoint_write(
                 "Cannot build LastCheckpointHintStats: the reconciliation iterator must be fully \
                  consumed and all data written to storage before finalizing",
-            ));
+            )
+            .into());
         }
         let size_in_bytes = i64::try_from(size_in_bytes).map_err(|e| {
             KernelError::checkpoint_write(format!("size_in_bytes {size_in_bytes} exceeds i64: {e}"))

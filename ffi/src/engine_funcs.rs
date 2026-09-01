@@ -132,7 +132,7 @@ fn read_parquet_file_impl(
 ) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
     let engine = extern_engine.engine();
     let parquet_handler = engine.parquet_handler();
-    let location = Url::parse(path?)?;
+    let location = Url::parse(path?).map_err(delta_kernel::KernelError::from)?;
     let delta_fm = delta_kernel::FileMeta {
         location,
         last_modified: file.last_modified,

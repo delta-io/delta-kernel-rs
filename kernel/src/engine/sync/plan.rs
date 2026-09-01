@@ -198,7 +198,12 @@ impl SyncPlanExecutor {
             .filter(|f| !file_constant_columns.contains(f.name()))
             .cloned();
         let read_schema = Arc::new(StructType::try_new(read_fields)?);
-        let output_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+        let output_schema: Arc<ArrowSchema> = Arc::new(
+            schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
+        );
 
         let store = self.storage.store();
         let mut batches = Vec::new();
@@ -233,7 +238,10 @@ impl SyncPlanExecutor {
                 // Reconcile writer-chosen map/list field names to `output_schema`'s before
                 // `try_new` asserts the schema. See `coerce_columns_to_schema`.
                 let columns = coerce_columns_to_schema(columns, &output_schema)?;
-                batches.push(RecordBatch::try_new(output_schema.clone(), columns)?);
+                batches.push(
+                    RecordBatch::try_new(output_schema.clone(), columns)
+                        .map_err(KernelError::from)?,
+                );
             }
         }
         Ok(batches)
@@ -293,32 +301,33 @@ fn dynamic_scan_files(
 
         for row in 0..batch.num_rows() {
             if path.is_null(row) {
-                return Err(KernelError::generic("DynamicScan path must not be null"));
+                return Err(KernelError::generic("DynamicScan path must not be null").into());
             }
             if dv.is_valid(row) && dv_ancestors.iter().all(|ancestor| ancestor.is_valid(row)) {
                 return Err(KernelError::unsupported(
                     "SyncPlanExecutor DynamicScan with deletion vectors",
-                ));
+                )
+                .into());
             }
             let path = path.value(row);
-            let location = dynamic_scan.base_url.join(path)?;
+            let location = dynamic_scan
+                .base_url
+                .join(path)
+                .map_err(KernelError::from)?;
             if size.is_null(row) {
-                return Err(KernelError::generic(
-                    "DynamicScan file size must not be null",
-                ));
+                return Err(KernelError::generic("DynamicScan file size must not be null").into());
             }
             let size = size.value(row);
             if size <= 0 {
-                return Err(KernelError::generic(
-                    "DynamicScan file size must be positive",
-                ));
+                return Err(KernelError::generic("DynamicScan file size must be positive").into());
             }
             let size = u64::try_from(size)
                 .map_err(|_| KernelError::generic("DynamicScan file size must fit in a u64"))?;
             if last_modified.is_null(row) {
                 return Err(KernelError::generic(
                     "DynamicScan last-modified time must not be null",
-                ));
+                )
+                .into());
             }
             let last_modified = last_modified.value(row);
             let file_constants = dynamic_scan
@@ -343,7 +352,9 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> DeltaResult<Vec<Reco
     let Some(first_batch) = input.first() else {
         return Ok(vec![]);
     };
-    let input_schema = Arc::new(StructType::try_from_arrow(first_batch.schema().as_ref())?);
+    let input_schema = Arc::new(
+        StructType::try_from_arrow(first_batch.schema().as_ref()).map_err(KernelError::from)?,
+    );
     let evaluator = ArrowEvaluationHandler.new_expression_evaluator(
         input_schema,
         project.expr,
@@ -363,7 +374,9 @@ fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> DeltaResult<Ve
     let Some(first_batch) = input.first() else {
         return Ok(vec![]);
     };
-    let input_schema = Arc::new(StructType::try_from_arrow(first_batch.schema().as_ref())?);
+    let input_schema = Arc::new(
+        StructType::try_from_arrow(first_batch.schema().as_ref()).map_err(KernelError::from)?,
+    );
     let evaluator = ArrowEvaluationHandler.new_predicate_evaluator(input_schema, predicate)?;
     input
         .iter()
@@ -378,7 +391,7 @@ fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> DeltaResult<Ve
                 .ok_or_else(|| {
                     KernelError::generic("Filter predicate did not produce a boolean array")
                 })?;
-            Ok(filter_record_batch(batch, mask)?)
+            Ok(filter_record_batch(batch, mask).map_err(KernelError::from)?)
         })
         .collect()
 }
@@ -399,7 +412,8 @@ fn eval_semi_join(
             let keep = encode_keys_as_rows(batch, &join.probe_keys)?
                 .into_iter()
                 .map(|key| join.inverted != build_keys.contains(&key));
-            Ok(filter_record_batch(batch, &BooleanArray::from_iter(keep))?)
+            Ok(filter_record_batch(batch, &BooleanArray::from_iter(keep))
+                .map_err(KernelError::from)?)
         })
         .collect()
 }
@@ -420,9 +434,12 @@ fn splice_file_constants(
         .map(
             |field| match file_constant_columns.iter().position(|c| c == field.name()) {
                 Some(slot) => constants[slot].to_array(rows),
-                None => read_columns.next().ok_or_else(|| {
-                    KernelError::generic("scan output has fewer columns than schema")
-                }),
+                None => read_columns
+                    .next()
+                    .ok_or_else(|| {
+                        KernelError::generic("scan output has fewer columns than schema")
+                    })
+                    .map_err(Into::into),
             },
         )
         .collect()
@@ -436,7 +453,11 @@ pub(super) fn encode_keys_as_rows(
     columns: &[ColumnName],
 ) -> DeltaResult<Vec<OwnedRow>> {
     if columns.is_empty() {
-        let key = RowConverter::new(vec![])?.parser().parse(&[]).owned();
+        let key = RowConverter::new(vec![])
+            .map_err(KernelError::from)?
+            .parser()
+            .parse(&[])
+            .owned();
         return Ok(vec![key; batch.num_rows()]);
     }
     let arrays: Vec<_> = columns
@@ -449,14 +470,18 @@ pub(super) fn encode_keys_as_rows(
         .iter()
         .map(|array| SortField::new(array.data_type().clone()))
         .collect();
-    let converter = RowConverter::new(sort_fields)?;
-    let rows = converter.convert_columns(&arrays)?;
+    let converter = RowConverter::new(sort_fields).map_err(KernelError::from)?;
+    let rows = converter
+        .convert_columns(&arrays)
+        .map_err(KernelError::from)?;
     Ok(rows.iter().map(|row| row.owned()).collect())
 }
 
 fn scalar_value(array: &dyn Array, row: usize) -> DeltaResult<Scalar> {
     if array.is_null(row) {
-        return Ok(Scalar::Null(DataType::try_from_arrow(array.data_type())?));
+        return Ok(Scalar::Null(
+            DataType::try_from_arrow(array.data_type()).map_err(KernelError::from)?,
+        ));
     }
     if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
         return Ok(Scalar::String(strings.value(row).to_string()));
@@ -467,7 +492,8 @@ fn scalar_value(array: &dyn Array, row: usize) -> DeltaResult<Scalar> {
     Err(KernelError::unsupported(format!(
         "Scalar conversion from array type {:?}",
         array.data_type()
-    )))
+    ))
+    .into())
 }
 
 /// Materialize a [`Values`] node's literal rows into a [`RecordBatch`]. An empty relation (the
@@ -492,8 +518,13 @@ fn values_to_record_batch(values: Values) -> DeltaResult<RecordBatch> {
             Ok(values)
         })
         .try_collect()?;
-    let schema = Arc::new(schema.as_ref().try_into_arrow()?);
-    Ok(RecordBatch::try_new(schema, columns)?)
+    let schema = Arc::new(
+        schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)?,
+    );
+    Ok(RecordBatch::try_new(schema, columns).map_err(KernelError::from)?)
 }
 
 #[cfg(test)]
@@ -513,7 +544,8 @@ mod tests {
         let batch = RecordBatch::try_from_iter([(
             "x",
             Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
-        )])?;
+        )])
+        .map_err(KernelError::from)?;
         let keys = encode_keys_as_rows(&batch, &[])?;
         assert_eq!(keys.len(), 3);
         assert!(keys.iter().all(|key| key == &keys[0]));

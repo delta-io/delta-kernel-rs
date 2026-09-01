@@ -396,7 +396,7 @@ mod tests {
         };
         let result = partition_value_map_insert_impl(
             &mut map,
-            Err(KernelError::generic("bad name")),
+            Err(KernelError::generic("bad name").into()),
             Ok(Scalar::from(1i32)),
         );
         assert!(result.is_err());

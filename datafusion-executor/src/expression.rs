@@ -71,20 +71,24 @@ pub fn to_df_expr(
         KernelExpression::Unary(u) => match u.op {
             UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
                 "converting the ToJson expression is not yet supported",
-            )),
+            )
+            .into()),
         },
 
         // TODO(#3007): implement once kernel's Cast semantics are clarified.
         KernelExpression::Cast(_) => Err(KernelError::unsupported(
             "converting a Cast expression is not yet supported",
-        )),
+        )
+        .into()),
 
         KernelExpression::Opaque(_) => Err(KernelError::unsupported(
             "cannot convert an engine-defined Opaque expression",
-        )),
+        )
+        .into()),
         KernelExpression::Unknown(name) => Err(KernelError::unsupported(format!(
             "cannot convert Unknown expression {name:?}"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -109,7 +113,8 @@ pub(crate) fn to_df_struct_columns(
         }
         _ => Err(KernelError::generic(format!(
             "Expression must be a Struct or StructPatch, got {expr:?}"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -148,7 +153,8 @@ fn variadic_to_df_expr(
             Some(other) => {
                 return Err(KernelError::unsupported(format!(
                     "converting an Array expression requires an array output type, got {other:?}"
-                )))
+                ))
+                .into())
             }
             None => None,
         },
@@ -174,10 +180,12 @@ fn require_struct_output<'a>(
         Some(KernelDataType::Struct(schema)) => Ok(schema),
         Some(other) => Err(KernelError::unsupported(format!(
             "converting a {arm} expression requires a struct output type, got {other:?}"
-        ))),
+        ))
+        .into()),
         None => Err(KernelError::unsupported(format!(
             "converting a {arm} expression requires a struct output type"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -254,7 +262,8 @@ fn struct_columns_from_fields(
             "Struct expression field count mismatch: {} fields in expression but {} in schema",
             fields.len(),
             target.num_fields()
-        )));
+        ))
+        .into());
     }
     let mut pairs = Vec::with_capacity(fields.len());
     for (child, field) in fields.iter().zip(target.fields()) {
@@ -296,7 +305,8 @@ fn struct_columns_from_patch(
         let KernelDataType::Struct(nested) = input_schema.field_at(path)?.data_type() else {
             return Err(KernelError::generic(format!(
                 "StructPatch input_path '{path}' does not resolve to a struct"
-            )));
+            ))
+            .into());
         };
         let source = column_to_df_expr(path, input_schema)?;
         (source_struct, source_expr) = (nested.as_ref(), Some(source));
@@ -369,7 +379,8 @@ fn struct_columns_from_patch(
     if used_required_field_patches < required {
         return Err(KernelError::generic(
             "StructPatch has non-optional field patches that reference missing input fields",
-        ));
+        )
+        .into());
     }
 
     for expr in &patch.appended_fields {
@@ -379,7 +390,8 @@ fn struct_columns_from_patch(
     if output_fields.next().is_some() {
         return Err(KernelError::generic(
             "StructPatch produced fewer fields than the output schema has",
-        ));
+        )
+        .into());
     }
 
     Ok(StructColumns { pairs, null_guard })
@@ -424,7 +436,8 @@ fn map_to_struct_to_df_expr(
                 "MapToStruct only supports primitive target types, but field '{}' is {:?}",
                 field.name(),
                 field.data_type()
-            )));
+            ))
+            .into());
         };
         let raw = get_field(map.clone(), field.name().to_string());
         let value = match prim {

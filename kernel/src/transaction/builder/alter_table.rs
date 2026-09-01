@@ -172,13 +172,15 @@ impl AlterTableTransactionBuilder<Modifying> {
         if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
             return Err(KernelError::unsupported(
                 "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
-            ));
+            )
+            .into());
         }
         // TODO(#2630): Support ALTER TABLE on tables with column defaults.
         if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
             return Err(KernelError::unsupported(
                 "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
-            ));
+            )
+            .into());
         }
         // Rejects writes to tables kernel can't safely commit to: writer version out of
         // kernel's supported range, unsupported writer features, or schemas with SQL-expression

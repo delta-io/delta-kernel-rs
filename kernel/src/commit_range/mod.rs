@@ -19,7 +19,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use delta_kernel::commit_range::{CommitRange, DeltaAction};
-//! use delta_kernel::{Engine, KernelError, Snapshot};
+//! use delta_kernel::{Engine, Snapshot};
 //! use delta_kernel::object_store::local::LocalFileSystem;
 //! use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 //!
@@ -41,7 +41,7 @@
 //!         let _batch = batch?;
 //!     }
 //! }
-//! # Ok::<(), KernelError>(())
+//! # Ok::<(), delta_kernel::Error>(())
 //! ```
 
 mod actions;
@@ -135,9 +135,7 @@ impl CommitRange {
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitAction>> + Send> {
         if actions.is_empty() {
-            return Err(KernelError::generic(
-                "at least one DeltaAction must be requested",
-            ));
+            return Err(KernelError::generic("at least one DeltaAction must be requested").into());
         }
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
@@ -147,7 +145,8 @@ impl CommitRange {
                         "snapshot table root ({}) does not match commit range table root ({})",
                         snapshot.table_root(),
                         self.table_root,
-                    )));
+                    ))
+                    .into());
                 }
                 let (anchor_version, anchor_name) = match self.commit_ordering {
                     CommitOrdering::AscendingOrder => (self.start_version, "start_version"),
@@ -157,7 +156,8 @@ impl CommitRange {
                     return Err(KernelError::generic(format!(
                         "snapshot version {} does not match {anchor_name} ({anchor_version})",
                         snapshot.version(),
-                    )));
+                    ))
+                    .into());
                 }
                 let table_config = snapshot.table_configuration();
                 table_config.ensure_operation_supported(Operation::Scan)?;
@@ -232,18 +232,16 @@ impl CommitActionsIterator {
     }
 }
 
-/// Prepend `commit v={version}` context to `err`, preserving the original variant for the two
-/// kernel error kinds that protocol validation surfaces ([`KernelError::Unsupported`] and
-/// [`KernelError::InvalidProtocol`]). Other variants fall back to [`KernelError::generic`].
-fn with_version_context(version: Version, err: KernelError) -> KernelError {
+/// Prepend `commit v={version}` context to kernel protocol-validation failures.
+fn with_version_context(version: Version, err: crate::Error) -> crate::Error {
     match err {
-        KernelError::Unsupported(msg) => {
-            KernelError::Unsupported(format!("commit v={version}: {msg}"))
+        crate::Error::Kernel(KernelError::Unsupported(msg)) => {
+            KernelError::Unsupported(format!("commit v={version}: {msg}")).into()
         }
-        KernelError::InvalidProtocol(msg) => {
-            KernelError::InvalidProtocol(format!("commit v={version}: {msg}"))
+        crate::Error::Kernel(KernelError::InvalidProtocol(msg)) => {
+            KernelError::InvalidProtocol(format!("commit v={version}: {msg}")).into()
         }
-        other => KernelError::generic(format!("commit v={version}: {other}")),
+        other => KernelError::generic(format!("commit v={version}: {other}")).into(),
     }
 }
 
@@ -697,16 +695,16 @@ mod tests {
     #[rstest::rstest]
     #[case::too_high_reader_version(
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#,
-        |err: &KernelError| matches!(err, KernelError::Unsupported(_)),
+        |err: &crate::Error| matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
     )]
     #[case::too_low_reader_version(
         r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
-        |err: &KernelError| matches!(err, KernelError::InvalidProtocol(_)),
+        |err: &crate::Error| matches!(err, crate::Error::Kernel(KernelError::InvalidProtocol(_))),
     )]
     #[tokio::test]
     async fn test_commits_errors_on_unsupported_reader_version(
         #[case] v1: &str,
-        #[case] is_expected_err: fn(&KernelError) -> bool,
+        #[case] is_expected_err: fn(&crate::Error) -> bool,
     ) {
         let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
         let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
@@ -929,7 +927,9 @@ mod tests {
                 "commits must reject snapshot with unsupported feature before iteration begins",
             );
         match err {
-            KernelError::Unsupported(msg) => assert!(msg.contains("futureFeature"), "got: {msg}"),
+            crate::Error::Kernel(KernelError::Unsupported(msg)) => {
+                assert!(msg.contains("futureFeature"), "got: {msg}")
+            }
             other => panic!("expected KernelError::Unsupported, got: {other:?}"),
         }
     }
@@ -975,7 +975,7 @@ mod tests {
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
             assert!(
-                matches!(err, KernelError::Unsupported(_)),
+                matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
                 "expected KernelError::Unsupported, got: {err:?}",
             );
         } else {
@@ -1004,7 +1004,7 @@ mod tests {
         let v0_result = iter.next().expect("v=0 commit yield slot");
         match v0_result {
             Ok(_) => panic!("v=0 must reject during iter.next()"),
-            Err(KernelError::Unsupported(msg)) => {
+            Err(crate::Error::Kernel(KernelError::Unsupported(msg))) => {
                 assert!(msg.contains("futureFeature"), "got: {msg}")
             }
             Err(other) => panic!("expected KernelError::Unsupported, got: {other:?}"),

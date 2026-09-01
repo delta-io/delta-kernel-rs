@@ -75,9 +75,12 @@ impl EnsureDataTypes {
         arrow_type: &ArrowDataType,
     ) -> DeltaResult<DataTypeCompat> {
         match (kernel_type, arrow_type) {
-            (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
-                check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
-            }
+            (DataType::Primitive(_), _) if arrow_type.is_primitive() => check_cast_compat(
+                kernel_type
+                    .try_into_arrow()
+                    .map_err(crate::KernelError::from)?,
+                arrow_type,
+            ),
             // A variant is physically a struct of binary fields, matched by name. Accept any Arrow
             // binary representation for the fields; their nullability is irrelevant to the physical
             // wrapper. Requiring exactly the variant's fields keeps this in sync with
@@ -104,15 +107,19 @@ impl EnsureDataTypes {
                         return Err(make_arrow_error(format!(
                             "Variant struct is missing field `{}`",
                             kernel_field.name
-                        )));
+                        ))
+                        .into());
                     };
                     self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
                 }
                 Ok(DataTypeCompat::Nested)
             }
-            (&DataType::Variant(_), _) => {
-                check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
-            }
+            (&DataType::Variant(_), _) => check_cast_compat(
+                kernel_type
+                    .try_into_arrow()
+                    .map_err(crate::KernelError::from)?,
+                arrow_type,
+            ),
             // Arrow's `is_primitive()` covers only numeric/temporal/decimal types and
             // excludes Boolean, the string and binary variants, and Null -- even though
             // kernel models all of these as `PrimitiveType` variants. Match them
@@ -138,12 +145,13 @@ impl EnsureDataTypes {
             }
             (DataType::Map(kernel_map_type), ArrowDataType::Map(arrow_map_type, _)) => {
                 let ArrowDataType::Struct(fields) = arrow_map_type.data_type() else {
-                    return Err(make_arrow_error("Arrow map type wasn't a struct."));
+                    return Err(make_arrow_error("Arrow map type wasn't a struct.").into());
                 };
                 let [key_type, value_type] = fields.deref() else {
                     return Err(make_arrow_error(
                         "Arrow map type didn't have expected key/value fields",
-                    ));
+                    )
+                    .into());
                 };
                 self.ensure_data_types(&kernel_map_type.key_type, key_type.data_type())?;
                 self.ensure_nullability(
@@ -212,7 +220,8 @@ impl EnsureDataTypes {
             }
             _ => Err(make_arrow_error(format!(
                 "Incorrect datatype. Expected {kernel_type}, got {arrow_type}"
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -227,7 +236,7 @@ impl EnsureDataTypes {
         {
             Err(KernelError::Generic(format!(
                 "{desc} has nullability {kernel_field_is_nullable} in kernel and {arrow_field_is_nullable} in arrow",
-            )))
+            )).into())
         } else {
             Ok(())
         }
@@ -251,7 +260,8 @@ impl EnsureDataTypes {
                 kernel_field.name,
                 kernel_field.metadata,
                 arrow_field.metadata(),
-            )))
+            ))
+            .into())
         } else {
             Ok(())
         }
@@ -292,7 +302,8 @@ fn check_cast_compat(
         (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
             "Incorrect datatype. Expected {target_type}, got {source_type}"
-        ))),
+        ))
+        .into()),
     }
 }
 

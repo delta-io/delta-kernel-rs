@@ -247,7 +247,7 @@ fn leaf_stats_field(field: &StructField, path: &[String]) -> DeltaResult<Option<
             "AMT stats schema generation is not yet implemented for geospatial column '{}' (type {})",
             field.name(),
             field.data_type(),
-        )));
+        )).into());
     }
 
     let Some(base_stats_id) = field_id_to_statistics_base(field_id) else {
@@ -283,7 +283,7 @@ fn leaf_stats_field(field: &StructField, path: &[String]) -> DeltaResult<Option<
 /// A [`SchemaTransform`] that collects the flat AMT `content_stats` schema by visiting every leaf
 /// of a table schema (see [`stats_schema`] for the layout, [`leaf_stats_field`] for each leaf).
 ///
-/// Uses the `Result<(), KernelError>` carrier: the rebuilt output is discarded,
+/// Uses the [`DeltaResult`] carrier: the rebuilt output is discarded,
 /// [`Self::fields`] is the
 /// real result, and an `Err` short-circuits the walk.
 struct StatsSchemaCollector {
@@ -294,9 +294,9 @@ struct StatsSchemaCollector {
 }
 
 impl<'a> SchemaTransform<'a> for StatsSchemaCollector {
-    transform_output_type!(|'a, T| Result<(), KernelError>);
+    transform_output_type!(|'a, T| DeltaResult<()>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), KernelError> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
         self.path.push(field.name().to_string());
         // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `path` is
         // discarded, so the skipped pop is harmless.

@@ -323,7 +323,7 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
     /// valid utf8 bytes.
     unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self> {
         let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
-        Ok(std::str::from_utf8(slice)?)
+        Ok(std::str::from_utf8(slice).map_err(delta_kernel::KernelError::from)?)
     }
 }
 

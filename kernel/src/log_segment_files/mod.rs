@@ -77,7 +77,9 @@ pub(crate) fn list_delta_log_from_storage(
     end_version: Version,
     cancellation_token: Option<&CancellationTokenRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
-    let start_from = log_root.join(&format!("{start_version:020}"))?;
+    let start_from = log_root
+        .join(&format!("{start_version:020}"))
+        .map_err(crate::KernelError::from)?;
     let log_root_str = log_root.to_string();
     let files = storage
         .list_from_with_cancellation(&start_from, cancellation_token.cloned())?
@@ -633,7 +635,8 @@ impl LogSegmentFiles {
             //     to two different tables and replays it as a single history.
             return Err(KernelError::invalid_checkpoint(
                 "Had a _last_checkpoint hint but didn't find any checkpoints",
-            ));
+            )
+            .into());
         };
         if latest_checkpoint.version != checkpoint_metadata.version {
             info!(

@@ -122,7 +122,8 @@ impl TypeChangesValidator {
             return Err(KernelError::schema(format!(
                 "Field '{path}' has a non-array `{type_changes_key}` annotation: \
                  {metadata}"
-            )));
+            ))
+            .into());
         };
         let type_changes: Vec<TypeChange> = serde_json::from_value(value.clone()).map_err(|e| {
             KernelError::schema(format!(
@@ -134,7 +135,8 @@ impl TypeChangesValidator {
                 return Err(KernelError::schema(format!(
                     "icebergCompatV3 does not support type change on field '{path}': {} -> {}",
                     type_change.from_type, type_change.to_type
-                )));
+                ))
+                .into());
             }
         }
         Ok(())

@@ -207,6 +207,7 @@ fn agg_decimal(
         })
         .transpose()
         .map_err(|e| KernelError::generic(format!("Invalid decimal precision/scale: {e}")))
+        .map_err(delta_kernel::Error::from)
 }
 
 /// Compute aggregation for a string array.
@@ -586,6 +587,7 @@ fn collect_stats_raw(
 
     StructArray::try_new(fields.into(), arrays, None)
         .map_err(|e| KernelError::generic(format!("Failed to create stats struct: {e}")))
+        .map_err(delta_kernel::Error::from)
 }
 
 // ============================================================================
@@ -633,8 +635,8 @@ fn collect_stats_raw(
 /// let physical_schema = StructType::try_new([StructField::not_null("id", KernelDataType::LONG)])?;
 ///
 /// let mut acc = FileStatsAccumulator::new(&[column_name!("id")], &physical_schema);
-/// acc.merge(&row_group(vec![1, 2])?)?;
-/// acc.merge(&row_group(vec![3, 4])?)?;
+/// acc.merge(&row_group(vec![1, 2]).map_err(delta_kernel::KernelError::from)?)?;
+/// acc.merge(&row_group(vec![3, 4]).map_err(delta_kernel::KernelError::from)?)?;
 /// let stats = acc.finish()?.expect("two row groups were merged");
 ///
 /// let id_stat = |section: &str| -> i64 {
@@ -696,7 +698,7 @@ impl FileStatsAccumulator {
 
     fn try_merge(&mut self, batch: &RecordBatch) -> DeltaResult<()> {
         let AccumulatorState::Open(row_groups) = &mut self.state else {
-            return Err(KernelError::stats_validation(FAILED));
+            return Err(KernelError::stats_validation(FAILED).into());
         };
         // Comparing derived stats shapes instead would collapse every nullCount-only leaf to the
         // same Int64.
@@ -707,7 +709,8 @@ impl FileStatsAccumulator {
                 "all row groups in a file must have the same schema; expected {:?} but got {:?}",
                 first_schema,
                 batch.schema(),
-            )));
+            ))
+            .into());
         }
         let batch_stats =
             collect_stats_raw(batch, &self.stats_columns, &self.null_count_only_columns)?;
@@ -720,7 +723,8 @@ impl FileStatsAccumulator {
                      equal but their nested field names differ: {} vs {}",
                     first.data_type(),
                     batch_stats.data_type(),
-                )));
+                ))
+                .into());
             }
         }
         row_groups.push(batch_stats);
@@ -740,7 +744,7 @@ impl FileStatsAccumulator {
     /// single row.
     pub fn finish(self) -> DeltaResult<Option<StructArray>> {
         let AccumulatorState::Open(row_groups) = self.state else {
-            return Err(KernelError::stats_validation(FAILED));
+            return Err(KernelError::stats_validation(FAILED).into());
         };
         if row_groups.is_empty() {
             return Ok(None);
@@ -775,12 +779,14 @@ fn reduce_stats(stats: &StructArray) -> DeltaResult<StructArray> {
             other => {
                 return Err(KernelError::internal_error(format!(
                     "cannot reduce unknown stats section: {other}"
-                )))
+                ))
+                .into())
             }
         });
     }
     StructArray::try_new(fields, cols, None)
         .map_err(|e| KernelError::generic(format!("rebuilding reduced stats struct: {e}")))
+        .map_err(delta_kernel::Error::from)
 }
 
 /// Reduce each child of a stats sub-struct (`nullCount`/`minValues`/`maxValues`) to one row,
@@ -815,7 +821,7 @@ fn reduce_count_leaf(array: &ArrayRef) -> DeltaResult<ArrayRef> {
         .as_primitive_opt::<Int64Type>()
         .ok_or_else(|| KernelError::internal_error("expected Int64 count leaf in stats"))?;
     if arr.null_count() != 0 {
-        return Err(KernelError::internal_error("null count leaf in stats"));
+        return Err(KernelError::internal_error("null count leaf in stats").into());
     }
     let sum = sum_checked(arr)
         .map_err(|e| KernelError::generic(format!("summing stats count leaf: {e}")))?
@@ -831,9 +837,7 @@ fn reduce_bool_and_leaf(array: &ArrayRef) -> DeltaResult<ArrayRef> {
         .as_boolean_opt()
         .ok_or_else(|| KernelError::internal_error("expected Boolean tightBounds leaf in stats"))?;
     if arr.null_count() != 0 {
-        return Err(KernelError::internal_error(
-            "null tightBounds leaf in stats",
-        ));
+        return Err(KernelError::internal_error("null tightBounds leaf in stats").into());
     }
     let all = bool_and(arr).unwrap_or(true);
     Ok(Arc::new(BooleanArray::from(vec![all])))
@@ -2538,7 +2542,10 @@ mod tests {
         let err = result.expect_err("must be rejected");
         // `KernelError::internal_error` captures a backtrace, which wraps the variant in
         // `Backtraced`.
-        let mut variant = &err;
+        let mut variant = match &err {
+            delta_kernel::Error::Kernel(error) => error,
+            error => panic!("expected a kernel error, got: {error:?}"),
+        };
         while let KernelError::Backtraced { source, .. } = variant {
             variant = source;
         }
@@ -2689,7 +2696,7 @@ mod tests {
             .merge(&second)
             .expect_err("a batch whose schema differs must be rejected");
         assert!(
-            matches!(err, KernelError::Schema(_)),
+            matches!(err, delta_kernel::Error::Kernel(KernelError::Schema(_))),
             "expected a schema error, got: {err}"
         );
         // A failed merge is terminal, so the first row group can never be published on its own.
@@ -2699,7 +2706,10 @@ mod tests {
             .expect_err("an accumulator that failed a merge must not publish statistics");
         // Its own variant, so callers can match the failure without matching on the message.
         assert!(
-            matches!(&err, KernelError::StatsValidation(msg) if msg == FAILED),
+            matches!(
+                &err,
+                delta_kernel::Error::Kernel(KernelError::StatsValidation(msg)) if msg == FAILED
+            ),
             "expected a stats validation error, got: {err}"
         );
     }
@@ -2727,7 +2737,7 @@ mod tests {
             .merge(&renamed)
             .expect_err("a batch deriving a different stats shape must be rejected");
         assert!(
-            matches!(err, KernelError::Schema(_)),
+            matches!(err, delta_kernel::Error::Kernel(KernelError::Schema(_))),
             "expected a schema error, got: {err}"
         );
         assert_result_error_with_message(acc.finish(), FAILED);

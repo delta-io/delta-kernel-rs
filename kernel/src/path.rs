@@ -388,7 +388,8 @@ impl ParsedLogPath<FileMeta> {
             return Err(KernelError::generic(format!(
                 "read_in_commit_timestamp can only be called on commit files, got: {:?}",
                 self.file_type
-            )));
+            ))
+            .into());
         }
 
         let mut action_iter = engine.json_handler().read_json_files(
@@ -404,12 +405,15 @@ impl ParsedLogPath<FileMeta> {
             Some(Ok(actions)) => {
                 let mut visitor = InCommitTimestampVisitor::default();
                 visitor.visit_rows_of(actions.as_ref())?;
-                visitor.in_commit_timestamp.ok_or_else(|| {
-                    KernelError::generic("In-Commit Timestamp not found in commit file")
-                })
+                visitor
+                    .in_commit_timestamp
+                    .ok_or_else(|| {
+                        KernelError::generic("In-Commit Timestamp not found in commit file")
+                    })
+                    .map_err(crate::Error::from)
             }
             Some(Err(err)) => Err(err),
-            None => Err(KernelError::generic("Commit file contains no actions")),
+            None => Err(KernelError::generic("Commit file contains no actions").into()),
         }
     }
 }
@@ -417,10 +421,18 @@ impl ParsedLogPath<FileMeta> {
 impl ParsedLogPath<Url> {
     /// Helper method to create a path with the given filename generator
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
-        let location = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?.join(&filename)?;
-        Self::try_from(location)?.ok_or_else(|| {
-            KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
-        })
+        let location = table_root
+            .join(DELTA_LOG_DIR_WITH_SLASH)
+            .map_err(crate::KernelError::from)?
+            .join(&filename)
+            .map_err(crate::KernelError::from)?;
+        Self::try_from(location)?
+            .ok_or_else(|| {
+                KernelError::internal_error(format!(
+                    "Attempted to create an invalid path: {filename}"
+                ))
+            })
+            .map_err(crate::Error::from)
     }
 
     // TODO: normalize all these log path constructors. we have overlap with this + LogPath +
@@ -433,7 +445,8 @@ impl ParsedLogPath<Url> {
         if !path.is_commit() {
             return Err(KernelError::internal_error(
                 "ParsedLogPath::new_commit created a non-commit path",
-            ));
+            )
+            .into());
         }
         Ok(path)
     }
@@ -448,7 +461,8 @@ impl ParsedLogPath<Url> {
         if !path.is_checkpoint() {
             return Err(KernelError::internal_error(
                 "ParsedLogPath::new_classic_parquet_checkpoint created a non-checkpoint path",
-            ));
+            )
+            .into());
         }
         Ok(path)
     }
@@ -464,7 +478,8 @@ impl ParsedLogPath<Url> {
         if !path.is_checkpoint() {
             return Err(KernelError::internal_error(
                 "ParsedLogPath::new_uuid_parquet_checkpoint created a non-checkpoint path",
-            ));
+            )
+            .into());
         }
         Ok(path)
     }
@@ -477,7 +492,8 @@ impl ParsedLogPath<Url> {
         if !matches!(path.file_type, LogPathFileType::Crc) {
             return Err(KernelError::internal_error(
                 "ParsedLogPath::new_crc created a non-CRC path",
-            ));
+            )
+            .into());
         }
         Ok(path)
     }
@@ -495,7 +511,8 @@ impl ParsedLogPath<Url> {
         if !matches!(path.file_type, LogPathFileType::CompactedCommit { .. }) {
             return Err(KernelError::internal_error(
                 "ParsedLogPath::new_log_compaction created a non-compaction path",
-            ));
+            )
+            .into());
         }
         Ok(path)
     }
@@ -509,9 +526,12 @@ impl ParsedLogPath<Url> {
 pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> DeltaResult<(String, Url)> {
     let filename = format!("{version:020}.checkpoint.{}.parquet", Uuid::new_v4());
     let url = table_root
-        .join(DELTA_LOG_DIR_WITH_SLASH)?
-        .join(SIDECAR_DIR_WITH_SLASH)?
-        .join(&filename)?;
+        .join(DELTA_LOG_DIR_WITH_SLASH)
+        .map_err(crate::KernelError::from)?
+        .join(SIDECAR_DIR_WITH_SLASH)
+        .map_err(crate::KernelError::from)?
+        .join(&filename)
+        .map_err(crate::KernelError::from)?;
     Ok((filename, url))
 }
 
@@ -533,7 +553,9 @@ impl LogRoot {
             let new_path = format!("{}/", table_root.path());
             table_root.set_path(&new_path);
         }
-        let log_root = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?;
+        let log_root = table_root
+            .join(DELTA_LOG_DIR_WITH_SLASH)
+            .map_err(crate::KernelError::from)?;
         Ok(Self {
             table_root,
             log_root,
@@ -551,10 +573,17 @@ impl LogRoot {
     /// Create a new commit path (absolute path) for the given version.
     pub(crate) fn new_commit_path(&self, version: Version) -> DeltaResult<ParsedLogPath<Url>> {
         let filename = format!("{version:020}.json");
-        let path = self.log_root().join(&filename)?;
-        ParsedLogPath::try_from(path)?.ok_or_else(|| {
-            KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
-        })
+        let path = self
+            .log_root()
+            .join(&filename)
+            .map_err(crate::KernelError::from)?;
+        ParsedLogPath::try_from(path)?
+            .ok_or_else(|| {
+                KernelError::internal_error(format!(
+                    "Attempted to create an invalid path: {filename}"
+                ))
+            })
+            .map_err(crate::Error::from)
     }
 
     /// Create a new staged commit path (absolute path) for the given version.
@@ -564,10 +593,19 @@ impl LogRoot {
     ) -> DeltaResult<ParsedLogPath<Url>> {
         let uuid = uuid::Uuid::new_v4();
         let filename = format!("{version:020}.{uuid}.json");
-        let path = self.log_root().join(STAGED_COMMITS_DIR)?.join(&filename)?;
-        ParsedLogPath::try_from(path)?.ok_or_else(|| {
-            KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
-        })
+        let path = self
+            .log_root()
+            .join(STAGED_COMMITS_DIR)
+            .map_err(crate::KernelError::from)?
+            .join(&filename)
+            .map_err(crate::KernelError::from)?;
+        ParsedLogPath::try_from(path)?
+            .ok_or_else(|| {
+                KernelError::internal_error(format!(
+                    "Attempted to create an invalid path: {filename}"
+                ))
+            })
+            .map_err(crate::Error::from)
     }
 }
 

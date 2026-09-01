@@ -123,10 +123,13 @@ fn next_item<T>(next: CIterNextFn<T>, state: NullableCvoid) -> Option<DeltaResul
     match out {
         OptionalValue::None => None,
         OptionalValue::Some(EngineExecResult::Success(item)) => Some(Ok(item)),
-        OptionalValue::Some(EngineExecResult::Failure(err)) => Some(Err(err.into())),
+        OptionalValue::Some(EngineExecResult::Failure(err)) => {
+            Some(Err(KernelError::from(err).into()))
+        }
         OptionalValue::Some(EngineExecResult::Uninit) => Some(Err(KernelError::internal_error(
             "FFI engine iterator returned from next upcall without writing an item",
-        ))),
+        )
+        .into())),
     }
 }
 
@@ -204,26 +207,28 @@ impl FfiBytesIter {
     }
 
     fn arrow_array_to_bytes(array: FFI_ArrowArray) -> DeltaResult<Bytes> {
-        let schema = FFI_ArrowSchema::try_from(&ArrowDataType::Binary)?;
-        let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }?;
+        let schema = FFI_ArrowSchema::try_from(&ArrowDataType::Binary)
+            .map_err(delta_kernel::KernelError::from)?;
+        let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }
+            .map_err(delta_kernel::KernelError::from)?;
         let array = arrow_array::make_array(array_data);
 
         let Some(binary) = array.as_any().downcast_ref::<BinaryArray>() else {
             return Err(KernelError::generic(format!(
                 "CBytesIterator must yield BinaryArray, got {:?}",
                 array.data_type()
-            )));
+            ))
+            .into());
         };
         if binary.len() != 1 {
             return Err(KernelError::generic(format!(
                 "CBytesIterator array must contain exactly one row, got {}",
                 binary.len()
-            )));
+            ))
+            .into());
         }
         if binary.is_null(0) {
-            return Err(KernelError::generic(
-                "CBytesIterator array row must not be null",
-            ));
+            return Err(KernelError::generic("CBytesIterator array row must not be null").into());
         }
 
         // TODO: this copies the payload bytes, but could be made zero-copy by
@@ -278,7 +283,7 @@ impl FfiFileMetaIter {
             ArrowField::new("last_modified", ArrowDataType::Int64, false),
             ArrowField::new("size", ArrowDataType::UInt64, false),
         ]));
-        Ok(FFI_ArrowSchema::try_from(&schema)?)
+        Ok(FFI_ArrowSchema::try_from(&schema).map_err(delta_kernel::KernelError::from)?)
     }
 
     /// Decodes a single engine batch into a `Vec<FileMeta>`.
@@ -286,19 +291,22 @@ impl FfiFileMetaIter {
         array: FFI_ArrowArray,
     ) -> DeltaResult<Vec<delta_kernel::FileMeta>> {
         let schema = Self::arrow_schema()?;
-        let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }?;
+        let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }
+            .map_err(delta_kernel::KernelError::from)?;
         let array = arrow_array::make_array(array_data);
 
         let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() else {
             return Err(KernelError::generic(format!(
                 "CFileMetaIterator must yield StructArray, got {:?}",
                 array.data_type()
-            )));
+            ))
+            .into());
         };
         if struct_array.is_empty() {
             return Err(KernelError::generic(
                 "CFileMetaIterator batch must contain at least one row",
-            ));
+            )
+            .into());
         }
 
         // The fixed schema guarantees three columns in this order, all non-null. `from_ffi`
@@ -333,13 +341,15 @@ impl FfiFileMetaIter {
         {
             return Err(KernelError::generic(
                 "CFileMetaIterator batch must not contain null fields",
-            ));
+            )
+            .into());
         }
 
         (0..struct_array.len())
             .map(|i| {
                 Ok(delta_kernel::FileMeta {
-                    location: Url::parse(location_col.value(i))?,
+                    location: Url::parse(location_col.value(i))
+                        .map_err(delta_kernel::KernelError::from)?,
                     last_modified: last_modified_col.value(i),
                     size: size_col.value(i),
                 })

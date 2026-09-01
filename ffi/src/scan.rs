@@ -206,12 +206,14 @@ pub(crate) fn decode_engine_predicate(
 ) -> DeltaResult<delta_kernel::Predicate> {
     let mut visitor_state = KernelExpressionVisitorState::default();
     let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-    unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
-        delta_kernel::KernelError::generic(
-            "engine predicate visitor returned an invalid expression ID; \
+    unwrap_kernel_predicate(&mut visitor_state, pred_id)
+        .ok_or_else(|| {
+            delta_kernel::KernelError::generic(
+                "engine predicate visitor returned an invalid expression ID; \
              predicate could not be decoded",
-        )
-    })
+            )
+        })
+        .map_err(delta_kernel::Error::from)
 }
 
 /// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
@@ -500,6 +502,7 @@ impl ScanMetadataIterator {
         self.data
             .lock()
             .map_err(|_| KernelError::generic("poisoned scan-metadata iterator mutex"))
+            .map_err(delta_kernel::Error::from)
     }
 }
 

@@ -245,11 +245,13 @@ pub unsafe extern "C" fn enable_formatted_log_line_tracing(
 // utility code below for setting up the tracing subscriber for events
 
 fn set_global_default(dispatch: tracing_core::Dispatch) -> DeltaResult<()> {
-    tracing_core::dispatcher::set_global_default(dispatch).map_err(|_| {
-        KernelError::generic(
-            "Unable to set global default subscriber. Trying to set more than once?",
-        )
-    })
+    tracing_core::dispatcher::set_global_default(dispatch)
+        .map_err(|_| {
+            KernelError::generic(
+                "Unable to set global default subscriber. Trying to set more than once?",
+            )
+        })
+        .map_err(delta_kernel::Error::from)
 }
 
 struct MessageFieldVisitor {
@@ -500,6 +502,7 @@ impl GlobalTracingState {
             .ok_or_else(|| KernelError::generic("logging filter not installed"))?
             .reload(LevelFilter::from(max_level))
             .map_err(reload_err)
+            .map_err(delta_kernel::Error::from)
     }
 
     fn register_event_callback(
@@ -508,7 +511,7 @@ impl GlobalTracingState {
         max_level: Level,
     ) -> DeltaResult<()> {
         if !max_level.is_valid() {
-            return Err(KernelError::generic("max_level out of range"));
+            return Err(KernelError::generic("max_level out of range").into());
         }
         self.ensure_installed()?;
         self.reload_logging(build_event_layer(callback), max_level)
@@ -526,7 +529,7 @@ impl GlobalTracingState {
         with_target: bool,
     ) -> DeltaResult<()> {
         if !max_level.is_valid() {
-            return Err(KernelError::generic("max_level out of range"));
+            return Err(KernelError::generic("max_level out of range").into());
         }
         self.ensure_installed()?;
         let layer =
@@ -546,6 +549,7 @@ impl GlobalTracingState {
             .ok_or_else(|| KernelError::generic("metrics filter not installed"))?
             .reload(LevelFilter::INFO)
             .map_err(|e| KernelError::generic(format!("Unable to reload metrics subscriber: {e}")))
+            .map_err(delta_kernel::Error::from)
     }
 }
 

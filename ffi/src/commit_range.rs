@@ -286,6 +286,7 @@ impl FfiCommitActionsIterator {
         self.data
             .lock()
             .map_err(|_| KernelError::generic("poisoned commit-actions iterator mutex"))
+            .map_err(delta_kernel::Error::from)
     }
 }
 

@@ -26,7 +26,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{schema, schema_ref, DataType, StructType};
 use crate::unit_test_utils::Action;
-use crate::{DeltaResult, Engine, EngineData, Snapshot};
+use crate::{DeltaResult, Engine, EngineData, KernelError, Snapshot};
 
 struct CheckpointParts {
     sidecar_files: Vec<Url>,
@@ -53,7 +53,12 @@ fn generate_checkpoint_parts(
         output_schema,
     )?;
 
-    let sidecars_base = writer.snapshot.log_segment().log_root.join("_sidecars/")?;
+    let sidecars_base = writer
+        .snapshot
+        .log_segment()
+        .log_root
+        .join("_sidecars/")
+        .map_err(KernelError::from)?;
     let mut sidecar_files = Vec::new();
     let mut sidecar_index = 1usize;
     loop {
@@ -61,7 +66,9 @@ fn generate_checkpoint_parts(
             SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?
                 .peekable();
         if single_sidecar_iter.peek().is_some() {
-            let sidecar_url = sidecars_base.join(&format!("sidecar_{sidecar_index}.parquet"))?;
+            let sidecar_url = sidecars_base
+                .join(&format!("sidecar_{sidecar_index}.parquet"))
+                .map_err(KernelError::from)?;
             engine
                 .parquet_handler()
                 .write_parquet_file(sidecar_url.clone(), Box::new(single_sidecar_iter))?;
@@ -305,7 +312,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 
     write_commit_to_store(&store, vec![create_remove_action("file1.parquet")], 2).await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -383,7 +390,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
     .await?;
     write_commit_to_store(&store, vec![create_add_action("file5.parquet")], 3).await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -485,7 +492,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
     )
     .await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -553,7 +560,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
         .insert("category".into(), "books".into());
     write_commit_to_store(&store, vec![Action::Add(add)], 1).await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -647,7 +654,7 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     )
     .await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 

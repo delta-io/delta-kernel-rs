@@ -201,7 +201,7 @@ impl DeletionVector for KernelDeletionVector {
 ///
 /// let descriptor = writer.write_deletion_vector(dv)?;
 /// writer.finalize()?;
-/// # Ok::<(), delta_kernel::KernelError>(())
+/// # Ok::<(), delta_kernel::Error>(())
 /// ```
 pub struct StreamingDeletionVectorWriter<'a, W: Write> {
     writer: &'a mut W,
@@ -258,7 +258,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
     ///
     /// let descriptor = writer.write_deletion_vector(dv)?;
     /// println!("Written DV at offset {} with size {}", descriptor.offset, descriptor.size_in_bytes);
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn write_deletion_vector(
         &mut self,
@@ -286,9 +286,9 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         //
         // [1] https://github.com/delta-io/delta/blob/b388f280d083d4cf92c6434e4f7a549fc26cd1fa/spark/src/main/scala/org/apache/spark/sql/delta/deletionvectors/RoaringBitmapArray.scala#L311
         if dv_size > i32::MAX as usize {
-            return Err(KernelError::generic(
-                "Deletion vector size exceeds maximum allowed size",
-            ));
+            return Err(
+                KernelError::generic("Deletion vector size exceeds maximum allowed size").into(),
+            );
         }
 
         // Record the offset where this DV size starts.
@@ -352,7 +352,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
     /// writer.write_deletion_vector(dv1)?;
     /// writer.write_deletion_vector(dv2)?;
     /// writer.finalize()?;
-    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn finalize(self) -> DeltaResult<()> {
         // Note: Currently this method only flushes the writer, but is kept as an explicit API
@@ -364,6 +364,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         self.writer
             .flush()
             .map_err(|e| KernelError::generic(format!("Failed to flush writer: {e}")))
+            .map_err(crate::Error::from)
     }
 }
 

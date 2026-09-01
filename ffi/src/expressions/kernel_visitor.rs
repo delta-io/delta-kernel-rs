@@ -248,9 +248,9 @@ unsafe fn visit_expression_column_impl(
     parts_len: usize,
 ) -> DeltaResult<usize> {
     if parts_len == 0 {
-        return Err(delta_kernel::KernelError::generic(
-            "column must have at least one field part",
-        ));
+        return Err(
+            delta_kernel::KernelError::generic("column must have at least one field part").into(),
+        );
     }
 
     let slices = unsafe { std::slice::from_raw_parts(parts, parts_len) };
@@ -259,9 +259,9 @@ unsafe fn visit_expression_column_impl(
         .map(|slice| unsafe { String::try_from_slice(slice) })
         .collect::<DeltaResult<Vec<String>>>()?;
     if fields.iter().any(|field| field.is_empty()) {
-        return Err(delta_kernel::KernelError::generic(
-            "column field part must not be empty",
-        ));
+        return Err(
+            delta_kernel::KernelError::generic("column field part must not be empty").into(),
+        );
     }
     let name = ColumnName::new(fields);
     Ok(wrap_expression(state, name))
@@ -507,7 +507,7 @@ pub(crate) enum NullTypeTag {
 }
 
 impl TryFrom<u8> for NullTypeTag {
-    type Error = delta_kernel::KernelError;
+    type Error = delta_kernel::Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -529,7 +529,8 @@ impl TryFrom<u8> for NullTypeTag {
             255 => Ok(Self::NonPrimitive),
             other => Err(delta_kernel::KernelError::generic(format!(
                 "Unrecognized null type tag: {other}"
-            ))),
+            ))
+            .into()),
         }
     }
 }
@@ -605,7 +606,8 @@ impl NullTypeTag {
             Self::NonPrimitive => Err(delta_kernel::KernelError::generic(
                 "Non-primitive null types (struct, array, map, variant) cannot be reconstructed \
                  from a type tag. Use opaque expressions or a schema visitor instead.",
-            )),
+            )
+            .into()),
         }
     }
 }

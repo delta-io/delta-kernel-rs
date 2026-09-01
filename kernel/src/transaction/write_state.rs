@@ -168,7 +168,8 @@ impl WriteState {
         Ok(serde_json::to_vec(&WriteStateWire {
             version: WRITE_STATE_FORMAT_VERSION,
             write_state: self,
-        })?)
+        })
+        .map_err(crate::KernelError::from)?)
     }
 
     /// Decodes shared write state from JSON bytes produced by [`encode`](Self::encode).
@@ -179,7 +180,8 @@ impl WriteState {
     /// Returns an error if the bytes contain an unsupported format version or do not contain a
     /// valid serialized write state.
     pub fn decode(bytes: &[u8]) -> DeltaResult<Arc<Self>> {
-        let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
+        let wire: DecodedWriteStateWire =
+            serde_json::from_slice(bytes).map_err(crate::KernelError::from)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
             KernelError::generic(format!(

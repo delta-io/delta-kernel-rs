@@ -18,7 +18,7 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaResult, KernelError};
 use rstest::rstest;
 use test_utils::{
     get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,
@@ -86,7 +86,12 @@ async fn test_create_table_with_row_tracking(
 
     if with_data {
         // Write one parquet file with 5 rows
-        let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
+        let arrow_schema = Arc::new(
+            schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
+        );
         let batch = RecordBatch::try_new(
             arrow_schema,
             vec![
@@ -200,8 +205,12 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
         .with_table_properties([("delta.enableRowTracking", "true")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let arrow_schema: Arc<delta_kernel::arrow::datatypes::Schema> =
-        Arc::new(schema.as_ref().try_into_arrow()?);
+    let arrow_schema: Arc<delta_kernel::arrow::datatypes::Schema> = Arc::new(
+        schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)?,
+    );
 
     // Write two separate parquet files: 3 rows and 5 rows
     let batch1 = RecordBatch::try_new(
@@ -325,7 +334,12 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
         .with_data_layout(DataLayout::clustered(["id"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
+    let arrow_schema = Arc::new(
+        schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)?,
+    );
     let batch = RecordBatch::try_new(
         arrow_schema,
         vec![

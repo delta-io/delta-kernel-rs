@@ -237,9 +237,7 @@ fn incremental_scan_stream_next_arrow_impl(
     let mut guard = lock_stream(stream)?;
     let Some(inner) = guard.as_mut() else {
         // The stream was already consumed by `into_summary` or dropped by a prior error.
-        return Err(KernelError::generic(
-            "incremental scan stream was already consumed",
-        ));
+        return Err(KernelError::generic("incremental scan stream was already consumed").into());
     };
     let result = next_arrow_batch(inner);
     // Kill the stream on any error so a later next_arrow / into_summary can't return a partial
@@ -307,6 +305,7 @@ fn lock_stream(
         .stream
         .lock()
         .map_err(|_| KernelError::generic("poisoned incremental scan stream mutex"))
+        .map_err(delta_kernel::Error::from)
 }
 
 /// The base (exclusive lower bound) version of the scanned range.

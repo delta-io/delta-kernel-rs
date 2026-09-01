@@ -1238,7 +1238,8 @@ mod tests {
                     Err(KernelError::UnexpectedColumnType(format!(
                         "{field_name} is not of type str"
                     ))
-                    .with_backtrace())
+                    .with_backtrace()
+                    .into())
                 } else {
                     Ok(None)
                 }
@@ -1249,7 +1250,8 @@ mod tests {
                     Err(KernelError::UnexpectedColumnType(format!(
                         "{field_name} is not of type i32"
                     ))
-                    .with_backtrace())
+                    .with_backtrace()
+                    .into())
                 } else {
                     Ok(None)
                 }
@@ -1277,7 +1279,8 @@ mod tests {
                     Err(KernelError::UnexpectedColumnType(format!(
                         "{field_name} is not of type i64"
                     ))
-                    .with_backtrace())
+                    .with_backtrace()
+                    .into())
                 } else {
                     Ok(None)
                 }

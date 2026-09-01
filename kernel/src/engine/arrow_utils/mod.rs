@@ -65,7 +65,9 @@ macro_rules! prim_array_cmp {
                             $right_arr.data_type())
                         )
                 )
-        }.map_err(KernelError::generic_err);
+        }
+        .map_err(KernelError::generic_err)
+        .map_err(crate::Error::from);
     };
 }
 
@@ -431,17 +433,17 @@ fn validate_parquet_variant(field: &ArrowField) -> DeltaResult<()> {
     match field.data_type() {
         ArrowDataType::Struct(fields) => {
             if fields.len() != 2 {
-                return Err(variant_parquet_error(field.name()));
+                return Err(variant_parquet_error(field.name()).into());
             }
             if !matches!(
                 (fields[0].name().as_str(), fields[1].name().as_str()),
                 ("value", "metadata") | ("metadata", "value")
             ) {
-                return Err(variant_parquet_error(field.name()));
+                return Err(variant_parquet_error(field.name()).into());
             }
             Ok(())
         }
-        _ => Err(variant_parquet_error(field.name())),
+        _ => Err(variant_parquet_error(field.name()).into()),
     }
 }
 
@@ -520,11 +522,15 @@ fn get_indices(
                             debug_assert_eq!(children.len(), requested_schema.num_fields());
                             deferred_missing.push(ReorderIndex::missing(
                                 index,
-                                Arc::new(requested_field.try_into_arrow()?),
+                                Arc::new(
+                                    requested_field
+                                        .try_into_arrow()
+                                        .map_err(crate::KernelError::from)?,
+                                ),
                             ));
                         }
                     } else {
-                        return Err(KernelError::unexpected_column_type(field.name()));
+                        return Err(KernelError::unexpected_column_type(field.name()).into());
                     }
                 }
                 ArrowDataType::List(list_field)
@@ -554,12 +560,17 @@ fn get_indices(
                             // No leaves selected inside this list. Defer a Missing entry.
                             deferred_missing.push(ReorderIndex::missing(
                                 index,
-                                Arc::new(requested_field.try_into_arrow()?),
+                                Arc::new(
+                                    requested_field
+                                        .try_into_arrow()
+                                        .map_err(crate::KernelError::from)?,
+                                ),
                             ));
                         } else if children.len() != 1 {
                             return Err(KernelError::generic(
                                 "List call should not have generated more than one reorder index",
-                            ));
+                            )
+                            .into());
                         } else {
                             // safety, checked that we have 1 element
                             let mut children = children.swap_remove(0);
@@ -569,7 +580,7 @@ fn get_indices(
                             reorder_indices.push(children);
                         }
                     } else {
-                        return Err(KernelError::unexpected_column_type(list_field.name()));
+                        return Err(KernelError::unexpected_column_type(list_field.name()).into());
                     }
                 }
                 ArrowDataType::Map(key_val_field, _) => {
@@ -586,7 +597,8 @@ fn get_indices(
                             if key_val_names.next().is_some() {
                                 return Err(KernelError::generic(
                                     "map fields had more than 2 members",
-                                ));
+                                )
+                                .into());
                             }
                             let inner_schema = map_type.as_struct_schema(key_name, val_name);
                             let mask_before = mask_indices.len();
@@ -606,12 +618,17 @@ fn get_indices(
                                 // No leaves selected inside this map. Defer a Missing entry.
                                 deferred_missing.push(ReorderIndex::missing(
                                     index,
-                                    Arc::new(requested_field.try_into_arrow()?),
+                                    Arc::new(
+                                        requested_field
+                                            .try_into_arrow()
+                                            .map_err(crate::KernelError::from)?,
+                                    ),
                                 ));
                             } else if children.len() != 2 {
                                 return Err(KernelError::generic(
                                     "Map call should have generated exactly two reorder indices",
-                                ));
+                                )
+                                .into());
                             } else {
                                 // vec indexing is safe, we checked len above
                                 let mut num_identity_transforms = 0;
@@ -631,7 +648,7 @@ fn get_indices(
                             }
                         }
                         _ => {
-                            return Err(KernelError::unexpected_column_type(field.name()));
+                            return Err(KernelError::unexpected_column_type(field.name()).into());
                         }
                     }
                 }
@@ -653,7 +670,8 @@ fn get_indices(
                         DataTypeCompat::Nested => {
                             return Err(KernelError::internal_error(
                                 "Comparing nested types in get_indices",
-                            ))
+                            )
+                            .into())
                         }
                     }
                     found_fields.insert(requested_field.name());
@@ -683,33 +701,33 @@ fn get_indices(
                         debug!("Inserting a row index column: {}", field.name());
                         reorder_indices.push(ReorderIndex::row_index(
                             requested_position,
-                            Arc::new(field.try_into_arrow()?),
+                            Arc::new(field.try_into_arrow().map_err(crate::KernelError::from)?),
                         ));
                     }
                     Some(MetadataColumnSpec::FilePath) => {
                         debug!("Inserting a file path column: {}", field.name());
                         reorder_indices.push(ReorderIndex::file_path(
                             requested_position,
-                            Arc::new(field.try_into_arrow()?),
+                            Arc::new(field.try_into_arrow().map_err(crate::KernelError::from)?),
                         ));
                     }
                     Some(metadata_spec) => {
                         return Err(KernelError::Generic(format!(
                             "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
-                        )));
+                        )).into());
                     }
                     None if field.nullable => {
                         debug!("Inserting missing and nullable field: {}", field.name());
                         reorder_indices.push(ReorderIndex::missing(
                             requested_position,
-                            Arc::new(field.try_into_arrow()?),
+                            Arc::new(field.try_into_arrow().map_err(crate::KernelError::from)?),
                         ));
                     }
                     None => {
                         return Err(KernelError::Generic(format!(
                             "Requested field not found in parquet schema, and field is not nullable: {}",
                             field.name()
-                        )));
+                        )).into());
                     }
                 }
             }
@@ -908,7 +926,10 @@ pub(crate) fn reorder_struct_array(
             match &reorder_index.transform {
                 ReorderIndexTransform::Cast(target) => {
                     let col = input_cols[parquet_position].as_ref();
-                    let col = Arc::new(crate::arrow::compute::cast(col, target)?);
+                    let col = Arc::new(
+                        crate::arrow::compute::cast(col, target)
+                            .map_err(crate::KernelError::from)?,
+                    );
                     let new_field = Arc::new(
                         input_fields[parquet_position]
                             .as_ref()
@@ -966,7 +987,8 @@ pub(crate) fn reorder_struct_array(
                         _ => {
                             return Err(KernelError::internal_error(
                                 "Nested reorder can only apply to struct/list/map.",
-                            ));
+                            )
+                            .into());
                         }
                     }
                 }
@@ -984,7 +1006,8 @@ pub(crate) fn reorder_struct_array(
                     let Some(ref mut row_index_iter) = row_indexes else {
                         return Err(KernelError::generic(
                             "Row index column requested but row index iterator not provided",
-                        ));
+                        )
+                        .into());
                     };
                     let row_index_array: PrimitiveArray<Int64Type> =
                         row_index_iter.take(num_rows).collect();
@@ -1001,7 +1024,8 @@ pub(crate) fn reorder_struct_array(
                     let Some(file_path) = file_location else {
                         return Err(KernelError::generic(
                             "File path column requested but file location not provided",
-                        ));
+                        )
+                        .into());
                     };
                     let file_path_array = StringArray::from(vec![file_path; num_rows]);
                     final_fields_cols[reorder_index.index] =
@@ -1013,15 +1037,12 @@ pub(crate) fn reorder_struct_array(
         let (field_vec, reordered_columns): (Vec<Arc<ArrowField>>, _) =
             final_fields_cols.into_iter().flatten().unzip();
         if field_vec.len() != num_cols {
-            Err(KernelError::internal_error(
-                "Found a None in final_fields_cols.",
-            ))
+            Err(KernelError::internal_error("Found a None in final_fields_cols.").into())
         } else {
-            Ok(StructArray::try_new(
-                field_vec.into(),
-                reordered_columns,
-                null_buffer,
-            )?)
+            Ok(
+                StructArray::try_new(field_vec.into(), reordered_columns, null_buffer)
+                    .map_err(crate::KernelError::from)?,
+            )
         }
     }
 }
@@ -1047,12 +1068,10 @@ fn reorder_list<O: OffsetSizeTrait>(
             result_array.fields().clone(),
             result_array.is_nullable(),
         ));
-        let list = Arc::new(GenericListArray::try_new(
-            new_list_field,
-            offset_buffer,
-            result_array,
-            null_buf,
-        )?);
+        let list = Arc::new(
+            GenericListArray::try_new(new_list_field, offset_buffer, result_array, null_buf)
+                .map_err(crate::KernelError::from)?,
+        );
         // Take the field's type from the rebuilt array so a LargeList isn't forced to List.
         let new_field = Arc::new(ArrowField::new(
             input_field_name,
@@ -1061,9 +1080,10 @@ fn reorder_list<O: OffsetSizeTrait>(
         ));
         Ok(Some((new_field, list)))
     } else {
-        Err(KernelError::internal_error(
-            "Nested reorder of list should have had struct child.",
-        ))
+        Err(
+            KernelError::internal_error("Nested reorder of list should have had struct child.")
+                .into(),
+        )
     }
 }
 
@@ -1095,13 +1115,16 @@ fn reorder_map(
         ordered,
         map_field.is_nullable(),
     ));
-    let map = Arc::new(MapArray::try_new(
-        new_map_field,
-        offset_buffer,
-        result_array,
-        null_buf,
-        ordered,
-    )?);
+    let map = Arc::new(
+        MapArray::try_new(
+            new_map_field,
+            offset_buffer,
+            result_array,
+            null_buf,
+            ordered,
+        )
+        .map_err(crate::KernelError::from)?,
+    );
     Ok(Some((new_field, map)))
 }
 
@@ -1199,7 +1222,8 @@ pub(crate) fn parse_json_impl(
         }
         dt => Err(KernelError::generic(format!(
             "Expected string array for JSON parsing, got {dt}"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -1213,12 +1237,17 @@ fn parse_json_inner<'a>(
     // the target type. `Cow::Borrowed` means nothing was rewritten; skip the cast pass.
     match StringifyFailureProneLeaves.transform_struct(schema.as_ref()) {
         Cow::Borrowed(_) => {
-            let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
+            let arrow_target = Arc::new(
+                ArrowSchema::try_from_kernel(schema.as_ref()).map_err(crate::KernelError::from)?,
+            );
             decode_with_arrow_json(json_strings, num_rows, arrow_target)
         }
         Cow::Owned(relaxed) => {
-            let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
-            let arrow_relaxed = Arc::new(ArrowSchema::try_from_kernel(&relaxed)?);
+            let arrow_target = Arc::new(
+                ArrowSchema::try_from_kernel(schema.as_ref()).map_err(crate::KernelError::from)?,
+            );
+            let arrow_relaxed =
+                Arc::new(ArrowSchema::try_from_kernel(&relaxed).map_err(crate::KernelError::from)?);
             let decoded = decode_with_arrow_json(json_strings, num_rows, arrow_relaxed)?;
             safe_cast_back(decoded, &arrow_target)
         }
@@ -1240,38 +1269,45 @@ fn decode_with_arrow_json<'a>(
     let mut decoder = ReaderBuilder::new(schema)
         .with_batch_size(num_rows)
         .with_coerce_primitive(true)
-        .build_decoder()?;
+        .build_decoder()
+        .map_err(crate::KernelError::from)?;
 
     for (json, row_number) in json_strings.zip(1..) {
         let line = json.unwrap_or("{}");
-        let consumed = decoder.decode(line.as_bytes())?;
+        let consumed = decoder
+            .decode(line.as_bytes())
+            .map_err(crate::KernelError::from)?;
         // did we fail to decode the whole line, or was the line partial
         if consumed != line.len() || decoder.has_partial_record() {
             return Err(KernelError::Generic(format!(
                 "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
-            )));
+            ))
+            .into());
         }
         // did we decode exactly one record
         if decoder.len() != row_number {
             return Err(KernelError::Generic(format!(
                 "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
-            )));
+            ))
+            .into());
         }
     }
     // Get the final batch out
-    if let Some(batch) = decoder.flush()? {
+    if let Some(batch) = decoder.flush().map_err(crate::KernelError::from)? {
         if batch.num_rows() != num_rows {
             return Err(KernelError::Generic(format!(
                 "Unexpected number of rows decoded. Got {}, expected{}",
                 batch.num_rows(),
                 num_rows
-            )));
+            ))
+            .into());
         }
         return Ok(batch);
     }
     Err(KernelError::generic(
         "Malformed JSON: exited parse_json_impl without deserializing anything useful",
-    ))
+    )
+    .into())
 }
 
 /// Rewrites failure-prone primitives (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) to
@@ -1322,7 +1358,8 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<
         target.clone(),
         columns,
         &RecordBatchOptions::new().with_row_count(Some(row_count)),
-    )?)
+    )
+    .map_err(crate::KernelError::from)?)
 }
 
 /// Casts each column to the type of the `target` field at the same position, so the columns can be
@@ -1411,13 +1448,12 @@ fn cast_array_to_type(
                 .zip(target_fields.iter())
                 .map(|(c, f)| cast_array_to_type(c.clone(), f.data_type(), opts))
                 .collect::<DeltaResult<Vec<_>>>()?;
-            Ok(Arc::new(StructArray::try_new(
-                target_fields.clone(),
-                new_children,
-                nulls,
-            )?))
+            Ok(Arc::new(
+                StructArray::try_new(target_fields.clone(), new_children, nulls)
+                    .map_err(crate::KernelError::from)?,
+            ))
         }
-        _ => Ok(cast_with_options(&array, target, opts)?),
+        _ => Ok(cast_with_options(&array, target, opts).map_err(crate::KernelError::from)?),
     }
 }
 
@@ -1491,9 +1527,9 @@ pub(crate) fn to_json_bytes(
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
         let batch = filter_to_record_batch(chunk?)?;
-        writer.write(&batch)?;
+        writer.write(&batch).map_err(crate::KernelError::from)?;
     }
-    writer.finish()?;
+    writer.finish().map_err(crate::KernelError::from)?;
     Ok(writer.into_inner())
 }
 
@@ -1545,7 +1581,7 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec
     }
 
     for (output_pos, field, spec) in metadata_entries {
-        let field = Arc::new(field.try_into_arrow()?);
+        let field = Arc::new(field.try_into_arrow().map_err(crate::KernelError::from)?);
         let rindex = match spec {
             MetadataColumnSpec::FilePath => ReorderIndex::file_path(output_pos, field),
             _ => ReorderIndex::missing(output_pos, field),
@@ -1565,7 +1601,7 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec
 #[internal_api]
 pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema> {
     let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
-    Ok(ArrowSchema::try_from_kernel(&json_fields)?)
+    Ok(ArrowSchema::try_from_kernel(&json_fields).map_err(crate::KernelError::from)?)
 }
 
 #[cfg(test)]
@@ -3690,7 +3726,8 @@ mod tests {
         let data = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(StringArray::from(vec!["string1", "string2"]))],
-        )?;
+        )
+        .map_err(KernelError::from)?;
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(data));
         let filtered_data = FilteredEngineData::with_all_rows_selected(data);
         let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data))))?;
@@ -3714,7 +3751,8 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![
                 "row0", "row1", "row2", "row3",
             ]))],
-        )?;
+        )
+        .map_err(KernelError::from)?;
 
         // Helper function to create EngineData from the same record batch
         let create_engine_data =

@@ -515,7 +515,8 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(KernelError::unsupported(
             "Feature 'catalogManaged' is not supported for CDF",
-        )),
+        )
+        .into()),
     }),
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -528,7 +529,8 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(KernelError::unsupported(
             "Feature 'catalogOwned-preview' is not supported for CDF",
-        )),
+        )
+        .into()),
     }),
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -672,9 +674,9 @@ static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
     #[cfg(feature = "geo-type-in-dev")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(KernelError::unsupported(
-            "Feature 'geospatial' is not supported for writes",
-        )),
+        Operation::Write => {
+            Err(KernelError::unsupported("Feature 'geospatial' is not supported for writes").into())
+        }
     }),
     #[cfg(not(feature = "geo-type-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
@@ -909,7 +911,8 @@ pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()>
         return Err(KernelError::unsupported(format!(
             "Unsupported minimum reader version {}",
             protocol.min_reader_version()
-        )));
+        ))
+        .into());
     }
     Ok(())
 }
@@ -927,7 +930,8 @@ pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> DeltaResult<()> {
             KernelSupport::NotSupported => {
                 return Err(KernelError::unsupported(format!(
                     "Feature '{feature}' is not supported by kernel",
-                )));
+                ))
+                .into());
             }
             KernelSupport::Custom(_) => {}
         }
@@ -1052,11 +1056,17 @@ mod tests {
         match expected {
             ExpectRead::Ok => result.expect("protocol must be readable"),
             ExpectRead::InvalidProtocol => assert!(
-                matches!(result, Err(KernelError::InvalidProtocol(_))),
+                matches!(
+                    result,
+                    Err(crate::Error::Kernel(KernelError::InvalidProtocol(_)))
+                ),
                 "expected InvalidProtocol, got: {result:?}"
             ),
             ExpectRead::Unsupported => assert!(
-                matches!(result, Err(KernelError::Unsupported(_))),
+                matches!(
+                    result,
+                    Err(crate::Error::Kernel(KernelError::Unsupported(_)))
+                ),
                 "expected Unsupported, got: {result:?}"
             ),
         }

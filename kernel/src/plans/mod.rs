@@ -119,7 +119,7 @@ impl PlanResult {
     pub fn into_data(self) -> DeltaResult<DeltaResultIteratorStatic<Box<dyn EngineData>>> {
         match self {
             Self::Data(iter) => Ok(iter),
-            other => Err(other.type_mismatch("Data")),
+            other => Err(other.type_mismatch("Data").into()),
         }
     }
 
@@ -129,7 +129,7 @@ impl PlanResult {
     pub fn into_file_meta(self) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         match self {
             Self::FileMeta(iter) => Ok(iter),
-            other => Err(other.type_mismatch("FileMeta")),
+            other => Err(other.type_mismatch("FileMeta").into()),
         }
     }
 
@@ -139,7 +139,7 @@ impl PlanResult {
     pub fn into_bytes(self) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         match self {
             Self::Bytes(iter) => Ok(iter),
-            other => Err(other.type_mismatch("Bytes")),
+            other => Err(other.type_mismatch("Bytes").into()),
         }
     }
 
@@ -149,7 +149,7 @@ impl PlanResult {
     pub fn into_parquet_footer(self) -> DeltaResult<ParquetFooter> {
         match self {
             Self::ParquetFooter(footer) => Ok(footer),
-            other => Err(other.type_mismatch("ParquetFooter")),
+            other => Err(other.type_mismatch("ParquetFooter").into()),
         }
     }
 
@@ -158,7 +158,7 @@ impl PlanResult {
     pub fn into_unit(self) -> DeltaResult<()> {
         match self {
             Self::Unit => Ok(()),
-            other => Err(other.type_mismatch("Unit")),
+            other => Err(other.type_mismatch("Unit").into()),
         }
     }
 

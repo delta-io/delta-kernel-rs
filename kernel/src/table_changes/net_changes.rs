@@ -76,7 +76,8 @@ pub(super) fn collapse_net_changes(
         else {
             return Err(KernelError::internal_error(format!(
                 "net-changes collapse produced an empty side slot for path {path}"
-            )));
+            ))
+            .into());
         };
         // Only a leading remove and/or a trailing add mark a net change; clone the boundary
         // file(s) that survive.

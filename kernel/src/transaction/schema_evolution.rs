@@ -70,7 +70,8 @@ fn modify_field_at_path(
         let DataType::Struct(inner) = &mut field.data_type else {
             return Err(KernelError::generic(format!(
                 "intermediate field '{first}' is not a struct"
-            )));
+            ))
+            .into());
         };
         return modify_field_at_path(inner.field_map_mut(), rest, modifier);
     }
@@ -145,7 +146,8 @@ pub(crate) fn apply_schema_operations(
                         "Cannot add column '{}': metadata columns are not allowed in \
                          a table schema",
                         field.name()
-                    )));
+                    ))
+                    .into());
                 }
                 if !matches!(field.data_type, DataType::Primitive(_)) {
                     StructType::ensure_no_metadata_columns_in_field(&field)?;
@@ -156,7 +158,8 @@ pub(crate) fn apply_schema_operations(
                     return Err(KernelError::schema(format!(
                         "Cannot add column '{}': a column with that name already exists",
                         field.name()
-                    )));
+                    ))
+                    .into());
                 }
                 // Validate field is nullable (Delta protocol requires added columns to be
                 // nullable so existing data files can return NULL for the new column)
@@ -166,7 +169,8 @@ pub(crate) fn apply_schema_operations(
                         "Cannot add non-nullable column '{}'. Added columns must be nullable \
                          because existing data files do not contain this column.",
                         field.name()
-                    )));
+                    ))
+                    .into());
                 }
                 let field = if cm_enabled {
                     let id = max_id.as_mut().ok_or_else(|| {
@@ -209,7 +213,8 @@ pub(crate) fn apply_schema_operations(
         Ordering::Less => {
             return Err(KernelError::internal_error(
                 "max column ID went backwards during schema evolution",
-            ))
+            )
+            .into())
         }
     };
     Ok(SchemaEvolutionResult {
@@ -542,7 +547,10 @@ mod tests {
         }];
         let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, None)
             .unwrap_err();
-        assert!(matches!(err, KernelError::InvalidProtocol(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::InvalidProtocol(_))
+        ));
         assert!(err.to_string().contains("maxColumnId"));
     }
 

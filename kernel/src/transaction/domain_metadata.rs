@@ -33,7 +33,7 @@ impl<S> Transaction<S> {
         {
             return Err(KernelError::unsupported(
                 "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
-            ));
+            ).into());
         }
 
         let is_create = self.is_create_table();
@@ -55,7 +55,8 @@ impl<S> Transaction<S> {
             if !seen_domains.insert(domain) {
                 return Err(KernelError::generic(format!(
                     "Metadata for domain {domain} already specified in this transaction"
-                )));
+                ))
+                .into());
             }
         }
 
@@ -67,14 +68,16 @@ impl<S> Transaction<S> {
             if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
                 return Err(KernelError::generic(
                     "Cannot modify domains that start with 'delta.' as those are system controlled",
-                ));
+                )
+                .into());
             }
 
             // Check for duplicates (spans both system and user domains)
             if !seen_domains.insert(domain) {
                 return Err(KernelError::generic(format!(
                     "Metadata for domain {domain} already specified in this transaction"
-                )));
+                ))
+                .into());
             }
         }
 
@@ -84,7 +87,8 @@ impl<S> Transaction<S> {
         if is_create && !self.user_domain_removals.is_empty() {
             return Err(KernelError::unsupported(
                 "Domain metadata removals are not supported in create-table transactions",
-            ));
+            )
+            .into());
         }
 
         // Validate domain removals (for non-create-table)
@@ -93,14 +97,16 @@ impl<S> Transaction<S> {
             if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
                 return Err(KernelError::generic(
                     "Cannot modify domains that start with 'delta.' as those are system controlled",
-                ));
+                )
+                .into());
             }
 
             // Check for duplicates
             if !seen_domains.insert(domain.as_str()) {
                 return Err(KernelError::generic(format!(
                     "Metadata for domain {domain} already specified in this transaction"
-                )));
+                ))
+                .into());
             }
         }
 
@@ -123,7 +129,8 @@ impl<S> Transaction<S> {
             _ => {
                 return Err(KernelError::generic(format!(
                     "Unknown system domain '{domain}'. Only known system domains are allowed."
-                )));
+                ))
+                .into());
             }
         };
 
@@ -132,7 +139,8 @@ impl<S> Transaction<S> {
             if !table_config.is_feature_supported(&feature) {
                 return Err(KernelError::generic(format!(
                     "System domain '{domain}' requires the '{feature}' feature to be enabled"
-                )));
+                ))
+                .into());
             }
         }
 

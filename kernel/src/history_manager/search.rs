@@ -250,7 +250,7 @@ mod tests {
 
         let failing_key_fn = |x: &i32| -> DeltaResult<i32> {
             if *x == 5 {
-                Err(KernelError::generic("Error extracting key"))
+                Err(KernelError::generic("Error extracting key").into())
             } else {
                 Ok(*x)
             }
@@ -260,7 +260,9 @@ mod tests {
             binary_search_by_key_with_bounds(&values, 7, failing_key_fn, Bound::LeastUpper);
         assert!(matches!(
             result,
-            Err(SearchError::KeyFunctionError(crate::KernelError::Generic(msg))) if msg.contains("Error extracting key")
+            Err(SearchError::KeyFunctionError(crate::Error::Kernel(
+                crate::KernelError::Generic(msg)
+            ))) if msg.contains("Error extracting key")
         ));
     }
 }

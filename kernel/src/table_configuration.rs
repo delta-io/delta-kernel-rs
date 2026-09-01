@@ -79,9 +79,9 @@ fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) 
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
-            return Err(KernelError::generic(format!(
-                "Duplicate partition column: '{col}'"
-            )));
+            return Err(
+                KernelError::generic(format!("Duplicate partition column: '{col}'")).into(),
+            );
         }
         require!(
             logical_schema.field(col).is_some(),
@@ -662,7 +662,8 @@ impl TableConfiguration {
             KernelSupport::NotSupported => {
                 return Err(KernelError::unsupported(format!(
                     "Feature '{feature}' is not supported"
-                )))
+                ))
+                .into())
             }
             KernelSupport::Custom(check) => {
                 check(&self.protocol, &self.table_properties, operation)?;
@@ -749,7 +750,8 @@ impl TableConfiguration {
             return Err(KernelError::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
-            )));
+            ))
+            .into());
         }
 
         // Check all enabled writer features have kernel support
@@ -762,9 +764,7 @@ impl TableConfiguration {
         if self.is_feature_supported(&TableFeature::Invariants)
             && schema_has_invariants(self.logical_schema.as_ref())
         {
-            return Err(KernelError::unsupported(
-                "Column invariants are not yet supported",
-            ));
+            return Err(KernelError::unsupported("Column invariants are not yet supported").into());
         }
 
         Ok(())
@@ -795,10 +795,12 @@ impl TableConfiguration {
             }),
             (Some(_), None) => Err(KernelError::generic(
                 "In-commit timestamp enabled, but enablement timestamp is missing",
-            )),
+            )
+            .into()),
             (None, Some(_)) => Err(KernelError::generic(
                 "In-commit timestamp enabled, but enablement version is missing",
-            )),
+            )
+            .into()),
             // If InCommitTimestamps was enabled at the beginning of the table's history,
             // it may have an empty enablement version and timestamp
             (None, None) => Ok(InCommitTimestampEnablement::Enabled { enablement: None }),
@@ -929,12 +931,14 @@ impl TableConfiguration {
             return Err(KernelError::unsupported(
                 "Remove actions are not yet supported on tables with rowTracking supported \
                  and not suspended",
-            ));
+            )
+            .into());
         }
         if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
             return Err(KernelError::unsupported(
                 "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
-            ));
+            )
+            .into());
         }
         Ok(())
     }
@@ -1232,7 +1236,8 @@ mod test {
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         assert!(matches!(
             table_config.in_commit_timestamp_enablement(),
-            Err(KernelError::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
+            Err(crate::Error::Kernel(KernelError::Generic(msg)))
+                if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
         ));
     }
     #[test]

@@ -189,9 +189,13 @@ impl CommitAction {
                 };
                 if ict_applies {
                     extracted_ict.ok_or_else(|| {
-                        with_version_context(version, KernelError::generic(
-                            "in-commit timestamp is enabled but missing ICT timestamp field in commit"
-                        ))
+                        with_version_context(
+                            version,
+                            KernelError::generic(
+                                "in-commit timestamp is enabled but missing ICT timestamp field in commit"
+                            )
+                            .into(),
+                        )
                     })?
                 } else {
                     self.log_path.location.last_modified

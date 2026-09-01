@@ -37,7 +37,7 @@ pub enum DeletionVectorStorageType {
 }
 
 impl FromStr for DeletionVectorStorageType {
-    type Err = KernelError;
+    type Err = crate::Error;
 
     fn from_str(s: &str) -> DeltaResult<Self> {
         match s {
@@ -46,7 +46,8 @@ impl FromStr for DeletionVectorStorageType {
             "p" => Ok(Self::PersistedAbsolute),
             _ => Err(KernelError::internal_error(format!(
                 "Unsupported deletion vector format option: {s}"
-            ))),
+            ))
+            .into()),
         }
     }
 }
@@ -116,6 +117,7 @@ impl DeletionVectorPath {
         self.table_path
             .join(&dv_suffix)
             .map_err(|_| KernelError::DeletionVector(format!("invalid path: {dv_suffix}")))
+            .map_err(crate::Error::from)
     }
 
     /// Returns the compressed encoded path for use in descriptor (prefix + z85 encoded UUID).
@@ -330,13 +332,13 @@ impl DeletionVectorDescriptor {
                     ROARING_BITMAP_PORTABLE_MAGIC => {
                         RoaringTreemap::deserialize_from(&byte_slice[4..])
                             .map_err(|err| KernelError::DeletionVector(err.to_string()))
+                            .map_err(crate::Error::from)
                     }
                     ROARING_BITMAP_NATIVE_MAGIC => Err(KernelError::deletion_vector(
                         "Native serialization in inline bitmaps is not yet supported",
-                    )),
-                    _ => Err(KernelError::DeletionVector(format!(
-                        "Invalid magic {magic}"
-                    ))),
+                    )
+                    .into()),
+                    _ => Err(KernelError::DeletionVector(format!("Invalid magic {magic}")).into()),
                 }
             }
             Some(path) => {
@@ -449,11 +451,13 @@ impl DeletionVectorDescriptor {
                 // Safety: verified bytes is larger than crc_start + 4, above.
                 let dv_bytes = bytes.slice(bitmap_start..crc_start);
                 let cursor = Cursor::new(dv_bytes);
-                RoaringTreemap::deserialize_from(cursor).map_err(|err| {
-                    KernelError::DeletionVector(format!(
-                        "Failed to deserialize deletion vector for {path}: {err}"
-                    ))
-                })
+                RoaringTreemap::deserialize_from(cursor)
+                    .map_err(|err| {
+                        KernelError::DeletionVector(format!(
+                            "Failed to deserialize deletion vector for {path}: {err}"
+                        ))
+                    })
+                    .map_err(crate::Error::from)
             }
         }
     }

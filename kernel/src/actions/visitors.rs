@@ -898,7 +898,8 @@ impl RowVisitor for CheckpointElementVisitor {
                     other => {
                         return Err(KernelError::generic(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
-                        )))
+                        ))
+                        .into())
                     }
                 }
             }
@@ -914,7 +915,8 @@ fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
     if slot.replace(value).is_some() {
         return Err(KernelError::generic(format!(
             "duplicate `{name}` element in checkpoint action"
-        )));
+        ))
+        .into());
     }
     Ok(())
 }

@@ -285,7 +285,8 @@ impl Transaction {
         if self.is_create_table() {
             return Err(KernelError::generic(
                 "Deletion vector operations require an existing table",
-            ));
+            )
+            .into());
         }
         self.ensure_deletion_vectors_enabled()?;
 
@@ -333,7 +334,8 @@ impl Transaction {
                 "Number of matched DV files does not match number of new DV descriptors: {} != {}",
                 matched_dv_files,
                 new_dv_descriptors.len()
-            )));
+            ))
+            .into());
         }
 
         self.dv_matched_files.extend(matched_files);
@@ -352,7 +354,8 @@ impl Transaction {
                 "Deletion vector writes require reader version 3, writer version 7, the \
                  'deletionVectors' feature in both reader and writer features, and the \
                  `delta.enableDeletionVectors` table property set to `true`",
-            ));
+            )
+            .into());
         }
         Ok(())
     }
@@ -475,7 +478,8 @@ impl<S> Transaction<S> {
         if self.is_create_table() && !self.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
                 "CREATE TABLE transaction cannot have DV update actions",
-            ));
+            )
+            .into());
         }
 
         // The rewritten stats are for the add action only, so they are dropped here.
@@ -666,7 +670,8 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     return Err(KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
                          or it is not a non-negative integer"
-                    )));
+                    ))
+                    .into());
                 }
 
                 // Widen tightBounds to false (unless already false) instead of recomputing the

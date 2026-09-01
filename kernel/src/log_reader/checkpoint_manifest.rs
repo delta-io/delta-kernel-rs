@@ -60,7 +60,8 @@ impl CheckpointManifestReader {
             extension => {
                 return Err(KernelError::generic(format!(
                     "Unsupported checkpoint extension: {extension}",
-                )));
+                ))
+                .into());
             }
         };
 

@@ -52,7 +52,7 @@ impl Validation for AddFileRequiredFields {
             .get_opt(row, "path")?
             .ok_or_else(|| KernelError::missing_data("AddFile is missing required field 'path'"))?;
         if path.is_empty() {
-            return Err(KernelError::generic("AddFile path must not be empty"));
+            return Err(KernelError::generic("AddFile path must not be empty").into());
         }
 
         let partition_values = validate_required_field_exist(
@@ -69,7 +69,8 @@ impl Validation for AddFileRequiredFields {
         if size < 0 {
             return Err(KernelError::generic(format!(
                 "AddFile for '{path}' has negative size {size}; size must be non-negative"
-            )));
+            ))
+            .into());
         }
         validate_required_field_exist::<i64>(
             getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?,
@@ -282,7 +283,7 @@ mod tests {
         let error = add_file_validator(physical_partition_columns)
             .validate(&adds)
             .expect_err("invalid partition values should be rejected");
-        let KernelError::InvalidPartitionValues(message) = error else {
+        let crate::Error::Kernel(KernelError::InvalidPartitionValues(message)) = error else {
             panic!("expected InvalidPartitionValues, got {error:?}");
         };
         assert!(

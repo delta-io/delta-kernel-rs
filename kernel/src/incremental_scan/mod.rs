@@ -288,7 +288,8 @@ impl IncrementalScanStream {
         if self.errored {
             return Err(KernelError::generic(
                 "IncrementalScanStream: cannot finish a stream that previously errored",
-            ));
+            )
+            .into());
         }
         // Drain anything the consumer didn't pull. `self.next()` propagates errors via
         // `Some(Err(_))` and sets `errored`; the `?` below surfaces them.

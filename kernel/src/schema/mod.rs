@@ -367,7 +367,7 @@ impl MetadataColumnSpec {
 }
 
 impl FromStr for MetadataColumnSpec {
-    type Err = KernelError;
+    type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -375,9 +375,7 @@ impl FromStr for MetadataColumnSpec {
             "row_id" => Ok(Self::RowId),
             "row_commit_version" => Ok(Self::RowCommitVersion),
             "_file" => Ok(Self::FilePath),
-            _ => Err(KernelError::Schema(format!(
-                "Unknown metadata column spec: {s}"
-            ))),
+            _ => Err(KernelError::Schema(format!("Unknown metadata column spec: {s}")).into()),
         }
     }
 }
@@ -557,7 +555,8 @@ impl StructField {
                     "Field '{}' has a non-string `{}` annotation: {other}",
                     self.name,
                     ColumnMetadataKey::CurrentDefault.as_ref(),
-                )))
+                ))
+                .into())
             }
         };
         ColumnDefault::new(raw_sql, &self.data_type).map(Some)
@@ -598,7 +597,8 @@ impl StructField {
                     "Field '{}' has a non-numeric `{}` annotation",
                     self.name,
                     ColumnMetadataKey::ColumnMappingId.as_ref(),
-                )));
+                ))
+                .into());
             }
         };
         let physical_name =
@@ -608,7 +608,8 @@ impl StructField {
                         "Field '{}' has an empty `{}` annotation",
                         self.name,
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    )));
+                    ))
+                    .into());
                 }
                 Some(MetadataValue::String(s)) => Some(s.as_str()),
                 None => None,
@@ -617,7 +618,8 @@ impl StructField {
                         "Field '{}' has a non-string `{}` annotation",
                         self.name,
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    )));
+                    ))
+                    .into());
                 }
             };
         Ok(ExistingColumnMappingAnnotations { id, physical_name })
@@ -919,7 +921,8 @@ impl StructType {
                 if metadata_columns.insert(metadata_column_spec, i).is_some() {
                     return Err(KernelError::schema(format!(
                         "Duplicate metadata column: {metadata_column_spec:?}",
-                    )));
+                    ))
+                    .into());
                 }
             }
 
@@ -930,7 +933,8 @@ impl StructType {
                 return Err(KernelError::schema(format!(
                     "Duplicate field name (case-insensitive): '{}'",
                     field.name
-                )));
+                ))
+                .into());
             }
 
             field_map.insert(field.name.clone(), field);
@@ -1050,7 +1054,9 @@ impl StructType {
     pub fn field_at<'a>(&'a self, col: &ColumnName) -> DeltaResult<&'a StructField> {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
-        field.ok_or_else(|| KernelError::generic("Empty path"))
+        field
+            .ok_or_else(|| KernelError::generic("Empty path"))
+            .map_err(crate::Error::from)
     }
 
     /// Checks whether this schema contains the field at the given column path.
@@ -1105,7 +1111,7 @@ impl StructType {
     {
         let path = col.path();
         if path.is_empty() {
-            return Err(KernelError::generic("Column path cannot be empty"));
+            return Err(KernelError::generic("Column path cannot be empty").into());
         }
         let mut current_struct = self;
         for (i, field_name) in path.iter().enumerate() {
@@ -1120,7 +1126,8 @@ impl StructType {
                     return Err(KernelError::generic(format!(
                         "Cannot resolve column '{col}': intermediate field '{field_name}' \
                          is not a struct type"
-                    )));
+                    ))
+                    .into());
                 };
                 current_struct = inner;
             }
@@ -1297,7 +1304,8 @@ impl StructType {
         if field.is_metadata_column() {
             return Err(KernelError::schema(
                 "Metadata columns are only allowed at the top level of a schema".to_string(),
-            ));
+            )
+            .into());
         }
 
         match &field.data_type {
@@ -1432,7 +1440,7 @@ impl<'a> IntoIterator for &'a StructType {
 /// # Examples
 ///
 /// ```
-/// # use delta_kernel::KernelError;
+/// # use delta_kernel::Error;
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
@@ -1445,7 +1453,7 @@ impl<'a> IntoIterator for &'a StructType {
 /// for field in struct_type {
 ///     println!("Field: {} ({})", field.name(), field.data_type());
 /// }
-/// # Ok::<(), KernelError>(())
+/// # Ok::<(), Error>(())
 /// ```
 ///
 /// [`IndexMap`]: indexmap::IndexMap
@@ -1505,7 +1513,7 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// # Examples
 ///
 /// ```
-/// # use delta_kernel::KernelError;
+/// # use delta_kernel::Error;
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
@@ -1526,7 +1534,7 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// for field in struct_type.fields() {
 ///     println!("Field type: {}", field.data_type());
 /// }
-/// # Ok::<(), KernelError>(())
+/// # Ok::<(), Error>(())
 /// ```
 ///
 /// [`StructType::fields()`]: StructType::fields
@@ -1817,7 +1825,8 @@ fn validate_crs(crs: &str) -> DeltaResult<()> {
     let [authority, code] = crs.split(':').collect::<Vec<_>>()[..] else {
         return Err(KernelError::invalid_geo_params(format!(
             "CRS '{crs}' must be in 'AUTHORITY:CODE' format"
-        )));
+        ))
+        .into());
     };
 
     require!(
@@ -4362,8 +4371,8 @@ mod tests {
         let field = StructField::create_metadata_column("test_row_id", MetadataColumnSpec::RowId);
 
         // Test that serialization works
-        let json = serde_json::to_string(&field)?;
-        let deserialized: StructField = serde_json::from_str(&json)?;
+        let json = serde_json::to_string(&field).map_err(KernelError::from)?;
+        let deserialized: StructField = serde_json::from_str(&json).map_err(KernelError::from)?;
 
         assert_eq!(deserialized.name(), field.name());
         assert_eq!(deserialized.data_type(), field.data_type());

@@ -429,7 +429,7 @@ pub(crate) fn timestamp_to_version(
                 HistoryCommitType::Recreatable,
             )
             .map_err(|e| match e {
-                DeltaError::LogHistory(inner) => *inner,
+                crate::Error::Kernel(DeltaError::LogHistory(inner)) => *inner,
                 _ => LogHistoryError::internal("failed to get earliest commit", e),
             })?;
             let limit = snapshot
@@ -541,7 +541,8 @@ pub fn latest_version_as_of(
         Bound::GreatestLower,
         resolved_commit_type,
     )
-    .map_err(Into::into)
+    .map_err(DeltaError::from)
+    .map_err(crate::Error::from)
 }
 
 /// Gets the first [`CommitAt`] (version and timestamp) with a timestamp at or after `timestamp`.
@@ -582,7 +583,8 @@ pub fn first_version_after(
         Bound::LeastUpper,
         resolved_commit_type,
     )
-    .map_err(Into::into)
+    .map_err(DeltaError::from)
+    .map_err(crate::Error::from)
 }
 
 /// Converts a timestamp range to a corresponding version range.
@@ -639,11 +641,10 @@ pub fn timestamp_range_to_versions(
         // The `start_timestamp` must be no greater than the `end_timestamp`.
         require!(
             start_timestamp <= end_timestamp,
-            LogHistoryError::InvalidTimestampRange {
+            DeltaError::from(LogHistoryError::InvalidTimestampRange {
                 start_timestamp,
                 end_timestamp
-            }
-            .into()
+            })
         );
     }
 
@@ -663,7 +664,7 @@ pub fn timestamp_range_to_versions(
 
     // If the end timestamp is present, convert it to an end version
     let end_version = end_timestamp
-        .map(|end| {
+        .map(|end| -> DeltaResult<_> {
             let end_version =
                 latest_version_as_of(snapshot, engine, end, HistoryCommitType::Published)?.version;
 
@@ -741,6 +742,7 @@ fn get_earliest_published_commit_version(
             log_root: log_root.clone(),
         })
     })
+    .map_err(crate::Error::from)
 }
 
 /// Returns the earliest table version that can be fully reconstructed, and from which we can replay
@@ -837,18 +839,21 @@ fn get_earliest_recreatable_commit(
         // Commits exist, but none is anchored by commit 0 or a complete checkpoint.
         return Err(DeltaError::from(LogHistoryError::NoRecreatableCommit {
             log_root: log_root.clone(),
-        }));
+        })
+        .into());
     }
     if earliest_ratified_commit_version == Some(0) {
         // Broken CCv2 invariant: the catalog ratified commit 0, but no published commit exists.
         return Err(DeltaError::generic(format!(
             "expected a published v0 commit for catalog-managed table {log_root}, \
              but the log listing returned no commits"
-        )));
+        ))
+        .into());
     }
     Err(DeltaError::from(LogHistoryError::NoCommitsFound {
         log_root: log_root.clone(),
-    }))
+    })
+    .into())
 }
 
 /// Selects which commit the [`get_earliest_commit`] query returns.
@@ -1637,7 +1642,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(crate::KernelError::LogHistory(ref e))
+                Err(crate::Error::Kernel(crate::KernelError::LogHistory(ref e)))
                     if matches!(**e, LogHistoryError::InvalidTimestampRange { .. })
             ),
             "{res:?}"
@@ -1664,7 +1669,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(crate::KernelError::LogHistory(ref e))
+                Err(crate::Error::Kernel(crate::KernelError::LogHistory(ref e)))
                     if matches!(**e, LogHistoryError::EmptyTimestampRange { between_version: 0, .. })
             ),
             "{res:?}"
@@ -2204,15 +2209,18 @@ mod tests {
         match expected {
             Expected::Version(v) => assert_eq!(res.unwrap(), v),
             Expected::NoCommitsFound => assert!(
-                matches!(&res, Err(DeltaError::LogHistory(e)) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
+                matches!(&res, Err(crate::Error::Kernel(DeltaError::LogHistory(e))) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
                 "expected NoCommitsFound error, got {res:?}"
             ),
             Expected::NoRecreatableCommit => assert!(
-                matches!(&res, Err(DeltaError::LogHistory(e)) if matches!(**e, LogHistoryError::NoRecreatableCommit { .. })),
+                matches!(&res, Err(crate::Error::Kernel(DeltaError::LogHistory(e))) if matches!(**e, LogHistoryError::NoRecreatableCommit { .. })),
                 "expected NoRecreatableCommit error, got {res:?}"
             ),
             Expected::CCv2MissingV0FilesystemCommit => {
-                assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
+                assert!(
+                    matches!(res, Err(crate::Error::Kernel(DeltaError::Generic(_)))),
+                    "{res:?}"
+                )
             }
         }
     }
@@ -2279,11 +2287,14 @@ mod tests {
         match expected {
             Expected::Version(v) => assert_eq!(res.unwrap(), v),
             Expected::NoCommitsFound => assert!(
-                matches!(res, Err(DeltaError::LogHistory(ref e)) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
+                matches!(res, Err(crate::Error::Kernel(DeltaError::LogHistory(ref e))) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
                 "{res:?}"
             ),
             Expected::CCv2MissingV0FilesystemCommit => {
-                assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
+                assert!(
+                    matches!(res, Err(crate::Error::Kernel(DeltaError::Generic(_)))),
+                    "{res:?}"
+                )
             }
             Expected::NoRecreatableCommit => {
                 unreachable!(

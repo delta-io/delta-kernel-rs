@@ -100,12 +100,18 @@ pub(crate) fn extract_column_ref<'a>(
     let mut field_names = col.iter();
     let mut field_name = match field_names.next() {
         Some(name) => name.as_ref(),
-        None => return Err(ArrowError::SchemaError("Empty column path".to_string()))?,
+        None => {
+            return Err(crate::KernelError::from(ArrowError::SchemaError(
+                "Empty column path".to_string(),
+            ))
+            .into())
+        }
     };
     loop {
         let child = parent
             .column_by_name(field_name)
-            .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {field_name}")))?;
+            .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {field_name}")))
+            .map_err(crate::KernelError::from)?;
         field_name = match field_names.next() {
             Some(name) => name.as_ref(),
             None => return Ok(child),
@@ -113,7 +119,8 @@ pub(crate) fn extract_column_ref<'a>(
         parent = child
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| ArrowError::SchemaError(format!("Not a struct: {field_name}")))?;
+            .ok_or_else(|| ArrowError::SchemaError(format!("Not a struct: {field_name}")))
+            .map_err(crate::KernelError::from)?;
     }
 }
 
@@ -129,7 +136,8 @@ fn evaluate_struct_expression(
             "Struct expression field count mismatch: {} fields in expression but {} in schema",
             fields.len(),
             output_schema.num_fields()
-        )));
+        ))
+        .into());
     }
 
     let output_cols: Vec<ArrayRef> = fields
@@ -166,7 +174,8 @@ fn evaluate_struct_expression(
     } else {
         None
     };
-    let data = StructArray::try_new(output_fields.into(), output_cols, null_buffer)?;
+    let data = StructArray::try_new(output_fields.into(), output_cols, null_buffer)
+        .map_err(crate::KernelError::from)?;
     Ok(Arc::new(data))
 }
 
@@ -237,7 +246,8 @@ fn evaluate_struct_patch_expression(
     if used_field_patches < required_count {
         return Err(KernelError::generic(
             "Some non-optional field patches reference invalid input field names",
-        ));
+        )
+        .into());
     }
 
     // Handle appends (insertions after all input fields and field-specific insertions)
@@ -247,7 +257,7 @@ fn evaluate_struct_patch_expression(
 
     // Verify we consumed all output schema fields
     if output_schema_iter.next().is_some() {
-        return Err(KernelError::generic("Too many fields in output schema"));
+        return Err(KernelError::generic("Too many fields in output schema").into());
     }
 
     // Build the final struct, preserving null bitmap for nested patches
@@ -270,7 +280,8 @@ fn evaluate_struct_patch_expression(
             .and_then(|s| s.nulls().cloned())
     });
 
-    let data = StructArray::try_new(output_fields.into(), output_cols, source_null_buffer)?;
+    let data = StructArray::try_new(output_fields.into(), output_cols, source_null_buffer)
+        .map_err(crate::KernelError::from)?;
     Ok(Arc::new(data))
 }
 
@@ -294,28 +305,32 @@ pub fn evaluate_expression(
         }
         (Struct(..), dt) => Err(KernelError::Generic(format!(
             "Struct expression expects a DataType::Struct result, but got {dt:?}"
-        ))),
+        ))
+        .into()),
         (StructPatch(patch), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_patch_expression(patch, batch, output_schema)
         }
         (StructPatch(_), _) => Err(KernelError::generic(
             "Data type is required to evaluate struct patch expressions",
-        )),
+        )
+        .into()),
         (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
             let result = evaluate_predicate(pred, batch, false)?;
             Ok(Arc::new(result))
         }
         (Predicate(_), Some(data_type)) => Err(KernelError::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
-        ))),
+        ))
+        .into()),
         (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
             None | Some(&DataType::STRING) => {
                 let input = evaluate_expression(expr, batch, None)?;
-                Ok(to_json(&input)?)
+                Ok(to_json(&input).map_err(crate::KernelError::from)?)
             }
             Some(data_type) => Err(KernelError::generic(format!(
                 "ToJson operator requires STRING output, but got {data_type:?}"
-            ))),
+            ))
+            .into()),
         },
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
@@ -329,7 +344,10 @@ pub fn evaluate_expression(
                 Divide => div,
             };
 
-            validate_array_type(eval(&left_arr, &right_arr)?, result_type)
+            validate_array_type(
+                eval(&left_arr, &right_arr).map_err(crate::KernelError::from)?,
+                result_type,
+            )
         }
         (
             Variadic(VariadicExpression {
@@ -352,7 +370,7 @@ pub fn evaluate_expression(
             }
 
             // Coalesce accumulated arrays
-            Ok(coalesce_arrays(&arrays, result_type)?)
+            Ok(coalesce_arrays(&arrays, result_type).map_err(crate::KernelError::from)?)
         }
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
             evaluate_array_expression(exprs, batch, result_type)
@@ -365,7 +383,8 @@ pub fn evaluate_expression(
                 Some(op) => op.eval_expr(exprs, batch, result_type),
                 None => Err(KernelError::unsupported(format!(
                     "Unsupported opaque expression: {op:?}"
-                ))),
+                ))
+                .into()),
             }
         }
         (ParseJson(p), _) => {
@@ -381,7 +400,8 @@ pub fn evaluate_expression(
                         "Failed to parse JSON stats as {}: {e}. Using null stats.",
                         p.output_schema,
                     );
-                    let arrow_schema = ArrowSchema::try_from_kernel(p.output_schema.as_ref())?;
+                    let arrow_schema = ArrowSchema::try_from_kernel(p.output_schema.as_ref())
+                        .map_err(crate::KernelError::from)?;
                     Ok(new_null_array(
                         &ArrowDataType::Struct(arrow_schema.fields().clone()),
                         json_arr.len(),
@@ -396,22 +416,24 @@ pub fn evaluate_expression(
         }
         (MapToStruct(_), dt) => Err(KernelError::Generic(format!(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
-        ))),
+        ))
+        .into()),
         (Cast(c), result_type) => {
             let input = evaluate_expression(&c.expr, batch, None)?;
-            let target = ArrowDataType::try_from_kernel(&c.target)?;
+            let target =
+                ArrowDataType::try_from_kernel(&c.target).map_err(crate::KernelError::from)?;
             // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
             // that to an all-NULL column so an unsupported cast keeps the file.
             let output = if can_cast_types(input.data_type(), &target) {
-                cast(&input, &target)?
+                cast(&input, &target).map_err(crate::KernelError::from)?
             } else {
                 new_null_array(&target, input.len())
             };
             validate_array_type(output, result_type)
         }
-        (Unknown(name), _) => Err(KernelError::unsupported(format!(
-            "Unknown expression: {name:?}"
-        ))),
+        (Unknown(name), _) => {
+            Err(KernelError::unsupported(format!("Unknown expression: {name:?}")).into())
+        }
     }
 }
 
@@ -439,7 +461,8 @@ fn evaluate_array_expression(
         Some(other) => {
             return Err(KernelError::generic(format!(
                 "Array expression requires a DataType::Array result type, but got {other:?}"
-            )));
+            ))
+            .into());
         }
         None => None,
     };
@@ -465,14 +488,16 @@ fn evaluate_array_expression(
                 "Array expression inputs must share the same element type; input 0 evaluates \
                  to {element_type:?} but input {i} evaluates to {:?}",
                 arr.data_type()
-            )));
+            ))
+            .into());
         }
         if !contains_null && arr.null_count() > 0 {
             return Err(KernelError::generic(format!(
                 "Array expression declares non-nullable elements (result_type contains_null \
                  is false) but input {i} contains {} null value(s)",
                 arr.null_count()
-            )));
+            ))
+            .into());
         }
     }
 
@@ -509,7 +534,8 @@ fn evaluate_array_expression(
         element_type,
         contains_null,
     ));
-    let list = ListArray::try_new(field, offsets, values, None)?;
+    let list =
+        ListArray::try_new(field, offsets, values, None).map_err(crate::KernelError::from)?;
     // Validate the assembled array's element type against the caller-declared result type,
     // consistent with the other expression arms. (Element nullability is enforced above, since
     // `validate_array_type` runs in TypesAndNames mode where nullability checks are a no-op.)
@@ -577,10 +603,11 @@ fn cast_list_elements(
         (dt, _) => {
             return Err(KernelError::generic(format!(
                 "cast_list_elements: expected a list type, got {dt:?}"
-            )))
+            ))
+            .into())
         }
     };
-    Ok(cast(vals, &container)?)
+    Ok(cast(vals, &container).map_err(crate::KernelError::from)?)
 }
 
 /// This function converts ArrowView types to their non-view type equivalents. This is used for
@@ -594,8 +621,12 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn A
         ArrowDataType::LargeListView(field) => {
             cast_list_elements(&vals, field, ViewCast::ToNonView)
         }
-        ArrowDataType::Utf8View => Ok(cast(&vals, &ArrowDataType::Utf8)?),
-        ArrowDataType::BinaryView => Ok(cast(&vals, &ArrowDataType::Binary)?),
+        ArrowDataType::Utf8View => {
+            Ok(cast(&vals, &ArrowDataType::Utf8).map_err(crate::KernelError::from)?)
+        }
+        ArrowDataType::BinaryView => {
+            Ok(cast(&vals, &ArrowDataType::Binary).map_err(crate::KernelError::from)?)
+        }
         _ => Ok(vals),
     }
 }
@@ -610,10 +641,10 @@ fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array
         ArrowDataType::ListView(field) => cast_list_elements(&vals, field, ViewCast::ToView),
         ArrowDataType::LargeListView(field) => cast_list_elements(&vals, field, ViewCast::ToView),
         ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
-            Ok(cast(&vals, &ArrowDataType::Utf8View)?)
+            Ok(cast(&vals, &ArrowDataType::Utf8View).map_err(crate::KernelError::from)?)
         }
         ArrowDataType::Binary | ArrowDataType::LargeBinary => {
-            Ok(cast(&vals, &ArrowDataType::BinaryView)?)
+            Ok(cast(&vals, &ArrowDataType::BinaryView).map_err(crate::KernelError::from)?)
         }
         _ => Ok(vals),
     }
@@ -641,8 +672,10 @@ pub fn evaluate_predicate(
             // instances are still cheaply clonable.
             let arr = evaluate_expression(expr, batch, Some(&DataType::BOOLEAN))?;
             match arr.as_any().downcast_ref::<BooleanArray>() {
-                Some(arr) => Ok(maybe_inverted(Cow::Borrowed(arr))?),
-                None => Err(KernelError::generic("expected boolean array")),
+                Some(arr) => {
+                    Ok(maybe_inverted(Cow::Borrowed(arr)).map_err(crate::KernelError::from)?)
+                }
+                None => Err(KernelError::generic("expected boolean array").into()),
             }
         }
         Not(pred) => evaluate_predicate(pred, batch, !inverted),
@@ -652,7 +685,7 @@ pub fn evaluate_predicate(
                 (UnaryPredicateOp::IsNull, false) => is_null,
                 (UnaryPredicateOp::IsNull, true) => is_not_null,
             };
-            Ok(eval_op_fn(&arr)?)
+            Ok(eval_op_fn(&arr).map_err(crate::KernelError::from)?)
         }
         Binary(BinaryPredicate { op, left, right }) => {
             let (left, right) = (left.as_ref(), right.as_ref());
@@ -660,67 +693,72 @@ pub fn evaluate_predicate(
             // IN is different from all the others, and also quite complex, so factor it out.
             //
             // TODO: Factor out as a stand-alone function instead of a closure?
-            let eval_in = || match (left, right) {
-                (Expression::Literal(_), Expression::Column(_)) => {
-                    let left = evaluate_expression(left, batch, None)?;
-                    let left = arrow_convert_to_non_view_type(left)?;
+            let eval_in = || -> DeltaResult<BooleanArray> {
+                match (left, right) {
+                    (Expression::Literal(_), Expression::Column(_)) => {
+                        let left = evaluate_expression(left, batch, None)?;
+                        let left = arrow_convert_to_non_view_type(left)?;
 
-                    let right = evaluate_expression(right, batch, None)?;
-                    let right = arrow_convert_to_non_view_type(right)?;
-                    if let Some(string_arr) = left.as_string_opt::<i32>() {
-                        if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            if list_arr.value_type() == ArrowDataType::Utf8 {
-                                let result = in_list_utf8(string_arr, list_arr)?;
-                                return Ok(result);
+                        let right = evaluate_expression(right, batch, None)?;
+                        let right = arrow_convert_to_non_view_type(right)?;
+                        if let Some(string_arr) = left.as_string_opt::<i32>() {
+                            if let Some(list_arr) = right.as_list_opt::<i32>() {
+                                if list_arr.value_type() == ArrowDataType::Utf8 {
+                                    let result = in_list_utf8(string_arr, list_arr)
+                                        .map_err(crate::KernelError::from)?;
+                                    return Ok(result);
+                                }
                             }
                         }
-                    }
 
-                    use ArrowDataType::*;
-                    prim_array_cmp! {
-                        left, right,
-                        (Int8, Int8Type),
-                        (Int16, Int16Type),
-                        (Int32, Int32Type),
-                        (Int64, Int64Type),
-                        (UInt8, UInt8Type),
-                        (UInt16, UInt16Type),
-                        (UInt32, UInt32Type),
-                        (UInt64, UInt64Type),
-                        (Float16, Float16Type),
-                        (Float32, Float32Type),
-                        (Float64, Float64Type),
-                        (Timestamp(TimeUnit::Second, _), TimestampSecondType),
-                        (Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
-                        (Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
-                        (Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
-                        (Date32, Date32Type),
-                        (Date64, Date64Type),
-                        (Time32(TimeUnit::Second), Time32SecondType),
-                        (Time32(TimeUnit::Millisecond), Time32MillisecondType),
-                        (Time64(TimeUnit::Microsecond), Time64MicrosecondType),
-                        (Time64(TimeUnit::Nanosecond), Time64NanosecondType),
-                        (Duration(TimeUnit::Second), DurationSecondType),
-                        (Duration(TimeUnit::Millisecond), DurationMillisecondType),
-                        (Duration(TimeUnit::Microsecond), DurationMicrosecondType),
-                        (Duration(TimeUnit::Nanosecond), DurationNanosecondType),
-                        (Interval(IntervalUnit::DayTime), IntervalDayTimeType),
-                        (Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
-                        (Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
-                        (Decimal128(_, _), Decimal128Type),
-                        (Decimal256(_, _), Decimal256Type)
+                        use ArrowDataType::*;
+                        prim_array_cmp! {
+                            left, right,
+                            (Int8, Int8Type),
+                            (Int16, Int16Type),
+                            (Int32, Int32Type),
+                            (Int64, Int64Type),
+                            (UInt8, UInt8Type),
+                            (UInt16, UInt16Type),
+                            (UInt32, UInt32Type),
+                            (UInt64, UInt64Type),
+                            (Float16, Float16Type),
+                            (Float32, Float32Type),
+                            (Float64, Float64Type),
+                            (Timestamp(TimeUnit::Second, _), TimestampSecondType),
+                            (Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
+                            (Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
+                            (Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
+                            (Date32, Date32Type),
+                            (Date64, Date64Type),
+                            (Time32(TimeUnit::Second), Time32SecondType),
+                            (Time32(TimeUnit::Millisecond), Time32MillisecondType),
+                            (Time64(TimeUnit::Microsecond), Time64MicrosecondType),
+                            (Time64(TimeUnit::Nanosecond), Time64NanosecondType),
+                            (Duration(TimeUnit::Second), DurationSecondType),
+                            (Duration(TimeUnit::Millisecond), DurationMillisecondType),
+                            (Duration(TimeUnit::Microsecond), DurationMicrosecondType),
+                            (Duration(TimeUnit::Nanosecond), DurationNanosecondType),
+                            (Interval(IntervalUnit::DayTime), IntervalDayTimeType),
+                            (Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
+                            (Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
+                            (Decimal128(_, _), Decimal128Type),
+                            (Decimal256(_, _), Decimal256Type)
+                        }
                     }
+                    (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
+                        // Logical (SQL) equality, so a NULL never matches another NULL. Struct,
+                        // array, and map elements/needles are unsupported:
+                        // `logical_eq` returns `false` for them, so they
+                        // never match, not even a structurally identical value.
+                        let exists = ad.array_elements().iter().any(|e| lit.logical_eq(e));
+                        Ok(BooleanArray::from(vec![exists]))
+                    }
+                    (l, r) => Err(KernelError::invalid_expression(format!(
+                        "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
+                    ))
+                    .into()),
                 }
-                (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
-                    // Logical (SQL) equality, so a NULL never matches another NULL. Struct, array,
-                    // and map elements/needles are unsupported: `logical_eq` returns `false` for
-                    // them, so they never match, not even a structurally identical value.
-                    let exists = ad.array_elements().iter().any(|e| lit.logical_eq(e));
-                    Ok(BooleanArray::from(vec![exists]))
-                }
-                (l, r) => Err(KernelError::invalid_expression(format!(
-                    "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
-                ))),
             };
 
             let eval_fn = match (op, inverted) {
@@ -732,7 +770,11 @@ pub fn evaluate_predicate(
                 (Equal, true) => neq,
                 (Distinct, false) => distinct,
                 (Distinct, true) => not_distinct,
-                (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
+                (In, _) => {
+                    return Ok(
+                        maybe_inverted(Cow::Owned(eval_in()?)).map_err(crate::KernelError::from)?
+                    )
+                }
             };
 
             let left = evaluate_expression(left, batch, None)?;
@@ -750,7 +792,7 @@ pub fn evaluate_predicate(
                     arrow_convert_to_view_type(right)?,
                 )
             };
-            Ok(eval_fn(&left, &right)?)
+            Ok(eval_fn(&left, &right).map_err(crate::KernelError::from)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
             // Leverage de Morgan's laws (invert the children and swap the operator):
@@ -768,7 +810,7 @@ pub fn evaluate_predicate(
             preds
                 .iter()
                 .map(|pred| evaluate_predicate(pred, batch, inverted))
-                .reduce(|l, r| Ok(reducer(&l?, &r?)?))
+                .reduce(|l, r| Ok(reducer(&l?, &r?).map_err(crate::KernelError::from)?))
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
         Opaque(OpaquePredicate { op, exprs }) => {
@@ -776,12 +818,13 @@ pub fn evaluate_predicate(
                 Some(op) => op.eval_pred(exprs, batch, inverted),
                 None => Err(KernelError::unsupported(format!(
                     "Unsupported opaque predicate: {op:?}"
-                ))),
+                ))
+                .into()),
             }
         }
-        Unknown(name) => Err(KernelError::unsupported(format!(
-            "Unknown predicate: {name:?}"
-        ))),
+        Unknown(name) => {
+            Err(KernelError::unsupported(format!("Unknown predicate: {name:?}")).into())
+        }
     }
 }
 
@@ -1028,11 +1071,13 @@ fn evaluate_map_to_struct(
             other => {
                 return Err(KernelError::generic(format!(
                     "MapToStruct only supports primitive target types, got {other:?}"
-                )));
+                ))
+                .into());
             }
         };
         target_types.push(prim);
-        let arrow_type = ArrowDataType::try_from_kernel(field.data_type())?;
+        let arrow_type =
+            ArrowDataType::try_from_kernel(field.data_type()).map_err(crate::KernelError::from)?;
         builders.push(arrow_array::make_builder(&arrow_type, num_rows));
     }
 
@@ -1093,7 +1138,8 @@ fn evaluate_map_to_struct(
     let arrow_fields: Vec<ArrowField> = fields
         .iter()
         .map(|f| ArrowField::try_from_kernel(*f))
-        .try_collect()?;
+        .try_collect()
+        .map_err(crate::KernelError::from)?;
 
     // Propagate the input map's null bitmap to the output struct. This is critical:
     // when a map row is null, the loop above appends null to every child builder
@@ -1111,7 +1157,8 @@ fn evaluate_map_to_struct(
         arrow_fields.into(),
         output_columns,
         map_array.nulls().cloned(),
-    )?)
+    )
+    .map_err(crate::KernelError::from)?)
 }
 
 fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaResult<ArrayRef> {

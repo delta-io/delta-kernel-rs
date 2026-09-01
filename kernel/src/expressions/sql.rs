@@ -42,7 +42,7 @@ mod token;
 pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expression> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
-        return Err(KernelError::generic("empty SQL literal"));
+        return Err(KernelError::generic("empty SQL literal").into());
     }
     // NULL is valid for any data type, including non-primitive ones.
     if trimmed.eq_ignore_ascii_case("null") {
@@ -63,7 +63,8 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
     let DataType::Primitive(primitive) = data_type else {
         return Err(KernelError::generic(format!(
             "SQL literal parsing only supports primitive types, got {data_type:?}"
-        )));
+        ))
+        .into());
     };
     let scalar = match primitive {
         PrimitiveType::Binary => parse_binary_literal(trimmed)?,
@@ -100,7 +101,9 @@ fn parse_binary_literal(trimmed: &str) -> DeltaResult<Scalar> {
 /// `DATE` keyword is optional and may have 0 or more whitespace before the apostrophe.
 fn parse_date_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> {
     let raw = unwrap_quoted_body(trimmed, &["DATE"], &PrimitiveType::Date, sql)?;
-    PrimitiveType::Date.parse_scalar(&raw)
+    PrimitiveType::Date
+        .parse_scalar(&raw)
+        .map_err(crate::Error::from)
 }
 
 /// Parse a zoneless (wall-clock) `Scalar::TimestampNtz` from a trimmed string.
@@ -116,7 +119,9 @@ fn parse_timestamp_ntz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> 
         &PrimitiveType::TimestampNtz,
         sql,
     )?;
-    PrimitiveType::TimestampNtz.parse_scalar(&raw)
+    PrimitiveType::TimestampNtz
+        .parse_scalar(&raw)
+        .map_err(crate::Error::from)
 }
 
 /// Parse a `Scalar::Timestamp` (local-time-zone) from a trimmed string in ISO 8601 / RFC 3339 form
@@ -135,7 +140,9 @@ fn parse_timestamp_ltz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> 
         sql,
     )?;
     require_utc_z_suffix(&raw, sql)?;
-    PrimitiveType::Timestamp.parse_scalar(&raw)
+    PrimitiveType::Timestamp
+        .parse_scalar(&raw)
+        .map_err(crate::Error::from)
 }
 
 /// Strip the typed-literal keyword prefix, if any, and return the inner literal value, unquoted and
@@ -154,9 +161,7 @@ fn unwrap_quoted_body(
     // Trim the inner body to match Spark's `stringToDate`/ `stringToTimestamp`.
     let body = body.trim();
     if body.is_empty() {
-        return Err(KernelError::generic(format!(
-            "empty {primitive:?} literal: {sql}"
-        )));
+        return Err(KernelError::generic(format!("empty {primitive:?} literal: {sql}")).into());
     }
     Ok(body.to_string())
 }
@@ -170,9 +175,9 @@ fn unwrap_quoted_body(
 /// - numeric offsets (e.g. `+05:00`, even `+00:00`), which `parse_scalar` silently drops as UTC.
 fn require_utc_z_suffix(raw: &str, sql: &str) -> DeltaResult<()> {
     if raw.contains(['t', 'z']) {
-        return Err(KernelError::generic(
-            "TIMESTAMP literal must use uppercase 'T' and or 'Z'",
-        ));
+        return Err(
+            KernelError::generic("TIMESTAMP literal must use uppercase 'T' and or 'Z'").into(),
+        );
     }
     if raw.ends_with('Z') {
         return Ok(());
@@ -185,10 +190,12 @@ fn require_utc_z_suffix(raw: &str, sql: &str) -> DeltaResult<()> {
         KernelError::generic(format!(
             "TIMESTAMP literal with an explicit offset is not yet supported; use 'Z' (UTC): {sql}"
         ))
+        .into()
     } else {
         KernelError::generic(
             "zoneless TIMESTAMP literal is not yet supported; use an explicit 'Z' (UTC) suffix",
         )
+        .into()
     })
 }
 
@@ -203,7 +210,8 @@ fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> Del
     if !has_exponent && exceeds_decimal_precision(raw) {
         return Err(KernelError::generic(format!(
             "numeric literal exceeds maximum DECIMAL precision 38: {sql}"
-        )));
+        ))
+        .into());
     }
     let scalar = if *primitive == PrimitiveType::Float && has_exponent {
         // f64 parse + `as f32` is the identical operation to Spark's Double.parseDouble + (float):
@@ -220,8 +228,8 @@ fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> Del
     let normalize_neg_zero = !has_exponent;
     let non_finite_error = || KernelError::generic("non-finite float literals are not supported");
     Ok(match scalar {
-        Scalar::Float(f) if !f.is_finite() => return Err(non_finite_error()),
-        Scalar::Double(d) if !d.is_finite() => return Err(non_finite_error()),
+        Scalar::Float(f) if !f.is_finite() => return Err(non_finite_error().into()),
+        Scalar::Double(d) if !d.is_finite() => return Err(non_finite_error().into()),
         Scalar::Float(f) if normalize_neg_zero => Scalar::Float(f + 0.0),
         Scalar::Double(d) if normalize_neg_zero => Scalar::Double(d + 0.0),
         other => other,
@@ -267,7 +275,8 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
         if c == '\\' {
             return Err(KernelError::generic(format!(
                 "backslash escapes in SQL string literals are not yet supported: {input}"
-            )));
+            ))
+            .into());
         }
         if c != '\'' {
             out.push(c);
@@ -279,13 +288,12 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
             Some(_) => {
                 return Err(KernelError::generic(format!(
                     "unexpected characters after closing quote in SQL string literal: {input}"
-                )))
+                ))
+                .into())
             }
         }
     }
-    Err(KernelError::generic(format!(
-        "unterminated SQL string literal: {input}"
-    )))
+    Err(KernelError::generic(format!("unterminated SQL string literal: {input}")).into())
 }
 
 /// Strip an optional typed-literal keyword prefix (e.g. `DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`) and
@@ -324,7 +332,8 @@ fn decode_binary_literal(input: &str) -> DeltaResult<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         return Err(KernelError::generic(format!(
             "binary literal must contain an even number of hex digits: {input}"
-        )));
+        ))
+        .into());
     }
     let (pairs, _) = hex.as_bytes().as_chunks::<2>();
     pairs

@@ -36,13 +36,11 @@ pub(crate) fn column_to_df_expr<E>(
 }
 
 impl ColumnResolver for StructType {
-    type Error = KernelError;
+    type Error = delta_kernel::Error;
 
     fn resolve_column(&self, name: &KernelColumnName) -> DeltaResult<DFColumn> {
         let Some(root) = name.first() else {
-            return Err(KernelError::generic(
-                "cannot convert an empty column reference",
-            ));
+            return Err(KernelError::generic("cannot convert an empty column reference").into());
         };
         let _ = self.field_at(name)?;
         Ok(DFColumn::new_unqualified(root.as_str()))

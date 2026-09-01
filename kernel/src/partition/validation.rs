@@ -88,7 +88,7 @@ fn validate_keys(
         if normalized.contains_key(*schema_name) {
             return Err(KernelError::invalid_partition_values(format!(
                 "duplicate partition column '{key}' (normalized to same key as a previously provided entry)"
-            )));
+            )).into());
         }
         normalized.insert(schema_name.to_string(), value);
     }
@@ -98,7 +98,8 @@ fn validate_keys(
             return Err(KernelError::invalid_partition_values(format!(
                 "missing partition column '{col}'. Provided: [{}]",
                 normalized.keys().cloned().collect::<Vec<_>>().join(", ")
-            )));
+            ))
+            .into());
         }
     }
 
@@ -146,14 +147,16 @@ fn validate_types(
             return Err(KernelError::invalid_partition_values(format!(
                 "partition column '{col_name}' has non-primitive type {expected_type:?}. \
                  Partition columns must be primitive types."
-            )));
+            ))
+            .into());
         }
         if would_serialize_to_null(value) {
             if !field.nullable {
                 return Err(KernelError::invalid_partition_values(format!(
                     "partition column '{col_name}' is not nullable but received a value that \
                      serializes to null (null scalar, empty string, or empty binary)"
-                )));
+                ))
+                .into());
             }
             continue;
         }
@@ -162,7 +165,8 @@ fn validate_types(
             return Err(KernelError::invalid_partition_values(format!(
                 "partition column '{col_name}' has type {expected_type:?} but got \
                  value of type {actual_type:?}"
-            )));
+            ))
+            .into());
         }
     }
     Ok(())

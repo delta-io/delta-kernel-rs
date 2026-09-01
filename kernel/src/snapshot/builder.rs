@@ -20,9 +20,8 @@ use crate::{DeltaResult, Engine, KernelError, Snapshot, Version};
 ///
 /// ```no_run
 /// # use delta_kernel::{Snapshot, Engine};
-/// # use url::Url;
 /// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
-/// let table_root = Url::parse("file:///path/to/table")?;
+/// let table_root = delta_kernel::try_parse_uri("file:///path/to/table")?;
 ///
 /// // Build a snapshot
 /// let snapshot = Snapshot::builder_for(table_root.clone())
@@ -312,7 +311,9 @@ impl SnapshotBuilder {
             try_parse_uri(table_root).and_then(|table_url| {
                 let log_segment = LogSegment::for_snapshot(
                     engine.storage_handler().as_ref(),
-                    table_url.join("_delta_log/")?,
+                    table_url
+                        .join("_delta_log/")
+                        .map_err(crate::KernelError::from)?,
                     log_tail,
                     effective_version,
                     metric_context.clone(),
@@ -335,6 +336,7 @@ impl SnapshotBuilder {
                         "SnapshotBuilder should have either table_root or existing_snapshot",
                     )
                 })
+                .map_err(crate::Error::from)
                 .and_then(|existing_snapshot| {
                     Snapshot::try_new_from(
                         existing_snapshot,
@@ -929,7 +931,10 @@ mod tests {
                 .with_log_tail(log_tail)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -944,7 +949,10 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -969,7 +977,10 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -981,7 +992,10 @@ mod tests {
 
             let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -998,7 +1012,10 @@ mod tests {
                 .with_max_catalog_version(0)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1022,7 +1039,10 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1076,7 +1096,10 @@ mod tests {
             // Incremental update without mcv should fail
             let result = SnapshotBuilder::new_from(initial).build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1111,7 +1134,9 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(KernelError::LogTailVersionsNotContiguous { .. })
+                Err(crate::Error::Kernel(
+                    KernelError::LogTailVersionsNotContiguous { .. }
+                ))
             ));
 
             Ok(())

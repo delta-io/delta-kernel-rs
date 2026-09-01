@@ -81,7 +81,8 @@ pub(crate) fn parse_partition_value(
     let Some(field) = logical_schema.field_at_index(field_idx) else {
         return Err(KernelError::InternalError(format!(
             "out of bounds partition column field index {field_idx}"
-        )));
+        ))
+        .into());
     };
     let name = field.physical_name(column_mapping_mode);
     let partition_value = parse_partition_value_raw(partition_values.get(name), field.data_type())?;
@@ -154,7 +155,8 @@ pub(crate) fn get_transform_expr(
                 let Some((_, partition_value)) = metadata_values.remove(field_index) else {
                     return Err(KernelError::MissingData(format!(
                         "missing partition value for field index {field_index}"
-                    )));
+                    ))
+                    .into());
                 };
 
                 let partition_value = Arc::new(partition_value.into());
@@ -181,7 +183,7 @@ pub(crate) fn get_transform_expr(
                     let Some((_, partition_value)) = metadata_values.remove(field_index) else {
                         return Err(KernelError::MissingData(format!(
                             "missing partition value for dynamic column '{physical_name}' at index {field_index}"
-                        )));
+                        )).into());
                     };
 
                     let partition_value = Arc::new(partition_value.into());
@@ -219,10 +221,11 @@ pub(crate) fn parse_partition_value_raw(
         (Some(v), Some(primitive)) if v.is_empty() => Ok(primitive
             .empty_string_partition_cast()
             .unwrap_or_else(|| Scalar::Null(data_type.clone()))),
-        (Some(v), Some(primitive)) => primitive.parse_scalar(v),
+        (Some(v), Some(primitive)) => primitive.parse_scalar(v).map_err(crate::Error::from),
         (Some(_), None) => Err(KernelError::generic(format!(
             "Unexpected partition column type: {data_type:?}"
-        ))),
+        ))
+        .into()),
         _ => Ok(Scalar::Null(data_type.clone())),
     }
 }

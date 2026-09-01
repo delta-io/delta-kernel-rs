@@ -130,9 +130,8 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
             vec![],
             &delta_kernel::arrow::array::RecordBatchOptions::new().with_row_count(Some(n_rows)),
         )
-        .map_err(|e| {
-            KernelError::Generic(format!("zero-arg opaque eval batch construction: {e}"))
-        });
+        .map_err(|e| KernelError::Generic(format!("zero-arg opaque eval batch construction: {e}")))
+        .map_err(delta_kernel::Error::from);
     }
 
     let arrays: Vec<ArrayRef> = args
@@ -152,6 +151,7 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
 
     RecordBatch::try_new(schema, arrays)
         .map_err(|e| KernelError::Generic(format!("opaque eval batch construction: {e}")))
+        .map_err(delta_kernel::Error::from)
 }
 
 /// Lift a column type hint from the first `Literal` arg (kernel-native lifts the same way from
@@ -217,6 +217,7 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaRe
     StructArray::try_new(arrow_fields, arrays, None)
         .map(|sa| Arc::new(sa) as ArrayRef)
         .map_err(|e| KernelError::Generic(format!("struct arg construction: {e}")))
+        .map_err(delta_kernel::Error::from)
 }
 
 /// Import an engine-produced `ArrowFFIData` into an `ArrayRef`, consuming the Arrow C Data
@@ -228,7 +229,8 @@ fn import_ffi_array(ffi: ArrowFFIData) -> DeltaResult<ArrayRef> {
     if ffi.array.is_released() {
         return Err(KernelError::Generic(
             "engine callback returned success but no result array".into(),
-        ));
+        )
+        .into());
     }
 
     let ArrowFFIData { array, schema } = ffi;
@@ -245,7 +247,8 @@ fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> DeltaResult<Boo
         return Err(KernelError::Generic(format!(
             "opaque predicate eval_pred returned {} rows, expected {expected_rows}",
             arr.len()
-        )));
+        ))
+        .into());
     }
     arr.as_any()
         .downcast_ref::<BooleanArray>()
@@ -256,6 +259,7 @@ fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> DeltaResult<Boo
                 arr.data_type()
             ))
         })
+        .map_err(delta_kernel::Error::from)
 }
 
 fn call_eval_pred(
@@ -286,11 +290,12 @@ fn call_eval_pred(
     }
     let result_ffi = match result {
         EngineExecResult::Success(result_ffi) => result_ffi,
-        EngineExecResult::Failure(err) => return Err(err.into()),
+        EngineExecResult::Failure(err) => return Err(KernelError::from(err).into()),
         EngineExecResult::Uninit => {
             return Err(KernelError::Generic(format!(
                 "engine opaque-eval callback for `{op_name}` returned without writing a result"
-            )))
+            ))
+            .into())
         }
     };
 

@@ -38,7 +38,9 @@ impl CatalogCommit {
         Ok(Self {
             version: catalog_commit.version,
             location: catalog_commit.location.location.clone(),
-            published_location: log_root.join(&format!("{:020}.json", catalog_commit.version))?,
+            published_location: log_root
+                .join(&format!("{:020}.json", catalog_commit.version))
+                .map_err(crate::KernelError::from)?,
         })
     }
 
@@ -131,6 +133,7 @@ impl PublishMetadata {
                         .collect::<Vec<_>>()
                 ))
             })
+            .map_err(crate::Error::from)
     }
 
     fn validate_end_version(
@@ -141,10 +144,12 @@ impl PublishMetadata {
             Some(v) if v == publish_to_version => Ok(()),
             Some(v) => Err(KernelError::Generic(format!(
                 "Catalog commits must end with snapshot version {publish_to_version}, but got {v}"
-            ))),
+            ))
+            .into()),
             None => Err(KernelError::Generic(format!(
                 "Catalog commits are empty, expected snapshot version {publish_to_version}"
-            ))),
+            ))
+            .into()),
         }
     }
 }

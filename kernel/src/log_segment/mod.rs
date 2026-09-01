@@ -435,7 +435,8 @@ impl LogSegment {
             if start_version > end_version {
                 return Err(KernelError::generic(
                     "Failed to build LogSegment: start_version cannot be greater than end_version",
-                ));
+                )
+                .into());
             }
         }
 
@@ -1051,7 +1052,8 @@ impl LogSegment {
                 let DataType::Struct(add_struct) = add_field.data_type() else {
                     return Err(KernelError::internal_error(
                         "add field in action schema must be a struct",
-                    ));
+                    )
+                    .into());
                 };
                 let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
 
@@ -1130,7 +1132,8 @@ impl LogSegment {
                 return Err(KernelError::generic(format!(
                     "Unsupported checkpoint file type: {}",
                     parsed_log_path.extension,
-                )));
+                ))
+                .into());
             }
             // This is the case when there are no checkpoints in the log segment
             // so we return an empty iterator
@@ -1485,13 +1488,15 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
         let LogPathFileType::CompactedCommit { hi } = f.file_type else {
             return Err(KernelError::generic(
                 "ascending_compaction_files contains non-compaction file",
-            ));
+            )
+            .into());
         };
         if f.version > hi {
             return Err(KernelError::generic(format!(
                 "compaction file has start version {} > end version {}",
                 f.version, hi
-            )));
+            ))
+            .into());
         }
         if let Some(next) = compactions.get(i + 1) {
             // next's type is validated on its own iteration; skip sort check if it isn't a
@@ -1500,7 +1505,8 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
                 if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
                     return Err(KernelError::generic(format!(
                         "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
-                    )));
+                    ))
+                    .into());
                 }
             }
         }
@@ -1516,26 +1522,27 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
     let first_version = parts[0].version;
     for p in parts {
         if !p.is_checkpoint() {
-            return Err(KernelError::generic(
-                "checkpoint_parts contains non-checkpoint file",
-            ));
+            return Err(
+                KernelError::generic("checkpoint_parts contains non-checkpoint file").into(),
+            );
         }
         if p.version != first_version {
             return Err(KernelError::generic(
                 "multi-part checkpoint parts have different versions",
-            ));
+            )
+            .into());
         }
         match p.file_type {
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts as usize == n => {}
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } => {
                 return Err(KernelError::generic(format!(
                     "multi-part checkpoint part count mismatch: slice has {n} parts but num_parts field says {num_parts}"
-                )));
+                )).into());
             }
             _ if n > 1 => {
                 return Err(KernelError::generic(format!(
                     "multi-part checkpoint part count mismatch: expected {n} multi-part checkpoint files but got a non-multi-part checkpoint"
-                )));
+                )).into());
             }
             _ => {}
         }
@@ -1546,9 +1553,9 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
 fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for f in commits {
         if !f.is_commit() {
-            return Err(KernelError::generic(
-                "ascending_commit_files contains non-commit file",
-            ));
+            return Err(
+                KernelError::generic("ascending_commit_files contains non-commit file").into(),
+            );
         }
     }
     Ok(())
@@ -1560,7 +1567,8 @@ fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()
             return Err(KernelError::generic(format!(
                 "Expected contiguous commit files, but found gap: {:?} -> {:?}",
                 pair[0], pair[1]
-            )));
+            ))
+            .into());
         }
     }
     Ok(())

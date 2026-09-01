@@ -64,9 +64,10 @@ impl StorageHandler for PlanBasedStorageHandler {
         // TODO(#2820): implement here once supported as IoOperation.
         // Intentionally do not use a fallback because we expect this SHOULD be implemented via
         // plan-execution.
-        Err(KernelError::unsupported(
-            "PlanBasedStorageHandler does not yet implement delete",
-        ))
+        Err(
+            KernelError::unsupported("PlanBasedStorageHandler does not yet implement delete")
+                .into(),
+        )
     }
 }
 
@@ -147,7 +148,10 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from_static(b"second"), false)
             .unwrap_err();
-        assert!(matches!(err, KernelError::FileAlreadyExists(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::FileAlreadyExists(_))
+        ));
 
         // With `overwrite = true`, the second write succeeds.
         storage
@@ -169,6 +173,9 @@ mod tests {
         // Errors on missing file
         let url = Url::from_file_path(tmp.path().join("missing.json")).unwrap();
         let err = make_handler().head(&url).unwrap_err();
-        assert!(matches!(err, KernelError::FileNotFound(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::FileNotFound(_))
+        ));
     }
 }

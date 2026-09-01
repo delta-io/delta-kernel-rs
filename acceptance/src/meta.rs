@@ -6,7 +6,7 @@ use std::sync::Arc;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path as ObjectPath;
 use delta_kernel::object_store::ObjectStore;
-use delta_kernel::{Engine, KernelError, Snapshot, Version};
+use delta_kernel::{Engine, Error, Snapshot, Version};
 use futures::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -16,8 +16,8 @@ pub enum AssertionError {
     #[error("Invalid test case data")]
     InvalidTestCase,
 
-    #[error("Kernel error: {0}")]
-    KernelError(#[from] KernelError),
+    #[error("Delta Kernel error: {0}")]
+    KernelError(#[from] Error),
 }
 
 pub type TestResult<T, E = AssertionError> = std::result::Result<T, E>;

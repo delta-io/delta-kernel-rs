@@ -190,7 +190,7 @@ impl StructDataFields {
                 }
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     return Err(add_scalar_path_context(
-                        KernelError::scalar_conversion("one field", "duplicate fields"),
+                        KernelError::scalar_conversion("one field", "duplicate fields").into(),
                         entry.key().clone(),
                     ));
                 }
@@ -199,7 +199,7 @@ impl StructDataFields {
         Ok(Self { expected, fields })
     }
 
-    pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
+    pub(crate) fn take_field<T: TryFrom<Scalar, Error = crate::Error>>(
         &mut self,
         field_name: &str,
     ) -> DeltaResult<T> {
@@ -210,7 +210,7 @@ impl StructDataFields {
         })?;
         let (actual_field, value) = self.fields.remove(field_name).ok_or_else(|| {
             add_scalar_path_context(
-                KernelError::scalar_conversion("present field", "missing field"),
+                KernelError::scalar_conversion("present field", "missing field").into(),
                 field_name,
             )
         })?;
@@ -228,7 +228,8 @@ impl StructDataFields {
                     } else {
                         "non-nullable field"
                     },
-                ),
+                )
+                .into(),
                 field_name,
             )
         );
@@ -243,9 +244,9 @@ impl StructDataFields {
         }
         let mut extra: Vec<_> = self.fields.keys().collect();
         extra.sort_unstable();
-        Err(KernelError::scalar_conversion(
-            "no additional fields",
-            format!("fields {extra:?}"),
-        ))
+        Err(
+            KernelError::scalar_conversion("no additional fields", format!("fields {extra:?}"))
+                .into(),
+        )
     }
 }

@@ -40,7 +40,7 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
                 .to_string()
         )
     );
-    let data = serde_json::to_vec(crc)?;
+    let data = serde_json::to_vec(crc).map_err(crate::KernelError::from)?;
     engine
         .storage_handler()
         .put(path, data.into(), false /* overwrite */)
@@ -233,7 +233,10 @@ mod tests {
 
         // Second write should fail (never overwrites)
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
-        assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_)))
+        ));
     }
 
     #[test]
@@ -244,7 +247,9 @@ mod tests {
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(
             result,
-            Err(KernelError::ChecksumWriteUnsupported(_))
+            Err(crate::Error::Kernel(KernelError::ChecksumWriteUnsupported(
+                _
+            )))
         ));
     }
 
@@ -272,7 +277,10 @@ mod tests {
         } else {
             let err = result.unwrap_err();
             assert!(
-                matches!(err, KernelError::ChecksumWriteUnsupported(_)),
+                matches!(
+                    err,
+                    crate::Error::Kernel(KernelError::ChecksumWriteUnsupported(_))
+                ),
                 "expected ChecksumWriteUnsupported, got: {err:?}"
             );
         }

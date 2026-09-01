@@ -48,12 +48,14 @@ pub(crate) fn resolve_scan_file_dv(
         (_, Some(_), CdfScanFileType::Remove) => {
             return Err(KernelError::generic(
                 "CdfScanFile with type remove cannot have a remove deletion vector",
-            ));
+            )
+            .into());
         }
         (_, Some(_), CdfScanFileType::Cdc) => {
             return Err(KernelError::generic(
                 "CdfScanFile with type cdc cannot have a remove deletion vector",
-            ));
+            )
+            .into());
         }
         (add_dv, Some(rm_dv), CdfScanFileType::Add) => {
             let add_dv = add_dv.unwrap_or_else(Default::default);

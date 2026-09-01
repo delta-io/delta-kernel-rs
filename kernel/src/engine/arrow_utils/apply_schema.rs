@@ -32,15 +32,16 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
     let DataType::Struct(struct_schema) = schema else {
         return Err(KernelError::generic(
             "apply_schema at top-level must be passed a struct schema",
-        ));
+        )
+        .into());
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
     let (fields, columns, _nulls) = applied.into_parts();
 
-    Ok(RecordBatch::try_new(
-        Arc::new(ArrowSchema::new(fields)),
-        columns,
-    )?)
+    Ok(
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+            .map_err(crate::KernelError::from)?,
+    )
 }
 
 // helper to transform an arrow field+col into the specified target type. If `rename` is specified
@@ -82,7 +83,8 @@ fn transform_struct(
                 Some(target_field),
                 &target_field.name,
             )?;
-            let mut arrow_metadata = kernel_flat_parquet_id_to_arrow_metadata(target_field)?;
+            let mut arrow_metadata = kernel_flat_parquet_id_to_arrow_metadata(target_field)
+                .map_err(crate::KernelError::from)?;
             // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
             // retained in Arrow; its content is processed by `apply_schema_to_list` /
             // `apply_schema_to_map`.
@@ -97,7 +99,8 @@ fn transform_struct(
                     return Err(KernelError::generic(format!(
                         "Field '{}': input field ID {} conflicts with target field ID {}",
                         target_field.name, input_id, target_id
-                    )));
+                    ))
+                    .into());
                 }
             }
             let transformed_field = new_field_with_metadata(
@@ -114,13 +117,13 @@ fn transform_struct(
         return Err(KernelError::internal_error(format!(
             "Passed struct had {input_col_count} columns, but transformed column has {}",
             transformed_cols.len()
-        )));
+        ))
+        .into());
     }
-    Ok(StructArray::try_new(
-        transformed_fields.into(),
-        transformed_cols,
-        nulls,
-    )?)
+    Ok(
+        StructArray::try_new(transformed_fields.into(), transformed_cols, nulls)
+            .map_err(crate::KernelError::from)?,
+    )
 }
 
 // Transform a struct array. The data is in `array`, and the target fields are in `kernel_fields`.
@@ -129,9 +132,9 @@ pub(crate) fn apply_schema_to_struct(
     kernel_fields: &Schema,
 ) -> DeltaResult<StructArray> {
     let Some(sa) = array.as_struct_opt() else {
-        return Err(make_arrow_error(
-            "Arrow claimed to be a struct but isn't a StructArray",
-        ));
+        return Err(
+            make_arrow_error("Arrow claimed to be a struct but isn't a StructArray").into(),
+        );
     };
     transform_struct(sa, kernel_fields.fields())
 }
@@ -146,16 +149,15 @@ fn apply_schema_to_list(
     relative_path: &str,
 ) -> DeltaResult<ListArray> {
     let Some(la) = array.as_list_opt() else {
-        return Err(make_arrow_error(
-            "Arrow claimed to be a list but isn't a ListArray",
-        ));
+        return Err(make_arrow_error("Arrow claimed to be a list but isn't a ListArray").into());
     };
     let (arrow_element_field, offset_buffer, arrow_values, nulls) = la.clone().into_parts();
 
     let element_path = format!("{relative_path}.{LIST_ARRAY_ROOT}");
     let element_id = nearest_ancestor_struct_field
         .map(|f| lookup_nested_field_id(f, &element_path))
-        .transpose()?
+        .transpose()
+        .map_err(crate::KernelError::from)?
         .flatten();
     let transformed_arrow_values = apply_schema_to_inner(
         &arrow_values,
@@ -177,7 +179,8 @@ fn apply_schema_to_list(
         offset_buffer,
         transformed_arrow_values,
         nulls,
-    )?)
+    )
+    .map_err(crate::KernelError::from)?)
 }
 
 // Rebuild a [`MapArray`] under the contract of [`apply_schema_to_inner`] (see that fn's doc
@@ -190,9 +193,7 @@ fn apply_schema_to_map(
     relative_path: &str,
 ) -> DeltaResult<MapArray> {
     let Some(ma) = array.as_map_opt() else {
-        return Err(make_arrow_error(
-            "Arrow claimed to be a map but isn't a MapArray",
-        ));
+        return Err(make_arrow_error("Arrow claimed to be a map but isn't a MapArray").into());
     };
     // Deconstruct the input MapArray and its inner entries struct.
     let (arrow_map_field, offset_buffer, arrow_map_struct_array, nulls, ordered) =
@@ -203,7 +204,8 @@ fn apply_schema_to_map(
         return Err(KernelError::internal_error(format!(
             "Map entries struct must have exactly 2 columns (key, value), got {}",
             arrow_cols.len()
-        )));
+        ))
+        .into());
     }
     let arrow_value_col = arrow_cols.remove(1);
     let arrow_key_col = arrow_cols.remove(0);
@@ -216,11 +218,13 @@ fn apply_schema_to_map(
     let value_path = format!("{relative_path}.{MAP_VALUE_DEFAULT}");
     let key_id = ancestor
         .map(|a| lookup_nested_field_id(a, &key_path))
-        .transpose()?
+        .transpose()
+        .map_err(crate::KernelError::from)?
         .flatten();
     let value_id = ancestor
         .map(|a| lookup_nested_field_id(a, &value_path))
-        .transpose()?
+        .transpose()
+        .map_err(crate::KernelError::from)?
         .flatten();
     let transformed_arrow_key = apply_schema_to_inner(
         &arrow_key_col,
@@ -253,7 +257,8 @@ fn apply_schema_to_map(
         vec![arrow_key_field.clone(), arrow_value_field.clone()].into(),
         vec![transformed_arrow_key, transformed_arrow_value],
         arrow_struct_nulls,
-    )?;
+    )
+    .map_err(crate::KernelError::from)?;
     let arrow_entries_field = ArrowField::new(
         arrow_map_field.name(),
         ArrowDataType::Struct(vec![arrow_key_field, arrow_value_field].into()),
@@ -265,7 +270,8 @@ fn apply_schema_to_map(
         arrow_entries_struct,
         nulls,
         ordered,
-    )?)
+    )
+    .map_err(crate::KernelError::from)?)
 }
 
 // Apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the

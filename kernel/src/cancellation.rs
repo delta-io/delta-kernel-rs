@@ -30,7 +30,7 @@ pub type CancelledFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// listing) so cancelled work is not begun.
 pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> DeltaResult<()> {
     match token {
-        Some(t) if t.is_cancelled() => Err(KernelError::Cancelled),
+        Some(t) if t.is_cancelled() => Err(KernelError::Cancelled.into()),
         _ => Ok(()),
     }
 }
@@ -125,13 +125,16 @@ where
         }
         if self.token.as_ref().is_some_and(|t| t.is_cancelled()) {
             self.done = true;
-            return Some(Err(KernelError::Cancelled));
+            return Some(Err(KernelError::Cancelled.into()));
         }
         let item = self.inner.next();
         // A cancellation-aware engine can itself surface `Err(Cancelled)` from an interrupted
         // read. Fuse on it so the composed pipeline still yields exactly one terminal error
         // rather than this layer re-injecting a second one on the next poll.
-        if matches!(item, Some(Err(KernelError::Cancelled))) {
+        if matches!(
+            item,
+            Some(Err(crate::Error::Kernel(KernelError::Cancelled)))
+        ) {
             self.done = true;
         }
         item
@@ -191,7 +194,10 @@ mod tests {
         let token = Arc::new(TestToken::default());
         token.cancel();
         let mut iter = CancellableIterator::new(ok_iter(3), Some(token as CancellationTokenRef));
-        assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
+        assert!(matches!(
+            iter.next(),
+            Some(Err(crate::Error::Kernel(KernelError::Cancelled)))
+        ));
         // Fused: never a `Some(Ok(..))` after cancellation, and no infinite error stream.
         assert!(iter.next().is_none());
         assert!(iter.next().is_none());
@@ -207,7 +213,10 @@ mod tests {
         token.cancel();
         // The terminal item is an error, so a cancelled listing can't look complete (which a
         // bare `None` / `take_while` would).
-        assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
+        assert!(matches!(
+            iter.next(),
+            Some(Err(crate::Error::Kernel(KernelError::Cancelled)))
+        ));
         assert!(iter.next().is_none());
     }
 
@@ -218,10 +227,13 @@ mod tests {
     #[test]
     fn inner_cancelled_error_fuses_without_double_emit() {
         let token: CancellationTokenRef = Arc::new(TestToken::default());
-        let inner = vec![Ok(0), Err(KernelError::Cancelled), Ok(99)].into_iter();
+        let inner = vec![Ok(0), Err(KernelError::Cancelled.into()), Ok(99)].into_iter();
         let mut iter = CancellableIterator::new(inner, Some(token));
         assert!(matches!(iter.next(), Some(Ok(0))));
-        assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
+        assert!(matches!(
+            iter.next(),
+            Some(Err(crate::Error::Kernel(KernelError::Cancelled)))
+        ));
         // Fused on the inner error: the trailing Ok is never yielded, and no second error.
         assert!(iter.next().is_none());
     }
@@ -235,7 +247,7 @@ mod tests {
         token.cancel();
         assert!(matches!(
             check_cancelled(Some(&ct)),
-            Err(KernelError::Cancelled)
+            Err(crate::Error::Kernel(KernelError::Cancelled))
         ));
     }
 

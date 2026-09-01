@@ -20,7 +20,7 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{DeltaResult, KernelError, Snapshot};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -35,7 +35,10 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 /// Writes a JSON commit file to the store.
 async fn write_commit(store: &Arc<InMemory>, content: &str, version: u64) -> DeltaResult<()> {
     let path = Path::from(format!("_delta_log/{version:020}.json"));
-    store.put(&path, content.to_string().into()).await?;
+    store
+        .put(&path, content.to_string().into())
+        .await
+        .map_err(KernelError::from)?;
     Ok(())
 }
 

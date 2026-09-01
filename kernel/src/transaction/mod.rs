@@ -377,7 +377,8 @@ impl<S> Transaction<S> {
             return Err(KernelError::generic(format!(
                 "app_id {} already exists in transaction",
                 dup.app_id
-            )));
+            ))
+            .into());
         }
 
         self.validate_blind_append_semantics()?;
@@ -553,7 +554,7 @@ impl<S> Transaction<S> {
             }
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
-            Err(e @ KernelError::IOError(_)) => {
+            Err(crate::Error::Kernel(e @ KernelError::IOError(_))) => {
                 // Flips the metric event from success -> failure.
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
@@ -701,10 +702,12 @@ impl<S> Transaction<S> {
             (false, true) => Err(KernelError::generic(
                 "This table is catalog-managed and requires a catalog committer. \
                  Please provide a catalog committer via Snapshot::transaction().",
-            )),
+            )
+            .into()),
             (true, false) => Err(KernelError::generic(
                 "This table is path-based and cannot be committed to with a catalog committer.",
-            )),
+            )
+            .into()),
         }
     }
 
@@ -838,7 +841,8 @@ impl<S> Transaction<S> {
                 "Cannot write data files to a Delta table with empty schema; \
                  use `snapshot.alter_table().add_column(...)` to add at least one \
                  column before writing data",
-            ));
+            )
+            .into());
         }
         Ok(())
     }
@@ -880,9 +884,12 @@ impl<S> Transaction<S> {
     // Returns the read snapshot. Returns an error if this is a create-table transaction.
     // To get the `Option<SnapshotRef>` directly, use the `read_snapshot_opt` field.
     fn read_snapshot(&self) -> DeltaResult<&Snapshot> {
-        self.read_snapshot_opt.as_deref().ok_or_else(|| {
-            KernelError::internal_error("read_snapshot() called on create-table transaction")
-        })
+        self.read_snapshot_opt
+            .as_deref()
+            .ok_or_else(|| {
+                KernelError::internal_error("read_snapshot() called on create-table transaction")
+            })
+            .map_err(crate::Error::from)
     }
 
     /// Computes the in-commit timestamp for this transaction if ICT is enabled.
@@ -1301,7 +1308,8 @@ impl<S> Transaction<S> {
                 let log_root = self
                     .effective_table_config
                     .table_root()
-                    .join("_delta_log/")?;
+                    .join("_delta_log/")
+                    .map_err(crate::KernelError::from)?;
                 let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
                 let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
                     KernelError::internal_error(
@@ -1420,7 +1428,8 @@ impl<S> Transaction<S> {
         if self.is_create_table() && !self.remove_files_metadata.is_empty() {
             return Err(KernelError::internal_error(
                 "CREATE TABLE transaction cannot have remove actions",
-            ));
+            )
+            .into());
         }
 
         let input_schema = scan_row_schema();
@@ -1737,9 +1746,7 @@ mod tests {
             _actions: DeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
-            Err(KernelError::IOError(std::io::Error::other(
-                "simulated IO error",
-            )))
+            Err(KernelError::IOError(std::io::Error::other("simulated IO error")).into())
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -1764,7 +1771,7 @@ mod tests {
             _actions: DeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
-            Err(KernelError::generic("simulated commit error"))
+            Err(KernelError::generic("simulated commit error").into())
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -1856,7 +1863,8 @@ mod tests {
 
         let commit_path = Path::from("_delta_log/00000000000000000000.json");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(storage.put(&commit_path, actions.into()))?;
+        rt.block_on(storage.put(&commit_path, actions.into()))
+            .map_err(KernelError::from)?;
         let engine: Arc<dyn Engine> = engine;
         let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
         Ok((engine, snapshot))
@@ -2502,7 +2510,7 @@ mod tests {
             .expect_err("DV updates should require delta.enableDeletionVectors=true");
 
         assert!(
-            matches!(err, KernelError::Unsupported(_)),
+            matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
             "unexpected error: {err}"
         );
         assert!(
@@ -2617,7 +2625,8 @@ mod tests {
                 .map(|metadata| Ok(metadata.scan_files))
                 .chain(std::iter::once(Err(KernelError::generic(
                     "simulated scan metadata failure",
-                )))),
+                )
+                .into()))),
         );
 
         assert!(result.is_err(), "iterator error should propagate");
@@ -2813,7 +2822,9 @@ mod tests {
         if expected_error {
             assert!(matches!(
                 result,
-                Err(KernelError::InvalidTransactionState(_))
+                Err(crate::Error::Kernel(KernelError::InvalidTransactionState(
+                    _
+                )))
             ));
         } else {
             result?;
@@ -2828,7 +2839,9 @@ mod tests {
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(
             result,
-            Err(KernelError::InvalidTransactionState(_))
+            Err(crate::Error::Kernel(KernelError::InvalidTransactionState(
+                _
+            )))
         ));
         Ok(())
     }
@@ -2842,7 +2855,9 @@ mod tests {
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(
             result,
-            Err(KernelError::InvalidTransactionState(_))
+            Err(crate::Error::Kernel(KernelError::InvalidTransactionState(
+                _
+            )))
         ));
         Ok(())
     }
@@ -2859,7 +2874,9 @@ mod tests {
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(
             result,
-            Err(KernelError::InvalidTransactionState(_))
+            Err(crate::Error::Kernel(KernelError::InvalidTransactionState(
+                _
+            )))
         ));
         Ok(())
     }
@@ -2876,14 +2893,16 @@ mod tests {
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(
             result,
-            Err(KernelError::InvalidTransactionState(_))
+            Err(crate::Error::Kernel(KernelError::InvalidTransactionState(
+                _
+            )))
         ));
         Ok(())
     }
 
     #[test]
     fn test_validate_blind_append_rejects_create_table() -> DeltaResult<()> {
-        let tempdir = tempfile::tempdir()?;
+        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
         let schema = schema_ref! { nullable "id": INTEGER };
         let engine = Arc::new(crate::engine::sync::SyncEngine::new());
         let mut txn = create_table(
@@ -2899,7 +2918,9 @@ mod tests {
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(
             result,
-            Err(KernelError::InvalidTransactionState(_))
+            Err(crate::Error::Kernel(KernelError::InvalidTransactionState(
+                _
+            )))
         ));
         Ok(())
     }
@@ -2942,7 +2963,10 @@ mod tests {
         // If it fails, it should NOT be an InvalidTransactionState error
         if let Err(e) = result {
             assert!(
-                !matches!(e, KernelError::InvalidTransactionState(_)),
+                !matches!(
+                    e,
+                    crate::Error::Kernel(KernelError::InvalidTransactionState(_))
+                ),
                 "Blind append validation should have passed, got: {e}"
             );
         }
@@ -3089,7 +3113,10 @@ mod tests {
         let result_batch = result.record_batch();
 
         // Verify: all field names, types, and metadata match the physical schema
-        let expected_arrow_schema: ArrowSchema = physical_schema.as_ref().try_into_arrow()?;
+        let expected_arrow_schema: ArrowSchema = physical_schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)?;
         assert_eq!(result_batch.schema().as_ref(), &expected_arrow_schema);
 
         // Verify: data is preserved (id values)
@@ -3322,7 +3349,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::KernelError::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            crate::Error::Kernel(KernelError::Generic(e))
+                if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 
@@ -3341,7 +3369,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::KernelError::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            crate::Error::Kernel(KernelError::Generic(e))
+                if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 

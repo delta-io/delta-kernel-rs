@@ -175,7 +175,10 @@ mod tests {
             .write_json_file(&location, Box::new(std::iter::empty()), false)
             .expect_err("write_json_file has no plan-execution path and no fallback");
         assert!(
-            matches!(err, delta_kernel::KernelError::Unsupported(_)),
+            matches!(
+                err,
+                delta_kernel::Error::Kernel(delta_kernel::KernelError::Unsupported(_))
+            ),
             "expected an unsupported error, got: {err:?}",
         );
 

@@ -100,7 +100,7 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
 }
 
 impl TryFrom<c_int> for KernelDvStorageType {
-    type Error = KernelError;
+    type Error = delta_kernel::Error;
 
     fn try_from(value: c_int) -> DeltaResult<Self> {
         match value {
@@ -109,7 +109,8 @@ impl TryFrom<c_int> for KernelDvStorageType {
             2 => Ok(Self::PersistedAbsolute),
             _ => Err(KernelError::generic(format!(
                 "invalid deletion vector storage type: {value}"
-            ))),
+            ))
+            .into()),
         }
     }
 }
@@ -345,7 +346,7 @@ mod tests {
 
         let result = dv_descriptor_map_insert_impl(
             &mut map,
-            Err(KernelError::generic("bad data file path")),
+            Err(KernelError::generic("bad data file path").into()),
             descriptor.shallow_copy(),
         );
 

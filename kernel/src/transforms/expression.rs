@@ -497,7 +497,8 @@ impl ExpressionDepthChecker {
                 return Err(KernelError::schema(format!(
                     "Max expression depth {} exceeded by {arg:?}",
                     self.depth_limit
-                )));
+                ))
+                .into());
             }
         }
         self.current_depth += 1;

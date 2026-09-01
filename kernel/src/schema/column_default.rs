@@ -61,7 +61,8 @@ impl<'a> ColumnDefault<'a> {
         if matches!(data_type, DataType::Variant(_)) && !is_null {
             return Err(KernelError::schema(format!(
                 "a Variant column's default must be NULL, got {raw_sql:?}"
-            )));
+            ))
+            .into());
         }
         let parsed_sql = parse_sql(&raw_sql, data_type).ok();
         Ok(Self {
@@ -95,7 +96,8 @@ impl<'a> ColumnDefault<'a> {
             Some(Expression::Literal(scalar)) => Ok(Some(scalar.clone())),
             Some(other) => Err(KernelError::generic(format!(
                 "kernel cannot evaluate non-literal column default expression: {other:?}"
-            ))),
+            ))
+            .into()),
         }
     }
 

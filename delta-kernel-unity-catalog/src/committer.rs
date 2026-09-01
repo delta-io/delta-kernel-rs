@@ -24,7 +24,7 @@ use crate::errors;
 macro_rules! require {
     ($cond:expr, $err:expr) => {
         if !($cond) {
-            return Err($err);
+            return Err(($err).into());
         }
     };
 }
@@ -160,7 +160,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(DeltaError::FileAlreadyExists(_)) => {
+            Err(delta_kernel::Error::Kernel(DeltaError::FileAlreadyExists(_))) => {
                 info!("version 0 commit conflict: commit file already exists");
                 Ok(CommitResponse::Conflict { version: 0 })
             }
@@ -248,7 +248,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             }),
             // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
             // transaction layer can rebase/retry, instead of collapsing every error to Generic.
-            Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
+            Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}")).into()),
         }
     }
 }
@@ -286,7 +286,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
                 Ok(_) => (),
-                Err(DeltaError::FileAlreadyExists(_)) => (),
+                Err(delta_kernel::Error::Kernel(DeltaError::FileAlreadyExists(_))) => (),
                 Err(e) => return Err(e),
             }
         }
@@ -300,6 +300,7 @@ fn u64_to_wire_i64(value: u64, field: &str) -> DeltaResult<i64> {
     value
         .try_into()
         .map_err(|_| DeltaError::generic(format!("{field} does not fit into i64 for UC commit")))
+        .map_err(delta_kernel::Error::from)
 }
 
 fn staged_commit_file_name(path: &url::Url) -> DeltaResult<String> {
@@ -308,6 +309,7 @@ fn staged_commit_file_name(path: &url::Url) -> DeltaResult<String> {
         .filter(|segment| !segment.is_empty())
         .map(str::to_string)
         .ok_or_else(|| DeltaError::generic("staged commit path has no file name"))
+        .map_err(delta_kernel::Error::from)
 }
 
 #[cfg(test)]

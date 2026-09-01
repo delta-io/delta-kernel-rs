@@ -13,7 +13,7 @@ use crate::{DeltaResult, KernelError};
 macro_rules! require {
     ( $cond:expr, $err:expr ) => {
         if !($cond) {
-            return Err($err);
+            return Err(($err).into());
         }
     };
 }
@@ -68,12 +68,14 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
                 // When we support writes, create a directory if we can
                 return Err(KernelError::InvalidTableLocation(format!(
                     "Path does not exist: {path:?}"
-                )));
+                ))
+                .into());
             }
             if !path.is_dir() {
                 return Err(KernelError::InvalidTableLocation(format!(
                     "{path:?} is not a directory"
-                )));
+                ))
+                .into());
             }
             let path = std::fs::canonicalize(path).map_err(|err| {
                 let msg = format!("Invalid table location: {uri} Error: {err:?}");
@@ -134,6 +136,7 @@ pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| KernelError::generic(format!("System time before Unix epoch: {e}")))
+        .map_err(crate::Error::from)
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
@@ -141,6 +144,7 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
     let duration = current_time_duration()?;
     i64::try_from(duration.as_millis())
         .map_err(|_| KernelError::generic("Current timestamp exceeds i64 millisecond range"))
+        .map_err(crate::Error::from)
 }
 
 /// Extension trait for folding zero or one value from an [`Option`] into a base value.

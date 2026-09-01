@@ -22,7 +22,7 @@ use crate::schema::SchemaRef;
 pub use crate::struct_patch::{ExpressionFieldPatch, ExpressionStructPatch};
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::CollectInto;
-use crate::{DataType, DeltaResult, DynPartialEq, KernelError};
+use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
@@ -668,7 +668,7 @@ impl ParseJsonExpression {
 /// this operator; [`ParseJsonExpression`] does not share it.
 ///
 /// - Missing keys produce null values
-/// - A value that cannot be parsed as its target field type returns [`KernelError::ParseError`]
+/// - A value that cannot be parsed as its target field type returns a kernel error
 /// - Duplicate map keys are resolved by taking the rightmost entry
 ///
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
@@ -763,7 +763,7 @@ impl Expression {
     pub fn struct_patch<P>(patch: P) -> DeltaResult<Self>
     where
         P: TryInto<ExpressionStructPatch>,
-        KernelError: From<P::Error>,
+        Error: From<P::Error>,
     {
         Ok(Self::StructPatch(patch.try_into()?))
     }

@@ -158,8 +158,9 @@ fn ensure_table_does_not_exist(
             match files.next() {
                 Some(Ok(_)) => Err(KernelError::generic(format!(
                     "Table already exists at path: {table_path}"
-                ))),
-                Some(Err(KernelError::FileNotFound(_))) | None => {
+                ))
+                .into()),
+                Some(Err(crate::Error::Kernel(KernelError::FileNotFound(_)))) | None => {
                     // Path doesn't exist or empty - OK for new table
                     Ok(())
                 }
@@ -169,7 +170,7 @@ fn ensure_table_does_not_exist(
                 }
             }
         }
-        Err(KernelError::FileNotFound(_)) => {
+        Err(crate::Error::Kernel(KernelError::FileNotFound(_))) => {
             // Directory doesn't exist - this is expected for a new table.
             // The storage layer will create the full path (including _delta_log/)
             // when the commit writes the first log file via write_json_file().
@@ -258,14 +259,12 @@ fn validate_partition_columns(
     partition_columns: &[ColumnName],
 ) -> DeltaResult<()> {
     if partition_columns.is_empty() {
-        return Err(KernelError::generic(
-            "Partitioning requires at least one column",
-        ));
+        return Err(KernelError::generic("Partitioning requires at least one column").into());
     }
     if partition_columns.len() >= schema.fields().len() {
-        return Err(KernelError::generic(
-            "Table must have at least one non-partition column",
-        ));
+        return Err(
+            KernelError::generic("Table must have at least one non-partition column").into(),
+        );
     }
 
     let mut seen = HashSet::new();
@@ -275,13 +274,14 @@ fn validate_partition_columns(
             return Err(KernelError::generic(format!(
                 "Partition column '{}' must be a top-level column (nested paths are not supported)",
                 col
-            )));
+            ))
+            .into());
         }
 
         if !seen.insert(col) {
-            return Err(KernelError::generic(format!(
-                "Duplicate partition column: '{col}'"
-            )));
+            return Err(
+                KernelError::generic(format!("Duplicate partition column: '{col}'")).into(),
+            );
         }
 
         // Safety: path.len() == 1 is enforced by the top-level check above
@@ -295,7 +295,8 @@ fn validate_partition_columns(
                 "Partition column '{col}' has non-primitive type '{}'. \
                  Partition columns must have primitive types.",
                 field.data_type()
-            )));
+            ))
+            .into());
         };
     }
     Ok(())
@@ -477,7 +478,8 @@ fn maybe_enable_ict_for_catalog_managed(
                 "Catalog-managed tables require '{ENABLE_IN_COMMIT_TIMESTAMPS}=true', \
                  but it was explicitly set to '{}'",
                 validated.properties[ENABLE_IN_COMMIT_TIMESTAMPS]
-            )));
+            ))
+            .into());
         }
         add_feature_to_lists(
             TableFeature::InCommitTimestamp,
@@ -538,7 +540,8 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
             return Err(KernelError::generic(format!(
                 "IcebergCompatV3 requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got \
                  '{other}'"
-            )));
+            ))
+            .into());
         }
     }
 
@@ -547,7 +550,8 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
     if validated.is_property_true(ROW_TRACKING_SUSPENDED) {
         return Err(KernelError::generic(format!(
             "IcebergCompatV3 cannot be enabled while '{ROW_TRACKING_SUSPENDED}' is 'true'"
-        )));
+        ))
+        .into());
     }
 
     // Row tracking enablement: require `true`; default to `true`.
@@ -565,7 +569,8 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
         Some(other) => {
             return Err(KernelError::generic(format!(
                 "IcebergCompatV3 requires '{ENABLE_ROW_TRACKING}' to be 'true', got '{other}'"
-            )));
+            ))
+            .into());
         }
     }
 
@@ -574,7 +579,8 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
         if validated.is_property_true(key) {
             return Err(KernelError::generic(format!(
                 "IcebergCompatV3 cannot be enabled together with '{key}'"
-            )));
+            ))
+            .into());
         }
     }
 
@@ -679,7 +685,7 @@ fn validate_extract_table_features_and_properties(
         if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
             return Err(KernelError::generic(format!(
                 "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
-            )));
+            )).into());
         }
 
         // Parse feature name to TableFeature (unknown features become TableFeature::Unknown)
@@ -690,7 +696,8 @@ fn validate_extract_table_features_and_properties(
         if !ALLOWED_DELTA_FEATURES.contains(&feature) {
             return Err(KernelError::generic(format!(
                 "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
-            )));
+            ))
+            .into());
         }
 
         // RowTracking requires DomainMetadata as a dependency
@@ -721,7 +728,8 @@ fn validate_extract_table_features_and_properties(
         {
             return Err(KernelError::generic(format!(
                 "Setting delta property '{key}' is not supported during CREATE TABLE"
-            )));
+            ))
+            .into());
         }
     }
 
@@ -895,7 +903,9 @@ impl CreateTableTransactionBuilder {
         let table_url = try_parse_uri(&self.path)?;
 
         // Check if table already exists by looking for _delta_log directory
-        let delta_log_url = table_url.join("_delta_log/")?;
+        let delta_log_url = table_url
+            .join("_delta_log/")
+            .map_err(crate::KernelError::from)?;
         let storage = engine.storage_handler();
         ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)?;
 

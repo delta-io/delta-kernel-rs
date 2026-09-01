@@ -125,7 +125,8 @@ impl Snapshot {
                 return Err(KernelError::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot \
                     hint version {existing_snapshot_version}"
-                )));
+                ))
+                .into());
             }
         } else {
             tracing::Span::current().record("version", existing_snapshot_version);
@@ -272,7 +273,8 @@ impl Snapshot {
                     "Requested snapshot version {requested_version} is not available: \
                      no new commits were found after existing snapshot version \
                      {existing_snapshot_version}"
-                ))),
+                ))
+                .into()),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 None => Ok(NewSegment::Unchanged),
             };
@@ -296,7 +298,8 @@ impl Snapshot {
             return Err(KernelError::Generic(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
-            )));
+            ))
+            .into());
         }
         if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version {
             if new_checkpoint_version > existing_snapshot_version {
@@ -574,7 +577,8 @@ mod tests {
                 &test_utils::compacted_log_path_for_versions(start, end, "json"),
                 content.into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
         Ok(())
     }
 
@@ -586,7 +590,7 @@ mod tests {
 
     fn setup_incremental_snapshot_test() -> DeltaResult<IncrementalSnapshotTestContext> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///").map_err(KernelError::from)?;
         let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
 
         Ok(IncrementalSnapshotTestContext { store, url, engine })
@@ -658,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_new_from_latest_commit_preservation() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///").map_err(KernelError::from)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create commits 0-2
@@ -708,7 +712,10 @@ mod tests {
         );
 
         // Create log_tail with FileMeta for version 2
-        let commit_2_url = url.join("_delta_log/")?.join("00000000000000000002.json")?;
+        let commit_2_url = url
+            .join("_delta_log/")
+            .and_then(|url| url.join("00000000000000000002.json"))
+            .map_err(KernelError::from)?;
         let file_meta = crate::FileMeta {
             location: commit_2_url,
             last_modified: 1234567890,
@@ -804,7 +811,8 @@ mod tests {
         );
         assert!(matches!(
             older_version,
-            Err(KernelError::Generic(msg)) if msg.contains("older than snapshot hint version")
+            Err(crate::Error::Kernel(KernelError::Generic(msg)))
+                if msg.contains("older than snapshot hint version")
         ));
 
         Ok(())
@@ -1027,7 +1035,8 @@ mod tests {
             .build(&engine);
         assert!(matches!(
             snapshot_res,
-            Err(KernelError::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
+            Err(crate::Error::Kernel(KernelError::Generic(msg)))
+                if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
         ));
 
         // 2. new version == existing version
@@ -1111,7 +1120,8 @@ mod tests {
         // version exceeds latest version of the table = err
         assert!(matches!(
             Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
-            Err(KernelError::Generic(msg)) if msg == "Requested snapshot version 1 is not available: no new commits were found after existing snapshot version 0"
+            Err(crate::Error::Kernel(KernelError::Generic(msg)))
+                if msg == "Requested snapshot version 1 is not available: no new commits were found after existing snapshot version 0"
         ));
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
@@ -1124,7 +1134,8 @@ mod tests {
                 "minWriterVersion": 5
             }
         });
-        checkpoint1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
+        checkpoint1[2]["partitionColumns"] =
+            serde_json::to_value(["some_partition_column"]).map_err(KernelError::from)?;
 
         let handler = engine.json_handler();
         let json_strings: StringArray = checkpoint1
@@ -1143,9 +1154,10 @@ mod tests {
 
         // Write the record batch to a Parquet file
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)?;
-        writer.write(&checkpoint)?;
-        writer.close()?;
+        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)
+            .map_err(KernelError::from)?;
+        writer.write(&checkpoint).map_err(KernelError::from)?;
+        writer.close().map_err(KernelError::from)?;
 
         store_3a
             .put(
@@ -1166,7 +1178,8 @@ mod tests {
                 "minWriterVersion": 5
             }
         });
-        commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
+        commit1[2]["partitionColumns"] =
+            serde_json::to_value(["some_partition_column"]).map_err(KernelError::from)?;
         commit(table_root, store_3c_i.as_ref(), 1, commit1).await;
         test_new_from(store_3c_i.clone())?;
 
@@ -1177,7 +1190,8 @@ mod tests {
             .build(&engine)?;
         assert!(matches!(
             Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
-            Err(KernelError::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
+            Err(crate::Error::Kernel(KernelError::Generic(msg)))
+                if msg == "LogSegment end version 1 not the same as the specified end version 2"
         ));
 
         // ii. commits have (new protocol, no metadata)
@@ -1196,7 +1210,8 @@ mod tests {
         // iii. commits have (no protocol, new metadata)
         let store_3c_iii = store.fork();
         let mut commit1 = commit0.clone();
-        commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
+        commit1[2]["partitionColumns"] =
+            serde_json::to_value(["some_partition_column"]).map_err(KernelError::from)?;
         commit1.remove(1); // remove protocol
         commit(table_root, &store_3c_iii, 1, commit1).await;
         test_new_from(store_3c_iii.into())?;
@@ -1252,7 +1267,8 @@ mod tests {
                 &delta_path_for_version(existing_crc_v, "crc"),
                 make_test_crc_json(300, 3).to_string().into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
@@ -1283,7 +1299,8 @@ mod tests {
                     &delta_path_for_version(v, "crc"),
                     make_test_crc_json(400, 4).to_string().into(),
                 )
-                .await?;
+                .await
+                .map_err(KernelError::from)?;
         }
 
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
@@ -1327,7 +1344,8 @@ mod tests {
                 &delta_path_for_version(1, "crc"),
                 make_test_crc_json(200, 2).to_string().into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         let snapshot_a = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
@@ -1401,7 +1419,8 @@ mod tests {
                 &delta_path_for_version(1, "crc"),
                 make_test_crc_json(200, 2).to_string().into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         let snapshot_v3 = Snapshot::builder_for(table_root)
             .at_version(3)
@@ -1488,7 +1507,8 @@ mod tests {
                 &delta_path_for_version(1, "crc"),
                 make_test_crc_json(200, 2).to_string().into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         let snapshot_v3 = Snapshot::builder_for(table_root)
             .at_version(3)
@@ -1545,7 +1565,8 @@ mod tests {
                 &delta_path_for_version(5, "crc"),
                 make_test_crc_json(600, 6).to_string().into(),
             )
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         // Hop 1: snapshot at v0.
         let snapshot_v0 = Snapshot::builder_for(ctx.url.as_str())
@@ -1959,7 +1980,8 @@ mod tests {
                     &delta_path_for_version(v, "crc"),
                     make_test_crc_json(200, 2).to_string().into(),
                 )
-                .await?;
+                .await
+                .map_err(KernelError::from)?;
         }
 
         let reporter = Arc::new(CapturingReporter::default());
@@ -2036,7 +2058,8 @@ mod tests {
                     &delta_path_for_version(v, "crc"),
                     make_test_crc_json(200, 2).to_string().into(),
                 )
-                .await?;
+                .await
+                .map_err(KernelError::from)?;
         }
 
         let reporter = Arc::new(CapturingReporter::default());
@@ -2126,7 +2149,8 @@ mod tests {
         // Corrupt a commit above the base so the incremental P&M replay of `(3, 5]` errors.
         ctx.store
             .put(&delta_path_for_version(4, "json"), "{ not json".into())
-            .await?;
+            .await
+            .map_err(KernelError::from)?;
 
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -2165,8 +2189,14 @@ mod tests {
 
         // Simulate commits incorrectly deleted from the log: re-listing now tops out below v5, so
         // the new segment's end version is older than the base and the regression branch fires.
-        ctx.store.delete(&delta_path_for_version(5, "json")).await?;
-        ctx.store.delete(&delta_path_for_version(4, "json")).await?;
+        ctx.store
+            .delete(&delta_path_for_version(5, "json"))
+            .await
+            .map_err(KernelError::from)?;
+        ctx.store
+            .delete(&delta_path_for_version(4, "json"))
+            .await
+            .map_err(KernelError::from)?;
 
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());

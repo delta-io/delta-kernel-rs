@@ -74,17 +74,20 @@ impl CommitProtocolMetadata {
         if read_protocol.is_some() != read_metadata.is_some() {
             return Err(crate::KernelError::generic(
                 "read_protocol and read_metadata must both be present or both be absent",
-            ));
+            )
+            .into());
         }
         if read_protocol.is_none() && new_protocol.is_none() {
             return Err(crate::KernelError::generic(
                 "CommitProtocolMetadata requires at least one protocol (read or new)",
-            ));
+            )
+            .into());
         }
         if read_metadata.is_none() && new_metadata.is_none() {
             return Err(crate::KernelError::generic(
                 "CommitProtocolMetadata requires at least one metadata (read or new)",
-            ));
+            )
+            .into());
         }
         Ok(Self {
             read_protocol,
@@ -225,6 +228,7 @@ impl CommitMetadata {
                     "CommitProtocolMetadata should have at least one protocol",
                 )
             })
+            .map_err(crate::Error::from)
     }
 
     /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
@@ -239,6 +243,7 @@ impl CommitMetadata {
                     "CommitProtocolMetadata should have at least one metadata",
                 )
             })
+            .map_err(crate::Error::from)
     }
 
     /// Check if the effective protocol has a specific writer feature by name.

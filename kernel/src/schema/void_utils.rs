@@ -86,9 +86,9 @@ struct ValidateForWrite {
 impl ValidateForWrite {
     fn descend_into_container(&mut self, etype: &DataType, position: &str) -> DeltaResult<()> {
         if *etype == DataType::VOID {
-            return Err(KernelError::schema(format!(
-                "Void type is not allowed as {position}"
-            )));
+            return Err(
+                KernelError::schema(format!("Void type is not allowed as {position}")).into(),
+            );
         }
         self.container_depth += 1;
         let result = self.transform(etype);
@@ -108,7 +108,8 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
                 "Table schema must contain at least one non-void column"
             } else {
                 "Cannot write to a table with a struct that contains no non-void fields"
-            }));
+            })
+            .into());
         }
         self.depth += 1;
         let result = self.recurse_into_struct(stype);
@@ -127,7 +128,8 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
         if self.container_depth > 0 && *field.data_type() == DataType::VOID {
             return Err(KernelError::schema(
                 "Void type is not allowed inside a struct nested in Array or Map",
-            ));
+            )
+            .into());
         }
         self.recurse_into_struct_field(field)
     }

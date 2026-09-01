@@ -69,7 +69,13 @@ pub(super) fn eval_aggregate(
     }
 
     // Handle empty input. Grouped: no rows. Ungrouped: one synthetic group of initial agg states.
-    let output_schema = Arc::new(aggregate.schema.as_ref().try_into_arrow()?);
+    let output_schema = Arc::new(
+        aggregate
+            .schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)?,
+    );
     let (reps, mut aggs_by_group): (Vec<_>, Vec<_>) = groups.into_values().unzip();
     if aggs_by_group.is_empty() {
         if !aggregate.group_by.is_empty() {
@@ -89,7 +95,9 @@ pub(super) fn eval_aggregate(
         output_arrays.push(op.finalize(&states, input)?);
     }
 
-    Ok(vec![RecordBatch::try_new(output_schema, output_arrays)?])
+    Ok(vec![
+        RecordBatch::try_new(output_schema, output_arrays).map_err(KernelError::from)?
+    ])
 }
 
 // Extracts the named column from each of the input batches
@@ -103,7 +111,7 @@ fn extract_column_values(input: &[RecordBatch], name: &ColumnName) -> DeltaResul
 // Thin wrapper around arrow `interleave` that converts our `&[ArrayRef]` into `&[&dyn Array]`
 fn interleave_column_values(arrays: &[ArrayRef], indices: &[InputRow]) -> DeltaResult<ArrayRef> {
     let refs = Vec::from_iter(arrays.iter().map(|c| c.as_ref()));
-    Ok(interleave(&refs, indices)?)
+    Ok(interleave(&refs, indices).map_err(KernelError::from)?)
 }
 
 fn bind_aggregate(agg: &Agg, output_type: &DataType) -> DeltaResult<Box<dyn BoundAggregate>> {
@@ -160,7 +168,8 @@ impl LongAccumulatorAgg {
         if output_type != &DataType::LONG {
             return Err(KernelError::unsupported(
                 "SyncPlanExecutor min/max/sum aggregate with non-LONG value",
-            ));
+            )
+            .into());
         }
         Ok(Box::new(Self {
             value: value.clone(),
@@ -233,7 +242,8 @@ impl CountAgg {
         if output_type != &DataType::LONG {
             return Err(KernelError::unsupported(
                 "SyncPlanExecutor count aggregate with non-LONG output",
-            ));
+            )
+            .into());
         }
         Ok(Box::new(Self(value.cloned())))
     }
@@ -296,7 +306,7 @@ impl NonNullByAgg {
             null_sentinel: operands.null_sentinel.clone(),
             key: operands.key.clone(),
             comparison,
-            output_type: output_type.try_into_arrow()?,
+            output_type: output_type.try_into_arrow().map_err(KernelError::from)?,
         }))
     }
 }
@@ -359,29 +369,39 @@ fn extract_long_column<'a>(
     name: &ColumnName,
 ) -> DeltaResult<&'a Int64Array> {
     let array = extract_column_ref(batch, name)?;
-    array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-        KernelError::unsupported(format!(
-            "SyncPlanExecutor aggregate operand `{name}` has non-LONG type"
-        ))
-    })
+    array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            KernelError::unsupported(format!(
+                "SyncPlanExecutor aggregate operand `{name}` has non-LONG type"
+            ))
+        })
+        .map_err(Into::into)
 }
 
 fn downcast_state<T: 'static>(state: &dyn Any) -> DeltaResult<&T> {
-    state.downcast_ref().ok_or_else(|| {
-        KernelError::generic(format!(
-            "Aggregate state is not a {}",
-            std::any::type_name::<T>()
-        ))
-    })
+    state
+        .downcast_ref()
+        .ok_or_else(|| {
+            KernelError::generic(format!(
+                "Aggregate state is not a {}",
+                std::any::type_name::<T>()
+            ))
+        })
+        .map_err(Into::into)
 }
 
 fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> DeltaResult<&mut T> {
-    state.downcast_mut().ok_or_else(|| {
-        KernelError::generic(format!(
-            "Aggregate state is not a {}",
-            std::any::type_name::<T>()
-        ))
-    })
+    state
+        .downcast_mut()
+        .ok_or_else(|| {
+            KernelError::generic(format!(
+                "Aggregate state is not a {}",
+                std::any::type_name::<T>()
+            ))
+        })
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -427,7 +447,8 @@ mod tests {
                 "key",
                 Arc::new(Int64Array::from(vec![Some(1), Some(3), None])),
             ),
-        ])?;
+        ])
+        .map_err(KernelError::from)?;
         let aggregate = Aggregate {
             group_by: vec![column_name!("group")],
             aggs: vec![
@@ -500,7 +521,8 @@ mod tests {
             ),
             ("sentinel", Arc::new(BooleanArray::from(vec![true]))),
             ("key", Arc::new(Int64Array::from(vec![1]))),
-        ])?;
+        ])
+        .map_err(KernelError::from)?;
         let second = RecordBatch::try_from_iter([
             (
                 "value",
@@ -508,7 +530,8 @@ mod tests {
             ),
             ("sentinel", Arc::new(BooleanArray::from(vec![true]))),
             ("key", Arc::new(Int64Array::from(vec![2]))),
-        ])?;
+        ])
+        .map_err(KernelError::from)?;
 
         assert_batches_eq(
             &eval_aggregate(&aggregate, &[first, second])?,
@@ -610,7 +633,8 @@ mod tests {
         let input = RecordBatch::try_from_iter([(
             "value",
             Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
-        )])?;
+        )])
+        .map_err(KernelError::from)?;
         let aggregate = Aggregate {
             group_by: vec![],
             aggs: vec![
@@ -641,7 +665,8 @@ mod tests {
             nested.columns().to_vec(),
             Some(crate::arrow::buffer::NullBuffer::new(validity)),
         ));
-        let input = RecordBatch::try_from_iter([("payload", structs as ArrayRef)])?;
+        let input = RecordBatch::try_from_iter([("payload", structs as ArrayRef)])
+            .map_err(KernelError::from)?;
         let aggregate = Aggregate {
             group_by: vec![],
             aggs: vec![Agg::count(column_name!("payload")), Agg::count_star()],
@@ -692,7 +717,8 @@ mod tests {
             ("sentinel", Arc::new(BooleanArray::from(vec![None]))),
             ("key", Arc::new(Int64Array::from(vec![Some(99)]))),
             ("outer", Arc::new(outer)),
-        ])?;
+        ])
+        .map_err(KernelError::from)?;
         let aggregate = Aggregate {
             group_by: vec![column_name!("outer.group")],
             aggs: vec![
@@ -733,7 +759,8 @@ mod tests {
             ),
             ("sentinel", Arc::new(BooleanArray::from(vec![true, true]))),
             ("key", Arc::new(Int64Array::from(vec![1, 2]))),
-        ])?;
+        ])
+        .map_err(KernelError::from)?;
         let aggregate = Aggregate {
             group_by: vec![],
             aggs: vec![Agg::max_non_null_by(

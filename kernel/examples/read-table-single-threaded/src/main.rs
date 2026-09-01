@@ -79,6 +79,6 @@ fn try_main() -> DeltaResult<()> {
             println!("Printing first {limit} rows of at least {rows_so_far} total rows.");
         }
     }
-    print_batches(&batches)?;
+    print_batches(&batches).map_err(delta_kernel::KernelError::from)?;
     Ok(())
 }

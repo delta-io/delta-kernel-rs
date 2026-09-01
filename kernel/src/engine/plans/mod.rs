@@ -194,12 +194,18 @@ mod tests {
             .json_handler()
             .write_json_file(&location, Box::new(std::iter::empty()), false)
             .expect_err("no fallback is configured");
-        assert!(matches!(json_err, KernelError::Unsupported(_)));
+        assert!(matches!(
+            json_err,
+            crate::Error::Kernel(KernelError::Unsupported(_))
+        ));
 
         let parquet_err = engine
             .parquet_handler()
             .write_parquet_file(location, Box::new(std::iter::empty()))
             .expect_err("no fallback is configured");
-        assert!(matches!(parquet_err, KernelError::Unsupported(_)));
+        assert!(matches!(
+            parquet_err,
+            crate::Error::Kernel(KernelError::Unsupported(_))
+        ));
     }
 }

@@ -69,7 +69,8 @@ impl JsonHandler for PlanBasedJsonHandler {
             return Err(KernelError::unsupported(
                 "PlanBasedJsonHandler does not support write_json_file yet, and no fallback \
                  handler is configured",
-            ));
+            )
+            .into());
         };
         debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
         fallback.write_json_file(path, data, overwrite)

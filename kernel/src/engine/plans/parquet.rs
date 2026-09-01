@@ -59,7 +59,8 @@ impl ParquetHandler for PlanBasedParquetHandler {
             return Err(KernelError::unsupported(
                 "PlanBasedParquetHandler does not support write_parquet_file yet, and no fallback \
                  handler is configured",
-            ));
+            )
+            .into());
         };
         debug!(%location, "PlanBasedParquetHandler delegating write_parquet_file to fallback handler");
         fallback.write_parquet_file(location, data)

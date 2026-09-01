@@ -90,7 +90,7 @@ impl FfiLogPath {
     /// The `self.location` string slice must be valid UTF-8 and represent a valid URL.
     unsafe fn log_path(&self) -> DeltaResult<LogPath> {
         let location_str = unsafe { TryFromStringSlice::try_from_slice(&self.location) }?;
-        let url = Url::parse(location_str)?;
+        let url = Url::parse(location_str).map_err(delta_kernel::KernelError::from)?;
         let file_meta = FileMeta {
             location: url,
             last_modified: self.last_modified,

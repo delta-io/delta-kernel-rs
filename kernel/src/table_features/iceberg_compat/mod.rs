@@ -108,7 +108,8 @@ pub(super) fn check_only_supported_types(
     };
     Err(KernelError::generic(format!(
         "{feature_label} does not support type at column: {offender}",
-    )))
+    ))
+    .into())
 }
 
 struct TypeAllowListVisitor {
@@ -185,7 +186,8 @@ pub(super) fn check_no_legacy_nested_ids(tc: &TableConfiguration) -> DeltaResult
          See https://github.com/delta-io/delta/issues/6688",
         ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
-    )))
+    ))
+    .into())
 }
 
 struct LegacyNestedIdsVisitor {

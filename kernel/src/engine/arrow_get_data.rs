@@ -163,9 +163,14 @@ fn struct_elements<'a>(
     list: &'a impl ListLikeArray,
     field_name: &str,
 ) -> DeltaResult<&'a StructArray> {
-    list.list_values().as_struct_opt().ok_or_else(|| {
-        KernelError::unexpected_column_type(format!("{field_name}: list values are not structs"))
-    })
+    list.list_values()
+        .as_struct_opt()
+        .ok_or_else(|| {
+            KernelError::unexpected_column_type(format!(
+                "{field_name}: list values are not structs"
+            ))
+        })
+        .map_err(crate::Error::from)
 }
 
 /// Shared implementation of [`GetData::get_struct_list`] for the list array flavors. Validates the
@@ -263,7 +268,8 @@ fn validate_and_get_physical_index(
     if row_index >= run_array.len() {
         return Err(KernelError::generic(format!(
             "Row index {row_index} out of bounds for field '{field_name}'"
-        )));
+        ))
+        .into());
     }
 
     let physical_idx = run_array.run_ends().get_physical_index(row_index);
@@ -578,7 +584,10 @@ mod tests {
             .unwrap()
             .visit_with(&mut visitor)
             .expect_err("a null element struct cannot be visited");
-        assert!(matches!(err, KernelError::InvalidStructData(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::InvalidStructData(_))
+        ));
     }
 
     #[test]

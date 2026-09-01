@@ -29,7 +29,7 @@ use crate::schema::{schema_ref, DataType as KernelDataType, StructField};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::Action;
-use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
+use crate::{DeltaResult, FileMeta, KernelError, LogPath, Snapshot};
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -68,7 +68,7 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     )
     .await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -179,7 +179,10 @@ pub(super) async fn write_commit_to_store(
         .collect();
     let content = json_lines.join("\n");
     let commit_path = delta_path_for_version(version, "json");
-    store.put(&commit_path, content.into()).await?;
+    store
+        .put(&commit_path, content.into())
+        .await
+        .map_err(KernelError::from)?;
     Ok(())
 }
 
@@ -285,9 +288,9 @@ async fn assert_last_checkpoint_contents(
 /// Reads the `_last_checkpoint` file from storage
 async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> {
     let path = Path::from("_delta_log/_last_checkpoint");
-    let data = store.get(&path).await?;
-    let byte_data = data.bytes().await?;
-    Ok(from_slice(&byte_data)?)
+    let data = store.get(&path).await.map_err(KernelError::from)?;
+    let byte_data = data.bytes().await.map_err(KernelError::from)?;
+    Ok(from_slice(&byte_data).map_err(KernelError::from)?)
 }
 
 /// Tests the `checkpoint()` API with:
@@ -326,14 +329,15 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     )
     .await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
         writer.checkpoint_path()?,
-        Url::parse("memory:///_delta_log/00000000000000000002.checkpoint.parquet")?
+        Url::parse("memory:///_delta_log/00000000000000000002.checkpoint.parquet")
+            .map_err(KernelError::from)?
     );
 
     let result = writer.checkpoint_data(&engine)?;
@@ -353,7 +357,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     // Finalize and verify checkpoint metadata
     let size_in_bytes = 10;
     let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
+        location: Url::parse("memory:///fake_path_2").map_err(KernelError::from)?,
         last_modified: 0,
         size: size_in_bytes,
     };
@@ -396,7 +400,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     )
     .await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     // Specify version 0 for checkpoint
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
@@ -406,7 +410,8 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     // Verify the checkpoint file path is the specified version.
     assert_eq!(
         writer.checkpoint_path()?,
-        Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")?
+        Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")
+            .map_err(KernelError::from)?
     );
 
     let result = writer.checkpoint_data(&engine)?;
@@ -421,7 +426,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     // Finalize and verify checkpoint metadata
     let size_in_bytes = 10;
     let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
+        location: Url::parse("memory:///fake_path_2").map_err(KernelError::from)?,
         last_modified: 0,
         size: size_in_bytes,
     };
@@ -449,7 +454,7 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
     )
     .await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
@@ -554,14 +559,15 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     )
     .await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
         writer.checkpoint_path()?,
-        Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet")?
+        Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet")
+            .map_err(KernelError::from)?
     );
 
     let result = writer.checkpoint_data(&engine)?;
@@ -586,7 +592,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     // Finalize and verify checkpoint metadata
     let size_in_bytes = 10;
     let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
+        location: Url::parse("memory:///fake_path_2").map_err(KernelError::from)?,
         last_modified: 0,
         size: size_in_bytes,
     };
@@ -633,9 +639,10 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
         .await
         .unwrap();
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let staged_commit = FileMeta {
-        location: Url::parse("memory:///_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")?,
+        location: Url::parse("memory:///_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")
+            .map_err(KernelError::from)?,
         last_modified: 0,
         size: 100,
     };
@@ -646,7 +653,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::KernelError::Generic(e) if e == "Log segment is not published"
+        crate::Error::Kernel(KernelError::Generic(e)) if e == "Log segment is not published"
     ));
     Ok(())
 }
@@ -724,14 +731,18 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
     )
     .await?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
 
     snapshot.checkpoint(&engine, None)?;
 
     // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
     let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
-    let checkpoint_size = store.head(&checkpoint_path).await?.size;
+    let checkpoint_size = store
+        .head(&checkpoint_path)
+        .await
+        .map_err(KernelError::from)?
+        .size;
     assert_last_checkpoint_contents(&store, 4, 10, 5, checkpoint_size).await?;
 
     // Version 5: add 2 files, remove 1
@@ -755,7 +766,11 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
 
     // Second checkpoint: 1 metadata + 1 protocol + 7 add + 4 remove = 13, numOfAddFiles = 7
     let checkpoint_path = Path::from("_delta_log/00000000000000000006.checkpoint.parquet");
-    let checkpoint_size = store.head(&checkpoint_path).await?.size;
+    let checkpoint_size = store
+        .head(&checkpoint_path)
+        .await
+        .map_err(KernelError::from)?
+        .size;
     assert_last_checkpoint_contents(&store, 6, 13, 7, checkpoint_size).await?;
 
     Ok(())
@@ -922,7 +937,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let _ = create_table(
         table_root.as_str(),
         schema_ref! { nullable "value": INTEGER },
@@ -1082,7 +1097,7 @@ async fn test_stats_config_round_trip(
 ) -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
 
     // Commit 0: protocol + metadata with initial settings
     write_commit_to_store(
@@ -1149,7 +1164,7 @@ async fn test_stats_config_round_trip_partitioned(
 ) -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
 
     // Commit 0: protocol + partitioned metadata with initial settings
     write_commit_to_store(
@@ -1301,7 +1316,7 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
     .await?;
 
     // Checkpoint version 0: stats_parsed nullCount fields are plain Int64 (no metadata)
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     Snapshot::builder_for(table_root.clone())
         .build(&engine)?
         .checkpoint(&engine, None)?;

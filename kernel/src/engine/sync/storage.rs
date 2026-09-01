@@ -56,7 +56,8 @@ impl StorageHandler for SyncStorageHandler {
                 .collect::<Vec<_>>(),
         )
         .into_iter()
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, _>>()
+        .map_err(KernelError::from)?;
         metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
 
         let iter = metas.into_iter().map(move |meta| {
@@ -81,8 +82,9 @@ impl StorageHandler for SyncStorageHandler {
             .into_iter()
             .map(|(url, _range_opt)| {
                 let (s, _, path) = resolve_scope(store.as_ref(), &url)?;
-                let get_result = futures::executor::block_on(s.get(&path))?;
-                Ok(futures::executor::block_on(get_result.bytes())?)
+                let get_result =
+                    futures::executor::block_on(s.get(&path)).map_err(KernelError::from)?;
+                Ok(futures::executor::block_on(get_result.bytes()).map_err(KernelError::from)?)
             })
             .collect();
         Ok(Box::new(results.into_iter()))
@@ -98,7 +100,7 @@ impl StorageHandler for SyncStorageHandler {
 
     fn head(&self, url: &Url) -> DeltaResult<FileMeta> {
         let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
-        let meta = futures::executor::block_on(store.head(&path))?;
+        let meta = futures::executor::block_on(store.head(&path)).map_err(KernelError::from)?;
         Ok(FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
@@ -111,7 +113,7 @@ impl StorageHandler for SyncStorageHandler {
         match futures::executor::block_on(store.delete(&path)) {
             Ok(()) => Ok(()),
             Err(crate::object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(KernelError::from(e).into()),
         }
     }
 }
@@ -279,7 +281,7 @@ mod tests {
         let url = Url::from_file_path(tmp_dir.path().join("missing.json")).unwrap();
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            KernelError::FileNotFound(_)
+            crate::Error::Kernel(KernelError::FileNotFound(_))
         ));
     }
 
@@ -318,7 +320,10 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from("second"), false)
             .unwrap_err();
-        assert!(matches!(err, KernelError::FileAlreadyExists(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::FileAlreadyExists(_))
+        ));
 
         // With overwrite, it should succeed.
         storage
@@ -344,7 +349,7 @@ mod tests {
 
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            KernelError::FileNotFound(_)
+            crate::Error::Kernel(KernelError::FileNotFound(_))
         ));
     }
 
@@ -356,7 +361,7 @@ mod tests {
 
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            KernelError::FileNotFound(_)
+            crate::Error::Kernel(KernelError::FileNotFound(_))
         ));
         storage.delete(&url).unwrap();
     }

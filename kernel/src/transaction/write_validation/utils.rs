@@ -9,11 +9,13 @@ pub(super) fn validate_required_field_exist<T>(
     path: &str,
     field: &str,
 ) -> DeltaResult<T> {
-    value.ok_or_else(|| {
-        KernelError::missing_data(format!(
-            "AddFile for '{path}' is missing required field '{field}'"
-        ))
-    })
+    value
+        .ok_or_else(|| {
+            KernelError::missing_data(format!(
+                "AddFile for '{path}' is missing required field '{field}'"
+            ))
+        })
+        .map_err(crate::Error::from)
 }
 
 pub(super) fn validate_partition_keys(

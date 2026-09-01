@@ -165,11 +165,17 @@ fn generate_data<I>(schema: SchemaRef, batches: I) -> DeltaResult<Vec<ArrowEngin
 where
     I: IntoIterator<Item = Vec<Arc<dyn Array>>>,
 {
-    let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+    let arrow_schema: Arc<ArrowSchema> = Arc::new(
+        schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)?,
+    );
     batches
         .into_iter()
         .map(|batch_columns| -> DeltaResult<ArrowEngineData> {
-            let record_batch = RecordBatch::try_new(arrow_schema.clone(), batch_columns)?;
+            let record_batch = RecordBatch::try_new(arrow_schema.clone(), batch_columns)
+                .map_err(KernelError::from)?;
             Ok(ArrowEngineData::new(record_batch))
         })
         .collect::<Result<Vec<_>, _>>()
@@ -183,12 +189,19 @@ async fn verify_row_tracking_in_commit(
     expected_base_row_ids: Vec<i64>,
     expected_row_id_high_water_mark: i64,
 ) -> DeltaResult<()> {
-    let commit_url = table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
-    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
+    let commit_url = table_url
+        .join(&format!("_delta_log/{commit_version:020}.json"))
+        .map_err(KernelError::from)?;
+    let commit = store
+        .get(&Path::from_url_path(commit_url.path()).map_err(KernelError::from)?)
+        .await
+        .map_err(KernelError::from)?;
 
-    let parsed_actions: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
-        .into_iter::<Value>()
-        .try_collect()?;
+    let parsed_actions: Vec<_> =
+        Deserializer::from_slice(&commit.bytes().await.map_err(KernelError::from)?)
+            .into_iter::<Value>()
+            .try_collect()
+            .map_err(KernelError::from)?;
 
     // Extract base row IDs and default commit versions
     let (mut base_row_ids, default_commit_versions): (Vec<_>, Vec<_>) = parsed_actions
@@ -246,7 +259,8 @@ async fn verify_row_tracking_in_commit(
         "There must be exactly one row tracking domain metadata action"
     );
 
-    let row_id_high_water_mark = serde_json::from_str::<Value>(row_tracking_domain_config[0])?
+    let row_id_high_water_mark = serde_json::from_str::<Value>(row_tracking_domain_config[0])
+        .map_err(KernelError::from)?
         .get("rowIdHighWaterMark")
         .expect("rowIdHighWaterMark should be present")
         .as_i64()
@@ -263,7 +277,7 @@ async fn verify_row_tracking_in_commit(
 async fn test_row_tracking_append() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_append").await?;
 
@@ -291,10 +305,18 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
 
     // Verify the data can still be read correctly
     test_read(
-        &ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
-        )?),
+        &ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(
+                    schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(KernelError::from)?,
+                ),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            )
+            .map_err(KernelError::from)?,
+        ),
         &table_url,
         engine,
     )?;
@@ -306,7 +328,7 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
 async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_single_records").await?;
 
@@ -340,7 +362,7 @@ async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
 async fn test_row_tracking_large_batch() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_large_batch").await?;
 
@@ -363,10 +385,18 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
 
     // Verify the data can still be read correctly
     test_read(
-        &ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(large_batch))],
-        )?),
+        &ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(
+                    schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(KernelError::from)?,
+                ),
+                vec![Arc::new(Int32Array::from(large_batch))],
+            )
+            .map_err(KernelError::from)?,
+        ),
         &table_url,
         engine,
     )?;
@@ -378,7 +408,7 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
 async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_consecutive_commits").await?;
 
@@ -424,10 +454,18 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
 
     // Verify the data can still be read correctly
     test_read(
-        &ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(vec![7, 8, 1, 2, 3, 4, 5, 6]))],
-        )?),
+        &ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(
+                    schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(KernelError::from)?,
+                ),
+                vec![Arc::new(Int32Array::from(vec![7, 8, 1, 2, 3, 4, 5, 6]))],
+            )
+            .map_err(KernelError::from)?,
+        ),
         &table_url,
         engine,
     )?;
@@ -439,7 +477,7 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
 async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let schema = schema_ref! {
         nullable "id": LONG,
         nullable "name": STRING,
@@ -531,7 +569,7 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
 async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_append").await?;
 
@@ -560,10 +598,18 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
 
     // Verify the data can still be read correctly
     test_read(
-        &ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
-        )?),
+        &ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(
+                    schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(KernelError::from)?,
+                ),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            )
+            .map_err(KernelError::from)?,
+        ),
         &table_url,
         engine,
     )?;
@@ -575,7 +621,7 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
 async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_append").await?;
 
@@ -619,7 +665,7 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
 async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let (_schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_consecutive_commits").await?;
     let txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?;
@@ -628,12 +674,19 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     assert!(txn.commit(engine.as_ref())?.is_committed());
 
     // Fetch and parse the commit
-    let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
-    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
+    let commit_url = table_url
+        .join(&format!("_delta_log/{:020}.json", 1))
+        .map_err(KernelError::from)?;
+    let commit = store
+        .get(&Path::from_url_path(commit_url.path()).map_err(KernelError::from)?)
+        .await
+        .map_err(KernelError::from)?;
 
-    let parsed_actions: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
-        .into_iter::<Value>()
-        .try_collect()?;
+    let parsed_actions: Vec<_> =
+        Deserializer::from_slice(&commit.bytes().await.map_err(KernelError::from)?)
+            .into_iter::<Value>()
+            .try_collect()
+            .map_err(KernelError::from)?;
 
     // Verify that there only is a commit info action
     // NOTE: We specifically test that we don't write domain metadata for commits without actual
@@ -648,7 +701,7 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
 async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_parallel_row_tracking").await?;
 
@@ -669,13 +722,25 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
 
     // Prepare data for both transactions
     let data1 = RecordBatch::try_new(
-        Arc::new(schema.as_ref().try_into_arrow()?),
+        Arc::new(
+            schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
+        ),
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )?;
+    )
+    .map_err(KernelError::from)?;
     let data2 = RecordBatch::try_new(
-        Arc::new(schema.as_ref().try_into_arrow()?),
+        Arc::new(
+            schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
+        ),
         vec![Arc::new(Int32Array::from(vec![4, 5]))],
-    )?;
+    )
+    .map_err(KernelError::from)?;
 
     // Write data for both transactions
     let write_context1 = txn1.write_state()?.unpartitioned_write_context()?;
@@ -749,10 +814,19 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
 
     // Verify the data matches the winning transaction
     test_read(
-        &ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))], // Only data from winning transaction
-        )?),
+        &ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(
+                    schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(KernelError::from)?,
+                ),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))], /* Only data from winning
+                                                                  * transaction */
+            )
+            .map_err(KernelError::from)?,
+        ),
         &table_url,
         engine1,
     )?;
@@ -764,7 +838,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
 async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir = tempdir().map_err(KernelError::from)?;
     let schema = schema_ref! { nullable "number": INTEGER };
 
     // Create a table without row tracking
@@ -802,12 +876,19 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
         .is_committed());
 
     // Verify that the commit does NOT contain row tracking fields
-    let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
-    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
+    let commit_url = table_url
+        .join(&format!("_delta_log/{:020}.json", 1))
+        .map_err(KernelError::from)?;
+    let commit = store
+        .get(&Path::from_url_path(commit_url.path()).map_err(KernelError::from)?)
+        .await
+        .map_err(KernelError::from)?;
 
-    let parsed_actions: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
-        .into_iter::<Value>()
-        .try_collect()?;
+    let parsed_actions: Vec<_> =
+        Deserializer::from_slice(&commit.bytes().await.map_err(KernelError::from)?)
+            .into_iter::<Value>()
+            .try_collect()
+            .map_err(KernelError::from)?;
 
     // Find all add actions and verify they don't have row tracking fields
     let add_actions: Vec<_> = parsed_actions
@@ -870,7 +951,7 @@ fn read_row_id_scan(
 #[tokio::test]
 async fn test_read_row_ids_basic() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_dir = tempdir()?;
+    let tmp_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, _store) =
         setup_number_table(&tmp_dir, "test_read_row_ids_basic").await?;
 
@@ -921,7 +1002,7 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
     #[case] deleted_indexes: &[u64],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_dir = tempdir()?;
+    let tmp_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) = setup_number_table_with_features(
         &tmp_dir,
         "test_read_row_ids_stable_across_dv",
@@ -1007,7 +1088,7 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
 #[tokio::test]
 async fn test_read_row_ids_multiple_files_one_commit() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_dir = tempdir()?;
+    let tmp_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, _store) =
         setup_number_table(&tmp_dir, "test_read_row_ids_multiple_files").await?;
 
@@ -1056,7 +1137,7 @@ async fn test_read_row_ids_multiple_files_one_commit() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_dir = tempdir()?;
+    let tmp_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, _store) =
         setup_number_table(&tmp_dir, "test_read_row_ids_multiple_commits").await?;
 
@@ -1099,7 +1180,7 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_dir = tempdir()?;
+    let tmp_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, _store) =
         setup_number_table(&tmp_dir, "test_read_row_ids_after_checkpoint").await?;
 
@@ -1153,7 +1234,7 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_read_row_ids_coexist_with_row_index() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_dir = tempdir()?;
+    let tmp_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, _store) =
         setup_number_table(&tmp_dir, "test_read_row_ids_coexist_with_row_index").await?;
 
@@ -1240,7 +1321,7 @@ async fn test_read_row_ids_coexist_with_row_index() -> DeltaResult<()> {
 #[ignore = "log compaction is not yet supported, tracked in #2337"]
 async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let tmp_dir = tempdir()?;
+    let tmp_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) =
         setup_number_table(&tmp_dir, "test_read_row_ids_after_log_compaction").await?;
 
@@ -1267,7 +1348,7 @@ async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
     let json_bytes = to_json_bytes(batches.into_iter().map(Ok))?;
     store
         .put(
-            &Path::from_url_path(compaction_path.path())?,
+            &Path::from_url_path(compaction_path.path()).map_err(KernelError::from)?,
             json_bytes.into(),
         )
         .await
