@@ -1,5 +1,6 @@
 //! Conversion from a kernel [`Expression`](KernelExpression) to a DataFusion [`Expr`](DFExpr).
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
@@ -14,11 +15,12 @@ use datafusion::logical_expr::{
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_expression::evaluate_expression as kernel_expression;
 use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, Expression as KernelExpression, ExpressionRef,
-    ExpressionStructPatch, MapToStructExpression, ParseJsonExpression, UnaryExpressionOp,
-    VariadicExpression, VariadicExpressionOp,
+    ExpressionStructPatch, MapToStructExpression, MapToStructOptions, ParseJsonExpression,
+    UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
@@ -385,26 +387,23 @@ fn struct_columns_from_patch(
     Ok(StructColumns { pairs, null_guard })
 }
 
-/// Lowers a `MapToStruct` (reshape a `Map<String, String>` into a struct by parsing each value into
-/// its target field type) to a DataFusion `named_struct(..)` rebuild. Field names and per-field
-/// types come from `output_type`, which must be a struct holding only primitive fields (matching
-/// the kernel evaluator, which supports only primitive targets).
+/// Lowers a `MapToStruct`, which reshapes a `Map<String, String>` into a struct by parsing each
+/// value into its target field type. Field names and per-field types come from `output_type`,
+/// which must be a struct containing only primitive fields.
 ///
-/// Each field extracts its value with `cast(get_field(map, name), T)`. For a numeric or temporal
-/// type the raw value is first wrapped in `nullif(.., '')`, mapping an empty string to null before
-/// the cast, so an empty string becomes null (kernel's `empty_string_partition_cast`) while an
-/// unparseable value fails the cast (kernel's hard parse error). String and Binary keep the raw
-/// value (empty is a valid empty string / empty bytes). A missing key or null value is already null
-/// via [`get_field`]. The whole struct is nulled where the input map row is null, via `<map> IS NOT
-/// NULL`.
+/// Default options preserve the native DataFusion `named_struct(..)` lowering. Each field uses
+/// `cast(get_field(map, name), T)`. Numeric and temporal values first pass through
+/// `nullif(value, '')`, matching kernel's rule that an empty partition value becomes null, while
+/// invalid non-empty values fail the cast. String and binary fields preserve empty values. Missing
+/// keys and null values remain null, and a null input map produces a null struct.
 ///
-/// KNOWN DIVERGENCES from the kernel parser, all confined to malformed or non-spec-compliant input
-/// (spec-compliant writers never emit any of these):
-/// - Duplicate keys: `get_field` takes the leftmost entry, the kernel evaluator the rightmost.
-/// - Boolean: arrow's cast also accepts `"yes"`/`"no"`/`"on"`/`"off"`/`"t"`/`"f"`/`"1"`/`"0"`,
-///   while kernel accepts only `"true"`/`"false"`.
-/// - Decimal: arrow's cast silently rescales/rounds to the target scale, while kernel requires the
-///   value's scale to match the target's exactly (and hard-errors otherwise).
+/// The native lowering has known differences from the kernel parser for malformed or
+/// non-spec-compliant input:
+/// - Duplicate keys use the leftmost entry instead of the rightmost.
+/// - Boolean casts also accept `yes`, `no`, `on`, `off`, `t`, `f`, `1`, and `0`.
+/// - Decimal casts may rescale or round instead of requiring an exact target scale.
+///
+/// Configured options use a kernel-backed UDF so reader-timezone parsing follows kernel semantics.
 ///
 /// # Errors
 /// Returns an error when `output_type` is absent, not a struct, or has a non-primitive field, or
@@ -417,9 +416,20 @@ fn map_to_struct_to_df_expr(
     let target = require_struct_output(output_type, "MapToStruct")?;
     let map = to_df_expr(&map_to_struct.map_expr, input_schema, None)?;
 
+    if map_to_struct.options == MapToStructOptions::default() {
+        return lower_default_map_to_struct(map, target);
+    }
+
+    validate_map_to_struct_target(target)?;
+    let udf =
+        KernelMapToStructUdf::try_new(Arc::new(target.clone()), map_to_struct.options.clone())?;
+    Ok(ScalarUDF::new_from_impl(udf).call(vec![map]))
+}
+
+fn lower_default_map_to_struct(map: DFExpr, target: &StructType) -> DeltaResult<DFExpr> {
     let mut args = Vec::with_capacity(target.num_fields() * 2);
     for field in target.fields() {
-        let KernelDataType::Primitive(prim) = field.data_type() else {
+        let KernelDataType::Primitive(primitive) = field.data_type() else {
             return Err(Error::unsupported(format!(
                 "MapToStruct only supports primitive target types, but field '{}' is {:?}",
                 field.name(),
@@ -427,9 +437,7 @@ fn map_to_struct_to_df_expr(
             )));
         };
         let raw = get_field(map.clone(), field.name().to_string());
-        let value = match prim {
-            // An empty string is a value for these two (the empty string / empty bytes) and null
-            // for every other type based on kernel.
+        let value = match primitive {
             PrimitiveType::String | PrimitiveType::Binary => raw,
             _ => nullif(raw, lit("")),
         };
@@ -442,6 +450,79 @@ fn map_to_struct_to_df_expr(
     }
 
     Ok(struct_null_when_not(map.is_not_null(), named_struct(args)))
+}
+
+fn validate_map_to_struct_target(target: &StructType) -> DeltaResult<()> {
+    for field in target.fields() {
+        if !matches!(field.data_type(), KernelDataType::Primitive(_)) {
+            return Err(Error::unsupported(format!(
+                "MapToStruct only supports primitive target types, but field '{}' is {:?}",
+                field.name(),
+                field.data_type()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A DataFusion scalar UDF that delegates map-to-struct parsing to kernel's Arrow evaluator.
+#[derive(Debug, PartialEq, Eq)]
+struct KernelMapToStructUdf {
+    output_schema: KernelSchemaRef,
+    options: MapToStructOptions,
+    return_type: ArrowDataType,
+    signature: Signature,
+}
+
+impl std::hash::Hash for KernelMapToStructUdf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_output_schema(self.output_schema.as_ref(), state);
+        self.options.hash(state);
+    }
+}
+
+impl KernelMapToStructUdf {
+    fn try_new(output_schema: KernelSchemaRef, options: MapToStructOptions) -> DeltaResult<Self> {
+        let arrow_schema: ArrowSchema = output_schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(Error::generic_err)?;
+        Ok(Self {
+            return_type: ArrowDataType::Struct(arrow_schema.fields().clone()),
+            output_schema,
+            options,
+            signature: Signature::any(1, Volatility::Immutable),
+        })
+    }
+}
+
+impl ScalarUDFImpl for KernelMapToStructUdf {
+    fn name(&self) -> &str {
+        "kernel_map_to_struct"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        let num_rows = args.number_rows;
+        let [map] = take_function_args(self.name(), args.args)?;
+        let batch = RecordBatch::try_from_iter([("map", map.into_array(num_rows)?)])?;
+        let expression = KernelExpression::map_to_struct(
+            KernelExpression::column(["map"]),
+            self.options.clone(),
+        );
+        let output_type = KernelDataType::from(self.output_schema.as_ref().clone());
+        let result =
+            kernel_expression::evaluate_expression(&expression, &batch, Some(&output_type))
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(ColumnarValue::Array(result))
+    }
 }
 
 /// Lowers a `ParseJson` (parse a JSON-string column into a struct) to a call of the
@@ -478,11 +559,15 @@ struct ParseJsonUdf {
 /// elimination. The output schema captures this UDF's schema-dependent behavior; its signature is
 /// otherwise identical for every instance.
 impl std::hash::Hash for ParseJsonUdf {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        for field in self.output_schema.fields() {
-            field.name().hash(state);
-            field.data_type().to_string().hash(state);
-        }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_output_schema(self.output_schema.as_ref(), state);
+    }
+}
+
+fn hash_output_schema<H: Hasher>(schema: &StructType, state: &mut H) {
+    for field in schema.fields() {
+        field.name().hash(state);
+        field.data_type().to_string().hash(state);
     }
 }
 
@@ -539,14 +624,18 @@ impl ScalarUDFImpl for ParseJsonUdf {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::{Array, AsArray, StringArray};
+    use datafusion::arrow::array::{
+        Array, AsArray, Int32Array, MapBuilder, StringArray, StringBuilder,
+        TimestampMicrosecondArray,
+    };
+    use datafusion::arrow::datatypes::Field as ArrowField;
     use datafusion::assert_batches_eq;
     use datafusion::common::DFSchema;
     use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
         col, lit, null_lit, ColumnName as KernelColumnName, Expression as KernelExpr,
-        ExpressionStructPatch, ExpressionStructPatchBuilder,
+        ExpressionStructPatch, ExpressionStructPatchBuilder, MapToStructOptions,
     };
     use delta_kernel::schema::{schema, schema_ref, ArrayType, DataType, MapType, StructType};
     use rstest::rstest;
@@ -997,29 +1086,22 @@ mod tests {
         schema! { nullable "pv": { STRING => nullable STRING } }
     }
 
-    /// Lowers a `MapToStruct` over `pv` targeting `output_schema` and renders it as a `Display`
-    /// string.
-    fn lower_map_to_struct(output_schema: StructType) -> String {
-        let kernel = KernelExpr::map_to_struct(col!("pv"));
+    fn lower_map_to_struct(output_schema: StructType, options: MapToStructOptions) -> String {
+        let kernel = KernelExpr::map_to_struct(col!("pv"), options);
         let target: DataType = output_schema.into();
         to_df_expr(&kernel, &pv_map_schema(), Some(&target))
             .unwrap()
             .to_string()
     }
 
-    /// Each target field extracts its value with `cast(get_field(pv, name), T)`, and the whole
-    /// rebuild is wrapped in a null-map guard. Runtime cast/parse semantics (empty-string,
-    /// temporal, decimal, duplicate keys, null masking) are arrow's, verified end-to-end rather
-    /// than here.
     #[test]
-    fn map_to_struct_lowers_to_named_struct_over_get_field() {
+    fn default_map_to_struct_retains_native_lowering() {
         let target = schema! {
             nullable "region": STRING,
             nullable "id": INTEGER,
         };
-        let rendered = lower_map_to_struct(target);
         assert_eq!(
-            rendered,
+            lower_map_to_struct(target, MapToStructOptions::default()),
             concat!(
                 r#"CASE WHEN pv IS NOT NULL THEN named_struct("#,
                 r#"Utf8("region"), CAST(get_field(pv, Utf8("region")) AS Utf8), "#,
@@ -1029,27 +1111,21 @@ mod tests {
         );
     }
 
-    /// String and Binary targets keep the raw value (empty string is a valid value), so they lower
-    /// to a bare `cast`; every other primitive first maps an empty string to null via `nullif`.
-    #[rstest]
-    #[case::string_bare_cast(DataType::STRING, "CAST(get_field(pv, Utf8(\"f\")) AS Utf8)")]
-    #[case::binary_bare_cast(DataType::BINARY, "CAST(get_field(pv, Utf8(\"f\")) AS Binary)")]
-    #[case::integer_wraps_nullif(
-        DataType::INTEGER,
-        "CAST(nullif(get_field(pv, Utf8(\"f\")), Utf8(\"\")) AS Int32)"
-    )]
-    fn map_to_struct_field_value_lowering(
-        #[case] field_type: DataType,
-        #[case] expected_value: &str,
-    ) {
-        let target = schema! { nullable "f": (field_type) };
-        let expected =
-            format!("CASE WHEN pv IS NOT NULL THEN named_struct(Utf8(\"f\"), {expected_value}) ELSE NULL END");
-        assert_eq!(lower_map_to_struct(target), expected);
+    #[test]
+    fn configured_map_to_struct_lowers_to_kernel_udf() {
+        let target = schema! {
+            nullable "region": STRING,
+            nullable "id": INTEGER,
+        };
+        let options = MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles");
+        assert_eq!(
+            lower_map_to_struct(target, options),
+            "kernel_map_to_struct(pv)"
+        );
     }
 
-    /// The target must be a struct of primitive fields: an absent one leaves the rebuild without
-    /// field names, and a non-primitive field has no string-to-value cast.
+    /// The target must be a struct of primitive fields: an absent one provides no field names,
+    /// and a non-primitive field is outside map-to-struct's parsing contract.
     #[rstest]
     #[case::no_target(None, "MapToStruct expression requires a struct output type")]
     #[case::non_primitive_field(
@@ -1059,14 +1135,69 @@ mod tests {
         "MapToStruct only supports primitive target types, but field 'nested' is"
     )]
     fn map_to_struct_with_unsupported_target_is_an_error(
+        #[values(
+            MapToStructOptions::default(),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles")
+        )]
+        options: MapToStructOptions,
         #[case] output_type: Option<DataType>,
         #[case] expected_message: &str,
     ) {
-        let kernel = KernelExpr::map_to_struct(col!("pv"));
+        let kernel = KernelExpr::map_to_struct(col!("pv"), options);
         let err = to_df_expr(&kernel, &pv_map_schema(), output_type.as_ref())
             .unwrap_err()
             .to_string();
         assert!(err.contains(expected_message), "{err}");
+    }
+
+    #[rstest]
+    #[case::default_utc(MapToStructOptions::default(), 1_718_443_800_000_000)]
+    #[case::reader_timezone(
+        MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        1_718_469_000_000_000
+    )]
+    fn map_to_struct_executes_with_options(
+        #[case] options: MapToStructOptions,
+        #[case] expected_timestamp: i64,
+    ) {
+        let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        maps.keys().append_value("id");
+        maps.values().append_value("7");
+        maps.keys().append_value("ts");
+        maps.values().append_value("2024-06-15 09:30:00");
+        maps.append(true).unwrap();
+        maps.append(false).unwrap();
+        let map = Arc::new(maps.finish()) as ArrayRef;
+        let arrow_schema =
+            ArrowSchema::new(vec![ArrowField::new("pv", map.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), vec![map]).unwrap();
+        let target = schema! {
+            nullable "id": INTEGER,
+            nullable "ts": TIMESTAMP,
+        };
+        let logical = to_df_expr(
+            &KernelExpr::map_to_struct(col!("pv"), options),
+            &pv_map_schema(),
+            Some(&DataType::from(target)),
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
+        let result = result.as_struct();
+        let ids = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let timestamps = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), 7);
+        assert_eq!(timestamps.value(0), expected_timestamp);
+        assert!(result.is_null(1));
     }
 
     // === ParseJson Shared Helpers ===

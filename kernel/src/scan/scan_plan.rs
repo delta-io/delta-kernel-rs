@@ -17,7 +17,7 @@ use crate::actions::{
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
     col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
-    Predicate,
+    MapToStructOptions, Predicate,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
@@ -486,7 +486,10 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         match physical_partitions {
             Some(schema) => {
                 let field = StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone());
-                let expr = Expr::map_to_struct(col!(ADD_NAME, PARTITION_VALUES));
+                let expr = Expr::map_to_struct(
+                    col!(ADD_NAME, PARTITION_VALUES),
+                    MapToStructOptions::default(),
+                );
                 if has_partition_values_parsed {
                     let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
                     self.replace_at(add, PARTITION_VALUES_PARSED, field, expr)
