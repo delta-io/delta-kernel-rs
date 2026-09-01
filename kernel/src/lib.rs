@@ -1,12 +1,11 @@
 //! # Delta Kernel
 //!
 //! Delta-kernel-rs is an experimental [Delta](https://github.com/delta-io/delta/) implementation
-//! focused on interoperability with a wide range of query engines. It supports reads and
-//! (experimental) writes (only blind appends in the write path currently). This library defines a
-//! number of traits which must be implemented to provide a working delta implementation. They are
-//! detailed below. There is a provided "default engine" that implements all these traits and can
-//! be used to ease integration work. See [`DefaultEngine`](engine/default/index.html) for more
-//! information.
+//! focused on interoperability with a wide range of query engines. It supports table reads, table
+//! creation, appends, file removals, deletion-vector updates, and limited schema evolution. This
+//! library defines the traits that connectors implement to provide I/O and expression evaluation.
+//! The [`delta_kernel_default_engine`](https://docs.rs/delta_kernel_default_engine) crate provides
+//! a ready-to-use implementation based on Arrow, `object_store`, and Tokio.
 //!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
@@ -26,15 +25,15 @@
 //! # Engine trait
 //!
 //! The [`Engine`] trait allows connectors to bring their own implementation of functionality such
-//! as reading parquet files, listing files in a file system, parsing a JSON string etc. This
-//! trait exposes methods to get sub-engines which expose the core functionalities customizable by
-//! connectors.
+//! as reading and writing Parquet and JSON files, listing files in storage, and evaluating
+//! expressions. It exposes handler traits for each capability.
+//! When adding cloud-storage functionality to an engine, such as writing JSON files, make sure to
+//! test it against S3, Azure, and GCS.
 //!
 //! ## Expression handling
 //!
-//! Expression handling is done via the [`EvaluationHandler`], which in turn allows the creation of
-//! [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
-//! and allow evaluation of that predicate for a specific batch of data.
+//! [`EvaluationHandler`] creates an [`ExpressionEvaluator`] for an [`Expression`] or a
+//! [`PredicateEvaluator`] for a [`Predicate`]. Each evaluator can process multiple data batches.
 //!
 //! ## File system interactions
 //!
@@ -45,10 +44,9 @@
 //!
 //! ## Reading log and data files
 //!
-//! Delta Kernel requires the capability to read and write json files and read parquet files, which
-//! is exposed via the [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files,
-//! connectors are asked to provide the context information they require to execute the actual
-//! operation. This is done by invoking methods on the [`StorageHandler`] trait.
+//! Delta Kernel requires the capability to read and write JSON and Parquet files, exposed via the
+//! [`JsonHandler`] and [`ParquetHandler`] respectively. Their read methods receive the context
+//! needed to execute the operation.
 
 #![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_cfg))]
 #![warn(
@@ -147,7 +145,7 @@ pub mod utils;
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::{try_parse_uri, CollectInto};
+pub use utils::{try_parse_uri, CollectInto, FoldWithOption};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -199,7 +197,7 @@ pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
-use schema::{StructField, StructType};
+use schema::{schema_ref, StructField};
 pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
@@ -361,6 +359,13 @@ pub trait AsAny: Any + Send + Sync {
     /// let a: &dyn Any = f.any_ref();
     /// let b: &Bar = a.downcast_ref().unwrap();
     /// ```
+    ///
+    /// When downcasting from behind an `Arc<dyn Trait>`, borrow the trait object first
+    /// (`arc.as_ref().any_ref()`): `Arc<dyn Trait>` is itself `Sized + Any`, so calling `any_ref()`
+    /// directly on the `Arc` downcasts the *`Arc`*, not the value inside it. The owning [`as_any`]
+    /// has no such hazard -- its `Arc<Self>` receiver binds to the inner value.
+    ///
+    /// [`as_any`]: AsAny::as_any
     fn any_ref(&self) -> &(dyn Any + Send + Sync);
 
     /// Obtains an `Arc<dyn Any>` reference to the object:
@@ -550,10 +555,9 @@ trait EvaluationHandlerExtension: EvaluationHandler {
     // future)
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
         // just get a single int column (arbitrary)
-        let null_row_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "null_col",
-            DataType::INTEGER,
-        )]));
+        let null_row_schema = schema_ref! {
+            nullable "null_col": INTEGER,
+        };
         let null_row = self.null_row(null_row_schema.clone())?;
 
         // Convert schema and leaf values to an expression
@@ -625,11 +629,56 @@ pub trait StorageHandler: AsAny {
     fn list_from(&self, path: &Url)
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
+    /// Cancellation-aware variant of [`list_from`](Self::list_from).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race its listing against the token and
+    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// rather than paging through the whole listing.
+    ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`list_from`](Self::list_from), ignoring the token for the rest
+    /// of the listing. So an engine that does not override this stays source-compatible while still
+    /// honoring an up-front cancellation; kernel additionally polls the token as it consumes the
+    /// listing. An engine that overrides this takes over the up-front check and should also
+    /// fast-path an already-cancelled token before starting I/O.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn list_from_with_cancellation(
+        &self,
+        path: &Url,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        check_cancelled(cancellation_token.as_ref())?;
+        self.list_from(path)
+    }
+
     /// Read data specified by the start and end offset from the file.
     fn read_files(
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+
+    /// Cancellation-aware variant of [`read_files`](Self::read_files).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
+    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// rather than reading every file slice to completion.
+    ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_files`](Self::read_files), ignoring the token for the rest
+    /// of the read. So an engine that does not override this stays source-compatible while still
+    /// honoring an up-front cancellation. An engine that overrides this takes over the up-front
+    /// check and should also fast-path an already-cancelled token before starting I/O.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_files_with_cancellation(
+        &self,
+        files: Vec<FileSlice>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+        check_cancelled(cancellation_token.as_ref())?;
+        self.read_files(files)
+    }
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
     /// it must return Err(Error::FileAlreadyExists).
@@ -712,8 +761,8 @@ pub trait JsonHandler: AsAny {
     /// and otherwise delegates to [`read_json_files`](Self::read_json_files), ignoring the token
     /// for the rest of the read. So an engine that does not override this stays source-compatible
     /// while still honoring an up-front cancellation; kernel additionally polls the token at
-    /// action-batch boundaries. An engine that overrides this may assume kernel has already
-    /// performed the pre-read check, and should focus on interrupting its in-flight I/O.
+    /// action-batch boundaries. An engine that overrides this takes over the up-front check and
+    /// should also fast-path an already-cancelled token before starting I/O.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_json_files_with_cancellation(
@@ -751,12 +800,21 @@ pub trait JsonHandler: AsAny {
     /// - `data` - Iterator of [`FilteredEngineData`] to write to the JSON file
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
+    ///
+    /// # Returns
+    ///
+    /// The exact number of serialized bytes written to the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FileAlreadyExists`] when `overwrite` is false and the destination exists,
+    /// or another error when serialization or storage fails.
     fn write_json_file(
         &self,
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<FileSize>;
 }
 
 /// Reserved field IDs for metadata columns in Delta tables.
@@ -950,8 +1008,8 @@ pub trait ParquetHandler: AsAny {
     /// and otherwise delegates to [`read_parquet_files`](Self::read_parquet_files), ignoring the
     /// token for the rest of the read. So an engine that does not override this stays
     /// source-compatible while still honoring an up-front cancellation; kernel additionally polls
-    /// the token at action-batch boundaries. An engine that overrides this may assume kernel has
-    /// already performed the pre-read check, and should focus on interrupting its in-flight I/O.
+    /// the token at action-batch boundaries. An engine that overrides this takes over the up-front
+    /// check and should also fast-path an already-cancelled token before starting I/O.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_parquet_files_with_cancellation(
@@ -1053,8 +1111,8 @@ pub trait ParquetHandler: AsAny {
     /// and otherwise delegates to [`read_parquet_footer`](Self::read_parquet_footer), ignoring the
     /// token for the rest of the read. So an engine that does not override this stays
     /// source-compatible while still honoring an up-front cancellation. An engine that overrides
-    /// this may assume kernel has already performed the pre-read check, and should focus on
-    /// interrupting its in-flight I/O.
+    /// this takes over the up-front check and should also fast-path an already-cancelled token
+    /// before starting I/O.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_parquet_footer_with_cancellation(
@@ -1067,11 +1125,10 @@ pub trait ParquetHandler: AsAny {
     }
 }
 
-/// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide
-/// to the Delta Kernel in order to read the Delta table.
+/// The `Engine` trait encapsulates the functionality an engine or connector provides to operate
+/// on Delta tables.
 ///
-/// Engines/Connectors are expected to pass an implementation of this trait when reading a Delta
-/// table.
+/// Connectors pass an implementation of this trait to Delta Kernel operations.
 pub trait Engine: AsAny {
     /// Get the connector provided [`EvaluationHandler`].
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;

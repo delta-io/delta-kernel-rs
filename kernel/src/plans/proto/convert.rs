@@ -18,8 +18,8 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
+    ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -147,7 +147,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Values(n) => Op::Values(n.into()),
             Operator::Project(n) => Op::Project(n.into()),
             Operator::Filter(n) => Op::Filter(n.into()),
-            Operator::Load(n) => Op::Load(n.into()),
+            Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
@@ -218,25 +218,17 @@ impl From<&Filter> for proto_plan::FilterNode {
     }
 }
 
-impl From<&Load> for proto_plan::LoadNode {
-    fn from(node: &Load) -> Self {
-        proto_plan::LoadNode {
+impl From<&DynamicScan> for proto_plan::DynamicScanNode {
+    fn from(node: &DynamicScan) -> Self {
+        proto_plan::DynamicScanNode {
             schema: Some(node.schema.as_ref().into()),
             file_type: proto_plan::FileType::from(node.file_type) as i32,
-            base_url: node.base_url.as_ref().map(ToString::to_string),
+            base_url: node.base_url.to_string(),
             file_constant_columns: node.file_constant_columns.clone(),
-            file_meta: Some((&node.file_meta).into()),
-            dv_column: Some((&node.dv_column).into()),
-        }
-    }
-}
-
-impl From<&LoadColumnFileMeta> for proto_plan::LoadColumnFileMeta {
-    fn from(meta: &LoadColumnFileMeta) -> Self {
-        proto_plan::LoadColumnFileMeta {
-            path_column: Some((&meta.path_column).into()),
-            file_size_column: Some((&meta.file_size_column).into()),
-            num_records_column: Some((&meta.num_records_column).into()),
+            path_column: Some((&node.path_column).into()),
+            file_size_column: Some((&node.file_size_column).into()),
+            last_modified_column: Some((&node.last_modified_column).into()),
+            dv_column: node.dv_column.as_ref().map(Into::into),
         }
     }
 }
@@ -254,22 +246,31 @@ impl From<&Aggregate> for proto_plan::AggregateNode {
 impl From<&Agg> for proto_plan::Agg {
     fn from(agg: &Agg) -> Self {
         let func = match agg {
-            Agg::Min { value } => proto_agg::Func::Min(proto_plan::MinAgg {
+            Agg::Min(value) => proto_agg::Func::Min(proto_plan::MinAgg {
                 value: Some(value.into()),
             }),
-            Agg::Max { value } => proto_agg::Func::Max(proto_plan::MaxAgg {
+            Agg::Max(value) => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
-            Agg::MinNonNullBy { value, key } => {
+            Agg::Sum(value) => proto_agg::Func::Sum(proto_plan::SumAgg {
+                value: Some(value.into()),
+            }),
+            Agg::Count(value) => proto_agg::Func::Count(proto_plan::CountAgg {
+                value: Some(value.into()),
+            }),
+            Agg::CountStar => proto_agg::Func::CountStar(proto_plan::CountStarAgg {}),
+            Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
-            Agg::MaxNonNullBy { value, key } => {
+            Agg::MaxNonNullBy(operands) => {
                 proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
         };
@@ -795,11 +796,9 @@ impl TryFrom<proto_schema::DataType> for DataType {
             .ok_or_else(|| Error::schema("DataType proto missing kind"))?;
         let data_type = match kind {
             DataTypeKind::Primitive(primitive) => DataType::Primitive(primitive.try_into()?),
-            DataTypeKind::Array(array) => DataType::Array(Box::new((*array).try_into()?)),
-            DataTypeKind::Struct(struct_type) => {
-                DataType::Struct(Box::new(struct_type.try_into()?))
-            }
-            DataTypeKind::Map(map) => DataType::Map(Box::new((*map).try_into()?)),
+            DataTypeKind::Array(array) => DataType::from(ArrayType::try_from(*array)?),
+            DataTypeKind::Struct(struct_type) => DataType::from(StructType::try_from(struct_type)?),
+            DataTypeKind::Map(map) => DataType::from(MapType::try_from(*map)?),
             // Kernel does not support shredded variants, so always decode as unshredded.
             DataTypeKind::Variant(_) => DataType::unshredded_variant(),
         };
@@ -975,19 +974,20 @@ mod tests {
 
     #[cfg(feature = "geo-type-in-dev")]
     use super::EdgeAlgo;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
-        lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
-        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
-        OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator, StructData,
-        UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
+        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
+        DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
+        OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+        StructData, UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
-        ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
+        ScanParquet, SemiJoin, UnionAll, Values,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -996,8 +996,8 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
-        StructField, StructType,
+        schema, schema_ref, ArrayType, DataType, DecimalType, MapType, MetadataValue,
+        PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     fn sample_schema() -> SchemaRef {
-        Arc::new(StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap())
+        schema_ref! { nullable "id": INTEGER }
     }
 
     fn decode(op: &Operation) -> proto_op::Operation {
@@ -1216,13 +1216,10 @@ mod tests {
 
     #[test]
     fn from_plan() {
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::not_null("name", DataType::STRING),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            not_null "name": STRING,
+        };
         let plan = Plan {
             nodes: vec![
                 PlanNode {
@@ -1235,10 +1232,7 @@ mod tests {
                 },
                 PlanNode {
                     op: Operator::Filter(Filter {
-                        predicate: Arc::new(Predicate::gt(
-                            Expression::Column(ColumnName::new(["id"])),
-                            lit(5i32),
-                        )),
+                        predicate: Arc::new(Predicate::gt(col!("id"), lit(5i32))),
                     }),
                     inputs: vec![0],
                 },
@@ -1305,17 +1299,19 @@ mod tests {
         }),
         "project"
     )]
-    #[case(Operator::Filter(Filter { predicate: Arc::new(Predicate::literal(true)) }), "filter")]
+    #[case(Operator::Filter(Filter { predicate: Arc::new(Predicate::TRUE) }), "filter")]
     #[case(
-        Operator::Load(Load {
+        Operator::DynamicScan(DynamicScan {
             schema: sample_schema(),
             file_type: FileType::Parquet,
-            base_url: None,
+            base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],
-            file_meta: sample_load_column_file_meta(),
-            dv_column: ColumnName::new(["dv"]),
+            path_column: column_name!("path"),
+            file_size_column: column_name!("size"),
+            last_modified_column: column_name!("filemod"),
+            dv_column: Some(column_name!("dv")),
         }),
-        "load"
+        "dynamic_scan"
     )]
     #[case(
         Operator::Aggregate(Aggregate {
@@ -1338,7 +1334,7 @@ mod tests {
             Op::Values(_) => "values",
             Op::Project(_) => "project",
             Op::Filter(_) => "filter",
-            Op::Load(_) => "load",
+            Op::DynamicScan(_) => "dynamic_scan",
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
             Op::UnionAll(_) => "union_all",
@@ -1409,61 +1405,102 @@ mod tests {
     #[test]
     fn from_filter() {
         let node = Filter {
-            predicate: Arc::new(Predicate::literal(true)),
+            predicate: Arc::new(Predicate::TRUE),
         };
         let proto = proto_plan::FilterNode::from(&node);
         assert!(proto.predicate.is_some());
     }
 
-    fn sample_load_column_file_meta() -> LoadColumnFileMeta {
-        LoadColumnFileMeta {
-            path_column: ColumnName::new(["path"]),
-            file_size_column: ColumnName::new(["size"]),
-            num_records_column: ColumnName::new(["num_records"]),
+    fn sample_dynamic_scan_input_schema() -> SchemaRef {
+        schema_ref! {
+            not_null "path": STRING,
+            not_null "size": LONG,
+            not_null "filemod": LONG,
+            nullable "dv": (DeletionVectorDescriptor::to_schema()),
+            nullable "c": INTEGER,
+        }
+    }
+
+    fn sample_dynamic_scan_output_schema() -> SchemaRef {
+        schema_ref! {
+            nullable "id": INTEGER,
+            nullable "c": INTEGER,
         }
     }
 
     #[rstest]
     #[case(
         FileType::Json,
-        Some(Url::parse("memory:///base/").unwrap()),
-        Some("memory:///base/")
+        Url::parse("memory:///base/").unwrap(),
+        "memory:///base/",
+        Some(column_name!("dv"))
     )]
-    #[case(FileType::Parquet, None, None)]
-    fn from_load(
+    #[case(
+        FileType::Parquet,
+        Url::parse("file:///table/").unwrap(),
+        "file:///table/",
+        Some(column_name!("dv"))
+    )]
+    #[case(
+        FileType::Parquet,
+        Url::parse("memory:///base/").unwrap(),
+        "memory:///base/",
+        None
+    )]
+    fn from_dynamic_scan(
         #[case] file_type: FileType,
-        #[case] base_url: Option<Url>,
-        #[case] expected_base_url: Option<&str>,
-    ) {
-        let node = Load {
-            schema: sample_schema(),
+        #[case] base_url: Url,
+        #[case] expected_base_url: &str,
+        #[case] dv_column: Option<ColumnName>,
+    ) -> DeltaResult<()> {
+        let expect_dv_column = dv_column.is_some();
+        let node = DynamicScan::try_new(
+            &sample_dynamic_scan_input_schema(),
+            sample_dynamic_scan_output_schema(),
             file_type,
             base_url,
-            file_constant_columns: vec!["c".to_string()],
-            file_meta: sample_load_column_file_meta(),
-            dv_column: ColumnName::new(["dv"]),
-        };
-        let proto = proto_plan::LoadNode::from(&node);
+            ["c"],
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+            dv_column,
+        )?;
+        let proto = proto_plan::DynamicScanNode::from(&node);
         assert!(proto.schema.is_some());
         assert_eq!(
             proto.file_type,
             proto_plan::FileType::from(file_type) as i32
         );
-        assert_eq!(proto.base_url.as_deref(), expected_base_url);
+        assert_eq!(proto.base_url, expected_base_url);
         assert_eq!(proto.file_constant_columns.len(), 1);
-        assert!(proto.dv_column.is_some());
+        assert_eq!(proto.dv_column.is_some(), expect_dv_column);
 
-        let file_meta = proto.file_meta.expect("file_meta present");
-        assert!(file_meta.path_column.is_some());
-        assert!(file_meta.file_size_column.is_some());
-        assert!(file_meta.num_records_column.is_some());
+        assert_eq!(
+            proto.path_column.expect("path column present").path,
+            ["path"]
+        );
+        assert_eq!(
+            proto
+                .file_size_column
+                .expect("file size column present")
+                .path,
+            ["size"]
+        );
+        assert_eq!(
+            proto
+                .last_modified_column
+                .expect("last modified column present")
+                .path,
+            ["filemod"]
+        );
+        Ok(())
     }
 
     #[test]
     fn from_aggregate() {
         let node = Aggregate {
-            group_by: vec![ColumnName::new(["g"])],
-            aggs: vec![Agg::max(ColumnName::new(["a"]))],
+            group_by: vec![column_name!("g")],
+            aggs: vec![Agg::max(column_name!("a"))],
             schema: sample_schema(),
         };
         let proto = proto_plan::AggregateNode::from(&node);
@@ -1474,16 +1511,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Agg::min(ColumnName::new(["a"])), "min")]
-    #[case(Agg::max(ColumnName::new(["a"])), "max")]
-    #[case(Agg::min_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "min_non_null_by")]
-    #[case(Agg::max_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "max_non_null_by")]
+    #[case(Agg::min(column_name!("a")), "min")]
+    #[case(Agg::max(column_name!("a")), "max")]
+    #[case(Agg::sum(column_name!("a")), "sum")]
+    #[case(Agg::count(column_name!("a")), "count")]
+    #[case(Agg::count_star(), "count_star")]
+    #[case(Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "min_non_null_by")]
+    #[case(Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
         use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);
         let kind = match proto.func.unwrap() {
             Func::Min(_) => "min",
             Func::Max(_) => "max",
+            Func::Sum(_) => "sum",
+            Func::Count(_) => "count",
+            Func::CountStar(_) => "count_star",
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
@@ -1496,8 +1539,8 @@ mod tests {
     fn from_semi_join(#[case] inverted: bool) {
         let node = SemiJoin {
             inverted,
-            probe_keys: vec![ColumnName::new(["p"])],
-            build_keys: vec![ColumnName::new(["b"])],
+            probe_keys: vec![column_name!("p")],
+            build_keys: vec![column_name!("b")],
         };
         let proto = proto_plan::SemiJoinNode::from(&node);
         assert_eq!(proto.inverted, inverted);
@@ -1516,8 +1559,8 @@ mod tests {
 
     #[rstest]
     #[case(lit(1), "literal")]
-    #[case(Expression::Column(ColumnName::new(["a"])), "column")]
-    #[case(Expression::Predicate(Box::new(Predicate::literal(true))), "predicate")]
+    #[case(col!("a"), "column")]
+    #[case(Expression::Predicate(Box::new(Predicate::TRUE)), "predicate")]
     #[case(Expression::struct_from([lit(1)]), "struct_expr")]
     #[case(
         Expression::StructPatch(
@@ -1530,7 +1573,7 @@ mod tests {
     #[case(Expression::coalesce([lit(1), lit(2)]), "variadic")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
-    #[case(Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))), "map_to_struct")]
+    #[case(Expression::map_to_struct(col!("m")), "map_to_struct")]
     #[case(Expression::unknown("x"), "unknown")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
@@ -1553,14 +1596,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Predicate::literal(true), "boolean_expression")]
-    #[case(Predicate::not(Predicate::literal(true)), "not")]
+    #[case(Predicate::TRUE, "boolean_expression")]
+    #[case(Predicate::not(Predicate::TRUE), "not")]
     #[case(Predicate::is_null(lit(1)), "unary")]
     #[case(Predicate::gt(lit(1), lit(2)), "binary")]
-    #[case(
-        Predicate::and(Predicate::literal(true), Predicate::literal(false)),
-        "junction"
-    )]
+    #[case(Predicate::and(Predicate::TRUE, Predicate::FALSE), "junction")]
     #[case(Predicate::opaque(TestOpaquePredOp, [lit(1)]), "opaque")]
     #[case(Predicate::Unknown("x".to_string()), "unknown")]
     fn from_predicate(#[case] pred: Predicate, #[case] expected: &str) {
@@ -1579,7 +1619,7 @@ mod tests {
 
     #[test]
     fn from_column_name() {
-        let proto = proto_expr::ColumnName::from(&ColumnName::new(["a", "b", "c"]));
+        let proto = proto_expr::ColumnName::from(&column_name!("a.b.c"));
         assert_eq!(proto.path, vec!["a", "b", "c"]);
     }
 
@@ -1663,9 +1703,9 @@ mod tests {
 
     #[test]
     fn from_map_to_struct_expression() {
-        let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
-            Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))),
-        ) else {
+        let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
+            expr_kind_of(Expression::map_to_struct(col!("m")))
+        else {
             panic!("expected a map_to_struct expression");
         };
         assert!(map_to_struct.map_expr.is_some());
@@ -1695,10 +1735,9 @@ mod tests {
 
     #[test]
     fn from_junction_predicate() {
-        let proto_expr::predicate::Kind::Junction(junction) = pred_kind_of(Predicate::and(
-            Predicate::literal(true),
-            Predicate::literal(false),
-        )) else {
+        let proto_expr::predicate::Kind::Junction(junction) =
+            pred_kind_of(Predicate::and(Predicate::TRUE, Predicate::FALSE))
+        else {
             panic!("expected a junction predicate");
         };
         assert_eq!(junction.op, proto_expr::JunctionPredicateOp::And as i32);
@@ -1991,12 +2030,7 @@ mod tests {
     #[rstest]
     #[case(DataType::INTEGER, "primitive")]
     #[case(ArrayType::new(DataType::INTEGER, true).into(), "array")]
-    #[case(
-        StructType::try_new(vec![StructField::nullable("a", DataType::INTEGER)])
-            .unwrap()
-            .into(),
-        "struct"
-    )]
+    #[case(DataType::from(schema! { nullable "a": INTEGER }), "struct")]
     #[case(MapType::new(DataType::STRING, DataType::INTEGER, true).into(), "map")]
     #[case(DataType::unshredded_variant(), "variant")]
     fn from_data_type(#[case] value: DataType, #[case] expected: &str) {
@@ -2085,11 +2119,10 @@ mod tests {
 
     #[test]
     fn from_struct_type() {
-        let struct_type = StructType::try_new(vec![
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::not_null("b", DataType::STRING),
-        ])
-        .unwrap();
+        let struct_type = schema! {
+            nullable "a": INTEGER,
+            not_null "b": STRING,
+        };
         let proto = proto_schema::StructType::from(&struct_type);
         assert_eq!(proto.fields.len(), 2);
         assert!(proto.fields[0].nullable);
@@ -2243,10 +2276,10 @@ mod tests {
         MapType::new(DataType::STRING, DataType::LONG, true),
         true
     )))]
-    #[case(DataType::from(StructType::try_new(vec![
-        StructField::nullable("a", DataType::INTEGER),
-        StructField::not_null("b", DataType::STRING),
-    ]).unwrap()))]
+    #[case(DataType::from(schema! {
+        nullable "a": INTEGER,
+        not_null "b": STRING,
+    }))]
     fn round_trip_composite(#[case] data_type: DataType) {
         assert_data_type_round_trips(data_type);
     }
@@ -2264,26 +2297,15 @@ mod tests {
 
     #[test]
     fn round_trip_full_schema() {
-        let schema = StructType::try_new(vec![
-            StructField::nullable("id", DataType::LONG)
-                .with_metadata([("k", MetadataValue::Number(7))]),
-            StructField::not_null("name", DataType::STRING),
-            StructField::nullable("scores", ArrayType::new(DataType::INTEGER, true)),
-            StructField::nullable(
-                "attrs",
-                MapType::new(DataType::STRING, DataType::LONG, true),
-            ),
-            StructField::nullable(
-                "price",
-                DataType::Primitive(PrimitiveType::decimal(10, 2).unwrap()),
-            ),
-            StructField::nullable(
-                "nested",
-                StructType::try_new(vec![StructField::not_null("inner", DataType::BOOLEAN)])
-                    .unwrap(),
-            ),
-        ])
-        .unwrap();
+        let schema = schema! {
+            (StructField::nullable("id", DataType::LONG)
+                .with_metadata([("k", MetadataValue::Number(7))])),
+            not_null "name": STRING,
+            nullable "scores": [ nullable INTEGER ],
+            nullable "attrs": { STRING => nullable LONG },
+            nullable "price": (PrimitiveType::decimal(10, 2).unwrap()),
+            nullable "nested": { not_null "inner": BOOLEAN },
+        };
         assert_schema_round_trips(schema);
     }
 
@@ -2291,14 +2313,11 @@ mod tests {
     /// decodes to the canonical unshredded form rather than round-tripping its inner struct.
     #[test]
     fn variant_decodes_to_unshredded() {
-        let shredded = DataType::Variant(Box::new(
-            StructType::try_new(vec![
-                StructField::not_null("metadata", DataType::BINARY),
-                StructField::not_null("value", DataType::BINARY),
-                StructField::nullable("typed_value", DataType::INTEGER),
-            ])
-            .unwrap(),
-        ));
+        let shredded = DataType::Variant(Box::new(schema! {
+            not_null "metadata": BINARY,
+            not_null "value": BINARY,
+            nullable "typed_value": INTEGER,
+        }));
         let decoded = DataType::try_from(proto_schema::DataType::from(&shredded));
         assert_eq!(
             decoded.expect("decode succeeds"),

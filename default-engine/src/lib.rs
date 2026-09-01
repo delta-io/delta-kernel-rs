@@ -16,7 +16,7 @@ use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
-use delta_kernel::transaction::WriteContext;
+use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler,
     ParquetHandler, StorageHandler,
@@ -223,7 +223,7 @@ pub struct DefaultEngineBuilder<E> {
 impl<E> std::fmt::Debug for DefaultEngineBuilder<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DefaultEngineBuilder")
-            .field("listing_capable", &self.store.paginated.is_some())
+            .field("store", &self.store)
             .field("io_config", &self.io_config)
             .finish_non_exhaustive()
     }
@@ -249,20 +249,10 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
     /// Create a new [`DefaultEngineBuilder`] with the default executor.
     ///
     /// For cloud stores, prefer [`from_url_opts`](Self::from_url_opts): a `dyn ObjectStore` cannot
-    /// expose delimiter pushdown and falls back to a single `list_with_delimiter` request.
-    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+    /// expose provider-specific paginated listing support.
+    pub fn new(store: impl Into<EngineStore>) -> Self {
         Self {
-            store: EngineStore::plain(object_store),
-            task_executor: DefaultTaskExecutor,
-            io_config: ReadIoConfig::default(),
-        }
-    }
-
-    /// Create a [`DefaultEngineBuilder`] from an [`EngineStore`] built separately (e.g. FFI, or a
-    /// custom backend).
-    pub fn from_engine_store(store: EngineStore) -> Self {
-        Self {
-            store,
+            store: store.into(),
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
         }
@@ -409,16 +399,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// `materializePartitionColumns` or `icebergCompatV3`), this function automatically inserts
     /// them into the data.
     ///
-    /// The `write_context` must be created by [`Transaction::partitioned_write_context`] or
-    /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
-    /// serialization, and logical-to-physical key translation.
-    ///
-    /// [`Transaction::partitioned_write_context`]: delta_kernel::transaction::Transaction::partitioned_write_context
-    /// [`Transaction::unpartitioned_write_context`]: delta_kernel::transaction::Transaction::unpartitioned_write_context
+    /// The `write_context` validates and serializes partition values and builds the
+    /// logical-to-physical transformation.
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
-        write_context: &WriteContext,
+        write_context: &BoundWriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
@@ -436,7 +422,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 }
 
 /// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values and
-/// table root from the provided [`WriteContext`].
+/// table root from the provided [`BoundWriteContext`].
 ///
 /// Paths in the returned Add action metadata are stored relative to the table root.
 ///
@@ -449,7 +435,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
 pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
-    write_context: &WriteContext,
+    write_context: &BoundWriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let add_path = write_context.resolve_file_path(file_metadata.location())?;
     file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)

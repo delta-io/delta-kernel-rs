@@ -9,6 +9,8 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
+use crate::path::tests::multipart_checkpoint_name;
+use crate::unit_test_utils::TestCancellationToken;
 use crate::{Engine as _, FileMeta};
 
 // size markers used to identify commit sources in tests
@@ -30,14 +32,15 @@ fn log_path_for_file_type(version: Version, file_type: &LogPathFileType) -> Stri
             let uuid = uuid::Uuid::new_v4();
             format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
         }
-        LogPathFileType::SinglePartCheckpoint => {
+        LogPathFileType::ClassicCheckpoint => {
             format!("_delta_log/{version:020}.checkpoint.parquet")
         }
         LogPathFileType::MultiPartCheckpoint {
             part_num,
             num_parts,
         } => {
-            format!("_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet")
+            let name = multipart_checkpoint_name(version, *part_num, *num_parts);
+            format!("_delta_log/{name}")
         }
         LogPathFileType::Crc => {
             format!("_delta_log/{version:020}.crc")
@@ -215,7 +218,15 @@ fn list_and_destructure(
     Option<ParsedLogPath>,
     Option<Version>,
 ) {
-    let r = LogSegmentFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
+    let r = LogSegmentFiles::list(
+        storage,
+        log_root,
+        log_tail,
+        start_version,
+        end_version,
+        None,
+    )
+    .unwrap();
     (
         r.ascending_commit_files,
         r.ascending_compaction_files,
@@ -531,7 +542,7 @@ async fn test_listing_with_checkpoint_and_crc_omits_staged_commits() {
         (2, LogPathFileType::Commit, CommitSource::Filesystem),
         (
             2,
-            LogPathFileType::SinglePartCheckpoint,
+            LogPathFileType::ClassicCheckpoint,
             CommitSource::Filesystem,
         ),
         (2, LogPathFileType::Crc, CommitSource::Filesystem),
@@ -594,7 +605,7 @@ async fn test_non_commit_files_at_log_tail_versions_are_preserved() {
         (5, LogPathFileType::Commit, CommitSource::Filesystem),
         (
             7,
-            LogPathFileType::SinglePartCheckpoint,
+            LogPathFileType::ClassicCheckpoint,
             CommitSource::Filesystem,
         ),
         (8, LogPathFileType::Crc, CommitSource::Filesystem),
@@ -673,7 +684,7 @@ async fn backward_scan_single_checkpoint_cases(
     if let Some(cp) = checkpoint_version {
         log_files.push((
             cp,
-            LogPathFileType::SinglePartCheckpoint,
+            LogPathFileType::ClassicCheckpoint,
             CommitSource::Filesystem,
         ));
     }
@@ -681,9 +692,14 @@ async fn backward_scan_single_checkpoint_cases(
     let (storage, log_root) = create_storage(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
 
@@ -718,7 +734,7 @@ fn files_incomplete_in_second_window_complete_in_third_window(
         .collect();
     log_files.push((
         500,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     log_files.push((
@@ -810,6 +826,7 @@ async fn backward_scan_multipart_checkpoint_cases(
         &log_root,
         vec![],
         end_version,
+        None,
     )
     .unwrap();
 
@@ -844,7 +861,7 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         .collect();
     log_files.push((
         5,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     let (storage, log_root) = create_storage(log_files).await;
@@ -860,6 +877,7 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         &log_root,
         log_tail,
         10,
+        None,
     )
     .unwrap();
 
@@ -893,7 +911,7 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         .collect();
     log_files.push((
         5,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     log_files.push((6, LogPathFileType::Crc, CommitSource::Filesystem));
@@ -910,6 +928,7 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         &log_root,
         log_tail,
         8,
+        None,
     )
     .unwrap();
 
@@ -952,6 +971,7 @@ async fn backward_scan_log_tail_defines_latest_version() {
         &log_root,
         log_tail,
         5,
+        None,
     )
     .unwrap();
 
@@ -1009,7 +1029,7 @@ async fn test_zero_byte_commit_kept_in_listing() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[0].version, 0);
     assert_eq!(result.ascending_commit_files[1].version, 1);
@@ -1038,10 +1058,16 @@ async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_sca
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4)
-            .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            4,
+            None,
+        )
+        .unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4), None).unwrap()
     };
 
     assert!(
@@ -1072,16 +1098,22 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
         (8, LogPathFileType::Commit, false),
         (9, LogPathFileType::Commit, false),
         (10, LogPathFileType::Commit, false),
-        (5, LogPathFileType::SinglePartCheckpoint, false), // valid checkpoint
-        (10, LogPathFileType::SinglePartCheckpoint, true), // empty checkpoint
+        (5, LogPathFileType::ClassicCheckpoint, false), // valid checkpoint
+        (10, LogPathFileType::ClassicCheckpoint, true), // empty checkpoint
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10)
-            .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            10,
+            None,
+        )
+        .unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10), None).unwrap()
     };
 
     // Should fall back to checkpoint at v5 (the empty v10 checkpoint is skipped)
@@ -1107,7 +1139,7 @@ async fn test_zero_byte_crc_kept() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
 
     // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
     let crc = result.latest_crc_file.unwrap();
@@ -1124,15 +1156,20 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     let mut log_files: Vec<(Version, LogPathFileType, bool)> = (0u64..=1005)
         .map(|v| (v, LogPathFileType::Commit, false))
         .collect();
-    log_files.push((5, LogPathFileType::SinglePartCheckpoint, false));
-    log_files.push((1005, LogPathFileType::SinglePartCheckpoint, true));
+    log_files.push((5, LogPathFileType::ClassicCheckpoint, false));
+    log_files.push((1005, LogPathFileType::ClassicCheckpoint, true));
 
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        None,
+    )
+    .unwrap();
 
     // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
     assert_eq!(counter.call_count(), 2);
@@ -1155,7 +1192,7 @@ async fn test_list_commits_zero_byte_commit_kept() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2))
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None)
             .unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[2].version, 2);
@@ -1227,7 +1264,8 @@ async fn list_commits_merges_log_tail(
         .collect();
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end).unwrap();
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end, None)
+            .unwrap();
 
     let commits = &result.ascending_commit_files;
     assert_eq!(commits.len(), expected.len());
@@ -1248,13 +1286,13 @@ async fn test_list_commits_keeps_commits_across_checkpoint() {
         .collect();
     files.push((
         3,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     let (storage, log_root) = create_storage(files).await;
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5))
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5), None)
             .unwrap();
     let versions: Vec<_> = result
         .ascending_commit_files
@@ -1288,7 +1326,7 @@ fn incomplete_then_complete_files() -> Vec<ParsedLogPath> {
     ));
     files.push(make_parsed_log_path_with_source(
         10,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     files
@@ -1304,12 +1342,12 @@ fn two_complete_checkpoints_files() -> Vec<ParsedLogPath> {
         .collect();
     files.push(make_parsed_log_path_with_source(
         5,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     files.push(make_parsed_log_path_with_source(
         10,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     files
@@ -1331,8 +1369,7 @@ fn find_complete_checkpoint_version_cases(
 ) {
     assert_eq!(find_complete_checkpoint_version(&files), expected);
 }
-
-/// Recursing `list_from` will trip this guard.
+/// A recursive result trips the direct-child assertion in `list_delta_log_from_storage`.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "not a direct child")]
@@ -1376,7 +1413,602 @@ fn list_delta_log_from_storage_rejects_recursive_listing() {
     }
 
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
-    let iter = list_delta_log_from_storage(&RecursingStorage, &log_root, 0, Version::MAX).unwrap();
+    let iter =
+        list_delta_log_from_storage(&RecursingStorage, &log_root, 0, Version::MAX, None).unwrap();
     // The assert fires lazily as the item is pulled.
     let _ = iter.collect::<Vec<_>>();
+}
+/// [`crate::path::tests::parse_log_path`] stamped with this module's filesystem size marker. Unlike
+/// [`make_parsed_log_path_with_source`], whose url is always `<version>.json`, this works for
+/// checkpoint paths, whose file name takes part in checkpoint selection.
+fn parse_log_path(filename: &str) -> ParsedLogPath {
+    crate::path::tests::parse_log_path(filename, FILESYSTEM_SIZE_MARKER)
+}
+
+/// A v5 `_last_checkpoint` hint describing the uuid-named (V2) checkpoint `filename`.
+fn hint_naming_uuid(filename: &str) -> LastCheckpointHint {
+    LastCheckpointHint {
+        version: 5,
+        v2_checkpoint: Some(crate::last_checkpoint_hint::LastCheckpointV2 {
+            path: filename.to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn checkpoint_instance_orders_like_delta_spark() {
+    let classic = CheckpointInstance::Classic;
+    let uuid_a = CheckpointInstance::Uuid {
+        filename: "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+            .to_string(),
+    };
+    let uuid_b = CheckpointInstance::Uuid {
+        filename: "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet"
+            .to_string(),
+    };
+
+    assert!(classic < CheckpointInstance::MultiPart { num_parts: 2 });
+    assert!(
+        CheckpointInstance::MultiPart { num_parts: 2 }
+            < CheckpointInstance::MultiPart { num_parts: 11 }
+    );
+    assert!(classic < CheckpointInstance::MultiPart { num_parts: 11 });
+    assert!(uuid_a > CheckpointInstance::MultiPart { num_parts: 11 });
+    assert!(uuid_a > classic);
+    // Two uuid checkpoints at one version break the tie on file name.
+    assert!(uuid_a < uuid_b);
+}
+
+/// The reported failure: two writers checkpointed one version with different part counts.
+#[tokio::test]
+async fn two_complete_checkpoints_at_one_version_selects_more_parts() {
+    let mut log_files: Vec<_> = (0..=6)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    for part_num in 1..=2 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 2,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    for part_num in 1..=11 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 11,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (commit_files, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    let selected: Vec<_> = checkpoint_parts.iter().map(|p| &p.filename).collect();
+    let expected: Vec<_> = (1..=11)
+        .map(|p| multipart_checkpoint_name(4, p, 11))
+        .collect();
+    assert_eq!(selected, expected.iter().collect::<Vec<_>>());
+    let commit_versions: Vec<_> = commit_files.iter().map(|c| c.version).collect();
+    assert_eq!(commit_versions, vec![5, 6]);
+}
+
+/// Rank orders the candidates, but only complete checkpoints are candidates at all.
+#[tokio::test]
+async fn torn_higher_ranked_checkpoint_loses_to_complete_lower_ranked() {
+    let mut log_files: Vec<_> = (0..=6)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    for part_num in 1..=2 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 2,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    // A writer got 3 of its 11 parts out before dying: outranks the 2-part group, unusable.
+    for part_num in 1..=3 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 11,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (commit_files, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    let selected: Vec<_> = checkpoint_parts.iter().map(|p| &p.filename).collect();
+    let expected: Vec<_> = (1..=2)
+        .map(|p| multipart_checkpoint_name(4, p, 2))
+        .collect();
+    assert_eq!(selected, expected.iter().collect::<Vec<_>>());
+    let commit_versions: Vec<_> = commit_files.iter().map(|c| c.version).collect();
+    assert_eq!(commit_versions, vec![5, 6]);
+}
+
+/// Same rule as above, but the surviving candidate is a single-file checkpoint.
+#[tokio::test]
+async fn torn_multipart_checkpoint_loses_to_classic_checkpoint() {
+    let mut log_files = vec![
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            1,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ),
+    ];
+    for part_num in 1..=2 {
+        log_files.push((
+            1,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 3,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.parquet"
+    );
+}
+
+#[tokio::test]
+async fn uuid_and_multipart_checkpoints_at_one_version_selects_uuid() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        ],
+        &[
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 1, 2)),
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 2, 2)),
+            "_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet",
+        ],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+    );
+}
+
+/// Two uuid-named checkpoints at one version are distinct checkpoints, not parts of one, since each
+/// writer picked its own uuid.
+#[tokio::test]
+async fn two_uuid_checkpoints_at_one_version_select_greater_filename() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![(1, LogPathFileType::Commit, CommitSource::Filesystem)],
+        &[
+            "_delta_log/00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet",
+            "_delta_log/00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet",
+        ],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet"
+    );
+}
+
+/// v5 holds a complete 2-part checkpoint and two uuid-named ones, so listing selects uuid `bbbb`.
+/// Each case points the hint at a different candidate; only the one naming `bbbb` applies. Runs
+/// `applies_to` against listed paths rather than hand-built ones.
+#[rstest]
+#[case::hint_names_winner_uuid(
+    hint_naming_uuid(
+        "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet"
+    ),
+    true
+)]
+#[case::hint_names_loser_uuid(
+    hint_naming_uuid(
+        "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+    ),
+    false
+)]
+#[case::hint_names_losing_multipart(
+    LastCheckpointHint { version: 5, parts: Some(2), ..Default::default() },
+    false
+)]
+#[case::hint_names_phantom_classic(
+    LastCheckpointHint { version: 5, ..Default::default() },
+    false
+)]
+#[tokio::test]
+async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
+    #[case] hint: LastCheckpointHint,
+    #[case] expect_hint_applies: bool,
+) {
+    let winner = "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet";
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (5, LogPathFileType::Commit, CommitSource::Filesystem),
+            (6, LogPathFileType::Commit, CommitSource::Filesystem),
+        ],
+        &[
+            &format!("_delta_log/{}", multipart_checkpoint_name(5, 1, 2)),
+            &format!("_delta_log/{}", multipart_checkpoint_name(5, 2, 2)),
+            "_delta_log/00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet",
+            &format!("_delta_log/{winner}"),
+        ],
+    )
+    .await;
+
+    let listed = LogSegmentFiles::list_with_checkpoint_hint(
+        &hint,
+        storage.as_ref(),
+        &log_root,
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+
+    // The winner is the same no matter what the hint names.
+    assert_eq!(listed.checkpoint_parts.len(), 1);
+    assert_eq!(listed.checkpoint_parts[0].filename, winner);
+    assert_eq!(
+        hint.applies_to(&listed.checkpoint_parts),
+        expect_hint_applies
+    );
+}
+
+#[tokio::test]
+async fn uuid_checkpoint_beats_classic_checkpoint_at_one_version() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::ClassicCheckpoint, CommitSource::Filesystem),
+        ],
+        &["_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+    );
+}
+
+/// A json checkpoint has no parquet footer, so selecting it routes schema discovery through the
+/// sidecar path rather than a footer read (see `LogSegment::get_file_actions_schema_and_sidecars`).
+#[tokio::test]
+async fn json_uuid_checkpoint_beats_v1_checkpoints_at_one_version() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                1,
+                LogPathFileType::ClassicCheckpoint,
+                CommitSource::Filesystem,
+            ),
+        ],
+        &[
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 1, 2)),
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 2, 2)),
+            "_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json",
+        ],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json"
+    );
+}
+
+/// Both are complete single-file V1 checkpoints, so they replay to the same state either way.
+#[tokio::test]
+async fn one_of_one_multipart_checkpoint_beats_classic_checkpoint() {
+    let (storage, log_root) = create_storage(vec![
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            1,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ),
+        (
+            1,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num: 1,
+                num_parts: 1,
+            },
+            CommitSource::Filesystem,
+        ),
+    ])
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        multipart_checkpoint_name(1, 1, 1)
+    );
+}
+
+#[rstest]
+// A classic and a 1-of-1 multi-part checkpoint at one version each fill their own group.
+#[case::single_and_one_of_one_same_version(
+        vec![
+            parse_log_path(&multipart_checkpoint_name(5, 1, 1)),
+            parse_log_path("00000000000000000005.checkpoint.parquet"),
+        ],
+        Some(5)
+    )]
+// A complete 2-part and a complete 11-part checkpoint at one version.
+#[case::two_complete_multipart_same_version(
+        (1..=2).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
+            .chain((1..=11).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))
+            .sorted_by_key(|f| f.filename.clone())
+            .collect(),
+        Some(10)
+    )]
+// A torn 11-part group beside a complete 2-part one: still checkpointed, on the complete group.
+#[case::torn_beside_complete_same_version(
+        (1..=2).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
+            .chain((1..=3).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))
+            .sorted_by_key(|f| f.filename.clone())
+            .collect(),
+        Some(10)
+    )]
+// Every group at the version is torn, so the version is not checkpointed.
+#[case::all_torn_same_version(
+        (1..=1).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
+            .chain((1..=3).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))
+            .sorted_by_key(|f| f.filename.clone())
+            .collect(),
+        None
+    )]
+fn find_complete_checkpoint_version_same_version_cases(
+    #[case] files: Vec<ParsedLogPath>,
+    #[case] expected: Option<u64>,
+) {
+    assert_eq!(find_complete_checkpoint_version(&files), expected);
+}
+
+// ===== cancellation tests =====
+
+/// A storage handler whose listing yields `count` synthetic commit paths and records how many were
+/// pulled, so a test can tell where a cancelled listing actually stopped.
+struct FiniteListingHandler {
+    log_root: Url,
+    count: usize,
+    items_pulled: Arc<AtomicU32>,
+}
+
+impl StorageHandler for FiniteListingHandler {
+    fn list_from(
+        &self,
+        _path: &Url,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        let log_root = self.log_root.clone();
+        let pulled = self.items_pulled.clone();
+        let iter = (0..self.count as u64).map(move |version| {
+            pulled.fetch_add(1, Ordering::Relaxed);
+            Ok(FileMeta::new(
+                log_root.join(&format!("{version:020}.json"))?,
+                version as i64,
+                1,
+            ))
+        });
+        Ok(Box::new(iter))
+    }
+
+    fn read_files(
+        &self,
+        _files: Vec<crate::FileSlice>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        panic!("read_files should not be called during listing");
+    }
+
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        panic!("put should not be called during listing");
+    }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        panic!("copy_atomic should not be called during listing");
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        panic!("head should not be called during listing");
+    }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during listing");
+    }
+}
+
+// Builds a `FiniteListingHandler` over `memory:///_delta_log/` yielding `count` paths, returning
+// the log root and the shared pull counter alongside it.
+fn finite_listing_handler(count: usize) -> (Url, Arc<AtomicU32>, FiniteListingHandler) {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let pulled = Arc::new(AtomicU32::new(0));
+    let storage = FiniteListingHandler {
+        log_root: log_root.clone(),
+        count,
+        items_pulled: pulled.clone(),
+    };
+    (log_root, pulled, storage)
+}
+
+// An already-cancelled token fails the listing before any storage call, via the default
+// `list_from_with_cancellation` (this handler does not override it).
+#[test]
+fn precancelled_token_stops_listing_before_any_storage_call() {
+    let (log_root, pulled, storage) = finite_listing_handler(100);
+
+    let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+
+    let result = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token));
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(pulled.load(Ordering::Relaxed), 0);
+}
+
+// Cancelling partway yields the items already produced, then exactly one terminal
+// `Error::Cancelled` -- never a bare `None`, which would make a truncated listing look complete.
+// This is the regression guard for polling inside (rather than outside) the version `take_while`.
+#[test]
+fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
+    let (log_root, pulled, storage) = finite_listing_handler(100);
+
+    let token = Arc::new(TestCancellationToken::default());
+    let token_ref: CancellationTokenRef = token.clone();
+    let mut iter =
+        list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token_ref))
+            .unwrap();
+
+    assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 0));
+    assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 1));
+
+    token.cancel();
+
+    assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+    // Fused: no second error and no further items.
+    assert!(iter.next().is_none());
+    assert!(iter.next().is_none());
+    // The listing stopped early rather than draining all 100 entries.
+    assert!(pulled.load(Ordering::Relaxed) < 100);
+}
+
+// With no token the listing is unchanged, so cancellation support is strictly opt-in.
+#[test]
+fn listing_without_token_is_unchanged() {
+    let (log_root, _pulled, storage) = finite_listing_handler(5);
+
+    let listed: Vec<_> = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, None)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(listed.len(), 5);
+}
+
+/// An iterator that yields nothing but cancels `token` the instant it is polled (i.e. as the
+/// enclosing listing is exhausted), so a later poll of the token observes the cancellation.
+struct CancelOnExhaustion {
+    token: Arc<TestCancellationToken>,
+    done: bool,
+}
+
+impl Iterator for CancelOnExhaustion {
+    type Item = DeltaResult<FileMeta>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.done {
+            self.done = true;
+            self.token.cancel();
+        }
+        None
+    }
+}
+
+/// A storage handler that returns an empty listing and cancels `token` as that listing is
+/// exhausted, counting its `list_from` calls. Lets a test flip the token *between* backward-scan
+/// windows rather than before the first one.
+struct CancelAfterListingHandler {
+    token: Arc<TestCancellationToken>,
+    list_calls: Arc<AtomicU32>,
+}
+
+impl StorageHandler for CancelAfterListingHandler {
+    fn list_from(
+        &self,
+        _path: &Url,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        self.list_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Box::new(CancelOnExhaustion {
+            token: self.token.clone(),
+            done: false,
+        }))
+    }
+
+    fn read_files(
+        &self,
+        _files: Vec<crate::FileSlice>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        panic!("read_files should not be called during listing");
+    }
+
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        panic!("put should not be called during listing");
+    }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        panic!("copy_atomic should not be called during listing");
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        panic!("head should not be called during listing");
+    }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during listing");
+    }
+}
+
+// The backward scan collects each window eagerly and re-checks the token at the top of every
+// window. Window 1 lists an empty window and succeeds; the token flips as that listing is
+// exhausted, so it is window 2's up-front check -- not window 1's -- that surfaces the cancellation
+// (exactly one listing ran).
+#[test]
+fn backward_scan_checks_cancellation_between_windows() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let token = Arc::new(TestCancellationToken::default());
+    let list_calls = Arc::new(AtomicU32::new(0));
+    let storage = CancelAfterListingHandler {
+        token: token.clone(),
+        list_calls: list_calls.clone(),
+    };
+    let token_ref: CancellationTokenRef = token;
+
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &storage,
+        &log_root,
+        vec![],
+        5_000,
+        Some(&token_ref),
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(list_calls.load(Ordering::Relaxed), 1);
 }

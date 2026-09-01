@@ -1033,7 +1033,8 @@ mod tests {
         let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
 
         // Verify results
-        assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no selected actions
+        assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no
+                                      // selected actions
         assert_eq!(results[0].selection_vector(), &vec![true]);
         assert_eq!(results[1].selection_vector(), &vec![false, true]);
         assert_eq!(actions_count, 2);

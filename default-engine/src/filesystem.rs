@@ -4,7 +4,7 @@ use bytes::Bytes;
 use delta_kernel::object_store::list::{PaginatedListOptions, PaginatedListStore};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectMeta, ObjectStoreExt as _, PutMode};
-use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use delta_kernel::{CancellationTokenRef, DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
@@ -206,10 +206,8 @@ async fn read_files_impl(
     let files = stream::iter(files).map(move |(url, range)| {
         let store = store.clone();
         async move {
-            // Wasn't checking the scheme before calling to_file_path causing the url path to
-            // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
-            // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
-            // details about why this check is necessary
+            // File URLs need OS path conversion. Other schemes need object-store URL decoding so
+            // already escaped path segments do not get escaped again.
             let path = if url.scheme() == "file" {
                 let file_path = url
                     .to_file_path()
@@ -217,7 +215,7 @@ async fn read_files_impl(
                 Path::from_absolute_path(file_path)
                     .map_err(|e| Error::InvalidTableLocation(format!("Invalid file path: {e}")))?
             } else {
-                Path::from(url.path())
+                Path::from_url_path(url.path())?
             };
             if url.is_presigned() {
                 // have to annotate type here or rustc can't figure it out
@@ -300,8 +298,20 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        self.list_from_with_cancellation(path, None)
+    }
+
+    fn list_from_with_cancellation(
+        &self,
+        path: &Url,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         let future = list_from_impl(self.inner.clone(), self.paginated.clone(), path.clone());
-        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        let iter = super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
@@ -315,8 +325,20 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+        self.read_files_with_cancellation(files, None)
+    }
+
+    fn read_files_with_cancellation(
+        &self,
+        files: Vec<FileSlice>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
-        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        let iter = super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
@@ -468,6 +490,29 @@ mod tests {
         assert_eq!(data[0], Bytes::from("kernel"));
         assert_eq!(data[1], Bytes::from("data"));
         assert_eq!(data[2], Bytes::from("el-da"));
+    }
+
+    #[tokio::test]
+    async fn read_files_decodes_non_file_url_paths_once() {
+        let store = Arc::new(InMemory::new());
+
+        let data = Bytes::from("kernel-data");
+        store
+            .put(&Path::from("hello, world!"), data.clone().into())
+            .await
+            .unwrap();
+
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let storage = ObjectStoreStorageHandler::new(store, None, executor);
+        let file_url = Url::parse("memory:///hello%2C%20world%21").unwrap();
+
+        let read_back: Vec<Bytes> = storage
+            .read_files(vec![(file_url, None)])
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(read_back, vec![data]);
     }
 
     #[tokio::test]
@@ -670,7 +715,6 @@ mod tests {
         ));
         handler.delete(&missing_url).unwrap();
     }
-
     /// [`PaginatedListStore`] over [`InMemory`] mimicking cloud `list_paginated`: `/` grouping,
     /// `offset` start-after, one `page_size` chunk per call. `reverse` lists descending (exercises
     /// the sort path). `honors_offset = false` models S3 Express dropping `start-after`.
@@ -1026,6 +1070,24 @@ mod tests {
     fn list_scope_rejects_authority_only_url() {
         // No path segments and not directory-like, thus no parent to list after.
         let url = Url::parse("s3://bucket").unwrap();
-        assert!(matches!(list_scope(&url), Err(Error::Generic(_))));
+        assert!(matches!(
+            list_scope(&url),
+            Err(Error::Generic(message))
+                if message == "Offset path must not be a root directory. Got: 's3://bucket'"
+        ));
+    }
+    // The cancellation-aware overrides feed the racing helper, so an already-cancelled token stops
+    // the operation instead of performing I/O.
+    #[test]
+    fn precancelled_token_short_circuits_list_and_read() {
+        let (tempdir, _store, handler) = setup_test();
+        let url = Url::from_directory_path(tempdir.path()).unwrap();
+        let token: CancellationTokenRef = Arc::new(test_utils::TestCancellationToken::cancelled());
+
+        let listed = handler.list_from_with_cancellation(&url, Some(token.clone()));
+        assert!(matches!(listed, Err(Error::Cancelled)));
+
+        let read = handler.read_files_with_cancellation(vec![(url, None)], Some(token));
+        assert!(matches!(read, Err(Error::Cancelled)));
     }
 }

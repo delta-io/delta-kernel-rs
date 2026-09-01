@@ -11,8 +11,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::validation::validate_interval_type_write_support;
-use super::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
+use super::{schema_ref, DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
 use crate::expressions::ExpressionStructPatchBuilder;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
@@ -56,7 +55,7 @@ pub(crate) fn strip_void_from_schema(schema: SchemaRef) -> SchemaRef {
     match StripVoidFields.transform_struct(&schema) {
         Some(Cow::Owned(stripped)) => Arc::new(stripped),
         Some(Cow::Borrowed(_)) => schema,
-        None => Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+        None => schema_ref! {},
     }
 }
 
@@ -71,10 +70,7 @@ pub(crate) fn strip_void_from_schema(schema: SchemaRef) -> SchemaRef {
 ///   values to drop them.
 /// - A struct contains no non-void fields (would produce an empty Parquet struct)
 /// - The table schema contains no non-void columns (would produce an empty Parquet schema)
-/// - The schema contains an ANSI interval type and the `interval-type-in-dev` feature is disabled
 pub(crate) fn validate_schema_for_write(schema: &Schema) -> DeltaResult<()> {
-    validate_interval_type_write_support(schema)?;
-
     ValidateForWrite {
         container_depth: 0,
         depth: 0,
@@ -194,21 +190,11 @@ fn add_void_stripping_inner<'a>(
 mod tests {
     use super::*;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+        StructType,
     };
 
     // ---- validate_schema_for_write tests ----
-
-    #[cfg(not(feature = "interval-type-in-dev"))]
-    #[rstest::rstest]
-    fn test_interval_type_requires_write_support(
-        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
-    ) {
-        let schema = StructType::new_unchecked([StructField::nullable("iv", interval)]);
-
-        let error = validate_schema_for_write(&schema).unwrap_err().to_string();
-        assert!(error.contains("interval-type-in-dev"));
-    }
 
     #[test]
     fn test_validator_catches_void_in_map_from_json() {
@@ -233,7 +219,9 @@ mod tests {
         }
 
         // The dedicated validator is what actually catches this
-        let schema = StructType::new_unchecked([field]);
+        let schema = schema! {
+            (field),
+        };
         assert!(validate_schema_for_write(&schema).is_err());
     }
 
@@ -257,9 +245,7 @@ mod tests {
         "void in array inside struct",
         StructField::nullable(
             "outer",
-            StructType::new_unchecked([
-                StructField::nullable("inner", ArrayType::new(DataType::VOID, true)),
-            ])
+            schema! { nullable "inner": [ nullable VOID ] }
         ),
         "array element type"
     )]
@@ -276,10 +262,10 @@ mod tests {
         StructField::nullable(
             "arr",
             ArrayType::new(
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::VOID),
-                ]),
+                schema! {
+                    nullable "a": INTEGER,
+                    nullable "b": VOID,
+                },
                 true,
             ),
         ),
@@ -291,10 +277,10 @@ mod tests {
             "m",
             MapType::new(
                 DataType::STRING,
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::VOID),
-                ]),
+                schema! {
+                    nullable "a": INTEGER,
+                    nullable "b": VOID,
+                },
                 true,
             ),
         ),
@@ -305,10 +291,10 @@ mod tests {
         StructField::nullable(
             "m",
             MapType::new(
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::VOID),
-                ]),
+                schema! {
+                    nullable "a": INTEGER,
+                    nullable "b": VOID,
+                },
                 DataType::STRING,
                 true,
             ),
@@ -321,10 +307,10 @@ mod tests {
             "outer",
             ArrayType::new(
                 ArrayType::new(
-                    StructType::new_unchecked([
-                        StructField::nullable("a", DataType::INTEGER),
-                        StructField::nullable("b", DataType::VOID),
-                    ]),
+                    schema! {
+                        nullable "a": INTEGER,
+                        nullable "b": VOID,
+                    },
                     true,
                 ),
                 true,
@@ -337,16 +323,13 @@ mod tests {
         StructField::nullable(
             "arr",
             ArrayType::new(
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable(
-                        "b",
-                        StructType::new_unchecked([
-                            StructField::nullable("x", DataType::INTEGER),
-                            StructField::nullable("y", DataType::VOID),
-                        ]),
-                    ),
-                ]),
+                schema! {
+                    nullable "a": INTEGER,
+                    nullable "b": {
+                        nullable "x": INTEGER,
+                        nullable "y": VOID,
+                    },
+                },
                 true,
             ),
         ),
@@ -357,16 +340,11 @@ mod tests {
         StructField::nullable(
             "outer",
             ArrayType::new(
-                StructType::new_unchecked([StructField::nullable(
-                    "inner",
-                    ArrayType::new(
-                        StructType::new_unchecked([StructField::nullable(
-                            "v",
-                            DataType::VOID,
-                        )]),
-                        true,
-                    ),
-                )]),
+                schema! {
+                    nullable "inner": [ nullable {
+                        nullable "v": VOID,
+                    } ],
+                },
                 true,
             ),
         ),
@@ -376,10 +354,7 @@ mod tests {
         "empty struct nested in array",
         StructField::nullable(
             "arr",
-            ArrayType::new(
-                StructType::new_unchecked(Vec::<StructField>::new()),
-                true,
-            ),
+            ArrayType::new(schema! {}, true),
         ),
         "struct nested in Array or Map must contain at least one non-void field"
     )]
@@ -389,10 +364,7 @@ mod tests {
             "m",
             MapType::new(
                 DataType::STRING,
-                StructType::new_unchecked([StructField::nullable(
-                    "x",
-                    DataType::VOID,
-                )]),
+                schema! { nullable "x": VOID },
                 true,
             ),
         ),
@@ -403,7 +375,9 @@ mod tests {
         #[case] field: StructField,
         #[case] expected_msg: &str,
     ) {
-        let schema = StructType::new_unchecked([field]);
+        let schema = schema! {
+            (field),
+        };
         let result = validate_schema_for_write(&schema);
         assert!(
             result.unwrap_err().to_string().contains(expected_msg),
@@ -414,54 +388,44 @@ mod tests {
     #[rstest::rstest]
     #[case(
         "void top level ok",
-        StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("void_col", DataType::VOID),
-        ])
+        schema! {
+            nullable "id": INTEGER,
+            nullable "void_col": VOID,
+        }
     )]
     #[case(
         "test no void ok",
-        StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])
+        schema! {
+            nullable "id": INTEGER,
+            nullable "name": STRING,
+        }
     )]
     #[case(
         "void in nested struct",
-        StructType::new_unchecked([StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::VOID),
-            ]),
-        )])
+        schema! {
+            nullable "s": {
+                nullable "a": INTEGER,
+                nullable "b": VOID,
+            },
+        }
     )]
     #[case(
         "array of struct without void",
-        StructType::new_unchecked([StructField::nullable(
-            "arr",
-            ArrayType::new(
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::STRING),
-                ]),
-                true,
-            ),
-        )])
+        schema! {
+            nullable "arr": [ nullable {
+                nullable "a": INTEGER,
+                nullable "b": STRING,
+            } ],
+        }
     )]
     #[case(
         "map of struct without void",
-        StructType::new_unchecked([StructField::nullable(
-            "m",
-            MapType::new(
-                DataType::STRING,
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::STRING),
-                ]),
-                true,
-            ),
-        )])
+        schema! {
+            nullable "m": { STRING => nullable {
+                nullable "a": INTEGER,
+                nullable "b": STRING,
+            } },
+        }
     )]
     fn test_valid_schema_for_complex_types(#[case] desc: &str, #[case] schema: StructType) {
         validate_schema_for_write(&schema)
@@ -473,27 +437,26 @@ mod tests {
     #[rstest::rstest]
     #[case(
         "with void column",
-        StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("void_col", DataType::VOID),
-        ])
+        schema! {
+            nullable "id": INTEGER,
+            nullable "void_col": VOID,
+        }
     )]
     #[case(
         "no void",
-        StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])
+        schema! {
+            nullable "id": INTEGER,
+            nullable "name": STRING,
+        }
     )]
     #[case(
         "struct with mixed void",
-        StructType::new_unchecked([StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::VOID),
-            ]),
-        )])
+        schema! {
+            nullable "s": {
+                nullable "a": INTEGER,
+                nullable "b": VOID,
+            },
+        }
     )]
     fn test_write_valid_schemas(#[case] desc: &str, #[case] schema: StructType) {
         validate_schema_for_write(&schema)
@@ -503,78 +466,56 @@ mod tests {
     #[rstest::rstest]
     #[case(
         "all void table",
-        StructType::new_unchecked([
-            StructField::nullable("a", DataType::VOID),
-            StructField::nullable("b", DataType::VOID),
-        ]),
+        schema! {
+            nullable "a": VOID,
+            nullable "b": VOID,
+        },
         "at least one non-void column"
     )]
     #[case(
         "all void struct",
-        StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable(
-                "s",
-                StructType::new_unchecked([
-                    StructField::nullable("x", DataType::VOID),
-                    StructField::nullable("y", DataType::VOID),
-                ]),
-            ),
-        ]),
+        schema! {
+            nullable "id": INTEGER,
+            nullable "s": {
+                nullable "x": VOID,
+                nullable "y": VOID,
+            },
+        },
         "contains no non-void fields"
     )]
     #[case(
         "void in array",
-        StructType::new_unchecked([StructField::nullable(
-            "arr",
-            ArrayType::new(DataType::VOID, true),
-        )]),
+        schema! { nullable "arr": [ nullable VOID ] },
         "array element type"
     )]
     #[case(
         "void in map",
-        StructType::new_unchecked([StructField::nullable(
-            "m",
-            MapType::new(
-                DataType::STRING,
-                DataType::VOID,
-                true,
-            ),
-        )]),
+        schema! { nullable "m": { STRING => nullable VOID } },
         "map value type"
     )]
     #[case(
         "nested all void struct",
-        StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable(
-                "outer",
-                StructType::new_unchecked([
-                    StructField::nullable(
-                        "inner",
-                        StructType::new_unchecked([StructField::nullable("x", DataType::VOID)]),
-                    ),
-                ]),
-            ),
-        ]),
+        schema! {
+            nullable "id": INTEGER,
+            nullable "outer": {
+                nullable "inner": {
+                    nullable "x": VOID,
+                },
+            },
+        },
         "contains no non-void fields"
     )]
     #[case(
         "empty struct at top level",
-        StructType::new_unchecked(Vec::<StructField>::new()),
+        schema! {},
         "at least one non-void column"
     )]
     #[case(
         "nested empty struct",
-        StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable(
-                "s",
-                StructType::new_unchecked(
-                    Vec::<StructField>::new(),
-                ),
-            ),
-        ]),
+        schema! {
+            nullable "id": INTEGER,
+            nullable "s": {},
+        },
         "contains no non-void fields"
     )]
     fn test_write_rejected_schemas(
@@ -594,64 +535,60 @@ mod tests {
     #[rstest::rstest]
     #[case(
         "schema with no void is noop",
-        StructType::new_unchecked([
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::STRING),
-        ]),
-        StructType::new_unchecked([
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::STRING),
-        ])
+        schema! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+        },
+        schema! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+        }
     )]
     #[case(
         "top-level void is dropped",
-        StructType::new_unchecked([
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::nullable("v", DataType::VOID),
-            StructField::nullable("b", DataType::STRING),
-        ]),
-        StructType::new_unchecked([
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::STRING),
-        ])
+        schema! {
+            nullable "a": INTEGER,
+            nullable "v": VOID,
+            nullable "b": STRING,
+        },
+        schema! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+        }
     )]
     #[case(
         "nested struct with mixed void",
-        StructType::new_unchecked([StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::VOID),
-                StructField::nullable("c", DataType::STRING),
-            ]),
-        )]),
-        StructType::new_unchecked([StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("c", DataType::STRING),
-            ]),
-        )])
+        schema! {
+            nullable "s": {
+                nullable "a": INTEGER,
+                nullable "b": VOID,
+                nullable "c": STRING,
+            },
+        },
+        schema! {
+            nullable "s": {
+                nullable "a": INTEGER,
+                nullable "c": STRING,
+            },
+        }
     )]
     #[case(
         "deeply nested void",
-        StructType::new_unchecked([StructField::nullable(
-            "outer",
-            StructType::new_unchecked([StructField::nullable(
-                "inner",
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("v", DataType::VOID),
-                ]),
-            )]),
-        )]),
-        StructType::new_unchecked([StructField::nullable(
-            "outer",
-            StructType::new_unchecked([StructField::nullable(
-                "inner",
-                StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]),
-            )]),
-        )])
+        schema! {
+            nullable "outer": {
+                nullable "inner": {
+                    nullable "a": INTEGER,
+                    nullable "v": VOID,
+                },
+            },
+        },
+        schema! {
+            nullable "outer": {
+                nullable "inner": {
+                    nullable "a": INTEGER,
+                },
+            },
+        }
     )]
     fn test_strip_void_from_schema(
         #[case] desc: &str,
@@ -678,10 +615,10 @@ mod tests {
         true
     )))]
     fn test_strip_drops_container_with_void(#[case] field_type: DataType) {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("c", field_type),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "c": (field_type),
+        };
         let stripped = strip_void_from_schema(schema);
         assert!(stripped.field("id").is_some());
         assert!(stripped.field("c").is_none());
@@ -691,16 +628,18 @@ mod tests {
     fn test_strip_preserves_metadata() {
         let mut s_field = StructField::nullable(
             "s",
-            StructType::new_unchecked([
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::VOID),
-            ]),
+            schema! {
+                nullable "a": INTEGER,
+                nullable "b": VOID,
+            },
         );
         s_field.metadata.insert(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
             MetadataValue::String("phys_s".into()),
         );
-        let schema = Arc::new(StructType::new_unchecked([s_field]));
+        let schema = schema_ref! {
+            (s_field),
+        };
         let stripped = strip_void_from_schema(schema);
         assert_eq!(
             stripped

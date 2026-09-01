@@ -89,7 +89,8 @@ fn truncate_max_string(s: &str) -> Option<Cow<'_, str>> {
     }
 
     // Start at STRING_PREFIX_LENGTH chars
-    let char_indices: Vec<(usize, char)> = s.char_indices().collect();
+    let char_indices: Vec<(usize, char)> =
+        s.char_indices().take(STRING_EXPANSION_LIMIT + 1).collect();
 
     // We can expand up to STRING_EXPANSION_LIMIT chars looking for a valid truncation point
     let max_chars = char_indices.len().min(STRING_EXPANSION_LIMIT);
@@ -911,7 +912,7 @@ mod tests {
     use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
     use delta_kernel::expressions::column_name;
     use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use delta_kernel::schema::StructField;
+    use delta_kernel::schema::schema;
     use test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -1462,6 +1463,20 @@ mod tests {
             truncate_max_string(&with_max_char).as_deref(),
             Some(expected.as_str())
         );
+
+        // Retain the final searchable position at the expansion limit.
+        let prefix = "a".repeat(STRING_PREFIX_LENGTH);
+        let max_chars = UTF8_MAX_CHAR.to_string().repeat(STRING_PREFIX_LENGTH);
+        let valid_at_limit = format!("{prefix}{max_chars}beyond");
+        let expected = format!("{prefix}{max_chars}{ASCII_MAX_CHAR}");
+        assert_eq!(
+            truncate_max_string(&valid_at_limit).as_deref(),
+            Some(expected.as_str())
+        );
+
+        // No bound exists when every searchable position is U+10FFFF.
+        let no_valid_bound = format!("{prefix}{max_chars}{UTF8_MAX_CHAR}");
+        assert_eq!(truncate_max_string(&no_valid_bound), None);
     }
 
     #[test]
@@ -2754,11 +2769,10 @@ mod tests {
             Field::new("span", arrow_type.clone(), true),
             Field::new("n", DataType::Int64, true),
         ]));
-        let physical_schema = StructType::try_new([
-            StructField::nullable("span", interval_type),
-            StructField::nullable("n", KernelDataType::LONG),
-        ])
-        .unwrap();
+        let physical_schema = schema! {
+            nullable "span": (interval_type),
+            nullable "n": LONG,
+        };
         let mk = |spans: &[i64], ns: &[i64]| {
             let span: ArrayRef = match arrow_type {
                 DataType::Int32 => Arc::new(Int32Array::from(

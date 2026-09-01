@@ -936,7 +936,7 @@ mod tests {
     use crate::expressions::{
         lit, Expression as Expr, ExpressionRef, ExpressionStructPatch, ExpressionStructPatchBuilder,
     };
-    use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType};
+    use crate::schema::{schema, DataType, SchemaStructPatchBuilder, StructField, StructType};
     use crate::struct_patch::ProjectionStructPatchBuilder;
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -1043,10 +1043,10 @@ mod tests {
     // Top-level schema with a "nested" struct field (holding `nested_a`, `nested_b`) and a
     // sibling top-level field, used to exercise nested-path patching.
     fn nested_input_schema() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::nullable("nested", schema(&["nested_a", "nested_b"])),
-            field("top"),
-        ])
+        schema! {
+            nullable "nested": (schema(&["nested_a", "nested_b"])),
+            (field("top")),
+        }
     }
 
     // Patches that leave the input schema fully unchanged (same fields, types, and order).
@@ -1073,7 +1073,7 @@ mod tests {
         SchemaStructPatchBuilder::new().append(field("appended_1")).append(field("appended_2")),
         &["a", "b", "appended_1", "appended_2"])]
     #[case::appends_to_empty_input(
-        StructType::new_unchecked(Vec::<StructField>::new()),
+        schema! {},
         SchemaStructPatchBuilder::new().append(field("only")),
         &["only"])]
     #[case::replaces_field_at_input_position(

@@ -27,6 +27,7 @@ the caller's memory space.
 
 - `src/lib.rs` -- main FFI entry points and type definitions
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
+- `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
 - `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
@@ -54,7 +55,17 @@ The caller owns the returned builder handle and must call either `snapshot_build
 Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
 `snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
 `num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
-complete file stats).
+complete file stats). `visit_file_size_histogram` exposes the optional variable-length histogram in
+the same file stats: it invokes one callback with borrowed `i64` slices for bin boundaries, file
+counts, and total bytes; callers must copy values they retain after the callback.
+
+Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
+`visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
+descriptor per clustering column -- logical name, physical name (what per-file stats are keyed on),
+and a type tag -- without exposing the guarded `delta.*` domain JSON directly. It returns
+`OptionalValue<usize>`: `None` means not clustered, `Some(0)` means clustered on no columns. The
+type tag reuses the `visit_expression_literal_null` encoding, with 255 for types that don't fit a
+compact tag (struct, array, map, variant, void, and geometry/geography).
 
 ## Commit Range Flow
 
@@ -130,6 +141,17 @@ snapshot is borrowed; the committer is consumed (do not free). The caller owns t
 snapshot handle. The returned snapshot carries the published watermark (`max_published_version`)
 needed for the next catalog commit; do not continue from the pre-publish post-commit snapshot.
 
+Column defaults (`allowColumnDefaults`) live in `ffi/src/column_default.rs`. The kernel reports
+defaults but never materializes them, so the connector fills every omitted column itself:
+
+```
+transaction()
+  -> transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)
+  -> transaction_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
+                                            // KernelError::InvalidTransactionStateError
+  -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
+```
+
 Deletion vector update flow:
 
 ```
@@ -187,3 +209,46 @@ Feature flags:
 - `alloc-tracking` -- installs `peak_alloc` as the tracking global allocator; enables meaningful
   `*_native_bytes` / `alloc_tracking_enabled` getters (cdylib only; conflicts with
   another `#[global_allocator]` if linked as an rlib)
+
+## Testing under Miri
+
+CI runs this crate's tests under Miri (the `miri` job in `build.yml`) to catch undefined
+behavior in the `unsafe` FFI boundary: raw-pointer reads/writes, `unsafe impl Send/Sync`,
+`Handle` conversions (`as_ref` / `clone_as_arc` / `into_inner`), and `free_*`. Miri is a MIR
+interpreter, so it runs 10x-100x slower than native and is billed by the interpreted
+instruction, not wall-clock work.
+
+The consequence: a test is expensive under Miri in proportion to how much *code it executes*,
+not how much it asserts. Tests that construct heavyweight but **safe** machinery -- a
+reqwest/rustls client (crypto init), a multi-threaded tokio runtime, an Arrow/parquet write --
+cost minutes under the interpreter while exercising none of our `unsafe`. That time buys no
+UB detection.
+
+Guidance for adding or triaging FFI tests:
+
+- **Keep under Miri** any test that executes `unsafe` whose correctness Miri can check. This is
+  the reason the job exists; do not skip these for speed.
+- **Never add new `unsafe` to a Miri-ignored test.** An ignored test is invisible to Miri, so
+  `unsafe` introduced in one is never checked for undefined behavior, and nothing in CI reports
+  the gap. When a change needs new `unsafe` in an ignored test, either exercise that `unsafe`
+  from a test that runs under Miri, or un-skip the test.
+- **`#[cfg_attr(miri, ignore)]` is legitimate for two reasons, and only these two:**
+  1. Miri cannot run it (e.g. an unsupported foreign function). Before accepting this, check
+     whether the blocker is avoidable: local-filesystem storage reaches `std::fs::hard_link`
+     (`linkat`), which Miri rejects, but in-memory storage does not. Prefer an in-memory store.
+  2. The test executes no `unsafe`, OR only `unsafe` that a kept test already covers, AND it is
+     expensive under Miri. Skip only with the coverage argument; skipping for cost alone drops
+     UB coverage.
+- When you skip under reason 2, **prove the coverage is preserved**: the kept tests' set of
+  `unsafe` FFI functions must be a superset of the skipped test's. Name the covering test in the
+  `ignore` reason or a nearby comment so a future reader can re-check it.
+- Miri's leak check also flags handles a test itself forgot to free. Triage before assuming a bug
+  in the code under test: a missing `free_*` in the test is a test fix, while an unjoined
+  background thread at teardown can be an artifact of how the test ends.
+- Prefer picking the **cheapest** test that crosses a given `unsafe` path over keeping several
+  that cross the same path with more safe work each.
+- `rest_engine` and the checkpoint tests in `lib.rs` document worked examples of this split.
+- `-Zmiri-provenance-gc=1000000` on the Miri step is a pure speed knob (GC frequency) and does
+  not weaken detection. Do NOT add `-Zmiri-disable-stacked-borrows`, `-disable-validation`,
+  `-disable-data-race-detector`, or `-Zmiri-preemption-rate=0`: the first three are unsound, and
+  the last reduces data-race schedule exploration.

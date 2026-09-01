@@ -1,6 +1,6 @@
 name: unity-catalog-test
 
-# Runs the gated `unity-catalog-delta-client-default` and `delta-kernel-unity-catalog` live
+# Runs the gated `unity-catalog-delta-rest-client` and `delta-kernel-unity-catalog` live
 # integration tests against a real Unity Catalog server (built from a pinned commit). Exercises the
 # read-only `get_config` handshake (needs no table), `load_table` against a table seeded via the
 # Delta-Commits (legacy) API before the test step, and the mutating create tests against the
@@ -11,7 +11,7 @@ on:
     paths:
       - "delta-kernel-unity-catalog/**"
       - "unity-catalog-delta-client-api/**"
-      - "unity-catalog-delta-client-default/**"
+      - "unity-catalog-delta-rest-client/**"
       - ".github/workflows/unitycatalog_test.yml"
       - ".github/scripts/setup_unitycatalog.sh"
       - ".github/scripts/uc_server.sh"
@@ -20,7 +20,7 @@ on:
     paths:
       - "delta-kernel-unity-catalog/**"
       - "unity-catalog-delta-client-api/**"
-      - "unity-catalog-delta-client-default/**"
+      - "unity-catalog-delta-rest-client/**"
       - ".github/workflows/unitycatalog_test.yml"
       - ".github/scripts/setup_unitycatalog.sh"
       - ".github/scripts/uc_server.sh"
@@ -94,7 +94,7 @@ jobs:
         # Live tests are `#[ignore]` so a normal `cargo nextest` reports them as skipped rather than
         # passing. `--run-ignored only -E 'test(live_)'` runs exactly the ignored live tests here,
         # where a UC server is available.
-        run: cargo nextest run --locked -p unity-catalog-delta-client-default -p delta-kernel-unity-catalog --features integration-test --run-ignored only -E 'test(live_)'
+        run: cargo nextest run --locked -p unity-catalog-delta-rest-client -p delta-kernel-unity-catalog --features integration-test --run-ignored only -E 'test(live_)'
 
       - name: Stop Unity Catalog server
         if: always()

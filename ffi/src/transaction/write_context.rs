@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::expressions::Scalar;
-use delta_kernel::transaction::WriteContext;
+use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -16,11 +16,11 @@ use crate::{
     SharedSchema, TryFromStringSlice, Url,
 };
 
-/// A [`WriteContext`] that provides schema and path information needed for writing data.
+/// A [`BoundWriteContext`] that provides schema and path information needed for writing data.
 /// This is a shared reference that can be cloned and used across multiple consumers.
 ///
-/// The [`WriteContext`] must be freed using [`free_write_context`] when no longer needed.
-#[handle_descriptor(target=WriteContext, mutable=false, sized=true)]
+/// The [`BoundWriteContext`] must be freed using [`free_write_context`] when no longer needed.
+#[handle_descriptor(target=BoundWriteContext, mutable=false, sized=true)]
 pub struct SharedWriteContext;
 
 /// Gets the write context from a transaction for an unpartitioned table. The write context
@@ -39,8 +39,9 @@ pub unsafe extern "C" fn get_unpartitioned_write_context(
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    txn.unpartitioned_write_context()
-        .map(|wc| Arc::new(wc).into())
+    txn.write_state()
+        .and_then(|state| state.unpartitioned_write_context())
+        .map(|context| Arc::new(context).into())
         .into_extern_result(&engine)
 }
 
@@ -59,8 +60,9 @@ pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    txn.unpartitioned_write_context()
-        .map(|wc| Arc::new(wc).into())
+    txn.write_state()
+        .and_then(|state| state.unpartitioned_write_context())
+        .map(|context| Arc::new(context).into())
         .into_extern_result(&engine)
 }
 
@@ -90,8 +92,11 @@ pub unsafe extern "C" fn get_partitioned_write_context(
     let txn = unsafe { txn.as_ref() };
     let partition_values = unsafe { partition_values.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    partitioned_write_context_impl(|pv| txn.partitioned_write_context(pv), *partition_values)
-        .into_extern_result(&engine)
+    partitioned_write_context_impl(
+        |pv| txn.write_state()?.partitioned_write_context(pv),
+        *partition_values,
+    )
+    .into_extern_result(&engine)
 }
 
 /// Gets the write context from a create-table transaction for a partitioned table. See
@@ -110,18 +115,19 @@ pub unsafe extern "C" fn create_table_get_partitioned_write_context(
     let txn = unsafe { txn.as_ref() };
     let partition_values = unsafe { partition_values.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    partitioned_write_context_impl(|pv| txn.partitioned_write_context(pv), *partition_values)
-        .into_extern_result(&engine)
+    partitioned_write_context_impl(
+        |pv| txn.write_state()?.partitioned_write_context(pv),
+        *partition_values,
+    )
+    .into_extern_result(&engine)
 }
 
-/// Shared body for the partitioned write-context entry points: hand the owned partition values to
-/// the transaction's `partitioned_write_context` and wrap the result in a shared handle.
 fn partitioned_write_context_impl(
-    build: impl FnOnce(HashMap<String, Scalar>) -> DeltaResult<WriteContext>,
+    build: impl FnOnce(HashMap<String, Scalar>) -> DeltaResult<BoundWriteContext>,
     partition_values: PartitionValueMap,
 ) -> DeltaResult<Handle<SharedWriteContext>> {
-    let wc = build(partition_values.inner)?;
-    Ok(Arc::new(wc).into())
+    let context = build(partition_values.inner)?;
+    Ok(Arc::new(context).into())
 }
 
 #[no_mangle]
@@ -129,14 +135,14 @@ pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteCon
     write_context.drop_handle();
 }
 
-/// Returns the logical (user-facing) write schema from a [`WriteContext`] handle. For
+/// Returns the logical (user-facing) write schema from a [`BoundWriteContext`] handle. For
 /// column-mapping-enabled writes, pair with [`get_physical_write_schema`] and
 /// [`get_logical_to_physical`].
 ///
 /// The returned schema must be freed via [`crate::free_schema`].
 ///
 /// # Safety
-/// Engine is responsible for providing a valid WriteContext pointer
+/// Engine is responsible for providing a valid BoundWriteContext pointer
 #[no_mangle]
 pub unsafe extern "C" fn get_write_schema(
     write_context: Handle<SharedWriteContext>,
@@ -145,7 +151,7 @@ pub unsafe extern "C" fn get_write_schema(
     write_context.logical_schema().clone().into()
 }
 
-/// Returns the physical write schema from a [`WriteContext`] handle: the schema of the data
+/// Returns the physical write schema from a [`BoundWriteContext`] handle: the schema of the data
 /// written to parquet files. With column mapping enabled, field names are physical
 /// (e.g. `col-<uuid>`) and each field has a `parquet.field.id` metadata entry per the Delta
 /// column-mapping spec; otherwise it matches the logical schema. Partition columns are
@@ -158,7 +164,7 @@ pub unsafe extern "C" fn get_write_schema(
 /// The returned schema must be freed via [`crate::free_schema`].
 ///
 /// # Safety
-/// Engine is responsible for providing a valid WriteContext pointer
+/// Engine is responsible for providing a valid BoundWriteContext pointer
 #[no_mangle]
 pub unsafe extern "C" fn get_physical_write_schema(
     write_context: Handle<SharedWriteContext>,
@@ -167,7 +173,7 @@ pub unsafe extern "C" fn get_physical_write_schema(
     write_context.physical_schema().clone().into()
 }
 
-/// Returns the logical-to-physical expression from a [`WriteContext`] handle. Engines apply
+/// Returns the logical-to-physical expression from a [`BoundWriteContext`] handle. Engines apply
 /// it via an [`ExpressionEvaluator`] to each batch of logical data before writing parquet.
 /// The logical data batches must not contain partition columns. The column rename itself is encoded
 /// in the physical schema (the evaluator matches input columns to output fields by position), not
@@ -180,7 +186,7 @@ pub unsafe extern "C" fn get_physical_write_schema(
 /// The returned expression must be freed via [`crate::expressions::free_kernel_expression`].
 ///
 /// # Safety
-/// Engine is responsible for providing a valid WriteContext pointer
+/// Engine is responsible for providing a valid BoundWriteContext pointer
 ///
 /// [`ExpressionEvaluator`]: delta_kernel::ExpressionEvaluator
 #[no_mangle]
@@ -191,12 +197,12 @@ pub unsafe extern "C" fn get_logical_to_physical(
     write_context.logical_to_physical().into()
 }
 
-/// Get the table root URL from a WriteContext handle. Returns the table root, not the
+/// Get the table root URL from a BoundWriteContext handle. Returns the table root, not the
 /// recommended write directory (which may include Hive-style partition paths or random
 /// prefixes); use [`get_write_dir`] for the latter.
 ///
 /// # Safety
-/// Engine is responsible for providing a valid WriteContext pointer
+/// Engine is responsible for providing a valid BoundWriteContext pointer
 #[no_mangle]
 pub unsafe extern "C" fn get_write_path(
     write_context: Handle<SharedWriteContext>,
@@ -207,7 +213,7 @@ pub unsafe extern "C" fn get_write_path(
     allocate_fn(kernel_string_slice!(write_path))
 }
 
-/// Get the recommended directory URL for writing data files from a WriteContext handle.
+/// Get the recommended directory URL for writing data files from a BoundWriteContext handle.
 /// Connectors should write files as `<write_dir>/<uuid>.parquet`. For a partitioned write context
 /// this includes the Hive-style partition prefix (e.g. `year=2024/`) when column mapping is off, or
 /// a random prefix when column mapping or `delta.randomizeFilePrefixes` is on.
@@ -220,7 +226,7 @@ pub unsafe extern "C" fn get_write_path(
 /// enabled, so call this once per file batch and reuse the result.
 ///
 /// # Safety
-/// Engine is responsible for providing a valid WriteContext pointer
+/// Engine is responsible for providing a valid BoundWriteContext pointer
 #[no_mangle]
 pub unsafe extern "C" fn get_write_dir(
     write_context: Handle<SharedWriteContext>,
@@ -231,7 +237,8 @@ pub unsafe extern "C" fn get_write_dir(
     allocate_fn(kernel_string_slice!(write_dir))
 }
 
-/// Visit the serialized partition values of a WriteContext handle by invoking `visitor` once per
+/// Visit the serialized partition values of a BoundWriteContext handle by invoking `visitor` once
+/// per
 /// partition column. Keys are *physical* column names (column-mapping applied) and values are the
 /// protocol-serialized strings the engine must record in each Add action's `partitionValues`. When
 /// a partition value is null, `is_null` is `true` and `value` is an empty slice. For an
@@ -239,7 +246,7 @@ pub unsafe extern "C" fn get_write_dir(
 /// so the callback sequence is deterministic across runs.
 ///
 /// # Safety
-/// Engine is responsible for providing a valid WriteContext pointer, a valid `engine_context`
+/// Engine is responsible for providing a valid BoundWriteContext pointer, a valid `engine_context`
 /// pointer passed through to each `visitor` invocation, and a valid `visitor` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_partition_values(
@@ -275,8 +282,8 @@ pub unsafe extern "C" fn visit_partition_values(
 /// Returns an error if `file_url` is not a valid URL or does not live under the table root.
 ///
 /// # Safety
-/// Engine is responsible for providing a valid WriteContext pointer, a valid `file_url` slice, and
-/// a valid engine handle.
+/// Engine is responsible for providing a valid BoundWriteContext pointer, a valid `file_url`
+/// slice, and a valid engine handle.
 #[no_mangle]
 pub unsafe extern "C" fn resolve_file_path(
     write_context: Handle<SharedWriteContext>,
@@ -293,7 +300,7 @@ pub unsafe extern "C" fn resolve_file_path(
 }
 
 fn resolve_file_path_impl(
-    write_context: &WriteContext,
+    write_context: &BoundWriteContext,
     file_url: DeltaResult<&str>,
 ) -> DeltaResult<String> {
     let url = Url::parse(file_url?).map_err(|e| {

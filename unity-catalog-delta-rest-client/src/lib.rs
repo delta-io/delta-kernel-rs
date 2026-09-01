@@ -6,11 +6,13 @@
 //! # Example
 //!
 //! ```no_run
-//! use unity_catalog_delta_client_default::{ClientConfig, UCClient};
+//! use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ClientConfig::build("uc.awesome.org", "your-token").build()?;
+//!     let config = ClientConfig::build("uc.awesome.org", "your-token")
+//!         .with_additional_user_agent([("MyEngine", "1.0.0"), ("MyConnector", "1.0.0")])
+//!         .build()?;
 //!     let client = UCClient::new(config)?;
 //!
 //!     let resp = client.load_table("main", "default", "my_table").await?;
@@ -30,3 +32,7 @@ mod tests;
 pub use clients::{UCClient, UCUpdateTableRestClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
+pub use unity_catalog_delta_client_api as api;
+pub use unity_catalog_delta_client_api::credentials::*;
+pub use unity_catalog_delta_client_api::models::*;
+pub use unity_catalog_delta_client_api::UpdateTableClient;

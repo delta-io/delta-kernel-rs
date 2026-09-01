@@ -207,7 +207,6 @@ fn collect_single_sidecar(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     use rstest::rstest;
 
@@ -215,7 +214,7 @@ mod tests {
     use crate::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS};
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::plans::{IoOperation, PlanResult};
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema, schema_ref};
     use crate::unit_test_utils::load_test_table;
 
     /// Counts ops by kind and delegates to `SyncPlanExecutor`, to assert which I/O the fast path
@@ -332,17 +331,12 @@ mod tests {
     /// Requested stats schema for the `*-struct-stats-only` fixtures (`id: long`, `value: string`),
     /// so compatibility does real per-column matching.
     fn probe_stats_schema() -> SchemaRef {
-        let columns = || {
-            StructType::new_unchecked([
-                StructField::nullable("id", DataType::LONG),
-                StructField::nullable("value", DataType::STRING),
-            ])
-        };
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable(NUM_RECORDS, DataType::LONG),
-            StructField::nullable(MIN_VALUES, columns()),
-            StructField::nullable(MAX_VALUES, columns()),
-        ]))
+        let columns = || schema! { nullable "id": LONG, nullable "value": STRING };
+        schema_ref! {
+            nullable NUM_RECORDS: LONG,
+            nullable MIN_VALUES: (columns()),
+            nullable MAX_VALUES: (columns()),
+        }
     }
 
     /// Fast path on a manifest hint: one sidecar footer read, no drain (`query_scans == 0`). Guards

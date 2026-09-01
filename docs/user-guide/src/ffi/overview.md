@@ -228,10 +228,10 @@ feature is enabled; the rest are always available.
 
 **Write context and file writing**
 
-Use a `WriteContext` to learn where to write parquet files and what schema to
+Use a `BoundWriteContext` to learn where to write parquet files and what schema to
 write. For unpartitioned writes, one context serves the whole transaction.
-Partitioned writes (which would use one context per partition) are tracked in
-[#2355](https://github.com/delta-io/delta-kernel-rs/issues/2355).
+For partitioned writes, create one context per partition by passing a
+`PartitionValueMap` to `get_partitioned_write_context`.
 
 Engines must append their own `<uuid>.parquet` filename (and any subdirectory
 layout) onto the returned table root. For partitioned tables, use
@@ -266,7 +266,7 @@ unpartitioned writes.
 | `create_table_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
 | `create_table_with_engine_info` | Attach a free-form engine identifier to a create-table transaction (consumes and returns a new handle) |
 | `create_table_set_data_change` | Toggle the data-change flag on a create-table transaction (does not consume the handle) |
-| `create_table_get_unpartitioned_write_context` | Get a `WriteContext` to stage initial data files during table creation |
+| `create_table_get_unpartitioned_write_context` | Get a `BoundWriteContext` to stage initial data files during table creation |
 | `create_table_add_files` | Register file metadata for initial data being written alongside the CREATE TABLE commit |
 | `create_table_commit` | Commit the create-table transaction |
 | `free_create_table_builder` | Release a create-table builder handle (before it is consumed by `create_table_builder_build*`) |

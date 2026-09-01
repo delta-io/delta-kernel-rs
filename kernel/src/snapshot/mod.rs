@@ -14,7 +14,7 @@ use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
-use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
+use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
     try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
@@ -31,7 +31,7 @@ use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{physical_to_logical_column_name, ColumnMappingMode, TableFeature};
+use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
@@ -534,15 +534,16 @@ impl Snapshot {
         self.get_domain_metadata_internal(domain, engine)
     }
 
-    /// Get the logical clustering columns for this snapshot, if clustering is enabled.
+    /// Get per-clustering-column descriptors for this snapshot, if clustering is enabled.
     ///
-    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
-    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
-    /// clustering metadata is malformed.
+    /// Returns `Ok(Some(infos))` when the ClusteredTable feature is enabled and the
+    /// `delta.clustering` domain has a current entry (`infos` may be empty if the entry lists
+    /// none), `Ok(None)` when the feature is absent or the domain has no current entry, or an
+    /// error if the clustering metadata is malformed. Descriptors are returned in the order the
+    /// columns appear in the domain.
     ///
-    /// The columns are returned as logical [`ColumnName`]s. When column mapping is enabled,
-    /// this converts the physical names stored in domain metadata back to logical names using
-    /// the table schema.
+    /// Each `ClusteringColumnInfo` carries the physical reference (as stored in the domain), the
+    /// logical reference resolved against the table schema, and the column's data type.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     ///
@@ -550,39 +551,41 @@ impl Snapshot {
     ///
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
-    ///
-    /// [`ColumnName`]: crate::expressions::ColumnName
-    #[allow(unused)]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
-    pub(crate) fn get_logical_clustering_columns(
+    pub(crate) fn get_clustering_column_infos(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        let physical_columns = match self.get_physical_clustering_columns(engine)? {
-            Some(cols) => cols,
-            None => return Ok(None),
+    ) -> DeltaResult<Option<Vec<ClusteringColumnInfo>>> {
+        let Some(physical_columns) = self.get_physical_clustering_columns(engine)? else {
+            return Ok(None);
         };
         let column_mapping_mode = self.table_configuration.column_mapping_mode();
-        if column_mapping_mode == ColumnMappingMode::None {
-            // No column mapping: physical = logical
-            return Ok(Some(physical_columns));
-        }
-        // Convert physical column names to logical names by walking the schema
         let logical_schema = self.table_configuration.logical_schema();
-        let logical_columns = physical_columns
-            .iter()
+        let infos = physical_columns
+            .into_iter()
             .map(|physical_col| {
-                physical_to_logical_column_name(&logical_schema, physical_col, column_mapping_mode)
+                let (logical_col, data_type) = physical_to_logical_column_name_and_type(
+                    &logical_schema,
+                    &physical_col,
+                    column_mapping_mode,
+                )?;
+                Ok(ClusteringColumnInfo {
+                    physical_column: physical_col,
+                    logical_column: logical_col,
+                    data_type,
+                })
             })
             .collect::<DeltaResult<Vec<_>>>()?;
-        Ok(Some(logical_columns))
+        Ok(Some(infos))
     }
 
     /// Get the clustering columns for this snapshot, if the table has clustering enabled.
     ///
-    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
-    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
-    /// clustering metadata is malformed.
+    /// Returns `Ok(Some(columns))` when the ClusteredTable feature is enabled and the
+    /// `delta.clustering` domain has a current entry (`columns` may be empty if the entry lists
+    /// none), `Ok(None)` when the feature is absent or the domain has no current entry, or an
+    /// error if the clustering metadata is malformed.
     ///
     /// The columns are returned as physical column names, respecting the column mapping mode.
     /// Note that this method performs log replay (fetches and processes metadata from storage).
@@ -591,6 +594,21 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        match self.get_clustering_domain_metadata(engine)? {
+            Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the raw JSON configuration of the `delta.clustering` domain.
+    ///
+    /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
+    /// the domain has no current entry. The JSON has the shape
+    /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
+    pub(crate) fn get_clustering_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<String>> {
         if !self
             .table_configuration
             .protocol()
@@ -598,10 +616,7 @@ impl Snapshot {
         {
             return Ok(None);
         }
-        match self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)? {
-            Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
-            None => Ok(None),
-        }
+        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
@@ -894,6 +909,11 @@ impl Snapshot {
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
     /// and the overall checkpoint process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Kernel does not support reading or writing the table, or if the
+    /// snapshot is not published.
     pub fn create_checkpoint_writer(
         self: Arc<Self>,
         engine: &dyn Engine,
@@ -940,6 +960,7 @@ impl Snapshot {
     ///
     /// # Errors
     ///
+    /// - If Kernel does not support reading or writing the table.
     /// - [`Error::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if the
     ///   resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
     ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
@@ -967,6 +988,8 @@ impl Snapshot {
             );
             return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
+
+        self.table_configuration().ensure_read_write_supported()?;
 
         let crc = self.resolve_crc_for_write(engine)?;
 
@@ -1086,6 +1109,7 @@ impl Snapshot {
     ///   write sidecar files.
     ///
     /// # Errors
+    /// - If Kernel does not support reading or writing the table.
     /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint` feature.
     /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature. Note: the
     ///   Delta protocol permits writing V1 checkpoints to such tables; this is a kernel limitation.
@@ -1490,7 +1514,7 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
+        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url, None).unwrap();
         assert!(cp.is_none());
     }
 
@@ -1549,8 +1573,8 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid =
-            LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
+            .expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -1584,8 +1608,8 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result =
-                LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+            let result = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
+                .expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }
@@ -1923,7 +1947,8 @@ mod tests {
                 false,
             ),
         ];
-        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from version 0
+        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from
+                                                                           // version 0
 
         // Create commit without ICT despite being enabled (corrupt case)
         let commit_missing_ict = [create_commit_info(1234567890, None)];
@@ -2307,38 +2332,56 @@ mod tests {
         assert_eq!(config.get("myapp.setting"), Some(&"value".to_string()));
     }
 
+    /// `physical_differs` records whether column mapping is expected to rename the column: with
+    /// mapping on, the domain stores a generated identifier, so only the logical name is
+    /// predictable and the physical one must merely differ from it.
     #[rstest::rstest]
-    #[case::no_clustering(None, None, None)]
-    #[case::clustered_no_column_mapping(
-        Some(vec!["region"]),
-        None,
-        Some(vec![ColumnName::new(["region"])])
-    )]
+    #[case::no_clustering(None, None, None, false)]
+    #[case::clustered_no_column_mapping(Some(vec![vec!["region"]]), None, Some(vec!["region"]), false)]
     #[case::clustered_with_column_mapping(
-        Some(vec!["region"]),
+        Some(vec![vec!["region"]]),
         Some("name"),
-        Some(vec![ColumnName::new(["region"])])
+        Some(vec!["region"]),
+        true
     )]
-    fn test_get_logical_clustering_columns(
-        #[case] clustering_cols: Option<Vec<&str>>,
+    #[case::nested_no_column_mapping(
+        Some(vec![vec!["address", "city"]]),
+        None,
+        Some(vec!["address", "city"]),
+        false
+    )]
+    #[case::nested_with_column_mapping(
+        Some(vec![vec!["address", "city"]]),
+        Some("name"),
+        Some(vec!["address", "city"]),
+        true
+    )]
+    fn test_get_clustering_column_infos(
+        #[case] clustering_cols: Option<Vec<Vec<&str>>>,
         #[case] column_mapping_mode: Option<&str>,
-        #[case] expected: Option<Vec<ColumnName>>,
+        #[case] expected_logical: Option<Vec<&str>>,
+        #[case] physical_differs: bool,
     ) {
         use crate::transaction::create_table::create_table;
         use crate::transaction::data_layout::DataLayout;
 
         let storage = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(storage);
-        let schema = Arc::new(
-            crate::schema::StructType::try_new(vec![
-                crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
-                crate::schema::StructField::new("region", crate::schema::DataType::STRING, true),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "region": STRING,
+            nullable "address": {
+                nullable "city": STRING,
+                nullable "zip": INTEGER,
+            },
+        };
         let _ = create_table("memory:///", schema, "test")
             .fold_with(clustering_cols.as_ref(), |builder, cols| {
-                builder.with_data_layout(DataLayout::clustered(cols.clone()))
+                let columns = cols
+                    .iter()
+                    .map(|path| ColumnName::new(path.iter().copied()))
+                    .collect();
+                builder.with_data_layout(DataLayout::Clustered { columns })
             })
             .fold_with(column_mapping_mode, |builder, mode| {
                 builder.with_table_properties([("delta.columnMapping.mode", mode)])
@@ -2351,8 +2394,33 @@ mod tests {
             .commit(&engine)
             .unwrap();
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
-        let result = snapshot.get_logical_clustering_columns(&engine).unwrap();
-        assert_eq!(result, expected);
+        let result = snapshot.get_clustering_column_infos(&engine).unwrap();
+
+        match expected_logical {
+            None => assert_eq!(result, None),
+            Some(logical) => {
+                let infos = result.expect("clustering infos should be present");
+                assert_eq!(infos.len(), 1);
+                let info = &infos[0];
+                assert_eq!(
+                    info.logical_column,
+                    ColumnName::new(logical.iter().copied())
+                );
+                assert_eq!(info.data_type, DataType::STRING);
+                assert_eq!(info.physical_column.path().len(), logical.len());
+                if physical_differs {
+                    assert_ne!(info.physical_column, info.logical_column);
+                    for part in info.physical_column.path() {
+                        assert!(
+                            part.starts_with("col-"),
+                            "physical path segment '{part}' should be a column-mapping id"
+                        );
+                    }
+                } else {
+                    assert_eq!(info.physical_column, info.logical_column);
+                }
+            }
+        }
     }
 
     // === estimated_owned_heap_size ===
@@ -2448,9 +2516,7 @@ mod tests {
             Snapshot::builder_for("memory:///").build(&engine).unwrap()
         }
 
-        let small_schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("a", DataType::INTEGER)]).unwrap(),
-        );
+        let small_schema = schema_ref! { nullable "a": INTEGER };
         let wide_schema = Arc::new(
             StructType::try_new(
                 (0..50)

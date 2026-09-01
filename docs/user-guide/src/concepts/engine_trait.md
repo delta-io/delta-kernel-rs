@@ -55,7 +55,7 @@ files themselves are parquet and are read by the `ParquetHandler` below.
 | `parse_json(strings, schema)` | Parse JSON strings into columnar `EngineData` |
 | `read_json_files(files, schema, predicate)` | Read JSON files and return `EngineData` (predicate is an optional hint) |
 | `read_json_files_with_cancellation(files, schema, predicate, token)` | As above, but a cooperative engine can abandon the read when `token` fires. Optional to override — see [Cancellation](#cancellation) |
-| `write_json_file(path, data, overwrite)` | Atomically write a stream of `FilteredEngineData` rows as a newline-delimited JSON file (one JSON object per row, nulls omitted) |
+| `write_json_file(path, data, overwrite)` | Atomically write a stream of `FilteredEngineData` rows as a newline-delimited JSON file (one JSON object per row, nulls omitted) and return its exact serialized byte size |
 
 ### ParquetHandler
 
@@ -153,7 +153,7 @@ let engine_data = engine
 ```
 
 This is not part of the `Engine` trait itself. It's a helper on `DefaultEngine` that
-orchestrates the lower-level `ParquetHandler` methods with a `WriteContext` (write directory,
+orchestrates the lower-level `ParquetHandler` methods with a `BoundWriteContext` (write directory,
 schema, stats columns, partition values).
 
 ## Configuring the Default Engine

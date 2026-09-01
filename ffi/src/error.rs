@@ -72,6 +72,7 @@ pub enum KernelError {
     LogHistoryError = 43,
     RowTrackingChangeFeedUnsupported = 44,
     CancelledError = 45,
+    InvalidTransactionStateError = 46,
 }
 
 impl From<Error> for KernelError {
@@ -138,24 +139,11 @@ impl From<Error> for KernelError {
                 KernelError::LiteralExpressionTransformError
             }
             Error::Schema(_) => KernelError::SchemaError,
+            Error::InvalidTransactionState(_) => KernelError::InvalidTransactionStateError,
             Error::LogHistory(_) => KernelError::LogHistoryError,
             Error::Cancelled => KernelError::CancelledError,
             _ => KernelError::UnknownError,
         }
-    }
-}
-
-#[cfg(test)]
-mod error_code_tests {
-    use super::*;
-
-    #[test]
-    fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
-        assert_eq!(
-            KernelError::from(Error::RowTrackingChangeFeedUnsupported(7)),
-            KernelError::RowTrackingChangeFeedUnsupported
-        );
-        assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
     }
 }
 
@@ -331,6 +319,7 @@ impl From<EngineExecError> for Error {
             KernelError::UnsupportedError => Error::Unsupported(message),
             KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
             KernelError::SchemaError => Error::Schema(message),
+            KernelError::InvalidTransactionStateError => Error::InvalidTransactionState(message),
             code @ KernelError::MissingVersionError => {
                 messageless_error(code, message, Error::MissingVersion)
             }
@@ -376,6 +365,20 @@ impl From<EngineExecError> for Error {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            KernelError::from(Error::RowTrackingChangeFeedUnsupported(7)),
+            KernelError::RowTrackingChangeFeedUnsupported
+        );
+        assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
     }
 }
 

@@ -15,7 +15,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema, schema_ref, DataType, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -132,9 +132,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
 }
 
 /// Writes an interval partition column, asserts the partitionValues entry is the Spark ANSI
-/// interval literal (CM=None), and verifies the value round-trips through a scan. Gated on
-/// `interval-type-in-dev` because writing an interval table requires interval writer support.
-#[cfg(feature = "interval-type-in-dev")]
+/// interval literal (CM=None), and verifies the value round-trips through a scan.
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
@@ -158,14 +156,14 @@ async fn test_write_partitioned_interval_roundtrip(
     )]
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("value", DataType::INTEGER),
-        StructField::nullable("period", interval),
-    ])?);
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "period": (interval),
+    };
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot =
         create_interval_partitioned_table(&table_path, engine.as_ref(), schema, cm_mode, false)?;
-    let data_schema = StructType::try_new([StructField::nullable("value", DataType::INTEGER)])?;
+    let data_schema = schema! { nullable "value": INTEGER };
     let batch = RecordBatch::try_new(
         Arc::new((&data_schema).try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![7]))],
@@ -202,7 +200,6 @@ async fn test_write_partitioned_interval_roundtrip(
 
 /// Materialized interval partition columns are written into the Parquet file as physical integer
 /// values and still round-trip through scan output as logical partition columns.
-#[cfg(feature = "interval-type-in-dev")]
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
@@ -226,16 +223,16 @@ async fn test_materialized_partitioned_interval_roundtrip(
     )]
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("value", DataType::INTEGER),
-        StructField::nullable("period", interval),
-    ])?);
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "period": (interval),
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot =
         create_interval_partitioned_table(&table_path, engine.as_ref(), schema, cm_mode, true)?;
 
-    let data_schema = StructType::try_new(vec![StructField::nullable("value", DataType::INTEGER)])?;
+    let data_schema = schema! { nullable "value": INTEGER };
     let batch = RecordBatch::try_new(
         Arc::new((&data_schema).try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![7]))],
@@ -421,13 +418,10 @@ async fn test_write_partitioned_path_encodes_special_chars(
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ===== Step 1: Create a single-STRING-partition table and write one row. =====
-    let schema = Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("value", DataType::INTEGER),
-            StructField::nullable("p", DataType::STRING),
-        ])
-        .unwrap(),
-    );
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "p": STRING,
+    };
     let (_tmp_dir, table_path, snapshot, engine) = setup_and_write(
         schema,
         &["p"],
@@ -516,25 +510,22 @@ async fn test_write_partitioned_path_encodes_special_chars(
 // ==============================================================================
 
 fn all_types_schema() -> Arc<StructType> {
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("value", DataType::INTEGER),
-            StructField::nullable("p_string", DataType::STRING),
-            StructField::nullable("p_int", DataType::INTEGER),
-            StructField::nullable("p_long", DataType::LONG),
-            StructField::nullable("p_short", DataType::SHORT),
-            StructField::nullable("p_byte", DataType::BYTE),
-            StructField::nullable("p_float", DataType::FLOAT),
-            StructField::nullable("p_double", DataType::DOUBLE),
-            StructField::nullable("p_boolean", DataType::BOOLEAN),
-            StructField::nullable("p_date", DataType::DATE),
-            StructField::nullable("p_timestamp", DataType::TIMESTAMP),
-            StructField::nullable("p_decimal", DataType::decimal(10, 2).unwrap()),
-            StructField::nullable("p_binary", DataType::BINARY),
-            StructField::nullable("p_timestamp_ntz", DataType::TIMESTAMP_NTZ),
-        ])
-        .unwrap(),
-    )
+    schema_ref! {
+        nullable "value": INTEGER,
+        nullable "p_string": STRING,
+        nullable "p_int": INTEGER,
+        nullable "p_long": LONG,
+        nullable "p_short": SHORT,
+        nullable "p_byte": BYTE,
+        nullable "p_float": FLOAT,
+        nullable "p_double": DOUBLE,
+        nullable "p_boolean": BOOLEAN,
+        nullable "p_date": DATE,
+        nullable "p_timestamp": TIMESTAMP,
+        nullable "p_decimal": (DataType::decimal(10, 2).unwrap()),
+        nullable "p_binary": BINARY,
+        nullable "p_timestamp_ntz": TIMESTAMP_NTZ,
+    }
 }
 
 const PARTITION_COLS: &[&str] = &[
@@ -687,7 +678,6 @@ macro_rules! assert_col {
     };
 }
 
-#[cfg(feature = "interval-type-in-dev")]
 fn assert_interval_value(batch: &RecordBatch, column_name: &str, expected: &Scalar) {
     match expected {
         Scalar::IntervalYearMonth(months) => {
@@ -774,7 +764,6 @@ fn cm_mode_str(mode: ColumnMappingMode) -> &'static str {
     }
 }
 
-#[cfg(feature = "interval-type-in-dev")]
 fn create_interval_partitioned_table(
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
@@ -1000,10 +989,10 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "partition";
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("number", DataType::INTEGER),
-        StructField::nullable(partition_col, DataType::STRING),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "number": INTEGER,
+        nullable (partition_col): STRING,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let _ = create_table(&table_path, table_schema.clone(), "test/1.0")
@@ -1016,10 +1005,7 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         .with_engine_info("default engine");
 
     // Data batch must not contain the partition column.
-    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let data_schema = schema_ref! { nullable "number": INTEGER };
     let arrow_schema = Arc::new(data_schema.as_ref().try_into_arrow()?);
     let batch = RecordBatch::try_new(
         arrow_schema,
@@ -1027,7 +1013,8 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     )?;
     let data = Box::new(ArrowEngineData::new(batch));
 
-    let write_context = txn.partitioned_write_context(HashMap::from([(
+    let write_state = txn.write_state()?;
+    let write_context = write_state.partitioned_write_context(HashMap::from([(
         partition_col.to_string(),
         Scalar::String("a".into()),
     )]))?;
@@ -1075,12 +1062,12 @@ async fn test_materialize_partition_columns_e2e(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cm = cm_mode_str(cm_mode);
     // Partition columns p1, p2 sit in the middle of the data columns.
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("d1", DataType::INTEGER),
-        StructField::nullable("p1", DataType::STRING),
-        StructField::nullable("p2", DataType::INTEGER),
-        StructField::nullable("d2", DataType::INTEGER),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "d1": INTEGER,
+        nullable "p1": STRING,
+        nullable "p2": INTEGER,
+        nullable "d2": INTEGER,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let _ = create_table(&table_path, table_schema, "test/1.0")
@@ -1094,10 +1081,10 @@ async fn test_materialize_partition_columns_e2e(
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // Data schema excludes partition columns.
-    let kernel_data_schema = StructType::try_new(vec![
-        StructField::nullable("d1", DataType::INTEGER),
-        StructField::nullable("d2", DataType::INTEGER),
-    ])?;
+    let kernel_data_schema = schema! {
+        nullable "d1": INTEGER,
+        nullable "d2": INTEGER,
+    };
     let arrow_data_schema: Arc<ArrowSchema> = Arc::new((&kernel_data_schema).try_into_arrow()?);
     let make_batch = |d1: Vec<i32>, d2: Vec<i32>| {
         RecordBatch::try_new(
@@ -1122,11 +1109,12 @@ async fn test_materialize_partition_columns_e2e(
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("default engine")
         .with_data_change(true);
+    let write_state = txn.write_state()?;
     for (d1, d2, p1, p2) in [
         (vec![1, 2, 3], vec![10, 20, 30], "x", 5),
         (vec![4, 5], vec![40, 50], "y", 6),
     ] {
-        let wc = txn.partitioned_write_context(partition_values(p1, p2))?;
+        let wc = write_state.partitioned_write_context(partition_values(p1, p2))?;
         let add = engine
             .write_parquet(&ArrowEngineData::new(make_batch(d1, d2)), &wc)
             .await?;
@@ -1203,7 +1191,7 @@ async fn test_materialize_all_primitive_partition_types() -> Result<(), Box<dyn 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     // Data schema excludes partition columns.
-    let data_schema = StructType::try_new(vec![StructField::nullable("value", DataType::INTEGER)])?;
+    let data_schema = schema! { nullable "value": INTEGER };
     let batch = RecordBatch::try_new(
         Arc::new((&data_schema).try_into_arrow()?),
         vec![normal_arrow_columns()[0].clone()],
@@ -1247,10 +1235,10 @@ async fn test_input_data_with_partition_column_errors(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cm = cm_mode_str(cm_mode);
     let partition_col = "partition";
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("number", DataType::INTEGER),
-        StructField::nullable(partition_col, DataType::STRING),
-    ])?);
+    let table_schema = schema_ref! {
+        nullable "number": INTEGER,
+        nullable (partition_col): STRING,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut properties = vec![("delta.columnMapping.mode", cm)];
@@ -1277,7 +1265,8 @@ async fn test_input_data_with_partition_column_errors(
     )?;
     let data = Box::new(ArrowEngineData::new(batch));
 
-    let write_context = txn.partitioned_write_context(HashMap::from([(
+    let write_state = txn.write_state()?;
+    let write_context = write_state.partitioned_write_context(HashMap::from([(
         partition_col.to_string(),
         Scalar::String("a".into()),
     )]))?;
@@ -1344,10 +1333,10 @@ async fn test_partition_null_validation(
     let (value, expected_err) = case;
 
     // Schema: a nullable data column + a NOT NULL string partition column.
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("value", DataType::INTEGER),
-        StructField::not_null("p", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        not_null "p": STRING,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut properties = vec![("delta.columnMapping.mode", cm_mode_str(cm_mode))];
@@ -1361,9 +1350,9 @@ async fn test_partition_null_validation(
         .commit(engine.as_ref())?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
-    let result = begin_transaction(snapshot, engine.as_ref())?
-        .with_engine_info("default engine")
-        .partitioned_write_context(HashMap::from([("p".to_string(), value)]));
+    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let write_state = txn.write_state()?;
+    let result = write_state.partitioned_write_context(HashMap::from([("p".to_string(), value)]));
 
     match expected_err {
         Some(needle) => {
@@ -1399,11 +1388,11 @@ async fn test_partition_null_validation_mixed_nullability(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("value", DataType::INTEGER),
-        StructField::not_null("p_required", DataType::STRING),
-        StructField::nullable("p_optional", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        not_null "p_required": STRING,
+        nullable "p_optional": STRING,
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_partitioned_table(
@@ -1415,22 +1404,20 @@ async fn test_partition_null_validation_mixed_nullability(
         false, // write_partition_values_parsed; unused, no checkpoint in this test
     )?;
 
-    begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("default engine")
-        .partitioned_write_context(HashMap::from([
-            ("p_required".to_string(), Scalar::String("a".into())),
-            ("p_optional".to_string(), Scalar::Null(DataType::STRING)),
-        ]))?;
+    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let write_state = txn.write_state()?;
 
-    begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("default engine")
-        .partitioned_write_context(HashMap::from([
-            ("p_required".to_string(), Scalar::String("a".into())),
-            ("p_optional".to_string(), Scalar::String(String::new())),
-        ]))?;
+    write_state.partitioned_write_context(HashMap::from([
+        ("p_required".to_string(), Scalar::String("a".into())),
+        ("p_optional".to_string(), Scalar::Null(DataType::STRING)),
+    ]))?;
 
-    let err = begin_transaction(snapshot, engine.as_ref())?
-        .with_engine_info("default engine")
+    write_state.partitioned_write_context(HashMap::from([
+        ("p_required".to_string(), Scalar::String("a".into())),
+        ("p_optional".to_string(), Scalar::String(String::new())),
+    ]))?;
+
+    let err = write_state
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::Null(DataType::STRING)),
             ("p_optional".to_string(), Scalar::String("b".into())),

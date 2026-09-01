@@ -12,16 +12,27 @@ use delta_kernel::object_store::{self, DynObjectStore, Error, ObjectStore, Objec
 use delta_kernel::{DeltaResult, Error as DeltaError};
 use url::Url;
 
-/// The backing store for a [`DefaultEngine`](crate::DefaultEngine). The optional
-/// [`PaginatedListStore`] enables delimiter pushdown: the LIST request groups keys by `/` (e.g. S3
-/// `delimiter=/`) so the backend returns only direct children. Without it, listing falls back to
-/// `list_with_delimiter` and bounds the result client-side.
+/// The backing store for a [`DefaultEngine`](crate::DefaultEngine).
+///
+/// The optional [`PaginatedListStore`] lets cloud storage apply the directory and offset bounds.
+/// Without it, the engine retrieves direct children from the start of the directory and applies
+/// the offset bound client-side.
 pub struct EngineStore {
     pub(crate) object_store: Arc<DynObjectStore>,
     pub(crate) paginated: Option<Arc<dyn PaginatedListStore>>,
 }
 
+impl std::fmt::Debug for EngineStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineStore")
+            .field("object_store", &self.object_store)
+            .field("paginated", &self.paginated.is_some())
+            .finish()
+    }
+}
+
 impl EngineStore {
+    /// Create a store without provider-specific paginated listing support.
     pub fn plain(object_store: Arc<DynObjectStore>) -> Self {
         Self {
             object_store,
@@ -69,6 +80,18 @@ impl EngineStore {
             ObjectStoreScheme::MicrosoftAzure => listing!(MicrosoftAzureBuilder::new()),
             _ => Self::plain(store_from_url_opts(url, opts)?),
         })
+    }
+}
+
+impl From<Arc<DynObjectStore>> for EngineStore {
+    fn from(object_store: Arc<DynObjectStore>) -> Self {
+        Self::plain(object_store)
+    }
+}
+
+impl<S: ObjectStore + 'static> From<Arc<S>> for EngineStore {
+    fn from(object_store: Arc<S>) -> Self {
+        Self::plain(object_store)
     }
 }
 

@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray, StructArray};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
-use delta_kernel::expressions::ColumnName;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::expressions::column_name;
+use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot};
@@ -38,9 +38,9 @@ use delta_kernel_unity_catalog::{
 };
 use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
-    CreateStagingTableRequest, CreateStagingTableResponse, LoadTableResponse, TableIdentifier,
+    CreateStagingTableRequest, LoadTableResponse, TableIdentifier,
 };
-use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 use url::Url;
 
 /// Returns `(server_url, token)` from the environment, or `None` to signal the caller to skip.
@@ -51,60 +51,14 @@ fn server_env() -> Option<(String, String)> {
     Some((url, token))
 }
 
-/// Builds a `ClientConfig`, applying `UC_USER_AGENT` when set. Some catalogs require a specific
-/// `User-Agent` value and reject others; others ignore the header entirely.
 fn client_config(url: &str, token: &str) -> ClientConfig {
-    let mut builder = ClientConfig::build(url, token);
-    if let Ok(user_agent) = std::env::var("UC_USER_AGENT") {
-        builder = builder.with_user_agent(user_agent);
-    }
-    builder.build().expect("failed to build ClientConfig")
+    ClientConfig::build(url, token)
+        .build()
+        .expect("failed to build ClientConfig")
 }
 
 fn client(url: &str, token: &str) -> UCClient {
     UCClient::new(client_config(url, token)).expect("failed to build UCClient")
-}
-
-/// Default `User-Agent` when `UC_USER_AGENT` is unset. Derived from the crate version to match the
-/// production default.
-const DEFAULT_USER_AGENT: &str = concat!(
-    "Delta/",
-    env!("CARGO_PKG_VERSION"),
-    " delta-kernel-rs/",
-    env!("CARGO_PKG_VERSION")
-);
-
-/// Returns the base URL (`<workspace>/api/2.1/unity-catalog/delta/v1/`) plus an authed
-/// `reqwest::Client` for the hand-rolled staging-tables/tables POSTs.
-fn raw_delta_rest_client(url: &str, token: &str) -> (Url, reqwest::Client) {
-    let base = ClientConfig::build(url, token)
-        .build()
-        .expect("failed to build ClientConfig")
-        .workspace_url
-        .join("delta/v1/")
-        .expect("failed to join delta/v1/ onto workspace URL");
-    let user_agent =
-        std::env::var("UC_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string());
-
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .expect("invalid bearer token"),
-    );
-    headers.insert(
-        reqwest::header::CONTENT_TYPE,
-        reqwest::header::HeaderValue::from_static("application/json"),
-    );
-    headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_str(&user_agent).expect("invalid user agent"),
-    );
-    let http = reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .expect("failed to build reqwest client");
-    (base, http)
 }
 
 /// Normalize a UC table location to a root URL ending in `/`. UC returns the location without a
@@ -162,9 +116,8 @@ async fn live_load_table_builds_log_tail() {
     );
 }
 
-/// Live CREATE through the full connector flow. The two CREATE endpoints (`staging-tables`,
-/// `tables`) are not yet on the REST client (tracked by #3032), so this test hand-rolls those POSTs
-/// with raw `reqwest` while using kernel for the v0 commit and the typed `tables` body.
+/// Live CREATE through the full connector flow: `UCClient::create_staging_table` to reserve,
+/// kernel for the v0 commit, then `UCClient::create_table` to register.
 ///
 /// The table enables row tracking and clustering so the create body and the write path exercise the
 /// `delta.rowTracking` and `delta.clustering` domains in one round trip: the initial watermark (-1)
@@ -186,37 +139,19 @@ async fn live_create_table() {
     let name = format!("kernel_rs_create_test_{}", uuid::Uuid::new_v4().simple());
     let name = name.as_str();
 
-    let (base, http) = raw_delta_rest_client(&url, &token);
-    let tables_base = base
-        .join(&format!("catalogs/{catalog}/schemas/{schema_name}/"))
-        .expect("tables base URL");
+    let uc_client = client(&url, &token);
 
-    // ===== Step 1: POST staging-tables -> allocate uuid + storage + staging credentials =====
-    let staging_url = tables_base
-        .join("staging-tables")
-        .expect("staging-tables URL");
-    let staging_req = CreateStagingTableRequest {
-        name: name.to_string(),
-    };
-    let staging_req_json =
-        serde_json::to_string_pretty(&staging_req).expect("serialize CreateStagingTableRequest");
-    let staging_resp = http
-        .post(staging_url)
-        .json(&staging_req)
-        .send()
+    // ===== Step 1: reserve a staging table -> allocate uuid + storage + staging credentials =====
+    let resp = uc_client
+        .create_staging_table(
+            &catalog,
+            &schema_name,
+            CreateStagingTableRequest {
+                name: name.to_string(),
+            },
+        )
         .await
-        .expect("staging-tables POST failed");
-    let staging_status = staging_resp.status();
-    if !staging_status.is_success() {
-        let body = staging_resp.text().await.unwrap_or_default();
-        panic!(
-            "staging-tables POST returned {staging_status}\nrequest body:\n{staging_req_json}\nresponse body:\n{body}"
-        );
-    }
-    let resp: CreateStagingTableResponse = staging_resp
-        .json()
-        .await
-        .expect("failed to deserialize CreateStagingTableResponse");
+        .expect("create_staging_table failed");
 
     // ===== Step 2: Build the engine over the staging storage location =====
     let table_root =
@@ -241,21 +176,14 @@ async fn live_create_table() {
     // ===== Step 3: Define the schema =====
     // A nested struct so clustering can target both a top-level and a nested
     // column.
-    let schema: SchemaRef = Arc::new(
-        StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-            StructField::nullable(
-                "address",
-                StructType::try_new(vec![
-                    StructField::nullable("city", DataType::STRING),
-                    StructField::nullable("zip", DataType::STRING),
-                ])
-                .expect("failed to build nested schema"),
-            ),
-        ])
-        .expect("failed to build schema"),
-    );
+    let schema: SchemaRef = schema_ref! {
+        not_null "id": INTEGER,
+        nullable "name": STRING,
+        nullable "address": {
+            nullable "city": STRING,
+            nullable "zip": STRING,
+        },
+    };
 
     // ===== Step 4: Invoke kernel to write the v0 commit (00.json) via the UC committer =====
     // The v0 path writes directly to storage and does not call the catalog. Enable row tracking so
@@ -271,10 +199,7 @@ async fn live_create_table() {
     create_table(table_root.as_str(), schema, "delta-kernel-rs-live-test")
         .with_table_properties(disk_props)
         .with_data_layout(DataLayout::Clustered {
-            columns: vec![
-                ColumnName::new(["name"]),
-                ColumnName::new(["address", "city"]),
-            ],
+            columns: vec![column_name!("name"), column_name!("address", "city")],
         })
         .build(engine.as_ref(), committer)
         .expect("failed to build create-table transaction")
@@ -321,23 +246,13 @@ async fn live_create_table() {
             "{key} should be present in the create body"
         );
     }
-    let req_json = serde_json::to_string_pretty(&req).expect("serialize CreateTableRequest");
-    let create_resp = http
-        .post(tables_base.join("tables").expect("tables URL"))
-        .json(&req)
-        .send()
+    uc_client
+        .create_table(&catalog, &schema_name, req)
         .await
-        .expect("tables POST failed");
-    let create_status = create_resp.status();
-    if !create_status.is_success() {
-        let body = create_resp.text().await.unwrap_or_default();
-        panic!(
-            "tables POST returned {create_status}\nrequest body:\n{req_json}\nresponse body:\n{body}"
-        );
-    }
+        .expect("create_table failed");
 
     // ===== Step 7: Verify registration: the table loads and its uuid matches the staging id =====
-    let loaded = client(&url, &token)
+    let loaded = uc_client
         .load_table(&catalog, &schema_name, name)
         .await
         .expect("load_table after create failed");

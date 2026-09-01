@@ -29,7 +29,7 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
 delta_kernel_default_engine = { path = "../default-engine", default-features = false, optional = true }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.26.0" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.28.0" }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog", optional = true }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", optional = true }
 
@@ -68,6 +68,8 @@ default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_def
 # batches, and requires `default-engine-base` because the `PlanBasedEngine` FFI constructor pairs
 # the plan executor with `ArrowEvaluationHandler`
 declarative-plans = ["delta_kernel/declarative-plans", "dep:prost", "arrow", "default-engine-base"]
+
+vendored-protoc = ["delta_kernel/vendored-protoc"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []

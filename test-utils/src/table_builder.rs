@@ -68,7 +68,7 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
-use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, PrimitiveType, SchemaRef, StructType};
 use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -988,24 +988,24 @@ impl fmt::Display for DataLayoutConfig {
 ///
 /// All columns are nullable. Follow-up: add non-nullable variants to test NOT NULL handling.
 pub fn partitioned_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
+    schema_ref! {
         // Partition-candidate columns (all valid partition types, matches write::partitioned)
-        StructField::new("part_bool", DataType::BOOLEAN, true),
-        StructField::new("part_byte", DataType::BYTE, true),
-        StructField::new("part_short", DataType::SHORT, true),
-        StructField::new("part_int", DataType::INTEGER, true),
-        StructField::new("part_long", DataType::LONG, true),
-        StructField::new("part_float", DataType::FLOAT, true),
-        StructField::new("part_double", DataType::DOUBLE, true),
-        StructField::new("part_string", DataType::STRING, true),
-        StructField::new("part_binary", DataType::BINARY, true),
-        StructField::new("part_date", DataType::DATE, true),
-        StructField::new("part_ts", DataType::TIMESTAMP, true),
-        StructField::new("part_ts_ntz", DataType::TIMESTAMP_NTZ, true),
-        StructField::new("part_decimal", DataType::decimal(10, 2).unwrap(), true),
+        nullable "part_bool": BOOLEAN,
+        nullable "part_byte": BYTE,
+        nullable "part_short": SHORT,
+        nullable "part_int": INTEGER,
+        nullable "part_long": LONG,
+        nullable "part_float": FLOAT,
+        nullable "part_double": DOUBLE,
+        nullable "part_string": STRING,
+        nullable "part_binary": BINARY,
+        nullable "part_date": DATE,
+        nullable "part_ts": TIMESTAMP,
+        nullable "part_ts_ntz": TIMESTAMP_NTZ,
+        nullable "part_decimal": (DataType::decimal(10, 2).unwrap()),
         // Non-partition data column (required: at least one non-partition column)
-        StructField::new("value", DataType::INTEGER, true),
-    ]))
+        nullable "value": INTEGER,
+    }
 }
 
 /// Schema with all stats-eligible primitive types for clustering. Boolean and Binary are
@@ -1014,22 +1014,22 @@ pub fn partitioned_schema() -> SchemaRef {
 ///
 /// All columns are nullable. Follow-up: add non-nullable variants to test NOT NULL handling.
 pub fn clustered_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
+    schema_ref! {
         // Clustering-eligible columns (stats-eligible primitive types)
-        StructField::new("clust_byte", DataType::BYTE, true),
-        StructField::new("clust_short", DataType::SHORT, true),
-        StructField::new("clust_int", DataType::INTEGER, true),
-        StructField::new("clust_long", DataType::LONG, true),
-        StructField::new("clust_float", DataType::FLOAT, true),
-        StructField::new("clust_double", DataType::DOUBLE, true),
-        StructField::new("clust_string", DataType::STRING, true),
-        StructField::new("clust_date", DataType::DATE, true),
-        StructField::new("clust_ts", DataType::TIMESTAMP, true),
-        StructField::new("clust_ts_ntz", DataType::TIMESTAMP_NTZ, true),
-        StructField::new("clust_decimal", DataType::decimal(10, 2).unwrap(), true),
+        nullable "clust_byte": BYTE,
+        nullable "clust_short": SHORT,
+        nullable "clust_int": INTEGER,
+        nullable "clust_long": LONG,
+        nullable "clust_float": FLOAT,
+        nullable "clust_double": DOUBLE,
+        nullable "clust_string": STRING,
+        nullable "clust_date": DATE,
+        nullable "clust_ts": TIMESTAMP,
+        nullable "clust_ts_ntz": TIMESTAMP_NTZ,
+        nullable "clust_decimal": (DataType::decimal(10, 2).unwrap()),
         // Non-clustering data column
-        StructField::new("value", DataType::INTEGER, true),
-    ]))
+        nullable "value": INTEGER,
+    }
 }
 
 // Canonical sweep rows for the DataLayoutConfig axis.
@@ -1431,7 +1431,7 @@ fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<()> {
 /// Write a data commit using kernel's transaction + write_parquet path.
 /// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
 /// tables, all rows in a file share the same partition values; for unpartitioned or
-/// clustered tables, uses `unpartitioned_write_context`. Non-partition columns get
+/// clustered tables, binds an unpartitioned write context. Non-partition columns get
 /// varying data derived from version and file index. Partition columns are never nulled
 /// so their data matches the declared partition value; all other nullable columns
 /// (including clustering columns, which kernel permits to be null) get sparse nulls.
@@ -1451,6 +1451,7 @@ async fn write_data_commit<E: TaskExecutor>(
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
+    let write_state = txn.write_state()?;
 
     let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
 
@@ -1480,14 +1481,14 @@ async fn write_data_commit<E: TaskExecutor>(
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
         let write_context = if partition_columns.is_empty() {
-            txn.unpartitioned_write_context()?
+            write_state.unpartitioned_write_context()?
         } else {
             let partition_values = generate_partition_values(
                 logical_schema.as_ref(),
                 partition_columns,
                 partition_seed,
             );
-            txn.partitioned_write_context(partition_values)?
+            write_state.partitioned_write_context(partition_values)?
         };
 
         let add_files = engine
@@ -1553,8 +1554,10 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
             Arc::new(Date32Array::from(values))
         }
         ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            // The sub-millisecond component keeps stats-formatting tests honest: a whole-second
+            // value cannot distinguish a three-digit fraction from an elided one.
             let values: Vec<i64> = (0..rows)
-                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000)
+                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000 + 298_677)
                 .collect();
             let array = TimestampMicrosecondArray::from(values);
             match tz {
@@ -1854,30 +1857,25 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
 /// Default schema with all Delta primitive types including TimestampNtz
 /// and a nested column type.
 pub(crate) fn default_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("bool_col", DataType::BOOLEAN, true),
-        StructField::new("byte_col", DataType::BYTE, true),
-        StructField::new("short_col", DataType::SHORT, true),
-        StructField::new("int_col", DataType::INTEGER, true),
-        StructField::new("long_col", DataType::LONG, true),
-        StructField::new("float_col", DataType::FLOAT, true),
-        StructField::new("double_col", DataType::DOUBLE, true),
-        StructField::new("string_col", DataType::STRING, true),
-        StructField::new("binary_col", DataType::BINARY, true),
-        StructField::new("date_col", DataType::DATE, true),
-        StructField::new("ts_col", DataType::TIMESTAMP, true),
-        StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
-        StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), true),
-        StructField::new(
-            "nested_col",
-            DataType::try_struct_type([
-                StructField::nullable("a", DataType::LONG),
-                StructField::nullable("b", DataType::STRING),
-            ])
-            .unwrap(),
-            true,
-        ),
-    ]))
+    schema_ref! {
+        nullable "bool_col": BOOLEAN,
+        nullable "byte_col": BYTE,
+        nullable "short_col": SHORT,
+        nullable "int_col": INTEGER,
+        nullable "long_col": LONG,
+        nullable "float_col": FLOAT,
+        nullable "double_col": DOUBLE,
+        nullable "string_col": STRING,
+        nullable "binary_col": BINARY,
+        nullable "date_col": DATE,
+        nullable "ts_col": TIMESTAMP,
+        nullable "ts_ntz_col": TIMESTAMP_NTZ,
+        nullable "decimal_col": (DataType::decimal(10, 2).unwrap()),
+        nullable "nested_col": {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -2368,11 +2366,12 @@ mod tests {
 
     #[test]
     fn test_nested_struct_schema_round_trip() -> DeltaResult<()> {
-        let inner = DataType::try_struct_type([StructField::nullable("a", DataType::LONG)])?;
-        let schema: SchemaRef = Arc::new(StructType::try_new([
-            StructField::nullable("id", DataType::LONG),
-            StructField::nullable("inner", inner),
-        ])?);
+        let schema = schema_ref! {
+            nullable "id": LONG,
+            nullable "inner": {
+                nullable "a": LONG,
+            },
+        };
         let table = TestTableBuilder::new()
             .with_schema(schema.clone())
             .build()?;

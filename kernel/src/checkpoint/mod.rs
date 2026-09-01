@@ -121,7 +121,7 @@ use crate::expressions::{
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
-use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType};
+use crate::schema::{lazy_schema_ref, schema, DataType, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
@@ -302,16 +302,13 @@ pub enum V2CheckpointConfig {
 /// Schema of the `_last_checkpoint` file
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
 /// field, which is only known at runtime.
-static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new_unchecked([
-        StructField::not_null("version", DataType::LONG),
-        StructField::not_null("size", DataType::LONG),
-        StructField::nullable("parts", DataType::LONG),
-        StructField::nullable("sizeInBytes", DataType::LONG),
-        StructField::nullable("numOfAddFiles", DataType::LONG),
-    ])
-    .into()
-});
+static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null "version": LONG,
+    not_null "size": LONG,
+    nullable "parts": LONG,
+    nullable "sizeInBytes": LONG,
+    nullable "numOfAddFiles": LONG,
+};
 
 /// Action fields shared by V1 and V2 checkpoint schemas.
 fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
@@ -336,7 +333,7 @@ static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
 fn checkpoint_metadata_field() -> StructField {
     StructField::nullable(
         CHECKPOINT_METADATA_NAME,
-        DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
+        schema! { not_null "version": LONG },
     )
 }
 
@@ -383,6 +380,10 @@ impl RetentionCalculator for CheckpointWriter {
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> DeltaResult<Self> {
+        snapshot
+            .table_configuration()
+            .ensure_read_write_supported()?;
+
         // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;

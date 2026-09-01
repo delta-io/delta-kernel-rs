@@ -158,7 +158,7 @@ pub fn get_engine(
                 )));
             }
         };
-        Ok(DefaultEngineBuilder::from_engine_store(store).build())
+        Ok(DefaultEngineBuilder::new(store).build())
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();

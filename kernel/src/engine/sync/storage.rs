@@ -27,6 +27,9 @@ impl SyncStorageHandler {
     }
 }
 
+// This handler collects eagerly under `block_on`, so there is no in-flight I/O for a cancellation
+// token to interrupt. It deliberately does not override the `*_with_cancellation` methods: their
+// default up-front check is the only cancellation it can honor.
 impl StorageHandler for SyncStorageHandler {
     fn list_from(
         &self,

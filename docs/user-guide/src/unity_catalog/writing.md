@@ -1,7 +1,7 @@
 # Writing to Unity Catalog tables
 
 <!-- Page type: How-to -->
-<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-client-default -->
+<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-rest-client -->
 
 To write to a Unity Catalog-managed Delta table, you create a `UCCommitter`,
 pass it to a Kernel transaction, and then publish the staged commit to make it
@@ -13,7 +13,7 @@ Before reading this page, make sure you understand the generic
 
 > [!NOTE]
 > This page uses the `delta-kernel-unity-catalog` and
-> `unity-catalog-delta-client-default` crates. All code examples use
+> `unity-catalog-delta-rest-client` crates. All code examples use
 > `rust,ignore` because they require these external crates.
 
 ## Set up clients and resolve the table
@@ -25,9 +25,9 @@ Use `UCClient` to load the table and fetch read-write credentials, and build a
 ```rust,ignore
 use std::sync::Arc;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
-let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
+let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).with_additional_user_agent([("MyConnector", "1.0")]).build()?;
 let uc_client = UCClient::new(config.clone())?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
@@ -102,7 +102,8 @@ write context, write Parquet files to the table's storage location, and add the
 resulting file metadata to the transaction.
 
 ```rust,ignore
-let write_context = txn.unpartitioned_write_context()?;
+let write_state = txn.write_state()?;
+let write_context = write_state.unpartitioned_write_context()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 ```
@@ -251,10 +252,10 @@ use std::sync::Arc;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
-use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 // 1. Set up clients
-let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
+let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).with_additional_user_agent([("MyConnector", "1.0")]).build()?;
 let uc_client = UCClient::new(config.clone())?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
@@ -286,7 +287,8 @@ let mut txn = snapshot.clone().transaction(committer, &engine)?
     .with_operation("INSERT".to_string());
 
 // 6. Write data
-let write_context = txn.unpartitioned_write_context()?;
+let write_state = txn.write_state()?;
+let write_context = write_state.unpartitioned_write_context()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 
