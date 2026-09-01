@@ -816,7 +816,65 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          trap 'rm -f /tmp/review_raw_output.txt /tmp/review_stderr.log' EXIT
+
+          emit_failure_diagnostics() {
+            local stop_token
+            stop_token="review-diagnostics-$(openssl rand -hex 16)"
+            echo "::stop-commands::${stop_token}"
+            python3 - <<'PYEOF'
+          import os
+          import pathlib
+          import re
+
+          secret = os.environ.get("LLM_API_KEY", "")
+          credential_patterns = (
+              re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?\S+"),
+              re.compile(
+                  r"(?i)((?:(?:x-)?api[-_ ]?key|access[-_ ]?token)\s*[:=]\s*)\S+"
+              ),
+              re.compile(r"(?i)((?:token|key|sig|signature)=)[^&\s]+"),
+          )
+
+          for label, filename in (
+              ("review stdout", "/tmp/review_raw_output.txt"),
+              ("review stderr", "/tmp/review_stderr.log"),
+          ):
+              path = pathlib.Path(filename)
+              if not path.exists():
+                  continue
+              text = path.read_text(errors="replace")
+              if secret:
+                  text = text.replace(secret, "[REDACTED]")
+              for pattern in credential_patterns:
+                  text = pattern.sub(r"\1[REDACTED]", text)
+              text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+              lines = text.splitlines()
+              if len(lines) > 200:
+                  lines = lines[-200:]
+                  lines.insert(0, "[earlier lines omitted]")
+              rendered = "\n".join(lines)
+              if len(rendered.encode("utf-8")) > 20_000:
+                  rendered = rendered.encode("utf-8")[-20_000:].decode(
+                      "utf-8", errors="replace"
+                  )
+                  rendered = "[earlier bytes omitted]\n" + rendered
+              print(f"--- {label} (redacted, bounded) ---")
+              for line in rendered.splitlines():
+                  print(f"diagnostic | {line}")
+          PYEOF
+            echo "::${stop_token}::"
+          }
+
+          cleanup() {
+            local status="$?"
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              emit_failure_diagnostics
+            fi
+            rm -f /tmp/review_raw_output.txt /tmp/review_stderr.log
+            exit "$status"
+          }
+          trap cleanup EXIT
 
           if [ "${REVIEW_STATUS:-1}" -ne 0 ]; then
             echo "::error::AI review exited with status ${REVIEW_STATUS:-unknown}."
