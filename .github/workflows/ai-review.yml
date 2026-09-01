@@ -471,6 +471,10 @@ jobs:
               subprocess.run([command, "--version"], check=True)
 
           reviewer = load(reviewer_root, expand_env=False)
+          standalone_prompt = reviewer_contract.partition("\n---\n\n")[2].strip()
+          if not standalone_prompt or standalone_prompt != reviewer.prompt.strip():
+              print("::error::REVIEW.md and config.yaml reviewer prompts must match.")
+              sys.exit(1)
           checked_in_agents = {
               path.parent.name
               for path in reviewer_root.joinpath("agents").glob("*/config.yaml")
