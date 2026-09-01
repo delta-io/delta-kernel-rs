@@ -499,7 +499,7 @@ jobs:
           source_tools = {"list_source_files", "read_source_file", "search_source_code"}
           forbidden_source_tools = {"sys_os_edit", "sys_os_shell", "sys_os_write"}
           for sub_agent in reviewer.sub_agents:
-              agent_dir = reviewer_root / "agents" / sub_agent.source_rel_dir
+              agent_dir = reviewer_root / "agents" / sub_agent.name
               sub_manager = ToolManager(
                   sub_agent,
                   workdir=agent_dir,
