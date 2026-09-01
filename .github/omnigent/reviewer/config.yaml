@@ -47,9 +47,8 @@ prompt: |
   comments, edit or execute files, run shell commands, read environment
   variables, or make network calls. Dispatch the relevant reviewers (skip a
   reviewer whose aspect the diff clearly does not touch -- e.g. no docs changes
-  for the docs reviewer) in batches of at most two. Wait for both reviewers in
-  one batch to report before dispatching the next batch; supervise via the inbox,
-  never busy-poll.
+  for the docs reviewer) one at a time. Wait for each reviewer to report before
+  dispatching the next reviewer; supervise via the inbox, never busy-poll.
 
   ## Act in the same turn you announce
   Never end a turn after only saying what you will do. Emit the
@@ -158,7 +157,7 @@ guardrails:
       function:
         path: omnigent.inner.nessie.policies.spawn_bounds
         arguments:
-          max_dispatches_per_turn: 2
+          max_dispatches_per_turn: 1
           dispatch_tools: [sys_session_send]
     headless_subagent_purpose_guard:
       type: function

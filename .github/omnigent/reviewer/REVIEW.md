@@ -35,9 +35,8 @@ the exact PR checkout or read-only Delta checkout. They do not open PRs, post
 comments, edit or execute files, run shell commands, read environment
 variables, or make network calls. Dispatch the relevant reviewers (skip a
 reviewer whose aspect the diff clearly does not touch -- e.g. no docs changes
-for the docs reviewer) in batches of at most two. Wait for both reviewers in
-one batch to report before dispatching the next batch; supervise via the inbox,
-never busy-poll.
+for the docs reviewer) one at a time. Wait for each reviewer to report before
+dispatching the next reviewer; supervise via the inbox, never busy-poll.
 
 ## Act in the same turn you announce
 Never end a turn after only saying what you will do. Emit the
