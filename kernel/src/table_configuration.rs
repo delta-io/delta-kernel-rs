@@ -525,9 +525,10 @@ impl TableConfiguration {
     ///   * [`IcebergCompatV2`] or [`IcebergCompatV3`] is enabled
     ///
     /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    /// [`IcebergCompatV2`]: crate::table_features::TableFeature::IcebergCompatV2
     /// [`IcebergCompatV3`]: crate::table_features::TableFeature::IcebergCompatV3
     pub(crate) fn should_materialize_partition_columns(&self) -> bool {
-        // TODO(#1125): add IcebergcompatV1/V2 here when they are supported.
+        // TODO(#1125): add IcebergCompatV1 here when it is supported.
         self.is_feature_enabled(&TableFeature::MaterializePartitionColumns)
             || self.is_feature_enabled(&TableFeature::IcebergCompatV2)
             || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
@@ -2878,6 +2879,143 @@ mod test {
             config.validate_feature_requirements(&feature_to_enable),
             expected_error_substring,
         );
+    }
+
+    // V2's feature_requirements: ColumnMapping enabled, and V1/V3/DeletionVectors not enabled.
+    #[rstest]
+    #[case::column_mapping_not_supported(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true")],
+        None,
+        vec![],
+        vec![TableFeature::IcebergCompatV2],
+        Some("requires 'columnMapping' to be enabled"),
+    )]
+    #[case::column_mapping_mode_none(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true")],
+        Some(ColumnMappingMode::None),
+        vec![TableFeature::ColumnMapping],
+        vec![TableFeature::IcebergCompatV2, TableFeature::ColumnMapping],
+        Some("requires 'columnMapping' to be enabled"),
+    )]
+    #[case::with_iceberg_compat_v1_enabled(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true"), (ENABLE_ICEBERG_COMPAT_V1, "true")],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV2,
+            TableFeature::IcebergCompatV1,
+            TableFeature::ColumnMapping,
+        ],
+        Some("requires 'icebergCompatV1' to not be enabled"),
+    )]
+    #[case::with_iceberg_compat_v3_enabled(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV2,
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'icebergCompatV3' to not be enabled"),
+    )]
+    #[case::with_deletion_vectors_enabled(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true"), (ENABLE_DELETION_VECTORS, "true")],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping, TableFeature::DeletionVectors],
+        vec![
+            TableFeature::IcebergCompatV2,
+            TableFeature::ColumnMapping,
+            TableFeature::DeletionVectors,
+        ],
+        Some("requires 'deletionVectors' to not be enabled"),
+    )]
+    #[case::all_satisfied_cm_name_mode(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true")],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![TableFeature::IcebergCompatV2, TableFeature::ColumnMapping],
+        None,
+    )]
+    #[case::all_satisfied_cm_id_mode(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true")],
+        Some(ColumnMappingMode::Id),
+        vec![TableFeature::ColumnMapping],
+        vec![TableFeature::IcebergCompatV2, TableFeature::ColumnMapping],
+        None,
+    )]
+    fn test_iceberg_compat_v2_feature_requirements(
+        #[case] props: &[(&str, &str)],
+        #[case] cm_mode: Option<ColumnMappingMode>,
+        #[case] reader_features: Vec<TableFeature>,
+        #[case] writer_features: Vec<TableFeature>,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_for_column_mapping(cm_mode))
+            .with_properties(props)
+            .with_column_mapping(cm_mode)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features(&reader_features)
+                    .with_writer_features(&writer_features)
+                    .build(),
+            )
+            .build();
+        let result = config.validate_feature_requirements(&TableFeature::IcebergCompatV2);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
+    }
+
+    /// A table that enables IcebergCompatV2 with a column whose type is outside V2's allow-list
+    #[test]
+    fn test_iceberg_compat_v2_rejects_unsupported_type_at_load() {
+        let result = MockTableConfigurationBuilder::new()
+            .with_schema(schema! { nullable "maybe": VOID })
+            .with_properties([(ENABLE_ICEBERG_COMPAT_V2, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::IcebergCompatV2])
+                    .build(),
+            )
+            .try_build();
+        assert_result_error_with_message(result, "does not support type");
+    }
+
+    /// IcebergCompatV2 implies partition-column materialization and the `numRecords` stat
+    /// requirement, matching V3.
+    #[test]
+    fn test_iceberg_compat_v2_implies_materialization_and_num_records() {
+        let v2 = MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_flat_with_column_mapping())
+            .with_properties([(ENABLE_ICEBERG_COMPAT_V2, "true")])
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features([TableFeature::ColumnMapping])
+                    .with_writer_features([
+                        TableFeature::IcebergCompatV2,
+                        TableFeature::ColumnMapping,
+                    ])
+                    .build(),
+            )
+            .build();
+        assert!(v2.should_materialize_partition_columns());
+        assert!(v2.requires_stats_num_records());
+
+        let plain = MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_flat())
+            .build();
+        assert!(!plain.should_materialize_partition_columns());
+        assert!(!plain.requires_stats_num_records());
     }
 
     /// `validate_feature_support_for_remove` must fire whenever row tracking is _supported_

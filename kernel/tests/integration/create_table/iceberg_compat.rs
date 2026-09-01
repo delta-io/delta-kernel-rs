@@ -1,4 +1,4 @@
-//! IcebergCompatV3 integration tests for the CreateTable API.
+//! IcebergCompat integration tests for the CreateTable API.
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
@@ -15,10 +15,11 @@ use test_utils::test_table_setup;
 /// `.build(...)` with a clear error.
 ///
 /// `cm_mode_none` and `row_tracking_disabled` are blocked by V3's dependency check
-/// (`maybe_enable_iceberg_compat_v3_dependencies`); the others are blocked earlier because
-/// the property is not in `ALLOWED_DELTA_PROPERTIES` for CREATE TABLE. Keep them here
-/// so that in the future when we support these properties for create table, we will remember
-/// to update this test.
+/// (`maybe_enable_iceberg_compat_v3_dependencies`); `iceberg_compat_v2_active` is blocked by
+/// V2/V3 mutual exclusion in `maybe_enable_iceberg_compat_v2_dependencies`; and
+/// `iceberg_compat_v1_active` is blocked earlier because `delta.enableIcebergCompatV1` is not in
+/// `ALLOWED_DELTA_PROPERTIES` for CREATE TABLE. Keep it here so that in the future when we
+/// support that property for create table, we will remember to update this test.
 #[rstest]
 #[case::cm_mode_none(
     &[("delta.columnMapping.mode", "none")],
@@ -34,7 +35,7 @@ use test_utils::test_table_setup;
 )]
 #[case::iceberg_compat_v2_active(
     &[("delta.enableIcebergCompatV2", "true")],
-    "Setting delta property 'delta.enableIcebergCompatV2' is not supported",
+    "IcebergCompatV2 cannot be enabled together with 'delta.enableIcebergCompatV3'",
 )]
 fn v3_create_table_rejects_incompatible_props(
     #[case] extra_props: &[(&str, &str)],
@@ -161,6 +162,59 @@ fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> DeltaResult<()> {
             .metadata
             .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()),
         "unexpected delta.columnMapping.nested.ids on data: {:?}",
+        data_field.metadata,
+    );
+    Ok(())
+}
+
+/// End-to-end create through the public builder: `delta.enableIcebergCompatV2=true` produces a
+/// loadable table that lists IcebergCompatV2 + ColumnMapping, defaults column mapping to `name`,
+/// and — critically — assigns `delta.columnMapping.nested.ids` to a Map column (regression guard
+/// for the nested-id gate that previously keyed only on V3).
+#[test]
+fn v2_create_table_enables_column_mapping_and_nested_ids() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "data": { STRING => nullable [nullable INTEGER] },
+    };
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.enableIcebergCompatV2", "true")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+
+    // 1. IcebergCompatV2 and ColumnMapping are in the protocol; V2 did not pull in RowTracking.
+    let writer_features = snapshot
+        .table_configuration()
+        .protocol()
+        .writer_features()
+        .expect("writerFeatures present");
+    assert!(
+        writer_features.contains(&TableFeature::IcebergCompatV2)
+            && writer_features.contains(&TableFeature::ColumnMapping),
+        "expected icebergCompatV2 + columnMapping in writerFeatures, got: {writer_features:?}",
+    );
+    assert!(
+        !writer_features.contains(&TableFeature::RowTracking),
+        "V2 must not enable rowTracking, got: {writer_features:?}",
+    );
+
+    // 2. Column mapping defaulted to `name`.
+    assert_eq!(
+        snapshot.table_configuration().column_mapping_mode(),
+        ColumnMappingMode::Name,
+    );
+
+    // 3. The Map column carries nested-id metadata (the V2 nested-id requirement).
+    let loaded_schema = snapshot.schema();
+    let data_field = loaded_schema.field("data").expect("data field present");
+    assert!(
+        data_field
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()),
+        "expected delta.columnMapping.nested.ids on data, got: {:?}",
         data_field.metadata,
     );
     Ok(())

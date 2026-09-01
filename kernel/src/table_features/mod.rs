@@ -17,7 +17,9 @@ use delta_kernel_derive::internal_api;
 pub(crate) use geospatial::validate_geospatial_feature_support;
 pub(crate) use iceberg_compat::v2::V2_VALIDATOR;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
-pub(crate) use iceberg_compat::{validate_iceberg_compat_if_needed, IcebergCompatValidationContext};
+pub(crate) use iceberg_compat::{
+    validate_iceberg_compat_if_needed, IcebergCompatValidationContext,
+};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -420,10 +422,10 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-/// IcebergCompatV2 ensures that Delta tables can be converted to Iceberg format
-/// Spec: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#iceberg-compatibility-v2.>
+/// IcebergCompatV2 ensures that Delta tables can be converted to Iceberg format.
+/// Spec: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#iceberg-compatibility-v2>.
 /// See
-/// https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
+/// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2>
 /// for more requirements to support.
 static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
