@@ -8,7 +8,7 @@
 pub(crate) mod v2;
 pub(crate) mod v3;
 
-use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField};
+use crate::schema::{ColumnMetadataKey, DataType, StructField};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
