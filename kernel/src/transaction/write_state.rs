@@ -14,7 +14,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
-use crate::{DataType, DeltaResult, Error, Expression};
+use crate::{DataType, DeltaResult, Expression, KernelError};
 
 const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 
@@ -103,7 +103,9 @@ impl WriteState {
     ) -> DeltaResult<BoundWriteContext> {
         require!(
             !self.logical_partition_columns.is_empty(),
-            Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
+            KernelError::generic(
+                "table is not partitioned; use unpartitioned_write_context() instead"
+            )
         );
         let normalized = validate_partition_values(
             &self.logical_partition_columns,
@@ -114,7 +116,7 @@ impl WriteState {
         let mut serialized = HashMap::with_capacity(normalized.len());
         for logical_name in &self.logical_partition_columns {
             let scalar = normalized.get(logical_name).ok_or_else(|| {
-                Error::internal_error(format!(
+                KernelError::internal_error(format!(
                     "partition column '{logical_name}' missing after validation"
                 ))
             })?;
@@ -123,7 +125,7 @@ impl WriteState {
                 .full_logical_schema
                 .field(logical_name)
                 .ok_or_else(|| {
-                    Error::internal_error(format!(
+                    KernelError::internal_error(format!(
                         "partition column '{logical_name}' not found in schema after validation"
                     ))
                 })?
@@ -146,7 +148,7 @@ impl WriteState {
     pub fn unpartitioned_write_context(self: &Arc<Self>) -> DeltaResult<BoundWriteContext> {
         require!(
             self.logical_partition_columns.is_empty(),
-            Error::generic("table is partitioned; use partitioned_write_context() instead")
+            KernelError::generic("table is partitioned; use partitioned_write_context() instead")
         );
         let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
         Ok(BoundWriteContext {
@@ -180,7 +182,7 @@ impl WriteState {
         let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "unsupported write state format version {}; expected {}",
                 wire.version, WRITE_STATE_FORMAT_VERSION
             ))
@@ -206,7 +208,7 @@ impl WriteState {
                     let value = partition_values
                         .and_then(|values| values.get(name))
                         .ok_or_else(|| {
-                            Error::internal_error(format!(
+                            KernelError::internal_error(format!(
                                 "partition column '{name}' missing while building \
                                  logical-to-physical expression"
                             ))

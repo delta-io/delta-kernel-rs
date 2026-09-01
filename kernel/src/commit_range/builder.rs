@@ -4,7 +4,7 @@ use crate::commit_range::CommitRange;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::snapshot::SnapshotRef;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, KernelError, Version};
 
 /// Builder for a [`CommitRange`].
 ///
@@ -84,7 +84,7 @@ impl CommitRangeBuilder {
 
         // Snapshot-derived ranges can't extend past the snapshot version.
         if self.snapshot.is_some() && end_version > log_segment.end_version {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "end_version ({end_version}) cannot exceed snapshot version ({})",
                 log_segment.end_version
             )));
@@ -135,7 +135,7 @@ pub enum CommitOrdering {
 
 fn validate_version_range(start: Version, end: Version) -> DeltaResult<()> {
     if start > end {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "start_version ({start}) must be <= end_version ({end})",
         )));
     }
@@ -151,10 +151,10 @@ fn validate_start_version_available(
     if first_commit.map(|f| f.version) == Some(start_version) {
         return Ok(());
     }
-    let earliest_available_commit = first_commit
-        .map(|f| f.version)
-        .ok_or_else(|| Error::generic("snapshot's log segment must have at least one commit"))?;
-    Err(Error::generic(format!(
+    let earliest_available_commit = first_commit.map(|f| f.version).ok_or_else(|| {
+        KernelError::generic("snapshot's log segment must have at least one commit")
+    })?;
+    Err(KernelError::generic(format!(
         "start_version {start_version} is not available in the snapshot's log segment \
          (earliest available commit: {earliest_available_commit})",
     )))
@@ -168,7 +168,7 @@ fn validate_number_of_commit_files(
     let expected = end - start + 1;
     let actual = commit_file_count as u64;
     if expected != actual {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "The number of commit files: {actual} does not match the expected range (start_version: {start}, end_version: {end}): expected {expected} commit files",
         )));
     }

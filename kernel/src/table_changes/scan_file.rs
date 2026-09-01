@@ -17,7 +17,7 @@ use crate::expressions::{col, lit, Expression};
 use crate::scan::state::DvInfo;
 use crate::schema::{lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, Error, RowVisitor};
+use crate::{DeltaResult, KernelError, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,14 +136,14 @@ impl TableChangesFileAction {
             CdfScanFileType::Add => {
                 require!(
                     scan_file.base_row_id.is_some(),
-                    Error::missing_data(format!(
+                    KernelError::missing_data(format!(
                         "baseRowId for row-tracking add action at path {} in version {}",
                         scan_file.path, scan_file.commit_version
                     ))
                 );
                 require!(
                     scan_file.default_row_commit_version.is_some(),
-                    Error::missing_data(format!(
+                    KernelError::missing_data(format!(
                         "defaultRowCommitVersion for row-tracking add action at path {} in \
                          version {}",
                         scan_file.path, scan_file.commit_version
@@ -167,7 +167,7 @@ impl TableChangesFileAction {
                     scan_file.dv_info.deletion_vector.clone(),
                 )),
             }),
-            CdfScanFileType::Cdc => Err(Error::internal_error(format!(
+            CdfScanFileType::Cdc => Err(KernelError::internal_error(format!(
                 "Row-tracking change feed listing unexpectedly produced a cdc scan file: \
                  path={}, version={}",
                 scan_file.path, scan_file.commit_version
@@ -339,7 +339,7 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == CDF_SCAN_FILE_GETTER_COUNT,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of CdfScanFileVisitor getters: {}",
                 getters.len()
             ))

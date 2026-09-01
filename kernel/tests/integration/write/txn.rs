@@ -2,7 +2,7 @@
 
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::{Error as KernelError, Snapshot};
+use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
 use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};

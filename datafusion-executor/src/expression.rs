@@ -24,7 +24,7 @@ use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
     StructType,
 };
-use delta_kernel::{DeltaResult, EngineData, Error};
+use delta_kernel::{DeltaResult, EngineData, KernelError};
 
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
@@ -42,7 +42,7 @@ use crate::utils::column_to_df_expr;
 /// # Errors
 /// Returns an error when a column cannot be resolved, a scalar cannot be converted, supplied type
 /// information is incompatible with the expression, or a `StructPatch` is inconsistent with its
-/// input or output schema. Returns [`Error::unsupported`] when no DataFusion equivalent is
+/// input or output schema. Returns [`KernelError::unsupported`] when no DataFusion equivalent is
 /// implemented.
 pub fn to_df_expr(
     expr: &KernelExpression,
@@ -69,20 +69,20 @@ pub fn to_df_expr(
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
         KernelExpression::Unary(u) => match u.op {
-            UnaryExpressionOp::ToJson => Err(Error::unsupported(
+            UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
                 "converting the ToJson expression is not yet supported",
             )),
         },
 
         // TODO(#3007): implement once kernel's Cast semantics are clarified.
-        KernelExpression::Cast(_) => Err(Error::unsupported(
+        KernelExpression::Cast(_) => Err(KernelError::unsupported(
             "converting a Cast expression is not yet supported",
         )),
 
-        KernelExpression::Opaque(_) => Err(Error::unsupported(
+        KernelExpression::Opaque(_) => Err(KernelError::unsupported(
             "cannot convert an engine-defined Opaque expression",
         )),
-        KernelExpression::Unknown(name) => Err(Error::unsupported(format!(
+        KernelExpression::Unknown(name) => Err(KernelError::unsupported(format!(
             "cannot convert Unknown expression {name:?}"
         ))),
     }
@@ -107,7 +107,7 @@ pub(crate) fn to_df_struct_columns(
         KernelExpression::StructPatch(patch) => {
             struct_columns_from_patch(patch, input_schema, output_type)
         }
-        _ => Err(Error::generic(format!(
+        _ => Err(KernelError::generic(format!(
             "Expression must be a Struct or StructPatch, got {expr:?}"
         ))),
     }
@@ -146,7 +146,7 @@ fn variadic_to_df_expr(
         VariadicExpressionOp::Array => match output_type {
             Some(KernelDataType::Array(arr)) => Some(arr.element_type()),
             Some(other) => {
-                return Err(Error::unsupported(format!(
+                return Err(KernelError::unsupported(format!(
                     "converting an Array expression requires an array output type, got {other:?}"
                 )))
             }
@@ -172,10 +172,10 @@ fn require_struct_output<'a>(
 ) -> DeltaResult<&'a StructType> {
     match output_type {
         Some(KernelDataType::Struct(schema)) => Ok(schema),
-        Some(other) => Err(Error::unsupported(format!(
+        Some(other) => Err(KernelError::unsupported(format!(
             "converting a {arm} expression requires a struct output type, got {other:?}"
         ))),
-        None => Err(Error::unsupported(format!(
+        None => Err(KernelError::unsupported(format!(
             "converting a {arm} expression requires a struct output type"
         ))),
     }
@@ -250,7 +250,7 @@ fn struct_columns_from_fields(
     target: &StructType,
 ) -> DeltaResult<StructColumns> {
     if fields.len() != target.num_fields() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Struct expression field count mismatch: {} fields in expression but {} in schema",
             fields.len(),
             target.num_fields()
@@ -294,7 +294,7 @@ fn struct_columns_from_patch(
     let (mut source_struct, mut source_expr) = (input_schema, None);
     if let Some(path) = patch.input_path() {
         let KernelDataType::Struct(nested) = input_schema.field_at(path)?.data_type() else {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "StructPatch input_path '{path}' does not resolve to a struct"
             )));
         };
@@ -314,7 +314,7 @@ fn struct_columns_from_patch(
                             expr: &KernelExpression|
      -> DeltaResult<()> {
         let field = output_fields.next().ok_or_else(|| {
-            Error::generic("StructPatch produced more fields than the output schema has")
+            KernelError::generic("StructPatch produced more fields than the output schema has")
         })?;
         let value = to_df_expr(expr, input_schema, Some(field.data_type()))?;
         pairs.push((field.name().to_string(), value));
@@ -325,7 +325,7 @@ fn struct_columns_from_patch(
                            name: &str|
      -> DeltaResult<()> {
         let field = output_fields.next().ok_or_else(|| {
-            Error::generic("StructPatch produced more fields than the output schema has")
+            KernelError::generic("StructPatch produced more fields than the output schema has")
         })?;
         let value = match &source_expr {
             Some(base) => get_field(base.clone(), name.to_string()),
@@ -367,7 +367,7 @@ fn struct_columns_from_patch(
         .filter(|fp| !fp.optional)
         .count();
     if used_required_field_patches < required {
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "StructPatch has non-optional field patches that reference missing input fields",
         ));
     }
@@ -377,7 +377,7 @@ fn struct_columns_from_patch(
     }
 
     if output_fields.next().is_some() {
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "StructPatch produced fewer fields than the output schema has",
         ));
     }
@@ -420,7 +420,7 @@ fn map_to_struct_to_df_expr(
     let mut args = Vec::with_capacity(target.num_fields() * 2);
     for field in target.fields() {
         let KernelDataType::Primitive(prim) = field.data_type() else {
-            return Err(Error::unsupported(format!(
+            return Err(KernelError::unsupported(format!(
                 "MapToStruct only supports primitive target types, but field '{}' is {:?}",
                 field.name(),
                 field.data_type()
@@ -436,7 +436,7 @@ fn map_to_struct_to_df_expr(
         let arrow_type = field
             .data_type()
             .try_into_arrow()
-            .map_err(Error::generic_err)?;
+            .map_err(KernelError::generic_err)?;
         args.push(lit(field.name().to_string()));
         args.push(cast(value, arrow_type));
     }
@@ -491,7 +491,7 @@ impl ParseJsonUdf {
         let arrow_schema: ArrowSchema = output_schema
             .as_ref()
             .try_into_arrow()
-            .map_err(Error::generic_err)?;
+            .map_err(KernelError::generic_err)?;
         Ok(Self {
             return_type: ArrowDataType::Struct(arrow_schema.fields().clone()),
             // Coerces Utf8 / LargeUtf8 / Utf8View, mirroring kernel's `parse_json_impl`.

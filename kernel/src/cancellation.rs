@@ -5,14 +5,14 @@
 //! [`ScanBuilder::with_cancellation_token`](crate::scan::ScanBuilder::with_cancellation_token)),
 //! Kernel polls it at action-batch boundaries, and cancellation-aware [`Engine`](crate::Engine)
 //! reads may race their I/O against it. Cancellation is always surfaced as
-//! [`Error::Cancelled`] -- never as normal iterator exhaustion -- so a partial listing can never be
-//! mistaken for a complete one.
+//! [`KernelError::Cancelled`] -- never as normal iterator exhaustion -- so a partial listing can
+//! never be mistaken for a complete one.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{AsAny, DeltaResult, Error};
+use crate::{AsAny, DeltaResult, KernelError};
 
 /// A shared, thread-safe cancellation token. Held as an `Arc` because the lazy scan iterator and
 /// the engine reads it drives can outlive the builder call and run on other threads.
@@ -23,13 +23,14 @@ pub type CancellationTokenRef = Arc<dyn CancellationToken>;
 /// Kernel taking on any async-runtime dependency.
 pub type CancelledFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-/// Returns `Err(Error::Cancelled)` if `token` is present and already cancelled, else `Ok(())`.
+/// Returns `Err(KernelError::Cancelled)` if `token` is present and already cancelled, else
+/// `Ok(())`.
 ///
 /// Used to fail fast before starting a setup/read operation (e.g. a footer read or a sidecar
 /// listing) so cancelled work is not begun.
 pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> DeltaResult<()> {
     match token {
-        Some(t) if t.is_cancelled() => Err(Error::Cancelled),
+        Some(t) if t.is_cancelled() => Err(KernelError::Cancelled),
         _ => Ok(()),
     }
 }
@@ -85,15 +86,15 @@ pub trait CancellationToken: AsAny {
 }
 
 /// Wraps a fallible iterator so that cancellation terminates it with a single
-/// [`Error::Cancelled`] rather than silent truncation.
+/// [`KernelError::Cancelled`] rather than silent truncation.
 ///
-/// Before each pull, the token is polled: if cancelled, one `Err(Error::Cancelled)` is yielded
-/// and every subsequent call returns `None` (the iterator is fused). An `Err(Error::Cancelled)`
-/// arriving from the inner iterator (e.g. a cancellation-aware engine interrupting a read) fuses
-/// it the same way, so a token shared with the engine still yields exactly one terminal error.
-/// With no token, or before cancellation, items pass through unchanged. This is deliberately
-/// **not** `take_while`, which would end the iterator with `None` and make a cancelled listing
-/// look complete.
+/// Before each pull, the token is polled: if cancelled, one `Err(KernelError::Cancelled)` is
+/// yielded and every subsequent call returns `None` (the iterator is fused). An
+/// `Err(KernelError::Cancelled)` arriving from the inner iterator (e.g. a cancellation-aware engine
+/// interrupting a read) fuses it the same way, so a token shared with the engine still yields
+/// exactly one terminal error. With no token, or before cancellation, items pass through unchanged.
+/// This is deliberately **not** `take_while`, which would end the iterator with `None` and make a
+/// cancelled listing look complete.
 pub(crate) struct CancellableIterator<I> {
     inner: I,
     token: Option<CancellationTokenRef>,
@@ -124,13 +125,13 @@ where
         }
         if self.token.as_ref().is_some_and(|t| t.is_cancelled()) {
             self.done = true;
-            return Some(Err(Error::Cancelled));
+            return Some(Err(KernelError::Cancelled));
         }
         let item = self.inner.next();
         // A cancellation-aware engine can itself surface `Err(Cancelled)` from an interrupted
         // read. Fuse on it so the composed pipeline still yields exactly one terminal error
         // rather than this layer re-injecting a second one on the next poll.
-        if matches!(item, Some(Err(Error::Cancelled))) {
+        if matches!(item, Some(Err(KernelError::Cancelled))) {
             self.done = true;
         }
         item
@@ -190,7 +191,7 @@ mod tests {
         let token = Arc::new(TestToken::default());
         token.cancel();
         let mut iter = CancellableIterator::new(ok_iter(3), Some(token as CancellationTokenRef));
-        assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+        assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
         // Fused: never a `Some(Ok(..))` after cancellation, and no infinite error stream.
         assert!(iter.next().is_none());
         assert!(iter.next().is_none());
@@ -206,7 +207,7 @@ mod tests {
         token.cancel();
         // The terminal item is an error, so a cancelled listing can't look complete (which a
         // bare `None` / `take_while` would).
-        assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+        assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
         assert!(iter.next().is_none());
     }
 
@@ -217,10 +218,10 @@ mod tests {
     #[test]
     fn inner_cancelled_error_fuses_without_double_emit() {
         let token: CancellationTokenRef = Arc::new(TestToken::default());
-        let inner = vec![Ok(0), Err(Error::Cancelled), Ok(99)].into_iter();
+        let inner = vec![Ok(0), Err(KernelError::Cancelled), Ok(99)].into_iter();
         let mut iter = CancellableIterator::new(inner, Some(token));
         assert!(matches!(iter.next(), Some(Ok(0))));
-        assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+        assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
         // Fused on the inner error: the trailing Ok is never yielded, and no second error.
         assert!(iter.next().is_none());
     }
@@ -232,7 +233,10 @@ mod tests {
         assert!(check_cancelled(Some(&ct)).is_ok());
         assert!(check_cancelled(None).is_ok());
         token.cancel();
-        assert!(matches!(check_cancelled(Some(&ct)), Err(Error::Cancelled)));
+        assert!(matches!(
+            check_cancelled(Some(&ct)),
+            Err(KernelError::Cancelled)
+        ));
     }
 
     /// A second token type, to check that a downcast discriminates rather than always succeeding.

@@ -134,11 +134,11 @@ fn commit_result_to_committed_handle<S>(
 ) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {
         CommitResult::CommittedTransaction(committed) => Ok(Box::new(committed).into()),
-        CommitResult::RetryableTransaction(_) => Err(delta_kernel::Error::unsupported(
+        CommitResult::RetryableTransaction(_) => Err(delta_kernel::KernelError::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
         )),
         CommitResult::ConflictedTransaction(conflicted) => {
-            Err(delta_kernel::Error::Generic(format!(
+            Err(delta_kernel::KernelError::Generic(format!(
                 "commit conflict at version {}",
                 conflicted.conflict_version()
             )))
@@ -796,7 +796,7 @@ mod tests {
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
-    use delta_kernel_ffi::error::KernelError;
+    use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
         engine_handle_for_store, ok_or_panic, recover_error, recover_string,
@@ -1644,7 +1644,7 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
         );
 
@@ -1687,7 +1687,7 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some("Generic delta kernel error: Metadata for domain dup already specified in this transaction"),
         );
 
@@ -1738,7 +1738,7 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::UnsupportedError,
+            FFIKernelError::UnsupportedError,
             Some("Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"),
         );
 
@@ -2306,7 +2306,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             missing_partition_value,
-            KernelError::UnknownError,
+            FFIKernelError::UnknownError,
             Some("Invalid partition values: missing partition column 'date'. Provided: []"),
         );
 
@@ -2434,7 +2434,7 @@ mod tests {
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let builder = unsafe { *builder_handle.into_inner() };
-        let layout: DeltaResult<DataLayout> = Err(delta_kernel::Error::generic("bad column"));
+        let layout: DeltaResult<DataLayout> = Err(delta_kernel::KernelError::generic("bad column"));
         let result = create_table_builder_with_data_layout_impl(builder, layout);
         assert!(result.is_err());
         unsafe { free_engine(engine) };
@@ -3164,7 +3164,7 @@ mod tests {
         let scan_after = snapshot.scan_builder().build()?;
         let total: usize = scan_after
             .execute(kernel_engine.clone())?
-            .map(|r| Ok::<_, delta_kernel::Error>(r?.len()))
+            .map(|r| Ok::<_, delta_kernel::KernelError>(r?.len()))
             .sum::<Result<_, _>>()?;
         assert_eq!(total, 2, "expected 2 surviving rows");
 
@@ -3266,7 +3266,7 @@ mod tests {
                 unsafe {
                     get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
                 },
-                KernelError::InvalidTransactionStateError,
+                FFIKernelError::InvalidTransactionStateError,
                 Some(
                     "Invalid transaction state: Writing data to a table with column defaults \
                      requires calling Transaction::ack_column_defaults() first",

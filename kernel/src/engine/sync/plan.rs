@@ -40,7 +40,7 @@ use crate::plans::ir::nodes::{
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
-use crate::{DeltaResult, Error, EvaluationHandler as _, FileMeta, StorageHandler as _};
+use crate::{DeltaResult, EvaluationHandler as _, FileMeta, KernelError, StorageHandler as _};
 
 /// A synchronous, test-only [`PlanExecutor`].
 ///
@@ -137,7 +137,7 @@ impl SyncPlanExecutor {
         }
         let terminal = outputs
             .pop()
-            .ok_or_else(|| Error::generic("plan has no nodes"))?;
+            .ok_or_else(|| KernelError::generic("plan has no nodes"))?;
         let batches = terminal
             .into_iter()
             .map(|batch| Ok(Box::new(ArrowEngineData::new(batch)) as _));
@@ -263,14 +263,14 @@ fn dynamic_scan_files(
     for batch in input {
         let path = extract_column(batch, dynamic_scan.path_column.path())?;
         let path = path.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Expected STRING Load path, got {:?}",
                 path.data_type()
             ))
         })?;
         let size = extract_column(batch, dynamic_scan.file_size_column.path())?;
         let size = size.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Expected LONG Load file size, got {:?}",
                 size.data_type()
             ))
@@ -280,7 +280,7 @@ fn dynamic_scan_files(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "Expected LONG Load last modified, got {:?}",
                     last_modified.data_type()
                 ))
@@ -293,26 +293,30 @@ fn dynamic_scan_files(
 
         for row in 0..batch.num_rows() {
             if path.is_null(row) {
-                return Err(Error::generic("DynamicScan path must not be null"));
+                return Err(KernelError::generic("DynamicScan path must not be null"));
             }
             if dv.is_valid(row) && dv_ancestors.iter().all(|ancestor| ancestor.is_valid(row)) {
-                return Err(Error::unsupported(
+                return Err(KernelError::unsupported(
                     "SyncPlanExecutor DynamicScan with deletion vectors",
                 ));
             }
             let path = path.value(row);
             let location = dynamic_scan.base_url.join(path)?;
             if size.is_null(row) {
-                return Err(Error::generic("DynamicScan file size must not be null"));
+                return Err(KernelError::generic(
+                    "DynamicScan file size must not be null",
+                ));
             }
             let size = size.value(row);
             if size <= 0 {
-                return Err(Error::generic("DynamicScan file size must be positive"));
+                return Err(KernelError::generic(
+                    "DynamicScan file size must be positive",
+                ));
             }
             let size = u64::try_from(size)
-                .map_err(|_| Error::generic("DynamicScan file size must fit in a u64"))?;
+                .map_err(|_| KernelError::generic("DynamicScan file size must fit in a u64"))?;
             if last_modified.is_null(row) {
-                return Err(Error::generic(
+                return Err(KernelError::generic(
                     "DynamicScan last-modified time must not be null",
                 ));
             }
@@ -372,7 +376,7 @@ fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> DeltaResult<Ve
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| {
-                    Error::generic("Filter predicate did not produce a boolean array")
+                    KernelError::generic("Filter predicate did not produce a boolean array")
                 })?;
             Ok(filter_record_batch(batch, mask)?)
         })
@@ -416,9 +420,9 @@ fn splice_file_constants(
         .map(
             |field| match file_constant_columns.iter().position(|c| c == field.name()) {
                 Some(slot) => constants[slot].to_array(rows),
-                None => read_columns
-                    .next()
-                    .ok_or_else(|| Error::generic("scan output has fewer columns than schema")),
+                None => read_columns.next().ok_or_else(|| {
+                    KernelError::generic("scan output has fewer columns than schema")
+                }),
             },
         )
         .collect()
@@ -460,7 +464,7 @@ fn scalar_value(array: &dyn Array, row: usize) -> DeltaResult<Scalar> {
     if let Some(longs) = array.as_any().downcast_ref::<Int64Array>() {
         return Ok(Scalar::Long(longs.value(row)));
     }
-    Err(Error::unsupported(format!(
+    Err(KernelError::unsupported(format!(
         "Scalar conversion from array type {:?}",
         array.data_type()
     )))
@@ -482,7 +486,7 @@ fn values_to_record_batch(values: Values) -> DeltaResult<RecordBatch> {
             // attribute of the column.
             let list = Scalar::Array(column).to_array(1)?;
             let list = list.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                Error::generic("Values: Scalar::Array did not lower to a ListArray")
+                KernelError::generic("Values: Scalar::Array did not lower to a ListArray")
             })?;
             let (_field, _offsets, values, _nulls) = list.clone().into_parts();
             Ok(values)

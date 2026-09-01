@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 pub(crate) mod log_replay;
 
@@ -101,11 +101,13 @@ pub(crate) fn deleted_file_retention_timestamp_with_time(
         retention_duration.unwrap_or_else(|| Duration::from_secs(DEFAULT_RETENTION_SECS));
 
     // Convert to milliseconds for remove action deletion_timestamp comparison
-    let now_ms = i64::try_from(now_duration.as_millis())
-        .map_err(|_| Error::checkpoint_write("Current timestamp exceeds i64 millisecond range"))?;
+    let now_ms = i64::try_from(now_duration.as_millis()).map_err(|_| {
+        KernelError::checkpoint_write("Current timestamp exceeds i64 millisecond range")
+    })?;
 
-    let retention_ms = i64::try_from(retention_duration.as_millis())
-        .map_err(|_| Error::checkpoint_write("Retention duration exceeds i64 millisecond range"))?;
+    let retention_ms = i64::try_from(retention_duration.as_millis()).map_err(|_| {
+        KernelError::checkpoint_write("Retention duration exceeds i64 millisecond range")
+    })?;
 
     // Simple subtraction - will produce negative values if retention > now
     Ok(now_ms - retention_ms)
@@ -121,8 +123,9 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
         .map(|duration| -> DeltaResult<i64> {
             let now_ms = crate::utils::current_time_ms()?;
 
-            let expiration_ms = i64::try_from(duration.as_millis())
-                .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
+            let expiration_ms = i64::try_from(duration.as_millis()).map_err(|_| {
+                KernelError::generic("Retention duration exceeds i64 millisecond range")
+            })?;
 
             Ok(now_ms - expiration_ms)
         })

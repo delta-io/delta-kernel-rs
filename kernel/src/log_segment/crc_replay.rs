@@ -36,7 +36,7 @@ use crate::schema::{
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
+use crate::{DeltaResult, Engine, FileMeta, KernelError, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // size is the only Add leaf the visitor reads, and it is required, so its presence marks
@@ -188,7 +188,9 @@ impl LogSegment {
     ) -> DeltaResult<Option<Crc>> {
         require!(
             self.checkpoint_version.is_none(),
-            Error::internal_error("build_crc_from_version_zero called with a checkpoint present")
+            KernelError::internal_error(
+                "build_crc_from_version_zero called with a checkpoint present"
+            )
         );
         let Some(first) = self.listed.ascending_commit_files.first() else {
             return Ok(None);
@@ -197,7 +199,7 @@ impl LogSegment {
         // truncated without a checkpoint.
         require!(
             first.version == 0,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Cannot build CRC: log has no checkpoint but its first commit is at version {} \
                  (expected 0); the log appears truncated without a checkpoint",
                 first.version
@@ -225,7 +227,7 @@ impl LogSegment {
     ) -> DeltaResult<CrcDelta> {
         require!(
             base_version < self.end_version,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "build_crc_delta_from_base: base_version ({}) must be strictly less \
                  than end_version ({})",
                 base_version, self.end_version,
@@ -242,7 +244,7 @@ impl LogSegment {
         let first_above = deltas.first().map(|c| c.version);
         require!(
             first_above == Some(base_version + 1),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "build_crc_delta_from_base: segment is missing commit {} \
                  (lowest commit above base_version is {:?})",
                 base_version + 1,
@@ -553,7 +555,7 @@ fn check_visitor_getters(
     let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
     require!(
         getters.len() == n_fixed + n_protocol_leaves + n_metadata_leaves,
-        Error::internal_error(format!(
+        KernelError::internal_error(format!(
             "Wrong number of {visitor_name} getters: {}",
             getters.len()
         ))

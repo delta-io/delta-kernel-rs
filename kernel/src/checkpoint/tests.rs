@@ -646,7 +646,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::Error::Generic(e) if e == "Log segment is not published"
+        crate::KernelError::Generic(e) if e == "Log segment is not published"
     ));
     Ok(())
 }
@@ -939,7 +939,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         actions_to_string(vec![TestAction::Add("file1.parquet".to_string())]),
     )
     .await
-    .map_err(|err| crate::Error::generic(err.to_string()))?;
+    .map_err(|err| crate::KernelError::generic(err.to_string()))?;
 
     // Version 2
     add_commit(
@@ -949,7 +949,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         actions_to_string(vec![TestAction::Add("file2.parquet".to_string())]),
     )
     .await
-    .map_err(|err| crate::Error::generic(err.to_string()))?;
+    .map_err(|err| crate::KernelError::generic(err.to_string()))?;
 
     // Checkpoint at version 2
     let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -960,7 +960,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         .get("sizeInBytes")
         .and_then(Value::as_u64)
         .ok_or_else(|| {
-            crate::Error::generic("missing or invalid sizeInBytes in _last_checkpoint")
+            crate::KernelError::generic("missing or invalid sizeInBytes in _last_checkpoint")
         })?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
 

@@ -191,7 +191,7 @@ use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error};
+pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, KernelError};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
@@ -214,7 +214,7 @@ pub type Version = u64;
 pub(crate) fn version_as_i64(version: Version) -> DeltaResult<i64> {
     version
         .try_into()
-        .map_err(|_| Error::generic(format!("Delta log version {version} exceeds i64::MAX")))
+        .map_err(|_| KernelError::generic(format!("Delta log version {version} exceeds i64::MAX")))
 }
 
 pub type FileSize = u64;
@@ -253,18 +253,20 @@ impl PartialOrd for FileMeta {
 }
 
 impl TryFrom<DirEntry> for FileMeta {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(ent: DirEntry) -> DeltaResult<FileMeta> {
         let metadata = ent.metadata()?;
         let last_modified = metadata
             .modified()?
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|_| Error::generic("Failed to convert file timestamp to milliseconds"))?;
+            .map_err(|_| {
+                KernelError::generic("Failed to convert file timestamp to milliseconds")
+            })?;
         let location = Url::from_file_path(ent.path())
-            .map_err(|_| Error::generic(format!("Invalid path: {:?}", ent.path())))?;
+            .map_err(|_| KernelError::generic(format!("Invalid path: {:?}", ent.path())))?;
         let last_modified = last_modified.as_millis().try_into().map_err(|_| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Failed to convert file modification time {:?} into i64",
                 last_modified.as_millis()
             ))
@@ -290,7 +292,7 @@ impl FileMeta {
     /// Casts `size` to `i64`. Errors if `size` exceeds `i64::MAX`.
     pub(crate) fn size_as_i64(&self) -> DeltaResult<i64> {
         i64::try_from(self.size)
-            .map_err(|_| Error::generic(format!("file size {} exceeds i64::MAX", self.size)))
+            .map_err(|_| KernelError::generic(format!("file size {} exceeds i64::MAX", self.size)))
     }
 }
 
@@ -632,17 +634,17 @@ pub trait StorageHandler: AsAny {
     /// Cancellation-aware variant of [`list_from`](Self::list_from).
     ///
     /// When `cancellation_token` is `Some`, an engine may race its listing against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than paging through the whole listing.
+    /// terminate the returned iterator with [`KernelError::Cancelled`] once cancellation is
+    /// observed, rather than paging through the whole listing.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`list_from`](Self::list_from), ignoring the token for the rest
-    /// of the listing. So an engine that does not override this stays source-compatible while still
-    /// honoring an up-front cancellation; kernel additionally polls the token as it consumes the
-    /// listing. An engine that overrides this takes over the up-front check and should also
-    /// fast-path an already-cancelled token before starting I/O.
+    /// The default implementation returns [`KernelError::Cancelled`] if the token is already
+    /// cancelled and otherwise delegates to [`list_from`](Self::list_from), ignoring the token
+    /// for the rest of the listing. So an engine that does not override this stays
+    /// source-compatible while still honoring an up-front cancellation; kernel additionally
+    /// polls the token as it consumes the listing. An engine that overrides this takes over the
+    /// up-front check and should also fast-path an already-cancelled token before starting I/O.
     ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
     fn list_from_with_cancellation(
         &self,
         path: &Url,
@@ -661,16 +663,17 @@ pub trait StorageHandler: AsAny {
     /// Cancellation-aware variant of [`read_files`](Self::read_files).
     ///
     /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file slice to completion.
+    /// terminate the returned iterator with [`KernelError::Cancelled`] once cancellation is
+    /// observed, rather than reading every file slice to completion.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`read_files`](Self::read_files), ignoring the token for the rest
-    /// of the read. So an engine that does not override this stays source-compatible while still
-    /// honoring an up-front cancellation. An engine that overrides this takes over the up-front
-    /// check and should also fast-path an already-cancelled token before starting I/O.
+    /// The default implementation returns [`KernelError::Cancelled`] if the token is already
+    /// cancelled and otherwise delegates to [`read_files`](Self::read_files), ignoring the
+    /// token for the rest of the read. So an engine that does not override this stays
+    /// source-compatible while still honoring an up-front cancellation. An engine that
+    /// overrides this takes over the up-front check and should also fast-path an
+    /// already-cancelled token before starting I/O.
     ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
     fn read_files_with_cancellation(
         &self,
         files: Vec<FileSlice>,
@@ -681,18 +684,18 @@ pub trait StorageHandler: AsAny {
     }
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
-    /// it must return Err(Error::FileAlreadyExists).
+    /// it must return Err(KernelError::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 
     /// Write data to the specified path.
     ///
     /// If `overwrite` is false and the file already exists, this must return
-    /// `Err(Error::FileAlreadyExists)`.
+    /// `Err(KernelError::FileAlreadyExists)`.
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()>;
 
     /// Perform a HEAD request for the given file at a Url, returning the file metadata.
     ///
-    /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
+    /// If the file does not exist, this must return an `Err` with [`KernelError::FileNotFound`].
     fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
 
     /// Delete the file at the given path.
@@ -754,17 +757,18 @@ pub trait JsonHandler: AsAny {
     /// Cancellation-aware variant of [`read_json_files`](Self::read_json_files).
     ///
     /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion.
+    /// terminate the returned iterator with [`KernelError::Cancelled`] once cancellation is
+    /// observed, rather than reading every file to completion.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`read_json_files`](Self::read_json_files), ignoring the token
-    /// for the rest of the read. So an engine that does not override this stays source-compatible
-    /// while still honoring an up-front cancellation; kernel additionally polls the token at
-    /// action-batch boundaries. An engine that overrides this takes over the up-front check and
-    /// should also fast-path an already-cancelled token before starting I/O.
+    /// The default implementation returns [`KernelError::Cancelled`] if the token is already
+    /// cancelled and otherwise delegates to [`read_json_files`](Self::read_json_files),
+    /// ignoring the token for the rest of the read. So an engine that does not override this
+    /// stays source-compatible while still honoring an up-front cancellation; kernel
+    /// additionally polls the token at action-batch boundaries. An engine that overrides this
+    /// takes over the up-front check and should also fast-path an already-cancelled token
+    /// before starting I/O.
     ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
     fn read_json_files_with_cancellation(
         &self,
         files: &[FileMeta],
@@ -807,8 +811,8 @@ pub trait JsonHandler: AsAny {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::FileAlreadyExists`] when `overwrite` is false and the destination exists,
-    /// or another error when serialization or storage fails.
+    /// Returns [`KernelError::FileAlreadyExists`] when `overwrite` is false and the destination
+    /// exists, or another error when serialization or storage fails.
     fn write_json_file(
         &self,
         path: &Url,
@@ -1001,17 +1005,18 @@ pub trait ParquetHandler: AsAny {
     /// Cancellation-aware variant of [`read_parquet_files`](Self::read_parquet_files).
     ///
     /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion.
+    /// terminate the returned iterator with [`KernelError::Cancelled`] once cancellation is
+    /// observed, rather than reading every file to completion.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`read_parquet_files`](Self::read_parquet_files), ignoring the
-    /// token for the rest of the read. So an engine that does not override this stays
-    /// source-compatible while still honoring an up-front cancellation; kernel additionally polls
-    /// the token at action-batch boundaries. An engine that overrides this takes over the up-front
-    /// check and should also fast-path an already-cancelled token before starting I/O.
+    /// The default implementation returns [`KernelError::Cancelled`] if the token is already
+    /// cancelled and otherwise delegates to [`read_parquet_files`](Self::read_parquet_files),
+    /// ignoring the token for the rest of the read. So an engine that does not override this
+    /// stays source-compatible while still honoring an up-front cancellation; kernel
+    /// additionally polls the token at action-batch boundaries. An engine that overrides this
+    /// takes over the up-front check and should also fast-path an already-cancelled token
+    /// before starting I/O.
     ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
     fn read_parquet_files_with_cancellation(
         &self,
         files: &[FileMeta],
@@ -1105,16 +1110,16 @@ pub trait ParquetHandler: AsAny {
     /// Cancellation-aware variant of [`read_parquet_footer`](Self::read_parquet_footer).
     ///
     /// When `cancellation_token` is `Some`, an engine may race the footer read against the token
-    /// and return [`Error::Cancelled`] once cancellation is observed.
+    /// and return [`KernelError::Cancelled`] once cancellation is observed.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`read_parquet_footer`](Self::read_parquet_footer), ignoring the
-    /// token for the rest of the read. So an engine that does not override this stays
-    /// source-compatible while still honoring an up-front cancellation. An engine that overrides
-    /// this takes over the up-front check and should also fast-path an already-cancelled token
-    /// before starting I/O.
+    /// The default implementation returns [`KernelError::Cancelled`] if the token is already
+    /// cancelled and otherwise delegates to [`read_parquet_footer`](Self::read_parquet_footer),
+    /// ignoring the token for the rest of the read. So an engine that does not override this
+    /// stays source-compatible while still honoring an up-front cancellation. An engine that
+    /// overrides this takes over the up-front check and should also fast-path an
+    /// already-cancelled token before starting I/O.
     ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
     fn read_parquet_footer_with_cancellation(
         &self,
         file: &FileMeta,
@@ -1155,11 +1160,11 @@ pub trait Engine: AsAny {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] when [`plan_executor`](Self::plan_executor) is `None`.
+    /// Returns [`KernelError::Unsupported`] when [`plan_executor`](Self::plan_executor) is `None`.
     #[cfg(feature = "declarative-plans")]
     fn require_plan_executor(&self) -> DeltaResult<Arc<dyn PlanExecutor>> {
         self.plan_executor()
-            .ok_or_else(|| Error::unsupported("this engine does not provide a PlanExecutor"))
+            .ok_or_else(|| KernelError::unsupported("this engine does not provide a PlanExecutor"))
     }
 }
 

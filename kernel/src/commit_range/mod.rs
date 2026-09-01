@@ -19,7 +19,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use delta_kernel::commit_range::{CommitRange, DeltaAction};
-//! use delta_kernel::{Engine, Error, Snapshot};
+//! use delta_kernel::{Engine, KernelError, Snapshot};
 //! use delta_kernel::object_store::local::LocalFileSystem;
 //! use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 //!
@@ -41,7 +41,7 @@
 //!         let _batch = batch?;
 //!     }
 //! }
-//! # Ok::<(), Error>(())
+//! # Ok::<(), KernelError>(())
 //! ```
 
 mod actions;
@@ -64,7 +64,7 @@ use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, KernelError, Version};
 
 /// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
 /// plus the materialized commit-file pointers in `commit_files`.
@@ -135,13 +135,15 @@ impl CommitRange {
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitAction>> + Send> {
         if actions.is_empty() {
-            return Err(Error::generic("at least one DeltaAction must be requested"));
+            return Err(KernelError::generic(
+                "at least one DeltaAction must be requested",
+            ));
         }
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
             Some(snapshot) => {
                 if snapshot.table_root() != &self.table_root {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "snapshot table root ({}) does not match commit range table root ({})",
                         snapshot.table_root(),
                         self.table_root,
@@ -152,7 +154,7 @@ impl CommitRange {
                     CommitOrdering::DescendingOrder => (self.end_version, "end_version"),
                 };
                 if snapshot.version() != anchor_version {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "snapshot version {} does not match {anchor_name} ({anchor_version})",
                         snapshot.version(),
                     )));
@@ -231,13 +233,17 @@ impl CommitActionsIterator {
 }
 
 /// Prepend `commit v={version}` context to `err`, preserving the original variant for the two
-/// kernel error kinds that protocol validation surfaces ([`Error::Unsupported`] and
-/// [`Error::InvalidProtocol`]). Other variants fall back to [`Error::generic`].
-fn with_version_context(version: Version, err: Error) -> Error {
+/// kernel error kinds that protocol validation surfaces ([`KernelError::Unsupported`] and
+/// [`KernelError::InvalidProtocol`]). Other variants fall back to [`KernelError::generic`].
+fn with_version_context(version: Version, err: KernelError) -> KernelError {
     match err {
-        Error::Unsupported(msg) => Error::Unsupported(format!("commit v={version}: {msg}")),
-        Error::InvalidProtocol(msg) => Error::InvalidProtocol(format!("commit v={version}: {msg}")),
-        other => Error::generic(format!("commit v={version}: {other}")),
+        KernelError::Unsupported(msg) => {
+            KernelError::Unsupported(format!("commit v={version}: {msg}"))
+        }
+        KernelError::InvalidProtocol(msg) => {
+            KernelError::InvalidProtocol(format!("commit v={version}: {msg}"))
+        }
+        other => KernelError::generic(format!("commit v={version}: {other}")),
     }
 }
 
@@ -691,16 +697,16 @@ mod tests {
     #[rstest::rstest]
     #[case::too_high_reader_version(
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#,
-        |err: &Error| matches!(err, Error::Unsupported(_)),
+        |err: &KernelError| matches!(err, KernelError::Unsupported(_)),
     )]
     #[case::too_low_reader_version(
         r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
-        |err: &Error| matches!(err, Error::InvalidProtocol(_)),
+        |err: &KernelError| matches!(err, KernelError::InvalidProtocol(_)),
     )]
     #[tokio::test]
     async fn test_commits_errors_on_unsupported_reader_version(
         #[case] v1: &str,
-        #[case] is_expected_err: fn(&Error) -> bool,
+        #[case] is_expected_err: fn(&KernelError) -> bool,
     ) {
         let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
         let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
@@ -923,8 +929,8 @@ mod tests {
                 "commits must reject snapshot with unsupported feature before iteration begins",
             );
         match err {
-            Error::Unsupported(msg) => assert!(msg.contains("futureFeature"), "got: {msg}"),
-            other => panic!("expected Error::Unsupported, got: {other:?}"),
+            KernelError::Unsupported(msg) => assert!(msg.contains("futureFeature"), "got: {msg}"),
+            other => panic!("expected KernelError::Unsupported, got: {other:?}"),
         }
     }
 
@@ -969,8 +975,8 @@ mod tests {
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
             assert!(
-                matches!(err, Error::Unsupported(_)),
-                "expected Error::Unsupported, got: {err:?}",
+                matches!(err, KernelError::Unsupported(_)),
+                "expected KernelError::Unsupported, got: {err:?}",
             );
         } else {
             result.expect("snapshot-less range must drain cleanly");
@@ -998,10 +1004,10 @@ mod tests {
         let v0_result = iter.next().expect("v=0 commit yield slot");
         match v0_result {
             Ok(_) => panic!("v=0 must reject during iter.next()"),
-            Err(Error::Unsupported(msg)) => {
+            Err(KernelError::Unsupported(msg)) => {
                 assert!(msg.contains("futureFeature"), "got: {msg}")
             }
-            Err(other) => panic!("expected Error::Unsupported, got: {other:?}"),
+            Err(other) => panic!("expected KernelError::Unsupported, got: {other:?}"),
         }
     }
 

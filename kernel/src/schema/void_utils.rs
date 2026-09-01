@@ -14,7 +14,7 @@ use std::sync::Arc;
 use super::{schema_ref, DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
 use crate::expressions::ExpressionStructPatchBuilder;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Returns true when this struct directly contains no non-void fields. The check is local --
 /// it does not recurse into nested structs, because the caller (`ValidateForWrite`) walks every
@@ -86,7 +86,7 @@ struct ValidateForWrite {
 impl ValidateForWrite {
     fn descend_into_container(&mut self, etype: &DataType, position: &str) -> DeltaResult<()> {
         if *etype == DataType::VOID {
-            return Err(Error::schema(format!(
+            return Err(KernelError::schema(format!(
                 "Void type is not allowed as {position}"
             )));
         }
@@ -102,7 +102,7 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
 
     fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<()> {
         if has_no_non_void_fields(stype) {
-            return Err(Error::schema(if self.container_depth > 0 {
+            return Err(KernelError::schema(if self.container_depth > 0 {
                 "A struct nested in Array or Map must contain at least one non-void field"
             } else if self.depth == 0 {
                 "Table schema must contain at least one non-void column"
@@ -125,7 +125,7 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
         // time. Lifting this restriction requires extending the runtime transform to descend
         // into Array elements and Map keys/values.
         if self.container_depth > 0 && *field.data_type() == DataType::VOID {
-            return Err(Error::schema(
+            return Err(KernelError::schema(
                 "Void type is not allowed inside a struct nested in Array or Map",
             ));
         }

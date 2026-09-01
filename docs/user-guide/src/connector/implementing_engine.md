@@ -52,13 +52,13 @@ pub trait StorageHandler {
   `/`, list all files in that directory. Otherwise, list files lexicographically greater than
   the given path in the same directory.
 
-- **`copy_atomic`**: Must fail with `Error::FileAlreadyExists` if the destination exists.
+- **`copy_atomic`**: Must fail with `KernelError::FileAlreadyExists` if the destination exists.
   This is used for commit publishing in catalog-managed tables.
 
 - **`put`**: Writes raw bytes to the given path. If `overwrite` is false and the file already
-  exists, must fail with `Error::FileAlreadyExists`.
+  exists, must fail with `KernelError::FileAlreadyExists`.
 
-- **`head`**: Must return `Error::FileNotFound` if the file doesn't exist.
+- **`head`**: Must return `KernelError::FileNotFound` if the file doesn't exist.
 
 - **`read_files`**: Each `FileSlice` is a `(Url, Option<Range<u64>>)`. When the range is
   `None`, read the entire file.
@@ -205,7 +205,7 @@ fn read_parquet_footer_with_cancellation(
 ) -> DeltaResult<ParquetFooter>;
 ```
 
-You do not have to implement these. Each has a default that returns `Error::Cancelled` if the
+You do not have to implement these. Each has a default that returns `KernelError::Cancelled` if the
 token is already cancelled and otherwise delegates to its plain counterpart. So an engine that
 never overrides them still reads correctly and still stops between batches (Kernel polls the token
 at every action-batch boundary on its own) — it just won't interrupt a read that is already in
@@ -225,15 +225,15 @@ fn read_parquet_files_with_cancellation(
 ) -> DeltaResult<FileDataReadResultIterator> {
     // Kick off the async read as usual, then poll the read future and the token's
     // `cancelled_future()` together. If cancellation wins the race, drop the in-flight
-    // work and yield `Err(Error::Cancelled)` as the iterator's terminal item.
+    // work and yield `Err(KernelError::Cancelled)` as the iterator's terminal item.
 }
 ```
 
 ### The contract you must uphold
 
-- **Surface cancellation as `Error::Cancelled`, never as a short read.** A cancelled read must not
+- **Surface cancellation as `KernelError::Cancelled`, never as a short read.** A cancelled read must not
   return fewer rows, an empty iterator, or a bare `None` — anything Kernel could mistake for a
-  complete result. Emit `Error::Cancelled` as the terminal item so a partial log replay can never
+  complete result. Emit `KernelError::Cancelled` as the terminal item so a partial log replay can never
   look like a finished one.
 - **Kernel already handles the pre-read check.** The default bodies fail fast on an
   already-cancelled token before delegating, so an override can skip that and focus on interrupting

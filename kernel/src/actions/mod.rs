@@ -30,8 +30,8 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta, FileSize,
-    IntoEngineData, RowVisitor as _,
+    DeltaResult, Engine, EngineData, EvaluationHandlerExtension as _, FileMeta, FileSize,
+    IntoEngineData, KernelError, RowVisitor as _,
 };
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -360,7 +360,7 @@ impl Metadata {
         // Note: We don't have to look for nested metadata columns because that is already validated
         // when creating a StructType.
         if let Some(metadata_field) = schema.fields().find(|field| field.is_metadata_column()) {
-            return Err(Error::Schema(format!(
+            return Err(KernelError::Schema(format!(
                 "Table schema must not contain metadata columns. Found metadata column: '{}'",
                 metadata_field.name
             )));
@@ -434,8 +434,8 @@ impl Metadata {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth or
-    /// declares a type the kernel doesn't support, or [`Error::MalformedJson`] for other
+    /// Returns [`KernelError::Schema`] when the schema exceeds the supported decoding depth or
+    /// declares a type the kernel doesn't support, or [`KernelError::MalformedJson`] for other
     /// JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
@@ -448,13 +448,13 @@ impl Metadata {
                     .to_string()
                     .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
             {
-                Error::schema(format!(
+                KernelError::schema(format!(
                     "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
                      serde_json's recursion limit: {error}"
                 ))
                 .with_backtrace()
             } else if is_unsupported_delta_type_error(&error) {
-                Error::schema(error.to_string()).with_backtrace()
+                KernelError::schema(error.to_string()).with_backtrace()
             } else {
                 error.into()
             }
@@ -595,7 +595,7 @@ struct ProtocolRaw {
 }
 
 impl TryFrom<ProtocolRaw> for Protocol {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(protocol: ProtocolRaw) -> DeltaResult<Self> {
         Protocol::try_new(
@@ -653,13 +653,13 @@ impl Protocol {
     ) -> DeltaResult<Self> {
         require!(
             min_reader_version >= MIN_VALID_RW_VERSION,
-            Error::InvalidProtocol(format!(
+            KernelError::InvalidProtocol(format!(
                 "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {min_reader_version}"
             ))
         );
         require!(
             min_writer_version >= MIN_VALID_RW_VERSION,
-            Error::InvalidProtocol(format!(
+            KernelError::InvalidProtocol(format!(
                 "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {min_writer_version}"
             ))
         );
@@ -672,14 +672,14 @@ impl Protocol {
         if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
             require!(
                 reader_features.is_some(),
-                Error::invalid_protocol(
+                KernelError::invalid_protocol(
                     "Reader features must be present when minimum reader version = 3"
                 )
             );
         } else {
             require!(
                 reader_features.is_none(),
-                Error::invalid_protocol(
+                KernelError::invalid_protocol(
                     "Reader features must not be present when minimum reader version != 3"
                 )
             );
@@ -690,14 +690,14 @@ impl Protocol {
         if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
             require!(
                 writer_features.is_some(),
-                Error::invalid_protocol(
+                KernelError::invalid_protocol(
                     "Writer features must be present when minimum writer version = 7"
                 )
             );
         } else {
             require!(
                 writer_features.is_none(),
-                Error::invalid_protocol(
+                KernelError::invalid_protocol(
                     "Writer features must not be present when minimum writer version != 7"
                 )
             );
@@ -715,7 +715,7 @@ impl Protocol {
                         FeatureType::ReaderWriter | FeatureType::Unknown
                     ) || !writer_features.contains(*feature)
                 }) {
-                    return Err(Error::invalid_protocol(format!(
+                    return Err(KernelError::invalid_protocol(format!(
                         "Reader features must contain only ReaderWriter features that are also \
                          listed in writer features, but {offending:?} is not \
                          (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
@@ -747,7 +747,7 @@ impl Protocol {
                     if LEGACY_READER_FEATURES.contains(feature) {
                         legacy_orphans.push(feature);
                     } else {
-                        return Err(Error::invalid_protocol(format!(
+                        return Err(KernelError::invalid_protocol(format!(
                             "Writer features must be Writer-only or also listed in reader features, \
                              but ReaderWriter feature {feature:?} is listed in writerFeatures and \
                              missing from readerFeatures \
@@ -783,7 +783,7 @@ impl Protocol {
                         }
                     }
                 }) {
-                    return Err(Error::invalid_protocol(format!(
+                    return Err(KernelError::invalid_protocol(format!(
                         "Writer features must be Writer-only or also listed in reader features, \
                          but ReaderWriter feature {offending:?} is listed in writerFeatures with \
                          no reader features present \
@@ -793,7 +793,7 @@ impl Protocol {
                 }
                 Ok(())
             }
-            (Some(_), None) => Err(Error::invalid_protocol(
+            (Some(_), None) => Err(KernelError::invalid_protocol(
                 "Reader features should be present in writer features",
             )),
         }?;
@@ -1247,7 +1247,7 @@ fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> DeltaResu
     let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
         fields.iter().any(|f| f.name() == field_name),
-        Error::generic(format!(
+        KernelError::generic(format!(
             "checkpoint union element field {field_name:?} not found in element schema"
         ))
     );
@@ -1362,7 +1362,7 @@ impl ContentRoot {
         let location = if has_scheme(path) {
             // A URI scheme means the path is absolute and used as-is.
             Url::parse(path).map_err(|e| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "Failed to parse absolute checkpoint contentRoot path {path:?}: {e}"
                 ))
             })?
@@ -1373,7 +1373,7 @@ impl ContentRoot {
                 base.push('/');
             }
             Url::parse(&format!("{base}{path}")).map_err(|e| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "Failed to resolve checkpoint contentRoot path {path:?} against table \
                      root {base}: {e}"
                 ))
@@ -1410,7 +1410,7 @@ impl CheckpointAction {
     fn validate(&self) -> DeltaResult<()> {
         require!(
             self.content_root.version <= self.version,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "checkpoint contentRoot.version {} exceeds checkpointMetadata.version {}",
                 self.content_root.version, self.version
             ))
@@ -1482,7 +1482,7 @@ pub(crate) struct Sidecar {
 /// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
 fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
     bytes.try_into().map_err(|_| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Failed to convert {context} size {bytes} to FileSize"
         ))
     })
@@ -1729,10 +1729,10 @@ mod tests {
                 ),
             );
             let error = match result.unwrap_err() {
-                Error::Backtraced { source, .. } => *source,
+                KernelError::Backtraced { source, .. } => *source,
                 error => error,
             };
-            assert!(matches!(error, Error::Schema(_)));
+            assert!(matches!(error, KernelError::Schema(_)));
         } else {
             result.unwrap();
         }
@@ -1785,15 +1785,18 @@ mod tests {
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
         // checking the underlying error.
         let error = match metadata.parse_schema().unwrap_err() {
-            Error::Backtraced { source, .. } => *source,
+            KernelError::Backtraced { source, .. } => *source,
             error => error,
         };
         match expected_error {
             "MalformedJson" => {
-                assert!(matches!(error, Error::MalformedJson(_)), "got: {error:?}")
+                assert!(
+                    matches!(error, KernelError::MalformedJson(_)),
+                    "got: {error:?}"
+                )
             }
             "Schema" => {
-                assert!(matches!(error, Error::Schema(_)), "got: {error:?}")
+                assert!(matches!(error, KernelError::Schema(_)), "got: {error:?}")
             }
             other => panic!("unknown expected_error discriminant: {other}"),
         }
@@ -2012,7 +2015,7 @@ mod tests {
                     reader_features,
                     writer_features
                 ),
-                Err(Error::InvalidProtocol(_)),
+                Err(KernelError::InvalidProtocol(_)),
             ));
         }
     }
@@ -2085,7 +2088,7 @@ mod tests {
             assert!(
                 matches!(
                     &res,
-                    Err(Error::InvalidProtocol(error)) if error.to_string().contains(error_msg)
+                    Err(KernelError::InvalidProtocol(error)) if error.to_string().contains(error_msg)
                 ),
                 "Expected message containing:\t{error_msg}\nBut got:{res:?}\n"
             );

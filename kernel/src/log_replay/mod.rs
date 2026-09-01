@@ -443,7 +443,7 @@ mod tests {
     impl<'a> GetData<'a> for MockGetData {
         fn get_str(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::Error::Generic(error_msg.clone()));
+                return Err(crate::KernelError::Generic(error_msg.clone()));
             }
             Ok(self
                 .string_values
@@ -453,7 +453,7 @@ mod tests {
 
         fn get_int(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i32>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::Error::Generic(error_msg.clone()));
+                return Err(crate::KernelError::Generic(error_msg.clone()));
             }
             Ok(self
                 .int_values
@@ -463,7 +463,7 @@ mod tests {
 
         fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::Error::Generic(error_msg.clone()));
+                return Err(crate::KernelError::Generic(error_msg.clone()));
             }
             Ok(self
                 .long_values

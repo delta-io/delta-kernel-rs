@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use delta_kernel::object_store::{Error as ObjectStoreError, ObjectStore};
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 use delta_kernel_default_engine::rest_store::{
     build_rest_client, headers_from_pairs, AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider,
     RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
@@ -221,7 +221,7 @@ pub(crate) fn rest_builder_state_from_ffi(
 unsafe fn take_auth_pairs_from_c(headers: *mut CAuthHeaders) -> DeltaResult<Vec<(String, String)>> {
     let count = (*headers).count as usize;
     if count > AUTH_MAX_NUM_HEADERS {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "auth header count {count} exceeds max {AUTH_MAX_NUM_HEADERS}"
         )));
     }
@@ -278,7 +278,7 @@ fn copy_optional_string(slice: &KernelStringSlice) -> DeltaResult<String> {
 fn copy_required_string(slice: &KernelStringSlice, field: &str) -> DeltaResult<String> {
     let value = copy_optional_string(slice)?;
     if value.is_empty() {
-        return Err(Error::generic(format!("`{field}` must be non-empty")));
+        return Err(KernelError::generic(format!("`{field}` must be non-empty")));
     }
     Ok(value)
 }
@@ -322,7 +322,7 @@ pub(crate) fn build_rest_object_store(
             .get(REST_BUILDER_OPTION_TLS_TIMEOUT_SECS)
             .map(|s| {
                 s.parse::<u64>().map_err(|e| {
-                    Error::generic(format!(
+                    KernelError::generic(format!(
                         "invalid {} `{s}`: {e}",
                         REST_BUILDER_OPTION_TLS_TIMEOUT_SECS
                     ))
@@ -334,7 +334,7 @@ pub(crate) fn build_rest_object_store(
         .get(REST_BUILDER_OPTION_RETRY_MAX_RETRIES)
         .map(|s| {
             s.parse::<u32>().map_err(|e| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "invalid {} `{s}`: {e}",
                     REST_BUILDER_OPTION_RETRY_MAX_RETRIES
                 ))
@@ -364,7 +364,7 @@ fn parse_bool_option(key: &str, value: Option<&String>) -> DeltaResult<bool> {
         Some(v) => match v.as_str() {
             "true" => Ok(true),
             "false" => Ok(false),
-            other => Err(Error::generic(format!(
+            other => Err(KernelError::generic(format!(
                 "invalid {key} `{other}`: expected `true` or `false`"
             ))),
         },

@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Version};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, KernelError, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -285,7 +285,7 @@ impl FfiCommitActionsIterator {
     fn lock_iter(&self) -> DeltaResult<MutexGuard<'_, CommitActionIter>> {
         self.data
             .lock()
-            .map_err(|_| Error::generic("poisoned commit-actions iterator mutex"))
+            .map_err(|_| KernelError::generic("poisoned commit-actions iterator mutex"))
     }
 }
 
@@ -430,7 +430,7 @@ mod tests {
     use super::*;
     use crate::engine_data::engine_data_length;
     use crate::engine_funcs::{free_read_result_iter, read_result_next};
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, assert_timestamp_is_recent,
         build_snapshot, ok_or_panic,
@@ -551,7 +551,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             result,
-            KernelError::InvalidTableLocationError,
+            FFIKernelError::InvalidTableLocationError,
             None,
         );
 
@@ -590,7 +590,7 @@ mod tests {
             ))
         };
         let result = unsafe { commit_range_builder_build(builder) };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
 
         unsafe { free_engine(engine) }
         Ok(())
@@ -665,7 +665,7 @@ mod tests {
                 unsafe { free_commit_actions_iter(iter) }
             }
             None => {
-                assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+                assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
             }
         }
 
@@ -691,7 +691,7 @@ mod tests {
                 0,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
 
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }

@@ -10,7 +10,7 @@ use crate::expressions::{
 };
 use crate::schema::{try_schema, DataType, SchemaRef, StructField};
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandler, ExpressionEvaluator, FileMeta,
+    DeltaResult, Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
     PredicateEvaluator,
 };
 
@@ -46,9 +46,9 @@ pub(super) fn create_sidecar_action_batch(
         .iter()
         .enumerate()
         .find(|(_, f)| f.name() == SIDECAR_NAME)
-        .ok_or_else(|| Error::internal_error("checkpoint schema missing sidecar field"))?;
+        .ok_or_else(|| KernelError::internal_error("checkpoint schema missing sidecar field"))?;
     let DataType::Struct(sidecar_struct) = sidecar_field.data_type() else {
-        return Err(Error::internal_error(format!(
+        return Err(KernelError::internal_error(format!(
             "expected sidecar field to be struct, got {:?}",
             sidecar_field.data_type()
         )));
@@ -81,7 +81,7 @@ pub(super) fn create_sidecar_action_batch(
                     // We explicitly fill it with `Scalar::Null` here, since
                     // `StructData::try_new` requires one value per schema field.
                     SIDECAR_SCHEMA_TAGS => Ok(Scalar::Null(field.data_type().clone())),
-                    other => Err(Error::CheckpointWrite(format!(
+                    other => Err(KernelError::CheckpointWrite(format!(
                         "Unexpected sidecar field: {other}"
                     ))),
                 })
@@ -161,20 +161,22 @@ impl SidecarSplitter {
     ) -> DeltaResult<Self> {
         // Derive sidecar output schema from the checkpoint data schema (add + remove only).
         let add_field = checkpoint_data_schema.field(ADD_NAME).ok_or_else(|| {
-            Error::checkpoint_write(format!("Checkpoint data schema missing '{ADD_NAME}' field"))
+            KernelError::checkpoint_write(format!(
+                "Checkpoint data schema missing '{ADD_NAME}' field"
+            ))
         })?;
         let remove_field = checkpoint_data_schema.field(REMOVE_NAME).ok_or_else(|| {
-            Error::checkpoint_write(format!(
+            KernelError::checkpoint_write(format!(
                 "Checkpoint data schema missing '{REMOVE_NAME}' field"
             ))
         })?;
         if !add_field.is_nullable() {
-            return Err(Error::checkpoint_write(format!(
+            return Err(KernelError::checkpoint_write(format!(
                 "Checkpoint data schema '{ADD_NAME}' field must be nullable"
             )));
         }
         if !remove_field.is_nullable() {
-            return Err(Error::checkpoint_write(format!(
+            return Err(KernelError::checkpoint_write(format!(
                 "Checkpoint data schema '{REMOVE_NAME}' field must be nullable"
             )));
         }
@@ -305,7 +307,7 @@ impl SingleSidecarDataIterator {
         max_file_actions_hint: usize,
     ) -> DeltaResult<Self> {
         if max_file_actions_hint == 0 {
-            return Err(Error::checkpoint_write(
+            return Err(KernelError::checkpoint_write(
                 "max_file_actions_hint must be greater than 0",
             ));
         }
@@ -332,7 +334,7 @@ impl Iterator for SingleSidecarDataIterator {
         let mut splitter = match self.splitter.lock() {
             Ok(guard) => guard,
             Err(e) => {
-                return Some(Err(Error::internal_error(format!(
+                return Some(Err(KernelError::internal_error(format!(
                     "sidecar splitter lock poisoned: {e}"
                 ))))
             }

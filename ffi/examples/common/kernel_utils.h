@@ -20,7 +20,7 @@ void free_error(Error* error);
 void* allocate_string(const KernelStringSlice slice);
 // kernel will call this to allocate our errors. This can be used to create an "engine native" type
 // error
-EngineError* allocate_error(KernelError etype, const KernelStringSlice msg);
+EngineError* allocate_error(FFIKernelError etype, const KernelStringSlice msg);
 // utility function to convert key/val into slices and set them on a builder
 // returns false on failure
 bool set_builder_opt(EngineBuilder* engine_builder, char* key, char* val);

@@ -360,7 +360,7 @@ pub unsafe extern "C" fn partition_value_map_insert_null(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::Error;
+    use delta_kernel::KernelError;
 
     use super::*;
 
@@ -396,7 +396,7 @@ mod tests {
         };
         let result = partition_value_map_insert_impl(
             &mut map,
-            Err(Error::generic("bad name")),
+            Err(KernelError::generic("bad name")),
             Ok(Scalar::from(1i32)),
         );
         assert!(result.is_err());
@@ -438,7 +438,7 @@ mod tests {
         use delta_kernel::schema::{DataType, PrimitiveType};
 
         use super::*;
-        use crate::error::{ExternResult, KernelError};
+        use crate::error::{ExternResult, FFIKernelError};
         use crate::ffi_test_utils::{ok_or_panic, recover_error};
         use crate::kernel_string_slice;
         use crate::tests::get_default_engine;
@@ -624,7 +624,7 @@ mod tests {
                     engine.shallow_copy(),
                 )
             });
-            assert_eq!(err, KernelError::GenericError);
+            assert_eq!(err, FFIKernelError::GenericError);
             let err = expect_err(unsafe {
                 partition_value_map_insert_null(
                     map.shallow_copy(),
@@ -635,7 +635,7 @@ mod tests {
                     engine.shallow_copy(),
                 )
             });
-            assert_eq!(err, KernelError::GenericError);
+            assert_eq!(err, FFIKernelError::GenericError);
             // Failed inserts did not add the "bad" key.
             assert!(!unsafe { map.as_ref() }.inner.contains_key("bad"));
 

@@ -184,7 +184,7 @@ mod tests {
     use test_utils::add_commit;
 
     use super::*;
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
         ok_or_panic, recover_string,
@@ -295,7 +295,7 @@ mod tests {
 
         let domain3 = "delta.domain3";
         let res = get_domain_metadata_helper(domain3);
-        assert_extern_result_error_with_message(res, KernelError::GenericError, Some("Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+        assert_extern_result_error_with_message(res, FFIKernelError::GenericError, Some("Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
 
         // Secondly, we visit the entire domain metadata
 
@@ -531,7 +531,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             rejected,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some(
                 "Generic delta kernel error: User DomainMetadata are not allowed to use \
                  system-controlled 'delta.*' domain",
@@ -809,7 +809,7 @@ mod tests {
                 visitor,
             )
         };
-        assert_extern_result_error_with_message(res, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(res, FFIKernelError::GenericError, None);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }

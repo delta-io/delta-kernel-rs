@@ -36,7 +36,7 @@ use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
+use crate::{DeltaResult, Engine, KernelError, LogCompactionWriter, Version};
 
 mod builder;
 mod incremental;
@@ -110,10 +110,10 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
-/// Build a [`Error::ChecksumWriteUnsupported`] for a resolution root that could not yield a
+/// Build a [`KernelError::ChecksumWriteUnsupported`] for a resolution root that could not yield a
 /// writable CRC. `reason` completes the sentence "Cannot resolve a CRC to write: ...".
-fn unresolved_crc(reason: &str) -> Error {
-    Error::ChecksumWriteUnsupported(format!("Cannot resolve a CRC to write: {reason}"))
+fn unresolved_crc(reason: &str) -> KernelError {
+    KernelError::ChecksumWriteUnsupported(format!("Cannot resolve a CRC to write: {reason}"))
 }
 
 impl Snapshot {
@@ -246,7 +246,7 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         require!(
             commit.is_commit(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Cannot create post-commit Snapshot. Log file is not a commit file. \
                 Path: {}, Type: {:?}.",
                 commit.location.location, commit.file_type
@@ -256,7 +256,7 @@ impl Snapshot {
         let new_version = commit.version;
         require!(
             new_version == read_version.wrapping_add(1),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Cannot create post-commit Snapshot. Log file version ({new_version}) does not \
                 equal Snapshot version ({read_version}) + 1."
             ))
@@ -526,7 +526,7 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
         if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
             ));
         }
@@ -782,7 +782,7 @@ impl Snapshot {
         } = enablement
         {
             if self.version() < enablement_version {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Invalid state: snapshot at version {} has ICT enablement version {} in the future",
                     self.version(),
                     enablement_version
@@ -795,7 +795,7 @@ impl Snapshot {
             match crc.in_commit_timestamp_opt {
                 Some(ict) => return Ok(Some(ict)),
                 None => {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "In-Commit Timestamp not found in CRC file at version {}",
                         self.version()
                     )));
@@ -809,7 +809,9 @@ impl Snapshot {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
                 Ok(Some(ict))
             }
-            None => Err(Error::generic("Last commit file not found in log segment")),
+            None => Err(KernelError::generic(
+                "Last commit file not found in log segment",
+            )),
         }
     }
 
@@ -837,7 +839,7 @@ impl Snapshot {
                         let ts = commit_file_meta.location.last_modified;
                         Ok(ts)
                     }
-                    None => Err(Error::generic(format!(
+                    None => Err(KernelError::generic(format!(
                         "Last commit file not found in log segment for version {} \
                          (ICT disabled): cannot read filesystem modification timestamp",
                         self.version()
@@ -847,13 +849,13 @@ impl Snapshot {
             InCommitTimestampEnablement::Enabled { .. } => self
                 .get_in_commit_timestamp(engine)
                 .map_err(|e| {
-                    Error::generic(format!(
+                    KernelError::generic(format!(
                         "Unable to read in-commit timestamp for version {}: {e}",
                         self.version()
                     ))
                 })?
                 .ok_or_else(|| {
-                    Error::internal_error(format!(
+                    KernelError::internal_error(format!(
                         "Invalid state: version {}, ICT is enabled \
                         but get_in_commit_timestamp returned None",
                         self.version()
@@ -961,8 +963,8 @@ impl Snapshot {
     /// # Errors
     ///
     /// - If Kernel does not support reading or writing the table.
-    /// - [`Error::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if the
-    ///   resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
+    /// - [`KernelError::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if
+    ///   the resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
     ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
     ///   `inCommitTimestampOpt` is absent.
@@ -1007,7 +1009,7 @@ impl Snapshot {
                 )?);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
-            Err(Error::FileAlreadyExists(_)) => {
+            Err(KernelError::FileAlreadyExists(_)) => {
                 info!(
                     "Another writer beat us to writing CRC file at {}",
                     crc_path.location
@@ -1028,7 +1030,7 @@ impl Snapshot {
     /// 3. A checkpoint, advanced over the tail commits via reverse replay.
     /// 4. A full reverse replay of the commit history.
     ///
-    /// Returns [`Error::ChecksumWriteUnsupported`] when a root is reached but cannot yield a
+    /// Returns [`KernelError::ChecksumWriteUnsupported`] when a root is reached but cannot yield a
     /// writable CRC (missing protocol or metadata, or a non-incremental tail that dooms file
     /// stats).
     ///
@@ -1157,7 +1159,7 @@ impl Snapshot {
         match spec {
             Some(CheckpointSpec::V2(cfg)) => {
                 if !v2_supported {
-                    return Err(Error::checkpoint_write(
+                    return Err(KernelError::checkpoint_write(
                         "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
                     ));
                 }
@@ -1165,7 +1167,7 @@ impl Snapshot {
                     file_actions_per_sidecar_hint: Some(0),
                 } = cfg
                 {
-                    return Err(Error::checkpoint_write(
+                    return Err(KernelError::checkpoint_write(
                         "file_actions_per_sidecar_hint must be greater than 0",
                     ));
                 }
@@ -1173,7 +1175,7 @@ impl Snapshot {
             Some(CheckpointSpec::V1) if v2_supported => {
                 // TODO: remove this once we support writing V1 checkpoints even if table supports
                 // v2Checkpoint See <https://github.com/delta-io/delta-kernel-rs/issues/2454>.
-                return Err(Error::unsupported(
+                return Err(KernelError::unsupported(
                     "Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint",
                 ));
             }
@@ -1195,7 +1197,7 @@ impl Snapshot {
 
         let info = match write_result {
             Ok(info) => info,
-            Err(Error::FileAlreadyExists(_)) => {
+            Err(KernelError::FileAlreadyExists(_)) => {
                 // NOTE: Per write_parquet_file's documentation, it should silently overwrite
                 // existing files, so we log a warning but still return the correct result.
                 warn!(
@@ -1211,7 +1213,7 @@ impl Snapshot {
         writer.finalize(engine, &info.last_checkpoint_stats)?;
 
         let checkpoint_log_path = ParsedLogPath::try_from(info.file_meta)?.ok_or_else(|| {
-            Error::internal_error("Checkpoint path could not be parsed as a log path")
+            KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
         let new_log_segment = self
             .log_segment
@@ -1265,7 +1267,7 @@ impl Snapshot {
             unpublished_catalog_commits
                 .windows(2)
                 .all(|commits| commits[0].version() + 1 == commits[1].version()),
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Expected ordered and contiguous unpublished catalog commits. \
                  Got: {unpublished_catalog_commits:?}"
             ))
@@ -1273,14 +1275,14 @@ impl Snapshot {
 
         require!(
             self.table_configuration().is_catalog_managed(),
-            Error::generic(
+            KernelError::generic(
                 "There are catalog commits that need publishing, but the table is not catalog-managed.",
             )
         );
 
         require!(
             committer.is_catalog_committer(),
-            Error::generic(
+            KernelError::generic(
                 "There are catalog commits that need publishing, but the committer is not a catalog committer.",
             )
         );
@@ -1753,7 +1755,7 @@ mod tests {
         let err = snapshot
             .get_domain_metadata("delta.domain3", &engine)
             .unwrap_err();
-        assert!(matches!(err, Error::Generic(msg) if
+        assert!(matches!(err, KernelError::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
 
         // Test get_domain_metadata_internal

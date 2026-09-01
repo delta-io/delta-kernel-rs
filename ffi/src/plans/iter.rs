@@ -29,7 +29,7 @@
 //!
 //! 3. Errors - each [`EngineExecError`](crate::error::EngineExecError) carries a kernel-allocated
 //!    `ExclusiveRustString` message handle. Kernel takes ownership of the message and frees it when
-//!    converting the error into a kernel error (via `From<EngineExecError> for Error`).
+//!    converting the error into a kernel error (via `From<EngineExecError> for KernelError`).
 //!
 //! # Safety
 //! The engine is responsible for ensuring that all `state`, `next`, and `free` pointers
@@ -41,7 +41,7 @@ use delta_kernel::arrow::array::{
     self as arrow_array, Array, BinaryArray, Int64Array, StringArray, StructArray, UInt64Array,
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
-use delta_kernel::{DeltaResult, EngineData, Error};
+use delta_kernel::{DeltaResult, EngineData, KernelError};
 use url::Url;
 
 use crate::error::EngineExecResult;
@@ -124,7 +124,7 @@ fn next_item<T>(next: CIterNextFn<T>, state: NullableCvoid) -> Option<DeltaResul
         OptionalValue::None => None,
         OptionalValue::Some(EngineExecResult::Success(item)) => Some(Ok(item)),
         OptionalValue::Some(EngineExecResult::Failure(err)) => Some(Err(err.into())),
-        OptionalValue::Some(EngineExecResult::Uninit) => Some(Err(Error::internal_error(
+        OptionalValue::Some(EngineExecResult::Uninit) => Some(Err(KernelError::internal_error(
             "FFI engine iterator returned from next upcall without writing an item",
         ))),
     }
@@ -209,19 +209,21 @@ impl FfiBytesIter {
         let array = arrow_array::make_array(array_data);
 
         let Some(binary) = array.as_any().downcast_ref::<BinaryArray>() else {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "CBytesIterator must yield BinaryArray, got {:?}",
                 array.data_type()
             )));
         };
         if binary.len() != 1 {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "CBytesIterator array must contain exactly one row, got {}",
                 binary.len()
             )));
         }
         if binary.is_null(0) {
-            return Err(Error::generic("CBytesIterator array row must not be null"));
+            return Err(KernelError::generic(
+                "CBytesIterator array row must not be null",
+            ));
         }
 
         // TODO: this copies the payload bytes, but could be made zero-copy by
@@ -288,13 +290,13 @@ impl FfiFileMetaIter {
         let array = arrow_array::make_array(array_data);
 
         let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() else {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "CFileMetaIterator must yield StructArray, got {:?}",
                 array.data_type()
             )));
         };
         if struct_array.is_empty() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "CFileMetaIterator batch must contain at least one row",
             ));
         }
@@ -307,19 +309,21 @@ impl FfiFileMetaIter {
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::generic("CFileMetaIterator: location column is not Utf8"))?;
+            .ok_or_else(|| {
+                KernelError::generic("CFileMetaIterator: location column is not Utf8")
+            })?;
         let last_modified_col = struct_array
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| {
-                Error::generic("CFileMetaIterator: last_modified column is not Int64")
+                KernelError::generic("CFileMetaIterator: last_modified column is not Int64")
             })?;
         let size_col = struct_array
             .column(2)
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::generic("CFileMetaIterator: size column is not UInt64"))?;
+            .ok_or_else(|| KernelError::generic("CFileMetaIterator: size column is not UInt64"))?;
 
         // The fixed schema declares every column non-null; reject any batch that violates that
         // contract up front so the per-row decode below can safely call `value(i)`.
@@ -327,7 +331,7 @@ impl FfiFileMetaIter {
             || last_modified_col.null_count() != 0
             || size_col.null_count() != 0
         {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "CFileMetaIterator batch must not contain null fields",
             ));
         }
@@ -402,7 +406,7 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
 
     use super::*;
-    use crate::error::{EngineExecError, KernelError};
+    use crate::error::{EngineExecError, FFIKernelError};
     use crate::ExclusiveRustString;
 
     // === Shared Test Helpers ===
@@ -440,7 +444,7 @@ mod tests {
 
     // Builds an engine execution error whose message is a kernel-allocated `ExclusiveRustString`
     // handle (mirroring the engine downcalling `allocate_kernel_string`).
-    fn make_exec_error(etype: KernelError, message: &str) -> EngineExecError {
+    fn make_exec_error(etype: FFIKernelError, message: &str) -> EngineExecError {
         let message: Handle<ExclusiveRustString> = Box::new(message.to_string()).into();
         EngineExecError { etype, message }
     }
@@ -465,7 +469,7 @@ mod tests {
         let (mock_iter, cleanup_called) = make_mock_iter::<Handle<ExclusiveEngineData>>(vec![
             OptionalValue::Some(EngineExecResult::Success(make_data_handle(3))),
             OptionalValue::Some(EngineExecResult::Failure(make_exec_error(
-                KernelError::GenericError,
+                FFIKernelError::GenericError,
                 "boom",
             ))),
             OptionalValue::Some(EngineExecResult::Success(make_data_handle(5))),
@@ -535,7 +539,7 @@ mod tests {
         let (mock_iter, cleanup_called) = make_mock_iter::<FFI_ArrowArray>(vec![
             OptionalValue::Some(EngineExecResult::Success(make_binary_ffi_array(b"hello"))),
             OptionalValue::Some(EngineExecResult::Failure(make_exec_error(
-                KernelError::GenericError,
+                FFIKernelError::GenericError,
                 "boom",
             ))),
             OptionalValue::Some(EngineExecResult::Success(make_binary_ffi_array(b"world!"))),
@@ -639,7 +643,7 @@ mod tests {
                 ("file:///b.parquet", 2, 200),
             ]))),
             OptionalValue::Some(EngineExecResult::Failure(make_exec_error(
-                KernelError::GenericError,
+                FFIKernelError::GenericError,
                 "boom",
             ))),
             OptionalValue::Some(EngineExecResult::Success(make_file_meta_ffi_array(&[(

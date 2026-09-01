@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use crate::expressions::{ColumnName, Expression, ExpressionRef};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::{CollectInto, FoldWithOption as _};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 // === Raw expression patch ===
 
@@ -411,7 +411,7 @@ impl<Item> StructPatchNode<Item> {
     ) -> DeltaResult<()> {
         let entry = self.field_patch_mut(field_name.into(), |field_name, entry| {
             if entry.action.is_optional_drop() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Field '{field_name}' cannot combine optional drop with insert-after"
                 )));
             }
@@ -436,12 +436,12 @@ impl<Item> StructPatchNode<Item> {
     ) -> DeltaResult<()> {
         let entry = self.field_patch_mut(field_name.into(), |field_name, entry| {
             if !entry.action.is_keep() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Field '{field_name}' has multiple input field actions"
                 )));
             }
             if action.is_optional_drop() && !entry.insert_after.is_empty() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Field '{field_name}' cannot combine optional drop with insert-after"
                 )));
             }
@@ -462,7 +462,7 @@ impl<Item> StructPatchNode<Item> {
             state.action = FieldPatchOp::Nested(Box::default());
         }
         let FieldPatchOp::Nested(node) = &mut state.action else {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Cannot patch nested fields under dropped/replaced field '{field_name}'"
             )));
         };
@@ -498,7 +498,7 @@ fn resolve_input_schema<'a>(
     };
     let field = input_schema.field_at(input_path)?;
     let DataType::Struct(nested_schema) = field.data_type() else {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Patching failed: input path '{input_path}' references a non-struct field"
         )));
     };
@@ -522,7 +522,7 @@ impl StructPatchBuilder<ExpressionRef> {
 }
 
 impl TryFrom<StructPatchBuilder<ExpressionRef>> for ExpressionStructPatch {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(builder: StructPatchBuilder<ExpressionRef>) -> DeltaResult<Self> {
         builder.build()
@@ -659,7 +659,7 @@ fn schema_walk<Item: SchemaPatchItem>(
             FieldPatchOp::Replace(item) => output.push(item.into_field()),
             FieldPatchOp::Nested(node) => {
                 let DataType::Struct(nested_schema) = input_field.data_type() else {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "Cannot patch nested fields under non-struct field '{}'",
                         input_field.name()
                     )));
@@ -680,7 +680,7 @@ fn schema_walk<Item: SchemaPatchItem>(
         .iter()
         .find(|(_, state)| !state.action.is_optional_drop())
     {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Field to patch does not exist: {field_name}"
         )));
     }

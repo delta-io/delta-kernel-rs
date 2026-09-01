@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 
 use indexmap::IndexMap;
 
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
@@ -54,21 +54,21 @@ fn modify_field_at_path(
 ) -> DeltaResult<()> {
     let (first, rest) = path
         .split_first()
-        .ok_or_else(|| Error::generic("empty column path"))?;
+        .ok_or_else(|| KernelError::generic("empty column path"))?;
 
     // Delta column names are case-insensitive.
     let lowered = first.to_lowercase();
     let idx = fields
         .iter()
         .position(|(_, f)| f.name().to_lowercase() == lowered)
-        .ok_or_else(|| Error::generic(format!("field '{first}' does not exist")))?;
+        .ok_or_else(|| KernelError::generic(format!("field '{first}' does not exist")))?;
 
     if !rest.is_empty() {
         let (_, field) = fields
             .get_index_mut(idx)
-            .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
+            .ok_or_else(|| KernelError::internal_error("idx from position() invalid"))?;
         let DataType::Struct(inner) = &mut field.data_type else {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "intermediate field '{first}' is not a struct"
             )));
         };
@@ -78,7 +78,7 @@ fn modify_field_at_path(
     // === Leaf handling ===
     let (_, field) = fields
         .get_index_mut(idx)
-        .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
+        .ok_or_else(|| KernelError::internal_error("idx from position() invalid"))?;
     modifier(field)
 }
 
@@ -117,7 +117,7 @@ pub(crate) fn apply_schema_operations(
     // out-of-range fresh ids.
     if let Some(seed) = current_max_column_id {
         validate_column_mapping_id(seed).map_err(|e| {
-            Error::invalid_protocol(format!(
+            KernelError::invalid_protocol(format!(
                 "Table property `delta.columnMapping.maxColumnId`: {e}"
             ))
         })?;
@@ -141,7 +141,7 @@ pub(crate) fn apply_schema_operations(
             // feature explicitly before adding such a column.
             SchemaOperation::AddColumn { field } => {
                 if field.is_metadata_column() {
-                    return Err(Error::schema(format!(
+                    return Err(KernelError::schema(format!(
                         "Cannot add column '{}': metadata columns are not allowed in \
                          a table schema",
                         field.name()
@@ -153,7 +153,7 @@ pub(crate) fn apply_schema_operations(
                 // Case-insensitive sibling-conflict check (O(N) per AddColumn).
                 let lowered = field.name().to_lowercase();
                 if schema.fields().any(|f| f.name().to_lowercase() == lowered) {
-                    return Err(Error::schema(format!(
+                    return Err(KernelError::schema(format!(
                         "Cannot add column '{}': a column with that name already exists",
                         field.name()
                     )));
@@ -162,7 +162,7 @@ pub(crate) fn apply_schema_operations(
                 // nullable so existing data files can return NULL for the new column)
                 // NOTE: non-nullable columns depend on invariants feature
                 if !field.is_nullable() {
-                    return Err(Error::schema(format!(
+                    return Err(KernelError::schema(format!(
                         "Cannot add non-nullable column '{}'. Added columns must be nullable \
                          because existing data files do not contain this column.",
                         field.name()
@@ -170,7 +170,7 @@ pub(crate) fn apply_schema_operations(
                 }
                 let field = if cm_enabled {
                     let id = max_id.as_mut().ok_or_else(|| {
-                        Error::invalid_protocol(
+                        KernelError::invalid_protocol(
                             "Column mapping is enabled but delta.columnMapping.maxColumnId \
                              is not set in table properties",
                         )
@@ -193,7 +193,7 @@ pub(crate) fn apply_schema_operations(
                     Ok(())
                 })
                 .map_err(|e| {
-                    Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
+                    KernelError::generic(format!("Cannot set nullable on column '{column}': {e}"))
                 })?;
             }
         }
@@ -207,7 +207,7 @@ pub(crate) fn apply_schema_operations(
         Ordering::Greater => max_id,
         Ordering::Equal => None,
         Ordering::Less => {
-            return Err(Error::internal_error(
+            return Err(KernelError::internal_error(
                 "max column ID went backwards during schema evolution",
             ))
         }
@@ -542,7 +542,7 @@ mod tests {
         }];
         let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, None)
             .unwrap_err();
-        assert!(matches!(err, Error::InvalidProtocol(_)));
+        assert!(matches!(err, KernelError::InvalidProtocol(_)));
         assert!(err.to_string().contains("maxColumnId"));
     }
 

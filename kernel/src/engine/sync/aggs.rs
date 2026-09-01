@@ -16,7 +16,7 @@ use crate::engine::arrow_expression::evaluate_expression::{extract_column, extra
 use crate::expressions::ColumnName;
 use crate::plans::ir::nodes::{Agg, Aggregate, NonNullByOperands};
 use crate::schema::DataType;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// A specific row of input: `(batch index, row index)`.
 type InputRow = (usize, usize);
@@ -158,7 +158,7 @@ impl LongAccumulatorAgg {
         op: LongAccumulator,
     ) -> DeltaResult<Box<dyn BoundAggregate>> {
         if output_type != &DataType::LONG {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "SyncPlanExecutor min/max/sum aggregate with non-LONG value",
             ));
         }
@@ -212,7 +212,7 @@ impl AggUpdater for LongAccumulatorUpdater<'_> {
                     state.0 = Some(match state.0 {
                         None => candidate,
                         Some(sum) => i64::checked_add(sum, candidate).ok_or_else(|| {
-                            Error::generic("SyncPlanExecutor SUM aggregate overflowed i64")
+                            KernelError::generic("SyncPlanExecutor SUM aggregate overflowed i64")
                         })?,
                     });
                 }
@@ -231,7 +231,7 @@ impl CountAgg {
         output_type: &DataType,
     ) -> DeltaResult<Box<dyn BoundAggregate>> {
         if output_type != &DataType::LONG {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "SyncPlanExecutor count aggregate with non-LONG output",
             ));
         }
@@ -268,8 +268,9 @@ impl AggUpdater for CountUpdater<'_> {
     fn update(&self, state: &mut dyn Any, (_, row_idx): InputRow) -> DeltaResult<()> {
         if self.0.is_none_or(|values| values.is_valid(row_idx)) {
             let state = downcast_state_mut::<CountState>(state)?;
-            state.0 = i64::checked_add(state.0, 1)
-                .ok_or_else(|| Error::generic("SyncPlanExecutor COUNT aggregate overflowed i64"))?;
+            state.0 = i64::checked_add(state.0, 1).ok_or_else(|| {
+                KernelError::generic("SyncPlanExecutor COUNT aggregate overflowed i64")
+            })?;
         }
         Ok(())
     }
@@ -359,7 +360,7 @@ fn extract_long_column<'a>(
 ) -> DeltaResult<&'a Int64Array> {
     let array = extract_column_ref(batch, name)?;
     array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-        Error::unsupported(format!(
+        KernelError::unsupported(format!(
             "SyncPlanExecutor aggregate operand `{name}` has non-LONG type"
         ))
     })
@@ -367,7 +368,7 @@ fn extract_long_column<'a>(
 
 fn downcast_state<T: 'static>(state: &dyn Any) -> DeltaResult<&T> {
     state.downcast_ref().ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Aggregate state is not a {}",
             std::any::type_name::<T>()
         ))
@@ -376,7 +377,7 @@ fn downcast_state<T: 'static>(state: &dyn Any) -> DeltaResult<&T> {
 
 fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> DeltaResult<&mut T> {
     state.downcast_mut().ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Aggregate state is not a {}",
             std::any::type_name::<T>()
         ))

@@ -190,7 +190,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
                     .map(|e| e.enter())
             })
             .ok_or_else(|| {
-                delta_kernel::Error::generic(
+                delta_kernel::KernelError::generic(
                     "FFIUCCommitter can only be used with the default engine",
                 )
             })?;

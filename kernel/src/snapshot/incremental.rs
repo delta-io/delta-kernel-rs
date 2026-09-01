@@ -17,7 +17,7 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, KernelError, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
@@ -122,7 +122,7 @@ impl Snapshot {
             }
             // Case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
-                return Err(Error::Generic(format!(
+                return Err(KernelError::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot \
                     hint version {existing_snapshot_version}"
                 )));
@@ -268,7 +268,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(requested_version) => Err(Error::Generic(format!(
+                Some(requested_version) => Err(KernelError::Generic(format!(
                     "Requested snapshot version {requested_version} is not available: \
                      no new commits were found after existing snapshot version \
                      {existing_snapshot_version}"
@@ -293,7 +293,7 @@ impl Snapshot {
         if new_end_version < existing_snapshot_version {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
             )));
@@ -715,7 +715,7 @@ mod tests {
             size: 100,
         };
         let parsed_path = ParsedLogPath::try_from(file_meta)?
-            .ok_or_else(|| Error::Generic("Failed to parse log path".to_string()))?;
+            .ok_or_else(|| KernelError::Generic("Failed to parse log path".to_string()))?;
         let log_tail = vec![parsed_path];
 
         // Create new snapshot from base to version 2 using try_new_from directly
@@ -804,7 +804,7 @@ mod tests {
         );
         assert!(matches!(
             older_version,
-            Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")
+            Err(KernelError::Generic(msg)) if msg.contains("older than snapshot hint version")
         ));
 
         Ok(())
@@ -1027,7 +1027,7 @@ mod tests {
             .build(&engine);
         assert!(matches!(
             snapshot_res,
-            Err(Error::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
+            Err(KernelError::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
         ));
 
         // 2. new version == existing version
@@ -1111,7 +1111,7 @@ mod tests {
         // version exceeds latest version of the table = err
         assert!(matches!(
             Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
-            Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is not available: no new commits were found after existing snapshot version 0"
+            Err(KernelError::Generic(msg)) if msg == "Requested snapshot version 1 is not available: no new commits were found after existing snapshot version 0"
         ));
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
@@ -1177,7 +1177,7 @@ mod tests {
             .build(&engine)?;
         assert!(matches!(
             Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
-            Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
+            Err(KernelError::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
         ));
 
         // ii. commits have (new protocol, no metadata)

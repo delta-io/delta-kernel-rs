@@ -21,7 +21,7 @@ use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, 
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 pub(crate) const STATS_FIELD: &str = "stats";
 pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
@@ -151,12 +151,12 @@ pub(crate) fn build_checkpoint_read_schema(
     transform_add_schema(base_schema, |add_struct| {
         // Validate fields aren't already present
         if add_struct.field(STATS_PARSED_FIELD).is_some() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "stats_parsed field already exists in Add schema",
             ));
         }
         if partition_schema.is_some() && add_struct.field(PARTITION_VALUES_PARSED_FIELD).is_some() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "partitionValues_parsed field already exists in Add schema",
             ));
         }
@@ -246,10 +246,10 @@ fn transform_add_schema(
     // Find and validate the add field
     let add_field = base_schema
         .field(ADD_NAME)
-        .ok_or_else(|| Error::generic("Expected 'add' field in checkpoint schema"))?;
+        .ok_or_else(|| KernelError::generic("Expected 'add' field in checkpoint schema"))?;
 
     let DataType::Struct(add_struct) = &add_field.data_type else {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Expected 'add' field to be a struct type, got {:?}",
             add_field.data_type
         )));

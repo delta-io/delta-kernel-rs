@@ -14,7 +14,7 @@ use crate::actions::{
 use crate::cancellation::CancellationTokenRef;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
+use crate::{DeltaResult, FileMeta, KernelError, StorageHandler, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -211,7 +211,7 @@ impl LastCheckpointHint {
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
-            Some(Err(Error::FileNotFound(_))) => {
+            Some(Err(KernelError::FileNotFound(_))) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
@@ -766,6 +766,6 @@ mod tests {
         let token: CancellationTokenRef =
             std::sync::Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled());
         let result = LastCheckpointHint::try_read(&NoIoStorageHandler, &log_root, Some(&token));
-        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(matches!(result, Err(KernelError::Cancelled)));
     }
 }

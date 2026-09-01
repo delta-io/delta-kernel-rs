@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use super::{EngineDataResultIterator, Transaction};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::row_tracking::{RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME};
 use crate::table_features::TableFeature;
 use crate::{DeltaResult, Engine, IntoEngineData};
@@ -31,7 +31,7 @@ impl<S> Transaction<S> {
             .effective_table_config
             .is_feature_supported(&TableFeature::DomainMetadata)
         {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
             ));
         }
@@ -53,7 +53,7 @@ impl<S> Transaction<S> {
 
             // Check for duplicates
             if !seen_domains.insert(domain) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Metadata for domain {domain} already specified in this transaction"
                 )));
             }
@@ -65,14 +65,14 @@ impl<S> Transaction<S> {
 
             // Users cannot add system domains via the public API
             if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-                return Err(Error::generic(
+                return Err(KernelError::generic(
                     "Cannot modify domains that start with 'delta.' as those are system controlled",
                 ));
             }
 
             // Check for duplicates (spans both system and user domains)
             if !seen_domains.insert(domain) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Metadata for domain {domain} already specified in this transaction"
                 )));
             }
@@ -82,7 +82,7 @@ impl<S> Transaction<S> {
         // Note: CreateTableTransaction does not expose with_domain_metadata_removed(),
         // so this is a defensive check. See #1768.
         if is_create && !self.user_domain_removals.is_empty() {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Domain metadata removals are not supported in create-table transactions",
             ));
         }
@@ -91,14 +91,14 @@ impl<S> Transaction<S> {
         for domain in &self.user_domain_removals {
             // Cannot remove system domains
             if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-                return Err(Error::generic(
+                return Err(KernelError::generic(
                     "Cannot modify domains that start with 'delta.' as those are system controlled",
                 ));
             }
 
             // Check for duplicates
             if !seen_domains.insert(domain.as_str()) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Metadata for domain {domain} already specified in this transaction"
                 )));
             }
@@ -121,7 +121,7 @@ impl<S> Transaction<S> {
             // Will be changed to a constant in a follow up clustering create table feature PR
             "delta.clustering" => Some(TableFeature::ClusteredTable),
             _ => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Unknown system domain '{domain}'. Only known system domains are allowed."
                 )));
             }
@@ -130,7 +130,7 @@ impl<S> Transaction<S> {
         // If the domain requires a feature, validate it's supported
         if let Some(feature) = required_feature {
             if !table_config.is_feature_supported(&feature) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "System domain '{domain}' requires the '{feature}' feature to be enabled"
                 )));
             }

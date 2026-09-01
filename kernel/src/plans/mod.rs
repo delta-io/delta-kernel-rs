@@ -78,7 +78,7 @@ use bytes::Bytes;
 pub use ir::{IoOperation, Operation};
 
 use crate::{
-    AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta, ParquetFooter,
+    AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, FileMeta, KernelError, ParquetFooter,
 };
 
 /// Provides the ability to execute declarative plans to the Delta Kernel.
@@ -172,8 +172,9 @@ impl PlanResult {
         }
     }
 
-    /// Build an [`Error::PlanResultTypeMismatch`] reporting `self`'s variant as the actual one.
-    fn type_mismatch(&self, expected: &'static str) -> Error {
-        Error::plan_result_type_mismatch(expected, self.variant_name())
+    /// Build a [`KernelError::PlanResultTypeMismatch`] reporting `self`'s variant as the actual
+    /// one.
+    fn type_mismatch(&self, expected: &'static str) -> KernelError {
+        KernelError::plan_result_type_mismatch(expected, self.variant_name())
     }
 }

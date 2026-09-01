@@ -506,7 +506,9 @@ async fn empty_create_then_add_column(
     .unwrap();
     let v2 = write_batch_to_table(&v1, engine.as_ref(), batch, HashMap::new())
         .await
-        .map_err(|e| delta_kernel::Error::generic(format!("write_batch_to_table failed: {e}")))?;
+        .map_err(|e| {
+            delta_kernel::KernelError::generic(format!("write_batch_to_table failed: {e}"))
+        })?;
     assert_eq!(v2.version(), 2);
 
     let scan = v2.scan_builder().build()?;

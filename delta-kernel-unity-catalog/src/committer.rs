@@ -5,7 +5,8 @@ use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 use delta_kernel::{
-    DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FileMeta, FilteredEngineData,
+    DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData,
+    KernelError as DeltaError,
 };
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{

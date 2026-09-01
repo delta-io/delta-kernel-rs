@@ -35,7 +35,7 @@ use crate::KernelStringSlice;
 /// The result uses the out-pointer convention: kernel pre-initializes `*out` to
 /// `EngineExecResult::Uninit`. On success the engine writes `EngineExecResult::Success` holding the
 /// result `BooleanArray` as Arrow C Data Interface structs, transferring their ownership to kernel.
-/// On failure it writes `EngineExecResult::Failure` carrying a `KernelError` code and a message
+/// On failure it writes `EngineExecResult::Failure` carrying an `FFIKernelError` code and a message
 /// handle (built via `allocate_kernel_string`); leaving `*out` as `Uninit` is also treated as an
 /// error. When `inverted`, evaluate `NOT op`.
 ///

@@ -94,7 +94,7 @@ impl ParquetHandler for SyncParquetHandler {
         mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         let first_batch = data.next().ok_or_else(|| {
-            crate::Error::generic("Cannot write parquet file with empty data iterator")
+            crate::KernelError::generic("Cannot write parquet file with empty data iterator")
         })??;
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();

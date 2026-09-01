@@ -10,7 +10,7 @@ use crate::error::add_scalar_path_context;
 use crate::expressions::{Scalar, StructData};
 use crate::schema::{ArrayType, DataType, MapType, StructField, StructType, ToSchema};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Converts a type to a [`DataType`]. Implemented for the primitive types and automatically derived
 /// for all types that implement [`ToSchema`].
@@ -169,14 +169,14 @@ impl StructDataFields {
         let (actual_fields, values) = data.into_parts();
         require!(
             actual_fields.len() == values.len(),
-            Error::scalar_conversion(
+            KernelError::scalar_conversion(
                 format!("{} struct values", actual_fields.len()),
                 format!("{} struct values", values.len()),
             )
         );
         require!(
             actual_fields.len() == expected.num_fields(),
-            Error::scalar_conversion(
+            KernelError::scalar_conversion(
                 format!("struct with {} fields", expected.num_fields()),
                 format!("struct with {} fields", actual_fields.len()),
             )
@@ -190,7 +190,7 @@ impl StructDataFields {
                 }
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     return Err(add_scalar_path_context(
-                        Error::scalar_conversion("one field", "duplicate fields"),
+                        KernelError::scalar_conversion("one field", "duplicate fields"),
                         entry.key().clone(),
                     ));
                 }
@@ -199,25 +199,25 @@ impl StructDataFields {
         Ok(Self { expected, fields })
     }
 
-    pub(crate) fn take_field<T: TryFrom<Scalar, Error = Error>>(
+    pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
         &mut self,
         field_name: &str,
     ) -> DeltaResult<T> {
         let expected = self.expected.field(field_name).ok_or_else(|| {
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Derived schema does not contain generated field {field_name:?}"
             ))
         })?;
         let (actual_field, value) = self.fields.remove(field_name).ok_or_else(|| {
             add_scalar_path_context(
-                Error::scalar_conversion("present field", "missing field"),
+                KernelError::scalar_conversion("present field", "missing field"),
                 field_name,
             )
         })?;
         require!(
             actual_field.is_nullable() == expected.is_nullable(),
             add_scalar_path_context(
-                Error::scalar_conversion(
+                KernelError::scalar_conversion(
                     if expected.is_nullable() {
                         "nullable field"
                     } else {
@@ -243,7 +243,7 @@ impl StructDataFields {
         }
         let mut extra: Vec<_> = self.fields.keys().collect();
         extra.sort_unstable();
-        Err(Error::scalar_conversion(
+        Err(KernelError::scalar_conversion(
             "no additional fields",
             format!("fields {extra:?}"),
         ))

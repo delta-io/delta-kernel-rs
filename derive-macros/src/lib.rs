@@ -429,7 +429,7 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         impl delta_kernel::IntoEngineData for #struct_name
         where
             #(#field_types: TryInto<delta_kernel::expressions::Scalar>,)*
-            #(delta_kernel::Error: From<<#field_types as TryInto<delta_kernel::expressions::Scalar>>::Error>,)*
+            #(delta_kernel::KernelError: From<<#field_types as TryInto<delta_kernel::expressions::Scalar>>::Error>,)*
         {
             fn into_engine_data(
                 self,
@@ -540,9 +540,9 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         where
             #struct_name: delta_kernel::schema::ToSchema,
             #(#field_types:
-                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::Error>,)*
+                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::KernelError>,)*
         {
-            type Error = delta_kernel::Error;
+            type Error = delta_kernel::KernelError;
 
             fn try_from(
                 value: delta_kernel::expressions::StructData,
@@ -565,10 +565,10 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         where
             #struct_name: TryFrom<
                 delta_kernel::expressions::StructData,
-                Error = delta_kernel::Error,
+                Error = delta_kernel::KernelError,
             >,
         {
-            type Error = delta_kernel::Error;
+            type Error = delta_kernel::KernelError;
 
             fn try_from(
                 value: delta_kernel::expressions::Scalar,

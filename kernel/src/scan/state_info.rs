@@ -14,7 +14,7 @@ use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, Struc
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use crate::{DeltaResult, Error, PredicateRef, StructField};
+use crate::{DeltaResult, KernelError, PredicateRef, StructField};
 
 /// All the state needed to process a scan.
 #[derive(Debug, Clone)]
@@ -88,7 +88,7 @@ fn validate_metadata_columns<'a>(
     for metadata_column in logical_schema.metadata_columns() {
         // Ensure we don't have a metadata column with same name as a partition column
         if partition_columns.contains(metadata_column.name()) {
-            return Err(Error::Schema(format!(
+            return Err(KernelError::Schema(format!(
                 "Metadata column names must not match partition columns: {}",
                 metadata_column.name()
             )));
@@ -99,13 +99,15 @@ fn validate_metadata_columns<'a>(
             }
             Some(MetadataColumnSpec::RowId) => {
                 if table_configuration.table_properties().enable_row_tracking != Some(true) {
-                    return Err(Error::unsupported("Row ids are not enabled on this table"));
+                    return Err(KernelError::unsupported(
+                        "Row ids are not enabled on this table",
+                    ));
                 }
                 let row_id_col = table_configuration
                     .metadata()
                     .configuration()
                     .get("delta.rowTracking.materializedRowIdColumnName")
-                    .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
+                    .ok_or(KernelError::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
                 metadata_info.materialized_row_id_column_name = Some(row_id_col);
             }
             Some(MetadataColumnSpec::RowCommitVersion) => {}
@@ -282,7 +284,7 @@ impl StateInfo {
                                 let index_column_name = (0..)
                                     .map(|i| format!("row_indexes_for_row_id_{i}"))
                                     .find(|name| logical_read_schema.field(name).is_none())
-                                    .ok_or(Error::generic(
+                                    .ok_or(KernelError::generic(
                                         "Couldn't generate row index column name",
                                     ))?;
                                 read_fields.push(StructField::create_metadata_column(
@@ -297,7 +299,7 @@ impl StateInfo {
                         };
                         let Some(row_id_col_name) = metadata_info.materialized_row_id_column_name
                         else {
-                            return Err(Error::internal_error(
+                            return Err(KernelError::internal_error(
                                 "Should always return a materialized_row_id_column_name if selecting row ids"
                             ));
                         };
@@ -309,7 +311,9 @@ impl StateInfo {
                         });
                     }
                     Some(MetadataColumnSpec::RowCommitVersion) => {
-                        return Err(Error::unsupported("Row commit versions not supported"));
+                        return Err(KernelError::unsupported(
+                            "Row commit versions not supported",
+                        ));
                     }
                     Some(MetadataColumnSpec::RowIndex)
                     | Some(MetadataColumnSpec::FilePath)
@@ -324,7 +328,7 @@ impl StateInfo {
                         if !logical_field.is_metadata_column()
                             && metadata_info.metadata_field_names.contains(&physical_name)
                         {
-                            return Err(Error::Schema(format!(
+                            return Err(KernelError::Schema(format!(
                                 "Metadata column names must not match physical columns, but logical column '{}' has physical name '{}'",
                                 logical_field.name(), physical_name,
                             )));

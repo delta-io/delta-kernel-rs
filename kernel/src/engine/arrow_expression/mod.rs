@@ -13,7 +13,7 @@ use crate::arrow::datatypes::{
 };
 use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
-use crate::error::{DeltaResult, Error};
+use crate::error::{DeltaResult, KernelError};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
@@ -63,7 +63,10 @@ impl Scalar {
         macro_rules! builder_as {
             ($t:ty) => {{
                 builder.as_any_mut().downcast_mut::<$t>().ok_or_else(|| {
-                    Error::invalid_expression(format!("Invalid builder for {}", self.data_type()))
+                    KernelError::invalid_expression(format!(
+                        "Invalid builder for {}",
+                        self.data_type()
+                    ))
                 })?
             }};
         }
@@ -110,7 +113,7 @@ impl Scalar {
                 let builder = builder_as!(array::StructBuilder);
                 require!(
                     builder.num_fields() == data.fields().len(),
-                    Error::generic("Struct builder has wrong number of fields")
+                    KernelError::generic("Struct builder has wrong number of fields")
                 );
                 let field_builders = builder.field_builders_mut().iter_mut();
                 for (builder, value) in field_builders.zip(data.values()) {
@@ -156,7 +159,7 @@ impl Scalar {
         macro_rules! builder_as {
             ($t:ty) => {{
                 builder.as_any_mut().downcast_mut::<$t>().ok_or_else(|| {
-                    Error::invalid_expression(format!("Invalid builder for {data_type}"))
+                    KernelError::invalid_expression(format!("Invalid builder for {data_type}"))
                 })?
             }};
         }
@@ -191,7 +194,7 @@ impl Scalar {
                 let builder = builder_as!(array::StructBuilder);
                 require!(
                     builder.num_fields() == stype.num_fields(),
-                    Error::generic("Struct builder has wrong number of fields")
+                    KernelError::generic("Struct builder has wrong number of fields")
                 );
                 let field_builders = builder.field_builders_mut().iter_mut();
                 for (builder, field) in field_builders.zip(stype.fields()) {
@@ -212,7 +215,7 @@ impl Scalar {
             }
             DataType::VOID => append_nulls_as!(array::NullBuilder),
             DataType::Variant(_) => {
-                return Err(Error::unsupported(
+                return Err(KernelError::unsupported(
                     "Variant is not supported as scalar yet.",
                 ));
             }
@@ -221,7 +224,9 @@ impl Scalar {
             DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
-                return Err(Error::unsupported("Geo is not supported as scalar yet."));
+                return Err(KernelError::unsupported(
+                    "Geo is not supported as scalar yet.",
+                ));
             }
         }
         Ok(())
@@ -300,7 +305,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         let num_fields = schema.fields().len();
         for (row_idx, row) in rows.iter().enumerate() {
             if row.len() != num_fields {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Row {} has {} scalars but schema has {} fields",
                     row_idx,
                     row.len(),
@@ -320,7 +325,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             let field_name = fields[col_idx].name();
             for (row_idx, row) in rows.iter().enumerate() {
                 row[col_idx].append_to(builder.as_mut(), 1).map_err(|e| {
-                    Error::generic(format!(
+                    KernelError::generic(format!(
                         "Row {row_idx}, field '{field_name}' \
                             (expected type {}, got {}): {e}",
                         fields[col_idx].data_type(),
@@ -352,7 +357,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         let batch = extract_record_batch(batch)?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
+        //     return Err(KernelError::Generic(format!(
         //         "input schema does not match batch schema: {:?} != {:?}",
         //         input_schema,
         //         batch.schema()
@@ -398,7 +403,7 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         let batch = extract_record_batch(batch)?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
+        //     return Err(KernelError::Generic(format!(
         //         "input schema does not match batch schema: {:?} != {:?}",
         //         input_schema,
         //         batch.schema()

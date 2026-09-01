@@ -172,7 +172,7 @@ async fn write_multi_row_group_parquet_to_store(
         .collect::<DeltaResult<Vec<_>>>()?;
     let schema = batches
         .first()
-        .ok_or_else(|| Error::internal_error("at least one row group is required"))?
+        .ok_or_else(|| KernelError::internal_error("at least one row group is required"))?
         .record_batch()
         .schema();
 

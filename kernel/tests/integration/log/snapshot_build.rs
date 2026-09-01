@@ -9,7 +9,7 @@ use delta_kernel::snapshot::{
     CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, SnapshotBuilder,
 };
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{DeltaResult, Error, Snapshot, Version};
+use delta_kernel::{DeltaResult, KernelError, Snapshot, Version};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -137,10 +137,10 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
         ),
     );
     let error = match result.unwrap_err() {
-        Error::Backtraced { source, .. } => *source,
+        KernelError::Backtraced { source, .. } => *source,
         error => error,
     };
-    assert!(matches!(error, Error::Schema(_)));
+    assert!(matches!(error, KernelError::Schema(_)));
     Ok(())
 }
 

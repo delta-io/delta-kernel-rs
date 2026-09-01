@@ -22,7 +22,9 @@ use crate::scan::metrics::ScanMetrics;
 use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
+use crate::{
+    Engine, EngineData, ExpressionEvaluator, KernelError, PredicateEvaluator, RowVisitor as _,
+};
 
 pub(crate) mod stats_schema;
 #[cfg(test)]
@@ -370,7 +372,7 @@ impl DataSkippingFilter {
         let file_stats = self.stats_evaluator.evaluate(batch)?;
         require!(
             file_stats.len() == batch_len,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "stats evaluator output length {} != batch length {}",
                 file_stats.len(),
                 batch_len
@@ -380,7 +382,7 @@ impl DataSkippingFilter {
         let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
         require!(
             skipping_predicate.len() == batch_len,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "skipping evaluator output length {} != batch length {}",
                 skipping_predicate.len(),
                 batch_len
@@ -393,7 +395,7 @@ impl DataSkippingFilter {
         debug_assert_eq!(selection_vector.len(), batch_len);
         require!(
             selection_vector.len() == batch_len,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "filter evaluator output length {} != batch length {}",
                 selection_vector.len(),
                 batch_len

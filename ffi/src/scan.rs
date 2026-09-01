@@ -8,7 +8,9 @@ use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Expression, ExpressionRef};
+use delta_kernel::{
+    DeltaResult, DeltaResultIteratorStatic, Expression, ExpressionRef, KernelError,
+};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -205,7 +207,7 @@ pub(crate) fn decode_engine_predicate(
     let mut visitor_state = KernelExpressionVisitorState::default();
     let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
     unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
-        delta_kernel::Error::generic(
+        delta_kernel::KernelError::generic(
             "engine predicate visitor returned an invalid expression ID; \
              predicate could not be decoded",
         )
@@ -497,7 +499,7 @@ impl ScanMetadataIterator {
     pub(crate) fn lock_iter(&self) -> DeltaResult<std::sync::MutexGuard<'_, ScanMetadataIter>> {
         self.data
             .lock()
-            .map_err(|_| Error::generic("poisoned scan-metadata iterator mutex"))
+            .map_err(|_| KernelError::generic("poisoned scan-metadata iterator mutex"))
     }
 }
 
@@ -1026,7 +1028,7 @@ fn scan_metadata_next_arrow_impl(
     let mut iter = data
         .data
         .lock()
-        .map_err(|_| Error::generic("poisoned mutex"))?;
+        .map_err(|_| KernelError::generic("poisoned mutex"))?;
 
     match iter.next().transpose()? {
         Some(scan_metadata) => {
@@ -1085,7 +1087,7 @@ mod scan_builder_tests {
         scan_builder_with_predicate, scan_builder_with_schema, scan_logical_schema,
         EnginePredicate, EngineSchema,
     };
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::expressions::kernel_visitor::{
         visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
         KernelExpressionVisitorState,
@@ -1335,7 +1337,7 @@ mod scan_builder_tests {
         );
         if let ExternResult::Err(e) = result {
             let err = unsafe { recover_error(e) };
-            assert_eq!(err.etype, KernelError::SchemaError);
+            assert_eq!(err.etype, FFIKernelError::SchemaError);
         }
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };

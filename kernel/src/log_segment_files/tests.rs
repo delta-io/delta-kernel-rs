@@ -1841,13 +1841,14 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
 
     let result = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token));
-    assert!(matches!(result, Err(Error::Cancelled)));
+    assert!(matches!(result, Err(KernelError::Cancelled)));
     assert_eq!(pulled.load(Ordering::Relaxed), 0);
 }
 
 // Cancelling partway yields the items already produced, then exactly one terminal
-// `Error::Cancelled` -- never a bare `None`, which would make a truncated listing look complete.
-// This is the regression guard for polling inside (rather than outside) the version `take_while`.
+// `KernelError::Cancelled` -- never a bare `None`, which would make a truncated listing look
+// complete. This is the regression guard for polling inside (rather than outside) the version
+// `take_while`.
 #[test]
 fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
     let (log_root, pulled, storage) = finite_listing_handler(100);
@@ -1863,7 +1864,7 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 
     token.cancel();
 
-    assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+    assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
     // Fused: no second error and no further items.
     assert!(iter.next().is_none());
     assert!(iter.next().is_none());
@@ -1967,6 +1968,6 @@ fn backward_scan_checks_cancellation_between_windows() {
         5_000,
         Some(&token_ref),
     );
-    assert!(matches!(result, Err(Error::Cancelled)));
+    assert!(matches!(result, Err(KernelError::Cancelled)));
     assert_eq!(list_calls.load(Ordering::Relaxed), 1);
 }

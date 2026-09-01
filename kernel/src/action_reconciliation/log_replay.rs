@@ -41,7 +41,7 @@ use crate::log_replay::{
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Error};
+use crate::{DeltaResult, DeltaResultIteratorStatic, KernelError};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -673,7 +673,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 16,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of visitor getters for ActionReconciliationVisitor: {}",
                 getters.len()
             ))
@@ -695,7 +695,7 @@ mod tests {
     use super::*;
     use crate::arrow::array::StringArray;
     use crate::unit_test_utils::{action_batch, parse_json_batch};
-    use crate::Error;
+    use crate::KernelError;
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {
@@ -1235,10 +1235,10 @@ mod tests {
         impl<'a> GetData<'a> for MockErrorGetData {
             fn get_str(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
                 if field_name == self.error_on_field && self.error_type == "str" {
-                    Err(
-                        Error::UnexpectedColumnType(format!("{field_name} is not of type str"))
-                            .with_backtrace(),
-                    )
+                    Err(KernelError::UnexpectedColumnType(format!(
+                        "{field_name} is not of type str"
+                    ))
+                    .with_backtrace())
                 } else {
                     Ok(None)
                 }
@@ -1246,10 +1246,10 @@ mod tests {
 
             fn get_int(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<i32>> {
                 if field_name == self.error_on_field && self.error_type == "int" {
-                    Err(
-                        Error::UnexpectedColumnType(format!("{field_name} is not of type i32"))
-                            .with_backtrace(),
-                    )
+                    Err(KernelError::UnexpectedColumnType(format!(
+                        "{field_name} is not of type i32"
+                    ))
+                    .with_backtrace())
                 } else {
                     Ok(None)
                 }
@@ -1274,10 +1274,10 @@ mod tests {
 
             fn get_long(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<i64>> {
                 if field_name.contains(self.error_field) {
-                    Err(
-                        Error::UnexpectedColumnType(format!("{field_name} is not of type i64"))
-                            .with_backtrace(),
-                    )
+                    Err(KernelError::UnexpectedColumnType(format!(
+                        "{field_name} is not of type i64"
+                    ))
+                    .with_backtrace())
                 } else {
                     Ok(None)
                 }

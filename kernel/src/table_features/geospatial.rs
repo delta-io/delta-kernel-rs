@@ -5,7 +5,7 @@ use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Returns `true` if the schema contains at least one geometry or geography column,
 /// including nested structs, arrays, and maps.
@@ -32,7 +32,7 @@ pub(crate) fn validate_geospatial_feature_support(tc: &TableConfiguration) -> De
     if schema_contains_geospatial(&tc.logical_schema()) {
         require!(
             tc.protocol().has_table_feature(&TableFeature::GeospatialType),
-            Error::unsupported(
+            KernelError::unsupported(
                 "Table contains geometry or geography columns but does not have the required 'geospatial' feature in reader and writer features"
             )
         );

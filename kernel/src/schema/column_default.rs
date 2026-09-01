@@ -22,7 +22,7 @@
 use crate::expressions::{parse_sql, Expression, Scalar};
 use crate::schema::{DataType, StructField, StructType};
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// A column-level default parsed from the `CURRENT_DEFAULT` metadata key of a
 /// [`StructField`](crate::schema::StructField).
@@ -52,14 +52,14 @@ impl<'a> ColumnDefault<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an [`Error::schema`] when `data_type` is a Variant and `raw_sql` is not `NULL`
+    /// Returns an [`KernelError::schema`] when `data_type` is a Variant and `raw_sql` is not `NULL`
     /// (case-insensitive). A non-`NULL` default on an Array, Map, or Struct column is accepted;
     /// the kernel cannot parse it, so [`to_scalar`](Self::to_scalar) returns `None`.
     pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
 
         if matches!(data_type, DataType::Variant(_)) && !is_null {
-            return Err(Error::schema(format!(
+            return Err(KernelError::schema(format!(
                 "a Variant column's default must be NULL, got {raw_sql:?}"
             )));
         }
@@ -93,7 +93,7 @@ impl<'a> ColumnDefault<'a> {
         match &self.parsed_sql {
             None => Ok(None),
             Some(Expression::Literal(scalar)) => Ok(Some(scalar.clone())),
-            Some(other) => Err(Error::generic(format!(
+            Some(other) => Err(KernelError::generic(format!(
                 "kernel cannot evaluate non-literal column default expression: {other:?}"
             ))),
         }

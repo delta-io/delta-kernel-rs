@@ -109,7 +109,7 @@ Resolve the file path against the table root and read with the physical schema:
 
 ```rust,ignore
 let file_url = scan.table_root().join(&scan_file.path)?;
-let size: u64 = scan_file.size.try_into().map_err(|_| Error::generic("negative file size"))?;
+let size: u64 = scan_file.size.try_into().map_err(|_| KernelError::generic("negative file size"))?;
 let file_meta = FileMeta::new(file_url, scan_file.modification_time, size);
 
 let read_results = engine
@@ -308,7 +308,7 @@ let scan = snapshot
     .build()?;
 
 for metadata in scan.scan_metadata(engine)? {
-    let metadata = metadata?; // yields Err(Error::Cancelled) once the token fires
+    let metadata = metadata?; // yields Err(KernelError::Cancelled) once the token fires
     // ... process the batch ...
 }
 ```
@@ -322,7 +322,7 @@ mistaken for a complete one:
   variants](../connector/implementing_engine.md#cancellation-aware-reads), an I/O already in flight
   can be interrupted rather than running to completion — this is what lets a scan stuck on one slow
   file read stop promptly.
-- Either way, the outcome surfaces as `Error::Cancelled`: either returned directly from
+- Either way, the outcome surfaces as `KernelError::Cancelled`: either returned directly from
   `scan_metadata()` (when the token is already cancelled before replay begins) or as the terminal
   item of its iterator. It is never a short or empty result.
 

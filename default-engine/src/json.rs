@@ -20,8 +20,8 @@ use delta_kernel::object_store::{
 };
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, Error,
-    FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator,
+    FileMeta, FileSize, JsonHandler, KernelError, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
@@ -114,7 +114,7 @@ async fn read_json_files_impl(
             let tagged = batch_stream
                 .map(move |result| fixup_json_read(result?, &reorder_indices, &file_path))
                 .boxed();
-            Ok::<_, Error>(tagged)
+            Ok::<_, KernelError>(tagged)
         }
     });
 
@@ -145,7 +145,9 @@ async fn write_json_file_impl(
     let path = Path::from_url_path(path.path())?;
     let result = store.put_opts(&path, buffer.into(), put_mode.into()).await;
     result.map_err(|e| match e {
-        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.to_string()),
+        object_store::Error::AlreadyExists { .. } => {
+            KernelError::FileAlreadyExists(path.to_string())
+        }
         e => e.into(),
     })?;
     Ok(size)
@@ -222,7 +224,7 @@ async fn open_json_file(
     match result.payload {
         GetResultPayload::File(file, _) => {
             let reader = builder.build(BufReader::new(file))?;
-            let reader = futures::stream::iter(reader).map_err(Error::from);
+            let reader = futures::stream::iter(reader).map_err(KernelError::from);
 
             // Emit exactly one error, then stop the stream. We check seen_error BEFORE
             // updating it so the first error passes through, but subsequent items don't.
@@ -239,7 +241,7 @@ async fn open_json_file(
         }
         GetResultPayload::Stream(s) => {
             let mut decoder = builder.build_decoder()?;
-            let mut input = s.map_err(Error::from);
+            let mut input = s.map_err(KernelError::from);
             let mut buffered = Bytes::new();
             let s = futures::stream::poll_fn(move |cx| {
                 loop {
@@ -269,7 +271,7 @@ async fn open_json_file(
                     }
                 }
 
-                Poll::Ready(decoder.flush().map_err(Error::from).transpose())
+                Poll::Ready(decoder.flush().map_err(KernelError::from).transpose())
             });
             Ok(s.boxed())
         }
@@ -909,7 +911,7 @@ mod tests {
         } else {
             // Verify the second write fails with FileAlreadyExists error
             match result {
-                Err(Error::FileAlreadyExists(err_path)) => {
+                Err(KernelError::FileAlreadyExists(err_path)) => {
                     assert_eq!(err_path, object_path.to_string());
                 }
                 _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),

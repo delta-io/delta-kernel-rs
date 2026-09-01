@@ -15,7 +15,7 @@ use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGet
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef};
+use crate::{DeltaResult, Engine, EngineData, ExpressionRef, KernelError};
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -185,7 +185,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
     ) -> DeltaResult<()> {
         require!(
             getters.len() == 14,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
             ))
@@ -207,7 +207,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
 
                 let dv_index = SCAN_ROW_SCHEMA
                     .index_of("deletionVector")
-                    .ok_or_else(|| Error::missing_column("deletionVector"))?;
+                    .ok_or_else(|| KernelError::missing_column("deletionVector"))?;
                 let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])?;
                 let dv_info = DvInfo { deletion_vector };
                 let partition_values =

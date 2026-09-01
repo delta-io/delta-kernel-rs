@@ -23,7 +23,7 @@ use crate::schema::{
     ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Field ID offsets for stats fields within a column's stats struct.
 const STATS_OFFSET_LOWER_BOUND: i32 = 1;
@@ -226,7 +226,7 @@ fn leaf_stats_field(field: &StructField, path: &[String]) -> DeltaResult<Option<
     // stats, so a field ID outside the supported range is expected for some reserved metadata
     // columns; skip (warn) rather than error in that case.
     let field_id = get_field_id(field).ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Field '{}' has no usable (present, i32-representable) field ID. metadata: {:#?}",
             field.name(),
             field.metadata()
@@ -243,7 +243,7 @@ fn leaf_stats_field(field: &StructField, path: &[String]) -> DeltaResult<Option<
         field.data_type(),
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_))
     ) {
-        return Err(Error::unsupported(format!(
+        return Err(KernelError::unsupported(format!(
             "AMT stats schema generation is not yet implemented for geospatial column '{}' (type {})",
             field.name(),
             field.data_type(),
@@ -283,7 +283,8 @@ fn leaf_stats_field(field: &StructField, path: &[String]) -> DeltaResult<Option<
 /// A [`SchemaTransform`] that collects the flat AMT `content_stats` schema by visiting every leaf
 /// of a table schema (see [`stats_schema`] for the layout, [`leaf_stats_field`] for each leaf).
 ///
-/// Uses the `Result<(), Error>` carrier: the rebuilt output is discarded, [`Self::fields`] is the
+/// Uses the `Result<(), KernelError>` carrier: the rebuilt output is discarded,
+/// [`Self::fields`] is the
 /// real result, and an `Err` short-circuits the walk.
 struct StatsSchemaCollector {
     /// Field names from the root to the current node; the last segment is the leaf being visited.
@@ -293,9 +294,9 @@ struct StatsSchemaCollector {
 }
 
 impl<'a> SchemaTransform<'a> for StatsSchemaCollector {
-    transform_output_type!(|'a, T| Result<(), Error>);
+    transform_output_type!(|'a, T| Result<(), KernelError>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), Error> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), KernelError> {
         self.path.push(field.name().to_string());
         // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `path` is
         // discarded, so the skipped pop is harmless.

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use crate::expressions::Scalar;
 use crate::partition::serialization::would_serialize_to_null;
 use crate::schema::{DataType, StructType};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Validates and normalizes partition keys and value types against the table schema.
 /// Returns the map re-keyed to schema case.
@@ -79,14 +79,14 @@ fn validate_keys(
     for (key, value) in logical_partition_values {
         let lower_key = key.to_lowercase();
         let schema_name = schema_lookup.get(&lower_key).ok_or_else(|| {
-            Error::invalid_partition_values(format!(
+            KernelError::invalid_partition_values(format!(
                 "unknown partition column '{key}'. Expected one of: [{}]",
                 logical_partition_columns.join(", ")
             ))
         })?;
         // Detect post-normalization duplicates (e.g., "COL" and "col" both provided).
         if normalized.contains_key(*schema_name) {
-            return Err(Error::invalid_partition_values(format!(
+            return Err(KernelError::invalid_partition_values(format!(
                 "duplicate partition column '{key}' (normalized to same key as a previously provided entry)"
             )));
         }
@@ -95,7 +95,7 @@ fn validate_keys(
 
     for col in logical_partition_columns {
         if !normalized.contains_key(col.as_str()) {
-            return Err(Error::invalid_partition_values(format!(
+            return Err(KernelError::invalid_partition_values(format!(
                 "missing partition column '{col}'. Provided: [{}]",
                 normalized.keys().cloned().collect::<Vec<_>>().join(", ")
             )));
@@ -134,7 +134,7 @@ fn validate_types(
 ) -> DeltaResult<()> {
     for (col_name, value) in logical_partition_values {
         let field = logical_schema.field(col_name).ok_or_else(|| {
-            Error::invalid_partition_values(format!(
+            KernelError::invalid_partition_values(format!(
                 "partition column '{col_name}' not found in table schema"
             ))
         })?;
@@ -143,14 +143,14 @@ fn validate_types(
             expected_type,
             DataType::Struct(_) | DataType::Array(_) | DataType::Map(_)
         ) {
-            return Err(Error::invalid_partition_values(format!(
+            return Err(KernelError::invalid_partition_values(format!(
                 "partition column '{col_name}' has non-primitive type {expected_type:?}. \
                  Partition columns must be primitive types."
             )));
         }
         if would_serialize_to_null(value) {
             if !field.nullable {
-                return Err(Error::invalid_partition_values(format!(
+                return Err(KernelError::invalid_partition_values(format!(
                     "partition column '{col_name}' is not nullable but received a value that \
                      serializes to null (null scalar, empty string, or empty binary)"
                 )));
@@ -159,7 +159,7 @@ fn validate_types(
         }
         let actual_type = value.data_type();
         if *expected_type != actual_type {
-            return Err(Error::invalid_partition_values(format!(
+            return Err(KernelError::invalid_partition_values(format!(
                 "partition column '{col_name}' has type {expected_type:?} but got \
                  value of type {actual_type:?}"
             )));

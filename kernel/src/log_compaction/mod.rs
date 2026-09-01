@@ -32,7 +32,7 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use delta_kernel::{ActionReconciliationIterator, LogCompactionWriter};
-//! # use delta_kernel::{Engine, Snapshot, DeltaResult, Error, FileMeta};
+//! # use delta_kernel::{DeltaResult, Engine, FileMeta, Snapshot};
 //! # use url::Url;
 //!
 //! // Engine-specific function to write compaction data

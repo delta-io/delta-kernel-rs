@@ -1482,7 +1482,7 @@ fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
         Box::new(crate::arrow::array::BinaryBuilder::new());
     let err = Scalar::append_null(builder.as_mut(), &dt, 1).unwrap_err();
     assert!(
-        matches!(err, Error::Unsupported(_)),
+        matches!(err, KernelError::Unsupported(_)),
         "expected Unsupported, got: {err:?}"
     );
 }

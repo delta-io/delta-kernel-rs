@@ -202,9 +202,9 @@ use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_colu
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, DeltaResult,
-    DeltaResultIterator, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    FilteredEngineData, JsonHandler, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot,
+    DeltaResultIterator, Engine, EngineData, FileDataReadResultIterator, FileMeta,
+    FilteredEngineData, JsonHandler, KernelError, LogPath, ParquetFooter, ParquetHandler,
+    PredicateRef, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -671,14 +671,15 @@ pub fn test_table_setup() -> DeltaResult<(
     String,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
 )> {
-    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
     let engine = create_default_engine(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -693,14 +694,15 @@ pub fn test_table_setup_mt() -> DeltaResult<(
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
 )> {
-    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
     let engine = create_default_engine_mt_executor(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -925,7 +927,7 @@ pub fn schema_with_column_defaults(
         })
         .collect();
     if !column_defaults.is_empty() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "column defaults reference unknown top-level columns: {:?}",
             column_defaults.into_keys().collect::<Vec<_>>()
         )));
@@ -1101,7 +1103,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
 ) -> DeltaResult<CommitResult> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let mut txn = snapshot
         .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())

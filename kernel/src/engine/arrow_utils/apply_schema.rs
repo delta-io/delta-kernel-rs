@@ -16,7 +16,7 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
-use crate::error::{DeltaResult, Error};
+use crate::error::{DeltaResult, KernelError};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField};
 
@@ -30,7 +30,7 @@ use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, Str
 // buffer since RecordBatch cannot have top-level nulls.
 pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "apply_schema at top-level must be passed a struct schema",
         ));
     };
@@ -94,7 +94,7 @@ fn transform_struct(
                 arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
             ) {
                 if input_id != target_id {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "Field '{}': input field ID {} conflicts with target field ID {}",
                         target_field.name, input_id, target_id
                     )));
@@ -111,7 +111,7 @@ fn transform_struct(
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =
         result_iter.process_results(|iter| iter.unzip())?;
     if transformed_cols.len() != input_col_count {
-        return Err(Error::internal_error(format!(
+        return Err(KernelError::internal_error(format!(
             "Passed struct had {input_col_count} columns, but transformed column has {}",
             transformed_cols.len()
         )));
@@ -200,7 +200,7 @@ fn apply_schema_to_map(
     let (arrow_input_fields, mut arrow_cols, arrow_struct_nulls) =
         arrow_map_struct_array.into_parts();
     if arrow_cols.len() != 2 || arrow_input_fields.len() != 2 {
-        return Err(Error::internal_error(format!(
+        return Err(KernelError::internal_error(format!(
             "Map entries struct must have exactly 2 columns (key, value), got {}",
             arrow_cols.len()
         )));

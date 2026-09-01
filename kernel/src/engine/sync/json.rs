@@ -15,8 +15,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    FileSize, JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
+    JsonHandler, KernelError, PredicateRef,
 };
 
 pub(crate) struct SyncJsonHandler {
@@ -159,7 +159,7 @@ mod tests {
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error
-            assert!(matches!(result, Err(Error::FileAlreadyExists(_))));
+            assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
         }
 
         Ok(())

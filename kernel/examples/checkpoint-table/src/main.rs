@@ -8,7 +8,7 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
 use delta_kernel::parquet::arrow::AsyncArrowWriter;
 use delta_kernel::parquet::errors::Result as ParquetResult;
-use delta_kernel::{ActionReconciliationIterator, DeltaResult, Error, Snapshot};
+use delta_kernel::{ActionReconciliationIterator, DeltaResult, KernelError, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use futures::future::{BoxFuture, FutureExt};
@@ -90,7 +90,7 @@ async fn try_main() -> DeltaResult<()> {
         // we'll use the first batch to determine the schema
         let first = batch_iter.next();
         let Some(first) = first else {
-            return Err(Error::generic("No batches in checkpoint data"));
+            return Err(KernelError::generic("No batches in checkpoint data"));
         };
         // Note that with `FilteredEngineData` it's important to `apply_selection_vector` to remove
         // any filtered out rows. It's also possible to use `into_parts` to get the

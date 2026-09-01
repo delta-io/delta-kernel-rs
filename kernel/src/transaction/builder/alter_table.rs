@@ -42,7 +42,7 @@ use crate::transaction::schema_evolution::{
     apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
 };
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Engine, KernelError};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
 /// See [`Chainable`] for the operations available on this state.
@@ -170,13 +170,13 @@ impl AlterTableTransactionBuilder<Modifying> {
         // We don't support ALTER TABLE on tables with icebergCompatV3 enabled yet. See
         // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
         if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
             ));
         }
         // TODO(#2630): Support ALTER TABLE on tables with column defaults.
         if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
             ));
         }

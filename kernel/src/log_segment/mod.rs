@@ -33,8 +33,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
-    Version,
+    DeltaResult, Engine, FileMeta, KernelError, Predicate, PredicateRef, RowVisitor,
+    StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -173,14 +173,14 @@ impl LogSegment {
     ) -> DeltaResult<Self> {
         require!(
             commit_file.version == 0,
-            crate::Error::internal_error(format!(
+            crate::KernelError::internal_error(format!(
                 "new_for_version_zero called with version {}",
                 commit_file.version
             ))
         );
         require!(
             commit_file.is_commit(),
-            crate::Error::internal_error(format!(
+            crate::KernelError::internal_error(format!(
                 "new_for_version_zero called with non-commit file type: {:?}",
                 commit_file.file_type
             ))
@@ -433,7 +433,7 @@ impl LogSegment {
         let end_version = end_version.into();
         if let Some(end_version) = end_version {
             if start_version > end_version {
-                return Err(Error::generic(
+                return Err(KernelError::generic(
                     "Failed to build LogSegment: start_version cannot be greater than end_version",
                 ));
             }
@@ -459,7 +459,7 @@ impl LogSegment {
                 .ascending_commit_files()
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Expected the first commit to have version {start_version}, got {:?}",
                 listed_files
                     .ascending_commit_files()
@@ -490,7 +490,7 @@ impl LogSegment {
         let start_from = limit
             .map(|limit| match NonZero::<Version>::try_from(limit) {
                 Ok(limit) => Ok(Version::saturating_sub(end_version, limit.get() - 1)),
-                _ => Err(Error::generic(format!(
+                _ => Err(KernelError::generic(format!(
                     "Invalid limit {limit} when building log segment in timestamp conversion",
                 ))),
             })
@@ -530,7 +530,7 @@ impl LogSegment {
     ) -> DeltaResult<Self> {
         require!(
             tail_commit_file.is_commit(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Cannot extend and create new LogSegment. Tail log file is not a commit file. \
                 Path: {}, Type: {:?}.",
                 tail_commit_file.location.location, tail_commit_file.file_type
@@ -538,7 +538,7 @@ impl LogSegment {
         );
         require!(
             tail_commit_file.version == self.end_version.wrapping_add(1),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Cannot extend and create new LogSegment. Tail commit file version ({}) does not \
                 equal LogSegment end_version ({}) + 1.",
                 tail_commit_file.version, self.end_version
@@ -574,7 +574,7 @@ impl LogSegment {
                 checkpoint.file_type,
                 LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint
             ),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Cannot update LogSegment with checkpoint. Path is not a single-file \
                 checkpoint. Path: {}, Type: {:?}.",
                 checkpoint.location.location, checkpoint.file_type
@@ -582,7 +582,7 @@ impl LogSegment {
         );
         require!(
             checkpoint.version == self.end_version,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Cannot update LogSegment with checkpoint. Checkpoint version ({}) does not \
                 equal LogSegment end_version ({}).",
                 checkpoint.version, self.end_version
@@ -618,7 +618,7 @@ impl LogSegment {
     pub(crate) fn try_new_with_crc_file(&self, crc_file: ParsedLogPath<Url>) -> DeltaResult<Self> {
         require!(
             crc_file.file_type == LogPathFileType::Crc,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Cannot update LogSegment with CRC. Path is not a CRC file. \
                 Path: {}, Type: {:?}.",
                 crc_file.location, crc_file.file_type
@@ -626,7 +626,7 @@ impl LogSegment {
         );
         require!(
             crc_file.version == self.end_version,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Cannot update LogSegment with CRC. CRC version ({}) does not \
                 equal LogSegment end_version ({}).",
                 crc_file.version, self.end_version
@@ -865,7 +865,7 @@ impl LogSegment {
             return Ok(None);
         };
         let version = self.checkpoint_version.ok_or_else(|| {
-            Error::generic("Checkpoint hint sidecars require a selected checkpoint version")
+            KernelError::generic("Checkpoint hint sidecars require a selected checkpoint version")
         })?;
         let version = crate::version_as_i64(version)?;
         sidecars
@@ -1049,7 +1049,7 @@ impl LogSegment {
                 (needs_add_augmentation, action_schema.field("add"))
             {
                 let DataType::Struct(add_struct) = add_field.data_type() else {
-                    return Err(Error::internal_error(
+                    return Err(KernelError::internal_error(
                         "add field in action schema must be a struct",
                     ));
                 };
@@ -1127,7 +1127,7 @@ impl LogSegment {
                     cancellation_token.cloned(),
                 )?,
             Some(parsed_log_path) => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Unsupported checkpoint file type: {}",
                     parsed_log_path.extension,
                 )));
@@ -1321,7 +1321,7 @@ impl LogSegment {
             self.listed
                 .max_published_version
                 .is_some_and(|v| v == self.end_version),
-            Error::generic("Log segment is not published")
+            KernelError::generic("Log segment is not published")
         );
         Ok(())
     }
@@ -1483,12 +1483,12 @@ impl LogSegment {
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
     for (i, f) in compactions.iter().enumerate() {
         let LogPathFileType::CompactedCommit { hi } = f.file_type else {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "ascending_compaction_files contains non-compaction file",
             ));
         };
         if f.version > hi {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "compaction file has start version {} > end version {}",
                 f.version, hi
             )));
@@ -1498,7 +1498,7 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
             // CompactedCommit since the type error will be caught then.
             if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
                 if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
                     )));
                 }
@@ -1516,24 +1516,24 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
     let first_version = parts[0].version;
     for p in parts {
         if !p.is_checkpoint() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "checkpoint_parts contains non-checkpoint file",
             ));
         }
         if p.version != first_version {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "multi-part checkpoint parts have different versions",
             ));
         }
         match p.file_type {
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts as usize == n => {}
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "multi-part checkpoint part count mismatch: slice has {n} parts but num_parts field says {num_parts}"
                 )));
             }
             _ if n > 1 => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "multi-part checkpoint part count mismatch: expected {n} multi-part checkpoint files but got a non-multi-part checkpoint"
                 )));
             }
@@ -1546,7 +1546,7 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
 fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for f in commits {
         if !f.is_commit() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "ascending_commit_files contains non-commit file",
             ));
         }
@@ -1557,7 +1557,7 @@ fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
 fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for pair in commits.windows(2) {
         if pair[0].version + 1 != pair[1].version {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Expected contiguous commit files, but found gap: {:?} -> {:?}",
                 pair[0], pair[1]
             )));
@@ -1578,7 +1578,7 @@ fn validate_checkpoint_commit_gap(
     if let (Some(checkpoint_version), Some(first_commit)) = (checkpoint_version, commits.first()) {
         require!(
             checkpoint_version + 1 == first_commit.version,
-            Error::InvalidCheckpoint(format!(
+            KernelError::InvalidCheckpoint(format!(
                 "Gap between checkpoint version {checkpoint_version} and next commit {}",
                 first_commit.version
             ))
@@ -1601,12 +1601,12 @@ fn validate_end_version(
     let effective_version = commits
         .last()
         .or(checkpoint_parts.first())
-        .ok_or(Error::generic("No files in log segment"))?
+        .ok_or(KernelError::generic("No files in log segment"))?
         .version;
     if let Some(end_version) = end_version {
         require!(
             effective_version == end_version,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "LogSegment end version {effective_version} not the same as the specified end version {end_version}"
             ))
         );
@@ -1624,14 +1624,14 @@ fn validate_latest_commit_file(
 ) -> DeltaResult<()> {
     require!(
         listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
-        Error::internal_error(
+        KernelError::internal_error(
             "latest_commit_file must be Some when ascending_commit_files is non-empty"
         )
     );
     if let Some(commit) = &listed.latest_commit_file {
         require!(
             commit.version == effective_version,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "latest_commit_file version {} does not match end_version {effective_version}",
                 commit.version,
             ))
@@ -1653,7 +1653,7 @@ fn validate_crc(
     if let Some(checkpoint_version) = checkpoint_version {
         require!(
             crc.version >= checkpoint_version,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "CRC file version {} is older than checkpoint version {checkpoint_version}",
                 crc.version
             ))
@@ -1661,7 +1661,7 @@ fn validate_crc(
     }
     require!(
         crc.version <= effective_version,
-        Error::internal_error(format!(
+        KernelError::internal_error(format!(
             "CRC file version {} is newer than log segment version {effective_version}",
             crc.version
         ))

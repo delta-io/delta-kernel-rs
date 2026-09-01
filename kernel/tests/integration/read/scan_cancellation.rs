@@ -1,5 +1,5 @@
 //! Integration coverage for `ScanBuilder::with_cancellation_token`: a cancelled scan must
-//! surface `Error::Cancelled` through the real Default Engine and can never be mistaken for a
+//! surface `KernelError::Cancelled` through the real Default Engine and can never be mistaken for a
 //! complete listing.
 
 use std::sync::Arc;
@@ -9,8 +9,8 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::{
-    CancellationToken as _, CancellationTokenRef, DeltaResult, Engine, Error, FileMeta, FileSlice,
-    JsonHandler, ParquetHandler, Snapshot, StorageHandler,
+    CancellationToken as _, CancellationTokenRef, DeltaResult, Engine, FileMeta, FileSlice,
+    JsonHandler, KernelError, ParquetHandler, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -47,7 +47,7 @@ async fn json_only_table() -> Result<(Arc<InMemory>, &'static str), Box<dyn std:
 }
 
 // A scan whose builder was given an already-cancelled token yields exactly one
-// `Error::Cancelled` and then ends -- it never produces a (partial) complete-looking listing.
+// `KernelError::Cancelled` and then ends -- it never produces a (partial) complete-looking listing.
 // Parametrized over stats mode because a predicate/stats scan takes a different replay path
 // (checkpoint parquet reads + stats parsing) than the JSON-only default, and both must honor the
 // token: `None` is the plain default (no `with_stats` call), `Some` opts into struct stats.
@@ -69,7 +69,7 @@ async fn precancelled_scan_yields_cancelled(
     }
     let scan = builder.build()?;
 
-    // Cancellation surfaces as `Error::Cancelled`, never as a complete listing. It may arrive
+    // Cancellation surfaces as `KernelError::Cancelled`, never as a complete listing. It may arrive
     // either from the eager setup reads that `scan_metadata` performs (returning `Err` directly)
     // or as the iterator's terminal item -- assert whichever, and that no successful batch and no
     // silent `None`-only stream is ever produced.
@@ -85,11 +85,11 @@ fn assert_cancelled<
     result: delta_kernel::DeltaResult<I>,
 ) {
     match result {
-        Err(Error::Cancelled) => {}
+        Err(KernelError::Cancelled) => {}
         Err(other) => panic!("expected Cancelled, got {other:?}"),
         Ok(mut iter) => {
             assert!(
-                matches!(iter.next(), Some(Err(Error::Cancelled))),
+                matches!(iter.next(), Some(Err(KernelError::Cancelled))),
                 "cancelled scan must yield Err(Cancelled), never an Ok batch or bare None"
             );
             assert!(
@@ -149,7 +149,7 @@ async fn mid_stream_cancellation_yields_exactly_one_error() -> Result<(), Box<dy
 
     token.cancel();
 
-    assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+    assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
     assert!(
         iter.next().is_none(),
         "iterator must fuse after the single error"
@@ -277,7 +277,7 @@ async fn parallel_scan_metadata_errors_when_token_set() -> Result<(), Box<dyn st
 
     let result = scan.parallel_scan_metadata(engine);
     assert!(
-        matches!(result, Err(Error::Unsupported(_))),
+        matches!(result, Err(KernelError::Unsupported(_))),
         "parallel_scan_metadata must reject a cancellation token"
     );
     Ok(())
@@ -296,8 +296,8 @@ async fn precancelled_snapshot_build_yields_cancelled() -> Result<(), Box<dyn st
         .build(&engine);
 
     assert!(
-        matches!(result, Err(Error::Cancelled)),
-        "a cancelled snapshot build must surface Error::Cancelled"
+        matches!(result, Err(KernelError::Cancelled)),
+        "a cancelled snapshot build must surface KernelError::Cancelled"
     );
     Ok(())
 }
@@ -421,7 +421,7 @@ async fn snapshot_build_cancelled_during_listing() -> Result<(), Box<dyn std::er
         .with_cancellation_token(token.clone() as CancellationTokenRef)
         .build(&engine);
     assert!(
-        matches!(result, Err(Error::Cancelled)),
+        matches!(result, Err(KernelError::Cancelled)),
         "cancellation during listing must surface from build()"
     );
     Ok(())
@@ -444,8 +444,8 @@ async fn precancelled_incremental_snapshot_build_yields_cancelled(
         .build(&engine);
 
     assert!(
-        matches!(result, Err(Error::Cancelled)),
-        "a cancelled incremental snapshot build must surface Error::Cancelled"
+        matches!(result, Err(KernelError::Cancelled)),
+        "a cancelled incremental snapshot build must surface KernelError::Cancelled"
     );
     Ok(())
 }

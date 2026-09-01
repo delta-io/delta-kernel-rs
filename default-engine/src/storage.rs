@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, Error, ObjectStore};
-use delta_kernel::Error as DeltaError;
+use delta_kernel::KernelError as DeltaError;
 use url::Url;
 
 /// Alias for convenience
@@ -163,7 +163,7 @@ mod tests {
         // to connect to, so the only way to really verify that we got the object store we
         // expected is to inspect the `store` on the error v_v
         match store_from_url_opts(&url, options) {
-            Err(delta_kernel::Error::ObjectStore(object_store::Error::Generic {
+            Err(delta_kernel::KernelError::ObjectStore(object_store::Error::Generic {
                 store,
                 source: _,
             })) => {

@@ -10,7 +10,7 @@ use crate::expressions::ArrayData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{AsAny, DeltaResult, Error};
+use crate::{AsAny, DeltaResult, KernelError};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
@@ -32,7 +32,7 @@ pub struct FilteredEngineData {
 impl FilteredEngineData {
     pub fn try_new(data: Box<dyn EngineData>, selection_vector: Vec<bool>) -> DeltaResult<Self> {
         if selection_vector.len() > data.len() {
-            return Err(Error::InvalidSelectionVector(format!(
+            return Err(KernelError::InvalidSelectionVector(format!(
                 "Selection vector is larger than data length: {} > {}",
                 selection_vector.len(),
                 data.len()
@@ -257,7 +257,7 @@ macro_rules! impl_default_get {
         $(
             fn $name(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
                 debug!("Asked for type {} on {field_name}, but using default error impl.", stringify!($typ));
-                Err(Error::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace())
+                Err(KernelError::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace())
             }
         )*
     };
@@ -265,7 +265,7 @@ macro_rules! impl_default_get {
 
 /// When calling back into a [`RowVisitor`], the engine needs to provide a slice of items that
 /// implement this trait. This allows type_safe extraction from the raw data by the kernel. By
-/// default all these methods will return an `Error` that an incorrect type has been asked
+/// default all these methods will return a [`KernelError`] that an incorrect type has been asked
 /// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
 ///
@@ -327,7 +327,8 @@ pub trait TypedGetData<'a, T> {
     fn get(&'a self, row_index: usize, field_name: &str) -> DeltaResult<T> {
         let val = self.get_opt(row_index, field_name)?;
         val.ok_or_else(|| {
-            Error::MissingData(format!("Data missing for field {field_name}")).with_backtrace()
+            KernelError::MissingData(format!("Data missing for field {field_name}"))
+                .with_backtrace()
         })
     }
 }
@@ -611,7 +612,7 @@ pub trait EngineData: AsAny {
     /// The selection vector may be shorter than the data; rows beyond its end are selected and
     /// must be retained (see [`FilteredEngineData`]). An empty selection vector selects all rows.
     /// A selection vector longer than the data is invalid and must be rejected, e.g. with
-    /// [`Error::InvalidSelectionVector`].
+    /// [`KernelError::InvalidSelectionVector`].
     fn apply_selection_vector(
         self: Box<Self>,
         selection_vector: Vec<bool>,
@@ -635,7 +636,7 @@ pub(crate) fn filter_by_predicate(
     visitor.visit_rows_of(predicate_result.as_ref())?;
     require!(
         visitor.selection_vector.len() == batch.len(),
-        Error::internal_error(format!(
+        KernelError::internal_error(format!(
             "predicate output length {} != batch length {}",
             visitor.selection_vector.len(),
             batch.len()

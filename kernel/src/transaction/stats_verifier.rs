@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::expressions::{column_name, ColumnName};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
@@ -82,19 +82,19 @@ impl StatsColumnVerifier {
         }
 
         if !missing_null_count.is_empty() {
-            return Err(Error::stats_validation(format!(
+            return Err(KernelError::stats_validation(format!(
                 "Required column '{column}' is missing 'nullCount' statistics for files: [{}]",
                 missing_null_count.join(", ")
             )));
         }
         if !missing_min.is_empty() {
-            return Err(Error::stats_validation(format!(
+            return Err(KernelError::stats_validation(format!(
                 "Required column '{column}' is missing 'minValues' statistics for files: [{}]",
                 missing_min.join(", ")
             )));
         }
         if !missing_max.is_empty() {
-            return Err(Error::stats_validation(format!(
+            return Err(KernelError::stats_validation(format!(
                 "Required column '{column}' is missing 'maxValues' statistics for files: [{}]",
                 missing_max.join(", ")
             )));
@@ -190,18 +190,20 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
-        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => Err(Error::unsupported(
-            format!("Interval types are not supported for stats validation: {dt}"),
-        )),
+        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
+            Err(KernelError::unsupported(format!(
+                "Interval types are not supported for stats validation: {dt}"
+            )))
+        }
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => Err(
-            Error::unsupported(format!("Unsupported data type for stats validation: {dt}")),
+            KernelError::unsupported(format!("Unsupported data type for stats validation: {dt}")),
         ),
         &DataType::VOID
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
-        | DataType::Variant(_) => Err(Error::internal_error(format!(
+        | DataType::Variant(_) => Err(KernelError::internal_error(format!(
             "Unsupported data type for stats validation: {dt}"
         ))),
     }
@@ -231,12 +233,14 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
-        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => Err(Error::unsupported(
-            format!("Interval types are not supported for stats presence check: {data_type}"),
-        )),
+        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
+            Err(KernelError::unsupported(format!(
+                "Interval types are not supported for stats presence check: {data_type}"
+            )))
+        }
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
-            Err(Error::unsupported(format!(
+            Err(KernelError::unsupported(format!(
                 "Unsupported data type for stats presence check: {data_type}"
             )))
         }
@@ -244,7 +248,7 @@ fn is_stat_present<'b>(
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
-        | DataType::Variant(_) => Err(Error::internal_error(format!(
+        | DataType::Variant(_) => Err(KernelError::internal_error(format!(
             "Unsupported data type for stats presence check: {data_type}"
         ))),
     }
@@ -268,7 +272,7 @@ impl RowVisitor for ColumnStatsValidator<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
             getters.len() == 5,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Expected 5 getters for column stats validation, got {}",
                 getters.len()
             ))
@@ -314,7 +318,7 @@ pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> D
         }
     }
     if let Some(path) = first_missing {
-        return Err(Error::stats_validation(format!(
+        return Err(KernelError::stats_validation(format!(
             "'stats.numRecords' is required for this table (see \
              `TableConfiguration::requires_stats_num_records`), but is missing for file '{path}'",
         )));
@@ -336,7 +340,7 @@ impl RowVisitor for NumRecordsValidator<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
             getters.len() == 2,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "Expected 2 getters for numRecords validation, got {}",
                 getters.len()
             ))

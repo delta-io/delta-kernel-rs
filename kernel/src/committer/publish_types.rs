@@ -4,7 +4,7 @@ use url::Url;
 
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::utils::require;
-use crate::{DeltaResult, Error, FileMeta, Version};
+use crate::{DeltaResult, FileMeta, KernelError, Version};
 
 /// A catalog commit that has been ratified by the catalog but not yet published to the Delta log.
 ///
@@ -30,7 +30,7 @@ impl CatalogCommit {
     ) -> DeltaResult<Self> {
         require!(
             catalog_commit.file_type == LogPathFileType::StagedCommit,
-            Error::Generic(format!(
+            KernelError::Generic(format!(
                 "Cannot construct CatalogCommit. Expected a StagedCommit, got {:?}",
                 catalog_commit.file_type
             ))
@@ -123,7 +123,7 @@ impl PublishMetadata {
             .all(|c| c[0].version() + 1 == c[1].version())
             .then_some(())
             .ok_or_else(|| {
-                Error::Generic(format!(
+                KernelError::Generic(format!(
                     "Catalog commits must be contiguous: got versions {:?}",
                     commits_to_publish
                         .iter()
@@ -139,10 +139,10 @@ impl PublishMetadata {
     ) -> DeltaResult<()> {
         match commits_to_publish.last().map(|c| c.version()) {
             Some(v) if v == publish_to_version => Ok(()),
-            Some(v) => Err(Error::Generic(format!(
+            Some(v) => Err(KernelError::Generic(format!(
                 "Catalog commits must end with snapshot version {publish_to_version}, but got {v}"
             ))),
-            None => Err(Error::Generic(format!(
+            None => Err(KernelError::Generic(format!(
                 "Catalog commits are empty, expected snapshot version {publish_to_version}"
             ))),
         }

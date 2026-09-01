@@ -8,7 +8,7 @@ use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::ExclusiveTransaction;
@@ -100,14 +100,14 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
 }
 
 impl TryFrom<c_int> for KernelDvStorageType {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(value: c_int) -> DeltaResult<Self> {
         match value {
             0 => Ok(Self::PersistedRelative),
             1 => Ok(Self::Inline),
             2 => Ok(Self::PersistedAbsolute),
-            _ => Err(Error::generic(format!(
+            _ => Err(KernelError::generic(format!(
                 "invalid deletion vector storage type: {value}"
             ))),
         }
@@ -345,7 +345,7 @@ mod tests {
 
         let result = dv_descriptor_map_insert_impl(
             &mut map,
-            Err(Error::generic("bad data file path")),
+            Err(KernelError::generic("bad data file path")),
             descriptor.shallow_copy(),
         );
 

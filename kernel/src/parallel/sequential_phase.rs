@@ -20,7 +20,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta};
+use crate::{DeltaResult, Engine, FileMeta, KernelError};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -149,7 +149,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     #[internal_api]
     pub(crate) fn finish(self) -> DeltaResult<AfterSequential<P>> {
         if !self.is_finished {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Must exhaust iterator before calling finish()",
             ));
         }
@@ -160,7 +160,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
                 let parts = self.checkpoint_parts;
                 require!(
                     parts.len() != 1,
-                    Error::generic(
+                    KernelError::generic(
                         "Invariant violation: If there is exactly one checkpoint part,
                         there must be a manifest reader"
                     )

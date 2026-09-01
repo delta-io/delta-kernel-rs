@@ -1083,6 +1083,6 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Delt
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();
 
-    assert!(matches!(err, crate::Error::Unsupported(_)));
+    assert!(matches!(err, crate::KernelError::Unsupported(_)));
     Ok(())
 }

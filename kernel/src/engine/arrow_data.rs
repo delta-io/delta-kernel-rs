@@ -23,7 +23,7 @@ use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract
 /// from it.
@@ -46,7 +46,7 @@ impl EngineDataArrowExt for Box<dyn EngineData> {
         Ok(self
             .into_any()
             .downcast::<ArrowEngineData>()
-            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+            .map_err(|_| delta_kernel::KernelError::EngineDataType("ArrowEngineData".to_string()))?
             .into())
     }
 }
@@ -56,7 +56,7 @@ impl EngineDataArrowExt for DeltaResult<Box<dyn EngineData>> {
         Ok(self?
             .into_any()
             .downcast::<ArrowEngineData>()
-            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+            .map_err(|_| delta_kernel::KernelError::EngineDataType("ArrowEngineData".to_string()))?
             .into())
     }
 }
@@ -64,7 +64,7 @@ impl EngineDataArrowExt for DeltaResult<Box<dyn EngineData>> {
 /// Helper function to extract a RecordBatch from EngineData, ensuring it's ArrowEngineData
 pub(crate) fn extract_record_batch(engine_data: &dyn EngineData) -> DeltaResult<&RecordBatch> {
     let Some(arrow_data) = engine_data.any_ref().downcast_ref::<ArrowEngineData>() else {
-        return Err(Error::engine_data_type("ArrowEngineData"));
+        return Err(KernelError::engine_data_type("ArrowEngineData"));
     };
     Ok(arrow_data.record_batch())
 }
@@ -89,7 +89,7 @@ impl ArrowEngineData {
         engine_data
             .into_any()
             .downcast::<ArrowEngineData>()
-            .map_err(|_| Error::engine_data_type("ArrowEngineData"))
+            .map_err(|_| KernelError::engine_data_type("ArrowEngineData"))
     }
 
     /// Get a reference to the `RecordBatch` this `ArrowEngineData` is wrapping
@@ -206,7 +206,7 @@ impl EngineData for ArrowEngineData {
         // Make sure the caller passed the correct number of column names
         let leaf_types = visitor.selected_column_names_and_types().1;
         if leaf_types.len() != leaf_columns.len() {
-            return Err(Error::MissingColumn(format!(
+            return Err(KernelError::MissingColumn(format!(
                 "Visitor expected {} column names, but caller passed {}",
                 leaf_types.len(),
                 leaf_columns.len()
@@ -248,7 +248,7 @@ impl EngineData for ArrowEngineData {
             match column_map.get(column.as_ref()) {
                 Some(ColumnState::HasGetter(getter)) => getters.push(*getter),
                 _ => {
-                    return Err(Error::MissingColumn(format!(
+                    return Err(KernelError::MissingColumn(format!(
                         "Column {column} not found in the data"
                     )));
                 }
@@ -256,7 +256,7 @@ impl EngineData for ArrowEngineData {
         }
 
         if getters.len() != leaf_columns.len() {
-            return Err(Error::MissingColumn(format!(
+            return Err(KernelError::MissingColumn(format!(
                 "Visitor expected {} leaf columns, but only {} were found in the data",
                 leaf_columns.len(),
                 getters.len()
@@ -295,7 +295,7 @@ impl EngineData for ArrowEngineData {
     ) -> DeltaResult<Box<dyn EngineData>> {
         require!(
             selection_vector.len() <= self.len(),
-            Error::InvalidSelectionVector(format!(
+            KernelError::InvalidSelectionVector(format!(
                 "Selection vector is larger than data length: {} > {}",
                 selection_vector.len(),
                 self.len()
@@ -362,7 +362,7 @@ impl ArrowEngineData {
                         *state = ColumnState::HasGetter(getter);
                     }
                     ColumnState::HasGetter(_) => {
-                        return Err(Error::internal_error(format!(
+                        return Err(KernelError::internal_error(format!(
                             "Column {} already has a getter - duplicate column?",
                             ColumnName::new(path.iter())
                         )));
@@ -514,7 +514,7 @@ impl ArrowEngineData {
                 // reject nullable elements up front, where the column can still be named.
                 require!(
                     !array.contains_null(),
-                    Error::unexpected_column_type(format!(
+                    KernelError::unexpected_column_type(format!(
                         "On {}: array<struct> columns with nullable elements are not visitable",
                         ColumnName::new(path)
                     ))
@@ -530,14 +530,14 @@ impl ArrowEngineData {
                 col_as_map().ok_or("map<string, string>")
             }
             data_type => {
-                return Err(Error::UnexpectedColumnType(format!(
+                return Err(KernelError::UnexpectedColumnType(format!(
                     "On {}: Unsupported type {data_type}",
                     ColumnName::new(path)
                 )));
             }
         };
         result.map_err(|type_name| {
-            Error::UnexpectedColumnType(format!(
+            KernelError::UnexpectedColumnType(format!(
                 "Type mismatch on {}: expected {}, got {}",
                 ColumnName::new(path),
                 type_name,

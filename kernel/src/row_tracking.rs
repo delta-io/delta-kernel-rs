@@ -10,7 +10,7 @@ use crate::actions::{DomainMetadata, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, Snapshot};
+use crate::{DeltaResult, Engine, KernelError, Snapshot};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,7 +70,7 @@ impl RowTrackingDomainMetadata {
 }
 
 impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
-    type Error = crate::Error;
+    type Error = crate::KernelError;
 
     fn try_from(metadata: RowTrackingDomainMetadata) -> DeltaResult<Self> {
         Ok(DomainMetadata::new(
@@ -124,7 +124,7 @@ impl RowVisitor for RowTrackingVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 1,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Wrong number of RowTrackingVisitor getters: {}",
                 getters.len()
             ))
@@ -136,7 +136,7 @@ impl RowVisitor for RowTrackingVisitor {
         let mut current_hwm = self.row_id_high_water_mark;
         for i in 0..row_count {
             let num_records: i64 = getters[0].get_opt(i, NUM_RECORDS)?.ok_or_else(|| {
-                Error::InternalError(format!(
+                KernelError::InternalError(format!(
                     "{NUM_RECORDS} must be present in Add actions when row tracking is enabled."
                 ))
             })?;

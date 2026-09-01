@@ -16,7 +16,7 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// V3 invariants paired with the version constant. Fed to
 /// [`super::validate_iceberg_compat_if_needed`].
@@ -119,19 +119,19 @@ impl TypeChangesValidator {
         };
         let path = self.path.join(".");
         let MetadataValue::Other(value) = metadata else {
-            return Err(Error::schema(format!(
+            return Err(KernelError::schema(format!(
                 "Field '{path}' has a non-array `{type_changes_key}` annotation: \
                  {metadata}"
             )));
         };
         let type_changes: Vec<TypeChange> = serde_json::from_value(value.clone()).map_err(|e| {
-            Error::schema(format!(
+            KernelError::schema(format!(
                 "Field '{path}' has an invalid `{type_changes_key}` annotation: {e}"
             ))
         })?;
         for type_change in type_changes {
             if !is_v3_allowed_type_change(&type_change.from_type, &type_change.to_type) {
-                return Err(Error::schema(format!(
+                return Err(KernelError::schema(format!(
                     "icebergCompatV3 does not support type change on field '{path}': {} -> {}",
                     type_change.from_type, type_change.to_type
                 )));

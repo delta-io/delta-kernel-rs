@@ -3,7 +3,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
-use delta_kernel::{CancellationTokenRef, DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use delta_kernel::{
+    CancellationTokenRef, DeltaResult, FileMeta, FileSlice, KernelError, StorageHandler,
+};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
@@ -55,7 +57,7 @@ async fn list_from_impl(
     } else {
         let mut parts = offset.parts().collect_vec();
         if parts.pop().is_none() {
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "Offset path must not be a root directory. Got: '{path}'",
             )));
         }
@@ -82,7 +84,9 @@ async fn list_from_impl(
         let mut items: Vec<_> = stream.try_collect().await?;
         items.sort_unstable();
         Ok(Box::pin(stream::iter(
-            items.into_iter().map(Ok::<FileMeta, delta_kernel::Error>),
+            items
+                .into_iter()
+                .map(Ok::<FileMeta, delta_kernel::KernelError>),
         )))
     } else {
         Ok(Box::pin(stream))
@@ -103,17 +107,18 @@ async fn read_files_impl(
             // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
             // details about why this check is necessary
             let path = if url.scheme() == "file" {
-                let file_path = url
-                    .to_file_path()
-                    .map_err(|_| Error::InvalidTableLocation(format!("Invalid file URL: {url}")))?;
-                Path::from_absolute_path(file_path)
-                    .map_err(|e| Error::InvalidTableLocation(format!("Invalid file path: {e}")))?
+                let file_path = url.to_file_path().map_err(|_| {
+                    KernelError::InvalidTableLocation(format!("Invalid file URL: {url}"))
+                })?;
+                Path::from_absolute_path(file_path).map_err(|e| {
+                    KernelError::InvalidTableLocation(format!("Invalid file path: {e}"))
+                })?
             } else {
                 Path::from(url.path())
             };
             if url.is_presigned() {
                 // have to annotate type here or rustc can't figure it out
-                Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
+                Ok::<bytes::Bytes, KernelError>(reqwest::get(url).await?.bytes().await?)
             } else if let Some(rng) = range {
                 Ok(store.get_range(&path, rng).await?)
             } else {
@@ -142,7 +147,9 @@ async fn copy_atomic_impl(
         .put_opts(&dest_path, data.into(), PutMode::Create.into())
         .await
         .map_err(|e| match e {
-            object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
+            object_store::Error::AlreadyExists { .. } => {
+                KernelError::FileAlreadyExists(dest_path.into())
+            }
             e => e.into(),
         })?;
     Ok(())
@@ -162,7 +169,7 @@ async fn put_impl(
     };
     let result = store.put_opts(&path, data.into(), put_mode.into()).await;
     result.map_err(|e| match e {
-        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.into()),
+        object_store::Error::AlreadyExists { .. } => KernelError::FileAlreadyExists(path.into()),
         e => e.into(),
     })?;
     Ok(())
@@ -464,7 +471,7 @@ mod tests {
         // copy to existing fails
         assert!(matches!(
             handler.copy_atomic(&src_url, &dest_url),
-            Err(Error::FileAlreadyExists(_))
+            Err(KernelError::FileAlreadyExists(_))
         ));
 
         // copy from non-existing fails
@@ -505,7 +512,7 @@ mod tests {
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         let result = handler.head(&missing_url);
 
-        assert!(matches!(result, Err(Error::FileNotFound(_))));
+        assert!(matches!(result, Err(KernelError::FileNotFound(_))));
     }
 
     #[test]
@@ -538,7 +545,7 @@ mod tests {
         let new_data = Bytes::from("updated");
         assert!(matches!(
             handler.put(&file_url, new_data.clone(), false),
-            Err(Error::FileAlreadyExists(_))
+            Err(KernelError::FileAlreadyExists(_))
         ));
 
         // Put with overwrite=true should succeed
@@ -566,7 +573,7 @@ mod tests {
 
         assert!(matches!(
             handler.head(&file_url),
-            Err(Error::FileNotFound(_))
+            Err(KernelError::FileNotFound(_))
         ));
     }
 
@@ -577,7 +584,7 @@ mod tests {
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         assert!(matches!(
             handler.head(&missing_url),
-            Err(Error::FileNotFound(_))
+            Err(KernelError::FileNotFound(_))
         ));
         handler.delete(&missing_url).unwrap();
     }
@@ -590,9 +597,9 @@ mod tests {
         let token: CancellationTokenRef = Arc::new(test_utils::TestCancellationToken::cancelled());
 
         let listed = handler.list_from_with_cancellation(&url, Some(token.clone()));
-        assert!(matches!(listed, Err(Error::Cancelled)));
+        assert!(matches!(listed, Err(KernelError::Cancelled)));
 
         let read = handler.read_files_with_cancellation(vec![(url, None)], Some(token));
-        assert!(matches!(read, Err(Error::Cancelled)));
+        assert!(matches!(read, Err(KernelError::Cancelled)));
     }
 }

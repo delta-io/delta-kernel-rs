@@ -18,7 +18,7 @@ use crate::committer::{
 };
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatch,
@@ -374,7 +374,7 @@ impl<S> Transaction<S> {
             .iter()
             .find(|t| !app_ids.insert(&t.app_id))
         {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "app_id {} already exists in transaction",
                 dup.app_id
             )));
@@ -404,7 +404,7 @@ impl<S> Transaction<S> {
                 .is_feature_enabled(&TableFeature::ChangeDataFeed);
             require!(
                 !cdf_enabled,
-                Error::generic(
+                KernelError::generic(
                     "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
                      This would require writing CDC files for DML operations, which is not yet supported. \
                      Consider using separate transactions: one to add files, another to remove files or update deletion vectors."
@@ -553,7 +553,7 @@ impl<S> Transaction<S> {
             }
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
-            Err(e @ Error::IOError(_)) => {
+            Err(e @ KernelError::IOError(_)) => {
                 // Flips the metric event from success -> failure.
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
@@ -698,11 +698,11 @@ impl<S> Transaction<S> {
             commit_type.requires_catalog_committer(),
         ) {
             (true, true) | (false, false) => Ok(()),
-            (false, true) => Err(Error::generic(
+            (false, true) => Err(KernelError::generic(
                 "This table is catalog-managed and requires a catalog committer. \
                  Please provide a catalog committer via Snapshot::transaction().",
             )),
-            (true, false) => Err(Error::generic(
+            (true, false) => Err(KernelError::generic(
                 "This table is path-based and cannot be committed to with a catalog committer.",
             )),
         }
@@ -765,25 +765,27 @@ impl<S> Transaction<S> {
         }
         require!(
             !self.is_create_table(),
-            Error::invalid_transaction_state(
+            KernelError::invalid_transaction_state(
                 "Blind append is not supported for create-table transactions",
             )
         );
         require!(
             !self.add_files_metadata.is_empty(),
-            Error::invalid_transaction_state("Blind append requires at least one added data file")
+            KernelError::invalid_transaction_state(
+                "Blind append requires at least one added data file"
+            )
         );
         require!(
             self.data_change,
-            Error::invalid_transaction_state("Blind append requires data_change to be true")
+            KernelError::invalid_transaction_state("Blind append requires data_change to be true")
         );
         require!(
             self.remove_files_metadata.is_empty(),
-            Error::invalid_transaction_state("Blind append cannot remove files")
+            KernelError::invalid_transaction_state("Blind append cannot remove files")
         );
         require!(
             self.dv_matched_files.is_empty(),
-            Error::invalid_transaction_state("Blind append cannot update deletion vectors")
+            KernelError::invalid_transaction_state("Blind append cannot update deletion vectors")
         );
 
         Ok(())
@@ -806,7 +808,7 @@ impl<S> Transaction<S> {
             .any(HasSelectionVector::has_selected_rows);
         require!(
             !removes_data,
-            Error::invalid_transaction_state(
+            KernelError::invalid_transaction_state(
                 "Append-only tables cannot remove files or update deletion vectors when data_change is true",
             )
         );
@@ -832,7 +834,7 @@ impl<S> Transaction<S> {
             return Ok(());
         }
         if self.effective_table_config.logical_schema().num_fields() == 0 {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Cannot write data files to a Delta table with empty schema; \
                  use `snapshot.alter_table().add_column(...)` to add at least one \
                  column before writing data",
@@ -850,7 +852,7 @@ impl<S> Transaction<S> {
                     .effective_table_config
                     .is_feature_enabled(&TableFeature::AllowColumnDefaults)
                 || !self.effective_table_config.has_column_with_default(),
-            Error::invalid_transaction_state(
+            KernelError::invalid_transaction_state(
                 "Writing data to a table with column defaults requires calling \
                  Transaction::ack_column_defaults() first",
             )
@@ -879,7 +881,7 @@ impl<S> Transaction<S> {
     // To get the `Option<SnapshotRef>` directly, use the `read_snapshot_opt` field.
     fn read_snapshot(&self) -> DeltaResult<&Snapshot> {
         self.read_snapshot_opt.as_deref().ok_or_else(|| {
-            Error::internal_error("read_snapshot() called on create-table transaction")
+            KernelError::internal_error("read_snapshot() called on create-table transaction")
         })
     }
 
@@ -1149,7 +1151,7 @@ impl<S> Transaction<S> {
                             .last()
                             .map(|field| field.data_type().clone())
                             .ok_or_else(|| {
-                                Error::internal_error(format!(
+                                KernelError::internal_error(format!(
                                     "Required column '{col}' not found in table schema"
                                 ))
                             })?;
@@ -1302,7 +1304,9 @@ impl<S> Transaction<S> {
                     .join("_delta_log/")?;
                 let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
                 let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
-                    Error::internal_error("CREATE TABLE CRC delta is missing protocol or metadata")
+                    KernelError::internal_error(
+                        "CREATE TABLE CRC delta is missing protocol or metadata",
+                    )
                 })?;
                 let stats = PostCommitStats {
                     commits_since_checkpoint: 1,
@@ -1377,7 +1381,7 @@ impl<S> Transaction<S> {
         }
     }
 
-    fn into_retryable(self, error: Error) -> RetryableTransaction<S> {
+    fn into_retryable(self, error: KernelError) -> RetryableTransaction<S> {
         RetryableTransaction {
             transaction: self,
             error,
@@ -1414,7 +1418,7 @@ impl<S> Transaction<S> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
         if self.is_create_table() && !self.remove_files_metadata.is_empty() {
-            return Err(Error::internal_error(
+            return Err(KernelError::internal_error(
                 "CREATE TABLE transaction cannot have remove actions",
             ));
         }
@@ -1666,7 +1670,7 @@ pub struct RetryableTransaction<S = ExistingTable> {
     /// The transaction that failed to commit due to a retryable error.
     pub transaction: Transaction<S>,
     /// Transient error that caused the commit to fail.
-    pub error: Error,
+    pub error: KernelError,
 }
 
 #[cfg(test)]
@@ -1733,7 +1737,9 @@ mod tests {
             _actions: DeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
-            Err(Error::IOError(std::io::Error::other("simulated IO error")))
+            Err(KernelError::IOError(std::io::Error::other(
+                "simulated IO error",
+            )))
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -1758,7 +1764,7 @@ mod tests {
             _actions: DeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
-            Err(Error::generic("simulated commit error"))
+            Err(KernelError::generic("simulated commit error"))
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -2496,7 +2502,7 @@ mod tests {
             .expect_err("DV updates should require delta.enableDeletionVectors=true");
 
         assert!(
-            matches!(err, Error::Unsupported(_)),
+            matches!(err, KernelError::Unsupported(_)),
             "unexpected error: {err}"
         );
         assert!(
@@ -2549,7 +2555,7 @@ mod tests {
         let existing_path = paths
             .into_iter()
             .next()
-            .ok_or_else(|| Error::generic("expected at least one scan file"))?;
+            .ok_or_else(|| KernelError::generic("expected at least one scan file"))?;
 
         let mut dv_map = HashMap::new();
         dv_map.insert(existing_path, create_test_dv_descriptor("matched"));
@@ -2599,7 +2605,7 @@ mod tests {
         let existing_path = paths
             .into_iter()
             .next()
-            .ok_or_else(|| Error::generic("expected at least one scan file"))?;
+            .ok_or_else(|| KernelError::generic("expected at least one scan file"))?;
 
         let mut dv_map = HashMap::new();
         dv_map.insert(existing_path, create_test_dv_descriptor("matched"));
@@ -2609,7 +2615,7 @@ mod tests {
             scan_metadata
                 .into_iter()
                 .map(|metadata| Ok(metadata.scan_files))
-                .chain(std::iter::once(Err(Error::generic(
+                .chain(std::iter::once(Err(KernelError::generic(
                     "simulated scan metadata failure",
                 )))),
         );
@@ -2805,7 +2811,10 @@ mod tests {
 
         let result = txn.validate_append_only_semantics();
         if expected_error {
-            assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+            assert!(matches!(
+                result,
+                Err(KernelError::InvalidTransactionState(_))
+            ));
         } else {
             result?;
         }
@@ -2817,7 +2826,10 @@ mod tests {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(matches!(
+            result,
+            Err(KernelError::InvalidTransactionState(_))
+        ));
         Ok(())
     }
 
@@ -2828,7 +2840,10 @@ mod tests {
         txn.set_data_change(false);
         add_dummy_file(&mut txn);
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(matches!(
+            result,
+            Err(KernelError::InvalidTransactionState(_))
+        ));
         Ok(())
     }
 
@@ -2842,7 +2857,10 @@ mod tests {
         ));
         txn.remove_files(remove_data);
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(matches!(
+            result,
+            Err(KernelError::InvalidTransactionState(_))
+        ));
         Ok(())
     }
 
@@ -2856,7 +2874,10 @@ mod tests {
         ));
         txn.dv_matched_files.push(dv_data);
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(matches!(
+            result,
+            Err(KernelError::InvalidTransactionState(_))
+        ));
         Ok(())
     }
 
@@ -2876,7 +2897,10 @@ mod tests {
         txn.is_blind_append = true;
         add_dummy_file(&mut txn);
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(matches!(
+            result,
+            Err(KernelError::InvalidTransactionState(_))
+        ));
         Ok(())
     }
 
@@ -2918,7 +2942,7 @@ mod tests {
         // If it fails, it should NOT be an InvalidTransactionState error
         if let Err(e) = result {
             assert!(
-                !matches!(e, Error::InvalidTransactionState(_)),
+                !matches!(e, KernelError::InvalidTransactionState(_)),
                 "Blind append validation should have passed, got: {e}"
             );
         }
@@ -3298,7 +3322,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            crate::KernelError::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 
@@ -3317,7 +3341,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            crate::KernelError::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 

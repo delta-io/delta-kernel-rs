@@ -9,8 +9,8 @@ use crate::engine::arrow_utils;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    FileSize, FilteredEngineData, JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
+    FilteredEngineData, JsonHandler, KernelError, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
@@ -66,7 +66,7 @@ impl JsonHandler for PlanBasedJsonHandler {
         overwrite: bool,
     ) -> DeltaResult<FileSize> {
         let Some(fallback) = &self.fallback else {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "PlanBasedJsonHandler does not support write_json_file yet, and no fallback \
                  handler is configured",
             ));

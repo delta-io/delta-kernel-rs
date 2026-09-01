@@ -41,7 +41,7 @@ pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
 pub(crate) use writer::try_write_crc_file;
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
-use crate::{DeltaResult, Error, Version};
+use crate::{DeltaResult, KernelError, Version};
 
 // ============================================================================
 // Crc: in-memory representation
@@ -178,7 +178,7 @@ impl Crc {
             ("numProtocol", raw.num_protocol),
         ] {
             if value != 1 {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected 1, got {value}"
                 )));
             }
@@ -223,10 +223,10 @@ impl Crc {
 
 /// Fails for non-`Complete` file stats: a degraded CRC has no well-defined on-disk shape.
 impl TryFrom<&Crc> for CrcRaw {
-    type Error = Error;
+    type Error = KernelError;
     fn try_from(crc: &Crc) -> Result<Self, Self::Error> {
         let FileStatsState::Complete(stats) = &crc.file_stats_state else {
-            return Err(Error::ChecksumWriteUnsupported(format!(
+            return Err(KernelError::ChecksumWriteUnsupported(format!(
                 "Cannot serialize CRC with {:?} file stats",
                 crc.file_stats_state
             )));
@@ -761,7 +761,7 @@ mod tests {
         };
         let err = CrcRaw::try_from(&crc).unwrap_err();
         assert!(
-            matches!(err, crate::Error::ChecksumWriteUnsupported(_)),
+            matches!(err, crate::KernelError::ChecksumWriteUnsupported(_)),
             "expected ChecksumWriteUnsupported, got: {err:?}"
         );
     }

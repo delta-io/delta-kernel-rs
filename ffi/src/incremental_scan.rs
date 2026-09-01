@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSummary};
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
+use delta_kernel::{DeltaResult, KernelError, PredicateRef, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 #[cfg(feature = "default-engine-base")]
@@ -237,7 +237,7 @@ fn incremental_scan_stream_next_arrow_impl(
     let mut guard = lock_stream(stream)?;
     let Some(inner) = guard.as_mut() else {
         // The stream was already consumed by `into_summary` or dropped by a prior error.
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "incremental scan stream was already consumed",
         ));
     };
@@ -295,7 +295,7 @@ fn incremental_scan_stream_into_summary_impl(
 ) -> DeltaResult<Handle<SharedIncrementalScanSummary>> {
     let inner = lock_stream(stream)?
         .take()
-        .ok_or_else(|| Error::generic("incremental scan stream was already consumed"))?;
+        .ok_or_else(|| KernelError::generic("incremental scan stream was already consumed"))?;
     let summary = inner.into_summary()?;
     Ok(Arc::new(summary).into())
 }
@@ -306,7 +306,7 @@ fn lock_stream(
     stream
         .stream
         .lock()
-        .map_err(|_| Error::generic("poisoned incremental scan stream mutex"))
+        .map_err(|_| KernelError::generic("poisoned incremental scan stream mutex"))
 }
 
 /// The base (exclusive lower bound) version of the scanned range.
@@ -432,7 +432,7 @@ mod tests {
     use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::expressions::kernel_visitor::{
         visit_expression_column, visit_expression_literal_int, visit_predicate_gt,
         KernelExpressionVisitorState,
@@ -655,7 +655,7 @@ mod tests {
             snapshot_incremental_scan_builder(snapshot.shallow_copy(), 2, engine.shallow_copy())
         };
         let result = unsafe { incremental_scan_builder_build(builder) };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
 
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
@@ -723,9 +723,9 @@ mod tests {
         let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
 
         let next = unsafe { incremental_scan_stream_next_arrow(surviving.shallow_copy()) };
-        assert_extern_result_error_with_message(next, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(next, FFIKernelError::GenericError, None);
         let again = unsafe { incremental_scan_stream_into_summary(surviving) };
-        assert_extern_result_error_with_message(again, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(again, FFIKernelError::GenericError, None);
 
         unsafe { free_incremental_scan_summary(summary) };
         unsafe { free_snapshot(snapshot) };
@@ -755,9 +755,9 @@ mod tests {
         drop(unsafe { recover_error(e) });
 
         let again = unsafe { incremental_scan_stream_next_arrow(stream.shallow_copy()) };
-        assert_extern_result_error_with_message(again, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(again, FFIKernelError::GenericError, None);
         let summary = unsafe { incremental_scan_stream_into_summary(stream) };
-        assert_extern_result_error_with_message(summary, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(summary, FFIKernelError::GenericError, None);
 
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
@@ -921,7 +921,7 @@ mod tests {
             ))
         };
         let result = unsafe { incremental_scan_builder_build(builder) };
-        assert_extern_result_error_with_message(result, KernelError::MissingColumnError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::MissingColumnError, None);
 
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };

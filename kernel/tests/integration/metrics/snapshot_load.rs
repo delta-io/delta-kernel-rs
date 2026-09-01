@@ -170,11 +170,11 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
         .collect::<DeltaResult<Vec<_>>>()?;
     let json_bytes = to_json_bytes(batches.into_iter().map(Ok))?;
     let compaction_path = Path::from_url_path(compaction_url.path())
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     store
         .put(&compaction_path, json_bytes.into())
         .await
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
 
     // commit 3: tail commit after the compaction
     insert_rows(&table_url, &setup_engine, 3, 1).await?;
@@ -208,9 +208,9 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
 async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<()> {
     // The crc-full golden table has commit 0 + a CRC file at version 0.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/"))
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-    let table_root =
-        Url::from_directory_path(path).map_err(|_| delta_kernel::Error::generic("invalid path"))?;
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+    let table_root = Url::from_directory_path(path)
+        .map_err(|_| delta_kernel::KernelError::generic("invalid path"))?;
 
     let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_root).build(&engine)?;

@@ -248,7 +248,7 @@ unsafe fn visit_expression_column_impl(
     parts_len: usize,
 ) -> DeltaResult<usize> {
     if parts_len == 0 {
-        return Err(delta_kernel::Error::generic(
+        return Err(delta_kernel::KernelError::generic(
             "column must have at least one field part",
         ));
     }
@@ -259,7 +259,7 @@ unsafe fn visit_expression_column_impl(
         .map(|slice| unsafe { String::try_from_slice(slice) })
         .collect::<DeltaResult<Vec<String>>>()?;
     if fields.iter().any(|field| field.is_empty()) {
-        return Err(delta_kernel::Error::generic(
+        return Err(delta_kernel::KernelError::generic(
             "column field part must not be empty",
         ));
     }
@@ -507,7 +507,7 @@ pub(crate) enum NullTypeTag {
 }
 
 impl TryFrom<u8> for NullTypeTag {
-    type Error = delta_kernel::Error;
+    type Error = delta_kernel::KernelError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -527,7 +527,7 @@ impl TryFrom<u8> for NullTypeTag {
             13 => Ok(Self::IntervalYearMonth),
             14 => Ok(Self::IntervalDayTime),
             255 => Ok(Self::NonPrimitive),
-            other => Err(delta_kernel::Error::generic(format!(
+            other => Err(delta_kernel::KernelError::generic(format!(
                 "Unrecognized null type tag: {other}"
             ))),
         }
@@ -602,7 +602,7 @@ impl NullTypeTag {
             Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
                 precision, scale,
             )?)),
-            Self::NonPrimitive => Err(delta_kernel::Error::generic(
+            Self::NonPrimitive => Err(delta_kernel::KernelError::generic(
                 "Non-primitive null types (struct, array, map, variant) cannot be reconstructed \
                  from a type tag. Use opaque expressions or a schema visitor instead.",
             )),
@@ -718,7 +718,7 @@ fn visit_engine_expression_impl(
     let expr_id = (engine_expression.visitor)(engine_expression.expression, &mut visitor_state);
 
     let expr = unwrap_kernel_expression(&mut visitor_state, expr_id).ok_or_else(|| {
-        delta_kernel::Error::generic(format!(
+        delta_kernel::KernelError::generic(format!(
             "Invalid expression ID {expr_id} returned from engine visitor"
         ))
     })?;
@@ -748,7 +748,7 @@ fn visit_engine_predicate_impl(
     let pred_id = (engine_predicate.visitor)(engine_predicate.predicate, &mut visitor_state);
 
     let pred = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
-        delta_kernel::Error::generic(format!(
+        delta_kernel::KernelError::generic(format!(
             "Invalid predicate ID {pred_id} returned from engine visitor"
         ))
     })?;
@@ -1127,18 +1127,18 @@ mod tests {
     #[rstest]
     #[case::no_parts(
         &[],
-        KernelError::GenericError,
+        FFIKernelError::GenericError,
         Some("Generic delta kernel error: column must have at least one field part")
     )]
     #[case::empty_part(
         &[&b"a"[..], &b""[..], &b"d"[..]],
-        KernelError::GenericError,
+        FFIKernelError::GenericError,
         Some("Generic delta kernel error: column field part must not be empty")
     )]
-    #[case::invalid_utf8(&[&[0xFF, 0xFE][..]], KernelError::Utf8Error, None)]
+    #[case::invalid_utf8(&[&[0xFF, 0xFE][..]], FFIKernelError::Utf8Error, None)]
     fn invalid_column_parts_are_rejected(
         #[case] raw_parts: &[&[u8]],
-        #[case] expected_error: KernelError,
+        #[case] expected_error: FFIKernelError,
         #[case] expected_message: Option<&str>,
     ) {
         let mut state = KernelExpressionVisitorState::default();
@@ -1241,7 +1241,7 @@ mod tests {
     // miri can validate the unsafe boundary, not just the `_impl` helpers above.
     // ============================================================================
 
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, ok_or_panic,
     };

@@ -24,7 +24,7 @@ use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
-use crate::{DeltaResult, Error, StorageHandler, Version};
+use crate::{DeltaResult, KernelError, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -68,7 +68,7 @@ pub(crate) struct LogSegmentFiles {
 ///
 /// With a `cancellation_token`, the listing becomes cancellable: the engine may interrupt its own
 /// I/O, and the returned iterator is polled against the token so cancellation arrives as a terminal
-/// [`Error::Cancelled`] rather than an early end.
+/// [`KernelError::Cancelled`] rather than an early end.
 #[internal_api]
 pub(crate) fn list_delta_log_from_storage(
     storage: &dyn StorageHandler,
@@ -110,7 +110,7 @@ pub(crate) fn list_delta_log_from_storage(
     // Wrap the filtered pipeline so cancellation is checked as the iterator is consumed, outside
     // the version `take_while` above. Checked inside, a cancelled listing would end with `None` and
     // be indistinguishable from a complete one; outside, it surfaces as a terminal
-    // `Error::Cancelled`.
+    // `KernelError::Cancelled`.
     Ok(CancellableIterator::new(files, cancellation_token.cloned()))
 }
 
@@ -631,7 +631,7 @@ impl LogSegmentFiles {
             //     the drop leaves commits 0-2 behind, the new table writes its own 0, 1, 2, ...,
             //     and listing from version 0 sees one contiguous sequence whose low versions belong
             //     to two different tables and replays it as a single history.
-            return Err(Error::invalid_checkpoint(
+            return Err(KernelError::invalid_checkpoint(
                 "Had a _last_checkpoint hint but didn't find any checkpoints",
             ));
         };

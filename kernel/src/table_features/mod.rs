@@ -32,7 +32,7 @@ use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 mod column_mapping;
 #[cfg(feature = "geo-type-in-dev")]
@@ -513,7 +513,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
-        Operation::Cdf => Err(Error::unsupported(
+        Operation::Cdf => Err(KernelError::unsupported(
             "Feature 'catalogManaged' is not supported for CDF",
         )),
     }),
@@ -526,7 +526,7 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
-        Operation::Cdf => Err(Error::unsupported(
+        Operation::Cdf => Err(KernelError::unsupported(
             "Feature 'catalogOwned-preview' is not supported for CDF",
         )),
     }),
@@ -646,7 +646,7 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::Custom(|_protocol, properties| {
             require!(
                 properties.column_mapping_mode == Some(ColumnMappingMode::Id),
-                Error::invalid_protocol(
+                KernelError::invalid_protocol(
                     "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
                 )
             );
@@ -672,7 +672,7 @@ static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
     #[cfg(feature = "geo-type-in-dev")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
+        Operation::Write => Err(KernelError::unsupported(
             "Feature 'geospatial' is not supported for writes",
         )),
     }),
@@ -896,17 +896,17 @@ pub(crate) fn auto_enable_property_driven_features(
 
 /// Enforce that `protocol.min_reader_version()` lies within
 /// [`MIN_VALID_RW_VERSION`]..=[`MAX_VALID_READER_VERSION`]. Below the minimum yields
-/// [`Error::InvalidProtocol`]; above the maximum yields [`Error::Unsupported`].
+/// [`KernelError::InvalidProtocol`]; above the maximum yields [`KernelError::Unsupported`].
 pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()> {
     require!(
         protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
-        Error::InvalidProtocol(format!(
+        KernelError::InvalidProtocol(format!(
             "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
             protocol.min_reader_version()
         ))
     );
     if protocol.min_reader_version() > MAX_VALID_READER_VERSION {
-        return Err(Error::unsupported(format!(
+        return Err(KernelError::unsupported(format!(
             "Unsupported minimum reader version {}",
             protocol.min_reader_version()
         )));
@@ -925,7 +925,7 @@ pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> DeltaResult<()> {
         match feature.info().kernel_support {
             KernelSupport::Supported => {}
             KernelSupport::NotSupported => {
-                return Err(Error::unsupported(format!(
+                return Err(KernelError::unsupported(format!(
                     "Feature '{feature}' is not supported by kernel",
                 )));
             }
@@ -1052,11 +1052,11 @@ mod tests {
         match expected {
             ExpectRead::Ok => result.expect("protocol must be readable"),
             ExpectRead::InvalidProtocol => assert!(
-                matches!(result, Err(Error::InvalidProtocol(_))),
+                matches!(result, Err(KernelError::InvalidProtocol(_))),
                 "expected InvalidProtocol, got: {result:?}"
             ),
             ExpectRead::Unsupported => assert!(
-                matches!(result, Err(Error::Unsupported(_))),
+                matches!(result, Err(KernelError::Unsupported(_))),
                 "expected Unsupported, got: {result:?}"
             ),
         }

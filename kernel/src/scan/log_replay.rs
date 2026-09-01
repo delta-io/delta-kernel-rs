@@ -28,7 +28,7 @@ use crate::schema::{
 };
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
-use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+use crate::{DeltaResult, Engine, ExpressionEvaluator, KernelError};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -138,7 +138,7 @@ pub struct SerializableScanState {
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique
 ///   file (identified by its path and deletion vector unique ID), only the latest valid Add action
 ///   is processed.
-/// - Parse-error fallback: If transformation and data skipping return [`Error::ParseError`],
+/// - Parse-error fallback: If transformation and data skipping return [`KernelError::ParseError`],
 ///   deduplicates the raw batch first, then retries transformation and data skipping on the
 ///   surviving actions.
 /// - Row StructPatch passthrough: Any user-provided row-level transformation expressions (e.g.
@@ -402,8 +402,9 @@ impl ScanLogReplayProcessor {
             is_catalog_managed,
             skip_row_transforms,
         };
-        let internal_state_blob = serde_json::to_vec(&internal_state)
-            .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
+        let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
+            KernelError::generic(format!("Failed to serialize internal state: {e}"))
+        })?;
 
         Ok(SerializableScanState {
             predicate,
@@ -433,14 +434,14 @@ impl ScanLogReplayProcessor {
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
         // Deserialize internal state from json
-        let internal_state: InternalScanState =
-            serde_json::from_slice(&state.internal_state_blob).map_err(Error::MalformedJson)?;
+        let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
+            .map_err(KernelError::MalformedJson)?;
 
         // Reconstruct PhysicalPredicate from predicate and predicate schema
         let physical_predicate = match state.predicate {
             Some(predicate) => {
                 let Some(predicate_schema) = internal_state.predicate_schema else {
-                    return Err(Error::generic(
+                    return Err(KernelError::generic(
                         "Invalid serialized internal state. Expected predicate schema.",
                     ));
                 };
@@ -485,7 +486,7 @@ impl ScanLogReplayProcessor {
         let transformed = transform.evaluate(actions)?;
         require!(
             transformed.len() == actions.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "transform output length {} != actions length {}",
                 transformed.len(),
                 actions.len()
@@ -495,7 +496,7 @@ impl ScanLogReplayProcessor {
         let selection_vector = self.build_selection_vector(transformed.as_ref())?;
         require!(
             selection_vector.len() == actions.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "selection vector length {} != actions length {}",
                 selection_vector.len(),
                 actions.len()
@@ -541,7 +542,7 @@ impl ScanLogReplayProcessor {
     ) -> DeltaResult<()> {
         require!(
             selection_vector.len() == active_add_file_sizes.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "selection vector length {} != active Add file sizes length {}",
                 selection_vector.len(),
                 active_add_file_sizes.len()
@@ -724,7 +725,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let expected_getters = if is_log_batch { 11 } else { 7 };
         require!(
             getters.len() == expected_getters,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of AddRemoveDedupVisitor getters: {}",
                 getters.len()
             ))
@@ -930,7 +931,9 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         } = actions_batch;
         require!(
             !is_log_batch,
-            Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
+            KernelError::generic(
+                "Parallel checkpoint processor may only be applied to checkpoint files"
+            )
         );
 
         let mut should_retry_transform_and_data_skip = false;
@@ -944,7 +947,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ Error::ParseError(_, _)) => {
+                Err(err @ KernelError::ParseError(_, _)) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
@@ -1040,7 +1043,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ Error::ParseError(_, _)) => {
+                Err(err @ KernelError::ParseError(_, _)) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }

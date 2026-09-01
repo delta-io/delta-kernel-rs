@@ -28,7 +28,9 @@ use delta_kernel::scan::{scan_row_schema, StatsOptions};
 use delta_kernel::schema::{schema_ref, DataType, MapType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, Error, Expression as Expr, Predicate as Pred, Snapshot};
+use delta_kernel::{
+    DeltaResult, Engine, Expression as Expr, KernelError, Predicate as Pred, Snapshot,
+};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
@@ -210,7 +212,7 @@ fn selected_scan_file_batch(
             return Ok(FilteredEngineData::with_all_rows_selected(data));
         }
     }
-    Err(Error::generic("expected at least one scan file"))
+    Err(KernelError::generic("expected at least one scan file"))
 }
 
 #[derive(Clone, Copy)]

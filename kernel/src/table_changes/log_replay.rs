@@ -24,7 +24,7 @@ use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
+use crate::{DeltaResult, Engine, EngineData, KernelError, PredicateRef, RowVisitor};
 
 #[cfg(test)]
 mod tests;
@@ -235,7 +235,7 @@ impl LogReplayScanner {
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
-                    Error::change_data_feed_incompatible_schema_at_version(
+                    KernelError::change_data_feed_incompatible_schema_at_version(
                         table_schema,
                         &schema,
                         commit_file.version
@@ -298,7 +298,7 @@ impl LogReplayScanner {
         let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
         {
             let Some(in_commit_timestamp) = in_commit_timestamp_opt else {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "In-commit timestamp is enabled but not found in commit at version {}",
                     commit_file.version
                 )));
@@ -351,7 +351,7 @@ impl LogReplayScanner {
         let commit_version = commit_file
             .version
             .try_into()
-            .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
+            .map_err(|_| KernelError::generic("Failed to convert commit version to i64"))?;
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             LOG_ADD_SCHEMA.clone(),
             Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
@@ -436,7 +436,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
             getters.len() == 11,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
             ))
@@ -515,7 +515,7 @@ impl RowVisitor for FileActionSelectionVisitor<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
             getters.len() == 5,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of FileActionSelectionVisitor getters: {}",
                 getters.len()
             ))

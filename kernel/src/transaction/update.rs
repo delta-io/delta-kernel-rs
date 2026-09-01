@@ -23,7 +23,7 @@ use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
 };
@@ -283,7 +283,7 @@ impl Transaction {
         existing_data_files: impl Iterator<Item = DeltaResult<FilteredEngineData>>,
     ) -> DeltaResult<()> {
         if self.is_create_table() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Deletion vector operations require an existing table",
             ));
         }
@@ -329,7 +329,7 @@ impl Transaction {
         }
 
         if matched_dv_files != new_dv_descriptors.len() {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Number of matched DV files does not match number of new DV descriptors: {} != {}",
                 matched_dv_files,
                 new_dv_descriptors.len()
@@ -348,7 +348,7 @@ impl Transaction {
             .effective_table_config
             .is_feature_enabled(&TableFeature::DeletionVectors)
         {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Deletion vector writes require reader version 3, writer version 7, the \
                  'deletionVectors' feature in both reader and writer features, and the \
                  `delta.enableDeletionVectors` table property set to `true`",
@@ -473,7 +473,7 @@ impl<S> Transaction<S> {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.dv_matched_files.is_empty() {
-            return Err(crate::error::Error::internal_error(
+            return Err(crate::error::KernelError::internal_error(
                 "CREATE TABLE transaction cannot have DV update actions",
             ));
         }
@@ -643,18 +643,18 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 let stats: Option<String> =
                     getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
                 let stats = stats.ok_or_else(|| {
-                    Error::generic(format!(
+                    KernelError::generic(format!(
                         "update_deletion_vectors: file {path} has no stats; \
                          deletion vectors require an accurate {NUM_RECORDS}"
                     ))
                 })?;
                 let mut parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
-                    Error::generic(format!(
+                    KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
                     ))
                 })?;
                 let stats_obj = parsed.as_object_mut().ok_or_else(|| {
-                    Error::generic(format!(
+                    KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is not a JSON object"
                     ))
                 })?;
@@ -663,7 +663,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     .and_then(serde_json::Value::as_u64)
                     .is_none()
                 {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
                          or it is not a non-negative integer"
                     )));
@@ -680,7 +680,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 } else {
                     stats_obj.insert(TIGHT_BOUNDS.to_string(), serde_json::Value::Bool(false));
                     serde_json::to_string(&parsed).map_err(|e| {
-                        Error::generic(format!(
+                        KernelError::generic(format!(
                             "update_deletion_vectors: failed to re-serialize stats for {path}: {e}"
                         ))
                     })?

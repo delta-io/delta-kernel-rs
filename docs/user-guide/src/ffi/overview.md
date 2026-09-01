@@ -405,7 +405,7 @@ callback to allocate error objects in your memory space whenever an operation fa
 Because the engine allocates these errors, the engine is also responsible for freeing
 them. Kernel returns the error pointer immediately and does not retain it.
 
-The `EngineError` struct contains a `KernelError` enum that classifies the error type
+The `EngineError` struct contains an `FFIKernelError` enum that classifies the error type
 (e.g., `GenericError`, `FileNotFoundError`, `InvalidUrlError`). The error message
 string passed to `allocate_error` is only valid for the duration of the callback, so
 you must copy it if you need to keep it.

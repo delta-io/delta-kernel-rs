@@ -16,7 +16,7 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
-use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
+use delta_kernel::{DeltaResult, Engine, KernelError, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
@@ -65,7 +65,7 @@ async fn try_main() -> DeltaResult<()> {
     // Check if path is a directory and if not, create it
     if !Path::new(&cli.location_args.path).exists() {
         create_dir_all(&cli.location_args.path).map_err(|e| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Failed to create directory {}: {e}",
                 cli.location_args.path
             ))
@@ -104,7 +104,7 @@ async fn try_main() -> DeltaResult<()> {
     let mut retries = 0;
     let committed = loop {
         if retries > 5 {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
@@ -113,7 +113,7 @@ async fn try_main() -> DeltaResult<()> {
             CommitResult::ConflictedTransaction(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
                 println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
-                return Err(Error::generic("Commit failed"));
+                return Err(KernelError::generic("Commit failed"));
             }
             CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
@@ -163,7 +163,7 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
         .map(|field| {
             let parts: Vec<&str> = field.split(':').collect();
             if parts.len() != 2 {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Invalid field specification: {field}. Expected format: field_name:data_type"
                 )));
             }
@@ -177,7 +177,7 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
                 "boolean" => DataType::BOOLEAN,
                 "timestamp" => DataType::TIMESTAMP,
                 _ => {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "Unsupported data type: {data_type}"
                     )));
                 }
@@ -237,7 +237,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
                 Arc::new(TimestampMicrosecondArray::from(data))
             }
             _ => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Unsupported data type for sample data: {:?}",
                     field.data_type()
                 )));

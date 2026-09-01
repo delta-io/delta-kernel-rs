@@ -165,8 +165,9 @@ mod tests {
             _data: DeltaResultIterator<'_, FilteredEngineData>,
             _overwrite: bool,
         ) -> DeltaResult<FileSize> {
-            self.write_size
-                .ok_or_else(|| crate::Error::generic("StubJsonHandler does not support writes"))
+            self.write_size.ok_or_else(|| {
+                crate::KernelError::generic("StubJsonHandler does not support writes")
+            })
         }
     }
 

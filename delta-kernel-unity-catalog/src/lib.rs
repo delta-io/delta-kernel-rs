@@ -7,7 +7,7 @@ mod utils;
 
 pub use committer::UCCommitter;
 use delta_kernel::snapshot::SnapshotBuilder;
-use delta_kernel::{DeltaResult, Error, LogPath, Snapshot};
+use delta_kernel::{DeltaResult, KernelError, LogPath, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
 use url::Url;
 pub use utils::{
@@ -36,7 +36,7 @@ pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> DeltaRe
         .into_iter()
         .map(|c| {
             let file_size = c.file_size.try_into().map_err(|_| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "commit file_size {} does not fit in FileSize",
                     c.file_size
                 ))
@@ -64,13 +64,13 @@ pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> DeltaRe
 /// fails, or if `latest_table_version` is negative.
 pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> DeltaResult<SnapshotBuilder> {
     let table_root = Url::parse(&resp.metadata.location)
-        .map_err(|e| Error::generic(format!("invalid table location: {e}")))?;
+        .map_err(|e| KernelError::generic(format!("invalid table location: {e}")))?;
     let log_tail = log_tail_from_commits(&resp.commits, table_root.clone())?;
     let mut builder = Snapshot::builder_for(table_root).with_log_tail(log_tail);
     if let Some(version) = resp.latest_table_version {
         let max_catalog_version: u64 = version
             .try_into()
-            .map_err(|_| Error::generic("catalog reported a negative table version"))?;
+            .map_err(|_| KernelError::generic("catalog reported a negative table version"))?;
         builder = builder.with_max_catalog_version(max_catalog_version);
     }
     Ok(builder)

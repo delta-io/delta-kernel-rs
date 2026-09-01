@@ -8,7 +8,7 @@ use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Column indices, matching the order in [`MANDATORY_ADD_FILE_COLUMNS`].
 const PATH: usize = 0;
@@ -50,9 +50,9 @@ impl Validation for AddFileRequiredFields {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?
-            .ok_or_else(|| Error::missing_data("AddFile is missing required field 'path'"))?;
+            .ok_or_else(|| KernelError::missing_data("AddFile is missing required field 'path'"))?;
         if path.is_empty() {
-            return Err(Error::generic("AddFile path must not be empty"));
+            return Err(KernelError::generic("AddFile path must not be empty"));
         }
 
         let partition_values = validate_required_field_exist(
@@ -67,7 +67,7 @@ impl Validation for AddFileRequiredFields {
             "size",
         )?;
         if size < 0 {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "AddFile for '{path}' has negative size {size}; size must be non-negative"
             )));
         }
@@ -282,7 +282,7 @@ mod tests {
         let error = add_file_validator(physical_partition_columns)
             .validate(&adds)
             .expect_err("invalid partition values should be rejected");
-        let Error::InvalidPartitionValues(message) = error else {
+        let KernelError::InvalidPartitionValues(message) = error else {
             panic!("expected InvalidPartitionValues, got {error:?}");
         };
         assert!(

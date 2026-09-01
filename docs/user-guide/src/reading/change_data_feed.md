@@ -64,7 +64,7 @@ let table_changes = TableChanges::try_new(url, &engine, 0, None)?;
 - The table schema at the start and end versions must be identical.
 - No unsupported reader features (other than deletion vectors) are enabled.
 
-If any check fails, it returns an `Error`.
+If any check fails, it returns a `KernelError`.
 
 ## CDF metadata columns
 

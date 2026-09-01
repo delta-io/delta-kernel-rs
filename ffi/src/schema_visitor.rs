@@ -24,7 +24,7 @@
 use delta_kernel::schema::{
     ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField, StructType,
 };
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 use tracing::warn;
 
 use crate::{
@@ -49,16 +49,16 @@ pub fn extract_kernel_schema(
     let schema_element = state
         .elements
         .take(schema_id)
-        .ok_or_else(|| Error::schema("Nonexistent id passed to extract_kernel_schema"))?;
+        .ok_or_else(|| KernelError::schema("Nonexistent id passed to extract_kernel_schema"))?;
     let DataType::Struct(struct_type) = schema_element.data_type else {
         warn!("Final returned id was not a struct, schema is invalid");
-        return Err(Error::schema(
+        return Err(KernelError::schema(
             "Final returned id was not a struct, schema is invalid",
         ));
     };
     if !state.elements.is_empty() {
         warn!("Didn't consume all visited fields, schema is invalid.");
-        Err(Error::schema(
+        Err(KernelError::schema(
             "Didn't consume all visited fields, schema is invalid.",
         ))
     } else {
@@ -408,7 +408,7 @@ pub unsafe extern "C" fn visit_field_struct(
     nullable: bool,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str: Result<&str, Error> = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let name_str: Result<&str, KernelError> = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
     visit_field_struct_impl(state, name_str, field_ids, nullable)
@@ -423,8 +423,9 @@ fn create_struct_data_type(
     let field_vec = field_ids
         .iter()
         .map(|&field_id| {
-            unwrap_field(state, field_id)
-                .ok_or_else(|| Error::generic(format!("Invalid field ID {field_id} in struct")))
+            unwrap_field(state, field_id).ok_or_else(|| {
+                KernelError::generic(format!("Invalid field ID {field_id} in struct"))
+            })
         })
         .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -474,7 +475,7 @@ fn visit_field_array_impl(
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
     let element_field = unwrap_field(state, element_type_id).ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Invalid element type ID {element_type_id} for array"
         ))
     })?;
@@ -518,15 +519,17 @@ fn visit_field_map_impl(
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
 
-    let key_field = unwrap_field(state, key_type_id)
-        .ok_or_else(|| Error::generic(format!("Invalid key type ID {key_type_id} for map")))?;
+    let key_field = unwrap_field(state, key_type_id).ok_or_else(|| {
+        KernelError::generic(format!("Invalid key type ID {key_type_id} for map"))
+    })?;
 
     if key_field.nullable {
-        return Err(Error::generic("Delta Map keys may not be nullable"));
+        return Err(KernelError::generic("Delta Map keys may not be nullable"));
     }
 
-    let value_field = unwrap_field(state, value_type_id)
-        .ok_or_else(|| Error::generic(format!("Invalid value type ID {value_type_id} for map")))?;
+    let value_field = unwrap_field(state, value_type_id).ok_or_else(|| {
+        KernelError::generic(format!("Invalid value type ID {value_type_id} for map"))
+    })?;
 
     let map_type = MapType::new(
         key_field.data_type,
@@ -580,7 +583,7 @@ fn create_variant_data_type(
     let Some(DataType::Struct(variant_struct)) =
         state.elements.take(struct_type_id).map(|f| f.data_type)
     else {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Invalid variant struct ID {struct_type_id} - must be DataType::Struct"
         )));
     };
@@ -592,7 +595,7 @@ mod tests {
     use delta_kernel::schema::{DataType, PrimitiveType};
 
     use super::*;
-    use crate::error::{EngineError, KernelError};
+    use crate::error::{EngineError, FFIKernelError};
     use crate::ffi_test_utils::ok_or_panic;
     use crate::KernelStringSlice;
 
@@ -600,7 +603,7 @@ mod tests {
     // errors.
     #[no_mangle]
     extern "C" fn test_allocate_error(
-        etype: KernelError,
+        etype: FFIKernelError,
         msg: crate::KernelStringSlice,
     ) -> *mut EngineError {
         panic!(
@@ -1352,7 +1355,7 @@ mod tests {
         // expect errors.
         #[no_mangle]
         extern "C" fn ensure_map_err(
-            _etype: KernelError,
+            _etype: FFIKernelError,
             msg: crate::KernelStringSlice,
         ) -> *mut EngineError {
             let msg = unsafe {

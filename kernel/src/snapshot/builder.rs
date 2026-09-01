@@ -12,7 +12,7 @@ use crate::metrics::{LogSegmentLoadType, MetricId, SnapshotLoadMetricContext};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
-use crate::{DeltaResult, Engine, Error, Snapshot, Version};
+use crate::{DeltaResult, Engine, KernelError, Snapshot, Version};
 
 /// Builder for creating [`Snapshot`] instances.
 ///
@@ -104,7 +104,7 @@ impl IncrementalReplay {
         target_version: Version,
     ) -> DeltaResult<bool> {
         let distance = target_version.checked_sub(crc_version).ok_or_else(|| {
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "CRC version {crc_version} is ahead of target version {target_version}"
             ))
         })?;
@@ -200,11 +200,11 @@ impl SnapshotBuilder {
     ///
     /// Kernel polls the token as it consumes the log listing, and a cancellation-aware [`Engine`]
     /// additionally races its listing and log reads against it. On cancellation
-    /// [`build`](Self::build) returns [`Error::Cancelled`] rather than a snapshot built from a
-    /// partial listing. With no token the build is not cancellable.
+    /// [`build`](Self::build) returns [`KernelError::Cancelled`] rather than a snapshot built from
+    /// a partial listing. With no token the build is not cancellable.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
     pub fn with_cancellation_token(
         mut self,
         token: impl Into<Option<CancellationTokenRef>>,
@@ -331,7 +331,7 @@ impl SnapshotBuilder {
         } else {
             existing_snapshot
                 .ok_or_else(|| {
-                    Error::internal_error(
+                    KernelError::internal_error(
                         "SnapshotBuilder should have either table_root or existing_snapshot",
                     )
                 })
@@ -376,7 +376,7 @@ impl SnapshotBuilder {
         for pair in log_tail.windows(2) {
             require!(
                 pair[0].version + 1 == pair[1].version,
-                Error::LogTailVersionsNotContiguous {
+                KernelError::LogTailVersionsNotContiguous {
                     first_version: pair[0].version,
                     second_version: pair[1].version,
                 }
@@ -392,7 +392,7 @@ impl SnapshotBuilder {
         // Staged commits require max_catalog_version
         require!(
             !has_catalog_commits || max_catalog_version.is_some(),
-            Error::MaxCatalogVersion(
+            KernelError::MaxCatalogVersion(
                 "Max catalog version is required when providing staged commits in the log tail. \
                  Use with_max_catalog_version()."
                     .to_string()
@@ -403,7 +403,7 @@ impl SnapshotBuilder {
         if let (Some(ver), Some(max_cv)) = (version, max_catalog_version) {
             require!(
                 ver <= max_cv,
-                Error::MaxCatalogVersion(format!(
+                KernelError::MaxCatalogVersion(format!(
                     "Requested version {ver} exceeds max catalog version {max_cv}"
                 ))
             );
@@ -415,7 +415,7 @@ impl SnapshotBuilder {
                 // With time-travel: last log_tail entry must be >= requested version
                 require!(
                     last.version >= ver,
-                    Error::MaxCatalogVersion(format!(
+                    KernelError::MaxCatalogVersion(format!(
                         "Log tail version {} is less than requested version {ver} for max catalog \
                          version {max_cv}",
                         last.version
@@ -425,7 +425,7 @@ impl SnapshotBuilder {
                 // Without time-travel: last log_tail entry must == max_catalog_version
                 require!(
                     last.version == max_cv,
-                    Error::MaxCatalogVersion(format!(
+                    KernelError::MaxCatalogVersion(format!(
                         "Log tail version {} does not match max catalog version {max_cv}",
                         last.version
                     ))
@@ -446,7 +446,7 @@ impl SnapshotBuilder {
 
         require!(
             !is_catalog_managed || max_catalog_version.is_some(),
-            Error::MaxCatalogVersion(
+            KernelError::MaxCatalogVersion(
                 "Max catalog version is required when loading a catalog-managed table. \
                  Use with_max_catalog_version()."
                     .to_string()
@@ -455,7 +455,7 @@ impl SnapshotBuilder {
         if let Some(max_catalog_version) = max_catalog_version {
             require!(
                 is_catalog_managed,
-                Error::MaxCatalogVersion(format!(
+                KernelError::MaxCatalogVersion(format!(
                     "Max catalog version {max_catalog_version} must not be set for a \
                      non-catalog-managed table"
                 ))
@@ -929,7 +929,7 @@ mod tests {
                 .with_log_tail(log_tail)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -944,7 +944,7 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -969,7 +969,7 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -981,7 +981,7 @@ mod tests {
 
             let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -998,7 +998,7 @@ mod tests {
                 .with_max_catalog_version(0)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -1022,7 +1022,7 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -1076,7 +1076,7 @@ mod tests {
             // Incremental update without mcv should fail
             let result = SnapshotBuilder::new_from(initial).build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -1111,7 +1111,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::LogTailVersionsNotContiguous { .. })
+                Err(KernelError::LogTailVersionsNotContiguous { .. })
             ));
 
             Ok(())

@@ -15,7 +15,7 @@ use crate::engine_data::{
 };
 use crate::schema::ColumnName;
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 // actual impls (todo: could macro these)
 
@@ -150,7 +150,7 @@ fn get_list_item<'a>(
         return Ok(None);
     }
     let values = as_string_accessor(list.list_values()).ok_or_else(|| {
-        Error::unexpected_column_type(format!(
+        KernelError::unexpected_column_type(format!(
             "{field_name}: list values are not a supported string type"
         ))
     })?;
@@ -164,7 +164,7 @@ fn struct_elements<'a>(
     field_name: &str,
 ) -> DeltaResult<&'a StructArray> {
     list.list_values().as_struct_opt().ok_or_else(|| {
-        Error::unexpected_column_type(format!("{field_name}: list values are not structs"))
+        KernelError::unexpected_column_type(format!("{field_name}: list values are not structs"))
     })
 }
 
@@ -197,7 +197,7 @@ impl<T: ListLikeArray> StructListAccessor for T {
         // RecordBatch.
         require!(
             !sliced.is_nullable(),
-            Error::invalid_struct_data("array<struct> elements are nullable; cannot visit")
+            KernelError::invalid_struct_data("array<struct> elements are nullable; cannot visit")
         );
         ArrowEngineData::from(sliced).visit_rows(column_names, visitor)
     }
@@ -235,12 +235,12 @@ impl<'a> GetData<'a> for MapArray {
             return Ok(None);
         }
         let keys = as_string_accessor(self.keys().as_ref()).ok_or_else(|| {
-            Error::unexpected_column_type(format!(
+            KernelError::unexpected_column_type(format!(
                 "{field_name}: map keys are not a supported string type"
             ))
         })?;
         let values = as_string_accessor(self.values().as_ref()).ok_or_else(|| {
-            Error::unexpected_column_type(format!(
+            KernelError::unexpected_column_type(format!(
                 "{field_name}: map values are not a supported string type"
             ))
         })?;
@@ -261,7 +261,7 @@ fn validate_and_get_physical_index(
     field_name: &str,
 ) -> DeltaResult<usize> {
     if row_index >= run_array.len() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Row index {row_index} out of bounds for field '{field_name}'"
         )));
     }
@@ -283,7 +283,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
             .as_any()
             .downcast_ref::<GenericByteArray<GenericStringType<i32>>>()
             .ok_or_else(|| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "Expected StringArray values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
@@ -298,7 +298,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
             .values()
             .as_primitive_opt::<Int32Type>()
             .ok_or_else(|| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "Expected Int32Array values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
@@ -313,7 +313,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
             .values()
             .as_primitive_opt::<Int64Type>()
             .ok_or_else(|| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "Expected Int64Array values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
@@ -325,7 +325,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
     fn get_bool(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<bool>> {
         let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self.values().as_boolean_opt().ok_or_else(|| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Expected BooleanArray values in RunArray, got {:?}",
                 self.values().data_type()
             ))
@@ -341,7 +341,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
             .as_any()
             .downcast_ref::<GenericByteArray<GenericBinaryType<i32>>>()
             .ok_or_else(|| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "Expected BinaryArray values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
@@ -578,7 +578,7 @@ mod tests {
             .unwrap()
             .visit_with(&mut visitor)
             .expect_err("a null element struct cannot be visited");
-        assert!(matches!(err, Error::InvalidStructData(_)));
+        assert!(matches!(err, KernelError::InvalidStructData(_)));
     }
 
     #[test]

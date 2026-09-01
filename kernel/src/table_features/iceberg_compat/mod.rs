@@ -11,7 +11,7 @@ use crate::schema::{ColumnMetadataKey, DataType, StructField};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 pub(crate) enum IcebergCompatVersion {
     // TODO: Add V1, V2 when kernel supports them.
@@ -106,7 +106,7 @@ pub(super) fn check_only_supported_types(
     let Some(offender) = v.offender else {
         return Ok(());
     };
-    Err(Error::generic(format!(
+    Err(KernelError::generic(format!(
         "{feature_label} does not support type at column: {offender}",
     )))
 }
@@ -180,7 +180,7 @@ pub(super) fn check_no_legacy_nested_ids(tc: &TableConfiguration) -> DeltaResult
     let Some(offender) = v.offender else {
         return Ok(());
     };
-    Err(Error::generic(format!(
+    Err(KernelError::generic(format!(
         "field `{offender}` carries deprecated `{}` metadata; use `{}` instead. \
          See https://github.com/delta-io/delta/issues/6688",
         ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),

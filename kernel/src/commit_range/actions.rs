@@ -11,7 +11,7 @@ use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{ensure_table_can_be_read, Operation};
-use crate::{DeltaResult, Engine, Error, FileDataReadResultIterator, Version};
+use crate::{DeltaResult, Engine, FileDataReadResultIterator, KernelError, Version};
 
 /// A Delta log action kind.
 ///
@@ -189,7 +189,7 @@ impl CommitAction {
                 };
                 if ict_applies {
                     extracted_ict.ok_or_else(|| {
-                        with_version_context(version, Error::generic(
+                        with_version_context(version, KernelError::generic(
                             "in-commit timestamp is enabled but missing ICT timestamp field in commit"
                         ))
                     })?

@@ -15,7 +15,7 @@ use crate::schema::{
     column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
 };
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 pub(crate) static METADATA_LEAVES: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
@@ -58,7 +58,7 @@ impl RowVisitor for SelectionVectorVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 1,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of SelectionVectorVisitor getters: {}",
                 getters.len()
             ))
@@ -115,7 +115,7 @@ impl AddVisitor {
     ) -> DeltaResult<Add> {
         require!(
             getters.len() == 15,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
             ))
@@ -189,7 +189,7 @@ impl RemoveVisitor {
     ) -> DeltaResult<Remove> {
         require!(
             getters.len() == 15,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
             ))
@@ -283,7 +283,7 @@ impl RowVisitor for CdcVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 5,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of CdcVisitor getters: {}",
                 getters.len()
             ))
@@ -331,7 +331,7 @@ impl SetTransactionVisitor {
     ) -> DeltaResult<SetTransaction> {
         require!(
             getters.len() == 3,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of SetTransactionVisitor getters: {}",
                 getters.len()
             ))
@@ -405,7 +405,7 @@ impl RowVisitor for SidecarVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 4,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of SidecarVisitor getters: {}",
                 getters.len()
             ))
@@ -453,7 +453,7 @@ impl DomainMetadataVisitor {
     ) -> DeltaResult<DomainMetadata> {
         require!(
             getters.len() == 3,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of DomainMetadataVisitor getters: {}",
                 getters.len()
             ))
@@ -557,7 +557,7 @@ pub(crate) fn visit_metadata_at<'a>(
 ) -> DeltaResult<Option<Metadata>> {
     require!(
         getters.len() == 9,
-        Error::InternalError(format!(
+        KernelError::InternalError(format!(
             "Wrong number of MetadataVisitor getters: {}",
             getters.len()
         ))
@@ -605,7 +605,7 @@ pub(crate) fn visit_protocol_at<'a>(
 ) -> DeltaResult<Option<Protocol>> {
     require!(
         getters.len() == 4,
-        Error::InternalError(format!(
+        KernelError::InternalError(format!(
             "Wrong number of ProtocolVisitor getters: {}",
             getters.len()
         ))
@@ -674,7 +674,7 @@ impl RowVisitor for InCommitTimestampVisitor {
     ) -> DeltaResult<()> {
         require!(
             getters.len() == 1,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of InCommitTimestampVisitor getters: {}",
                 getters.len()
             ))
@@ -720,7 +720,7 @@ impl RowVisitor for CheckpointVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 1,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of CheckpointVisitor getters: {}",
                 getters.len()
             ))
@@ -828,7 +828,7 @@ impl CheckpointElementVisitor {
     /// was absent or if [`CheckpointAction::validate`] rejects the assembled action.
     fn into_checkpoint_action(self) -> DeltaResult<CheckpointAction> {
         let missing = |field: &str| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "checkpoint action is missing required `{field}` element"
             ))
         };
@@ -896,7 +896,7 @@ impl RowVisitor for CheckpointElementVisitor {
                     SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
                     DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
                     other => {
-                        return Err(Error::generic(format!(
+                        return Err(KernelError::generic(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
                         )))
                     }
@@ -912,7 +912,7 @@ impl RowVisitor for CheckpointElementVisitor {
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
     if slot.replace(value).is_some() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "duplicate `{name}` element in checkpoint action"
         )));
     }

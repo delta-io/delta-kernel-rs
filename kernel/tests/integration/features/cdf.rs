@@ -9,7 +9,7 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{col, lit, Predicate as Pred};
 use delta_kernel::schema::schema_ref;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
+use delta_kernel::{DeltaResult, KernelError, PredicateRef, Version};
 use itertools::Itertools;
 use test_utils::{
     add_commit, create_default_engine, create_default_engine_with_batch, create_table,
@@ -436,14 +436,14 @@ fn invalid_range_end_before_start() {
     let res = read_cdf_for_table("cdf-table-simple", 1, 0, None);
     let expected_msg =
         "Failed to build LogSegment: start_version cannot be greater than end_version";
-    assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
+    assert!(matches!(res, Err(KernelError::Generic(msg)) if msg == expected_msg));
 }
 
 #[test]
 fn invalid_range_start_after_last_version_of_table() {
     let res = read_cdf_for_table("cdf-table-simple", 3, 4, None);
     let expected_msg = "Expected the first commit to have version 3, got None";
-    assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
+    assert!(matches!(res, Err(KernelError::Generic(msg)) if msg == expected_msg));
 }
 
 #[test]

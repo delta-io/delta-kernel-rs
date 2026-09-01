@@ -99,13 +99,13 @@ pub enum LogHistoryError {
         context: &'static str,
         /// The underlying error, if any.
         #[source]
-        source: Option<Box<crate::Error>>,
+        source: Option<Box<crate::KernelError>>,
     },
 }
 
 impl LogHistoryError {
     /// Creates an internal error with context and an underlying cause.
-    pub(crate) fn internal(context: &'static str, source: crate::Error) -> Self {
+    pub(crate) fn internal(context: &'static str, source: crate::KernelError) -> Self {
         Self::Internal {
             context,
             source: Some(Box::new(source)),
@@ -134,8 +134,8 @@ impl LogHistoryError {
     }
 }
 
-impl From<LogHistoryError> for crate::Error {
+impl From<LogHistoryError> for crate::KernelError {
     fn from(e: LogHistoryError) -> Self {
-        crate::Error::LogHistory(Box::new(e))
+        crate::KernelError::LogHistory(Box::new(e))
     }
 }

@@ -28,7 +28,7 @@ use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::schema::{schema, schema_ref, DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{Error, Snapshot, SnapshotRef};
+use delta_kernel::{KernelError, Snapshot, SnapshotRef};
 use rstest::rstest;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -931,8 +931,8 @@ async fn scan_with_replace_table_schema_change(
     let error = surviving_paths(&table_path, engine, predicate, use_parallel)
         .expect_err("an active incompatible add file should fail the scan");
     assert!(matches!(
-        error.downcast_ref::<Error>(),
-        Some(Error::ParseError(_, _))
+        error.downcast_ref::<KernelError>(),
+        Some(KernelError::ParseError(_, _))
     ));
     Ok(())
 }

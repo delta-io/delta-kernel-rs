@@ -24,7 +24,7 @@ mod tests {
     use delta_kernel::transaction::stats_verifier::{
         verify_num_records_present, StatsColumnVerifier,
     };
-    use delta_kernel::{EngineData, Error};
+    use delta_kernel::{EngineData, KernelError};
     use rstest::rstest;
 
     use crate::stats::collect_stats_for_test as collect_stats;
@@ -223,7 +223,7 @@ mod tests {
         let columns = vec![(column_name!("col"), DataType::LONG)];
         let verifier = StatsColumnVerifier::new(columns);
         let result = verifier.verify(&[batch]);
-        assert!(matches!(result, Err(Error::StatsValidation(_))));
+        assert!(matches!(result, Err(KernelError::StatsValidation(_))));
         let err = result.unwrap_err().to_string();
         assert!(err.contains("minValues"));
     }

@@ -16,7 +16,7 @@ use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::SchemaRef;
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, EngineData, FileMeta, KernelError, PredicateRef};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -112,7 +112,7 @@ impl TableChangesScanBuilder {
         // Row-tracking CDF requires row-level reconciliation by row IDs, which this
         // scanner does not perform.
         if self.table_changes.mode != CdfMode::ChangeDataFeed {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "A row-tracking TableChanges cannot be scanned for data; use \
                  TableChanges::scan_file_listing instead",
             ));
@@ -279,7 +279,7 @@ fn read_scan_file(
         size: match scan_file.size {
             Some(s) => s
                 .try_into()
-                .map_err(|_| Error::generic(format!("invalid file size: {s}")))?,
+                .map_err(|_| KernelError::generic(format!("invalid file size: {s}")))?,
             None => 0,
         },
         location,

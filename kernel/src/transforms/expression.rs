@@ -11,7 +11,7 @@ use crate::transforms::{
     map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
     Carrier,
 };
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Generic framework for recursive bottom-up transforms of expressions and predicates.
 ///
@@ -494,7 +494,7 @@ impl ExpressionDepthChecker {
         if self.current_depth > self.max_depth_seen {
             self.max_depth_seen = self.current_depth;
             if self.current_depth > self.depth_limit {
-                return Err(Error::schema(format!(
+                return Err(KernelError::schema(format!(
                     "Max expression depth {} exceeded by {arg:?}",
                     self.depth_limit
                 )));

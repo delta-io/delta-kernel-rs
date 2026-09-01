@@ -18,7 +18,7 @@ use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
-use crate::{Error, Version};
+use crate::{KernelError, Version};
 
 mod deserialize;
 pub use deserialize::ParseIntervalError;
@@ -303,17 +303,19 @@ impl Default for DataSkippingNumIndexedCols {
 }
 
 impl TryFrom<&str> for DataSkippingNumIndexedCols {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let num: i64 = value.parse().map_err(|_| {
-            Error::generic("couldn't parse DataSkippingNumIndexedCols to an integer")
+            KernelError::generic("couldn't parse DataSkippingNumIndexedCols to an integer")
         })?;
         match num {
             -1 => Ok(DataSkippingNumIndexedCols::AllColumns),
             x => Ok(DataSkippingNumIndexedCols::NumColumns(
                 x.try_into().map_err(|_| {
-                    Error::generic("couldn't parse DataSkippingNumIndexedCols to positive integer")
+                    KernelError::generic(
+                        "couldn't parse DataSkippingNumIndexedCols to positive integer",
+                    )
                 })?,
             )),
         }

@@ -5,7 +5,7 @@ use tracing::{info, instrument};
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
 use super::Committer;
-use crate::{DeltaResult, DeltaResultIterator, Engine, Error, FileMeta, FilteredEngineData};
+use crate::{DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData, KernelError};
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
 /// commits to a file system directly via `Engine::json_handler().write_json_file` for
@@ -54,7 +54,7 @@ impl Committer for FileSystemCommitter {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(Error::FileAlreadyExists(_)) => {
+            Err(KernelError::FileAlreadyExists(_)) => {
                 info!(
                     conflicting_version = version,
                     "Filesystem commit conflict: target version already exists"
@@ -73,7 +73,7 @@ impl Committer for FileSystemCommitter {
     /// something has gone wrong upstream.
     fn publish(&self, _engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
         if !publish_metadata.commits_to_publish().is_empty() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "The FilesystemCommitter does not support publishing catalog commits.",
             ));
         }
@@ -127,7 +127,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
+            crate::KernelError::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
         ));
     }
 

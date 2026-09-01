@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use crate::schema::{StructField, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::SchemaTransform;
-use crate::{transform_output_type, DeltaResult, Error};
+use crate::{transform_output_type, DeltaResult, KernelError};
 
 /// Characters that are invalid in Parquet column names when column mapping is disabled.
 /// These characters have special meaning in Parquet schema syntax.
@@ -63,7 +63,7 @@ impl SchemaValidator {
         if self.errors.is_empty() {
             Ok(())
         } else {
-            Err(Error::generic(format!(
+            Err(KernelError::generic(format!(
                 "Schema validation failed:\n- {}",
                 self.errors.join("\n- ")
             )))
@@ -125,12 +125,12 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
 /// of column mapping mode.
 fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
     if name.is_empty() {
-        return Err(Error::generic("Column name cannot be empty"));
+        return Err(KernelError::generic("Column name cannot be empty"));
     }
     if cm_enabled {
         // Newlines break metadata serialization regardless of column mapping mode.
         if name.contains('\n') {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Column name '{name}' contains a newline character, which is not allowed"
             )));
         }
@@ -139,7 +139,7 @@ fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
             .chars()
             .filter(|c| INVALID_PARQUET_CHARS.contains(c))
             .collect();
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Column name '{name}' contains invalid character(s) {invalid:?} that are not \
              allowed in Parquet column names. \
              Enable column mapping to use special characters in column names."
