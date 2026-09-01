@@ -15,8 +15,9 @@
 #   vars.DISPROVE_MODEL           GPT disprove-gate model.
 #
 # Ready PRs from authors with write-or-higher permission are reviewed
-# automatically and published to the workflow summary. Authorized actors can
-# also trigger a review manually with a /review comment or workflow dispatch.
+# automatically and published to the workflow summary and a non-blocking PR
+# check. Authorized actors can also trigger a review manually with a /review
+# comment or workflow dispatch.
 # =============================================================================
 name: AI PR Review
 
@@ -204,6 +205,7 @@ jobs:
       needs.authorize.outputs.skip != 'true' &&
       needs.authorize.outputs.allowed == 'true'
     permissions:
+      checks: write
       contents: read
       issues: write
       pull-requests: write
@@ -1056,3 +1058,58 @@ jobs:
           path: /tmp/review_output.txt
           retention-days: 7
           if-no-files-found: error
+
+      - name: Publish non-blocking PR check
+        continue-on-error: true
+        if: >-
+          always() &&
+          steps.creds.outputs.available == 'true' &&
+          steps.context.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          REVIEW_READY: ${{ steps.review.outputs.review_text != '' }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+
+          if [ "$REVIEW_READY" = "true" ]; then
+            title="AI review completed"
+            summary_file=/tmp/review_output.txt
+          else
+            title="AI review unavailable"
+            summary_file=/tmp/check-summary.txt
+            printf '%s\n' \
+              "The workflow did not produce validated review output. See the workflow run for diagnostics." \
+              > "$summary_file"
+          fi
+
+          jq -n \
+            --rawfile summary "$summary_file" \
+            --arg name "AI PR Review" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg details_url "$RUN_URL" \
+            --arg review_ready "$REVIEW_READY" \
+            --arg title "$title" \
+            '{
+              name: $name,
+              head_sha: $head_sha,
+              status: "completed",
+              conclusion: "neutral",
+              details_url: $details_url,
+              output: {
+                title: $title,
+                summary: (
+                  if $review_ready == "true"
+                  then "Draft - human review required.\n\n" + $summary
+                  else $summary
+                  end
+                )
+              }
+            }' > /tmp/check-run.json
+
+          gh api --method POST "repos/${REPO}/check-runs" \
+            --input /tmp/check-run.json --silent
+          echo "Published non-blocking check for PR #${PR_NUMBER} at ${HEAD_SHA}."
