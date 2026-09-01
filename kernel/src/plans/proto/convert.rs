@@ -976,10 +976,10 @@ mod tests {
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
-        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, DecimalData,
-        Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
-        OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator, StructData,
-        UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
+        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
+        DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
+        OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+        StructData, UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1428,45 +1428,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn from_dynamic_scan_omits_dv_column_when_none() {
-        let input_schema = schema_ref! {
-            not_null "path": STRING,
-            not_null "size": LONG,
-            not_null "filemod": LONG,
-            nullable "c": INTEGER,
-        };
-        let node = DynamicScan::try_new(
-            &input_schema,
-            sample_dynamic_scan_output_schema(),
-            FileType::Parquet,
-            Url::parse("memory:///base/").unwrap(),
-            ["c"],
-            column_name!("path"),
-            column_name!("size"),
-            column_name!("filemod"),
-            None,
-        )
-        .unwrap();
-        assert!(proto_plan::DynamicScanNode::from(&node).dv_column.is_none());
-    }
-
     #[rstest]
     #[case(
         FileType::Json,
         Url::parse("memory:///base/").unwrap(),
-        "memory:///base/"
+        "memory:///base/",
+        Some(column_name!("dv"))
     )]
     #[case(
         FileType::Parquet,
         Url::parse("file:///table/").unwrap(),
-        "file:///table/"
+        "file:///table/",
+        Some(column_name!("dv"))
+    )]
+    #[case(
+        FileType::Parquet,
+        Url::parse("memory:///base/").unwrap(),
+        "memory:///base/",
+        None
     )]
     fn from_dynamic_scan(
         #[case] file_type: FileType,
         #[case] base_url: Url,
         #[case] expected_base_url: &str,
+        #[case] dv_column: Option<ColumnName>,
     ) -> DeltaResult<()> {
+        let expect_dv_column = dv_column.is_some();
         let node = DynamicScan::try_new(
             &sample_dynamic_scan_input_schema(),
             sample_dynamic_scan_output_schema(),
@@ -1476,7 +1463,7 @@ mod tests {
             column_name!("path"),
             column_name!("size"),
             column_name!("filemod"),
-            Some(column_name!("dv")),
+            dv_column,
         )?;
         let proto = proto_plan::DynamicScanNode::from(&node);
         assert!(proto.schema.is_some());
@@ -1486,7 +1473,7 @@ mod tests {
         );
         assert_eq!(proto.base_url, expected_base_url);
         assert_eq!(proto.file_constant_columns.len(), 1);
-        assert!(proto.dv_column.is_some());
+        assert_eq!(proto.dv_column.is_some(), expect_dv_column);
 
         assert_eq!(
             proto.path_column.expect("path column present").path,

@@ -383,8 +383,7 @@ pub enum FileType {
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
 /// and drops file rows whose row index appears in the DV. A NULL value for a given
 /// input row means "no DV for this file", so all file rows are emitted. `None` means the
-/// scan has no deletion-vector column at all (e.g. a V2-checkpoint sidecar scan), so no DV
-/// is applied and every file row is emitted.
+/// scan has no deletion-vector column at all, so no DV is applied and every file row is emitted.
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
 ///
@@ -445,7 +444,7 @@ pub struct DynamicScan {
     /// Non-nullable input column with the last-modified timestamp in milliseconds since epoch.
     pub last_modified_column: ColumnName,
     /// Optional nullable input column with the schema of [`DeletionVectorDescriptor`]; `None`
-    /// when the scanned files never carry deletion vectors (e.g. V2-checkpoint sidecars).
+    /// when the scanned files never carry deletion vectors.
     pub dv_column: Option<ColumnName>,
 }
 
@@ -458,10 +457,9 @@ impl DynamicScan {
     /// # Errors
     ///
     /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
-    /// metadata column is absent from `input_schema`, has an incompatible type, or has invalid
-    /// nullability; when a configured deletion-vector column has an incompatible type or is
-    /// non-nullable; or when a file-constant column is absent from either schema, is a metadata
-    /// column, or has different input and output types or nullability.
+    /// metadata column or a configured deletion-vector column is absent, has an incompatible type,
+    /// or has invalid nullability; or when a file-constant column is absent from either schema, is
+    /// a metadata column, or has different input and output types or nullability.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         input_schema: &SchemaRef,
@@ -501,10 +499,9 @@ impl DynamicScan {
     /// # Errors
     ///
     /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
-    /// metadata column is absent, has an incompatible type, or has invalid nullability; when a
-    /// configured deletion-vector column has an incompatible type or is non-nullable; or when a
-    /// file-constant column is absent from either schema, is a metadata column, or has different
-    /// input and output types or nullability.
+    /// metadata column or a configured deletion-vector column is absent, has an incompatible type,
+    /// or has invalid nullability; or when a file-constant column is absent from either schema, is
+    /// a metadata column, or has different input and output types or nullability.
     pub fn validate_input(&self, input_schema: &SchemaRef) -> DeltaResult<()> {
         static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
             LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
