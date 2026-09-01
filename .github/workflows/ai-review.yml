@@ -8,11 +8,11 @@
 #   GATEWAY_HOST      Bare hostname of GATEWAY_BASE_URL, for the egress allowlist.
 # Optional named-bot comments:
 #   vars.OMNIGENT_BOT_APP_ID + secrets.OMNIGENT_BOT_APP_KEY
-# Optional model overrides:
-#   vars.MODEL                    Default Claude model.
-#   vars.CLAUDE_MAINTAINER_MODEL  Claude maintainer-pass model.
-#   vars.CODEX_MAINTAINER_MODEL   Codex maintainer-pass model.
-#   vars.DISPROVE_MODEL           GPT disprove-gate model.
+# Required environment variables:
+#   MODEL                    Default Claude model.
+#   CLAUDE_MAINTAINER_MODEL  Claude maintainer-pass model.
+#   CODEX_MAINTAINER_MODEL   Codex maintainer-pass model.
+#   DISPROVE_MODEL           GPT disprove-gate model.
 #
 # Ready PRs from authors with write-or-higher permission are reviewed
 # automatically and published to the workflow summary and a non-blocking PR
@@ -261,6 +261,28 @@ jobs:
             echo "::add-mask::${LLM_API_KEY}"
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Require model configuration
+        if: steps.creds.outputs.available == 'true'
+        env:
+          CLAUDE_MAINTAINER_MODEL: ${{ vars.CLAUDE_MAINTAINER_MODEL }}
+          CODEX_MAINTAINER_MODEL: ${{ vars.CODEX_MAINTAINER_MODEL }}
+          DISPROVE_MODEL: ${{ vars.DISPROVE_MODEL }}
+          MODEL: ${{ vars.MODEL }}
+        run: |
+          set -euo pipefail
+          model_variables=(
+            MODEL
+            CLAUDE_MAINTAINER_MODEL
+            CODEX_MAINTAINER_MODEL
+            DISPROVE_MODEL
+          )
+          for name in "${model_variables[@]}"; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Required ai-review environment variable ${name} is not set."
+              exit 1
+            fi
+          done
 
       - name: Check out repo
         if: steps.creds.outputs.available == 'true'
@@ -553,12 +575,10 @@ jobs:
           python3 -c "
           import json, os, pathlib
           gw = os.environ['GATEWAY_BASE_URL'].rstrip('/')
-          model = os.environ.get('MODEL') or 'databricks-claude-opus-4-8'
-          claude_maintainer_model = os.environ.get('CLAUDE_MAINTAINER_MODEL') or model
-          codex_maintainer_model = (
-              os.environ.get('CODEX_MAINTAINER_MODEL') or 'databricks-gpt-5-3-codex'
-          )
-          disprove_model = os.environ.get('DISPROVE_MODEL') or 'databricks-gpt-5-6-sol'
+          model = os.environ['MODEL']
+          claude_maintainer_model = os.environ['CLAUDE_MAINTAINER_MODEL']
+          codex_maintainer_model = os.environ['CODEX_MAINTAINER_MODEL']
+          disprove_model = os.environ['DISPROVE_MODEL']
           cfg = {
               'providers': {
                   'gateway': {
@@ -601,14 +621,12 @@ jobs:
           import pathlib
           import yaml
 
-          model = os.environ.get("MODEL") or "databricks-claude-opus-4-8"
+          model = os.environ["MODEL"]
           replacements = {
               "default": model,
-              "maintainer-claude": os.environ.get("CLAUDE_MAINTAINER_MODEL") or model,
-              "maintainer-codex": (
-                  os.environ.get("CODEX_MAINTAINER_MODEL") or "databricks-gpt-5-3-codex"
-              ),
-              "disprove": os.environ.get("DISPROVE_MODEL") or "databricks-gpt-5-6-sol",
+              "maintainer-claude": os.environ["CLAUDE_MAINTAINER_MODEL"],
+              "maintainer-codex": os.environ["CODEX_MAINTAINER_MODEL"],
+              "disprove": os.environ["DISPROVE_MODEL"],
           }
 
           for path in pathlib.Path(".github/omnigent/reviewer").rglob("config.yaml"):
@@ -761,7 +779,7 @@ jobs:
           set -euo pipefail
           umask 077
           prompt=$(cat /tmp/review_prompt.txt)
-          model="${MODEL:-databricks-claude-opus-4-8}"
+          model="$MODEL"
 
           export ANTHROPIC_AUTH_TOKEN="$LLM_API_KEY"
           export ANTHROPIC_BASE_URL="${GATEWAY_BASE_URL%/}/anthropic"
