@@ -100,9 +100,13 @@ Do not request shell, file, environment, or network access.
 ## Output contract
 Emit a publishable review only after every dispatched reviewer completed
 successfully and every required disprove gate returned a verdict. If a
-reviewer or required disprove gate fails, output only
-<!-- AI_REVIEW_INCOMPLETE --> followed by a concise reason. Do not emit the
-start or end markers, and do not downgrade a finding to bypass a failed gate.
+reviewer or required disprove gate fails, do not emit the start or end
+markers. Output only these three lines, using one failure code and only names
+from the checked-in roster:
+<!-- AI_REVIEW_INCOMPLETE -->
+Failure code: dispatch_failed|reviewer_failed|disprove_failed|timeout|other
+Failed agents: comma-separated agent names, or none
+Do not downgrade a finding to bypass a failed gate.
 
 Your output is posted verbatim as a PR comment. Output ONLY the final
 consolidated review -- no narration and no status updates. Include reviewer

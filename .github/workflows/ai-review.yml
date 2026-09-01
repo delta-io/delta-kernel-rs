@@ -710,9 +710,11 @@ jobs:
 
           Emit those markers only if every dispatched reviewer completed
           successfully and every required disprove gate returned a verdict. If
-          either fails, output <!-- AI_REVIEW_INCOMPLETE --> and a concise
-          reason without the start or end markers. Do not downgrade a finding
-          to bypass a failed gate.
+          either fails, do not emit the start or end markers. Output only:
+          <!-- AI_REVIEW_INCOMPLETE -->
+          Failure code: dispatch_failed|reviewer_failed|disprove_failed|timeout|other
+          Failed agents: comma-separated checked-in agent names, or none
+          Do not downgrade a finding to bypass a failed gate.
 
           ## PR Diff
 
@@ -852,7 +854,9 @@ jobs:
                   )
                   known_categories = {
                       "dispatch": ("dispatch", "spawn", "session"),
+                      "disprove": ("disprove_failed",),
                       "model": ("model", "provider", "gateway"),
+                      "reviewer": ("reviewer_failed",),
                       "timeout": ("timeout", "timed out"),
                       "tool": ("tool", "source"),
                   }
