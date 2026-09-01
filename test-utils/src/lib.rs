@@ -1112,7 +1112,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
     }
 
     let write_state = txn.write_state()?;
-    let write_context = write_state.unpartitioned_write_context()?;
+    let write_context = write_state.write_context_builder().build()?;
     let add_files_metadata = engine
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
@@ -1531,9 +1531,12 @@ pub async fn write_batch_to_table(
             partition_values.is_empty(),
             "partition_values should be empty for unpartitioned tables"
         );
-        write_state.unpartitioned_write_context()?
+        write_state.write_context_builder().build()?
     } else {
-        write_state.partitioned_write_context(partition_values)?
+        write_state
+            .write_context_builder()
+            .with_partition_values(partition_values)
+            .build()?
     };
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)

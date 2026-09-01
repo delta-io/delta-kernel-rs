@@ -101,9 +101,12 @@ From this point, writing data works the same as any Kernel transaction. Get the
 write context, write Parquet files to the table's storage location, and add the
 resulting file metadata to the transaction.
 
+This example writes to an unpartitioned table. For a partitioned table, call
+`with_partition_values(...)` before `build()`.
+
 ```rust,ignore
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 ```
@@ -288,7 +291,7 @@ let mut txn = snapshot.clone().transaction(committer, &engine)?
 
 // 6. Write data
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 

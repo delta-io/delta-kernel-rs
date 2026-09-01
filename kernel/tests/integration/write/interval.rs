@@ -85,7 +85,7 @@ mod supported {
             ],
         )?;
 
-        let write_context = txn.write_state()?.unpartitioned_write_context()?;
+        let write_context = txn.write_state()?.write_context_builder().build()?;
         let add_files_metadata = engine
             .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
             .await?;
