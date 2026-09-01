@@ -264,7 +264,9 @@ jobs:
         if: steps.creds.outputs.available == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          # The workflow event commit is the trusted base/default-branch SHA for
+          # pull_request_target and issue_comment, or the selected dispatch ref.
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       # Reference data only. Reviewers have no execution-capable tools and can
@@ -773,7 +775,10 @@ jobs:
           echo "review_status=${review_status}" >> "$GITHUB_OUTPUT"
 
       - name: Verify reviewed PR head is current
-        if: always() && steps.creds.outputs.available == 'true'
+        if: >-
+          always() &&
+          steps.creds.outputs.available == 'true' &&
+          steps.context.outcome == 'success'
         env:
           EXPECTED_BASE_SHA: ${{ steps.context.outputs.base_sha }}
           EXPECTED_HEAD_SHA: ${{ steps.context.outputs.head_sha }}
@@ -794,7 +799,10 @@ jobs:
 
       - name: Validate review output
         id: review
-        if: always() && steps.creds.outputs.available == 'true'
+        if: >-
+          always() &&
+          steps.creds.outputs.available == 'true' &&
+          steps.run_review.outcome == 'success'
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           REVIEW_STATUS: ${{ steps.run_review.outputs.review_status }}
