@@ -835,8 +835,19 @@ jobs:
               sys.exit(1)
           start = f"<!-- AI_REVIEW_START_{marker} -->"
           end = f"<!-- AI_REVIEW_END_{marker} -->"
-          if raw.count(start) != 1 or raw.count(end) != 1:
-              print("::error::AI review did not produce one complete publishable result.")
+          start_count = raw.count(start)
+          end_count = raw.count(end)
+          if start_count != 1 or end_count != 1:
+              if "<!-- AI_REVIEW_INCOMPLETE -->" in raw:
+                  detail = "the reviewer reported an incomplete run"
+              elif "<!-- AI_REVIEW_START -->" in raw or "<!-- AI_REVIEW_END -->" in raw:
+                  detail = "the reviewer used legacy fixed markers"
+              else:
+                  detail = (
+                      f"marker counts were start={start_count}, end={end_count}; "
+                      f"captured {len(raw.encode('utf-8'))} bytes"
+                  )
+              print(f"::error::AI review is not publishable: {detail}.")
               sys.exit(1)
 
           start_idx = raw.index(start) + len(start)
