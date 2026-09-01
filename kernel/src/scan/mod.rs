@@ -330,9 +330,9 @@ impl ScanBuilder {
     /// empty (each row's transform is `None`); use [`Scan::scan_metadata`] for listing.
     ///
     /// With this set the engine must itself apply every physical-to-logical fixup the transform
-    /// would normally perform: partition column injection, column-mapping renames, and generated
-    /// row ids. Deletion vectors are unaffected: they are delivered per file in the scan metadata
-    /// regardless. [`Scan::execute`] returns an error.
+    /// would normally perform: partition column injection, column-mapping renames, generated Row
+    /// IDs, and generated Row Commit Versions. Deletion vectors are unaffected: they are delivered
+    /// per file in the scan metadata regardless. [`Scan::execute`] returns an error.
     pub fn without_row_transforms(mut self) -> Self {
         self.without_row_transforms = true;
         self

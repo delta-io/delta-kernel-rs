@@ -13,7 +13,7 @@ use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, TableFeature};
 use crate::{DeltaResult, Error, PredicateRef, StructField};
 
 /// All the state needed to process a scan.
@@ -72,6 +72,9 @@ struct MetadataInfo<'a> {
     /// the materializedRowIdColumnName extracted from the table config if row ids are requested,
     /// or None if they are not requested
     materialized_row_id_column_name: Option<&'a String>,
+    /// the materializedRowCommitVersionColumnName extracted from the table config if row commit
+    /// versions are requested, or None if they are not requested
+    materialized_row_commit_version_column_name: Option<&'a String>,
 }
 
 /// This validates that we have sensible metadata columns, and that the requested metadata is
@@ -108,7 +111,23 @@ fn validate_metadata_columns<'a>(
                     .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
                 metadata_info.materialized_row_id_column_name = Some(row_id_col);
             }
-            Some(MetadataColumnSpec::RowCommitVersion) => {}
+            Some(MetadataColumnSpec::RowCommitVersion) => {
+                if !table_configuration.is_feature_enabled(&TableFeature::RowTracking) {
+                    return Err(Error::unsupported(
+                        "Row commit versions are not enabled on this table",
+                    ));
+                }
+                let row_commit_version_col = table_configuration
+                    .table_properties()
+                    .materialized_row_commit_version_column_name
+                    .as_ref()
+                    .ok_or(Error::generic(
+                        "No delta.rowTracking.materializedRowCommitVersionColumnName key found in \
+                         metadata configuration",
+                    ))?;
+                metadata_info.materialized_row_commit_version_column_name =
+                    Some(row_commit_version_col);
+            }
             Some(MetadataColumnSpec::FilePath) => {
                 // FilePath metadata column is handled by the parquet reader
             }
@@ -302,14 +321,33 @@ impl StateInfo {
                             ));
                         };
 
-                        read_fields.push(StructField::nullable(row_id_col_name, DataType::LONG));
+                        let row_id_col_name = row_id_col_name.to_string();
+                        read_fields.push(StructField::nullable(&row_id_col_name, DataType::LONG));
                         transform_spec.push(FieldTransformSpec::GenerateRowId {
-                            field_name: row_id_col_name.to_string(),
+                            field_name: row_id_col_name.clone(),
                             row_index_field_name: index_column_name,
                         });
+                        last_physical_field = Some(row_id_col_name);
                     }
                     Some(MetadataColumnSpec::RowCommitVersion) => {
-                        return Err(Error::unsupported("Row commit versions not supported"));
+                        let Some(row_commit_version_col_name) =
+                            metadata_info.materialized_row_commit_version_column_name
+                        else {
+                            return Err(Error::internal_error(
+                                "missing materialized Row Commit Version column name when row \
+                                 tracking is enabled",
+                            ));
+                        };
+
+                        let row_commit_version_col_name = row_commit_version_col_name.to_string();
+                        read_fields.push(StructField::nullable(
+                            &row_commit_version_col_name,
+                            DataType::LONG,
+                        ));
+                        transform_spec.push(FieldTransformSpec::GenerateRowCommitVersion {
+                            field_name: row_commit_version_col_name.clone(),
+                        });
+                        last_physical_field = Some(row_commit_version_col_name);
                     }
                     Some(MetadataColumnSpec::RowIndex)
                     | Some(MetadataColumnSpec::FilePath)
@@ -781,6 +819,46 @@ pub(crate) mod tests {
     pub(crate) const ROW_TRACKING_FEATURES: &[TableFeature] =
         &[TableFeature::RowTracking, TableFeature::DomainMetadata];
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RowTrackingState {
+        Unsupported,
+        SupportedNotEnabled,
+        Enabled,
+        Suspended,
+    }
+
+    impl RowTrackingState {
+        pub(crate) fn features(self) -> &'static [TableFeature] {
+            match self {
+                Self::Unsupported => &[],
+                Self::SupportedNotEnabled | Self::Enabled | Self::Suspended => {
+                    ROW_TRACKING_FEATURES
+                }
+            }
+        }
+
+        pub(crate) fn properties(self) -> HashMap<String, String> {
+            let mut properties = get_string_map(&[
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "row_commit_version_col",
+                ),
+            ]);
+            if self == Self::Enabled {
+                properties.insert("delta.enableRowTracking".to_string(), "true".to_string());
+            }
+            if self == Self::Suspended {
+                properties.insert("delta.enableRowTracking".to_string(), "false".to_string());
+                properties.insert("delta.rowTrackingSuspended".to_string(), "true".to_string());
+            }
+            properties
+        }
+    }
+
     fn get_string_map(slice: &[(&str, &str)]) -> HashMap<String, String> {
         slice
             .iter()
@@ -833,6 +911,47 @@ pub(crate) mod tests {
             false, // we did not request row indexes
             "some_row_id_col",
             "row_indexes_for_row_id_0",
+        );
+    }
+
+    #[test]
+    fn request_row_commit_versions() {
+        let schema = schema_ref! { nullable "id": STRING };
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            ROW_TRACKING_FEATURES,
+            get_string_map(&[
+                ("delta.enableRowTracking", "true"),
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "some_row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "some_row_commit_version_col",
+                ),
+            ]),
+            vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            state_info
+                .physical_schema
+                .field("some_row_commit_version_col")
+                .map(StructField::data_type),
+            Some(&DataType::LONG)
+        );
+        assert_eq!(
+            state_info.transform_spec.as_deref().map(Vec::as_slice),
+            Some(
+                [FieldTransformSpec::GenerateRowCommitVersion {
+                    field_name: "some_row_commit_version_col".to_string(),
+                }]
+                .as_slice()
+            )
         );
     }
 
@@ -909,7 +1028,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn invalid_rowtracking_config() {
+    fn invalid_row_id_config() {
         let schema = schema_ref! { nullable "id": STRING };
 
         // Row IDs requested but row tracking not enabled → error
@@ -935,6 +1054,46 @@ pub(crate) mod tests {
         assert_result_error_with_message(
             res,
             "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
+        );
+    }
+
+    #[rstest]
+    #[case::unsupported(RowTrackingState::Unsupported)]
+    #[case::supported_not_enabled(RowTrackingState::SupportedNotEnabled)]
+    #[case::suspended(RowTrackingState::Suspended)]
+    fn request_row_commit_versions_requires_enabled_row_tracking(
+        #[case] row_tracking_state: RowTrackingState,
+    ) {
+        let schema = schema_ref! { nullable "id": STRING };
+        let res = get_state_info(
+            schema,
+            vec![],
+            None,
+            row_tracking_state.features(),
+            row_tracking_state.properties(),
+            vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
+        );
+        assert_result_error_with_message(
+            res,
+            "Unsupported: Row commit versions are not enabled on this table",
+        );
+    }
+
+    #[test]
+    fn request_row_commit_versions_requires_materialized_column_name() {
+        let schema = schema_ref! { nullable "id": STRING };
+        let res = get_state_info(
+            schema,
+            vec![],
+            None,
+            ROW_TRACKING_FEATURES,
+            get_string_map(&[("delta.enableRowTracking", "true")]),
+            vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
+        );
+        assert_result_error_with_message(
+            res,
+            "No delta.rowTracking.materializedRowCommitVersionColumnName key found in metadata \
+             configuration",
         );
     }
 
