@@ -425,6 +425,14 @@ jobs:
               "codex": "codex",
           }
           reviewer_root = pathlib.Path(".github/omnigent/reviewer")
+          reviewer_contract = reviewer_root.joinpath("REVIEW.md").read_text()
+          legacy_markers = {
+              "<!-- AI_REVIEW_START -->",
+              "<!-- AI_REVIEW_END -->",
+          }
+          if any(marker in reviewer_contract for marker in legacy_markers):
+              print("::error::REVIEW.md must use invocation-supplied per-run markers.")
+              sys.exit(1)
           config_paths = list(reviewer_root.rglob("config.yaml"))
           harnesses = set()
           for path in config_paths:
