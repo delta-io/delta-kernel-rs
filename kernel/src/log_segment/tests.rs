@@ -3126,17 +3126,17 @@ fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
 
 /// The schema a valid `sidecarFileSchema` tag encodes, used both to build the tag and as the
 /// expected result of parsing it back.
-fn sidecar_hint_schema() -> SchemaRef {
-    schema_ref! { nullable "add": { nullable "path": STRING } }
+fn sidecar_hint_schema() -> StructType {
+    schema! { nullable "add": { nullable "path": STRING } }
 }
 
-/// A `checkpointMetadata` action carrying the given `sidecarFileSchema` tag value (`None` omits the
-/// tag).
-fn checkpoint_metadata_action(tag: Option<&str>) -> HintAction {
+/// A `checkpointMetadata` action carrying the given `(key, value)` tag (`None` omits the `tags`
+/// map entirely).
+fn checkpoint_metadata_action(tag: Option<(&str, &str)>) -> HintAction {
     HintAction::CheckpointMetadata(CheckpointMetadata {
         version: 1,
-        tags: tag.map(|v| {
-            std::collections::HashMap::from([(SIDECAR_FILE_SCHEMA_TAG.to_string(), v.to_string())])
+        tags: tag.map(|(key, value)| {
+            std::collections::HashMap::from([(key.to_string(), value.to_string())])
         }),
     })
 }
@@ -3148,17 +3148,18 @@ fn checkpoint_metadata_action(tag: Option<&str>) -> HintAction {
 #[rstest]
 #[case::valid_tag_applicable(
     true,
-    Some(vec![checkpoint_metadata_action(Some(&serde_json::to_string(&sidecar_hint_schema()).unwrap()))]),
+    Some(vec![checkpoint_metadata_action(Some((SIDECAR_FILE_SCHEMA_TAG, &serde_json::to_string(&sidecar_hint_schema()).unwrap())))]),
     true
 )]
 #[case::valid_tag_mismatched_checkpoint(
     false,
-    Some(vec![checkpoint_metadata_action(Some(&serde_json::to_string(&sidecar_hint_schema()).unwrap()))]),
+    Some(vec![checkpoint_metadata_action(Some((SIDECAR_FILE_SCHEMA_TAG, &serde_json::to_string(&sidecar_hint_schema()).unwrap())))]),
     false
 )]
 #[case::no_checkpoint_metadata(true, Some(vec![]), false)]
 #[case::metadata_without_tag(true, Some(vec![checkpoint_metadata_action(None)]), false)]
-#[case::unparseable_tag(true, Some(vec![checkpoint_metadata_action(Some("not valid json"))]), false)]
+#[case::metadata_with_unrelated_tag(true, Some(vec![checkpoint_metadata_action(Some(("numOfAddFiles", "42")))]), false)]
+#[case::unparseable_tag(true, Some(vec![checkpoint_metadata_action(Some((SIDECAR_FILE_SCHEMA_TAG, "not valid json")))]), false)]
 #[case::absent_non_file_actions(true, None, false)]
 fn checkpoint_hint_sidecar_file_schema_resolution(
     #[case] path_matches: bool,

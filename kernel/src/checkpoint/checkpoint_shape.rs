@@ -13,7 +13,7 @@ use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, FileMeta};
 
@@ -153,25 +153,29 @@ impl CheckpointShape {
     /// only when stats were requested. All sidecars of a checkpoint share one schema, so any one is
     /// sufficient.
     ///
-    /// If the `_last_checkpoint` hint carries a `sidecarFileSchema`, we can use it directly.
-    /// Otherwise we must read the sidecar's footer to get the schema.
+    /// If the `_last_checkpoint` hint carries a `sidecarFileSchema`, use it directly,
+    /// Otherwise read the sidecar's footer to get the schema.
     fn try_new_manifest(
         exec: &dyn PlanExecutor,
         sidecar: FileMeta,
         stats_schema: Option<&SchemaRef>,
-        hint_sidecar_schema: Option<SchemaRef>,
+        hint_sidecar_schema: Option<StructType>,
     ) -> DeltaResult<CheckpointShape> {
         let parsed_stats_schema = match stats_schema {
             Some(stats_schema) => {
-                let sidecar_schema = match hint_sidecar_schema {
-                    Some(schema) => schema,
-                    None => exec.read_parquet_footer(sidecar)?.schema,
+                let compatible = match hint_sidecar_schema {
+                    Some(schema) => {
+                        LogSegment::schema_has_compatible_stats_parsed(&schema, stats_schema)
+                    }
+                    None => {
+                        let footer_schema = exec.read_parquet_footer(sidecar)?.schema;
+                        LogSegment::schema_has_compatible_stats_parsed(
+                            footer_schema.as_ref(),
+                            stats_schema,
+                        )
+                    }
                 };
-                LogSegment::schema_has_compatible_stats_parsed(
-                    sidecar_schema.as_ref(),
-                    stats_schema,
-                )
-                .then(|| stats_schema.clone())
+                compatible.then(|| stats_schema.clone())
             }
             None => None,
         };
@@ -647,7 +651,7 @@ mod tests {
             &exec,
             sidecar,
             Some(&stats_schema),
-            Some(footer_schema),
+            Some(footer_schema.as_ref().clone()),
         )
         .unwrap();
 
