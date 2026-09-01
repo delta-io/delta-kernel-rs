@@ -23,6 +23,8 @@ use crate::actions::{
     DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
     METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
+use crate::coroutine::read::ReadFileFormatStart;
+use crate::coroutine::{Channel, GeneratorState};
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,
@@ -36,7 +38,9 @@ use crate::schema::{
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, Error, FileMeta, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // size is the only Add leaf the visitor reads, and it is required, so its presence marks
@@ -66,9 +70,9 @@ impl LogSegment {
     /// - Case 2: base CRC at `end_version` -> return it as-is
     /// - Case 3: stale base CRC older than `end_version` -> advance it to `end_version` when
     ///   `incremental_replay` permits, else fall back to normal log replay (return None)
-    pub(crate) fn try_build_crc_within_budget(
+    pub(crate) async fn try_build_crc_within_budget(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
@@ -81,7 +85,7 @@ impl LogSegment {
         if !incremental_replay.should_advance(base.version, self.end_version)? {
             return Ok(None);
         }
-        let advanced = self.build_crc_from_base(engine, base)?;
+        let advanced = self.build_crc_from_base(channel, base).await?;
         Ok(Some((
             Arc::new(advanced),
             ProtocolMetadataSource::CrcAdvancedByReplay,
@@ -91,9 +95,9 @@ impl LogSegment {
     /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
     /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
     /// read. Drops a base below the checkpoint; returns None when no candidate remains.
-    pub(crate) fn pick_latest_base_crc(
+    pub(crate) async fn pick_latest_base_crc(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         in_memory_base: Option<&Arc<Crc>>,
     ) -> Option<Arc<Crc>> {
         let preferred_disk_crc = self
@@ -101,29 +105,31 @@ impl LogSegment {
             .latest_crc_file
             .as_ref()
             .filter(|f| in_memory_base.is_none_or(|m| f.version > m.version));
-        preferred_disk_crc
-            .and_then(|f| read_crc_file_or_none(engine, f))
-            .or_else(|| in_memory_base.cloned())
-            .filter(|crc| {
-                self.checkpoint_version
-                    .is_none_or(|ckpt| crc.version >= ckpt)
-            })
+        match preferred_disk_crc {
+            Some(file) => read_crc_file_or_none(channel, file).await,
+            None => None,
+        }
+        .or_else(|| in_memory_base.cloned())
+        .filter(|crc| {
+            self.checkpoint_version
+                .is_none_or(|ckpt| crc.version >= ckpt)
+        })
     }
 
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.
     /// Returns None when there is no CRC file or the read fails. The returned CRC may be stale
     /// (older than `end_version`).
-    pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> Option<Arc<Crc>> {
-        self.pick_latest_base_crc(engine, /* in_memory_base */ None)
+    pub(crate) async fn read_latest_crc(&self, channel: &Channel) -> Option<Arc<Crc>> {
+        self.pick_latest_base_crc(channel, None).await
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
     #[instrument(name = "log_seg.build_crc_from_base", skip_all, err)]
-    pub(crate) fn build_crc_from_base(
+    pub(crate) async fn build_crc_from_base(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         base_crc: &Crc,
     ) -> DeltaResult<Crc> {
         let seed_histogram = base_crc
@@ -133,7 +139,9 @@ impl LogSegment {
                 FileSizeHistogram::create_empty_with_boundaries(h.sorted_bin_boundaries().to_vec())
             })
             .transpose()?;
-        let delta = self.build_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
+        let delta = self
+            .build_crc_delta_from_base(channel, base_crc.version, seed_histogram)
+            .await?;
         Ok(base_crc.clone().apply(delta, self.end_version))
     }
 
@@ -147,9 +155,9 @@ impl LogSegment {
     /// [`Complete`](DomainMetadataState::Complete) since a checkpoint is authoritative.
     /// `in_commit_timestamp_opt` is left `None`: a checkpoint carries no `commitInfo`, so the
     /// caller sets the ICT on the returned CRC afterward.
-    pub(crate) fn build_crc_from_checkpoint(
+    pub(crate) async fn build_crc_from_checkpoint(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<Option<Crc>> {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
@@ -158,18 +166,11 @@ impl LogSegment {
         // table, which `into_complete_crc` turns into a Complete CRC.
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
-        let batches = self
-            .create_checkpoint_stream(
-                engine,
-                CHECKPOINT_CRC_SCHEMA.clone(),
-                None,
-                None,
-                None,
-                None,
-            )?
-            .actions;
-        for batch in batches {
-            let batch = batch?;
+        let stream = self
+            .create_checkpoint_stream(channel, CHECKPOINT_CRC_SCHEMA.clone(), None, None, None)
+            .await?;
+        let mut batches = GeneratorState::Start(stream.actions);
+        while let Some(batch) = batches.next(channel).await? {
             let mut visitor = CheckpointCrcVisitor { acc: &mut acc };
             visitor.visit_rows_of(batch.actions())?;
         }
@@ -182,9 +183,9 @@ impl LogSegment {
     ///
     /// Returns `None` if protocol or metadata could not be recovered. File stats degrade to
     /// [`Indeterminate`](FileStatsState::Indeterminate) if the replay is not incremental-safe.
-    pub(crate) fn build_crc_from_version_zero(
+    pub(crate) async fn build_crc_from_version_zero(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<Option<Crc>> {
         require!(
             self.checkpoint_version.is_none(),
@@ -203,11 +204,13 @@ impl LogSegment {
                 first.version
             ))
         );
-        let delta = self.replay_commits_into_crc_delta(
-            engine,
-            self.listed.ascending_commit_files.iter(),
-            Some(FileSizeHistogram::create_default()),
-        )?;
+        let delta = self
+            .replay_commits_into_crc_delta(
+                channel,
+                self.listed.ascending_commit_files.iter(),
+                Some(FileSizeHistogram::create_default()),
+            )
+            .await?;
         Ok(delta.into_complete_crc(self.end_version))
     }
 
@@ -217,9 +220,9 @@ impl LogSegment {
     ///
     /// Errors if `base_version >= self.end_version` or if the segment is missing the
     /// commit at `base_version + 1` (i.e. has a gap above `base_version`).
-    pub(crate) fn build_crc_delta_from_base(
+    pub(crate) async fn build_crc_delta_from_base(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         base_version: Version,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> DeltaResult<CrcDelta> {
@@ -250,16 +253,17 @@ impl LogSegment {
             ))
         );
 
-        self.replay_commits_into_crc_delta(engine, deltas.into_iter(), seed_histogram)
+        self.replay_commits_into_crc_delta(channel, deltas.into_iter(), seed_histogram)
+            .await
     }
 
     /// Replay the given commits into a [`CrcDelta`]. The shared core of
     /// [`Self::build_crc_delta_from_base`] and [`Self::build_crc_from_version_zero`].
     /// `ascending_commits` are taken oldest-first; `seed_histogram` is an empty histogram with the
     /// downstream base's bin boundaries, or `None` to skip histogram tracking.
-    fn replay_commits_into_crc_delta<'a>(
+    async fn replay_commits_into_crc_delta<'a>(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> DeltaResult<CrcDelta> {
@@ -269,16 +273,24 @@ impl LogSegment {
             .map(|c| c.location.clone())
             .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        let batches =
-            engine
-                .json_handler()
-                .read_json_files(&locations, REPLAY_SCHEMA.clone(), None)?;
-
-        for batch_result in batches {
-            // Transient visitor borrows the shared accumulator for the duration of the
-            // batch; same pattern as `ActionReconciliationVisitor`.
-            let mut visitor = CommitCrcVisitor { acc: &mut acc };
-            visitor.visit_rows_of(batch_result?.as_ref())?;
+        let mut page = channel
+            .start_read_json(ReadFileFormatStart {
+                files: locations,
+                physical_schema: REPLAY_SCHEMA.clone(),
+                predicate: None,
+            })
+            .await?;
+        loop {
+            for batch in page.data {
+                // Transient visitor borrows the shared accumulator for the duration of the
+                // batch; same pattern as `ActionReconciliationVisitor`.
+                let mut visitor = CommitCrcVisitor { acc: &mut acc };
+                visitor.visit_rows_of(batch.as_ref())?;
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            page = channel.continue_read_json(next).await?;
         }
 
         // Run the per-commit invariant on the final (oldest) commit; no successor batch
@@ -680,8 +692,10 @@ mod tests {
     use test_utils::{add_commit, assert_result_error_with_message};
 
     use super::*;
+    use crate::coroutine::engine::EngineConnector;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
+    use crate::log_segment::for_snapshot_from_storage;
     use crate::object_store::memory::InMemory;
     use crate::table_features::TableFeature;
 
@@ -946,13 +960,12 @@ mod tests {
 "#.to_string()).await.unwrap();
 
         let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
-        let segment = LogSegment::for_snapshot_impl(
+        let segment = for_snapshot_from_storage(
             engine.storage_handler().as_ref(),
             log_root,
             vec![],
             None,
             Some(2),
-            None,
         )
         .unwrap();
 
@@ -967,7 +980,10 @@ mod tests {
             set_transaction_state: SetTransactionState::Complete(HashMap::new()),
             ..Default::default()
         };
-        let crc = segment.build_crc_from_base(&engine, &base).unwrap();
+        let crc = EngineConnector::run_with(&engine, async move |channel| {
+            segment.build_crc_from_base(&channel, &base).await
+        })
+        .unwrap();
 
         // Newest-wins: v2's upgraded protocol (now carries `rowTracking` on top of v0's
         // features), v2's metadata, v2's ICT.
@@ -1024,18 +1040,22 @@ mod tests {
         .await
         .unwrap();
         let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
-        let segment = LogSegment::for_snapshot_impl(
+        let segment = for_snapshot_from_storage(
             engine.storage_handler().as_ref(),
             log_root,
             vec![],
             None,
             Some(0),
-            None,
         )
         .unwrap();
         for base in [0, 5] {
+            let segment = segment.clone();
             assert_result_error_with_message(
-                segment.build_crc_delta_from_base(&engine, base, None),
+                EngineConnector::run_with(&engine, async move |channel| {
+                    segment
+                        .build_crc_delta_from_base(&channel, base, None)
+                        .await
+                }),
                 "must be strictly less than end_version",
             );
         }
@@ -1055,17 +1075,18 @@ mod tests {
         .await
         .unwrap();
         let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
-        let segment = LogSegment::for_snapshot_impl(
+        let segment = for_snapshot_from_storage(
             engine.storage_handler().as_ref(),
             log_root,
             vec![],
             None,
             Some(1),
-            None,
         )
         .unwrap();
         assert_result_error_with_message(
-            segment.build_crc_from_version_zero(&engine),
+            EngineConnector::run_with(&engine, async move |channel| {
+                segment.build_crc_from_version_zero(&channel).await
+            }),
             "log appears truncated without a checkpoint",
         );
     }

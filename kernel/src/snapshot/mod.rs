@@ -10,12 +10,16 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
+use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::read::ReadFileFormatStart;
+use crate::coroutine::{Channel, Workflow};
 use crate::crc::{
     try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
     SetTransactionState,
@@ -36,7 +40,7 @@ use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
+use crate::{DeltaResult, Engine, Error, LogCompactionWriter, RowVisitor, Version};
 
 mod builder;
 mod incremental;
@@ -81,6 +85,11 @@ pub struct Snapshot {
     crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
+}
+
+enum InCommitTimestampSource<'a> {
+    Resolved(Option<i64>),
+    Commit(&'a ParsedLogPath),
 }
 
 impl PartialEq for Snapshot {
@@ -191,11 +200,11 @@ impl Snapshot {
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
-    fn try_new_from_log_segment(
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(channel))]
+    async fn try_new_from_log_segment(
+        channel: &Channel,
         location: Url,
         log_segment: LogSegment,
-        engine: &dyn Engine,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
@@ -204,9 +213,10 @@ impl Snapshot {
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
-        let base_crc = log_segment.read_latest_crc(engine);
+        let base_crc = log_segment.read_latest_crc(channel).await;
         let crc_at_version = log_segment
-            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .try_build_crc_within_budget(channel, base_crc.as_ref(), incremental_replay)
+            .await
             .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
@@ -214,7 +224,8 @@ impl Snapshot {
         let (metadata, protocol, source) = match &crc_at_version {
             Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
             None => log_segment
-                .read_protocol_metadata(engine, base_crc.as_ref())
+                .read_protocol_metadata(channel, base_crc.as_ref())
+                .await
                 .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
         };
         emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
@@ -765,18 +776,58 @@ impl Snapshot {
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
     #[internal_api]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
-        // Get ICT enablement info and check if we should read ICT for this version
+        match self.in_commit_timestamp_source()? {
+            InCommitTimestampSource::Resolved(timestamp) => Ok(timestamp),
+            InCommitTimestampSource::Commit(commit) => {
+                Ok(Some(commit.read_in_commit_timestamp(engine)?))
+            }
+        }
+    }
+
+    /// Coroutine body of [`Self::get_in_commit_timestamp`].
+    async fn get_in_commit_timestamp_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<i64>> {
+        let commit = match self.in_commit_timestamp_source()? {
+            InCommitTimestampSource::Resolved(timestamp) => return Ok(timestamp),
+            InCommitTimestampSource::Commit(commit) => commit,
+        };
+        let mut page = channel
+            .start_read_json(ReadFileFormatStart {
+                files: vec![commit.location.clone()],
+                physical_schema: InCommitTimestampVisitor::schema(),
+                predicate: None,
+            })
+            .await?;
+        // CommitInfo is the first action, so the first batch is enough. Empty pages with a live
+        // cursor are not exhaustion and must be continued.
+        let batch = loop {
+            if let Some(batch) = page.data.into_iter().next() {
+                break batch;
+            }
+            let Some(next) = page.next else {
+                return Err(Error::generic("Commit file contains no actions"));
+            };
+            page = channel.continue_read_json(next).await?;
+        };
+        let mut visitor = InCommitTimestampVisitor::default();
+        visitor.visit_rows_of(batch.as_ref())?;
+        visitor
+            .in_commit_timestamp
+            .map(Some)
+            .ok_or_else(|| Error::generic("In-Commit Timestamp not found in commit file"))
+    }
+
+    fn in_commit_timestamp_source(&self) -> DeltaResult<InCommitTimestampSource<'_>> {
         let enablement = self
             .table_configuration()
             .in_commit_timestamp_enablement()?;
 
-        // Return None if ICT is not enabled at all
         if matches!(enablement, InCommitTimestampEnablement::NotEnabled) {
-            return Ok(None);
+            return Ok(InCommitTimestampSource::Resolved(None));
         }
 
-        // If ICT is enabled with an enablement version, verify the enablement version is not in the
-        // future
         if let InCommitTimestampEnablement::Enabled {
             enablement: Some((enablement_version, _)),
         } = enablement
@@ -790,10 +841,9 @@ impl Snapshot {
             }
         }
 
-        // Fast path: serve ICT from CRC if available at this version.
         if let Some(crc) = self.crc_at_version() {
             match crc.in_commit_timestamp_opt {
-                Some(ict) => return Ok(Some(ict)),
+                Some(ict) => return Ok(InCommitTimestampSource::Resolved(Some(ict))),
                 None => {
                     return Err(Error::generic(format!(
                         "In-Commit Timestamp not found in CRC file at version {}",
@@ -803,12 +853,8 @@ impl Snapshot {
             }
         }
 
-        // Fallback: read the ICT from latest_commit_file
         match &self.log_segment.listed.latest_commit_file {
-            Some(commit_file_meta) => {
-                let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
-                Ok(Some(ict))
-            }
+            Some(commit) => Ok(InCommitTimestampSource::Commit(commit)),
             None => Err(Error::generic("Last commit file not found in log segment")),
         }
     }
@@ -969,10 +1015,32 @@ impl Snapshot {
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
-    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
     pub fn write_checksum(
         self: &SnapshotRef,
         engine: &dyn Engine,
+    ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
+        EngineConnector::new(engine).drive(self.start_write_checksum())
+    }
+
+    /// Start a connector-driven workflow that writes this snapshot's version checksum.
+    ///
+    /// Returns the first workflow state; connectors resume read and write operations until the
+    /// workflow produces `(ChecksumWriteResult, SnapshotRef)`.
+    ///
+    /// Errors if kernel cannot resolve a writable CRC before the first connector operation.
+    /// Errors encountered later surface from the corresponding resume handle.
+    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
+    pub fn start_write_checksum(
+        self: &SnapshotRef,
+    ) -> DeltaResult<Workflow<(ChecksumWriteResult, SnapshotRef)>> {
+        let snapshot = Arc::clone(self);
+        Workflow::start(async move |channel| snapshot.write_checksum_with_channel(&channel).await)
+    }
+
+    /// Coroutine body of [`Self::write_checksum`].
+    async fn write_checksum_with_channel(
+        self: &SnapshotRef,
+        channel: &Channel,
     ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
         let has_crc_on_disk = self
             .log_segment
@@ -991,11 +1059,11 @@ impl Snapshot {
 
         self.table_configuration().ensure_read_write_supported()?;
 
-        let crc = self.resolve_crc_for_write(engine)?;
+        let crc = self.resolve_crc_for_write(channel).await?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        match try_write_crc_file(engine, &crc_path.location, &crc) {
+        match try_write_crc_file(channel, &crc_path.location, &crc).await {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
@@ -1034,7 +1102,7 @@ impl Snapshot {
     ///
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
-    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
+    async fn resolve_crc_for_write(&self, channel: &Channel) -> DeltaResult<Arc<Crc>> {
         let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
@@ -1049,7 +1117,7 @@ impl Snapshot {
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
         if let Some(base) = self.base_crc() {
             span.record("root", "stale_crc");
-            let crc = log_segment.build_crc_from_base(engine, base)?;
+            let crc = log_segment.build_crc_from_base(channel, base).await?;
             return Ok(Arc::new(crc));
         }
 
@@ -1062,24 +1130,29 @@ impl Snapshot {
                 // at the checkpoint version and returns None when ICT is disabled, or errors when
                 // it is enabled but unreadable.
                 let mut crc = log_segment
-                    .build_crc_from_checkpoint(engine)?
+                    .build_crc_from_checkpoint(channel)
+                    .await?
                     .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
-                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
+                crc.in_commit_timestamp_opt =
+                    self.get_in_commit_timestamp_with_channel(channel).await?;
                 return Ok(Arc::new(crc));
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
             // what the checkpoint holds, so skip the larger checkpoint read in that case.
-            let delta = log_segment.build_crc_delta_from_base(
-                engine,
-                checkpoint_version,
-                Some(FileSizeHistogram::create_default()),
-            )?;
+            let delta = log_segment
+                .build_crc_delta_from_base(
+                    channel,
+                    checkpoint_version,
+                    Some(FileSizeHistogram::create_default()),
+                )
+                .await?;
             require!(
                 delta.is_incremental_safe,
                 unresolved_crc("commits after the checkpoint are not incremental-safe")
             );
             let base = log_segment
-                .build_crc_from_checkpoint(engine)?
+                .build_crc_from_checkpoint(channel)
+                .await?
                 .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
             return Ok(Arc::new(base.apply(delta, end)));
@@ -1088,7 +1161,8 @@ impl Snapshot {
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
         span.record("root", "version_zero");
         let crc = log_segment
-            .build_crc_from_version_zero(engine)?
+            .build_crc_from_version_zero(channel)
+            .await?
             .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
         Ok(Arc::new(crc))
     }
@@ -1324,6 +1398,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
+    use tempfile::tempdir;
     use test_utils::table_builder::{
         checkpoint_json_stats, unpartitioned, FeatureSet, LogState, TestTableBuilder, VersionTarget,
     };
@@ -1334,6 +1409,8 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
+    use crate::coroutine::engine::drive_storage;
+    use crate::coroutine::{Cursor, CursorState, Page, PageRequest, Request};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -1352,6 +1429,7 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::utils::FoldWithOption as _;
+    use crate::StorageHandler;
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
@@ -1503,6 +1581,17 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
+    /// Drive [`LastCheckpointHint::try_read`] through a [`StorageHandler`].
+    fn read_last_checkpoint(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+    ) -> DeltaResult<Option<LastCheckpointHint>> {
+        let log_root = log_root.clone();
+        drive_storage(storage, None, async move |channel| {
+            LastCheckpointHint::try_read(&channel, &log_root).await
+        })
+    }
+
     #[test]
     fn test_read_table_with_missing_last_checkpoint() {
         // this table doesn't have a _last_checkpoint file
@@ -1514,7 +1603,7 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url, None).unwrap();
+        let cp = read_last_checkpoint(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -1573,8 +1662,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-            .expect("read last checkpoint");
+        let invalid = read_last_checkpoint(storage.as_ref(), &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -1608,8 +1696,8 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-                .expect("read last checkpoint");
+            let result =
+                read_last_checkpoint(storage.as_ref(), &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }
@@ -2111,6 +2199,62 @@ mod tests {
             let ict_ts = snapshot.get_in_commit_timestamp(&engine)?.unwrap();
             assert_eq!(ts, ict_ts);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ict_channel_read_continues_past_empty_pages() -> DeltaResult<()> {
+        let temp_dir = tempdir().unwrap();
+        let table_path = Url::from_directory_path(temp_dir.path())
+            .unwrap()
+            .to_string();
+        let engine = SyncEngine::new();
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let _ = create_table(&table_path, schema, "Test/1.0")
+            .with_table_properties(vec![(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?;
+        let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
+        let expected = snapshot.get_in_commit_timestamp(&engine)?.unwrap();
+
+        let json_strings: StringArray = vec![format!(
+            r#"{{"commitInfo":{{"inCommitTimestamp":{expected}}}}}"#
+        )]
+        .into();
+        let mut batch = Some(engine.json_handler().parse_json(
+            string_array_to_engine_data(json_strings),
+            InCommitTimestampVisitor::schema(),
+        )?);
+
+        let mut workflow = Workflow::start(async move |channel| {
+            snapshot
+                .get_in_commit_timestamp_with_channel(&channel)
+                .await
+        })?;
+        let timestamp = loop {
+            workflow = match workflow {
+                Workflow::Done(timestamp) => break timestamp,
+                Workflow::Request(Request::ReadJson(PageRequest::Start(_, resume))) => resume
+                    .resume(Ok(Page {
+                        data: Vec::new(),
+                        next: Some(Cursor::id(1)),
+                    }))?,
+                Workflow::Request(Request::ReadJson(PageRequest::Continue(cursor, resume))) => {
+                    assert!(matches!(cursor.into_state(), CursorState::Id(1)));
+                    resume.resume(Ok(Page {
+                        data: vec![batch.take().expect("first non-empty JSON page")],
+                        next: None,
+                    }))?
+                }
+                Workflow::Request(_) => panic!("workflow requested an unexpected operation"),
+            };
+        };
+
+        assert!(
+            batch.is_none(),
+            "empty page should have been followed by a batch"
+        );
+        assert_eq!(timestamp, Some(expected));
         Ok(())
     }
 

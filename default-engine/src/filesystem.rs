@@ -3,7 +3,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
-use delta_kernel::{CancellationTokenRef, DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use delta_kernel::{
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, Error, FileMeta, FileSlice,
+    StorageHandler,
+};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
@@ -41,7 +44,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// returns the raw stream.
 ///
 /// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
-async fn list_from_impl(
+pub(crate) async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
@@ -90,7 +93,7 @@ async fn list_from_impl(
 }
 
 /// Native async implementation for read_files
-async fn read_files_impl(
+pub(crate) async fn read_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileSlice>,
     readahead: usize,
@@ -147,7 +150,7 @@ async fn copy_atomic_impl(
 }
 
 /// Native async implementation for put
-async fn put_impl(
+pub(crate) async fn put_impl(
     store: Arc<DynObjectStore>,
     path: Path,
     data: Bytes,
@@ -186,10 +189,7 @@ async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta
 }
 
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         self.list_from_with_cancellation(path, None)
     }
 
@@ -197,14 +197,14 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         let future = list_from_impl(self.inner.clone(), path.clone());
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
             future,
             cancellation_token,
         )?;
-        Ok(iter) // type coercion drops the unneeded Send bound
+        Ok(iter)
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -213,10 +213,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     ///
     /// Multiple reads may occur in parallel, depending on the configured readahead.
     /// See [`Self::with_readahead`].
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         self.read_files_with_cancellation(files, None)
     }
 
@@ -224,14 +221,14 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
             future,
             cancellation_token,
         )?;
-        Ok(iter) // type coercion drops the unneeded Send bound
+        Ok(iter)
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {

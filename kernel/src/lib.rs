@@ -91,6 +91,7 @@ pub mod commit_range;
 pub mod committer;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod content_tree;
+pub mod coroutine;
 #[cfg(feature = "internal-api")]
 pub mod crc;
 #[cfg(not(feature = "internal-api"))]
@@ -184,7 +185,7 @@ pub mod parallel;
 pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
-use cancellation::check_cancelled;
+use cancellation::{check_cancelled, CancellableIterator};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
@@ -207,10 +208,17 @@ pub use snapshot::{Snapshot, SnapshotRef};
 ))]
 pub mod engine;
 
-/// Delta table version is 8 byte unsigned int
+/// Delta table version represented as an 8-byte unsigned integer.
+///
+/// NOTE: In practice, versions are 63-bit unsigned values (`0..=i64::MAX`) because The Java
+/// ecosystem lacks an unsigned 64-bit int type. In bounds and searches, `Version::MAX` is the
+/// sentinel value for a missing/open upper bound, and code using versions MUST treat
+/// `v..Version::MAX` as equivalent to `v..`. Use saturating adds when increasing a version number
+/// to preserve the sentinel while avoiding overflow panics.
 pub type Version = u64;
 
 /// Converts a [`Version`] to `i64`, returning an error if the version exceeds `i64::MAX`.
+// See `Version` above for the sentinel semantics that callers must preserve before conversion.
 pub(crate) fn version_as_i64(version: Version) -> DeltaResult<i64> {
     version
         .try_into()
@@ -626,58 +634,59 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(&self, path: &Url)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>>;
 
     /// Cancellation-aware variant of [`list_from`](Self::list_from).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its listing against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than paging through the whole listing.
+    /// When `cancellation_token` is `Some`, an engine races its listing against the token and
+    /// terminates the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// rather than paging through the whole listing. Kernel injects no additional checks.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`list_from`](Self::list_from), ignoring the token for the rest
-    /// of the listing. So an engine that does not override this stays source-compatible while still
-    /// honoring an up-front cancellation; kernel additionally polls the token as it consumes the
-    /// listing. An engine that overrides this takes over the up-front check and should also
-    /// fast-path an already-cancelled token before starting I/O.
+    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
+    /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
+    /// kernel will not inject additional cancellation checks when consuming this iterator.
+    ///
+    /// The default implementation delegates to [`list_from`](Self::list_from), but checks
+    /// cancellation first and wraps the iterator to also check at every `next` call. An engine with
+    /// cancellable I/O should override this method to use that capability.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn list_from_with_cancellation(
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         check_cancelled(cancellation_token.as_ref())?;
-        self.list_from(path)
+        let iter = self.list_from(path)?;
+        Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
     /// Read data specified by the start and end offset from the file.
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>>;
 
     /// Cancellation-aware variant of [`read_files`](Self::read_files).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file slice to completion.
+    /// When `cancellation_token` is `Some`, the returned iterator must remain cancellation-aware:
+    /// once cancellation is observed, it must yield [`Error::Cancelled`] and then end rather than
+    /// continuing or reporting normal exhaustion. An engine may also race in-flight I/O against
+    /// the token.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`read_files`](Self::read_files), ignoring the token for the rest
-    /// of the read. So an engine that does not override this stays source-compatible while still
-    /// honoring an up-front cancellation. An engine that overrides this takes over the up-front
-    /// check and should also fast-path an already-cancelled token before starting I/O.
+    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
+    /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
+    /// kernel will not inject additional cancellation checks when consuming this iterator.
+    ///
+    /// The default implementation delegates to [`read_files`](Self::read_files), but checks
+    /// cancellation first and wraps the iterator to also check at every `next` call.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_files_with_cancellation(
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         check_cancelled(cancellation_token.as_ref())?;
-        self.read_files(files)
+        let iter = self.read_files(files)?;
+        Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
@@ -753,16 +762,18 @@ pub trait JsonHandler: AsAny {
 
     /// Cancellation-aware variant of [`read_json_files`](Self::read_json_files).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion.
+    /// When `cancellation_token` is `Some`, the returned iterator must remain cancellation-aware:
+    /// once cancellation is observed, it must yield [`Error::Cancelled`] and then end rather than
+    /// continuing or reporting normal exhaustion. An engine may also race in-flight I/O against
+    /// the token.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`read_json_files`](Self::read_json_files), ignoring the token
-    /// for the rest of the read. So an engine that does not override this stays source-compatible
-    /// while still honoring an up-front cancellation; kernel additionally polls the token at
-    /// action-batch boundaries. An engine that overrides this takes over the up-front check and
-    /// should also fast-path an already-cancelled token before starting I/O.
+    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
+    /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
+    /// kernel will not inject additional cancellation checks when consuming this iterator.
+    ///
+    /// The default implementation delegates to [`read_json_files`](Self::read_json_files), but
+    /// checks cancellation first and wraps the iterator to also check at every `next` call. An
+    /// engine with cancellable I/O should override this method to use that capability.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_json_files_with_cancellation(
@@ -773,7 +784,8 @@ pub trait JsonHandler: AsAny {
         cancellation_token: Option<CancellationTokenRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         check_cancelled(cancellation_token.as_ref())?;
-        self.read_json_files(files, physical_schema, predicate)
+        let iter = self.read_json_files(files, physical_schema, predicate)?;
+        Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
     /// Atomically (!) write a single JSON file. Each selected row of the input data must be
@@ -1000,16 +1012,18 @@ pub trait ParquetHandler: AsAny {
 
     /// Cancellation-aware variant of [`read_parquet_files`](Self::read_parquet_files).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion.
+    /// When `cancellation_token` is `Some`, the returned iterator must remain cancellation-aware:
+    /// once cancellation is observed, it must yield [`Error::Cancelled`] and then end rather than
+    /// continuing or reporting normal exhaustion. An engine may also race in-flight I/O against
+    /// the token.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`read_parquet_files`](Self::read_parquet_files), ignoring the
-    /// token for the rest of the read. So an engine that does not override this stays
-    /// source-compatible while still honoring an up-front cancellation; kernel additionally polls
-    /// the token at action-batch boundaries. An engine that overrides this takes over the up-front
-    /// check and should also fast-path an already-cancelled token before starting I/O.
+    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
+    /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
+    /// kernel will not inject additional cancellation checks when consuming this iterator.
+    ///
+    /// The default implementation delegates to [`read_parquet_files`](Self::read_parquet_files),
+    /// but checks cancellation first and wraps the iterator to also check at every `next` call. An
+    /// engine with cancellable I/O should override this method to use that capability.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_parquet_files_with_cancellation(
@@ -1020,7 +1034,8 @@ pub trait ParquetHandler: AsAny {
         cancellation_token: Option<CancellationTokenRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         check_cancelled(cancellation_token.as_ref())?;
-        self.read_parquet_files(files, physical_schema, predicate)
+        let iter = self.read_parquet_files(files, physical_schema, predicate)?;
+        Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
     /// Write data to a Parquet file at the specified URL.
@@ -1107,12 +1122,13 @@ pub trait ParquetHandler: AsAny {
     /// When `cancellation_token` is `Some`, an engine may race the footer read against the token
     /// and return [`Error::Cancelled`] once cancellation is observed.
     ///
+    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
+    /// points to calls of this function. Engines are responsible to honor a cancellation promptly.
+    ///
     /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
     /// and otherwise delegates to [`read_parquet_footer`](Self::read_parquet_footer), ignoring the
-    /// token for the rest of the read. So an engine that does not override this stays
-    /// source-compatible while still honoring an up-front cancellation. An engine that overrides
-    /// this takes over the up-front check and should also fast-path an already-cancelled token
-    /// before starting I/O.
+    /// token for the rest of the read. An engine with cancellable I/O should override this method
+    /// to use that capability.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_parquet_footer_with_cancellation(

@@ -1715,7 +1715,7 @@ impl JsonHandler for CapturingJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<u64> {
         self.inner.write_json_file(path, data, overwrite)
@@ -1784,7 +1784,9 @@ pub fn read_add_infos(
     engine: &impl Engine,
 ) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
     let schema = LOG_ADD_SCHEMA.clone();
-    let batches = snapshot.log_segment().read_actions(engine, schema)?;
+    let batches = snapshot
+        .log_segment()
+        .read_actions_with_engine(engine, schema)?;
     let mut actions = Vec::new();
     for batch_result in batches {
         let actions_batch = batch_result?;

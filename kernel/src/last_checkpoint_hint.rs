@@ -11,10 +11,10 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use crate::cancellation::CancellationTokenRef;
+use crate::coroutine::Channel;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
+use crate::{DeltaResult, Error, FileMeta, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -190,18 +190,17 @@ impl LastCheckpointHint {
     /// failing the read. Thus, the semantics of this function are to return `None` if the file is
     /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
     /// are assumed to cause failure.
-    // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
-    // level result coming from storage.read_files
     #[instrument(name = "last_checkpoint.read", skip_all, err)]
-    pub(crate) fn try_read(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn try_read(
+        channel: &Channel,
         log_root: &Url,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage
-            .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())?
-            .next()
+        match channel
+            .read_small_file(file_path, None)
+            .await
+            .map(|data| (!data.is_empty()).then_some(data))
+            .transpose()
         {
             Some(Ok(data)) => {
                 let result: Option<LastCheckpointHint> =
@@ -240,12 +239,16 @@ impl LastCheckpointHint {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rstest::rstest;
 
     use super::*;
+    use crate::coroutine::engine::drive_storage;
     use crate::schema::schema;
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::create_log_path;
+    use crate::unit_test_utils::{create_log_path, TestCancellationToken};
+    use crate::{CancellationTokenRef, DeltaResultIteratorStatic, StorageHandler};
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
     /// `path` and file metadata. An empty `sidecarFiles` (a leaf checkpoint) parses to `Some([])`,
@@ -581,11 +584,12 @@ mod tests {
             config: expected_config,
         } = expected;
 
-        let (engine, snapshot, _tempdir) = load_test_table(table)?;
+        let (_engine, snapshot, _tempdir) = load_test_table(table)?;
         let seg = snapshot.log_segment();
-        let hint =
-            LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root, None)?
-                .expect("table has a _last_checkpoint");
+        let hint = seg
+            .last_checkpoint_metadata
+            .as_ref()
+            .expect("table has a _last_checkpoint");
         let v2 = hint.v2_checkpoint.as_ref().expect("V2 checkpoint hint");
 
         // Version, checkpoint file path, and sidecar paths are this table's exact identity.
@@ -730,16 +734,13 @@ mod tests {
     struct NoIoStorageHandler;
 
     impl StorageHandler for NoIoStorageHandler {
-        fn list_from(
-            &self,
-            _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
             panic!("list_from should not be called");
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
             panic!("read_files should not be called");
         }
         fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
@@ -757,15 +758,16 @@ mod tests {
     }
 
     // A cancelled token must surface as `Err(Cancelled)`, never swallowed as "no hint"
-    // (`Ok(None)`). The pre-cancelled token short-circuits the default
-    // `read_files_with_cancellation` before any read, so the panicking handler is never
-    // touched.
+    // (`Ok(None)`), which is how `try_read` reports a missing or unparseable hint. The
+    // pre-cancelled token short-circuits the default `read_files_with_cancellation` before any
+    // read, so the panicking handler is never touched.
     #[test]
     fn try_read_propagates_cancellation() {
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
-        let token: CancellationTokenRef =
-            std::sync::Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled());
-        let result = LastCheckpointHint::try_read(&NoIoStorageHandler, &log_root, Some(&token));
+        let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+        let result = drive_storage(&NoIoStorageHandler, Some(token), async move |channel| {
+            LastCheckpointHint::try_read(&channel, &log_root).await
+        });
         assert!(matches!(result, Err(Error::Cancelled)));
     }
 }

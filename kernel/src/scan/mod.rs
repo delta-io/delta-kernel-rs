@@ -25,7 +25,7 @@ use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
+use crate::log_segment::{CheckpointReadInfo, EngineActionsWithCheckpointInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
@@ -46,7 +46,10 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
+use crate::{
+    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta, SnapshotRef,
+    Version,
+};
 
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
@@ -912,9 +915,9 @@ impl Scan {
         &self,
         engine: &dyn Engine,
         existing_version: Version,
-        existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         _existing_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<ScanMetadata>> {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
@@ -944,8 +947,14 @@ impl Scan {
         // Since we're only processing existing data (no checkpoint), we use the base schema
         // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
-            let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-                actions: existing_data.into_iter().map(apply_transform),
+            // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
+            // consuming it.
+            let actions = CancellableIterator::new(
+                existing_data.into_iter().map(apply_transform),
+                self.cancellation_token.clone(),
+            );
+            let actions_with_checkpoint_info = EngineActionsWithCheckpointInfo {
+                actions,
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
                     has_partition_values_parsed: false,
@@ -985,22 +994,23 @@ impl Scan {
         // checkpoint schema returned by the function for consistency.
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
-        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions_with_engine(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
             physical_stats_schema,
             None,
-            // The incremental path relies on the batch-boundary poll in `scan_metadata_inner`
-            // for cancellation; it does not thread the token into the engine reads here, so a
-            // read already in flight is not interrupted mid-I/O.
-            None,
+            self.cancellation_token.as_ref(),
         )?;
-        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-            actions: result
-                .actions
-                .chain(existing_data.into_iter().map(apply_transform)),
+        // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
+        // newly read action prefix.
+        let existing_actions = CancellableIterator::new(
+            existing_data.into_iter().map(apply_transform),
+            self.cancellation_token.clone(),
+        );
+        let actions_with_checkpoint_info = EngineActionsWithCheckpointInfo {
+            actions: result.actions.chain(existing_actions),
             checkpoint_info: result.checkpoint_info,
         };
 
@@ -1013,10 +1023,10 @@ impl Scan {
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
-        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        actions_with_checkpoint_info: EngineActionsWithCheckpointInfo<
+            impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
         >,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>> + Send> {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1028,15 +1038,9 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
-                // Wrap the input iterator (not the shared `process_actions_iter`) so token
-                // polling stays scoped to scans.
-                let actions = CancellableIterator::new(
-                    actions_with_checkpoint_info.actions,
-                    self.cancellation_token.clone(),
-                );
                 let (it, m) = scan_action_iter(
                     engine,
-                    actions,
+                    actions_with_checkpoint_info.actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
@@ -1093,7 +1097,7 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+        EngineActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
@@ -1101,7 +1105,7 @@ impl Scan {
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
             .log_segment()
-            .read_actions_with_projected_checkpoint_actions(
+            .read_actions_with_projected_checkpoint_actions_with_engine(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,

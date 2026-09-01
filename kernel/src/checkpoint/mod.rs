@@ -470,7 +470,7 @@ impl CheckpointWriter {
         let actions = self
             .snapshot
             .log_segment()
-            .read_actions(engine, self.read_schema.clone())?;
+            .read_actions_with_engine(engine, self.read_schema.clone())?;
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(

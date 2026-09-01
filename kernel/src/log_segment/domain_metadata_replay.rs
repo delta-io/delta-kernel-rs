@@ -124,7 +124,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
+        self.read_actions_with_engine(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
     }
 }
 

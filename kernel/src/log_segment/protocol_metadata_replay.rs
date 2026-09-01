@@ -16,6 +16,7 @@ use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
+use crate::coroutine::{Channel, Generator, GeneratorState};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::ActionsBatch;
@@ -26,12 +27,12 @@ use crate::plans::ir::nodes::Agg;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation, PlanBuilder, PlanExecutor};
+use crate::plans::{Operation, PlanBuilder};
 use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
-use crate::{DeltaResult, Engine, EngineData, Error, Version};
+use crate::{DeltaResult, EngineData, Error, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -40,12 +41,12 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
     /// snapshot creation where both Protocol and Metadata must exist.
-    pub(crate) fn read_protocol_metadata(
+    pub(crate) async fn read_protocol_metadata(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         crc: Option<&Arc<Crc>>,
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
-        match self.read_protocol_metadata_opt(engine, crc)? {
+        match self.read_protocol_metadata_opt(channel, crc).await? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
             (None, Some(_), _) => Err(Error::MissingMetadata),
             (Some(_), None, _) => Err(Error::MissingProtocol),
@@ -63,9 +64,9 @@ impl LogSegment {
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
     #[instrument(name = "log_seg.load_p_m", skip_all, err)]
-    pub(crate) fn read_protocol_metadata_opt(
+    pub(crate) async fn read_protocol_metadata_opt(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         crc: Option<&Arc<Crc>>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
         // Case 1: If CRC at target version, use it directly and exit early.
@@ -97,7 +98,7 @@ impl LogSegment {
             let PmCandidate {
                 metadata: metadata_opt,
                 protocol: protocol_opt,
-            } = pruned.replay_for_pm(engine)?;
+            } = pruned.replay_for_pm(channel).await?;
             // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
             // carry it, and the CRC's P&M is at least as new.
             let metadata_opt = metadata_opt
@@ -131,7 +132,7 @@ impl LogSegment {
         let PmCandidate {
             metadata: metadata_opt,
             protocol: protocol_opt,
-        } = self.replay_for_pm(engine)?;
+        } = self.replay_for_pm(channel).await?;
         Ok((
             metadata_opt.map(|(_, m)| m),
             protocol_opt.map(|(_, p)| p),
@@ -140,21 +141,26 @@ impl LogSegment {
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
-    fn replay_for_pm(&self, engine: &dyn Engine) -> DeltaResult<PmCandidate> {
+    async fn replay_for_pm(&self, channel: &Channel) -> DeltaResult<PmCandidate> {
         #[cfg(feature = "declarative-plans")]
-        if let Some(executor) = engine.plan_executor() {
-            return resolve_pm_batches(self.read_pm_batches_via_plan(executor.as_ref())?);
-        }
-        resolve_pm_batches(self.read_pm_batches(engine)?)
+        let batches = match self.read_pm_batches_via_plan(channel).await {
+            Ok(batches) => batches,
+            Err(Error::Unsupported(_)) => self.read_pm_batches(channel).await?,
+            Err(error) => return Err(error),
+        };
+        #[cfg(not(feature = "declarative-plans"))]
+        let batches = self.read_pm_batches(channel).await?;
+
+        resolve_pm_batches(channel, batches).await
     }
 
     /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
     /// its version.
     #[cfg(feature = "declarative-plans")]
-    fn read_pm_batches_via_plan(
+    async fn read_pm_batches_via_plan(
         &self,
-        executor: &dyn PlanExecutor,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+        channel: &Channel,
+    ) -> DeltaResult<Generator<(), VersionedBatch>> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -211,28 +217,36 @@ impl LogSegment {
             })?
             .build()?;
 
-        let batches = executor
-            .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?
-            .map(|batch| {
-                // Mark as a log batch so the checkpoint action is read from it.
-                let batch = ActionsBatch::new(batch?, true);
-                let (protocol_version, metadata_version) =
-                    pm_versions_from_plan_output(batch.actions.as_ref())?;
-                Ok(VersionedBatch {
-                    protocol_version,
-                    metadata_version,
-                    batch,
-                })
-            });
-        Ok(batches)
+        let mut page = channel.start_plan(Operation::QueryPlan(plan)).await?;
+        Generator::start(async move |channel| {
+            loop {
+                for data in page.data {
+                    // Mark as a log batch so the checkpoint action is read from it.
+                    let batch = ActionsBatch::new(data, true);
+                    let (protocol_version, metadata_version) =
+                        pm_versions_from_plan_output(batch.actions.as_ref())?;
+                    channel
+                        .yield_item(VersionedBatch {
+                            protocol_version,
+                            metadata_version,
+                            batch,
+                        })
+                        .await?;
+                }
+                let Some(next) = page.next else {
+                    break;
+                };
+                page = channel.continue_plan(next).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Reads the P&M commit cover and checkpoint, tagging each batch with its version.
-    fn read_pm_batches(
+    async fn read_pm_batches(
         &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+        channel: &Channel,
+    ) -> DeltaResult<Generator<(), VersionedBatch>> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =
@@ -241,32 +255,39 @@ impl LogSegment {
             commit_schema.fields().cloned().chain([file_column]),
         )?);
         let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
-        let batches = self
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
+        let mut batches = GeneratorState::Start(
+            self.read_actions_with_projected_checkpoint_actions(
+                channel,
                 commit_schema,
                 checkpoint_schema,
                 None,
                 None,
                 None,
-                None,
-            )?
-            .actions;
-        Ok(batches.map(move |batch| {
-            let batch = batch?;
-            // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
-            let version = if batch.is_log_batch {
-                batch_version(batch.actions.as_ref())? as i64
-            } else {
-                checkpoint_version
-                    .ok_or_else(|| Error::internal_error("checkpoint batch without a version"))?
-            };
-            Ok(VersionedBatch {
-                protocol_version: Some(version),
-                metadata_version: Some(version),
-                batch,
-            })
-        }))
+            )
+            .await?
+            .actions,
+        );
+        Generator::start(async move |channel| {
+            while let Some(batch) = batches.next(&channel).await? {
+                // A commit's version is parsed from its `_file`; a checkpoint batch uses the
+                // constant.
+                let version = if batch.is_log_batch {
+                    batch_version(batch.actions.as_ref())? as i64
+                } else {
+                    checkpoint_version.ok_or_else(|| {
+                        Error::internal_error("checkpoint batch without a version")
+                    })?
+                };
+                channel
+                    .yield_item(VersionedBatch {
+                        protocol_version: Some(version),
+                        metadata_version: Some(version),
+                        batch,
+                    })
+                    .await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -285,17 +306,19 @@ struct VersionedBatch {
 }
 
 /// The newest Protocol and Metadata across `batches`.
-fn resolve_pm_batches(
-    batches: impl Iterator<Item = DeltaResult<VersionedBatch>>,
+async fn resolve_pm_batches(
+    channel: &Channel,
+    batches: Generator<(), VersionedBatch>,
 ) -> DeltaResult<PmCandidate> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
-    for batch in batches {
+    let mut batches = GeneratorState::Start(batches);
+    while let Some(batch) = batches.next(channel).await? {
         let VersionedBatch {
             protocol_version,
             metadata_version,
             batch,
-        } = batch?;
+        } = batch;
         let batch_version = protocol_version.max(metadata_version);
         let candidate = pm_candidate(&batch, protocol_version, metadata_version)?;
         metadata = newer(metadata, candidate.metadata);
@@ -480,6 +503,7 @@ mod tests {
     use itertools::Itertools;
     use test_log::test;
 
+    use crate::coroutine::engine::EngineConnector;
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
@@ -516,9 +540,13 @@ mod tests {
         let engine = SyncEngine::new();
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let data: Vec<_> = snapshot
-            .log_segment()
-            .read_pm_batches(&engine)
+        let log_segment = snapshot.log_segment().clone();
+        let connector = EngineConnector::new(&engine);
+        let generator = connector
+            .run(async move |channel| log_segment.read_pm_batches(&channel).await)
+            .unwrap();
+        let data: Vec<_> = connector
+            .iterate_generator(Ok(generator))
             .unwrap()
             .try_collect()
             .unwrap();
@@ -578,6 +606,20 @@ mod tests {
 
         assert_eq!(snapshot.version(), 5);
         assert_eq!(snapshot.schema().fields().count(), 5);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[test]
+    fn test_snapshot_build_without_plan_executor_falls_back_to_handlers() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = DelegatingEngine::new(Arc::new(SyncEngine::new())).without_plan_executor();
+
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        assert_eq!(snapshot.version(), 1);
+        assert_eq!(snapshot.schema().fields().count(), 3);
     }
 
     #[cfg(feature = "declarative-plans")]

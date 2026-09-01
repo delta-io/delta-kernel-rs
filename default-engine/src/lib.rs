@@ -18,8 +18,8 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler,
-    ParquetHandler, StorageHandler,
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error,
+    EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
 use futures::future::{self, Either};
 use futures::stream::{BoxStream, StreamExt as _};
@@ -30,6 +30,7 @@ use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
 
+pub mod coroutine;
 pub mod executor;
 pub mod file_stream;
 pub mod filesystem;
@@ -38,6 +39,8 @@ pub mod parquet;
 pub mod rest_store;
 pub mod stats;
 pub mod storage;
+
+pub use self::coroutine::AsyncEngineConnector;
 
 /// Converts a Stream-producing future to a synchronous iterator.
 ///
@@ -73,7 +76,7 @@ pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::
         + Send
         + 'static,
     cancellation_token: Option<CancellationTokenRef>,
-) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<U>> + Send>> {
+) -> DeltaResult<DeltaResultIteratorStatic<U>> {
     let Some(token) = cancellation_token else {
         return stream_future_to_iter(task_executor, stream_future);
     };
@@ -182,6 +185,7 @@ pub(crate) const DEFAULT_READ_BATCH_SIZE: NonZero<usize> =
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
+    io_config: ReadIoConfig,
     storage: Arc<MeteredStorageHandler>,
     json: Arc<MeteredJsonHandler>,
     parquet: Arc<MeteredParquetHandler>,
@@ -336,6 +340,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             raw_parquet,
             object_store,
             task_executor,
+            io_config,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
         }
     }
@@ -353,6 +358,21 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 
     pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
         Some(self.object_store.clone())
+    }
+
+    /// Return a native async connector with this engine's object store and read tuning.
+    ///
+    /// The returned connector completely bypasses the [`Engine`] trait hierarchy and does not use
+    /// this engine's [`TaskExecutor`] (because it never blocks, only awaits).
+    pub fn async_connector(&self) -> AsyncEngineConnector {
+        let mut connector = AsyncEngineConnector::new(self.object_store.clone());
+        if let Some(buffer_size) = self.io_config.buffer_size {
+            connector = connector.with_buffer_size(buffer_size);
+        }
+        if let Some(batch_size) = self.io_config.batch_size {
+            connector = connector.with_batch_size(batch_size);
+        }
+        connector
     }
 
     /// Returns the concrete [`DefaultParquetHandler`] for callers that need the inherent

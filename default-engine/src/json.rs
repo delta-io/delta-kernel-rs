@@ -84,7 +84,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
 }
 
 /// Internal async implementation of read_json_files
-async fn read_json_files_impl(
+pub(crate) async fn read_json_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,

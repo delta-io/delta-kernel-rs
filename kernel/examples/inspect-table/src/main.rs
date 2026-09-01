@@ -224,7 +224,7 @@ fn try_main() -> DeltaResult<()> {
             let actions_schema = get_all_actions_schema();
             let actions = snapshot
                 .log_segment()
-                .read_actions(&engine, actions_schema.clone())?;
+                .read_actions_with_engine(&engine, actions_schema.clone())?;
 
             let mut visitor = LogVisitor::new();
             for action in actions {

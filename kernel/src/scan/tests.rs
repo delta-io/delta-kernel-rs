@@ -32,9 +32,10 @@ use crate::schema::{
     StructType,
 };
 use crate::transaction::create_table::create_table;
+use crate::unit_test_utils::TestCancellationToken;
 use crate::{
-    DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
-    ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
+    CancellationTokenRef, DeltaResultIteratorStatic, Engine, EngineData,
+    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -663,6 +664,39 @@ fn test_scan_metadata_from_same_version() {
         .unwrap();
 
     assert_eq!(new_files.len(), 1);
+}
+
+#[test_log::test]
+fn scan_metadata_from_cancels_cached_metadata_consumption() {
+    let path =
+        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let version = snapshot.version();
+    let uncancelled_scan = snapshot.clone().scan_builder().build().unwrap();
+    let files: Vec<_> = uncancelled_scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| scan_files.into_parts().0)
+        .try_collect()
+        .unwrap();
+
+    let token = Arc::new(TestCancellationToken::default());
+    let token_ref: CancellationTokenRef = token.clone();
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(token_ref)
+        .build()
+        .unwrap();
+    let mut metadata = scan
+        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .unwrap();
+
+    token.cancel();
+    assert!(matches!(metadata.next(), Some(Err(Error::Cancelled))));
+    assert!(metadata.next().is_none());
 }
 
 // reading v0 with 3 files.

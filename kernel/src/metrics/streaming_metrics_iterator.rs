@@ -8,11 +8,11 @@
 //! [`MeteredStorageHandler`]: crate::metrics::MeteredStorageHandler
 
 use std::marker::PhantomData;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::metrics::events::STORAGE_SPAN;
+use crate::metrics::events::{StorageListCompleted, StorageReadCompleted, STORAGE_SPAN};
 use crate::{DeltaResult, FileMeta};
 
 /// Counts items observed and emits a `"storage"` span on drop. The type parameter
@@ -59,11 +59,21 @@ impl<I, T> Drop for MetricsIterator<I, T> {
     }
 }
 
+/// Emit a [`StorageListCompleted`] metric for a listing's `elapsed` time and `num_files` count.
+pub fn emit_storage_list_completed(elapsed: Duration, num_files: u64) {
+    emit_storage_span(StorageListCompleted::NAME, elapsed, num_files, 0);
+}
+
+/// Emit a [`StorageReadCompleted`] metric for a read's elapsed time, file count, and byte count.
+pub fn emit_storage_read_completed(elapsed: Duration, num_files: u64, bytes_read: u64) {
+    emit_storage_span(StorageReadCompleted::NAME, elapsed, num_files, bytes_read);
+}
+
 /// Emit a one-shot `"storage"` span describing a completed operation. Use when the
 /// operation does not return an iterator (e.g. `copy_atomic`).
 pub(crate) fn emit_storage_span(
     name: &'static str,
-    elapsed: std::time::Duration,
+    elapsed: Duration,
     num_files: u64,
     bytes_read: u64,
 ) {

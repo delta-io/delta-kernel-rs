@@ -315,6 +315,11 @@ Keep this list updated when new protocol features are added to kernel.
   block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
   warning-eligible work, so it may run under the lock directly.) See
   `kernel/src/metrics/reporter.rs` for the canonical pattern.
+- **`Version::MAX` is a sentinel, not a practical table version:** It canonically means unbounded/no
+  upper version: `v..=Version::MAX` is invalid and `v..Version::MAX` is equivalent to `v..`. Real
+  Delta versions actually stop at `i64::MAX` because the JVM ecosystem has no `u64` equivalent. Use
+  saturating adds to avoid panic overflows when manipulating versions as bounds. NEVER attempt to
+  emulate inclusive upper bounds that include `Version::MAX` as a normal version.
 
 ## Code Style
 

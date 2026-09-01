@@ -89,7 +89,7 @@ fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-    log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
+    log_segment.read_actions_with_engine(engine, LOG_TXN_SCHEMA.clone())
 }
 
 #[cfg(test)]
