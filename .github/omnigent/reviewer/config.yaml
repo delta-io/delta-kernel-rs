@@ -120,10 +120,9 @@ prompt: |
 
   Your output is posted verbatim as a PR comment. Output ONLY the final
   consolidated review -- no narration and no status updates. Include reviewer
-  attribution on findings as required above. Begin your response with the exact marker
-  <!-- AI_REVIEW_START --> on its own line, then the review. Nothing before the
-  marker will be shown. End your response with the exact marker
-  <!-- AI_REVIEW_END --> on its own line. Nothing after the marker will be shown.
+  attribution on findings as required above. Begin and end your response with
+  the exact per-run markers supplied in the invocation prompt. Put each marker
+  on its own line. Nothing outside those markers will be shown.
 
 async: true
 cancellable: true
