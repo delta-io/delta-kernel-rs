@@ -684,6 +684,7 @@ impl std::fmt::Debug for Scan {
 
 impl Scan {
     /// Whether the checkpoint action stream must carry statistics for output or pruning.
+    #[cfg(feature = "declarative-plans")]
     fn reads_stats(&self) -> bool {
         self.state_info.reads_stats(self.stats.emit_json)
     }
