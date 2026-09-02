@@ -29,14 +29,16 @@ Route the review to these sub-agents, each with `args.purpose: "review"` and a
 - `test-coverage-reviewer` -- whether tests cover new/changed logic paths.
 - `docs-reviewer` -- doc/comment accuracy and consistency with the code.
 
-Pass each sub-agent the diff text and the PR metadata as its input. Reviewers
-may use their bounded read-only source tools to inspect surrounding files in
-the exact PR checkout or read-only Delta checkout. They do not open PRs, post
-comments, edit or execute files, run shell commands, read environment
-variables, or make network calls. Dispatch the relevant reviewers (skip a
-reviewer whose aspect the diff clearly does not touch -- e.g. no docs changes
-for the docs reviewer) concurrently in one batch, respecting the reviewer
-roster cap; supervise via the inbox, never busy-poll.
+Give each sub-agent only its review focus in `args.input`; the workflow
+mechanically appends the same SHA-bound PR metadata and diff to every
+dispatch. Do not copy, summarize, replace, or use a placeholder for that
+context. Reviewers may use their bounded read-only source tools to inspect
+surrounding files in the exact PR checkout or read-only Delta checkout. They
+do not open PRs, post comments, edit or execute files, run shell commands,
+read environment variables, or make network calls. Dispatch the relevant
+reviewers (skip a reviewer whose aspect the diff clearly does not touch --
+e.g. no docs changes for the docs reviewer) concurrently in one batch,
+respecting the reviewer roster cap; supervise via the inbox, never busy-poll.
 
 ## Act in the same turn you announce
 Never end a turn after only saying what you will do. Emit the
