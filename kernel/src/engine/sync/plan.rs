@@ -285,20 +285,28 @@ fn dynamic_scan_files(
                     last_modified.data_type()
                 ))
             })?;
-        let dv_path = dynamic_scan.dv_column.path();
-        let dv = extract_column(batch, dv_path)?;
-        let dv_ancestors: Vec<_> = (1..dv_path.len())
-            .map(|len| extract_column(batch, &dv_path[..len]))
-            .try_collect()?;
+        let dv = match &dynamic_scan.dv_column {
+            Some(dv_column) => {
+                let dv_path = dv_column.path();
+                let dv = extract_column(batch, dv_path)?;
+                let dv_ancestors: Vec<_> = (1..dv_path.len())
+                    .map(|len| extract_column(batch, &dv_path[..len]))
+                    .try_collect()?;
+                Some((dv, dv_ancestors))
+            }
+            None => None,
+        };
 
         for row in 0..batch.num_rows() {
             if path.is_null(row) {
                 return Err(Error::generic("DynamicScan path must not be null"));
             }
-            if dv.is_valid(row) && dv_ancestors.iter().all(|ancestor| ancestor.is_valid(row)) {
-                return Err(Error::unsupported(
-                    "SyncPlanExecutor DynamicScan with deletion vectors",
-                ));
+            if let Some((dv, dv_ancestors)) = &dv {
+                if dv.is_valid(row) && dv_ancestors.iter().all(|ancestor| ancestor.is_valid(row)) {
+                    return Err(Error::unsupported(
+                        "SyncPlanExecutor DynamicScan with deletion vectors",
+                    ));
+                }
             }
             let path = path.value(row);
             let location = dynamic_scan.base_url.join(path)?;
@@ -564,7 +572,7 @@ mod tests {
             path_column: column_name!("path"),
             file_size_column: column_name!("size"),
             last_modified_column: column_name!("filemod"),
-            dv_column: column_name!("dv"),
+            dv_column: Some(column_name!("dv")),
         };
 
         dynamic_scan_files(&dynamic_scan, &[input])
@@ -650,6 +658,33 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_scan_executor_accepts_no_dv_column() {
+        let input_schema = schema_ref! {
+            nullable "path": STRING,
+            nullable "size": LONG,
+            nullable "filemod": LONG,
+        };
+        let input = values_to_record_batch(Values::new(
+            input_schema,
+            vec![vec!["file.parquet".into(), 1_i64.into(), 42_i64.into()]],
+        ))
+        .unwrap();
+        let dynamic_scan = DynamicScan {
+            schema: schema_ref! {},
+            file_type: FileType::Parquet,
+            base_url: Url::parse("memory:///").unwrap(),
+            file_constant_columns: vec![],
+            path_column: column_name!("path"),
+            file_size_column: column_name!("size"),
+            last_modified_column: column_name!("filemod"),
+            dv_column: None,
+        };
+        let files = dynamic_scan_files(&dynamic_scan, &[input]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].meta.last_modified, 42);
+    }
+
+    #[test]
     fn dynamic_scan_treats_dv_under_null_ancestor_as_null() {
         let metadata_type = schema! {
             nullable "dv": (DeletionVectorDescriptor::to_schema()),
@@ -685,7 +720,7 @@ mod tests {
             path_column: column_name!("path"),
             file_size_column: column_name!("size"),
             last_modified_column: column_name!("filemod"),
-            dv_column: column_name!("metadata.dv"),
+            dv_column: Some(column_name!("metadata.dv")),
         };
 
         assert_eq!(
