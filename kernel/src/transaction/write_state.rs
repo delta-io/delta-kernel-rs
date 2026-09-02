@@ -86,11 +86,13 @@ impl WriteContextBuilder {
         let is_partitioned = !self.write_state.logical_partition_columns.is_empty();
         require!(
             is_partitioned || self.partition_values.is_none(),
-            Error::generic("table is not partitioned; partition values are not allowed")
+            Error::invalid_partition_values(
+                "table is not partitioned; partition values are not allowed"
+            )
         );
         require!(
             !is_partitioned || self.partition_values.is_some(),
-            Error::generic("table is partitioned; partition values are required")
+            Error::invalid_partition_values("table is partitioned; partition values are required")
         );
         let normalized = self
             .partition_values

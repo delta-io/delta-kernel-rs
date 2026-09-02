@@ -237,19 +237,15 @@ async fn test_append_partitioned(
                     partition_col.to_string(),
                     Scalar::String(partition_val.into()),
                 )]);
-                let write_context = match &encoded_write_state {
-                    Some(encoded) => WriteState::decode(encoded).and_then(|state| {
-                        state
-                            .write_context_builder()
-                            .with_partition_values(partition_values)
-                            .build()
-                    }),
-                    None => write_state
-                        .write_context_builder()
-                        .with_partition_values(partition_values)
-                        .build(),
-                }
-                .unwrap();
+                let state = match &encoded_write_state {
+                    Some(encoded) => WriteState::decode(encoded).unwrap(),
+                    None => Arc::clone(&write_state),
+                };
+                let write_context = state
+                    .write_context_builder()
+                    .with_partition_values(partition_values)
+                    .build()
+                    .unwrap();
                 let engine = engine.clone();
                 tokio::task::spawn(async move {
                     engine

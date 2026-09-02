@@ -2441,18 +2441,27 @@ mod tests {
     #[rstest]
     #[case::partition_value_on_unpartitioned(
         "./tests/data/table-without-dv-small/",
-        true,
-        "not partitioned"
+        Some(HashMap::from([("x".to_string(), Scalar::Integer(1))])),
+        "not partitioned",
+        None
     )]
     #[case::missing_values_on_partitioned(
         "./tests/data/basic_partitioned/",
-        false,
-        "table is partitioned"
+        None,
+        "table is partitioned",
+        None
+    )]
+    #[case::empty_values_on_partitioned(
+        "./tests/data/basic_partitioned/",
+        Some(HashMap::new()),
+        "missing partition column",
+        Some("required")
     )]
     fn test_write_context_builder_requires_matching_partition_values(
         #[case] table_path: &str,
-        #[case] provide_partition_values: bool,
+        #[case] partition_values: Option<HashMap<String, Scalar>>,
         #[case] expected_msg: &str,
+        #[case] unexpected_msg: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
@@ -2460,19 +2469,26 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let write_state = txn.write_state()?;
-        let result = if provide_partition_values {
-            write_state
-                .write_context_builder()
-                .with_partition_values(HashMap::from([("x".to_string(), Scalar::Integer(1))]))
-                .build()
-        } else {
-            write_state.write_context_builder().build()
-        };
-        let err = result.unwrap_err().to_string();
+        let mut builder = write_state.write_context_builder();
+        if let Some(partition_values) = partition_values {
+            builder = builder.with_partition_values(partition_values);
+        }
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidPartitionValues(_)),
+            "unexpected error: {err}"
+        );
+        let err = err.to_string();
         assert!(
             err.contains(expected_msg),
             "expected '{expected_msg}' in error, got: {err}"
         );
+        if let Some(unexpected_msg) = unexpected_msg {
+            assert!(
+                !err.contains(unexpected_msg),
+                "did not expect '{unexpected_msg}' in error, got: {err}"
+            );
+        }
         Ok(())
     }
 
