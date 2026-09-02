@@ -2074,7 +2074,6 @@ fn test_default_stats_options_no_struct_output() {
         synthesize_json: true,
         struct_stats: StructStats::Columns {
             requested: vec![column_name!("id")],
-            extra_indexed: vec![],
         },
     },
     &["id"],
@@ -2243,7 +2242,6 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
             synthesize_json: true,
             struct_stats: StructStats::Columns {
                 requested: vec![column_name!("nonexistent_column")],
-                extra_indexed: vec![],
             },
         })
         .build();
@@ -2260,10 +2258,9 @@ fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
 
     let result = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::struct_columns_with_extra_indexed(
-            vec![],
-            vec![column_name!("nonexistent_column")],
-        ))
+        .with_stats(StatsOptions::all_struct_with_extra_indexed(vec![
+            column_name!("nonexistent_column"),
+        ]))
         .build();
 
     assert!(

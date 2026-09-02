@@ -333,8 +333,15 @@ fn surviving_paths_with_stats(
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn extra_indexed_stats_column_past_cap_enables_pruning(
+async fn past_cap_stats_column_enables_pruning_via_extra_indexed_or_requested(
     #[values(false, true)] use_parallel: bool,
+    // Both entry points bypass the cap through the same limit-exempt mechanism: `All`'s
+    // best-effort `extra_indexed`, and `Columns`'s explicit `requested`.
+    #[values(
+        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
+        StatsOptions::struct_columns(vec![column_name!("c2")])
+    )]
+    bypass_stats: StatsOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats().await?;
     let predicate = || Arc::new(Pred::gt(col!("c2"), lit(60i64)));
@@ -349,20 +356,15 @@ async fn extra_indexed_stats_column_past_cap_enables_pruning(
     assert_eq!(
         default_survivors.len(),
         3,
-        "without `extra_indexed`, c2 is capped out and every file survives"
+        "c2 is capped out by default, so every file survives"
     );
 
-    let pruned = surviving_paths_with_stats(
-        &table_path,
-        engine,
-        predicate(),
-        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
-        use_parallel,
-    )?;
+    let pruned =
+        surviving_paths_with_stats(&table_path, engine, predicate(), bypass_stats, use_parallel)?;
     assert_eq!(
         pruned.len(),
         1,
-        "with c2 `extra_indexed`, only file C (c2 == 100 > 60) survives"
+        "with c2 exempt from the cap, only file C (c2 == 100 > 60) survives"
     );
     Ok(())
 }

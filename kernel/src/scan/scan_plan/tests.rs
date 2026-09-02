@@ -351,10 +351,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     // Compare only the caller-requested stats after checking the declarative schema above.
     let parsed_stats_requested = match &struct_stats {
         StructStats::None => false,
-        StructStats::Columns {
-            requested,
-            extra_indexed,
-        } => !requested.is_empty() || !extra_indexed.is_empty(),
+        StructStats::Columns { requested } => !requested.is_empty(),
         StructStats::All { .. } => true,
     };
     if !parsed_stats_requested {

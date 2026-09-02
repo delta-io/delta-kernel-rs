@@ -43,7 +43,7 @@ use crate::schema::{
     StructField, StructType, ToSchema as _,
 };
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, Operation};
+use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -121,27 +121,28 @@ pub struct StatsOptions {
 ///
 /// Indexed columns are non-partition data columns named by `delta.dataSkippingStatsColumns`, or,
 /// when that property is absent, the first `delta.dataSkippingNumIndexedCols` leaf columns (32 by
-/// default). Extra-indexed columns allow statistics produced outside that declared set, such as
-/// those from a maintenance process, to participate in data skipping.
+/// default).
 #[derive(Clone, Debug)]
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
     /// internal data skipping unless the caller picked [`StatsOptions::none`], which
     /// disables stats reading entirely.
     None,
-    /// Emit all indexed columns and any extra-indexed columns.
+    /// Emit all indexed columns, plus the `extra_indexed` columns.
     All {
-        /// Columns to include even when they fall outside the indexed set.
+        /// Columns to include even when they fall outside the indexed set. Best-effort: an
+        /// unresolvable name is ignored with a warning, and a file with no on-disk stats for one
+        /// reads as NULL (which prunes nothing).
         extra_indexed: Vec<ColumnName>,
     },
-    /// Emit requested indexed columns and any extra-indexed columns.
+    /// Emit stats for exactly the `requested` columns, regardless of the table's indexed set.
     ///
-    /// Predicate-referenced columns may also appear.
+    /// Predicate-referenced columns may also appear, so kernel can still prune internally.
     Columns {
-        /// Indexed columns to emit.
+        /// Columns to emit stats for, exempt from `delta.dataSkippingNumIndexedCols` and
+        /// `delta.dataSkippingStatsColumns`. An unresolvable name is a hard error. A file with no
+        /// on-disk stats for a column reads as NULL (which prunes nothing).
         requested: Vec<ColumnName>,
-        /// Columns to include even when they fall outside the indexed set.
-        extra_indexed: Vec<ColumnName>,
     },
 }
 
@@ -173,15 +174,14 @@ impl StatsOptions {
         }
     }
 
-    /// Struct stats for at least the specified columns without JSON synthesis. Predicate-referenced
-    /// columns may also appear because scan paths can retain stats used for data skipping.
+    /// Struct stats for exactly `cols` without JSON synthesis, regardless of the table's indexed
+    /// set -- a column past `delta.dataSkippingNumIndexedCols` still gets stats. Predicate-
+    /// referenced columns may also appear because scan paths retain stats used for data skipping.
+    /// An unresolvable column name is a hard error.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
-            struct_stats: StructStats::Columns {
-                requested: cols,
-                extra_indexed: Vec::new(),
-            },
+            struct_stats: StructStats::Columns { requested: cols },
         }
     }
 
@@ -193,22 +193,6 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::All { extra_indexed },
-        }
-    }
-
-    /// Returns struct stats for `requested` indexed columns and `extra_indexed` columns.
-    ///
-    /// Pass an empty `requested` list to emit only the extra-indexed columns.
-    pub fn struct_columns_with_extra_indexed(
-        requested: Vec<ColumnName>,
-        extra_indexed: Vec<ColumnName>,
-    ) -> Self {
-        Self {
-            synthesize_json: false,
-            struct_stats: StructStats::Columns {
-                requested,
-                extra_indexed,
-            },
         }
     }
 
@@ -740,8 +724,8 @@ pub struct Scan {
 ///
 /// For example, if the caller requests `[a, b]` and the predicate references `c`,
 /// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
-/// Returns `None` when no eligible struct stats are requested. Unresolvable requested columns
-/// return an error, while unresolvable extra-indexed columns are ignored with a warning.
+/// Returns `None` when no struct stats are requested. `Columns` names were already resolved
+/// (strictly) into `StateInfo::cap_exempt_stats_columns` when the `StateInfo` was built.
 fn build_physical_stats_output_schema(
     table_configuration: &TableConfiguration,
     state_info: &StateInfo,
@@ -750,33 +734,16 @@ fn build_physical_stats_output_schema(
     match &stats.struct_stats {
         StructStats::None => Ok(None),
         StructStats::All { .. } => Ok(state_info.physical_stats_schema.clone()),
-        StructStats::Columns {
-            requested,
-            extra_indexed,
-        } if requested.is_empty() && extra_indexed.is_empty() => Ok(None),
-        StructStats::Columns {
-            requested,
-            extra_indexed,
-        } => {
-            // Resolve requested columns strictly, then retain valid extra-indexed columns in the
-            // output filter.
-            let logical_schema = table_configuration.logical_schema();
-            let column_mapping_mode = table_configuration.column_mapping_mode();
-            let extra_indexed_physical =
-                state_info::resolve_physical_columns(table_configuration, extra_indexed);
-            let mut filter: Vec<_> = requested
-                .iter()
-                .map(|column| {
-                    get_any_level_column_physical_name(&logical_schema, column, column_mapping_mode)
-                })
-                .try_collect()?;
-            state_info::union_extra_into_filter(&mut filter, &extra_indexed_physical);
-            let required =
-                (!extra_indexed_physical.is_empty()).then_some(extra_indexed_physical.as_slice());
+        StructStats::Columns { .. } => {
+            // `requested` bypasses the indexed-column cap, so it serves as both the limit-exempt
+            // set and the output filter: the emitted schema is exactly the requested columns.
+            let requested = &state_info.cap_exempt_stats_columns;
+            if requested.is_empty() {
+                return Ok(None);
+            }
             let stats_schema = table_configuration
-                .build_expected_stats_schemas(required, Some(&filter))?
+                .build_expected_stats_schemas(Some(requested), Some(requested))?
                 .physical;
-
             Ok(stats_schema_with_data_columns(stats_schema))
         }
     }

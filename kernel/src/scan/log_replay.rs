@@ -87,6 +87,10 @@ struct InternalScanState {
     /// still correct.
     #[serde(default)]
     physical_stats_columns: HashSet<ColumnName>,
+    /// Columns exempt from the indexed-column cap. Carried alongside `physical_stats_schema` for a
+    /// faithful round-trip; `#[serde(default)]` keeps older blobs readable.
+    #[serde(default)]
+    cap_exempt_stats_columns: Vec<ColumnName>,
     #[serde(default)]
     is_catalog_managed: bool,
     skip_row_transforms: bool,
@@ -382,6 +386,7 @@ impl ScanLogReplayProcessor {
             physical_stats_schema,
             physical_partition_schema,
             physical_stats_columns,
+            cap_exempt_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
         } = self.state_info.as_ref().clone();
@@ -404,6 +409,7 @@ impl ScanLogReplayProcessor {
             partition_values_options: self.partition_values_options,
             physical_partition_schema,
             physical_stats_columns,
+            cap_exempt_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
         };
@@ -463,6 +469,7 @@ impl ScanLogReplayProcessor {
             physical_stats_schema: internal_state.physical_stats_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
             physical_stats_columns: internal_state.physical_stats_columns,
+            cap_exempt_stats_columns: internal_state.cap_exempt_stats_columns,
             is_catalog_managed: internal_state.is_catalog_managed,
             skip_row_transforms: internal_state.skip_row_transforms,
         });
@@ -1293,6 +1300,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
+            cap_exempt_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         });
@@ -1677,6 +1685,7 @@ mod tests {
                 physical_stats_schema: None,
                 physical_partition_schema: None,
                 physical_stats_columns: HashSet::new(),
+                cap_exempt_stats_columns: Vec::new(),
                 is_catalog_managed: false,
                 skip_row_transforms: false,
             });
@@ -1713,6 +1722,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
+            cap_exempt_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         });
@@ -1745,6 +1755,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
+            cap_exempt_stats_columns: Vec::new(),
             is_catalog_managed: true,
             skip_row_transforms: false,
         });
@@ -1777,6 +1788,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
+            cap_exempt_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: skip,
         });
@@ -1827,6 +1839,7 @@ mod tests {
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
+            cap_exempt_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         };
@@ -1859,6 +1872,7 @@ mod tests {
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
+            cap_exempt_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         };
