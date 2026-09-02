@@ -24,14 +24,14 @@ use datafusion::logical_expr::{
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
 use delta_kernel::expressions::{ColumnName as KernelColumnName, Scalar as KernelScalar};
 use delta_kernel::plans::ir::nodes::{
-    Agg as KernelAgg, Aggregate as KernelAggregate, Filter as KernelFilter,
-    Operator as KernelOperator, Project as KernelProject, SemiJoin as KernelSemiJoin,
-    UnionAll as KernelUnionAll, Values as KernelValues,
+    Agg as KernelAgg, Aggregate as KernelAggregate, DataSkippingSite as KernelDataSkippingSite,
+    Filter as KernelFilter, Operator as KernelOperator, Project as KernelProject,
+    SemiJoin as KernelSemiJoin, UnionAll as KernelUnionAll, Values as KernelValues,
 };
 use delta_kernel::schema::{StructField, StructType};
 
-use crate::expression::to_df_struct_columns;
-use crate::predicate::to_df_predicate_expr;
+use crate::expression::to_df_plan_struct_columns;
+use crate::predicate::to_df_plan_predicate_expr;
 use crate::scalar::to_df_scalar;
 use crate::utils::column_to_df_expr;
 
@@ -69,6 +69,12 @@ pub(crate) fn lower_operator(
             };
             lower_filter(filter, input)
         }
+        KernelOperator::DataSkipping(site) => {
+            let [input] = inputs else {
+                return Err(input_count_error(1));
+            };
+            lower_data_skipping(site, input)
+        }
         KernelOperator::Aggregate(aggregate) => {
             let [input] = inputs else {
                 return Err(input_count_error(1));
@@ -89,6 +95,25 @@ pub(crate) fn lower_operator(
     }
 }
 
+/// Applies Kernel's portable data-skipping predicate, or leaves the input unchanged when Kernel
+/// could not derive one. A native optimizer may instead install a conservative filter based on
+/// [`KernelDataSkippingSite::source_predicate`].
+fn lower_data_skipping(
+    site: &KernelDataSkippingSite,
+    input: &Arc<DFLogicalPlan>,
+) -> Result<DFLogicalPlan, DataFusionError> {
+    let Some(predicate) = site.kernel_keep_predicate() else {
+        return Ok(input.as_ref().clone());
+    };
+    let input_schema: StructType = input.schema().as_arrow().try_into_kernel()?;
+    let predicate = to_df_plan_predicate_expr(predicate, &input_schema)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    Ok(DFLogicalPlan::Filter(DFFilter::try_new(
+        predicate,
+        Arc::clone(input),
+    )?))
+}
+
 /// Lowers a [`Project`](KernelProject) to a single DataFusion projection.
 ///
 /// A kernel Project holds a struct expression and its declared output schema, while DataFusion
@@ -104,14 +129,14 @@ fn lower_project(
     input: &Arc<DFLogicalPlan>,
 ) -> Result<DFLogicalPlan, DataFusionError> {
     let input_schema: StructType = input.schema().as_arrow().try_into_kernel()?;
-    let arrow_schema: ArrowSchema = project.schema.as_ref().try_into_arrow()?;
+    let arrow_schema: ArrowSchema = project.schema().as_ref().try_into_arrow()?;
     let df_schema = Arc::new(DFSchema::try_from(arrow_schema)?);
-    let columns = to_df_struct_columns(&project.expr, &input_schema, project.schema.as_ref())
+    let columns = to_df_plan_struct_columns(project.expression(), &input_schema)
         .map_err(|error| DataFusionError::External(Box::new(error)))?
         .into_guarded_columns();
     let exprs: Result<Vec<DFExpr>, DataFusionError> = columns
         .into_iter()
-        .zip(project.schema.fields())
+        .zip(project.schema().fields())
         .map(|((name, expr), field)| {
             let target = field.data_type().try_into_arrow()?;
             let expr = expr.cast_to(&target, input.schema())?.alias(name);
@@ -332,7 +357,7 @@ fn lower_filter(
     input: &Arc<DFLogicalPlan>,
 ) -> Result<DFLogicalPlan, DataFusionError> {
     let input_schema: StructType = input.schema().as_arrow().try_into_kernel()?;
-    let predicate = to_df_predicate_expr(&filter.predicate, &input_schema)
+    let predicate = to_df_plan_predicate_expr(filter.predicate(), &input_schema)
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
     let filter = DFFilter::try_new(predicate, Arc::clone(input))?;
     Ok(DFLogicalPlan::Filter(filter))
@@ -398,6 +423,7 @@ mod tests {
         ExpressionStructPatchBuilder, JunctionPredicateOp as KernelJunctionPredicateOp,
         MapData as KernelMapData, Predicate as KernelPredicate, StructData as KernelStructData,
     };
+    use delta_kernel::plans::ir::nodes::{DataSkippingStats, DataSkippingTarget};
     use delta_kernel::schema::{
         schema, ArrayType, DataType, MapType, SchemaRef, StructField, StructType,
     };
@@ -659,9 +685,8 @@ mod tests {
     #[test]
     fn filter_wraps_its_input_and_inherits_schema() {
         let input = input_with_schema(test_schema());
-        let filter = KernelFilter {
-            predicate: KernelPredicate::is_null(col!("a")).into(),
-        };
+        let filter =
+            KernelFilter::try_new(&test_schema(), KernelPredicate::is_null(col!("a"))).unwrap();
         let lowered = lower_operator(
             &KernelOperator::Filter(filter),
             std::slice::from_ref(&input),
@@ -675,14 +700,68 @@ mod tests {
         assert_eq!(lowered.schema(), input.schema());
     }
 
+    fn data_skipping_input_schema() -> StructType {
+        schema! {
+            nullable "stats": {
+                nullable "maxValues": { nullable "a": LONG },
+            },
+            not_null "is_add": BOOLEAN,
+        }
+    }
+
+    fn data_skipping_site(
+        keep: Option<KernelPredicate>,
+    ) -> delta_kernel::plans::ir::nodes::DataSkippingSite {
+        let input_schema = data_skipping_input_schema();
+        let stats = DataSkippingStats::try_new(
+            &input_schema,
+            Arc::new(schema! { nullable "a": LONG }),
+            Some(column_name!("stats")),
+            None,
+        )
+        .unwrap();
+        KernelDataSkippingSite::try_new(
+            &input_schema,
+            KernelPredicate::gt(col!("a"), kernel_lit(10i64)),
+            stats,
+            DataSkippingTarget::AddsOnly,
+            keep.map(Arc::new),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn data_skipping_without_portable_predicate_is_identity() {
+        let input = input_with_schema(data_skipping_input_schema());
+        let lowered = lower_operator(
+            &KernelOperator::DataSkipping(data_skipping_site(None)),
+            std::slice::from_ref(&input),
+        )
+        .unwrap();
+
+        assert_eq!(&lowered, input.as_ref());
+    }
+
+    #[test]
+    fn data_skipping_with_portable_predicate_lowers_to_filter() {
+        let input = input_with_schema(data_skipping_input_schema());
+        let keep = KernelPredicate::gt(col!("stats.maxValues.a"), kernel_lit(10i64));
+        let lowered = lower_operator(
+            &KernelOperator::DataSkipping(data_skipping_site(Some(keep))),
+            std::slice::from_ref(&input),
+        )
+        .unwrap();
+
+        assert!(matches!(lowered, DFLogicalPlan::Filter(_)));
+    }
+
     async fn execute_filter(
         rows: Vec<Vec<KernelScalar>>,
         predicate: KernelPredicate,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
         let input = Arc::new(lower_values_node(test_schema(), rows)?);
-        let filter = KernelFilter {
-            predicate: predicate.into(),
-        };
+        let filter = KernelFilter::try_new(&test_schema(), predicate)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
         execute(lower_operator(
             &KernelOperator::Filter(filter),
             std::slice::from_ref(&input),
@@ -816,9 +895,9 @@ mod tests {
     fn filter_rejects_wrong_input_count(#[case] actual: usize) {
         let input = input_with_schema(test_schema());
         let inputs = vec![input; actual];
-        let op = KernelOperator::Filter(KernelFilter {
-            predicate: KernelPredicate::is_null(col!("a")).into(),
-        });
+        let op = KernelOperator::Filter(
+            KernelFilter::try_new(&test_schema(), KernelPredicate::is_null(col!("a"))).unwrap(),
+        );
         let err = lower_operator(&op, &inputs).unwrap_err();
         assert!(
             err.to_string()
@@ -840,11 +919,11 @@ mod tests {
         schema: impl Into<SchemaRef>,
         parent: &Arc<DFLogicalPlan>,
     ) -> Result<DFLogicalPlan, DataFusionError> {
+        let input_schema: StructType = parent.schema().as_arrow().try_into_kernel()?;
+        let project = KernelProject::try_new(&input_schema, expr, schema)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
         lower_operator(
-            &KernelOperator::Project(KernelProject {
-                expr: expr.into(),
-                schema: schema.into(),
-            }),
+            &KernelOperator::Project(project),
             std::slice::from_ref(parent),
         )
     }
@@ -931,8 +1010,8 @@ mod tests {
             .drop("small")
             .drop("nested")
             .append(
-                StructField::nullable("sum", DataType::LONG),
-                col!("a") + KernelExpr::coalesce([col!("b"), kernel_lit(99i64)]),
+                StructField::nullable("selected", DataType::LONG),
+                KernelExpr::coalesce([col!("a"), col!("b")]),
             )
             .build()
             .unwrap()
@@ -941,7 +1020,10 @@ mod tests {
     fn nested_struct_patch_project() -> (SchemaRef, ExpressionRef) {
         let input = project_input_schema();
         ProjectionStructPatchBuilder::new_nested(&input, ["nested"])
-            .replace_expr("value", col!("nested.value") + kernel_lit(1i32))
+            .replace_expr(
+                "value",
+                KernelExpr::coalesce([col!("nested.value"), kernel_lit(0i32)]),
+            )
             .build()
             .unwrap()
     }
@@ -952,12 +1034,12 @@ mod tests {
     fn project_rejects_wrong_parent_count(#[case] actual: usize) {
         let parent = input_with_schema(test_schema());
         let parents = vec![parent; actual];
-        let op = KernelOperator::Project(KernelProject {
-            expr: KernelExpr::struct_from([col!("a")]).into(),
-            schema: Arc::new(
-                StructType::try_new([StructField::nullable("a", DataType::LONG)]).unwrap(),
-            ),
-        });
+        let output =
+            Arc::new(StructType::try_new([StructField::nullable("a", DataType::LONG)]).unwrap());
+        let op = KernelOperator::Project(
+            KernelProject::try_new(&test_schema(), KernelExpr::struct_from([col!("a")]), output)
+                .unwrap(),
+        );
         let err = lower_operator(&op, &parents).unwrap_err();
         assert!(
             err.to_string().contains(&format!(
@@ -1017,11 +1099,15 @@ mod tests {
         let output =
             StructType::try_new([StructField::nullable("projected", DataType::LONG)]).unwrap();
         let projected = Arc::new(
-            lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap(),
+            lower_project_expr(
+                KernelExpr::struct_from([col!("a")]),
+                output.clone(),
+                &parent,
+            )
+            .unwrap(),
         );
-        let filter = KernelFilter {
-            predicate: KernelPredicate::is_null(col!("projected")).into(),
-        };
+        let filter =
+            KernelFilter::try_new(&output, KernelPredicate::is_null(col!("projected"))).unwrap();
         let filtered = lower_operator(
             &KernelOperator::Filter(filter),
             std::slice::from_ref(&projected),
@@ -1091,7 +1177,7 @@ mod tests {
     )]
     #[case::malformed_patch(
         KernelExpr::struct_patch(ExpressionStructPatchBuilder::new()).unwrap(),
-        "produced more fields"
+        "produces too many fields"
     )]
     fn zero_field_project_rejects_invalid_expression(
         #[case] expr: KernelExpr,
@@ -1103,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn project_rejects_uncastable_output_type() {
+    fn project_rejects_output_type_mismatch_before_datafusion() {
         let parent = input_with_schema(test_schema());
         let output =
             StructType::try_new([StructField::nullable("a", DataType::unshredded_variant())])
@@ -1111,11 +1197,8 @@ mod tests {
         let err =
             lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap_err();
         let message = err.to_string();
-        assert!(matches!(&err, DataFusionError::Plan(_)), "{message}");
-        assert!(
-            message.contains("Cannot automatically convert"),
-            "{message}"
-        );
+        assert!(matches!(&err, DataFusionError::External(_)), "{message}");
+        assert!(message.contains("expected variant"), "{message}");
     }
 
     #[rstest]
@@ -1147,24 +1230,18 @@ mod tests {
             ),
         ]).unwrap()
     )]
-    fn project_casts_output_to_declared_type(
+    fn project_rejects_implicit_casts_at_plan_boundary(
         #[case] input: StructType,
         #[case] expr: KernelExpr,
         #[case] output: StructType,
     ) {
-        let expected: ArrowSchema = (&output).try_into_arrow().unwrap();
-        let expected_types: Vec<ArrowDataType> = expected
-            .fields()
-            .iter()
-            .map(|field| field.data_type().clone())
-            .collect();
         let parent = input_with_schema(input);
-        let lowered = lower_project_expr(expr, output, &parent).unwrap();
-        assert_eq!(output_types(&lowered), expected_types);
+        let error = lower_project_expr(expr, output, &parent).unwrap_err();
+        assert!(error.to_string().contains("expected"), "{error}");
     }
 
     #[rstest]
-    #[case::literal_column_and_cast(
+    #[case::literal_and_column(
         struct_project([
             (StructField::nullable("selected", DataType::LONG), col!("a")),
             (StructField::nullable("literal", DataType::STRING), kernel_lit("constant")),
@@ -1172,66 +1249,31 @@ mod tests {
                 StructField::nullable("null_value", DataType::LONG),
                 null_lit(DataType::LONG),
             ),
-            (StructField::nullable("widened", DataType::LONG), col!("small")),
+            (StructField::nullable("small", DataType::INTEGER), col!("small")),
         ]),
         &[
-            "+----------+----------+------------+---------+",
-            "| selected | literal  | null_value | widened |",
-            "+----------+----------+------------+---------+",
-            "| 10       | constant |            | 1       |",
-            "| 20       | constant |            | 2       |",
-            "|          | constant |            | 3       |",
-            "+----------+----------+------------+---------+",
+            "+----------+----------+------------+-------+",
+            "| selected | literal  | null_value | small |",
+            "+----------+----------+------------+-------+",
+            "| 10       | constant |            | 1     |",
+            "| 20       | constant |            | 2     |",
+            "|          | constant |            | 3     |",
+            "+----------+----------+------------+-------+",
         ]
     )]
-    #[case::arithmetic(
-        struct_project([
-            (StructField::nullable("sum", DataType::LONG), col!("a") + col!("b")),
-            (
-                StructField::nullable("difference", DataType::LONG),
-                col!("a") - col!("b"),
-            ),
-            (
-                StructField::nullable("product", DataType::LONG),
-                col!("a") * col!("b"),
-            ),
-            (
-                StructField::nullable("quotient", DataType::LONG),
-                col!("a") / col!("b"),
-            ),
-        ]),
+    #[case::coalesce(
+        struct_project([(
+            StructField::nullable("coalesced", DataType::LONG),
+            KernelExpr::coalesce([col!("b"), col!("a"), kernel_lit(99i64)]),
+        )]),
         &[
-            "+-----+------------+---------+----------+",
-            "| sum | difference | product | quotient |",
-            "+-----+------------+---------+----------+",
-            "| 12  | 8          | 20      | 5        |",
-            "|     |            |         |          |",
-            "|     |            |         |          |",
-            "+-----+------------+---------+----------+",
-        ]
-    )]
-    #[case::variadic(
-        struct_project([
-            (
-                StructField::nullable("coalesced", DataType::LONG),
-                KernelExpr::coalesce([col!("b"), col!("a"), kernel_lit(99i64)]),
-            ),
-            (
-                StructField::nullable(
-                    "array",
-                    ArrayType::new(DataType::LONG, true),
-                ),
-                KernelExpr::array([col!("a"), col!("b"), kernel_lit(5i64)]),
-            ),
-        ]),
-        &[
-            "+-----------+------------+",
-            "| coalesced | array      |",
-            "+-----------+------------+",
-            "| 2         | [10, 2, 5] |",
-            "| 20        | [20, , 5]  |",
-            "| 4         | [, 4, 5]   |",
-            "+-----------+------------+",
+            "+-----------+",
+            "| coalesced |",
+            "+-----------+",
+            "| 2         |",
+            "| 20        |",
+            "| 4         |",
+            "+-----------+",
         ]
     )]
     #[case::predicate(
@@ -1271,7 +1313,7 @@ mod tests {
             StructField::nullable(
                 "record",
                 StructType::try_new([
-                    StructField::nullable("value", DataType::LONG),
+                    StructField::nullable("value", DataType::INTEGER),
                     StructField::nullable("label", DataType::STRING),
                 ]).unwrap(),
             ),
@@ -1288,30 +1330,6 @@ mod tests {
             "| {value: 8, label: seen} |",
             "|                         |",
             "+-------------------------+",
-        ]
-    )]
-    #[case::array_of_structs(
-        struct_project([(
-            StructField::nullable(
-                "records",
-                ArrayType::new(
-                    StructType::try_new([StructField::nullable("value", DataType::LONG)]).unwrap(),
-                    true,
-                ),
-            ),
-            KernelExpr::array([
-                KernelExpr::struct_from([col!("a")]),
-                KernelExpr::struct_from([col!("b")]),
-            ]),
-        )]),
-        &[
-            "+---------------------------+",
-            "| records                   |",
-            "+---------------------------+",
-            "| [{value: 10}, {value: 2}] |",
-            "| [{value: 20}, {value: }]  |",
-            "| [{value: }, {value: 4}]   |",
-            "+---------------------------+",
         ]
     )]
     #[case::top_level_nullability(
@@ -1383,13 +1401,13 @@ mod tests {
     #[case::struct_patch(
         struct_patch_project(),
         &[
-            "+----+----+-----+",
-            "| a  | b  | sum |",
-            "+----+----+-----+",
-            "| 10 | 2  | 12  |",
-            "| 20 | 99 | 119 |",
-            "|    | 4  |     |",
-            "+----+----+-----+",
+            "+----+----+----------+",
+            "| a  | b  | selected |",
+            "+----+----+----------+",
+            "| 10 | 2  | 10       |",
+            "| 20 | 99 | 20       |",
+            "|    | 4  | 4        |",
+            "+----+----+----------+",
         ]
     )]
     #[case::nested_struct_patch(
@@ -1398,8 +1416,8 @@ mod tests {
             "+-------+",
             "| value |",
             "+-------+",
+            "| 7     |",
             "| 8     |",
-            "| 9     |",
             "|       |",
             "+-------+",
         ]
@@ -1415,22 +1433,16 @@ mod tests {
         assert_batches_eq!(expected, &batches);
     }
 
-    #[tokio::test]
-    async fn project_rejects_invalid_cast_value_during_execution() {
+    #[test]
+    fn project_rejects_implicit_cast_before_execution() {
         let input = StructType::try_new([StructField::nullable("a", DataType::STRING)]).unwrap();
         let parent = Arc::new(
             lower_values_node(input, vec![vec![KernelScalar::String("abc".into())]]).unwrap(),
         );
         let output = StructType::try_new([StructField::nullable("a", DataType::INTEGER)]).unwrap();
-        let lowered =
-            lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap();
-
-        let err = execute(lowered).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Cannot cast string 'abc' to value of Int32 type"),
-            "{err}"
-        );
+        let error =
+            lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap_err();
+        assert!(error.to_string().contains("expected integer"), "{error}");
     }
 
     #[test]
@@ -1496,12 +1508,21 @@ mod tests {
         let expected: ArrowSchema = (&schema).try_into_arrow().unwrap();
         let expected_type = expected.field(0).data_type().clone();
         let parent = input_with_schema(schema.clone());
-        let lowered =
-            lower_project_expr(KernelExpr::struct_from([col!("a")]), schema, &parent).unwrap();
+        let project = KernelProject::try_new(
+            &schema,
+            KernelExpr::struct_from([col!("a")]),
+            schema.clone(),
+        )
+        .unwrap();
+        let lowered = lower_operator(
+            &KernelOperator::Project(project),
+            std::slice::from_ref(&parent),
+        )
+        .unwrap();
         assert_eq!(output_types(&lowered), [expected_type]);
     }
 
-    /// Errors from converting a Project's child expression propagate to the caller.
+    /// Unsupported broad expressions are rejected while constructing the Project.
     #[test]
     fn project_propagates_expression_conversion_error() {
         let parent = input_with_schema(test_schema());
@@ -1511,7 +1532,7 @@ mod tests {
         let message = err.to_string();
         assert!(matches!(&err, DataFusionError::External(_)), "{message}");
         assert!(
-            message.contains(r#"cannot convert Unknown expression "engine_expr""#),
+            message.contains("Unknown is not part of the mandatory plan expression dialect"),
             "{message}"
         );
     }

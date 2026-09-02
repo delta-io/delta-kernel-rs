@@ -17,9 +17,13 @@ use crate::expressions::{
     OpaquePredicate, ParseJsonExpression, Predicate, Scalar, StructData, UnaryExpression,
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
+use crate::plans::ir::expression::{
+    PlanComparison, PlanExpression, PlanExpressionKind, PlanExpressionRef, PlanFieldPatch,
+    PlanPredicate, PlanPredicateKind, PlanPredicateRef, PlanStructPatch,
+};
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
-    ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, DataSkippingSite, DataSkippingStats, DataSkippingTarget, DynamicScan, FileType,
+    Filter, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -47,6 +51,20 @@ where
     E: AsRef<Expression>,
 {
     items.iter().map(|e| e.as_ref().into()).collect()
+}
+
+fn convert_plan_expr_vec(items: &[PlanExpressionRef]) -> Vec<proto_expr::PlanExpression> {
+    items
+        .iter()
+        .map(|expression| expression.as_ref().into())
+        .collect()
+}
+
+fn convert_plan_predicate_vec(items: &[PlanPredicateRef]) -> Vec<proto_expr::PlanPredicate> {
+    items
+        .iter()
+        .map(|predicate| predicate.as_ref().into())
+        .collect()
 }
 
 // === Operation / IoOperation to Proto ===
@@ -124,7 +142,7 @@ impl From<&FileMeta> for proto_plan::FileMeta {
 impl From<&Plan> for proto_plan::Plan {
     fn from(plan: &Plan) -> Self {
         proto_plan::Plan {
-            nodes: convert_vec(&plan.nodes),
+            nodes: convert_vec(plan.nodes()),
         }
     }
 }
@@ -132,8 +150,8 @@ impl From<&Plan> for proto_plan::Plan {
 impl From<&PlanNode> for proto_plan::PlanNode {
     fn from(node: &PlanNode) -> Self {
         proto_plan::PlanNode {
-            op: Some((&node.op).into()),
-            inputs: node.inputs.iter().map(|&i| i as u32).collect(),
+            op: Some(node.operator().into()),
+            inputs: node.inputs().iter().map(|&i| i as u32).collect(),
         }
     }
 }
@@ -147,6 +165,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Values(n) => Op::Values(n.into()),
             Operator::Project(n) => Op::Project(n.into()),
             Operator::Filter(n) => Op::Filter(n.into()),
+            Operator::DataSkipping(n) => Op::DataSkipping(n.into()),
             Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
@@ -204,8 +223,8 @@ impl From<&Values> for proto_plan::ValuesNode {
 impl From<&Project> for proto_plan::ProjectNode {
     fn from(node: &Project) -> Self {
         proto_plan::ProjectNode {
-            expr: Some(node.expr.as_ref().into()),
-            schema: Some(node.schema.as_ref().into()),
+            expr: Some(node.expression().as_ref().into()),
+            schema: Some(node.schema().as_ref().into()),
         }
     }
 }
@@ -213,7 +232,45 @@ impl From<&Project> for proto_plan::ProjectNode {
 impl From<&Filter> for proto_plan::FilterNode {
     fn from(node: &Filter) -> Self {
         proto_plan::FilterNode {
-            predicate: Some(node.predicate.as_ref().into()),
+            predicate: Some(node.predicate().as_ref().into()),
+        }
+    }
+}
+
+impl From<&DataSkippingSite> for proto_plan::DataSkippingNode {
+    fn from(site: &DataSkippingSite) -> Self {
+        Self {
+            source_predicate: Some(site.source_predicate().as_ref().into()),
+            stats: Some(site.stats().into()),
+            target: Some(site.target().into()),
+            kernel_keep_predicate: site
+                .kernel_keep_predicate()
+                .map(|predicate| predicate.as_ref().into()),
+        }
+    }
+}
+
+impl From<&DataSkippingStats> for proto_plan::DataSkippingStats {
+    fn from(stats: &DataSkippingStats) -> Self {
+        Self {
+            source_schema: Some(stats.source_schema().as_ref().into()),
+            stats_column: stats.stats_column().map(|column| column.name().into()),
+            partition_values_column: stats
+                .partition_values_column()
+                .map(|column| column.name().into()),
+        }
+    }
+}
+
+impl From<&DataSkippingTarget> for proto_plan::DataSkippingTarget {
+    fn from(target: &DataSkippingTarget) -> Self {
+        use proto_plan::data_skipping_target::Target;
+        let target = match target {
+            DataSkippingTarget::AddsOnly => Target::AddsOnly(true),
+            DataSkippingTarget::MixedActions { is_add } => Target::IsAdd(is_add.name().into()),
+        };
+        Self {
+            target: Some(target),
         }
     }
 }
@@ -299,6 +356,118 @@ impl From<FileType> for proto_plan::FileType {
 
 // === Expressions to Proto ===
 
+impl From<&PlanExpression> for proto_expr::PlanExpression {
+    fn from(expression: &PlanExpression) -> Self {
+        use proto_expr::plan_expression::Kind;
+        let kind = match expression.kind() {
+            PlanExpressionKind::Literal(scalar) => Kind::Literal(scalar.into()),
+            PlanExpressionKind::Column(column) => Kind::Column(column.name().into()),
+            PlanExpressionKind::Predicate(predicate) => Kind::Predicate(Box::new(predicate.into())),
+            PlanExpressionKind::Struct {
+                fields,
+                nullability,
+            } => Kind::StructExpr(Box::new(proto_expr::PlanStructExpression {
+                fields: convert_plan_expr_vec(fields),
+                nullability: nullability.map(|expression| Box::new(expression.into())),
+            })),
+            PlanExpressionKind::StructPatch(patch) => Kind::StructPatch(patch.into()),
+            PlanExpressionKind::Coalesce(expressions) => Kind::Coalesce(proto_expr::PlanCoalesce {
+                expressions: convert_plan_expr_vec(expressions),
+            }),
+            PlanExpressionKind::ParseJson {
+                json,
+                output_schema,
+            } => Kind::ParseJson(Box::new(proto_expr::PlanParseJson {
+                json: Some(Box::new(json.into())),
+                output_schema: Some(output_schema.as_ref().into()),
+            })),
+            PlanExpressionKind::MapToStruct { map, output_schema } => {
+                Kind::MapToStruct(Box::new(proto_expr::PlanMapToStruct {
+                    map: Some(Box::new(map.into())),
+                    output_schema: Some(output_schema.into()),
+                }))
+            }
+        };
+        Self {
+            data_type: Some(expression.data_type().into()),
+            nullable: expression.is_nullable(),
+            kind: Some(kind),
+        }
+    }
+}
+
+impl From<&PlanPredicate> for proto_expr::PlanPredicate {
+    fn from(predicate: &PlanPredicate) -> Self {
+        use proto_expr::plan_predicate::Kind;
+        let kind = match predicate.kind() {
+            PlanPredicateKind::Boolean(expression) => {
+                Kind::BooleanExpression(Box::new(expression.into()))
+            }
+            PlanPredicateKind::Not(inner) => Kind::Not(Box::new(inner.into())),
+            PlanPredicateKind::IsNull {
+                expression,
+                inverted,
+            } => Kind::IsNull(Box::new(proto_expr::PlanIsNull {
+                expression: Some(Box::new(expression.into())),
+                inverted,
+            })),
+            PlanPredicateKind::Compare { op, left, right } => {
+                Kind::Compare(Box::new(proto_expr::PlanCompare {
+                    op: proto_expr::PlanComparison::from(op) as i32,
+                    left: Some(Box::new(left.into())),
+                    right: Some(Box::new(right.into())),
+                }))
+            }
+            PlanPredicateKind::And(predicates) => Kind::And(proto_expr::PlanJunction {
+                predicates: convert_plan_predicate_vec(predicates),
+            }),
+            PlanPredicateKind::Or(predicates) => Kind::Or(proto_expr::PlanJunction {
+                predicates: convert_plan_predicate_vec(predicates),
+            }),
+        };
+        Self {
+            nullable: predicate.is_nullable(),
+            kind: Some(kind),
+        }
+    }
+}
+
+impl From<&PlanStructPatch> for proto_expr::PlanStructPatch {
+    fn from(patch: &PlanStructPatch) -> Self {
+        Self {
+            input_path: patch.input_path().map(Into::into),
+            field_patches: patch
+                .field_patches()
+                .iter()
+                .map(|(name, patch)| (name.clone(), patch.into()))
+                .collect(),
+            prepended_fields: convert_plan_expr_vec(patch.prepended_fields()),
+            appended_fields: convert_plan_expr_vec(patch.appended_fields()),
+        }
+    }
+}
+
+impl From<&PlanFieldPatch> for proto_expr::PlanFieldPatch {
+    fn from(patch: &PlanFieldPatch) -> Self {
+        Self {
+            keep_input: patch.keeps_input(),
+            insertions: convert_plan_expr_vec(patch.insertions()),
+            optional: patch.is_optional(),
+        }
+    }
+}
+
+impl From<PlanComparison> for proto_expr::PlanComparison {
+    fn from(comparison: PlanComparison) -> Self {
+        match comparison {
+            PlanComparison::LessThan => Self::LessThan,
+            PlanComparison::GreaterThan => Self::GreaterThan,
+            PlanComparison::Equal => Self::Equal,
+            PlanComparison::Distinct => Self::Distinct,
+        }
+    }
+}
+
 impl From<&Expression> for proto_expr::Expression {
     fn from(expr: &Expression) -> Self {
         use proto_expr::expression::Kind;
@@ -324,8 +493,10 @@ impl From<&Expression> for proto_expr::Expression {
             Expression::MapToStruct(map_to_struct) => {
                 Kind::MapToStruct(Box::new(map_to_struct.into()))
             }
-            // No proto cast node yet; serialize as an opaque unknown.
-            Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
+            Expression::Cast(cast) => Kind::Cast(Box::new(proto_expr::CastExpression {
+                expr: Some(Box::new(cast.expr.as_ref().into())),
+                target: Some((&cast.target).into()),
+            })),
         };
         proto_expr::Expression { kind: Some(kind) }
     }
@@ -966,8 +1137,6 @@ impl TryFrom<proto_schema::MetadataValue> for MetadataValue {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use bytes::Bytes;
     use rstest::rstest;
     use url::Url;
@@ -986,8 +1155,9 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
-        ScanParquet, SemiJoin, UnionAll, Values,
+        Agg, Aggregate, DataSkippingSite, DataSkippingStats, DataSkippingTarget, DynamicScan,
+        FileType, Filter, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll,
+        Values,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1068,7 +1238,7 @@ mod tests {
     }
 
     fn decode(op: &Operation) -> proto_op::Operation {
-        let bytes = op.to_proto_bytes();
+        let bytes = op.to_proto_bytes().unwrap();
         prost::Message::decode(bytes.as_slice()).expect("decode succeeds")
     }
 
@@ -1104,7 +1274,10 @@ mod tests {
         Operation::IoOperation(IoOperation::head_file(Url::parse("memory:///h").unwrap())),
         "io"
     )]
-    #[case(Operation::QueryPlan(Plan { nodes: vec![] }), "query_plan")]
+    #[case(Operation::QueryPlan(Plan::try_new(vec![PlanNode::new(
+        Values::new(sample_schema(), vec![]),
+        vec![],
+    )]).unwrap()), "query_plan")]
     fn from_operation(#[case] op: Operation, #[case] expected: &str) {
         use proto_op::operation::Op;
         let kind = match decode(&op).op.unwrap() {
@@ -1220,24 +1393,23 @@ mod tests {
             nullable "id": INTEGER,
             not_null "name": STRING,
         };
-        let plan = Plan {
-            nodes: vec![
-                PlanNode {
-                    op: Operator::ScanParquet(ScanParquet {
-                        files: vec![ScanFile::new(sample_file_meta())],
-                        file_constant_columns: vec![],
-                        schema: schema.clone(),
-                    }),
-                    inputs: vec![],
-                },
-                PlanNode {
-                    op: Operator::Filter(Filter {
-                        predicate: Arc::new(Predicate::gt(col!("id"), lit(5i32))),
-                    }),
-                    inputs: vec![0],
-                },
-            ],
-        };
+        let plan = Plan::try_new(vec![
+            PlanNode::new(
+                Operator::ScanParquet(ScanParquet {
+                    files: vec![ScanFile::new(sample_file_meta())],
+                    file_constant_columns: vec![],
+                    schema: schema.clone(),
+                }),
+                vec![],
+            ),
+            PlanNode::new(
+                Operator::Filter(
+                    Filter::try_new(&schema, Predicate::gt(col!("id"), lit(5i32))).unwrap(),
+                ),
+                vec![0],
+            ),
+        ])
+        .unwrap();
 
         let Some(proto_op::operation::Op::QueryPlan(plan)) = decode(&Operation::QueryPlan(plan)).op
         else {
@@ -1264,13 +1436,56 @@ mod tests {
             panic!("expected Filter");
         };
         let predicate = filter.predicate.as_ref().unwrap();
-        let Some(proto_expr::predicate::Kind::Binary(binary)) = &predicate.kind else {
-            panic!("expected a binary predicate");
+        let Some(proto_expr::plan_predicate::Kind::Compare(compare)) = &predicate.kind else {
+            panic!("expected a resolved comparison predicate");
         };
-        assert_eq!(binary.op, proto_expr::BinaryPredicateOp::GreaterThan as i32);
+        assert_eq!(compare.op, proto_expr::PlanComparison::GreaterThan as i32);
         assert!(matches!(
-            binary.left.as_ref().unwrap().kind,
-            Some(proto_expr::expression::Kind::Column(_))
+            compare.left.as_ref().unwrap().kind,
+            Some(proto_expr::plan_expression::Kind::Column(_))
+        ));
+    }
+
+    #[test]
+    fn data_skipping_source_divide_is_serialized_as_optional_analysis_input() {
+        let stats_type = schema! {
+            nullable "maxValues": { nullable "x": LONG },
+        };
+        let input_schema = schema_ref! {
+            nullable "stats": (stats_type),
+            not_null "is_add": BOOLEAN,
+        };
+        let source_schema = schema_ref! { nullable "x": LONG };
+        let source_predicate = Predicate::gt(
+            Expression::binary(BinaryExpressionOp::Divide, col!("x"), lit(2i64)),
+            lit(50i64),
+        );
+        let stats = DataSkippingStats::try_new(
+            &input_schema,
+            source_schema,
+            Some(column_name!("stats")),
+            None,
+        )
+        .unwrap();
+        let target =
+            DataSkippingTarget::mixed_actions(&input_schema, column_name!("is_add")).unwrap();
+        let site = DataSkippingSite::try_new(&input_schema, source_predicate, stats, target, None)
+            .unwrap();
+
+        let proto = proto_plan::DataSkippingNode::from(&site);
+        let source = proto.source_predicate.unwrap();
+        let proto_expr::predicate::Kind::Binary(comparison) = source.kind.unwrap() else {
+            panic!("expected source comparison");
+        };
+        let proto_expr::expression::Kind::Binary(divide) = comparison.left.unwrap().kind.unwrap()
+        else {
+            panic!("expected source divide");
+        };
+        assert_eq!(divide.op, proto_expr::BinaryExpressionOp::Divide as i32);
+        assert!(proto.kernel_keep_predicate.is_none());
+        assert!(matches!(
+            proto.target.unwrap().target,
+            Some(proto_plan::data_skipping_target::Target::IsAdd(_))
         ));
     }
 
@@ -1293,13 +1508,17 @@ mod tests {
     )]
     #[case(Operator::Values(Values { schema: sample_schema(), rows: vec![] }), "values")]
     #[case(
-        Operator::Project(Project {
-            expr: Arc::new(Expression::struct_from([lit(1)])),
-            schema: sample_schema(),
-        }),
+        Operator::Project(
+            Project::try_new(
+                &sample_schema(),
+                Expression::struct_from([lit(1)]),
+                sample_schema(),
+            )
+            .unwrap(),
+        ),
         "project"
     )]
-    #[case(Operator::Filter(Filter { predicate: Arc::new(Predicate::TRUE) }), "filter")]
+    #[case(Operator::Filter(Filter::try_new(&sample_schema(), Predicate::TRUE).unwrap()), "filter")]
     #[case(
         Operator::DynamicScan(DynamicScan {
             schema: sample_schema(),
@@ -1334,6 +1553,7 @@ mod tests {
             Op::Values(_) => "values",
             Op::Project(_) => "project",
             Op::Filter(_) => "filter",
+            Op::DataSkipping(_) => "data_skipping",
             Op::DynamicScan(_) => "dynamic_scan",
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
@@ -1393,22 +1613,33 @@ mod tests {
 
     #[test]
     fn from_project() {
-        let node = Project {
-            expr: Arc::new(Expression::struct_from([lit(1)])),
-            schema: sample_schema(),
-        };
+        let node = Project::try_new(
+            &sample_schema(),
+            Expression::struct_from([lit(1)]),
+            sample_schema(),
+        )
+        .unwrap();
         let proto = proto_plan::ProjectNode::from(&node);
-        assert!(proto.expr.is_some());
+        let expression = proto.expr.unwrap();
+        assert!(expression.data_type.is_some());
+        assert!(!expression.nullable);
+        assert!(matches!(
+            expression.kind,
+            Some(proto_expr::plan_expression::Kind::StructExpr(_))
+        ));
         assert!(proto.schema.is_some());
     }
 
     #[test]
     fn from_filter() {
-        let node = Filter {
-            predicate: Arc::new(Predicate::TRUE),
-        };
+        let node = Filter::try_new(&sample_schema(), Predicate::TRUE).unwrap();
         let proto = proto_plan::FilterNode::from(&node);
-        assert!(proto.predicate.is_some());
+        let predicate = proto.predicate.unwrap();
+        assert!(!predicate.nullable);
+        assert!(matches!(
+            predicate.kind,
+            Some(proto_expr::plan_predicate::Kind::BooleanExpression(_))
+        ));
     }
 
     fn sample_dynamic_scan_input_schema() -> SchemaRef {
@@ -1575,6 +1806,7 @@ mod tests {
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
     #[case(Expression::map_to_struct(col!("m")), "map_to_struct")]
     #[case(Expression::unknown("x"), "unknown")]
+    #[case(Expression::cast(col!("a"), DataType::LONG), "cast")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
         let kind = match proto_expr::Expression::from(&expr).kind.unwrap() {
@@ -1591,6 +1823,7 @@ mod tests {
             Kind::ParseJson(_) => "parse_json",
             Kind::MapToStruct(_) => "map_to_struct",
             Kind::Unknown(_) => "unknown",
+            Kind::Cast(_) => "cast",
         };
         assert_eq!(kind, expected);
     }
@@ -1663,6 +1896,23 @@ mod tests {
         assert_eq!(binary.op, proto_expr::BinaryExpressionOp::Plus as i32);
         assert!(binary.left.is_some());
         assert!(binary.right.is_some());
+    }
+
+    #[test]
+    fn from_cast_expression_preserves_child_and_target() {
+        let proto_expr::expression::Kind::Cast(cast) =
+            expr_kind_of(Expression::cast(col!("a"), DataType::LONG))
+        else {
+            panic!("expected a cast expression");
+        };
+        assert!(matches!(
+            cast.expr.unwrap().kind,
+            Some(proto_expr::expression::Kind::Column(_))
+        ));
+        assert_eq!(
+            DataType::try_from(cast.target.unwrap()).unwrap(),
+            DataType::LONG
+        );
     }
 
     #[test]

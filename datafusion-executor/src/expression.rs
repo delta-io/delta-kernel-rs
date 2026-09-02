@@ -20,6 +20,9 @@ use delta_kernel::expressions::{
     ExpressionStructPatch, MapToStructExpression, ParseJsonExpression, UnaryExpressionOp,
     VariadicExpression, VariadicExpressionOp,
 };
+use delta_kernel::plans::ir::expression::{
+    PlanExpression, PlanExpressionKind, PlanExpressionRef, PlanStructPatch,
+};
 use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
     StructType,
@@ -86,6 +89,202 @@ pub fn to_df_expr(
             "cannot convert Unknown expression {name:?}"
         ))),
     }
+}
+
+/// Converts a resolved plan expression into its DataFusion equivalent.
+///
+/// Unlike [`to_df_expr`], this function does not infer result types or thread an expected type
+/// through the tree. Kernel has already resolved every child and rejected expressions outside the
+/// mandatory plan dialect before constructing the plan.
+///
+/// # Errors
+///
+/// Returns an error when a scalar has no Arrow representation or DataFusion cannot construct the
+/// equivalent expression. Structural inconsistencies indicate an invalid resolved plan.
+pub(crate) fn to_df_plan_expr(
+    expr: &PlanExpression,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
+    match expr.kind() {
+        PlanExpressionKind::Literal(scalar) => Ok(lit(to_df_scalar(scalar)?)),
+        PlanExpressionKind::Column(column) => column_to_df_expr(column.name(), input_schema),
+        PlanExpressionKind::Predicate(predicate) => {
+            crate::predicate::to_df_plan_predicate_expr(predicate, input_schema)
+        }
+        PlanExpressionKind::Struct {
+            fields,
+            nullability,
+        } => {
+            let target = plan_struct_type(expr, "Struct")?;
+            Ok(plan_struct_columns_from_fields(fields, nullability, input_schema, target)?.pack())
+        }
+        PlanExpressionKind::StructPatch(patch) => {
+            let target = plan_struct_type(expr, "StructPatch")?;
+            Ok(plan_struct_columns_from_patch(patch, input_schema, target)?.pack())
+        }
+        PlanExpressionKind::Coalesce(expressions) => {
+            let args = expressions
+                .iter()
+                .map(|expression| to_df_plan_expr(expression, input_schema))
+                .collect::<DeltaResult<Vec<_>>>()?;
+            Ok(coalesce(args))
+        }
+        PlanExpressionKind::ParseJson {
+            json,
+            output_schema,
+        } => {
+            let json = to_df_plan_expr(json, input_schema)?;
+            let udf = ScalarUDF::new_from_impl(ParseJsonUdf::try_new(Arc::clone(output_schema))?);
+            Ok(udf.call(vec![json]))
+        }
+        PlanExpressionKind::MapToStruct { map, output_schema } => {
+            let map = to_df_plan_expr(map, input_schema)?;
+            map_to_struct_from_parts(map, output_schema)
+        }
+    }
+}
+
+/// Flattens a resolved top-level struct projection into named DataFusion columns.
+///
+/// # Errors
+///
+/// Returns an error if `expr` is not a struct constructor or struct patch, or a child cannot be
+/// converted to DataFusion.
+pub(crate) fn to_df_plan_struct_columns(
+    expr: &PlanExpression,
+    input_schema: &StructType,
+) -> DeltaResult<StructColumns> {
+    match expr.kind() {
+        PlanExpressionKind::Struct {
+            fields,
+            nullability,
+        } => plan_struct_columns_from_fields(
+            fields,
+            nullability,
+            input_schema,
+            plan_struct_type(expr, "Struct")?,
+        ),
+        PlanExpressionKind::StructPatch(patch) => plan_struct_columns_from_patch(
+            patch,
+            input_schema,
+            plan_struct_type(expr, "StructPatch")?,
+        ),
+        _ => Err(Error::internal_error(
+            "resolved Project expression is not a Struct or StructPatch",
+        )),
+    }
+}
+
+fn plan_struct_type<'a>(expr: &'a PlanExpression, arm: &str) -> DeltaResult<&'a StructType> {
+    let KernelDataType::Struct(schema) = expr.data_type() else {
+        return Err(Error::internal_error(format!(
+            "resolved {arm} expression does not have a struct type"
+        )));
+    };
+    Ok(schema)
+}
+
+fn plan_struct_columns_from_fields(
+    fields: &[PlanExpressionRef],
+    nullability: Option<&PlanExpression>,
+    input_schema: &StructType,
+    target: &StructType,
+) -> DeltaResult<StructColumns> {
+    if fields.len() != target.num_fields() {
+        return Err(Error::internal_error(
+            "resolved Struct field count does not match its output schema",
+        ));
+    }
+    let pairs = fields
+        .iter()
+        .zip(target.fields())
+        .map(|(child, field)| {
+            Ok((
+                field.name().to_string(),
+                to_df_plan_expr(child, input_schema)?,
+            ))
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let null_guard = nullability
+        .map(|guard| to_df_plan_expr(guard, input_schema))
+        .transpose()?;
+    Ok(StructColumns { pairs, null_guard })
+}
+
+fn plan_struct_columns_from_patch(
+    patch: &PlanStructPatch,
+    input_schema: &StructType,
+    target: &StructType,
+) -> DeltaResult<StructColumns> {
+    let (source_struct, source_expr) = match patch.input_path() {
+        Some(path) => {
+            let KernelDataType::Struct(nested) = input_schema.field_at(path)?.data_type() else {
+                return Err(Error::internal_error(
+                    "resolved StructPatch input is not a struct",
+                ));
+            };
+            (
+                nested.as_ref(),
+                Some(column_to_df_expr(path, input_schema)?),
+            )
+        }
+        None => (input_schema, None),
+    };
+    let null_guard = source_expr.as_ref().map(|base| base.clone().is_not_null());
+    let mut output_fields = target.fields();
+    let mut pairs = Vec::with_capacity(target.num_fields());
+
+    let append_resolved = |pairs: &mut Vec<(String, DFExpr)>,
+                           output_fields: &mut dyn Iterator<Item = &StructField>,
+                           expression: &PlanExpression|
+     -> DeltaResult<()> {
+        let field = output_fields.next().ok_or_else(|| {
+            Error::internal_error("resolved StructPatch produces too many fields")
+        })?;
+        pairs.push((
+            field.name().to_string(),
+            to_df_plan_expr(expression, input_schema)?,
+        ));
+        Ok(())
+    };
+    let append_existing = |pairs: &mut Vec<(String, DFExpr)>,
+                           output_fields: &mut dyn Iterator<Item = &StructField>,
+                           name: &str|
+     -> DeltaResult<()> {
+        let field = output_fields.next().ok_or_else(|| {
+            Error::internal_error("resolved StructPatch produces too many fields")
+        })?;
+        let value = match &source_expr {
+            Some(base) => get_field(base.clone(), name.to_string()),
+            None => DFExpr::Column(DFColumn::new_unqualified(name)),
+        };
+        pairs.push((field.name().to_string(), value));
+        Ok(())
+    };
+
+    for expression in patch.prepended_fields() {
+        append_resolved(&mut pairs, &mut output_fields, expression)?;
+    }
+    for input_field in source_struct.fields() {
+        let field_patch = patch.field_patches().get(input_field.name());
+        if field_patch.is_none_or(|field_patch| field_patch.keeps_input()) {
+            append_existing(&mut pairs, &mut output_fields, input_field.name())?;
+        }
+        if let Some(field_patch) = field_patch {
+            for expression in field_patch.insertions() {
+                append_resolved(&mut pairs, &mut output_fields, expression)?;
+            }
+        }
+    }
+    for expression in patch.appended_fields() {
+        append_resolved(&mut pairs, &mut output_fields, expression)?;
+    }
+    if output_fields.next().is_some() {
+        return Err(Error::internal_error(
+            "resolved StructPatch produces fewer fields than its output schema",
+        ));
+    }
+    Ok(StructColumns { pairs, null_guard })
 }
 
 /// Lowers [`KernelExpression::Struct`] or [`KernelExpression::StructPatch`] into named child
@@ -417,6 +616,10 @@ fn map_to_struct_to_df_expr(
     let target = require_struct_output(output_type, "MapToStruct")?;
     let map = to_df_expr(&map_to_struct.map_expr, input_schema, None)?;
 
+    map_to_struct_from_parts(map, target)
+}
+
+fn map_to_struct_from_parts(map: DFExpr, target: &StructType) -> DeltaResult<DFExpr> {
     let mut args = Vec::with_capacity(target.num_fields() * 2);
     for field in target.fields() {
         let KernelDataType::Primitive(prim) = field.data_type() else {

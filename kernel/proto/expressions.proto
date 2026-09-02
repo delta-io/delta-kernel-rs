@@ -1,9 +1,10 @@
-// Proto mirror of `kernel/src/expressions/mod.rs` + `scalars.rs` (the Rust IR is the source
-// of truth for these shapes).
+// Expression wire types. The broad Expression/Predicate messages describe source syntax and
+// optional analysis input. Mandatory query-plan execution uses only the closed PlanExpression and
+// PlanPredicate messages below.
 //
-// Opaque{Expression,Predicate} and Unknown are escape hatches: kernel-rs can't serialise the
-// opaque trait objects, and Unknown is the "do not silently interpret" marker. They appear
-// here so the grammar is total, but engines MUST error on them, not produce NULL.
+// Opaque nodes carry a name rather than a Rust callback. An optional optimizer may use one only
+// when it recognizes the exact engine-owned operation; otherwise it must keep all candidate rows.
+// Unknown nodes are never executable.
 
 syntax = "proto3";
 
@@ -120,6 +121,97 @@ message ColumnName {
 }
 
 // ============================================================================
+// Resolved declarative-plan language
+// ============================================================================
+
+// These messages define every expression used for mandatory plan execution. They deliberately
+// exclude arithmetic, casts, arrays, IN, opaque callbacks, and unknown placeholders. A
+// DataSkippingNode may separately carry a broad Predicate as optional analysis input.
+
+enum PlanComparison {
+  PLAN_COMPARISON_UNSPECIFIED = 0;
+  PLAN_COMPARISON_LESS_THAN = 1;
+  PLAN_COMPARISON_GREATER_THAN = 2;
+  PLAN_COMPARISON_EQUAL = 3;
+  PLAN_COMPARISON_DISTINCT = 4;
+}
+
+message PlanStructExpression {
+  repeated PlanExpression fields = 1;
+  PlanExpression nullability = 2;
+}
+
+message PlanFieldPatch {
+  bool keep_input = 1;
+  repeated PlanExpression insertions = 2;
+  bool optional = 3;
+}
+
+message PlanStructPatch {
+  ColumnName input_path = 1;
+  map<string, PlanFieldPatch> field_patches = 2;
+  repeated PlanExpression prepended_fields = 3;
+  repeated PlanExpression appended_fields = 4;
+}
+
+message PlanCoalesce {
+  repeated PlanExpression expressions = 1;
+}
+
+message PlanParseJson {
+  PlanExpression json = 1;
+  delta.kernel.schema.StructType output_schema = 2;
+}
+
+message PlanMapToStruct {
+  PlanExpression map = 1;
+  delta.kernel.schema.StructType output_schema = 2;
+}
+
+message PlanIsNull {
+  PlanExpression expression = 1;
+  bool inverted = 2;
+}
+
+message PlanCompare {
+  PlanComparison op = 1;
+  PlanExpression left = 2;
+  PlanExpression right = 3;
+}
+
+message PlanJunction {
+  repeated PlanPredicate predicates = 1;
+}
+
+message PlanPredicate {
+  // Whether this predicate can evaluate to SQL unknown.
+  bool nullable = 1;
+  oneof kind {
+    PlanExpression boolean_expression = 2;
+    PlanPredicate not = 3;
+    PlanIsNull is_null = 4;
+    PlanCompare compare = 5;
+    PlanJunction and = 6;
+    PlanJunction or = 7;
+  }
+}
+
+message PlanExpression {
+  delta.kernel.schema.DataType data_type = 1;
+  bool nullable = 2;
+  oneof kind {
+    Scalar literal = 3;
+    ColumnName column = 4;
+    PlanPredicate predicate = 5;
+    PlanStructExpression struct_expr = 6;
+    PlanStructPatch struct_patch = 7;
+    PlanCoalesce coalesce = 8;
+    PlanParseJson parse_json = 9;
+    PlanMapToStruct map_to_struct = 10;
+  }
+}
+
+// ============================================================================
 // Composite expression bodies
 // ============================================================================
 
@@ -152,6 +244,11 @@ message ParseJsonExpression {
 
 message MapToStructExpression {
   Expression map_expr = 1;
+}
+
+message CastExpression {
+  Expression expr = 1;
+  delta.kernel.schema.DataType target = 2;
 }
 
 // `nullability_predicate` is optional: when set and it evaluates to false/null, the whole
@@ -239,5 +336,6 @@ message Expression {
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;
     string unknown = 13;
+    CastExpression cast = 14;
   }
 }
