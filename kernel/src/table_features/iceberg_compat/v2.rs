@@ -7,6 +7,8 @@ use super::{
 use crate::schema::DataType;
 use crate::schema::PrimitiveType::*;
 use crate::table_configuration::TableConfiguration;
+use crate::table_features::TableFeature;
+use crate::transforms::SchemaTransform as _;
 use crate::DeltaResult;
 
 /// V2 invariants paired with the version constant. Fed to
@@ -19,6 +21,7 @@ pub(crate) const V2_VALIDATOR: IcebergCompatValidator = IcebergCompatValidator {
 const V2_CHECKS: &[IcebergCompatCheck] = &[
     IcebergCompatCheck::always(check_v2_supported_types),
     IcebergCompatCheck::always(check_no_legacy_nested_ids),
+    IcebergCompatCheck::write_only(iceberg_compat_v2_type_changes_validation),
 ];
 
 fn is_v2_supported_type(dt: &DataType) -> bool {
@@ -49,6 +52,29 @@ fn check_v2_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
         is_v2_supported_type,
         IcebergCompatVersion::V2.as_table_feature().as_ref(),
     )
+}
+
+/// Validates that historical type changes on an IcebergCompatV2 table are compatible with Iceberg
+/// schema evolution rules.
+///
+/// This is a write-side guard because unsupported type changes do not prevent Delta reads. They
+/// only violate the IcebergCompatV2 writer contract that the table remains convertible to Iceberg.
+///
+/// # Errors
+///
+/// Returns an error if `delta.typeChanges` metadata is malformed, or if any recorded type change
+/// is outside Iceberg V2's allowed widening list.
+pub(crate) fn iceberg_compat_v2_type_changes_validation(
+    tc: &TableConfiguration,
+) -> DeltaResult<()> {
+    if !tc.is_feature_supported(&TableFeature::TypeWidening)
+        && !tc.is_feature_supported(&TableFeature::TypeWideningPreview)
+    {
+        return Ok(());
+    }
+
+    let mut validator = super::TypeChangesValidator { path: vec![] };
+    validator.transform_struct(tc.logical_schema_ref())
 }
 
 #[cfg(test)]

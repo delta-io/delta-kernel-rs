@@ -15,8 +15,8 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error};
+use crate::transforms::SchemaTransform;
+use crate::DeltaResult;
 
 /// V3 invariants paired with the version constant. Fed to
 /// [`super::validate_iceberg_compat_if_needed`].
@@ -82,101 +82,8 @@ pub(crate) fn iceberg_compat_v3_type_changes_validation(
         return Ok(());
     }
 
-    let mut validator = TypeChangesValidator { path: vec![] };
+    let mut validator = super::TypeChangesValidator { path: vec![] };
     validator.transform_struct(tc.logical_schema_ref())
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TypeChange {
-    from_type: DataType,
-    to_type: DataType,
-}
-
-fn is_v3_allowed_type_change(from: &DataType, to: &DataType) -> bool {
-    match (from, to) {
-        (DataType::Primitive(Byte), DataType::Primitive(Short | Integer | Long)) => true,
-        (DataType::Primitive(Short), DataType::Primitive(Integer | Long)) => true,
-        (DataType::Primitive(Integer), DataType::Primitive(Long)) => true,
-        (DataType::Primitive(Float), DataType::Primitive(Double)) => true,
-        (DataType::Primitive(Decimal(from_decimal)), DataType::Primitive(Decimal(to_decimal))) => {
-            from_decimal.scale() == to_decimal.scale()
-                && to_decimal.precision() > from_decimal.precision()
-        }
-        _ => false,
-    }
-}
-
-struct TypeChangesValidator {
-    path: Vec<String>,
-}
-
-impl TypeChangesValidator {
-    fn validate_field_type_changes(&self, field: &StructField) -> DeltaResult<()> {
-        let type_changes_key = ColumnMetadataKey::TypeChanges.as_ref();
-        let Some(metadata) = field.metadata().get(type_changes_key) else {
-            return Ok(());
-        };
-        let path = self.path.join(".");
-        let MetadataValue::Other(value) = metadata else {
-            return Err(Error::schema(format!(
-                "Field '{path}' has a non-array `{type_changes_key}` annotation: \
-                 {metadata}"
-            )));
-        };
-        let type_changes: Vec<TypeChange> = serde_json::from_value(value.clone()).map_err(|e| {
-            Error::schema(format!(
-                "Field '{path}' has an invalid `{type_changes_key}` annotation: {e}"
-            ))
-        })?;
-        for type_change in type_changes {
-            if !is_v3_allowed_type_change(&type_change.from_type, &type_change.to_type) {
-                return Err(Error::schema(format!(
-                    "icebergCompatV3 does not support type change on field '{path}': {} -> {}",
-                    type_change.from_type, type_change.to_type
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<'a> SchemaTransform<'a> for TypeChangesValidator {
-    transform_output_type!(|'a, T| DeltaResult<()>);
-
-    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
-        self.path.push(field.name().clone());
-        let result = self
-            .validate_field_type_changes(field)
-            .and_then(|_| self.recurse_into_struct_field(field));
-        self.path.pop();
-        result
-    }
-
-    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<()> {
-        self.path.push("element".to_string());
-        let result = self.transform(etype);
-        self.path.pop();
-        result
-    }
-
-    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<()> {
-        self.path.push("key".to_string());
-        let result = self.transform(ktype);
-        self.path.pop();
-        result
-    }
-
-    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<()> {
-        self.path.push("value".to_string());
-        let result = self.transform(vtype);
-        self.path.pop();
-        result
-    }
-
-    fn transform_variant(&mut self, _stype: &'a crate::schema::StructType) -> DeltaResult<()> {
-        Ok(())
-    }
 }
 
 /// Validates IcebergCompatV3 column defaults and logs warnings kernel cannot verify.
