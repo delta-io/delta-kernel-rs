@@ -71,9 +71,7 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
 ///
 /// Returns an error if `delta.typeChanges` metadata is malformed, or if any recorded type change
 /// is outside Iceberg V3's allowed widening list.
-pub(crate) fn iceberg_compat_v3_type_changes_validation(
-    tc: &TableConfiguration,
-) -> DeltaResult<()> {
+fn iceberg_compat_v3_type_changes_validation(tc: &TableConfiguration) -> DeltaResult<()> {
     if !tc.is_feature_supported(&TableFeature::TypeWidening)
         && !tc.is_feature_supported(&TableFeature::TypeWideningPreview)
     {
@@ -82,7 +80,7 @@ pub(crate) fn iceberg_compat_v3_type_changes_validation(
 
     let mut validator = super::TypeChangesValidator {
         path: vec![],
-        feature_label: "icebergCompatV3",
+        version: IcebergCompatVersion::V3,
     };
     validator.transform_struct(tc.logical_schema_ref())
 }

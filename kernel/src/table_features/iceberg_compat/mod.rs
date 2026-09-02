@@ -242,8 +242,7 @@ fn is_iceberg_allowed_type_change(from: &DataType, to: &DataType) -> bool {
 
 struct TypeChangesValidator {
     path: Vec<String>,
-    /// Feature name reported in error message, e.g. `"icebergCompatV2"`
-    feature_label: &'static str,
+    version: IcebergCompatVersion,
 }
 
 impl TypeChangesValidator {
@@ -268,7 +267,9 @@ impl TypeChangesValidator {
             if !is_iceberg_allowed_type_change(&type_change.from_type, &type_change.to_type) {
                 return Err(Error::schema(format!(
                     "{} does not support type change on field '{path}': {} -> {}",
-                    self.feature_label, type_change.from_type, type_change.to_type
+                    self.version.as_table_feature(),
+                    type_change.from_type,
+                    type_change.to_type
                 )));
             }
         }
