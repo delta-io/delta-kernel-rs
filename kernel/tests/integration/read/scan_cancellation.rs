@@ -9,8 +9,8 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::{
-    CancellationToken as _, CancellationTokenRef, DeltaResult, Engine, Error, FileMeta, FileSlice,
-    JsonHandler, ParquetHandler, Snapshot, StorageHandler,
+    CancellationToken as _, CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, Engine,
+    Error, FileMeta, FileSlice, JsonHandler, ParquetHandler, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -330,10 +330,7 @@ struct CancelOnListHandler {
 }
 
 impl StorageHandler for CancelOnListHandler {
-    fn list_from(
-        &self,
-        path: &url::Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, path: &url::Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         self.inner.list_from(path)
     }
 
@@ -341,7 +338,7 @@ impl StorageHandler for CancelOnListHandler {
         &self,
         path: &url::Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         self.token.cancel();
         self.inner
             .list_from_with_cancellation(path, cancellation_token)
@@ -350,7 +347,7 @@ impl StorageHandler for CancelOnListHandler {
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
         self.inner.read_files(files)
     }
 
@@ -358,7 +355,7 @@ impl StorageHandler for CancelOnListHandler {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
         self.inner
             .read_files_with_cancellation(files, cancellation_token)
     }
