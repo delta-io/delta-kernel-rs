@@ -4,7 +4,9 @@ use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME};
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
-use crate::scan::transform_spec::{get_transform_expr, parse_partition_values};
+use crate::scan::transform_spec::{
+    get_transform_expr, parse_partition_values, FileRowTrackingMetadata,
+};
 use crate::schema::{schema_ref, SchemaRef, StructType};
 use crate::{DeltaResult, Error, ExpressionRef};
 
@@ -121,7 +123,7 @@ pub(crate) fn get_cdf_transform_expr(
         transform_spec,
         partition_values,
         physical_schema,
-        None, /* base_row_id */
+        FileRowTrackingMetadata::default(),
     )
     .map(Some)
 }
