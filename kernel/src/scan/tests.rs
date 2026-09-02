@@ -2072,7 +2072,10 @@ fn test_default_stats_options_no_struct_output() {
 #[case::id_with_json_without_predicate(
     StatsOptions {
         synthesize_json: true,
-        struct_stats: StructStats::Columns(vec![column_name!("id")]),
+        struct_stats: StructStats::Columns {
+            requested: vec![column_name!("id")],
+            extra_indexed: vec![],
+        },
     },
     &["id"],
     None,
@@ -2238,11 +2241,40 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         .scan_builder()
         .with_stats(StatsOptions {
             synthesize_json: true,
-            struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
+            struct_stats: StructStats::Columns {
+                requested: vec![column_name!("nonexistent_column")],
+                extra_indexed: vec![],
+            },
         })
         .build();
 
     assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
+}
+
+/// `extra_indexed` is best-effort: an unresolvable extra-indexed column is dropped with a warning,
+/// so the scan still builds. Contrast `test_scan_metadata_with_nonexistent_stats_columns`, where a
+/// nonexistent `requested` column is rejected. Goes through `scan_builder().build()` so it covers
+/// `build_physical_stats_output_schema`'s `Columns` arm, not just the internal skipping schema.
+#[test]
+fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let result = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::struct_columns_with_extra_indexed(
+            vec![],
+            vec![column_name!("nonexistent_column")],
+        ))
+        .build();
+
+    assert!(
+        result.is_ok(),
+        "unresolvable extra_indexed column should be dropped, not error: {:?}",
+        result.err()
+    );
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.

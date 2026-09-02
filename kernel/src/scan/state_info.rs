@@ -151,10 +151,17 @@ fn validate_metadata_columns<'a>(
 /// the union of requested + predicate-referenced columns. That path applies the same
 /// `BaseStatsTransform` -> `MinMaxStatsTransform` pipeline writers use, so the read-side
 /// stats schema's shape matches the write-side exactly.
+///
+/// `extra_indexed_physical` are already-resolved physical columns (the caller's `extra_indexed`)
+/// that must survive the `delta.dataSkippingNumIndexedCols` limit. They are passed as the
+/// limit-exempt `required_columns` argument on every emitting arm; on the `Columns` arm they are
+/// also unioned into the requested-columns output filter, or the filter would drop them from the
+/// schema even though they pass the table gate.
 fn build_data_skipping_schemas(
     struct_stats: &StructStats,
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
+    extra_indexed_physical: Option<&[ColumnName]>,
     table_configuration: &TableConfiguration,
 ) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
     // Narrow the table's typed partition schema to the columns the predicate references. The
@@ -181,16 +188,7 @@ fn build_data_skipping_schemas(
                 union_logical.push(col.clone());
             }
         }
-        let logical_schema = table_configuration.logical_schema();
-        let column_mapping_mode = table_configuration.column_mapping_mode();
-        union_logical
-            .iter()
-            .filter_map(|col| {
-                get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
-                    .inspect_err(|e| warn!("Failed to resolve physical name for column {col}: {e}"))
-                    .ok()
-            })
-            .collect()
+        resolve_physical_columns(table_configuration, &union_logical)
     };
 
     // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields
@@ -208,19 +206,25 @@ fn build_data_skipping_schemas(
     };
 
     let stats_schema = match (struct_stats, physical_predicate) {
-        // Full table stats schema for stats_parsed.
-        (StructStats::All, _) => with_data_cols(
+        // Full table stats schema for stats_parsed, plus any limit-exempt extra-indexed columns.
+        // No requested filter, so the extra-indexed columns need no special handling here.
+        (StructStats::All { .. }, _) => with_data_cols(
             table_configuration
-                .build_expected_stats_schemas(None, None)?
+                .build_expected_stats_schemas(extra_indexed_physical, None)?
                 .physical,
         ),
         // Explicit requested columns. Union in predicate refs so the stats schema covers
-        // both sources.
-        (StructStats::Columns(requested_columns), _) if !requested_columns.is_empty() => {
-            let requested_physical = union_to_physical(requested_columns);
+        // both sources, and the extra-indexed columns so the requested filter does not drop them.
+        (StructStats::Columns { requested, .. }, _)
+            if !requested.is_empty() || extra_indexed_physical.is_some() =>
+        {
+            let mut filter = union_to_physical(requested);
+            if let Some(extra) = extra_indexed_physical {
+                union_extra_into_filter(&mut filter, extra);
+            }
             with_data_cols(
                 table_configuration
-                    .build_expected_stats_schemas(None, Some(&requested_physical))?
+                    .build_expected_stats_schemas(extra_indexed_physical, Some(&filter))?
                     .physical,
             )
         }
@@ -237,6 +241,40 @@ fn build_data_skipping_schemas(
         (_, _) => None,
     };
     Ok((stats_schema, predicate_partition_schema))
+}
+
+/// Resolves logical column names to physical names, dropping (with a warning) any that fail to
+/// resolve (e.g. a name absent from the schema, or a column-mapping annotation gap). Used for
+/// engine-supplied and predicate-derived column lists, where an unresolvable name should be
+/// ignored rather than fail the scan.
+pub(super) fn resolve_physical_columns(
+    table_configuration: &TableConfiguration,
+    logical: &[ColumnName],
+) -> Vec<ColumnName> {
+    let logical_schema = table_configuration.logical_schema();
+    let column_mapping_mode = table_configuration.column_mapping_mode();
+    logical
+        .iter()
+        .filter_map(|col| {
+            get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
+                .inspect_err(|e| {
+                    warn!("Failed to resolve physical name for stats column {col}: {e}")
+                })
+                .ok()
+        })
+        .collect()
+}
+
+/// Appends `extra` to the requested-columns output `filter`, skipping columns already present.
+/// The limit-exempt `extra` columns must also survive the requested filter, or the stats schema
+/// drops them even though they pass the table-level gate.
+pub(super) fn union_extra_into_filter(filter: &mut Vec<ColumnName>, extra: &[ColumnName]) {
+    let to_add: Vec<ColumnName> = extra
+        .iter()
+        .filter(|c| !filter.contains(c))
+        .cloned()
+        .collect();
+    filter.extend(to_add);
 }
 
 impl StateInfo {
@@ -389,9 +427,25 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
+        // Extra-indexed stats columns the engine asked to keep even past
+        // `dataSkippingNumIndexedCols`. They live only on the emitting `StructStats` variants;
+        // `None` carries none. Resolve to physical names once and feed both the gate set and the
+        // schema builder below, so internal skipping and `stats_parsed` stay in lockstep.
+        let extra_indexed_logical: &[ColumnName] = match &stats.struct_stats {
+            StructStats::All { extra_indexed } | StructStats::Columns { extra_indexed, .. } => {
+                extra_indexed
+            }
+            StructStats::None => &[],
+        };
+        let extra_indexed_physical =
+            resolve_physical_columns(table_configuration, extra_indexed_logical);
+        let extra_indexed_stats_columns =
+            (!extra_indexed_physical.is_empty()).then_some(extra_indexed_physical.as_slice());
+
         // Stats-eligible column set. Partition columns are excluded; they flow through
         // `partitionValues_parsed` instead.
-        let physical_stats_columns = table_configuration.physical_stats_columns_set(None);
+        let physical_stats_columns =
+            table_configuration.physical_stats_columns_set(extra_indexed_stats_columns);
         // Observability: predicate refs outside `physical_stats_columns` get folded to NULL
         // by the gate. Surface the dropped set so an engine operator can see what got folded.
         // The filter walk is bounded by predicate width but still does a physical-name
@@ -447,6 +501,7 @@ impl StateInfo {
             &stats.struct_stats,
             &physical_predicate,
             &predicate_column_names,
+            extra_indexed_stats_columns,
             table_configuration,
         )?;
 
@@ -1202,7 +1257,10 @@ pub(crate) mod tests {
             vec![],
             StatsOptions {
                 synthesize_json: true,
-                struct_stats: StructStats::Columns(vec![column_name!("value")]),
+                struct_stats: StructStats::Columns {
+                    requested: vec![column_name!("value")],
+                    extra_indexed: vec![],
+                },
             },
         )
         .unwrap();
@@ -1248,7 +1306,10 @@ pub(crate) mod tests {
             vec![],
             StatsOptions {
                 synthesize_json: true,
-                struct_stats: StructStats::Columns(vec![column_name!("value")]),
+                struct_stats: StructStats::Columns {
+                    requested: vec![column_name!("value")],
+                    extra_indexed: vec![],
+                },
             },
         )
         .unwrap();
@@ -1404,7 +1465,10 @@ pub(crate) mod tests {
             vec![],
             StatsOptions {
                 synthesize_json: true,
-                struct_stats: StructStats::Columns(vec![column_name!("col_a")]),
+                struct_stats: StructStats::Columns {
+                    requested: vec![column_name!("col_a")],
+                    extra_indexed: vec![],
+                },
             },
         )
         .unwrap();
@@ -1413,8 +1477,27 @@ pub(crate) mod tests {
             .physical_stats_schema
             .expect("should have physical stats schema");
 
-        let present = ["phys_a", "phys_b"];
-        let absent = ["col_a", "col_b", "phys_c"];
+        assert_stats_leaves(
+            &stats_schema,
+            &["phys_a", "phys_b"],
+            &["col_a", "col_b", "phys_c"],
+        );
+    }
+
+    // === physical_stats_columns trims the predicate-derived stats schema ===
+
+    /// Flat schema with `n` long columns named `c0..c{n-1}`.
+    fn flat_long_schema(n: usize) -> SchemaRef {
+        Arc::new(StructType::new_unchecked(
+            (0..n)
+                .map(|i| StructField::nullable(format!("c{i}"), DataType::LONG))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Asserts each `present` top-level leaf is in, and each `absent` leaf is out of, both
+    /// `minValues` and `maxValues` of `stats_schema`.
+    fn assert_stats_leaves(stats_schema: &SchemaRef, present: &[&str], absent: &[&str]) {
         for stats_field in [MIN_VALUES, MAX_VALUES] {
             let DataType::Struct(inner) = stats_schema
                 .field(stats_field)
@@ -1436,17 +1519,6 @@ pub(crate) mod tests {
                 );
             }
         }
-    }
-
-    // === physical_stats_columns trims the predicate-derived stats schema ===
-
-    /// Flat schema with `n` long columns named `c0..c{n-1}`.
-    fn flat_long_schema(n: usize) -> SchemaRef {
-        Arc::new(StructType::new_unchecked(
-            (0..n)
-                .map(|i| StructField::nullable(format!("c{i}"), DataType::LONG))
-                .collect::<Vec<_>>(),
-        ))
     }
 
     /// `delta.dataSkippingNumIndexedCols=<n>` configuration map.
@@ -1544,23 +1616,8 @@ pub(crate) mod tests {
             .physical_stats_schema
             .as_ref()
             .expect("should have stats schema (indexed arm survives)");
-        for stats_field in [MIN_VALUES, MAX_VALUES] {
-            let DataType::Struct(inner) = stats_schema
-                .field(stats_field)
-                .unwrap_or_else(|| panic!("should have {stats_field}"))
-                .data_type()
-            else {
-                panic!("{stats_field} should be a struct");
-            };
-            assert!(
-                inner.field("c0").is_some(),
-                "{stats_field} should contain c0 (indexed)"
-            );
-            assert!(
-                inner.field("c4").is_none(),
-                "{stats_field} should NOT contain c4 (past cap)"
-            );
-        }
+        // c0 (indexed) survives; c4 (past cap) is dropped.
+        assert_stats_leaves(stats_schema, &["c0"], &["c4"]);
     }
 
     /// `numIndexedCols=2` against `{ a, b, s: { c, d } }` keeps `a, b` and drops the
@@ -1722,5 +1779,192 @@ pub(crate) mod tests {
         let expected_cols: HashSet<ColumnName> =
             expected.iter().map(|s| ColumnName::new([*s])).collect();
         assert_eq!(state_info.physical_stats_columns, expected_cols);
+    }
+
+    // === StatsOptions `extra_indexed` columns bypass dataSkippingNumIndexedCols ===
+
+    /// Schema + gate-set expectations for `extra_indexed` on a flat `c0..c4` schema, across the
+    /// count-based cap and the explicit `dataSkippingStatsColumns` list. Each case asserts the
+    /// emitted stats schema leaves (present/absent in min/max) and the internal skipping gate set
+    /// (`physical_stats_columns`).
+    #[rstest]
+    // All indexed columns plus a past-cap `extra_indexed` column, in both schema and gate.
+    #[case::all_extra_past_cap(
+        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c4")]),
+        num_indexed_cols_config(2),
+        &["c0", "c1", "c4"], &["c2", "c3"], &["c0", "c1", "c4"],
+    )]
+    // Conformance guard: without `extra_indexed`, a past-cap column stays out of schema and gate.
+    #[case::all_no_extra(
+        StatsOptions::all_struct(),
+        num_indexed_cols_config(2),
+        &["c0", "c1"], &["c2", "c3", "c4"], &["c0", "c1"],
+    )]
+    // An `extra_indexed` column already within the cap changes nothing.
+    #[case::extra_within_cap_noop(
+        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c0")]),
+        num_indexed_cols_config(2),
+        &["c0", "c1"], &["c2", "c3", "c4"], &["c0", "c1"],
+    )]
+    // `Columns` requested plus a past-cap `extra_indexed` column (the requested-filter union).
+    #[case::columns_plus_extra(
+        StatsOptions::struct_columns_with_extra_indexed(
+            vec![column_name!("c0")],
+            vec![column_name!("c4")],
+        ),
+        num_indexed_cols_config(2),
+        &["c0", "c4"], &["c1", "c2", "c3"], &["c0", "c1", "c4"],
+    )]
+    // Forced-only: everything in `extra_indexed`, `requested` empty -> schema is exactly those.
+    #[case::columns_extra_only(
+        StatsOptions::struct_columns_with_extra_indexed(vec![], vec![column_name!("c4")]),
+        num_indexed_cols_config(2),
+        &["c4"], &["c0", "c1", "c2", "c3"], &["c0", "c1", "c4"],
+    )]
+    // Composes with the explicit `dataSkippingStatsColumns` list, not just the count cap.
+    #[case::extra_with_stats_columns(
+        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c4")]),
+        stats_columns_config(&["c0"]),
+        &["c0", "c4"], &["c1", "c2", "c3"], &["c0", "c4"],
+    )]
+    // An unresolvable `extra_indexed` column is dropped (with a warning), not an error.
+    #[case::unresolvable_extra_dropped(
+        StatsOptions::all_struct_with_extra_indexed(vec![
+            column_name!("c4"),
+            column_name!("does_not_exist"),
+        ]),
+        num_indexed_cols_config(2),
+        &["c0", "c1", "c4"], &["c2", "c3"], &["c0", "c1", "c4"],
+    )]
+    fn extra_indexed_schema_and_gate(
+        #[case] stats: StatsOptions,
+        #[case] config: HashMap<String, String>,
+        #[case] present: &[&str],
+        #[case] absent: &[&str],
+        #[case] expected_set: &[&str],
+    ) {
+        let state_info = get_state_info_with_stats(
+            flat_long_schema(5),
+            vec![],
+            None,
+            &[],
+            config,
+            vec![],
+            stats,
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("stats schema present");
+        assert_stats_leaves(stats_schema, present, absent);
+        let expected: HashSet<ColumnName> =
+            expected_set.iter().map(|s| ColumnName::new([*s])).collect();
+        assert_eq!(state_info.physical_stats_columns, expected);
+    }
+
+    /// A predicate on a past-cap column normally drops the stats schema
+    /// (see `predicate_on_past_cap_column_drops_stats_schema`). Naming the column `extra_indexed`
+    /// keeps it prunable: it survives in the schema and the gate.
+    #[test]
+    fn extra_indexed_column_widens_internal_skipping_gate() {
+        let state_info = get_state_info_with_stats(
+            flat_long_schema(5),
+            vec![],
+            Some(Arc::new(col!("c4").gt(lit(10i64)))),
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+            StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c4")]),
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("stats schema present because c4 is extra_indexed");
+        assert_stats_leaves(stats_schema, &["c4"], &[]);
+        assert!(state_info
+            .physical_stats_columns
+            .contains(&column_name!("c4")));
+    }
+
+    /// A nested subfield past the cap, requested via `extra_indexed`, survives (predictive
+    /// optimization routinely selects struct subfields).
+    #[test]
+    fn extra_indexed_nested_subfield_past_cap_appears() {
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(3), // a, b, s.c indexed; s.d past cap
+            vec![],
+            StatsOptions::all_struct_with_extra_indexed(vec![column_name!("s.d")]),
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("stats schema present");
+        for stats_field in [MIN_VALUES, MAX_VALUES] {
+            let DataType::Struct(inner) = stats_schema.field(stats_field).unwrap().data_type()
+            else {
+                panic!("{stats_field} should be a struct");
+            };
+            let DataType::Struct(s) = inner.field("s").expect("s present").data_type() else {
+                panic!("s should be a struct");
+            };
+            assert!(s.field("c").is_some(), "s.c (indexed) present");
+            assert!(
+                s.field("d").is_some(),
+                "s.d (extra_indexed, past cap) present"
+            );
+        }
+        assert!(state_info
+            .physical_stats_columns
+            .contains(&column_name!("s.d")));
+    }
+
+    /// An `extra_indexed` logical name resolves to its physical name under column mapping.
+    #[test]
+    fn extra_indexed_column_resolves_physical_name_under_column_mapping() {
+        let schema = schema_ref! {
+            (cm_field("col_a", 1, "phys_a", DataType::LONG)),
+            (cm_field("col_b", 2, "phys_b", DataType::LONG)),
+            (cm_field("col_c", 3, "phys_c", DataType::LONG)),
+        };
+        let mut props = HashMap::new();
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+        props.insert(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "1".to_string(),
+        );
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            None,
+            &[],
+            props,
+            vec![],
+            StatsOptions::all_struct_with_extra_indexed(vec![column_name!("col_c")]),
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("stats schema present");
+        // col_c is past the cap (1) and resolves to phys_c; the logical name never appears.
+        assert_stats_leaves(stats_schema, &["phys_a", "phys_c"], &["col_c", "phys_b"]);
+        assert!(state_info
+            .physical_stats_columns
+            .contains(&column_name!("phys_c")));
     }
 }
