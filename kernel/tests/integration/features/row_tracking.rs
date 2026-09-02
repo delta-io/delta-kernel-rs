@@ -912,8 +912,8 @@ async fn test_read_row_ids_basic() -> DeltaResult<()> {
 #[case::none("none")]
 #[case::name("name")]
 #[case::id("id")]
-  /// Row-tracking metadata columns directly adjacent to partition columns should preserve their
-  /// scan-schema order.
+/// Row-tracking metadata columns directly adjacent to partition columns should preserve their
+/// scan-schema order.
 fn generated_row_tracking_and_partition_columns_preserve_scan_schema_order(
     #[case] column_mapping_mode: &str,
 ) -> DeltaResult<()> {
