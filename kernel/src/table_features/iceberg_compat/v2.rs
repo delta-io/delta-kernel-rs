@@ -222,6 +222,36 @@ mod tests {
         assert!(err.contains("m.value.inner"), "unexpected error: {err}");
     }
 
+    #[rstest]
+    #[case::wrong_metadata_type(
+        MetadataValue::String("not an array".to_string()),
+        "non-array",
+    )]
+    #[case::json_object(
+        MetadataValue::Other(json!({"fromType": "integer", "toType": "long"})),
+        "invalid",
+    )]
+    #[case::missing_to_type(
+        MetadataValue::Other(json!([{"fromType": "integer"}])),
+        "invalid",
+    )]
+    fn v2_type_change_validation_rejects_malformed_metadata(
+        #[case] metadata: MetadataValue,
+        #[case] expected_error: &str,
+    ) {
+        let field = StructField::nullable("a", DataType::LONG)
+            .add_metadata([(ColumnMetadataKey::TypeChanges.as_ref(), metadata)]);
+        let table_configuration = table_config_with_schema(schema! { (field) });
+
+        let err = iceberg_compat_v2_type_changes_validation(&table_configuration)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(expected_error) && err.contains("delta.typeChanges"),
+            "unexpected error: {err}",
+        );
+    }
+
     #[test]
     fn v2_type_change_validation_skips_tables_without_type_widening_support() {
         let table_configuration = table_config_with_schema_and_features(
