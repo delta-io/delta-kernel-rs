@@ -1162,7 +1162,7 @@ async fn test_read_row_commit_versions_prefer_materialized_values(
     Ok(())
 }
 
- /// Collects `(number, value)` pairs, where `value` comes from `column_name`.
+/// Collects `(number, value)` pairs, where `value` comes from `column_name`.
 fn collect_number_to_column(batches: &[RecordBatch], column_name: &str) -> HashMap<i32, i64> {
     let mut map = HashMap::new();
     for batch in batches {
@@ -1181,6 +1181,7 @@ fn collect_number_to_column(batches: &[RecordBatch], column_name: &str) -> HashM
     map
 }
 
+/// A deletion vector must not change surviving rows' stable Row IDs or Row Commit Versions.
 #[rstest]
 #[case::middle(&[4, 5, 6])]
 #[case::first(&[0, 1, 2])]
