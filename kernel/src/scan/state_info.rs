@@ -819,6 +819,7 @@ pub(crate) mod tests {
     pub(crate) const ROW_TRACKING_FEATURES: &[TableFeature] =
         &[TableFeature::RowTracking, TableFeature::DomainMetadata];
 
+    // TODO(#3248): Add tests for row id.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum RowTrackingState {
         Unsupported,

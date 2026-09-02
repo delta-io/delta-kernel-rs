@@ -858,31 +858,32 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     Ok(())
 }
 
-/// Build a scan with `MetadataColumnSpec::RowId` appended to the snapshot schema and execute it.
-fn read_row_id_scan(
+fn read_row_tracking_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
+    metadata_column: MetadataColumnSpec,
 ) -> DeltaResult<Vec<RecordBatch>> {
     let scan_schema = Arc::new(
         snapshot
             .schema()
-            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
+            .add_metadata_column(metadata_column.text_value(), metadata_column)?,
     );
     let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
     read_scan(&scan, engine)
+}
+
+fn read_row_id_scan(
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn delta_kernel::Engine>,
+) -> DeltaResult<Vec<RecordBatch>> {
+    read_row_tracking_scan(snapshot, engine, MetadataColumnSpec::RowId)
 }
 
 fn read_row_commit_version_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
 ) -> DeltaResult<Vec<RecordBatch>> {
-    let scan_schema = Arc::new(
-        snapshot
-            .schema()
-            .add_metadata_column("row_commit_version", MetadataColumnSpec::RowCommitVersion)?,
-    );
-    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
-    read_scan(&scan, engine)
+    read_row_tracking_scan(snapshot, engine, MetadataColumnSpec::RowCommitVersion)
 }
 
 /// Basic read: write one file with 3 rows, verify row IDs are sequential starting from 0.
@@ -1161,27 +1162,25 @@ async fn test_read_row_commit_versions_prefer_materialized_values(
     Ok(())
 }
 
-/// Collect `(number, row_id)` pairs from a row-id scan, keyed by the `number` data column.
-fn collect_number_to_row_id(batches: &[RecordBatch]) -> HashMap<i32, i64> {
+ /// Collects `(number, value)` pairs, where `value` comes from `column_name`.
+fn collect_number_to_column(batches: &[RecordBatch], column_name: &str) -> HashMap<i32, i64> {
     let mut map = HashMap::new();
     for batch in batches {
         let numbers = batch
             .column_by_name("number")
             .expect("number column not found")
             .as_primitive::<Int32Type>();
-        let row_ids = batch
-            .column_by_name("row_id")
-            .expect("row_id column not found")
+        let values = batch
+            .column_by_name(column_name)
+            .unwrap_or_else(|| panic!("{column_name} column not found"))
             .as_primitive::<Int64Type>();
         for i in 0..batch.num_rows() {
-            map.insert(numbers.value(i), row_ids.value(i));
+            map.insert(numbers.value(i), values.value(i));
         }
     }
     map
 }
 
-/// Deletion vector: must not renumber the surviving rows' stable row IDs and not change any row
-/// tracking metadata.
 #[rstest]
 #[case::middle(&[4, 5, 6])]
 #[case::first(&[0, 1, 2])]
@@ -1189,14 +1188,16 @@ fn collect_number_to_row_id(batches: &[RecordBatch]) -> HashMap<i32, i64> {
 #[case::first_and_last(&[0, 1, 8, 9])]
 #[case::first_middle_last(&[0, 4, 5, 9])]
 #[tokio::test]
-async fn test_read_row_ids_stable_across_deletion_vector_update(
+async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
     #[case] deleted_indexes: &[u64],
+    #[values(MetadataColumnSpec::RowId, MetadataColumnSpec::RowCommitVersion)]
+    metadata_column: MetadataColumnSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir()?;
     let (schema, table_url, engine, store) = setup_number_table_with_features(
         &tmp_dir,
-        "test_read_row_ids_stable_across_dv",
+        "test_read_row_tracking_metadata_stable_across_dv",
         &["deletionVectors"],
         &[],
     )
@@ -1211,16 +1212,25 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
         .await?
         .unwrap_committed();
 
-    // Snapshot the (value -> row_id) mapping before any deletion. value v sits at physical index
-    // (v - 100), and with baseRowId 0 that is also its row ID.
+    let column_name = metadata_column.text_value();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let before = collect_number_to_row_id(&read_row_id_scan(snapshot.clone(), engine.clone())?);
+    let before = collect_number_to_column(
+        &read_row_tracking_scan(snapshot.clone(), engine.clone(), metadata_column)?,
+        column_name,
+    );
+    let expected_before = (100..110)
+        .map(|value| {
+            let metadata_value = if metadata_column == MetadataColumnSpec::RowId {
+                i64::from(value - 100)
+            } else {
+                1
+            };
+            (value, metadata_value)
+        })
+        .collect::<HashMap<_, _>>();
     assert_eq!(
-        before,
-        (100..110)
-            .map(|v| (v, (v - 100) as i64))
-            .collect::<HashMap<_, _>>(),
-        "row IDs must equal each row's physical index before deletion"
+        before, expected_before,
+        "{column_name} values must match before deletion"
     );
 
     // The original Add's row-tracking fields, to confirm they survive the DV update unchanged.
@@ -1250,17 +1260,22 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
     )?;
     txn.commit(engine.as_ref())?.unwrap_committed();
 
-    // Every survivor keeps the exact row ID it had before.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let after = collect_number_to_row_id(&read_row_id_scan(snapshot, engine.clone())?);
+    let after = collect_number_to_column(
+        &read_row_tracking_scan(snapshot, engine.clone(), metadata_column)?,
+        column_name,
+    );
 
     let expected_survivors: HashMap<i32, i64> = (100..110)
-        .filter(|v| !deleted_indexes.contains(&((v - 100) as u64)))
-        .map(|v| (v, (v - 100) as i64))
+        .filter(|value| {
+            !deleted_indexes
+                .contains(&u64::try_from(value - 100).expect("test values must be at least 100"))
+        })
+        .map(|value| (value, expected_before[&value]))
         .collect();
     assert_eq!(
         after, expected_survivors,
-        "surviving rows must keep their original row IDs, not be renumbered"
+        "surviving rows must keep their original {column_name} values"
     );
 
     // The DV update must preserve the original row-tracking fields on the rewritten Add.

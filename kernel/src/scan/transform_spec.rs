@@ -165,9 +165,12 @@ pub(crate) fn get_transform_expr(
             GenerateRowCommitVersion { field_name } => {
                 let default_row_commit_version = row_tracking_metadata
                     .default_row_commit_version
-                    .ok_or(Error::missing_data(
-                    "Missing defaultRowCommitVersion for Row Commit Version reconstruction",
-                ))?;
+                    .ok_or_else(|| {
+                    Error::missing_data(concat!(
+                        "Missing defaultRowCommitVersion for Row Commit Version ",
+                        "reconstruction",
+                    ))
+                })?;
                 let expr = Arc::new(Expression::coalesce([
                     Expression::column([field_name]),
                     lit(default_row_commit_version),
