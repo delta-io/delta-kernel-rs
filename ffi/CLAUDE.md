@@ -32,7 +32,7 @@ the caller's memory space.
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
 - `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
 - `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)
-- `src/alloc_stats.rs` -- `peak_alloc` global allocator and native-heap FFI getters
+- `src/alloc_stats.rs` -- allocation-tracking global allocator and native-heap FFI getters
   (`alloc-tracking`)
 
 ## Read Flow
@@ -206,8 +206,9 @@ Feature flags:
 - `arrow-59`, `arrow-58`
 - `delta-kernel-unity-catalog`
 - `tracing`
-- `alloc-tracking` -- installs `peak_alloc` as the tracking global allocator; enables meaningful
-  `*_native_bytes` / `alloc_tracking_enabled` getters (cdylib only; conflicts with
+- `alloc-tracking` -- installs `TrackingAlloc<PeakAlloc>` as the global allocator; enables
+  meaningful live, peak, and cumulative allocated/freed `*_native_bytes` getters plus
+  `alloc_tracking_enabled` (cdylib only; conflicts with
   another `#[global_allocator]` if linked as an rlib)
 
 ## Testing under Miri
