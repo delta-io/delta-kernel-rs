@@ -81,7 +81,7 @@ optional = true
 # arrow 59
 [dependencies.arrow_59]
 package = "arrow"
-version = "59"
+version = "59.2"
 features = ["chrono-tz", "ffi", "json"]
 optional = true
 [dependencies.parquet_59]

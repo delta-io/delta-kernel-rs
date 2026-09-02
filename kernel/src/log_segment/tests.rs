@@ -14,7 +14,8 @@ use crate::actions::{
     COMMIT_INFO_NAME, LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS,
     REMOVE_NAME, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
-use crate::arrow::array::StringArray;
+use crate::arrow::array::{Array, AsArray, MapArray, StringArray, StructArray};
+use crate::arrow::error::ArrowError;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
@@ -4948,9 +4949,10 @@ fn test_combine_checkpoint_predicates(
 /// checkpoint writing calls `schema.asNullable` which forces all maps nullable. The
 /// schema must match this behavior.
 ///
-/// This test reads JSON actions through `DefaultEngine` + `InMemory` store +
+/// This test reads JSON actions through `SyncEngine` + `InMemory` store +
 /// `log_segment.read_actions()`, then re-validates the resulting Arrow `StructArray` with
-/// `StructArray::try_new`. Without the fix, non-nullable map value fields cause:
+/// `StructArray::try_new`. Arrow 59 performs this validation during JSON decoding, while Arrow 58
+/// requires the explicit revalidation. Non-nullable map value fields containing nulls cause:
 ///   "Found unmasked nulls for non-nullable StructArray field 'value'"
 #[rstest]
 // remove.partitionValues.month: null
@@ -5007,25 +5009,50 @@ fn test_combine_checkpoint_predicates(
     "operationParameters",
     r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","description":null}}}"#
 )]
-// metaData.configuration.key2: null
-#[should_panic(expected = "StructArray re-validation failed")]
-#[case::metadata_configuration_known_issue(
-    "metaData",
-    "configuration",
-    r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"key1":"val1","key2":null},"createdTime":1000}}"#
-)]
 #[tokio::test]
 async fn read_actions_with_null_map_values(
     #[case] action_name: &str,
     #[case] map_field: &str,
     #[case] json_action: &str,
 ) {
-    use crate::arrow::array::{Array, AsArray, MapArray, StructArray};
+    let actions_batch = read_json_action_batch(json_action)
+        .await
+        .expect("Reading an action with nullable map values should succeed");
+    let validation = revalidate_map_entries(actions_batch.actions, action_name, map_field);
+    validation.unwrap_or_else(|error| {
+        panic!(
+            "{action_name}.{map_field} entries StructArray re-validation failed: {error}. \
+             This means the schema has non-nullable value field but the data has nulls."
+        )
+    });
+}
 
+#[tokio::test]
+async fn metadata_configuration_with_null_value_reports_schema_mismatch() {
+    let json_action = concat!(
+        r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"#,
+        r#""schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"#,
+        r#""configuration":{"key1":"val1","key2":null}}}"#,
+    );
+    let batch_result = read_json_action_batch(json_action).await;
+
+    // Arrow 59 validates map entries during JSON decoding. Arrow 58 constructs the entries
+    // unchecked, so explicitly rebuilding the StructArray performs the equivalent validation.
+    let validation: Result<(), String> = match batch_result {
+        Err(error) => Err(error.to_string()),
+        Ok(actions_batch) => {
+            revalidate_map_entries(actions_batch.actions, METADATA_NAME, "configuration")
+                .map_err(|error| error.to_string())
+        }
+    };
+    assert_result_error_with_message(
+        validation,
+        r#"Found unmasked nulls for non-nullable StructArray field "value""#,
+    );
+}
+
+async fn read_json_action_batch(json_action: &str) -> DeltaResult<ActionsBatch> {
     let store = Arc::new(InMemory::new());
-    let log_root = Url::parse("memory:///_delta_log/").unwrap();
-
-    // Write a single commit file with the action containing null map values.
     store
         .put(
             &delta_path_for_version(0, "json"),
@@ -5034,60 +5061,50 @@ async fn read_actions_with_null_map_values(
         .await
         .unwrap();
 
-    // Build engine and read actions -- same as DeltaActionExtractor::get_actions.
     let engine = SyncEngine::new_with_store(store);
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
     let log_segment =
         LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, Some(0))
             .unwrap();
 
-    // Use all_actions_schema to cover sidecar and checkpointMetadata (checkpoint-only actions).
-    let action_schema = get_all_actions_schema().clone();
-    let action_batches = log_segment
-        .read_actions(&engine, action_schema)
+    let mut action_batches = log_segment
+        .read_actions(&engine, get_all_actions_schema().clone())
         .expect("read_actions should succeed");
+    action_batches
+        .next()
+        .expect("Should produce an action batch")
+}
 
-    // Iterate batches and verify the map value field is nullable.
-    let mut found = false;
-    for batch_result in action_batches {
-        let actions_batch = batch_result.expect("Iterating action batches should succeed");
-
-        let data_any = actions_batch.actions.into_any();
-        let arrow_data = data_any
-            .downcast_ref::<ArrowEngineData>()
-            .expect("ArrowEngineData");
-        let rb = arrow_data.record_batch();
-
-        let Some(action_col) = rb.column_by_name(action_name) else {
-            continue;
-        };
-        let action_struct = action_col
-            .as_struct_opt()
-            .unwrap_or_else(|| panic!("{action_name} column should be a struct"));
-        let map_col = action_struct
-            .column_by_name(map_field)
-            .unwrap_or_else(|| panic!("{action_name}.{map_field} not found"));
-        let map_array = map_col
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .unwrap_or_else(|| panic!("{action_name}.{map_field} should be a MapArray"));
-        // Re-validate the entries StructArray with its own schema, same as what Arrow's
-        // IPC deserializer does. Without the fix, this fails with:
-        // "Found unmasked nulls for non-nullable StructArray field 'value'"
-        let entries = map_array.entries();
-        StructArray::try_new(
-            entries.fields().clone(),
-            entries.columns().to_vec(),
-            entries.nulls().cloned(),
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "{action_name}.{map_field} entries StructArray re-validation failed: {e}. \
-                 This means the schema has non-nullable value field but the data has nulls."
-            )
-        });
-        found = true;
-    }
-    assert!(found, "Should have found a {action_name} action batch");
+fn revalidate_map_entries(
+    actions: Box<dyn EngineData>,
+    action_name: &str,
+    map_field: &str,
+) -> Result<(), ArrowError> {
+    let data_any = actions.into_any();
+    let arrow_data = data_any
+        .downcast_ref::<ArrowEngineData>()
+        .expect("ArrowEngineData");
+    let action_col = arrow_data
+        .record_batch()
+        .column_by_name(action_name)
+        .unwrap_or_else(|| panic!("Should contain a {action_name} action"));
+    let action_struct = action_col
+        .as_struct_opt()
+        .unwrap_or_else(|| panic!("{action_name} column should be a struct"));
+    let map_col = action_struct
+        .column_by_name(map_field)
+        .unwrap_or_else(|| panic!("{action_name}.{map_field} not found"));
+    let map_array = map_col
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .unwrap_or_else(|| panic!("{action_name}.{map_field} should be a MapArray"));
+    let entries = map_array.entries();
+    let _ = StructArray::try_new(
+        entries.fields().clone(),
+        entries.columns().to_vec(),
+        entries.nulls().cloned(),
+    )?;
+    Ok(())
 }
 
 #[test]
