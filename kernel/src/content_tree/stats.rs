@@ -144,7 +144,7 @@ fn get_field_id(field: &StructField) -> Option<i32> {
     }
 }
 
-/// Which Delta JSON stat categories a leaf appears in. Gates which sub-fields
+/// Which Delta JSON stat categories a leaf appears in. Selects which sub-fields
 /// [`build_stats_struct`] emits under the projection (see there).
 #[derive(Clone, Copy)]
 struct StatCategories {
@@ -157,7 +157,7 @@ struct StatCategories {
 }
 
 impl StatCategories {
-    /// All three categories present: the unprojected gate, keeping every type-eligible sub-field.
+    /// All three categories present: the unprojected case, keeping every type-eligible sub-field.
     const ALL: StatCategories = StatCategories {
         null_count: true,
         min_values: true,
@@ -175,19 +175,20 @@ impl StatCategories {
 /// - offset 1/2: `lower_bound` / `upper_bound` (typed as `bounds_type`)
 /// - offset 3: `tight_bounds` (boolean) - excluded for variants
 /// - offset 4: `value_count` (long)
-/// - offset 5: `null_value_count` (long) - always present
+/// - offset 5: `null_value_count` (long) - emitted regardless of the column's nullability
 /// - offset 6: `nan_value_count` (long) - only for float/double `bounds_type`
 /// - offset 7: `avg_value_size_in_bytes` (int) - for string/binary `bounds_type`, or any variant
 ///
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
 ///
-/// `categories` gates the sub-fields against the Delta stat categories the leaf appears in. `None`
+/// `categories` restricts the sub-fields to the Delta stat categories the leaf appears in. `None`
 /// (the unprojected path) keeps every type-eligible sub-field. When `Some`, a sub-field is kept
-/// only when a category that backs it is present: `lower_bound`<-`minValues`,
+/// only when a category backing it is present: `lower_bound`<-`minValues`,
 /// `upper_bound`<-`maxValues`, `value_count`/`null_value_count`<-`nullCount`,
 /// `tight_bounds`/`nan_value_count`<-either bound category. `avg_value_size_in_bytes` has no
-/// backing category and is dropped whenever projecting.
+/// backing category and is dropped whenever projecting -- so `null_value_count`, though independent
+/// of nullability, is still dropped when the leaf is absent from `nullCount`.
 fn build_stats_struct(
     base_field_id: i32,
     bounds_type: &DataType,
@@ -203,8 +204,8 @@ fn build_stats_struct(
         _ => (false, false),
     };
 
-    // With no projection (`None`), `StatCategories::ALL` collapses every category gate below to
-    // `true`, keeping every type-eligible sub-field.
+    // With no projection (`None`), `StatCategories::ALL` makes every category check below `true`,
+    // keeping every type-eligible sub-field.
     let projecting = categories.is_some();
     let StatCategories {
         null_count: has_null,
@@ -265,17 +266,17 @@ fn build_stats_struct(
     StructType::new_unchecked(fields)
 }
 
-/// Builds the flat stats field for a non-struct leaf, or `None` when the leaf carries no stats:
-/// an array/map column, or a field ID outside the supported stats range (skipped with a
-/// warning). The returned field is named by the leaf's full
-/// dotted path (`path`, whose last segment is the leaf itself) and keyed at the leaf's base stats
-/// field ID (see [`build_stats_struct`] for the sub-fields).
+/// Builds the flat stats field for a non-struct leaf, or `None` when the leaf carries no stats: an
+/// array/map column, or a field ID outside the supported stats range (skipped with a warning). The
+/// returned field is named by the leaf's full dotted path (`path`, whose last segment is the leaf
+/// itself) and keyed at the leaf's base stats field ID (see [`build_stats_struct`] for the
+/// sub-fields).
 ///
 /// Errors if the leaf is missing its field-id metadata, or is an (as-yet unimplemented) geospatial
 /// column.
 ///
-/// `categories` is forwarded to [`build_stats_struct`] to gate the sub-fields (see there); `None`
-/// emits the full stats struct.
+/// `categories` is forwarded to [`build_stats_struct`] to restrict the sub-fields (see there);
+/// `None` emits the full stats struct.
 fn leaf_stats_field(
     field: &StructField,
     path: &[String],
@@ -295,7 +296,7 @@ fn leaf_stats_field(
 
     // Geospatial stats generation is not implemented yet. Error (rather than silently dropping the
     // column) so this is not forgotten once geospatial support lands -- checked before the range
-    // gate below so an out-of-range geo field ID still errors. Reachable only with the
+    // check below so an out-of-range geo field ID still errors. Reachable only with the
     // `geo-type-in-dev` feature enabled.
     // TODO: emit proper stats for geospatial columns.
     #[cfg(feature = "geo-type-in-dev")]
@@ -401,10 +402,12 @@ impl<'a> CategoryScopes<'a> {
             categories[i] = match struct_sub_schema(delta_stats_schema, category) {
                 SubSchema::Absent => None,
                 SubSchema::Struct(s) => Some(s),
-                SubSchema::Mismatch => return Err(Error::generic(format!(
+                SubSchema::Mismatch => {
+                    return Err(Error::generic(format!(
                     "Delta stats schema invariant violation: category '{category}' is a scalar, \
                          but it must be a struct mirroring the table"
-                ))),
+                )))
+                }
             };
         }
         Ok(CategoryScopes { categories })
@@ -496,7 +499,7 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector<'a> {
             // (never descended into: their inner fields carry no field IDs) and array/map columns
             // (which produce no stats). When projecting, a leaf absent from every category is
             // dropped here (before `leaf_stats_field`'s field-id checks); otherwise its category
-            // membership gates which stats sub-fields survive.
+            // membership determines which stats sub-fields survive.
             let categories = self.projection.map(|s| s.leaf_categories(field.name()));
             if categories.is_some_and(|c| !c.any()) {
                 Ok(())
@@ -917,7 +920,7 @@ mod tests {
 
     /// `null_value_count` is always emitted, independent of the leaf's or any ancestor's
     /// nullability. Covers plain and variant leaves, at top level and nested under a not-null
-    /// struct (the case that historically omitted it).
+    /// struct (a not-null leaf under a not-null ancestor must still carry it).
     #[rstest]
     #[case::top_level_not_null_int(DataType::INTEGER, false, None)]
     #[case::top_level_nullable_variant(DataType::unshredded_variant(), true, None)]
@@ -973,7 +976,7 @@ mod tests {
     #[case::geography_in_range(DataType::from(
         GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).expect("valid crs")
     ), 1)]
-    // Out of range: still errors, because the geospatial check precedes the range gate.
+    // Out of range: still errors, because the geospatial check precedes the range check.
     #[case::geometry_out_of_range(
         DataType::from(GeometryType::try_new("EPSG:4326").expect("valid crs")),
         MAX_DATA_FIELD_ID + 1
@@ -1223,7 +1226,7 @@ mod tests {
 
     /// The exact flat stats entry the projection emits for one surviving leaf: the dotted `name`
     /// keyed at the leaf's base stats ID, holding the sub-fields [`build_stats_struct`]
-    /// produces for `bounds_type` gated to the Delta stat `categories` the leaf appears in
+    /// produces for `bounds_type` restricted to the Delta stat `categories` the leaf appears in
     /// (each a [`NULL_COUNT`]/[`MIN_VALUES`]/[`MAX_VALUES`] name). Lets a case assert the full
     /// projected schema by naming a leaf's categories rather than field-presence alone.
     fn expected_leaf(
@@ -1311,11 +1314,11 @@ mod tests {
         assert_eq!(projected, expected);
     }
 
-    /// Independently pins the category -> sub-field mapping: a surviving leaf keeps exactly the
+    /// Independently checks the category -> sub-field mapping: a surviving leaf keeps exactly the
     /// named sub-fields, in schema order, for the categories it appears in. Unlike the other
     /// projected tests (which build expectations via `build_stats_struct`), the expected sub-field
-    /// names here are spelled out per case, so a wrong gate in `build_stats_struct` is caught. The
-    /// leaf type varies to exercise the type-specific gates (`nan_value_count`,
+    /// names here are spelled out per case, so a wrong condition in `build_stats_struct` is caught.
+    /// The leaf type varies to exercise the type-specific conditions (`nan_value_count`,
     /// `avg_value_size_in_bytes`). Column `c` is always field id 1.
     #[rstest]
     // Int: lower<-minValues, upper<-maxValues, tight_bounds<-either bound, value/null_value_count
@@ -1562,7 +1565,7 @@ mod tests {
 
     #[test]
     fn projected_leaf_in_category_still_warn_dropped_when_out_of_range() {
-        // Presence in a category does not bypass the supported-range gate in `leaf_stats_field`.
+        // Presence in a category does not bypass the supported-range check in `leaf_stats_field`.
         let table = StructType::new_unchecked([field_with_id(
             "c",
             DataType::INTEGER,
