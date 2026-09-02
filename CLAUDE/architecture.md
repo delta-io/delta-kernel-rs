@@ -71,10 +71,10 @@ file listing without re-scanning the table.
 `BoundWriteContext`) -> commit
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
-partition values to create a `BoundWriteContext` containing validated partition values, schemas,
-statistics columns, and the recommended write directory. The transaction registers the resulting
-files, enforces protocol compliance, assembles commit actions, and delegates the atomic commit to
-a `Committer`.
+partition values and any logical materialized row-tracking columns to create a `BoundWriteContext`
+containing validated partition values, data schemas, statistics columns, and the recommended write
+directory. The transaction registers the resulting files, enforces protocol compliance, assembles
+commit actions, and delegates the atomic commit to a `Committer`.
 
 **Data-write steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
