@@ -124,24 +124,16 @@ pub enum StructStats {
     /// internal data skipping unless the caller picked [`StatsOptions::none`], which
     /// disables stats reading entirely.
     None,
-    /// Emit all indexed stats columns, plus `extra_indexed`.
+    /// Emit all indexed and extra-indexed stats columns.
     All {
-        /// Columns to collect stats for even when they fall outside the indexed set -- i.e.
-        /// past `delta.dataSkippingNumIndexedCols`, or not listed in
-        /// `delta.dataSkippingStatsColumns`. Best-effort: a file carrying no stats for one
-        /// reads NULL and prunes nothing.
+        /// Columns to include regardless of the table's configured indexed set.
         extra_indexed: Vec<ColumnName>,
     },
-    /// Emit stats for `requested` (predicate-referenced columns may also appear), plus
-    /// `extra_indexed`.
+    /// Emit requested and extra-indexed stats columns. Predicate columns may also appear.
     Columns {
-        /// Output filter: emit stats only for these columns, and only where they fall *within*
-        /// the indexed set (`delta.dataSkippingNumIndexedCols` /
-        /// `delta.dataSkippingStatsColumns`). A column outside that set is dropped -- pass it in
-        /// `extra_indexed` to force it in.
+        /// Indexed columns to emit.
         requested: Vec<ColumnName>,
-        /// Same as `extra_indexed` on [`StructStats::All`]: forced into the stats set regardless
-        /// of the indexed limit.
+        /// Columns to include regardless of the table's configured indexed set.
         extra_indexed: Vec<ColumnName>,
     },
 }
@@ -186,16 +178,10 @@ impl StatsOptions {
         }
     }
 
-    /// Like [`Self::all_struct`], but also retains stats for `extra_indexed` columns even when
-    /// they fall outside the indexed set (past `delta.dataSkippingNumIndexedCols`, or absent
-    /// from `delta.dataSkippingStatsColumns`).
+    /// Returns structured stats for all indexed columns and `extra_indexed`.
     ///
-    /// Best-effort: kernel widens the stats schema to include these columns, so a file that
-    /// carries stats for them becomes prunable; a file that does not reads NULL and prunes
-    /// nothing. Supplying a column with no on-disk stats is therefore safe. The engine resolves
-    /// the column list from whatever source it owns (e.g. a catalog-managed table property);
-    /// kernel never learns that source. Unlike [`Self::struct_columns`] (an output filter that
-    /// respects the limit, per the Delta protocol), `extra_indexed` bypasses the limit.
+    /// Extra-indexed columns bypass the table's configured indexed set. Missing on-disk stats read
+    /// as NULL and do not prune; names that cannot be resolved are ignored with a warning.
     pub fn all_struct_with_extra_indexed(extra_indexed: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
@@ -203,10 +189,9 @@ impl StatsOptions {
         }
     }
 
-    /// Like [`Self::struct_columns`], but also retains limit-exempt `extra_indexed` columns (see
-    /// [`Self::all_struct_with_extra_indexed`] for the `extra_indexed` semantics). To force a
-    /// narrow set of columns past the limit without emitting anything else, pass them all in
-    /// `extra_indexed` and leave `requested` empty.
+    /// Returns structured stats for `requested` indexed columns and `extra_indexed` columns.
+    ///
+    /// Pass an empty `requested` list to emit only the extra-indexed columns.
     pub fn struct_columns_with_extra_indexed(
         requested: Vec<ColumnName>,
         extra_indexed: Vec<ColumnName>,
@@ -748,9 +733,8 @@ pub struct Scan {
 ///
 /// For example, if the caller requests `[a, b]` and the predicate references `c`,
 /// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
-/// Returns `None` when no eligible struct stats are requested. An unresolvable `requested` column
-/// is an error (rejecting a nonexistent requested column); an unresolvable `extra_indexed` column
-/// is dropped with a warning (best-effort), matching the internal skipping schema.
+/// Returns `None` when no eligible structured stats are requested. Unresolvable requested columns
+/// return an error, while unresolvable extra-indexed columns are ignored with a warning.
 fn build_physical_stats_output_schema(
     table_configuration: &TableConfiguration,
     state_info: &StateInfo,
@@ -758,8 +742,6 @@ fn build_physical_stats_output_schema(
 ) -> DeltaResult<Option<SchemaRef>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
-        // The parse schema in `state_info` already includes `extra_indexed` columns (see
-        // `build_data_skipping_schemas`), so cloning it surfaces them in the output too.
         StructStats::All { .. } => Ok(state_info.physical_stats_schema.clone()),
         StructStats::Columns {
             requested,
@@ -769,11 +751,8 @@ fn build_physical_stats_output_schema(
             requested,
             extra_indexed,
         } => {
-            // `requested` uses strict resolution (a nonexistent requested column is rejected).
-            // `extra_indexed` is best-effort like the internal skipping schema (unresolvable names
-            // dropped), and is unioned into the requested-columns output filter so the filter does
-            // not drop it -- it bypasses the num-indexed-cols limit as `required_columns`, but the
-            // filter would still exclude it from the emitted schema.
+            // Resolve requested columns strictly, then retain valid extra-indexed columns in the
+            // output filter.
             let logical_schema = table_configuration.logical_schema();
             let column_mapping_mode = table_configuration.column_mapping_mode();
             let extra_indexed_physical =

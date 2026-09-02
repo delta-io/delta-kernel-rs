@@ -140,23 +140,10 @@ fn validate_metadata_columns<'a>(
     Ok(metadata_info)
 }
 
-/// Build data-skipping schemas based on `StructStats` and `PhysicalPredicate`.
+/// Builds the physical stats and partition schemas used by scan metadata and data skipping.
 ///
-/// Returns `(physical_stats_schema, physical_partition_schema)`, where:
-/// - `physical_stats_schema` contains data-column stats for `stats_parsed`.
-/// - `physical_partition_schema` contains typed partition values for `partitionValues_parsed`.
-///
-/// All three arms route through `TableConfiguration::build_expected_stats_schemas`: the
-/// `All` arm with no `requested_physical_columns` filter, and the two scoped arms with
-/// the union of requested + predicate-referenced columns. That path applies the same
-/// `BaseStatsTransform` -> `MinMaxStatsTransform` pipeline writers use, so the read-side
-/// stats schema's shape matches the write-side exactly.
-///
-/// `extra_indexed_physical` are already-resolved physical columns (the caller's `extra_indexed`)
-/// that must survive the `delta.dataSkippingNumIndexedCols` limit. They are passed as the
-/// limit-exempt `required_columns` argument on every emitting arm; on the `Columns` arm they are
-/// also unioned into the requested-columns output filter, or the filter would drop them from the
-/// schema even though they pass the table gate.
+/// Extra-indexed physical columns bypass the table's configured indexed set and remain in any
+/// requested-column output filter.
 fn build_data_skipping_schemas(
     struct_stats: &StructStats,
     physical_predicate: &PhysicalPredicate,
@@ -206,15 +193,12 @@ fn build_data_skipping_schemas(
     };
 
     let stats_schema = match (struct_stats, physical_predicate) {
-        // Full table stats schema for stats_parsed, plus any limit-exempt extra-indexed columns.
-        // No requested filter, so the extra-indexed columns need no special handling here.
         (StructStats::All { .. }, _) => with_data_cols(
             table_configuration
                 .build_expected_stats_schemas(extra_indexed_physical, None)?
                 .physical,
         ),
-        // Explicit requested columns. Union in predicate refs so the stats schema covers
-        // both sources, and the extra-indexed columns so the requested filter does not drop them.
+        // Include predicate and extra-indexed columns in the requested-column filter.
         (StructStats::Columns { requested, .. }, _)
             if !requested.is_empty() || extra_indexed_physical.is_some() =>
         {
@@ -243,10 +227,7 @@ fn build_data_skipping_schemas(
     Ok((stats_schema, predicate_partition_schema))
 }
 
-/// Resolves logical column names to physical names, dropping (with a warning) any that fail to
-/// resolve (e.g. a name absent from the schema, or a column-mapping annotation gap). Used for
-/// engine-supplied and predicate-derived column lists, where an unresolvable name should be
-/// ignored rather than fail the scan.
+/// Resolves logical column names to physical names, warning and omitting unresolved names.
 pub(super) fn resolve_physical_columns(
     table_configuration: &TableConfiguration,
     logical: &[ColumnName],
@@ -265,9 +246,7 @@ pub(super) fn resolve_physical_columns(
         .collect()
 }
 
-/// Appends `extra` to the requested-columns output `filter`, skipping columns already present.
-/// The limit-exempt `extra` columns must also survive the requested filter, or the stats schema
-/// drops them even though they pass the table-level gate.
+/// Adds missing extra-indexed columns to a requested-column output filter.
 pub(super) fn union_extra_into_filter(filter: &mut Vec<ColumnName>, extra: &[ColumnName]) {
     let to_add: Vec<ColumnName> = extra
         .iter()
@@ -427,10 +406,7 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Extra-indexed stats columns the engine asked to keep even past
-        // `dataSkippingNumIndexedCols`. They live only on the emitting `StructStats` variants;
-        // `None` carries none. Resolve to physical names once and feed both the gate set and the
-        // schema builder below, so internal skipping and `stats_parsed` stay in lockstep.
+        // Use the same resolved extra-indexed columns for output and internal data skipping.
         let extra_indexed_logical: &[ColumnName] = match &stats.struct_stats {
             StructStats::All { extra_indexed } | StructStats::Columns { extra_indexed, .. } => {
                 extra_indexed
@@ -1484,9 +1460,6 @@ pub(crate) mod tests {
         );
     }
 
-    // === physical_stats_columns trims the predicate-derived stats schema ===
-
-    /// Flat schema with `n` long columns named `c0..c{n-1}`.
     fn flat_long_schema(n: usize) -> SchemaRef {
         Arc::new(StructType::new_unchecked(
             (0..n)
@@ -1495,8 +1468,7 @@ pub(crate) mod tests {
         ))
     }
 
-    /// Asserts each `present` top-level leaf is in, and each `absent` leaf is out of, both
-    /// `minValues` and `maxValues` of `stats_schema`.
+    /// Checks top-level leaves in both `minValues` and `maxValues`.
     fn assert_stats_leaves(stats_schema: &SchemaRef, present: &[&str], absent: &[&str]) {
         for stats_field in [MIN_VALUES, MAX_VALUES] {
             let DataType::Struct(inner) = stats_schema
@@ -1521,7 +1493,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// `delta.dataSkippingNumIndexedCols=<n>` configuration map.
     fn num_indexed_cols_config(n: i32) -> HashMap<String, String> {
         let mut m = HashMap::new();
         m.insert(
@@ -1531,16 +1502,12 @@ pub(crate) mod tests {
         m
     }
 
-    /// `delta.dataSkippingStatsColumns=<cols joined by ",">` configuration map.
     fn stats_columns_config(cols: &[&str]) -> HashMap<String, String> {
         let mut m = HashMap::new();
         m.insert("delta.dataSkippingStatsColumns".to_string(), cols.join(","));
         m
     }
 
-    /// Both `delta.dataSkippingStatsColumns` and `delta.dataSkippingNumIndexedCols` set
-    /// simultaneously. Per the Delta protocol, the explicit list takes precedence over the
-    /// cap; this helper exists for tests that exercise that precedence.
     fn both_configs(stats_cols: &[&str], num_indexed: i32) -> HashMap<String, String> {
         let mut m = stats_columns_config(stats_cols);
         m.insert(
@@ -1550,8 +1517,6 @@ pub(crate) mod tests {
         m
     }
 
-    /// `delta.dataSkippingNumIndexedCols` caps the `physical_stats_columns` set to the
-    /// first N leaves.
     #[test]
     fn stats_columns_honors_num_indexed_cols() {
         let schema = flat_long_schema(5);
@@ -1568,8 +1533,6 @@ pub(crate) mod tests {
         assert_eq!(state_info.physical_stats_columns, cols);
     }
 
-    /// Predicate on a past-cap column: stats schema goes to `None` (no skipping), but
-    /// the physical predicate is retained so engines can still apply it per-row.
     #[test]
     fn predicate_on_past_cap_column_drops_stats_schema() {
         let schema = flat_long_schema(5);
@@ -1594,8 +1557,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Indexed AND past-cap: indexed leaf survives in the stats schema, past-cap leaf
-    /// is dropped.
     #[test]
     fn predicate_on_mixed_indexed_and_past_cap_keeps_indexed_only() {
         let schema = flat_long_schema(5);
@@ -1616,12 +1577,9 @@ pub(crate) mod tests {
             .physical_stats_schema
             .as_ref()
             .expect("should have stats schema (indexed arm survives)");
-        // c0 (indexed) survives; c4 (past cap) is dropped.
         assert_stats_leaves(stats_schema, &["c0"], &["c4"]);
     }
 
-    /// `numIndexedCols=2` against `{ a, b, s: { c, d } }` keeps `a, b` and drops the
-    /// entire `s` struct, so a predicate on `s.c` produces no stats schema.
     #[test]
     fn predicate_on_nested_past_cap_leaf_drops_parent_struct() {
         let schema = schema_ref! {
@@ -1632,7 +1590,6 @@ pub(crate) mod tests {
                 nullable "d": LONG,
             },
         };
-        // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
         let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
         let state_info = get_state_info(
             schema,
@@ -1650,8 +1607,6 @@ pub(crate) mod tests {
             .contains(&column_name!("s.c")));
     }
 
-    /// `delta.dataSkippingStatsColumns` selects exactly the listed leaves, regardless of
-    /// their position relative to the (default) cap.
     #[rstest]
     #[case::single(&["c2"], &["c2"])]
     #[case::sparse_subset(&["c0", "c3"], &["c0", "c3"])]
@@ -1675,9 +1630,6 @@ pub(crate) mod tests {
         assert_eq!(state_info.physical_stats_columns, expected_cols);
     }
 
-    /// `numIndexedCols=3` against `{ a, b, s: { c, d } }` keeps `a, b, s.c` and drops
-    /// `s.d`. A predicate on both `s.c` and `s.d` keeps the `s` struct under
-    /// `minValues` / `maxValues` with `c` only.
     #[test]
     fn predicate_on_nested_mixed_keeps_intersection_under_parent_struct() {
         let schema = schema_ref! {
@@ -1731,9 +1683,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// `dataSkippingStatsColumns` with a parent struct path admits every leaf under that
-    /// parent (the trie matches by prefix). `{ a, s: { c, d } }` with the property set to
-    /// `"s"` should produce `{ s.c, s.d }` (and exclude `a`, which is not in the list).
     #[test]
     fn stats_columns_admits_all_children_of_nested_parent_in_explicit_list() {
         let schema = schema_ref! {
@@ -1756,8 +1705,6 @@ pub(crate) mod tests {
         assert_eq!(state_info.physical_stats_columns, expected);
     }
 
-    /// `dataSkippingStatsColumns` ("A") takes precedence over `dataSkippingNumIndexedCols`
-    /// ("B") whether A wants more columns than B allows or fewer.
     #[rstest]
     #[case::a_broader_than_b(&["c0", "c3", "c4"], 2, &["c0", "c3", "c4"])]
     #[case::a_narrower_than_b(&["c0"], 3, &["c0"])]
@@ -1781,32 +1728,22 @@ pub(crate) mod tests {
         assert_eq!(state_info.physical_stats_columns, expected_cols);
     }
 
-    // === StatsOptions `extra_indexed` columns bypass dataSkippingNumIndexedCols ===
-
-    /// Schema + gate-set expectations for `extra_indexed` on a flat `c0..c4` schema, across the
-    /// count-based cap and the explicit `dataSkippingStatsColumns` list. Each case asserts the
-    /// emitted stats schema leaves (present/absent in min/max) and the internal skipping gate set
-    /// (`physical_stats_columns`).
     #[rstest]
-    // All indexed columns plus a past-cap `extra_indexed` column, in both schema and gate.
     #[case::all_extra_past_cap(
         StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c4")]),
         num_indexed_cols_config(2),
         &["c0", "c1", "c4"], &["c2", "c3"], &["c0", "c1", "c4"],
     )]
-    // Conformance guard: without `extra_indexed`, a past-cap column stays out of schema and gate.
     #[case::all_no_extra(
         StatsOptions::all_struct(),
         num_indexed_cols_config(2),
         &["c0", "c1"], &["c2", "c3", "c4"], &["c0", "c1"],
     )]
-    // An `extra_indexed` column already within the cap changes nothing.
     #[case::extra_within_cap_noop(
         StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c0")]),
         num_indexed_cols_config(2),
         &["c0", "c1"], &["c2", "c3", "c4"], &["c0", "c1"],
     )]
-    // `Columns` requested plus a past-cap `extra_indexed` column (the requested-filter union).
     #[case::columns_plus_extra(
         StatsOptions::struct_columns_with_extra_indexed(
             vec![column_name!("c0")],
@@ -1815,19 +1752,16 @@ pub(crate) mod tests {
         num_indexed_cols_config(2),
         &["c0", "c4"], &["c1", "c2", "c3"], &["c0", "c1", "c4"],
     )]
-    // Forced-only: everything in `extra_indexed`, `requested` empty -> schema is exactly those.
     #[case::columns_extra_only(
         StatsOptions::struct_columns_with_extra_indexed(vec![], vec![column_name!("c4")]),
         num_indexed_cols_config(2),
         &["c4"], &["c0", "c1", "c2", "c3"], &["c0", "c1", "c4"],
     )]
-    // Composes with the explicit `dataSkippingStatsColumns` list, not just the count cap.
     #[case::extra_with_stats_columns(
         StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c4")]),
         stats_columns_config(&["c0"]),
         &["c0", "c4"], &["c1", "c2", "c3"], &["c0", "c4"],
     )]
-    // An unresolvable `extra_indexed` column is dropped (with a warning), not an error.
     #[case::unresolvable_extra_dropped(
         StatsOptions::all_struct_with_extra_indexed(vec![
             column_name!("c4"),
@@ -1863,9 +1797,6 @@ pub(crate) mod tests {
         assert_eq!(state_info.physical_stats_columns, expected);
     }
 
-    /// A predicate on a past-cap column normally drops the stats schema
-    /// (see `predicate_on_past_cap_column_drops_stats_schema`). Naming the column `extra_indexed`
-    /// keeps it prunable: it survives in the schema and the gate.
     #[test]
     fn extra_indexed_column_widens_internal_skipping_gate() {
         let state_info = get_state_info_with_stats(
@@ -1888,8 +1819,6 @@ pub(crate) mod tests {
             .contains(&column_name!("c4")));
     }
 
-    /// A nested subfield past the cap, requested via `extra_indexed`, survives (predictive
-    /// optimization routinely selects struct subfields).
     #[test]
     fn extra_indexed_nested_subfield_past_cap_appears() {
         let schema = schema_ref! {
@@ -1905,7 +1834,7 @@ pub(crate) mod tests {
             vec![],
             None,
             &[],
-            num_indexed_cols_config(3), // a, b, s.c indexed; s.d past cap
+            num_indexed_cols_config(3),
             vec![],
             StatsOptions::all_struct_with_extra_indexed(vec![column_name!("s.d")]),
         )
@@ -1933,7 +1862,6 @@ pub(crate) mod tests {
             .contains(&column_name!("s.d")));
     }
 
-    /// An `extra_indexed` logical name resolves to its physical name under column mapping.
     #[test]
     fn extra_indexed_column_resolves_physical_name_under_column_mapping() {
         let schema = schema_ref! {
@@ -1961,7 +1889,6 @@ pub(crate) mod tests {
             .physical_stats_schema
             .as_ref()
             .expect("stats schema present");
-        // col_c is past the cap (1) and resolves to phys_c; the logical name never appears.
         assert_stats_leaves(stats_schema, &["phys_a", "phys_c"], &["col_c", "phys_b"]);
         assert!(state_info
             .physical_stats_columns

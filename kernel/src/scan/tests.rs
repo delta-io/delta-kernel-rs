@@ -2251,10 +2251,6 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
     assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
 }
 
-/// `extra_indexed` is best-effort: an unresolvable extra-indexed column is dropped with a warning,
-/// so the scan still builds. Contrast `test_scan_metadata_with_nonexistent_stats_columns`, where a
-/// nonexistent `requested` column is rejected. Goes through `scan_builder().build()` so it covers
-/// `build_physical_stats_output_schema`'s `Columns` arm, not just the internal skipping schema.
 #[test]
 fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
