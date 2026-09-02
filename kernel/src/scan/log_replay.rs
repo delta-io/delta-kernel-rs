@@ -1482,6 +1482,8 @@ mod tests {
             ScanPartitionValuesOptions::default(),
         )?;
 
+        let mut iter = iter.peekable();
+        assert!(iter.peek().is_some(), "scan metadata must not be empty");
         for scan_metadata in iter {
             let transforms = scan_metadata?.scan_file_transforms;
             assert_eq!(transforms.len(), 1);

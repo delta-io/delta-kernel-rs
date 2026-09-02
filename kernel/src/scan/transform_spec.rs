@@ -23,6 +23,9 @@ use crate::{DeltaResult, Error};
 // description for that concept.
 pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 
+/// Per-file Add-action values used to reconstruct stable row id/commit version.
+///
+/// A value is absent when the Add action doesn't have the corresponding field.
 #[derive(Debug, Default)]
 pub(crate) struct FileRowTrackingMetadata {
     pub(crate) base_row_id: Option<i64>,

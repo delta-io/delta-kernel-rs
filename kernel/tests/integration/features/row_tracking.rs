@@ -912,9 +912,9 @@ async fn test_read_row_ids_basic() -> DeltaResult<()> {
 #[case::none("none")]
 #[case::name("name")]
 #[case::id("id")]
-/// When the row tracking metadata columns are before the partition columns in
-/// scan schema, the read result should preserve the order.
-fn generated_row_tracking_columns_preserve_order_before_partitions(
+  /// Row-tracking metadata columns directly adjacent to partition columns should preserve their
+  /// scan-schema order.
+fn generated_row_tracking_and_partition_columns_preserve_scan_schema_order(
     #[case] column_mapping_mode: &str,
 ) -> DeltaResult<()> {
     let table_schema = schema_ref! {
@@ -1089,6 +1089,11 @@ async fn test_read_row_commit_versions_use_add_action_defaults(
             .expect("row_commit_version column not found")
             .as_primitive::<Int64Type>();
         for row in 0..batch.num_rows() {
+            assert!(
+                !actual.contains_key(&numbers.value(row)),
+                "duplicate number {}",
+                numbers.value(row)
+            );
             actual.insert(numbers.value(row), row_commit_versions.value(row));
         }
     }
@@ -1397,6 +1402,7 @@ async fn test_read_row_tracking_values_after_checkpoint() -> DeltaResult<()> {
 
     let row_commit_version_batches =
         read_row_commit_version_scan(fresh_snapshot, mt_engine.clone())?;
+    assert!(!row_commit_version_batches.is_empty());
     for batch in row_commit_version_batches {
         let row_commit_versions = batch
             .column_by_name("row_commit_version")

@@ -285,8 +285,8 @@ impl ScanBuilder {
     /// have been filtered out but were kept).
     ///
     /// NOTE: Predicates referencing metadata columns the caller added to the projection via
-    /// [`StructType::add_metadata_column`] (row indexes, row ids, file paths) are not supported
-    /// and will error at build time.
+    /// [`StructType::add_metadata_column`] (row indexes, row ids, row commit versions, file paths)
+    /// are not supported and will error at build time.
     ///
     /// A predicate alone enables internal data skipping; kernel does not surface stats
     /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
