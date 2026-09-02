@@ -5,10 +5,10 @@ use std::ffi::c_void;
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
-    JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef,
-    OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData,
-    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
-    VariadicExpressionOp,
+    JunctionPredicateOp, MapData, MapToStructExpression, MapToStructOptions, OpaqueExpression,
+    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate,
+    Scalar, StructData, UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
+    VariadicExpression, VariadicExpressionOp,
 };
 
 use super::kernel_visitor::NullTypeTag;
@@ -174,9 +174,9 @@ pub struct EngineExpressionVisitor {
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
     /// into.
     pub visit_parse_json: VisitParseJsonFn,
-    /// Visits the `MapToStruct` expression belonging to the list identified by `sibling_list_id`.
-    /// The sub-expression (map column) will be in a _one_ item list identified by `child_list_id`.
-    /// The output struct schema is determined by the evaluator's result type.
+    /// Visits a `MapToStruct` expression with default options. The sub-expression is in the
+    /// one-item list identified by `child_list_id`. Expressions with configured options are
+    /// reported through `visit_unknown` without visiting the child expression.
     pub visit_map_to_struct: VisitUnaryFn,
     /// Visits the `LessThan` binary operator belonging to the list identified by
     /// `sibling_list_id`. The operands will be in a _two_ item list identified by
@@ -696,7 +696,12 @@ fn visit_expression_impl(
                 schema_handle
             );
         }
-        Expression::MapToStruct(MapToStructExpression { map_expr }) => {
+        Expression::MapToStruct(map_to_struct)
+            if map_to_struct.options != MapToStructOptions::default() =>
+        {
+            visit_unknown(visitor, sibling_list_id, "map_to_struct")
+        }
+        Expression::MapToStruct(MapToStructExpression { map_expr, .. }) => {
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, map_expr, child_list_id);
             call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
@@ -771,7 +776,7 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{lit, Expression, Scalar};
+    use delta_kernel::expressions::{lit, Expression, MapToStructOptions, Scalar};
     use rstest::rstest;
 
     use super::*;
@@ -790,6 +795,10 @@ mod tests {
         Column {
             sibling_list_id: usize,
             parts: Vec<String>,
+        },
+        Unknown {
+            sibling_list_id: usize,
+            name: String,
         },
     }
 
@@ -847,6 +856,18 @@ mod tests {
         });
     }
 
+    extern "C" fn visit_unknown_name(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let name = unsafe { String::try_from_slice(&name) }.unwrap();
+        builder.events.push(LiteralEvent::Unknown {
+            sibling_list_id,
+            name,
+        });
+    }
     macro_rules! ignore_fn {
         ($fn_name:ident $(, $arg_type:ty)*) => {
             extern "C" fn $fn_name(
@@ -925,7 +946,7 @@ mod tests {
             visit_field_patch: ignore_field_patch,
             visit_opaque_expr: ignore_opaque_expr,
             visit_opaque_pred: ignore_opaque_pred,
-            visit_unknown: ignore_string_slice,
+            visit_unknown: visit_unknown_name,
         }
     }
 
@@ -991,5 +1012,26 @@ mod tests {
 
         assert_eq!(top_level_id, 0);
         assert_eq!(builder.events, vec![expected]);
+    }
+
+    #[test]
+    fn timezone_aware_map_to_struct_visits_unknown() {
+        let expression = Expression::map_to_struct(
+            Expression::column(["partitionValues"]),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Unknown {
+                sibling_list_id: 0,
+                name: "map_to_struct".to_string(),
+            }]
+        );
     }
 }

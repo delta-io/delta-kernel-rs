@@ -6,6 +6,7 @@ use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values};
 use crate::schema::{schema_ref, SchemaRef, StructType};
+use crate::timestamp_timezone::TimestampTimezone;
 use crate::{DeltaResult, Error, ExpressionRef};
 
 /// Gets CDF metadata columns from the logical schema and scan file.
@@ -110,6 +111,7 @@ pub(crate) fn get_cdf_transform_expr(
         transform_spec,
         &scan_file.partition_values,
         state_info.column_mapping_mode,
+        TimestampTimezone::default(),
     )?;
     partition_values.extend(parsed_values);
 

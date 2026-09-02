@@ -16,7 +16,7 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
-use crate::expressions::{col, Expression, ExpressionRef, UnaryExpressionOp};
+use crate::expressions::{col, Expression, ExpressionRef, MapToStructOptions, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
@@ -211,7 +211,10 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([
         col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD),
-        Expression::map_to_struct(col!(ADD_NAME, PARTITION_VALUES_FIELD)),
+        Expression::map_to_struct(
+            col!(ADD_NAME, PARTITION_VALUES_FIELD),
+            MapToStructOptions::default(),
+        ),
     ]))
 }
 
@@ -437,8 +440,8 @@ mod tests {
     }
 
     /// The checkpoint falls back to `MAP_TO_STRUCT` over `partitionValues` when no native
-    /// `partitionValues_parsed` column is present, so a checkpoint reconstructs the same typed
-    /// struct the scan reads and the two can never disagree on a value.
+    /// `partitionValues_parsed` column is present, so footer skipping still has typed partition
+    /// values for checkpoints that do not provide them natively.
     #[test]
     fn build_partition_values_parsed_expr_falls_back_to_map_to_struct() {
         let expr = build_partition_values_parsed_expr();

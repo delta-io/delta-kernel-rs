@@ -21,7 +21,9 @@ use crate::expressions::{
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
-use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
+use crate::scan::log_replay::{
+    parsed_partition_values_expr, PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME,
+};
 use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType,
@@ -124,24 +126,30 @@ impl Scan {
     ///            stats_parsed, partitionValues_parsed
     ///          ),
     ///          add.stats_parsed AS stats_parsed,
-    ///          MAP_TO_STRUCT(add.partitionValues, physical_partitions) AS partitionValues_parsed
+    ///          MAP_TO_STRUCT(
+    ///            add.partitionValues, physical_partitions, reader_timezone
+    ///          ) AS partitionValues_parsed
     ///        ) AS add,
     ///        version, add.path IS NOT NULL AS is_add, file_key(add) AS key
     /// FROM checkpoint_actions
-    /// WHERE add.path IS NOT NULL
+    /// WHERE native_partition_predicate IS NOT FALSE
+    ///   AND add.path IS NOT NULL
     ///
     /// When the checkpoint lacks native parsed stats, `FROM_JSON(add.stats, physical_stats)`
-    /// replaces `add.stats_parsed` above. A parsed field is omitted when its schema is absent.
+    /// replaces `add.stats_parsed` above. Partition values always come from the canonical raw map.
+    /// A parsed field is omitted when its schema is absent.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.state_info.physical_stats_schema.as_ref();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
         let source_physical_stats = shape.parsed_stats_schema.as_ref();
+        let source_physical_partitions = shape.parsed_partition_values_schema.as_ref();
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
             (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-                let schema = parquet_read_schema(source_physical_stats, None)?;
+                let schema =
+                    parquet_read_schema(source_physical_stats, source_physical_partitions)?;
                 PlanBuilder::scan_parquet(parts, &[VERSION], schema)
             }
             (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
@@ -152,7 +160,8 @@ impl Scan {
                 )
             }
             (CheckpointType::Manifest, Some((file_type, parts))) => {
-                let schema = parquet_read_schema(source_physical_stats, None)?;
+                let schema =
+                    parquet_read_schema(source_physical_stats, source_physical_partitions)?;
                 match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
                     Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
                     // Without a complete hint, load the sidecars referenced by the manifest.
@@ -165,11 +174,22 @@ impl Scan {
         }?;
 
         actions
+            .try_fold_with(
+                source_physical_partitions.and_then(|_| self.build_actions_partition_predicate()),
+                |actions, predicate| {
+                    let predicate = predicate.as_ref().clone();
+                    let is_unknown = Expr::from_pred(predicate.clone()).is_null();
+                    actions.filter(Predicate::or(predicate, is_unknown))
+                },
+            )?
             .filter(col!("add.path").is_not_null())?
             .project_patch(|patch| {
                 patch
                     .with_parsed_add_stats(physical_stats)
-                    .with_parsed_add_partition_values(physical_partitions)
+                    .with_parsed_add_partition_values(
+                        physical_partitions,
+                        self.partition_values.timestamp_timezone.as_deref(),
+                    )
                     .append(
                         StructField::not_null(IS_ADD, DataType::BOOLEAN),
                         Expr::from(col!("add.path").is_not_null()),
@@ -188,7 +208,9 @@ impl Scan {
     /// SELECT STRUCT(
     ///          add.* EXCEPT (stats_parsed, partitionValues_parsed),
     ///          FROM_JSON(add.stats, physical_stats) AS stats_parsed,
-    ///          MAP_TO_STRUCT(add.partitionValues, physical_partitions) AS partitionValues_parsed
+    ///          MAP_TO_STRUCT(
+    ///            add.partitionValues, physical_partitions, reader_timezone
+    ///          ) AS partitionValues_parsed
     ///        ) AS add,
     ///        remove, version, add.path IS NOT NULL AS is_add,
     ///        file_key(COALESCE(add, remove)) AS key
@@ -211,6 +233,7 @@ impl Scan {
                     .with_parsed_add_stats(self.state_info.physical_stats_schema.as_ref())
                     .with_parsed_add_partition_values(
                         self.state_info.physical_partition_schema.as_ref(),
+                        self.partition_values.timestamp_timezone.as_deref(),
                     )
                     .append(
                         StructField::not_null(IS_ADD, DataType::BOOLEAN),
@@ -397,7 +420,7 @@ fn json_read_schema(include_remove: bool) -> SchemaRef {
     }
 }
 
-/// Read schema for parquet add actions.
+/// Read schema for parquet add actions, including compatible typed metadata when available.
 fn parquet_read_schema(
     physical_stats: Option<&SchemaRef>,
     physical_partitions: Option<&SchemaRef>,
@@ -454,8 +477,12 @@ trait ProjectionStructPatchBuilderExt<'a> {
     /// `add.stats_parsed` or the fallback `add.stats` JSON field.
     fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self;
 
-    /// Parses add partition values, preferring a compatible parsed field.
-    fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self;
+    /// Parses add partition values from the canonical raw map.
+    fn with_parsed_add_partition_values(
+        self,
+        physical_partitions: Option<&SchemaRef>,
+        timestamp_timezone: Option<&str>,
+    ) -> Self;
 }
 
 impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
@@ -478,7 +505,11 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         }
     }
 
-    fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self {
+    fn with_parsed_add_partition_values(
+        self,
+        physical_partitions: Option<&SchemaRef>,
+        timestamp_timezone: Option<&str>,
+    ) -> Self {
         let has_partition_values_parsed = self
             .input_schema()
             .contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
@@ -486,9 +517,11 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         match physical_partitions {
             Some(schema) => {
                 let field = StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone());
-                let expr = Expr::map_to_struct(col!(ADD_NAME, PARTITION_VALUES));
+                let expr = parsed_partition_values_expr(
+                    col!(ADD_NAME, PARTITION_VALUES),
+                    timestamp_timezone,
+                );
                 if has_partition_values_parsed {
-                    let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
                     self.replace_at(add, PARTITION_VALUES_PARSED, field, expr)
                 } else {
                     self.append_at(add, field, expr)
@@ -648,6 +681,7 @@ mod tests {
         CheckpointShape {
             checkpoint_type,
             parsed_stats_schema: parsed_stats,
+            parsed_partition_values_schema: None,
         }
     }
 
@@ -827,7 +861,7 @@ mod tests {
             add_struct(&dynamic_scan.schema)
                 .field(PARTITION_VALUES_PARSED)
                 .is_none(),
-            "native parsed partition values are not requested yet"
+            "native parsed partition values must not override the raw map"
         );
         assert!(
             dynamic_scan.dv_column.is_none(),

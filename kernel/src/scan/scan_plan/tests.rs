@@ -15,7 +15,7 @@ use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::expressions::{col, column_name, lit, Predicate as Pred};
+use crate::expressions::{col, column_name, lit, Predicate as Pred, Scalar};
 use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
@@ -251,6 +251,72 @@ fn declarative_metadata_matches_imperative_scan(
     } else {
         assert_metadata_eq(&actual, &expected, &format!("table {table}"))
     }
+}
+
+#[rstest]
+#[case::json_commit(LogState::with_latest_version(1), FeatureSet::new())]
+#[case::v1_checkpoint(
+    LogState::with_latest_version(1).with_checkpoint_at([1]),
+    FeatureSet::new()
+)]
+#[case::v2_sidecar(
+    LogState::with_latest_version(1)
+        .with_checkpoint_at([1])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint()
+)]
+#[case::column_mapping(
+    LogState::with_latest_version(1).with_checkpoint_at([1]),
+    FeatureSet::new().column_mapping("id")
+)]
+fn declarative_metadata_matches_imperative_with_reader_timezone(
+    #[case] log_state: LogState,
+    #[case] features: FeatureSet,
+) -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(log_state)
+        .with_features(features)
+        .with_table_config(TableConfig::new().write_stats_as_struct(true))
+        .with_data_layout(DataLayoutConfig::PartitionedAllTypes)
+        .build()
+        .expect("build reader-timezone parity table");
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let partition_values =
+        || PartitionValuesOptions::with_struct().with_timestamp_timezone("America/Los_Angeles");
+    // The version-1 partition is midnight at day 19,000. Native checkpoint values interpret it
+    // as UTC and reject this predicate, while reader-timezone reparsing moves it eight hours later
+    // and accepts it. Matching the imperative result proves native pruning happens first.
+    let threshold = 19_000 * 86_400_000_000 + 4 * 3_600_000_000;
+    let predicate: PredicateRef = Pred::gt(col!("part_ts"), Scalar::Timestamp(threshold)).into();
+
+    let expected = imperative_metadata(
+        snapshot
+            .clone()
+            .scan_builder()
+            .with_partition_values(partition_values())
+            .with_predicate(predicate.clone())
+            .build()?,
+        &engine,
+    )?;
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(partition_values())
+        .with_predicate(predicate)
+        .build()?;
+    let checkpoint_predicate = scan
+        .build_actions_meta_predicate()
+        .expect("zoned timestamp partition should remain eligible for checkpoint pruning");
+    assert!(
+        checkpoint_predicate
+            .references()
+            .iter()
+            .any(|column| column.to_string().contains("add.partitionValues_parsed")),
+        "checkpoint pruning should use native parsed partition values: {checkpoint_predicate}"
+    );
+    let actual = declarative_metadata(&scan, &engine)?;
+
+    assert_metadata_eq(&actual, &expected, "reader-timezone metadata parity")
 }
 
 #[rstest]

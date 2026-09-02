@@ -1983,6 +1983,7 @@ pub enum PrimitiveType {
     Date,
     /// Microsecond precision timestamp, adjusted to UTC.
     Timestamp,
+    /// Microsecond precision local timestamp without timezone adjustment.
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
     Void,

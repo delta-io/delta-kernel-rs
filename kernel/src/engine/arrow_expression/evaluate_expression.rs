@@ -3,7 +3,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
@@ -14,7 +13,6 @@ use crate::arrow::array::{
     RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -43,6 +41,7 @@ use crate::expressions::{
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::timestamp_timezone::{parse_partition_scalar, TimestampTimezone};
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -389,7 +388,9 @@ pub fn evaluate_expression(
         }
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
-            let result = evaluate_map_to_struct(&map_arr, output_schema)?;
+            let timestamp_timezone =
+                TimestampTimezone::parse(m.options.timestamp_timezone().unwrap_or("UTC"))?;
+            let result = evaluate_map_to_struct(&map_arr, output_schema, timestamp_timezone)?;
             Ok(Arc::new(result) as ArrayRef)
         }
         (MapToStruct(_), dt) => Err(Error::Generic(format!(
@@ -940,48 +941,10 @@ pub fn coalesce_arrays(
     Ok(make_array(mutable.freeze()))
 }
 
-/// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
-///
-/// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-///
-/// Date and timestamp use arrow's `Date32Type::parse` / `string_to_datetime`, which are much
-/// faster than `parse_scalar`'s chrono path and yield the same value for valid Delta partition
-/// values. These arrow parsers accept a superset of the canonical formats (e.g. `20240115`, or a
-/// timestamp carrying an explicit offset) and interpret no-offset timestamps as UTC, matching
-/// `parse_scalar`; spec-compliant writers only emit canonical values, so the extra leniency is
-/// harmless on the read path. All other types go through `parse_scalar`.
-fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
-    if raw.is_empty() {
-        return Ok(prim.empty_string_partition_cast());
-    }
-    match prim {
-        PrimitiveType::Date => {
-            let days = Date32Type::parse(raw).ok_or_else(|| {
-                Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
-            })?;
-            return Ok(Some(Scalar::Date(days)));
-        }
-        PrimitiveType::Timestamp => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
-            return Ok(Some(Scalar::Timestamp(micros)));
-        }
-        PrimitiveType::TimestampNtz => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
-            return Ok(Some(Scalar::TimestampNtz(micros)));
-        }
-        _ => {}
-    }
-    let scalar = prim.parse_scalar(raw)?;
-    Ok((!matches!(scalar, Scalar::Null(_))).then_some(scalar))
-}
-
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
 /// casts via [`PrimitiveType::empty_string_partition_cast`].
+/// `timestamp_timezone` controls the interpretation of offset-less `TIMESTAMP` values.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -989,6 +952,7 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
+    timestamp_timezone: TimestampTimezone,
 ) -> DeltaResult<StructArray> {
     let map_array = map_arr
         .as_any()
@@ -1069,7 +1033,7 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw)? {
+                match parse_partition_scalar(target_types[i], raw, timestamp_timezone)? {
                     Some(scalar) => scalar.append_to(builder, 1)?,
                     None => Scalar::append_null(builder, field.data_type(), 1)?,
                 }
@@ -1130,7 +1094,7 @@ mod tests {
     use crate::expressions::{
         col, column_expr_ref, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
         Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        Predicate as Pred, StructData,
+        MapToStructOptions, Predicate as Pred, StructData,
     };
     use crate::schema::{
         schema, schema_ref, ArrayType, DataType, MapType, StructField, StructType,
@@ -2690,7 +2654,7 @@ mod tests {
             nullable "date": DATE,
         };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2731,7 +2695,7 @@ mod tests {
         let batch = create_partition_map_batch();
         let output_schema = schema! { nullable "nonexistent": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let col = structs
@@ -2766,7 +2730,7 @@ mod tests {
 
         let output_schema = schema! { nullable "region": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2797,7 +2761,7 @@ mod tests {
 
         let output_schema = schema! { nullable "count": INTEGER };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
     }
@@ -2819,7 +2783,7 @@ mod tests {
 
         let output_schema = schema! { nullable "ts": TIMESTAMP };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let ts = structs
@@ -2828,6 +2792,125 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), 1718443800000000); // 2024-06-15T09:30:00Z
+    }
+
+    fn expected_timestamp_micros(value: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .timestamp_micros()
+    }
+
+    fn evaluate_map_timestamp_timezone(
+        raw: &str,
+        target: DataType,
+        timestamp_timezone: Option<&str>,
+    ) -> DeltaResult<Option<i64>> {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("ts");
+        builder.values().append_value(raw);
+        builder.append(true).unwrap();
+        let map = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new("pv", map.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map)]).unwrap();
+        let output_schema = StructType::new_unchecked(vec![StructField::nullable("ts", target)]);
+        let result_type = DataType::from(output_schema);
+        let expr = match timestamp_timezone {
+            Some(timezone) => Expr::map_to_struct(
+                col!("pv"),
+                MapToStructOptions::default().with_timestamp_timezone(timezone),
+            ),
+            None => Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
+        };
+        let result = evaluate_expression(&expr, &batch, Some(&result_type))?;
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let timestamps = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        Ok(timestamps.is_valid(0).then(|| timestamps.value(0)))
+    }
+
+    #[rstest]
+    #[case::default_compatibility(
+        None,
+        "2024-01-15 12:30:45.123456",
+        "2024-01-15T12:30:45.123456Z"
+    )]
+    #[case::iana_winter(
+        Some("America/Los_Angeles"),
+        "2024-01-15 12:30:45.123456",
+        "2024-01-15T20:30:45.123456Z"
+    )]
+    #[case::iana_summer(
+        Some("America/Los_Angeles"),
+        "2024-06-15 08:00:00.500500",
+        "2024-06-15T15:00:00.500500Z"
+    )]
+    #[case::fixed_offset_with_seconds(
+        Some("+12:45:30"),
+        "2024-01-15 12:30:45.123456",
+        "2024-01-14T23:45:15.123456Z"
+    )]
+    #[case::explicit_input_offset(
+        Some("America/Los_Angeles"),
+        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T10:30:45Z"
+    )]
+    #[case::dst_overlap(
+        Some("America/Los_Angeles"),
+        "2024-11-03 01:30:00",
+        "2024-11-03T08:30:00Z"
+    )]
+    #[case::dst_gap(
+        Some("America/Los_Angeles"),
+        "2024-03-10 02:30:00",
+        "2024-03-10T10:30:00Z"
+    )]
+    #[case::skipped_day(Some("Pacific/Apia"), "2011-12-30 12:00:00", "2011-12-30T22:00:00Z")]
+    fn test_map_to_struct_timestamp_timezone(
+        #[case] timestamp_timezone: Option<&str>,
+        #[case] raw: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            evaluate_map_timestamp_timezone(raw, DataType::TIMESTAMP, timestamp_timezone).unwrap(),
+            Some(expected_timestamp_micros(expected))
+        );
+    }
+
+    #[test]
+    fn test_map_to_struct_timestamp_timezone_does_not_affect_timestamp_ntz() {
+        let raw = "2024-01-15 12:30:45.123456";
+        assert_eq!(
+            evaluate_map_timestamp_timezone(
+                raw,
+                DataType::TIMESTAMP_NTZ,
+                Some("America/Los_Angeles")
+            )
+            .unwrap(),
+            Some(expected_timestamp_micros("2024-01-15T12:30:45.123456Z"))
+        );
+    }
+
+    #[test]
+    fn test_map_to_struct_timestamp_timezone_reports_invalid_inputs() {
+        let invalid_timezone = evaluate_map_timestamp_timezone(
+            "2024-01-15 12:30:45",
+            DataType::TIMESTAMP,
+            Some("Not/AZone"),
+        )
+        .unwrap_err();
+        assert!(invalid_timezone.to_string().contains("Not/AZone"));
+
+        assert!(matches!(
+            evaluate_map_timestamp_timezone(
+                "not a timestamp",
+                DataType::TIMESTAMP,
+                Some("America/Los_Angeles")
+            ),
+            Err(Error::ParseError(..))
+        ));
     }
 
     #[test]
@@ -2849,7 +2932,7 @@ mod tests {
 
         let output_schema = schema! { nullable "x": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let col = structs
@@ -2903,7 +2986,7 @@ mod tests {
             not_null "id": INTEGER,
         };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2939,7 +3022,10 @@ mod tests {
 
         let output_schema = schema! { not_null "date": DATE };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::coalesce([col!("pv_parsed"), Expr::map_to_struct(col!("pv"))]);
+        let expr = Expr::coalesce([
+            col!("pv_parsed"),
+            Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
+        ]);
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -2957,7 +3043,7 @@ mod tests {
 
         let output_schema = schema! { nullable "x": STRING };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("s"));
+        let expr = Expr::map_to_struct(col!("s"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
     }
@@ -2989,7 +3075,7 @@ mod tests {
             nullable "count": INTEGER,
         };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
@@ -3041,7 +3127,7 @@ mod tests {
             nullable "ts": TIMESTAMP_NTZ,
         };
         let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"));
+        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
