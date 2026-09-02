@@ -42,6 +42,19 @@ fn field_names(s: &StructArray) -> Vec<String> {
 }
 
 #[test]
+fn partition_values_options_carry_optional_timestamp_timezone() {
+    let default = PartitionValuesOptions::with_struct();
+    assert!(default.parsed_struct);
+    assert_eq!(default.timestamp_timezone, None);
+
+    let zoned = default.with_timestamp_timezone("America/Los_Angeles");
+    assert_eq!(
+        zoned.timestamp_timezone.as_deref(),
+        Some("America/Los_Angeles")
+    );
+}
+
+#[test]
 fn test_static_skipping() {
     let test_cases = [
         (false, column_pred!("a")),
@@ -763,6 +776,7 @@ fn test_get_partition_value() {
         let value = crate::scan::transform_spec::parse_partition_value_raw(
             Some(&raw.to_string()),
             &DataType::Primitive(data_type.clone()),
+            crate::timestamp_timezone::TimestampTimezone::default(),
         )
         .unwrap();
         assert_eq!(value, *expected);

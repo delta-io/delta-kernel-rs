@@ -60,9 +60,9 @@ pub(crate) struct CheckpointReadInfo {
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
     #[allow(unused)]
     pub has_stats_parsed: bool,
-    /// Whether the checkpoint has compatible pre-parsed partition values.
-    /// When `true`, checkpoint batches can read typed partition values directly from
-    /// `partitionValues_parsed` instead of parsing strings from `partitionValues`.
+    /// Whether the checkpoint has compatible pre-parsed partition values for footer skipping.
+    /// When `true`, checkpoint readers can prune with `partitionValues_parsed`; surviving scan
+    /// rows may still reparse raw `partitionValues` with reader options.
     #[serde(default)]
     #[allow(unused)]
     pub has_partition_values_parsed: bool,

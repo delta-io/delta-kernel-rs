@@ -440,8 +440,8 @@ mod tests {
     }
 
     /// The checkpoint falls back to `MAP_TO_STRUCT` over `partitionValues` when no native
-    /// `partitionValues_parsed` column is present, so a checkpoint reconstructs the same typed
-    /// struct the scan reads and the two can never disagree on a value.
+    /// `partitionValues_parsed` column is present, so footer skipping still has typed partition
+    /// values for checkpoints that do not provide them natively.
     #[test]
     fn build_partition_values_parsed_expr_falls_back_to_map_to_struct() {
         let expr = build_partition_values_parsed_expr();
