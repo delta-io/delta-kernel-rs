@@ -95,7 +95,7 @@ async fn write_data_to_table(
         load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
 
     // Write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
+    let write_context = Arc::new(txn.write_state()?.write_context_builder().build()?);
     let tasks = data.into_iter().map(|data| {
         let engine = engine.clone();
         let write_context = write_context.clone();
@@ -684,8 +684,8 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     )?;
 
     // Write data for both transactions
-    let write_context1 = txn1.write_state()?.unpartitioned_write_context()?;
-    let write_context2 = txn2.write_state()?.unpartitioned_write_context()?;
+    let write_context1 = txn1.write_state()?.write_context_builder().build()?;
+    let write_context2 = txn2.write_state()?.write_context_builder().build()?;
 
     let metadata1 = engine1
         .write_parquet(&ArrowEngineData::new(data1), &write_context1)
@@ -1247,7 +1247,7 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
     let mut dv = KernelDeletionVector::new();
     dv.add_deleted_row_indexes(deleted_indexes.iter().copied());
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
-    let write_context = txn.write_state()?.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
 
     let file_path = read_add_infos(snapshot.as_ref(), engine.as_ref())?[0]

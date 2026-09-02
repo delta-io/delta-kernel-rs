@@ -312,9 +312,12 @@ async fn write_state_acknowledgement_depends_on_column_defaults(
     }
     let write_state = txn.write_state()?;
     if partition_columns.is_empty() {
-        write_state.unpartitioned_write_context()?;
+        write_state.write_context_builder().build()?;
     } else {
-        write_state.partitioned_write_context(partition_values)?;
+        write_state
+            .write_context_builder()
+            .with_partition_values(partition_values)
+            .build()?;
     }
 
     Ok(())
@@ -565,7 +568,7 @@ async fn test_load_and_write_allow_orphan_default() -> Result<(), Box<dyn std::e
         txn.top_level_column_defaults()?.is_empty(),
         "orphaned defaults must not be surfaced without allowColumnDefaults",
     );
-    txn.write_state()?.unpartitioned_write_context()?;
+    txn.write_state()?.write_context_builder().build()?;
 
     Ok(())
 }
