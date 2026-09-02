@@ -1495,7 +1495,7 @@ mod scan_metadata_arrow_tests {
 
     #[rstest]
     #[case::json_only(FfiStatsOptions::JsonOnly, false, true)]
-    #[case::all_struct(FfiStatsOptions::AllStruct, true, true)]
+    #[case::all_struct(FfiStatsOptions::AllStruct, true, false)]
     #[case::all(FfiStatsOptions::All, true, true)]
     #[case::none(FfiStatsOptions::None, false, false)]
     #[tokio::test]

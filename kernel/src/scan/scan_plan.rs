@@ -17,8 +17,8 @@ use crate::actions::{
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, null_lit, ColumnName, Expression as Expr,
-    ExpressionRef, Predicate, UnaryExpressionOp,
+    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
+    Predicate, UnaryExpressionOp,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
