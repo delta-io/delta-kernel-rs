@@ -66,6 +66,9 @@ pub(crate) const CDC_NAME: &str = "cdc";
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
 #[internal_api]
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
+/// Optional `checkpointMetadata.tags` key whose value is the JSON-encoded `StructType` of the
+/// checkpoint's sidecar files
+pub(crate) const SIDECAR_FILE_SCHEMA_TAG: &str = "sidecarFileSchema";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 #[cfg(feature = "adaptive-metadata-in-dev")]

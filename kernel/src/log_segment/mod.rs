@@ -10,12 +10,13 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA, SIDECAR_NAME,
+    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA,
+    SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
@@ -283,6 +284,29 @@ impl LogSegment {
             .as_ref()?
             .sidecar_files
             .as_ref()
+    }
+
+    /// The sidecar files' schema from the applicable `_last_checkpoint` hint's
+    /// `checkpointMetadata.tags["sidecarFileSchema"]`.
+    ///
+    /// `None` when the hint is absent/mismatched, carried no `checkpointMetadata`
+    /// (e.g. `nonFileActions` was trimmed), lacked the tag, or the value failed to parse.
+    #[allow(unused)] // consumed by the scan-shape checkpoint classifier
+    pub(crate) fn checkpoint_hint_sidecar_file_schema(&self) -> Option<StructType> {
+        let non_file_actions = self
+            .checkpoint_hint()?
+            .v2_checkpoint
+            .as_ref()?
+            .non_file_actions
+            .as_ref()?;
+        let tags = non_file_actions.iter().find_map(|action| match action {
+            HintAction::CheckpointMetadata(cp) => cp.tags.as_ref(),
+            _ => None,
+        })?;
+        let raw = tags.get(SIDECAR_FILE_SCHEMA_TAG)?;
+        serde_json::from_str::<StructType>(raw)
+            .inspect_err(|e| warn!("Unparseable sidecarFileSchema tag, ignoring: {e}"))
+            .ok()
     }
 
     /// Succinct summary string for logging purposes.

@@ -6,8 +6,6 @@ import os
 from pathlib import Path, PurePosixPath
 from typing import Iterator, Literal
 
-from omnigent_client import tool
-
 Repository = Literal["pr", "delta"]
 
 _ROOT_ENV = {
@@ -80,7 +78,6 @@ def _iter_files(root: Path, target: Path) -> Iterator[Path]:
             yield resolved
 
 
-@tool
 def read_source_file(
     repository: Repository,
     path: str,
@@ -109,7 +106,6 @@ def read_source_file(
         return f"Error: {exc}"
 
 
-@tool
 def list_source_files(
     repository: Repository,
     path: str = "",
@@ -136,7 +132,6 @@ def list_source_files(
         return f"Error: {exc}"
 
 
-@tool
 def search_source_code(
     repository: Repository,
     query: str,
