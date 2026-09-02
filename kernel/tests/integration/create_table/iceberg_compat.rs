@@ -244,8 +244,7 @@ fn v2_existing_table_transaction_rejects_unsupported_type_change() -> DeltaResul
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let result = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref());
-    let err = result
-        .expect_err("V2 transaction should reject the type change");
+    let err = result.expect_err("V2 transaction should reject the type change");
     assert!(
         err.to_string()
             .contains("icebergCompatV2 does not support type change"),
