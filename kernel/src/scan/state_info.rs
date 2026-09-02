@@ -154,13 +154,10 @@ fn build_data_skipping_schemas(
             .collect()
     };
 
-    // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields
-    // `build_expected_stats_schemas` always emits) has nothing to prune by. Return `None`
-    // in that case so the caller skips building a `DataSkippingFilter`. `nullCount` is the
-    // per-column stats wrapper, so its presence is the signal that at least one data
-    // column survived. The Delta protocol allows `minValues` / `maxValues` without
-    // `nullCount`, but `build_expected_stats_schemas` always emits `nullCount` whenever it
-    // emits min/max; this check relies on that implementation property.
+    // Predicate-only schemas with just `numRecords` and `tightBounds` have nothing to prune by.
+    // `nullCount` is the per-column stats wrapper, so its presence means at least one data column
+    // survived. The Delta protocol allows `minValues` / `maxValues` without `nullCount`, but the
+    // expected-schema builder emits `nullCount` whenever it emits min/max.
     let with_data_cols = |stats_schema: SchemaRef| -> Option<SchemaRef> {
         stats_schema
             .field(NULL_COUNT)
@@ -168,28 +165,26 @@ fn build_data_skipping_schemas(
             .then_some(stats_schema)
     };
 
-    let build_schema = |columns: Option<&[ColumnName]>| -> DeltaResult<Option<SchemaRef>> {
-        let schema = table_configuration
+    let build_schema = |columns: Option<&[ColumnName]>| -> DeltaResult<SchemaRef> {
+        Ok(table_configuration
             .build_expected_stats_schemas(None, columns)?
-            .physical;
-        Ok(with_data_cols(schema))
+            .physical)
     };
 
-    let requested_logical = match struct_stats {
-        StructStats::Columns(columns) => columns.clone(),
+    let requested_physical = match struct_stats {
+        StructStats::Columns(columns) => to_physical(columns)?,
         _ => Vec::new(),
     };
-    let requested_physical = to_physical(&requested_logical)?;
     let output_stats_schema = match struct_stats {
-        StructStats::All => build_schema(None)?,
+        StructStats::All => Some(build_schema(None)?),
         StructStats::Columns(_) if !requested_physical.is_empty() => {
-            build_schema(Some(&requested_physical))?
+            Some(build_schema(Some(&requested_physical))?)
         }
         _ => None,
     };
 
     let physical_stats_schema = if matches!(struct_stats, StructStats::All) || emit_json {
-        build_schema(None)?
+        Some(build_schema(None)?)
     } else {
         let mut union_physical = requested_physical;
         let mut existing: HashSet<ColumnName> = union_physical.iter().cloned().collect();
@@ -203,7 +198,12 @@ fn build_data_skipping_schemas(
         if union_physical.is_empty() {
             None
         } else {
-            build_schema(Some(&union_physical))?
+            let schema = build_schema(Some(&union_physical))?;
+            if output_stats_schema.is_some() {
+                Some(schema)
+            } else {
+                with_data_cols(schema)
+            }
         }
     };
 
@@ -460,9 +460,8 @@ impl StateInfo {
 
     /// Returns the parsed stats schema needed in normalized scan rows.
     ///
-    /// JSON-only scans can forward commit JSON directly and serialize native checkpoint stats
-    /// without adding a temporary `stats_parsed` field. Structured output and predicate pruning
-    /// still require that field.
+    /// JSON-only scans forward commit JSON and serialize native checkpoint stats.
+    /// Structured output and predicate pruning use `stats_parsed`.
     pub(crate) fn stats_schema_for_transform(&self) -> Option<&SchemaRef> {
         if self.output_stats_schema.is_some()
             || matches!(&self.physical_predicate, PhysicalPredicate::Some(_, _))
@@ -499,7 +498,7 @@ pub(crate) mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{MAX_VALUES, MIN_VALUES};
+    use crate::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS, TIGHT_BOUNDS};
     use crate::expressions::{col, column_name, lit, Predicate as Pred};
     use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
     use crate::table_features::TableFeature;
@@ -1442,6 +1441,30 @@ pub(crate) mod tests {
         .unwrap();
         let cols = HashSet::from_iter([column_name!("c0"), column_name!("c1")]);
         assert_eq!(state_info.physical_stats_columns, cols);
+    }
+
+    #[test]
+    fn all_struct_retains_bookkeeping_stats_with_no_indexed_columns() {
+        let state_info = get_state_info_with_stats(
+            flat_long_schema(2),
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(0),
+            vec![],
+            StatsOptions::all_struct(),
+        )
+        .unwrap();
+
+        let output = state_info
+            .output_stats_schema
+            .as_ref()
+            .expect("structured output should retain bookkeeping stats");
+        assert!(output.field(NUM_RECORDS).is_some());
+        assert!(output.field(TIGHT_BOUNDS).is_some());
+        assert!(output.field(NULL_COUNT).is_none());
+        assert_eq!(state_info.physical_stats_schema.as_ref(), Some(output));
+        assert!(state_info.stats_schema_for_transform().is_some());
     }
 
     /// Predicate on a past-cap column: stats schema goes to `None` (no skipping), but

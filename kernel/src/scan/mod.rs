@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{add_schema_without_json_stats, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+use crate::actions::{ADD_FIELD, ADD_NAME, ADD_SCHEMA_NO_JSON_STATS, REMOVE_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
@@ -69,7 +69,7 @@ pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 };
 pub(crate) static COMMIT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     schema_ref! {
-        nullable ADD_NAME: (add_schema_without_json_stats()),
+        nullable ADD_NAME: (ADD_SCHEMA_NO_JSON_STATS.clone()),
         (&REMOVE_FIELD),
     }
 });
@@ -81,7 +81,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
 /// Discovery restores JSON stats when structured stats cannot satisfy the scan.
 pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     schema_ref! {
-        nullable ADD_NAME: (add_schema_without_json_stats()),
+        nullable ADD_NAME: (ADD_SCHEMA_NO_JSON_STATS.clone()),
     }
 });
 
@@ -281,9 +281,9 @@ impl ScanBuilder {
     /// [`StructType::add_metadata_column`] (row indexes, row ids, file paths) are not supported
     /// and will error at build time.
     ///
-    /// A predicate alone enables internal data skipping; kernel does not surface stats
-    /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
-    /// also wants stats in the scan metadata output.
+    /// A predicate enables internal data skipping. Statistics output remains controlled by
+    /// [`StatsOptions`], whose default emits JSON stats. Use [`with_stats`](Self::with_stats) to
+    /// request structured stats or suppress statistics output.
     ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
@@ -1175,19 +1175,19 @@ impl Scan {
                  use scan_metadata for a cancellable scan",
             ));
         }
-        // For the sequential/parallel phase approach, we use a conservative checkpoint_info
-        // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
-        // currently support stats_parsed optimization.
-        let checkpoint_read_schema = if self.reads_stats() {
+        let checkpoint_read_schema = if self.stats.emit_json {
             CHECKPOINT_READ_SCHEMA.clone()
         } else {
             CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
         };
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed: false,
-            has_partition_values_parsed: false,
-            checkpoint_read_schema: checkpoint_read_schema.clone(),
-        };
+        let checkpoint_info = self.snapshot.log_segment().checkpoint_read_info(
+            engine.as_ref(),
+            checkpoint_read_schema,
+            self.state_info.physical_stats_schema.as_deref(),
+            self.state_info.physical_partition_schema.as_deref(),
+            None,
+        )?;
+        let checkpoint_read_schema = checkpoint_info.checkpoint_read_schema.clone();
         let processor = ScanLogReplayProcessor::new(
             engine.as_ref(),
             self.state_info.clone(),

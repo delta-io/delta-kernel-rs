@@ -299,7 +299,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] expected_stats_field_groups: &[&[&str]],
 ) -> DeltaResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
-    let predicate: PredicateRef = col!("id").gt(lit(0i64)).into();
+    let predicate: PredicateRef = col!("id").gt(lit(400i64)).into();
     let expected_builder = snapshot
         .clone()
         .scan_builder()
@@ -314,6 +314,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .with_predicate(predicate);
     let scan = builder.build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
+    assert_eq!(metadata_row_count(&actual), 2);
     let actual_fields = leaf_paths(&actual);
     let imperative_fields = leaf_paths(&expected);
     let unexpected_fields: Vec<_> = actual_fields

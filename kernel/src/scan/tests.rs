@@ -2133,6 +2133,35 @@ fn stats_none_preserves_data_skipping(#[case] predicate_column: &str) {
     assert_eq!(selected_file_count, 2);
 }
 
+#[test]
+fn stats_none_preserves_partition_pruning_without_loading_stats() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(col!("modified").eq(lit("2021-02-01"))))
+        .with_stats(StatsOptions::none())
+        .build()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let (underlying_data, selection_vector) = scan_metadata.unwrap().scan_files.into_parts();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        assert!(batch.column_by_name("stats_parsed").is_none());
+    }
+
+    assert_eq!(selected_file_count, 2);
+}
+
 /// Calling `with_stats` twice replaces the prior value; the last call wins.
 #[test]
 fn test_with_stats_last_call_wins() {

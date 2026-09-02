@@ -12,7 +12,7 @@ use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    add_schema_without_json_stats, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME,
+    ADD_NAME, ADD_SCHEMA, ADD_SCHEMA_NO_JSON_STATS, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME,
     STATS, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
@@ -27,9 +27,9 @@ use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType,
 };
-use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::struct_patch::{project_struct_to_schema, ProjectionStructPatchBuilder};
 use crate::transforms::{transform_output_type, ExpressionTransform};
-use crate::utils::{CollectInto, FoldWithOption as _};
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Error, PlanBuilder};
 
 // === Internal column names ===
@@ -305,7 +305,7 @@ impl Scan {
             (Some(physical_stats), _) => projection.replace(
                 STATS_PARSED,
                 StructField::nullable(STATS_PARSED, physical_stats.as_ref().clone()),
-                project_nested_struct_to_schema([ADD_NAME, STATS_PARSED_NAME], physical_stats),
+                project_struct_to_schema([ADD_NAME, STATS_PARSED_NAME], physical_stats),
             ),
             (None, true) => projection.drop(STATS_PARSED),
             (None, false) => projection,
@@ -323,7 +323,7 @@ impl Scan {
             (Some(schema), true) => projection.replace(
                 PARTITION_VALUES_PARSED,
                 StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
-                project_nested_struct_to_schema([ADD_NAME, PARTITION_VALUES_PARSED_NAME], schema),
+                project_struct_to_schema([ADD_NAME, PARTITION_VALUES_PARSED_NAME], schema),
             ),
             (Some(_), false) => {
                 return Err(Error::internal_error(
@@ -403,7 +403,7 @@ fn add_read_schema(include_json_stats: bool) -> StructType {
     if include_json_stats {
         ADD_SCHEMA.clone()
     } else {
-        add_schema_without_json_stats()
+        ADD_SCHEMA_NO_JSON_STATS.clone()
     }
 }
 
@@ -541,26 +541,6 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             None => self,
         }
     }
-}
-
-/// Rebuilds `root` to match a narrowed schema while preserving a null parent struct. A direct
-/// column reference would retain fields not requested by the caller.
-fn project_nested_struct_to_schema(
-    root: impl CollectInto<ColumnName>,
-    schema: &StructType,
-) -> Expr {
-    let root = root.collect_into();
-    let fields = schema.fields().map(|field| {
-        let column = root.join(&ColumnName::new([field.name()]));
-        match field.data_type() {
-            DataType::Struct(schema) => project_nested_struct_to_schema(column, schema),
-            _ => Expr::from(column),
-        }
-    });
-    Expr::struct_with_nullability_from(
-        fields,
-        Expr::from_pred(Expr::from(root.clone()).is_not_null()),
-    )
 }
 
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.

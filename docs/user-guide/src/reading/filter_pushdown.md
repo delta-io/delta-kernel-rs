@@ -275,7 +275,8 @@ let scan = snapshot
 # }
 ```
 
-Only the requested columns appear in `stats_parsed`. An empty column list normalizes to
+Only the requested data columns appear under `minValues`, `maxValues`, and `nullCount`;
+`stats_parsed` also includes `numRecords` and `tightBounds`. An empty column list normalizes to
 `StatsOptions::none()` and changes only statistics output.
 
 ### Omitting statistics from scan metadata

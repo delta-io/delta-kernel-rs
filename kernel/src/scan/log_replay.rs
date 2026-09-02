@@ -26,12 +26,12 @@ use crate::schema::{
     lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
 };
-use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::struct_patch::{project_struct_to_schema, ProjectionStructPatchBuilder};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
-/// Read-time scan output policy consumed by [`ScanLogReplayProcessor`].
+/// Controls connector-visible statistics during log replay.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ScanStatsOptions {
     /// Emit the `stats` JSON value, synthesizing it from `stats_parsed` when necessary.
@@ -339,6 +339,13 @@ impl ScanLogReplayProcessor {
 
     pub(crate) fn is_catalog_managed(&self) -> bool {
         self.state_info.is_catalog_managed
+    }
+
+    fn project_output(&self, data: Box<dyn EngineData>) -> DeltaResult<Box<dyn EngineData>> {
+        let Some(transform) = &self.output_transform else {
+            return Ok(data);
+        };
+        transform.evaluate(data.as_ref())
     }
 
     /// Serialize the processor state for distributed processing.
@@ -794,29 +801,6 @@ fn scan_row_schema_with_parsed_columns(
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
-fn drop_unrequested_fields<'a>(
-    mut projection: ProjectionStructPatchBuilder<'a>,
-    input: &StructType,
-    requested: &StructType,
-    path: Vec<String>,
-) -> ProjectionStructPatchBuilder<'a> {
-    for input_field in input.fields() {
-        let Some(requested_field) = requested.field(input_field.name()) else {
-            projection = projection.drop_at(path.clone(), input_field.name());
-            continue;
-        };
-        if let (DataType::Struct(input_child), DataType::Struct(requested_child)) =
-            (input_field.data_type(), requested_field.data_type())
-        {
-            let mut child_path = path.clone();
-            child_path.push(input_field.name().clone());
-            projection =
-                drop_unrequested_fields(projection, input_child, requested_child, child_path);
-        }
-    }
-    projection
-}
-
 fn build_scan_output_projection(
     input_schema: &StructType,
     output_stats_schema: Option<&StructType>,
@@ -825,21 +809,10 @@ fn build_scan_output_projection(
     let mut projection = ProjectionStructPatchBuilder::new(input_schema);
     match output_stats_schema {
         Some(requested) => {
-            let Some(input_field) = input_schema.field(STATS_PARSED_NAME) else {
-                return Err(Error::internal_error(
-                    "requested stats output is absent from the internal scan schema",
-                ));
-            };
-            let DataType::Struct(input_stats) = input_field.data_type() else {
-                return Err(Error::internal_error(
-                    "internal stats output must be a struct",
-                ));
-            };
-            projection = drop_unrequested_fields(
-                projection,
-                input_stats,
-                requested,
-                vec![STATS_PARSED_NAME.to_string()],
+            projection = projection.replace(
+                STATS_PARSED_NAME,
+                StructField::nullable(STATS_PARSED_NAME, requested.clone()),
+                project_struct_to_schema([STATS_PARSED_NAME], requested),
             );
         }
         None => projection = projection.drop_if_exists(STATS_PARSED_NAME),
@@ -904,7 +877,7 @@ fn get_add_transform_expr(
         ])),
     ];
 
-    // Add stats_parsed when stats output is requested (using physical column names)
+    // Add stats_parsed for structured output or internal data skipping.
     if let Some(stats_schema) = physical_stats_schema {
         let stats_parsed_expr = if has_stats_parsed {
             // Checkpoint has stats_parsed column - read directly
@@ -1039,10 +1012,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
-        let output = match &self.output_transform {
-            Some(transform) => transform.evaluate(transformed_actions.as_ref())?,
-            None => transformed_actions,
-        };
+        let output = self.project_output(transformed_actions)?;
         let scan_metadata = ScanMetadata::try_new(output, final_selection, row_transform_exprs)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
@@ -1141,10 +1111,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
-        let output = match &self.output_transform {
-            Some(transform) => transform.evaluate(transformed_actions.as_ref())?,
-            None => transformed_actions,
-        };
+        let output = self.project_output(transformed_actions)?;
         let scan_metadata = ScanMetadata::try_new(output, final_selection, row_transform_exprs)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
@@ -2127,8 +2094,6 @@ mod tests {
         }
     }
 
-    /// `emit_json=false` removes every `ToJson` node from the add transform;
-    /// `emit_json=true` leaves exactly one inside the COALESCE branch.
     #[test]
     fn add_transform_omits_to_json_when_emit_json_is_false() {
         let stats_schema: SchemaRef = schema_ref! {
