@@ -403,7 +403,8 @@ mod tests {
         assert!(transform_spec.iter().any(|t| matches!(t,
             FieldTransformSpec::MetadataDerivedColumn {
                 insert_after: Some(insert_after),
-                field_index
+                field_index,
+                ..
             }
             if insert_after == "id" && *field_index == 3
         )));
@@ -412,7 +413,8 @@ mod tests {
         assert!(transform_spec.iter().any(|t| matches!(t,
             FieldTransformSpec::MetadataDerivedColumn {
                 insert_after: Some(insert_after),
-                field_index
+                field_index,
+                ..
             }
             if insert_after == "id" && *field_index == 4
         )));
@@ -473,7 +475,8 @@ mod tests {
         assert!(matches!(&transform_spec[0],
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index,
-                insert_after: Some(insert_after)
+                insert_after: Some(insert_after),
+                ..
             }
             if *field_index == 1 && insert_after == "id"
         ));

@@ -57,6 +57,7 @@ impl TransformFieldClassifier for CdfTransformFieldClassifier {
                 Some(FieldTransformSpec::MetadataDerivedColumn {
                     field_index,
                     insert_after: last_physical_field.clone(),
+                    partition_source: None,
                 })
             }
             _ => None,

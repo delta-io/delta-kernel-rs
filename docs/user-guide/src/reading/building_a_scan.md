@@ -47,20 +47,15 @@ Pass a schema containing only the columns you want to read:
 ```rust,no_run
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
-# use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
-let read_schema = Arc::new(StructType::try_new([
-    StructField::nullable("name", DataType::STRING),
-    StructField::nullable("age", DataType::INTEGER),
-])?);
+let read_schema = snapshot.schema().project(&["name", "age"])?;
 
 let scan = snapshot
     .scan_builder()
@@ -70,8 +65,10 @@ let scan = snapshot
 # }
 ```
 
-The schema you provide must be a subset of the table's schema. Kernel only reads the
-columns you specify from each Parquet file.
+Build the projection from the current `Snapshot` schema. `project()` retains the field
+types, nullability, and column-mapping metadata that Kernel needs to read table columns.
+`build()` returns a schema error if a projected partition field conflicts with the
+`Snapshot` schema. Kernel only reads the columns you specify from each Parquet file.
 
 For more details, see [Column Selection](./column_selection.md).
 
