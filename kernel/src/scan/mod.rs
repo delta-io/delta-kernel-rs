@@ -117,7 +117,7 @@ pub struct StatsOptions {
     pub(crate) struct_stats: StructStats,
 }
 
-/// Controls which structured statistics appear in `stats_parsed`.
+/// Controls which struct stats columns appear in `stats_parsed`.
 ///
 /// Indexed columns are non-partition data columns named by `delta.dataSkippingStatsColumns`, or,
 /// when that property is absent, the first `delta.dataSkippingNumIndexedCols` leaf columns (32 by
@@ -185,7 +185,7 @@ impl StatsOptions {
         }
     }
 
-    /// Returns structured stats for all indexed columns and `extra_indexed`.
+    /// Returns struct stats for all indexed columns and `extra_indexed`.
     ///
     /// Extra-indexed columns bypass the table's configured indexed set. Missing on-disk stats read
     /// as NULL and do not prune; names that cannot be resolved are ignored with a warning.
@@ -196,7 +196,7 @@ impl StatsOptions {
         }
     }
 
-    /// Returns structured stats for `requested` indexed columns and `extra_indexed` columns.
+    /// Returns struct stats for `requested` indexed columns and `extra_indexed` columns.
     ///
     /// Pass an empty `requested` list to emit only the extra-indexed columns.
     pub fn struct_columns_with_extra_indexed(
@@ -740,7 +740,7 @@ pub struct Scan {
 ///
 /// For example, if the caller requests `[a, b]` and the predicate references `c`,
 /// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
-/// Returns `None` when no eligible structured stats are requested. Unresolvable requested columns
+/// Returns `None` when no eligible struct stats are requested. Unresolvable requested columns
 /// return an error, while unresolvable extra-indexed columns are ignored with a warning.
 fn build_physical_stats_output_schema(
     table_configuration: &TableConfiguration,
