@@ -1,18 +1,17 @@
 # =============================================================================
 # AI PR Review - Omnigent-powered reviewer for GitHub PRs.
 #
-# Setup (Settings -> Environments -> ai-review), as ENVIRONMENT secrets:
+# Setup as repository secrets:
 #   LLM_API_KEY       Bearer token for the LLM gateway.
 #   GATEWAY_BASE_URL  Gateway base URL, e.g. https://<host>/serving-endpoints
-# Required variable:
+# Required repository variables:
 #   GATEWAY_HOST      Bare hostname of GATEWAY_BASE_URL, for the egress allowlist.
-# Optional named-bot comments:
-#   vars.OMNIGENT_BOT_APP_ID + secrets.OMNIGENT_BOT_APP_KEY
-# Required environment variables:
 #   MODEL                    Default Claude model.
 #   CLAUDE_MAINTAINER_MODEL  Claude maintainer-pass model.
 #   CODEX_MAINTAINER_MODEL   Codex maintainer-pass model.
 #   DISPROVE_MODEL           GPT disprove-gate model.
+# Optional named-bot comments:
+#   vars.OMNIGENT_BOT_APP_ID + secrets.OMNIGENT_BOT_APP_KEY
 #
 # Ready PRs from authors with write-or-higher permission are reviewed
 # automatically and published to the workflow summary and a non-blocking PR
@@ -41,14 +40,17 @@ on:
           - artifact
           - summary
           - collapsed
+          - inline
           - comment
 
 permissions:
   contents: read
 
 concurrency:
+  # Keep comments isolated until the authorize job has parsed and approved a command.
   group: >-
     ai-review-${{
+      github.event_name == 'issue_comment' && github.run_id ||
       github.event.pull_request.number ||
       github.event.issue.number ||
       inputs.pr
@@ -125,9 +127,10 @@ jobs:
                   artifact|dark) mode=artifact ;;
                   summary) mode=summary ;;
                   collapsed) mode=collapsed ;;
+                  inline) mode=inline ;;
                   comment) mode=comment ;;
                   *)
-                    echo "::error::Unknown /review option '$word'. Use artifact, summary, collapsed, or comment."
+                    echo "::error::Unknown /review option '$word'. Use artifact, summary, collapsed, inline, or comment."
                     exit 1
                     ;;
                 esac
@@ -153,7 +156,7 @@ jobs:
             exit 1
           fi
           case "$mode" in
-            artifact|summary|collapsed|comment) ;;
+            artifact|summary|collapsed|inline|comment) ;;
             *) echo "::error::Invalid output mode '$mode'."; exit 1 ;;
           esac
 
@@ -204,6 +207,9 @@ jobs:
     if: >-
       needs.authorize.outputs.skip != 'true' &&
       needs.authorize.outputs.allowed == 'true'
+    concurrency:
+      group: ai-review-job-${{ needs.authorize.outputs.pr_number }}
+      cancel-in-progress: true
     permissions:
       checks: write
       contents: read
@@ -423,6 +429,9 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/.github/omnigent
         run: |
           set -euo pipefail
+          python3 -m unittest discover \
+            --start-directory .github/omnigent/tests \
+            --pattern test_inline_review.py
           python3 - <<'PYEOF'
           import json
           import os
@@ -708,6 +717,7 @@ jobs:
         id: context
         env:
           GH_TOKEN: ${{ github.token }}
+          OUTPUT_MODE: ${{ needs.authorize.outputs.output_mode }}
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           REPO: ${{ github.repository }}
         run: |
@@ -746,12 +756,20 @@ jobs:
           import json
           import os
           import pathlib
+          import sys
+
+          sys.path.insert(0, ".github/omnigent")
+          from inline_review import inline_prompt_instructions
 
           max_diff_bytes = 80_000
           max_prompt_bytes = 100_000
+          output_mode = os.environ["OUTPUT_MODE"]
           review_marker = os.environ["REVIEW_MARKER"]
           start_marker = f"<!-- AI_REVIEW_START_{review_marker} -->"
           end_marker = f"<!-- AI_REVIEW_END_{review_marker} -->"
+          inline_instructions = ""
+          if output_mode == "inline":
+              inline_instructions = inline_prompt_instructions(review_marker)
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           body = (meta.get("body") or "")[:4096]
           diff_bytes = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
@@ -821,7 +839,7 @@ jobs:
           destination. Output ONLY the final consolidated review, with no
           narration or status updates. Begin your response with the exact marker
           {start_marker} on its own line, then the review. End with the exact
-          marker {end_marker} on its own line.
+          marker {end_marker} on its own line.{inline_instructions}
 
           Emit those markers only if every dispatched reviewer completed
           successfully and every required disprove gate returned a verdict. If
@@ -935,6 +953,7 @@ jobs:
           steps.run_review.outcome == 'success'
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          OUTPUT_MODE: ${{ needs.authorize.outputs.output_mode }}
           REVIEW_MARKER: ${{ steps.context.outputs.review_marker }}
           REVIEW_STATUS: ${{ steps.run_review.outputs.review_status }}
         run: |
@@ -1012,10 +1031,14 @@ jobs:
           fi
 
           python3 - <<'PYEOF'
+          import json
           import os
           import pathlib
           import re
           import sys
+
+          sys.path.insert(0, ".github/omnigent")
+          from inline_review import extract_inline_findings
 
           raw = pathlib.Path("/tmp/review_raw_output.txt").read_text(errors="replace")
           marker = os.environ.get("REVIEW_MARKER", "")
@@ -1084,6 +1107,16 @@ jobs:
               print("::error::AI review contains unsupported control characters.")
               sys.exit(1)
 
+          if os.environ.get("OUTPUT_MODE") == "inline":
+              try:
+                  body, findings = extract_inline_findings(body, marker)
+              except ValueError as error:
+                  print(f"::error::AI inline review metadata is invalid: {error}.")
+                  sys.exit(1)
+              pathlib.Path("/tmp/inline_findings.json").write_text(
+                  json.dumps(findings)
+              )
+
           pathlib.Path("/tmp/review_output.txt").write_text(body + "\n")
           PYEOF
 
@@ -1119,30 +1152,61 @@ jobs:
           OUTPUT_MODE: ${{ needs.authorize.outputs.output_mode }}
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           REPO: ${{ github.repository }}
-          REVIEW_TEXT: ${{ steps.review.outputs.review_text }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
-          {
-            echo "<!-- ai-review-bot -->"
-            echo "## AI Review <sub>(draft - human review required)</sub>"
-            echo ""
-            if [ "$OUTPUT_MODE" = "collapsed" ]; then
-              echo "<details><summary>Show review</summary>"
-              echo ""
-            fi
-            echo "$REVIEW_TEXT"
-            if [ "$OUTPUT_MODE" = "collapsed" ]; then
-              echo ""
-              echo "</details>"
-            fi
-            echo ""
-            echo "---"
-            echo "<sub>Automated review - [workflow run](${RUN_URL})</sub>"
-          } > /tmp/comment.md
+          python3 - <<'PYEOF'
+          import os
+          import pathlib
+          import sys
+
+          sys.path.insert(0, ".github/omnigent")
+          from review_publish import format_review_body
+
+          review = pathlib.Path("/tmp/review_output.txt").read_text()
+          body = format_review_body(
+              review,
+              os.environ["RUN_URL"],
+              collapsed=os.environ["OUTPUT_MODE"] == "collapsed",
+          )
+          pathlib.Path("/tmp/comment.md").write_text(body + "\n")
+          PYEOF
 
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
           echo "Posted review comment."
+
+      - name: Post inline review
+        if: >-
+          steps.review.outputs.review_text != '' &&
+          needs.authorize.outputs.output_mode == 'inline'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          python3 .github/omnigent/inline_review.py \
+            --review /tmp/review_output.txt \
+            --findings /tmp/inline_findings.json \
+            --diff /tmp/pr_diff.txt \
+            --head-sha "$HEAD_SHA" \
+            --run-url "$RUN_URL" \
+            --output /tmp/inline-review.json \
+            --unmapped-output /tmp/unmapped-findings.txt
+
+          mapped_count="$(jq '.comments | length' /tmp/inline-review.json)"
+          unmapped_count="$(wc -l < /tmp/unmapped-findings.txt | tr -d ' ')"
+          if ! gh api --method POST "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+            --input /tmp/inline-review.json --silent; then
+            echo "::warning::GitHub rejected the inline review; posting the collapsed review without inline comments."
+            jq -r '.body' /tmp/inline-review.json > /tmp/comment.md
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
+            exit 0
+          fi
+          printf 'Posted %s inline finding(s); %s remained in the collapsed review.\n' \
+            "$mapped_count" "$unmapped_count"
 
       - name: Publish review summary
         if: >-
