@@ -213,15 +213,15 @@ This happens for several reasons:
 ## Controlling statistics
 
 By default, Kernel reads file-level statistics from the transaction log
-and uses them internally for data skipping, but does not expose those statistics to your
+and uses them internally for data skipping, and exposes those statistics as JSON to your
 connector. To override the default, call `ScanBuilder::with_stats` with a
 `StatsOptions` value. The named constructors cover the common shapes; you can also
 build the struct directly for any combination.
+Statistics output is independent of data skipping.
 
-### Disabling data skipping entirely
+### Omitting statistics from scan metadata
 
-If your compute engine performs its own data skipping, you can tell Kernel to skip reading
-statistics altogether. This avoids the cost of parsing statistics from checkpoint files.
+If your connector does not consume file statistics, you can omit them from scan metadata:
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -245,18 +245,14 @@ let scan = snapshot
 
 With `StatsOptions::none()`:
 
-- Kernel skips the stats column entirely during checkpoint reads.
-- No statistics-based or partition-value-based file pruning occurs (row-level
-  partition filtering still applies).
+- Kernel skips statistics entirely when there is no predicate.
+- Predicate-based statistics and partition-value pruning remain enabled.
 - The `stats` field on each `ScanFile` is `None`.
-
-Use this when your connector or compute engine already handles file pruning and you want to
-avoid the overhead of parsing statistics you won't use.
 
 ### Including all statistics in scan metadata
 
 To receive pre-parsed statistics (min/max values, null counts, row counts) for every file in your
-scan metadata, pass `StatsOptions::all_struct()` (structured stats without JSON synthesis) or
+scan metadata, pass `StatsOptions::all_struct()` (structured stats without JSON output) or
 `StatsOptions::all()` (both structured stats and the legacy JSON `stats` column):
 
 ```rust,no_run
@@ -283,8 +279,7 @@ The statistics appear in a `stats_parsed` column in the scan metadata. Which col
 statistics depends on the table's configuration (`delta.dataSkippingStatsColumns` or
 `delta.dataSkippingNumIndexedCols`).
 
-For compatible checkpoints, `all_struct` leaves `stats` null and avoids reading or synthesizing
-JSON stats. JSON commits and fallback checkpoints preserve existing JSON.
+`all_struct` leaves `stats` null and avoids serializing structured checkpoint statistics to JSON.
 
 You can combine this with `with_predicate`. When both are set, Kernel performs its own data
 skipping internally and exposes the parsed statistics so your connector can apply
@@ -318,20 +313,18 @@ let scan = snapshot
 # }
 ```
 
-The named columns always appear in `stats_parsed`. When the scan also has a predicate,
-predicate-referenced columns may appear as well because Kernel can retain the statistics it uses
-for data skipping. Connectors should treat the named columns as a minimum projection and ignore
-additional columns they do not need.
+Only the named data columns appear in structured output. Kernel removes any additional statistics
+read internally for data skipping. An empty column list is equivalent to `StatsOptions::none()`.
 
 ### Choosing the right mode
 
 | Goal | Constructor |
 |------|-------------|
-| Default behavior (Kernel skips files internally, no stats exposed) | No call needed (or `StatsOptions::json_only()`) |
-| Disable all stats reading for performance | `StatsOptions::none()` |
-| Expose all structured stats without JSON synthesis | `StatsOptions::all_struct()` |
-| Expose both struct stats and the JSON `stats` column | `StatsOptions::all()` |
-| Expose selected structured stats without JSON synthesis | `StatsOptions::struct_columns(cols)` |
+| JSON statistics only (default) | No call needed (or `StatsOptions::json_only()`) |
+| No statistics output | `StatsOptions::none()` |
+| All structured statistics without JSON | `StatsOptions::all_struct()` |
+| JSON and all structured statistics | `StatsOptions::all()` |
+| Selected structured statistics without JSON | `StatsOptions::struct_columns(cols)` |
 
 `with_stats` takes a single `StatsOptions` value, so each call fully replaces any prior
 configuration. There is no "last call wins" composition to track.

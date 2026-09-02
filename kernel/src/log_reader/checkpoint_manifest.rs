@@ -1,15 +1,15 @@
 //! Manifest phase for log replay - processes single-part checkpoints and manifest checkpoints.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
+use crate::actions::{ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::schema::{lazy_schema_ref, SchemaRef};
+use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
 
@@ -27,34 +27,37 @@ pub(crate) struct CheckpointManifestReader {
 impl CheckpointManifestReader {
     /// Create a new manifest phase for a single-part checkpoint.
     ///
-    /// The schema is automatically augmented with the sidecar column since the manifest
-    /// phase needs to extract sidecar references for phase transitions.
+    /// The Add projection is combined with the full Remove and Sidecar fields required by replay
+    /// and sidecar discovery.
+    /// The read is unfiltered because sidecar actions have null Add fields and must remain visible
+    /// to sidecar discovery.
     ///
     /// # Parameters
     /// - `manifest_file`: The checkpoint manifest file to process
     /// - `log_root`: Root URL for resolving sidecar paths
     /// - `engine`: Engine for reading files
+    /// - `checkpoint_read_schema`: Projected checkpoint schema required by scan replay
     #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         manifest: &ParsedLogPath,
         log_root: Url,
+        checkpoint_read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
-        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = lazy_schema_ref! {
-            (&ADD_FIELD),
-            (&REMOVE_FIELD),
-            (&SIDECAR_FIELD),
-        };
+        let manifest_read_schema = checkpoint_read_schema
+            .project_as_struct(&[ADD_NAME])?
+            .add([(*REMOVE_FIELD).clone(), (*SIDECAR_FIELD).clone()])?;
+        let manifest_read_schema = Arc::new(manifest_read_schema);
 
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
+                manifest_read_schema,
                 None,
             )?,
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
+                manifest_read_schema,
                 None,
             )?,
             extension => {
@@ -136,8 +139,12 @@ mod tests {
         let log_root = log_segment.log_root.clone();
         assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
         let checkpoint_file = &log_segment.listed.checkpoint_parts[0];
-        let mut manifest_phase =
-            CheckpointManifestReader::try_new(engine.clone(), checkpoint_file, log_root)?;
+        let mut manifest_phase = CheckpointManifestReader::try_new(
+            engine.clone(),
+            checkpoint_file,
+            log_root,
+            crate::scan::CHECKPOINT_READ_SCHEMA.clone(),
+        )?;
 
         // Extract add file paths and verify expectations
         let mut file_paths = vec![];
@@ -218,6 +225,7 @@ mod tests {
             engine.clone(),
             &snapshot.log_segment().listed.checkpoint_parts[0],
             snapshot.log_segment().log_root.clone(),
+            crate::scan::CHECKPOINT_READ_SCHEMA.clone(),
         )?;
 
         let result = manifest_phase.extract_sidecars();

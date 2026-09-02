@@ -2168,11 +2168,10 @@ fn checkpoint_stats_skipping(
 // writeStatsAsStruct=true, writeStatsAsJson=false (no JSON stats in checkpoint),
 // schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
 // Cross-product covers all five checkpoint variants against four stats option
-// shapes: ScanFile.stats should be populated via the COALESCE/ToJson fallback
-// when both `json=true` and `struct_stats=All` are set; otherwise null on these
-// struct-stats-only checkpoints.
+// shapes: ScanFile.stats is populated whenever JSON output is requested, using the
+// COALESCE/ToJson fallback on these struct-stats-only checkpoints.
 #[rstest::rstest]
-#[case::default_json_only(StatsOptions::default(), false)]
+#[case::default_json_only(StatsOptions::default(), true)]
 #[case::all_both(StatsOptions::all(), true)]
 #[case::all_struct_only(StatsOptions::all_struct(), false)]
 #[case::none(StatsOptions::none(), false)]
@@ -2227,13 +2226,14 @@ fn struct_stats_surfaced_in_scan_file(
     Ok(())
 }
 
-// On a JSON-only table (no parsed-stats checkpoint), `has_stats_parsed` is
-// false and the COALESCE branch is never selected, so `StatsOptions::all_struct`
-// vs `StatsOptions::default` is a no-op for the `stats` JSON column: `add.stats`
-// is read directly from the commit JSON either way.
 #[rstest::rstest]
-fn struct_stats_only_no_op_on_json_only_table(
-    #[values(StatsOptions::default(), StatsOptions::all_struct())] stats: StatsOptions,
+#[case::json_only(StatsOptions::json_only(), true)]
+#[case::all_struct(StatsOptions::all_struct(), false)]
+#[case::all(StatsOptions::all(), true)]
+#[case::none(StatsOptions::none(), false)]
+fn stats_options_control_json_on_json_only_table(
+    #[case] stats: StatsOptions,
+    #[case] expect_json_stats: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
@@ -2250,9 +2250,11 @@ fn struct_stats_only_no_op_on_json_only_table(
 
     assert!(!scan_files.is_empty());
     for scan_file in &scan_files {
-        assert!(
+        assert_eq!(
             scan_file.stats.is_some(),
-            "JSON commits populate stats from add.stats"
+            expect_json_stats,
+            "unexpected JSON stats output for {}",
+            scan_file.path
         );
     }
     Ok(())

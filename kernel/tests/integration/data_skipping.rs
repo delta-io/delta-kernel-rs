@@ -1087,9 +1087,7 @@ async fn interval_partition_values_do_not_prune_files(
 // no matter how the all-null file's Add is sourced or how its stats are stored: a JSON commit
 // (`log_transform` parses `add.stats`), a checkpoint with native `stats_parsed`
 // (`writeStatsAsStruct=true`), or a checkpoint with JSON stats (the protocol default, parsed
-// from `add.stats` at read time). One exception is captured at the assertion: the parallel scan
-// path does not yet read `stats_parsed`, so it cannot skip an all-null file sourced from a
-// struct-only checkpoint.
+// from `add.stats` at read time).
 #[derive(Clone, Copy, Debug)]
 enum AllNullSource {
     /// All-null file added via a JSON commit, with no checkpoint (the pure delta-log path).
@@ -1204,23 +1202,7 @@ async fn all_null_files_pruned_regardless_of_source(
     // `5` can never match an all-null file, but it sits inside the kept file's `[1, 10]` range, so
     // `keep.parquet` always survives; every all-null file should otherwise be pruned.
     let survivors = surviving_paths(&table_path, engine, Arc::new(predicate), use_parallel)?;
-    let mut expected = vec!["keep.parquet".to_string()];
-    // TODO(#2832): remove this branch once the parallel scan path reads `stats_parsed`.
-    // `Scan::parallel_scan_metadata` sets `has_stats_parsed = false` and re-parses JSON
-    // `add.stats`, so over a struct-only checkpoint (JSON stats disabled) it has no stats to read
-    // and conservatively keeps the checkpoint-sourced all-null file -- a missed optimization,
-    // never wrong data; the sequential path reads `stats_parsed` and prunes it. When the parallel
-    // checkpoint reader gains `stats_parsed` support, `allnull_ckpt.parquet` will be pruned here
-    // too. The commit-sourced all-null file in `Both` carries JSON stats, so it is pruned on both
-    // paths.
-    let struct_only_checkpoint = matches!(
-        source,
-        AllNullSource::CheckpointStructStats | AllNullSource::Both
-    );
-    if use_parallel && struct_only_checkpoint {
-        expected.push("allnull_ckpt.parquet".to_string());
-    }
-    expected.sort();
+    let expected = vec!["keep.parquet".to_string()];
     assert_eq!(
         survivors, expected,
         "unexpected survivors for source {source:?} (use_parallel={use_parallel})"

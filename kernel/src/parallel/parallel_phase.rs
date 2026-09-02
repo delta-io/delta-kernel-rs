@@ -132,6 +132,7 @@ mod tests {
     use super::*;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::{col, lit};
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
@@ -148,7 +149,7 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::scan::{ScanBuilder, StatsOptions};
-    use crate::schema::{schema_ref, DataType, StructField, StructType};
+    use crate::schema::{schema_ref, StructField, StructType};
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
@@ -1019,10 +1020,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_with_skip_stats() -> DeltaResult<()> {
+    fn test_parallel_without_stats_output() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
-        // Get expected paths using single-node scan_metadata with skip_stats=true
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -1033,14 +1033,13 @@ mod tests {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 assert!(
                     scan_file.stats.is_none(),
-                    "Single-node: scan_file.stats should be None when skip_stats=true"
+                    "single-node scan_file.stats should be None"
                 );
                 ps.push(scan_file.path);
             })
         })?;
         expected_paths.sort();
 
-        // Run parallel workflow with skip_stats=true
         let scan = snapshot
             .scan_builder()
             .with_stats(StatsOptions::none())
@@ -1052,7 +1051,7 @@ mod tests {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 assert!(
                     scan_file.stats.is_none(),
-                    "sequential: scan_file.stats should be None when skip_stats=true"
+                    "sequential scan_file.stats should be None"
                 );
                 ps.push(scan_file.path);
             })
@@ -1061,15 +1060,21 @@ mod tests {
         match sequential.finish()? {
             AfterSequentialScanMetadata::Done => {}
             AfterSequentialScanMetadata::Parallel { state, files } => {
-                // Verify stats is None in parallel results and collect paths
-                let mut parallel =
-                    ParallelScanMetadata::try_new(engine.clone(), Arc::from(state), files)?;
+                let state = Arc::new(ParallelState::from_bytes(
+                    engine.as_ref(),
+                    &state.into_bytes()?,
+                )?);
+                let read_schema = state.file_read_schema();
+                assert!(!read_schema.contains_col(["add", "stats"]));
+                assert!(!read_schema.contains_col(["add", "stats_parsed"]));
+
+                let mut parallel = ParallelScanMetadata::try_new(engine.clone(), state, files)?;
 
                 let parallel_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
                     metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                         assert!(
                             scan_file.stats.is_none(),
-                            "parallel: scan_file.stats should be None when skip_stats=true"
+                            "parallel scan_file.stats should be None"
                         );
                         ps.push(scan_file.path);
                     })
@@ -1083,9 +1088,42 @@ mod tests {
         all_paths.sort();
         assert_eq!(
             all_paths, expected_paths,
-            "Parallel workflow with skip_stats=true should return same files as single-node scan_metadata"
+            "parallel workflow should return the same files as single-node scan_metadata"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_struct_stats_and_predicate_survive_serde() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-parquet-sidecars-struct-stats-only")?;
+        let scan = snapshot
+            .scan_builder()
+            .with_stats(StatsOptions::all_struct())
+            .with_predicate(Arc::new(col!("id").gt(lit(3i64))))
+            .build()?;
+        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
+        for result in sequential.by_ref() {
+            result?;
+        }
+        let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? else {
+            panic!("expected a parallel checkpoint phase");
+        };
+        let state = Arc::new(ParallelState::from_bytes(
+            engine.as_ref(),
+            &state.into_bytes()?,
+        )?);
+        let parallel = ParallelScanMetadata::try_new(engine, state, files)?;
+        let mut selected_files = 0;
+        for result in parallel {
+            let metadata = result?;
+            let (data, selection) = metadata.scan_files.into_parts();
+            let data = ArrowEngineData::try_from_engine_data(data)?;
+            assert!(data.record_batch().column_by_name("stats_parsed").is_some());
+            selected_files += selection.into_iter().filter(|selected| *selected).count();
+        }
+        assert_eq!(selected_files, 2);
         Ok(())
     }
 

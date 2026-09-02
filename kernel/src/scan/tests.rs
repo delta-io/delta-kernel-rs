@@ -1773,10 +1773,12 @@ fn scan_execute_passes_scan_file_modification_time_to_parquet_handler() {
 }
 
 #[rstest]
+#[case::json_only(StatsOptions::json_only(), true, false)]
 #[case::all_struct(StatsOptions::all_struct(), false, false)]
 #[case::all(StatsOptions::all(), true, false)]
 #[case::none_with_predicate(StatsOptions::none(), false, true)]
-fn test_checkpoint_stats_projection_matches_requested_output(
+#[case::none_without_predicate(StatsOptions::none(), false, false)]
+fn checkpoint_stats_projection_follows_output_or_pruning(
     #[values(
         "v1-single-part-struct-stats-only",
         "v2-parquet-sidecars-struct-stats-only",
@@ -1785,7 +1787,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
     table: &str,
     #[case] stats: StatsOptions,
     #[case] request_json_stats: bool,
-    #[case] skip_stats: bool,
+    #[case] with_predicate: bool,
 ) {
     let extracted = load_test_data("tests/data", table).ok();
     let path = extracted
@@ -1802,21 +1804,28 @@ fn test_checkpoint_stats_projection_matches_requested_output(
     recorder.take_reads();
 
     let predicate: Option<PredicateRef> =
-        skip_stats.then(|| Arc::new(Pred::gt(col!("id"), lit(0i64))) as PredicateRef);
+        with_predicate.then(|| Arc::new(Pred::gt(col!("id"), lit(0i64))) as PredicateRef);
+    let needs_stats =
+        request_json_stats || with_predicate || !matches!(stats.struct_stats, StructStats::None);
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
         .with_stats(stats)
         .build()
         .unwrap();
+    let commit_schema = scan.commit_read_schema();
+    let DataType::Struct(commit_add) = commit_schema.field(ADD_NAME).unwrap().data_type() else {
+        panic!("commit add must be a struct");
+    };
+    assert_eq!(commit_add.field("stats").is_some(), needs_stats);
     for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
         action.unwrap();
     }
 
     let reads = recorder.take_reads();
     let compatible_structured_stats = table != "v2-checkpoints-parquet-with-sidecars";
-    let expect_parsed_stats = !skip_stats && compatible_structured_stats;
-    let expect_json_stats = !skip_stats && (request_json_stats || !expect_parsed_stats);
+    let expect_parsed_stats = needs_stats && compatible_structured_stats;
+    let expect_json_stats = needs_stats && (request_json_stats || !expect_parsed_stats);
     let expected_file_fragment = if table.starts_with("v2-") {
         "_sidecars/"
     } else {
@@ -1843,12 +1852,12 @@ fn test_checkpoint_stats_projection_matches_requested_output(
         assert_eq!(
             add.field("stats").is_some(),
             expect_json_stats,
-            "JSON checkpoint stats projection must match the requested output"
+            "JSON checkpoint stats projection must match output and pruning requirements"
         );
         assert_eq!(
             add.field("stats_parsed").is_some(),
             expect_parsed_stats,
-            "structured checkpoint stats projection must match the requested output"
+            "structured checkpoint stats projection must match output and pruning requirements"
         );
     }
 }
@@ -1919,8 +1928,8 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
     let url = url::Url::from_directory_path(path).unwrap();
     let sync = Arc::new(SyncEngine::new());
     let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
-    let engine = DelegatingEngine::new(sync).with_parquet_handler(recorder.clone());
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let engine = Arc::new(DelegatingEngine::new(sync).with_parquet_handler(recorder.clone()));
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     recorder.take_reads();
 
     let scan = snapshot
@@ -1928,7 +1937,11 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
         .with_predicate(Arc::new(pred))
         .build()
         .unwrap();
-    for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
+    for action in scan
+        .replay_for_scan_metadata(engine.as_ref())
+        .unwrap()
+        .actions
+    {
         action.unwrap();
     }
 
@@ -1945,19 +1958,49 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
         }),
         "expected {expected_ref} on a {expected_file_fragment} read, got {reads:#?}"
     );
+
+    if table.starts_with("v2-") {
+        recorder.take_reads();
+        let mut sequential = scan.parallel_scan_metadata(engine).unwrap();
+        for result in sequential.by_ref() {
+            result.unwrap();
+        }
+        sequential.finish().unwrap();
+        let reads = recorder.take_reads();
+        assert!(
+            reads.iter().any(|read| {
+                read.files.iter().any(|file| {
+                    let location = file.location.as_str();
+                    location.contains(".checkpoint.") && !location.contains("/_sidecars/")
+                }) && read.physical_schema.field("sidecar").is_some()
+                    && read.predicate.is_none()
+            }),
+            "expected an unfiltered checkpoint manifest read, got {reads:#?}"
+        );
+    }
 }
 
-#[test]
-fn test_skip_stats_disables_data_skipping() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+#[rstest]
+#[case::data_stats(
+    "parsed-stats",
+    Pred::gt(col!("id"), lit(400i64)),
+)]
+#[case::case_divergent_data_stats(
+    "parsed-stats",
+    Pred::gt(Expr::column(["ID"]), lit(400i64)),
+)]
+#[case::partition_values(
+    "app-txn-checkpoint",
+    col!("modified").eq(lit("2021-02-01")),
+)]
+fn stats_none_preserves_pruning_without_output(#[case] table: &str, #[case] predicate: Pred) {
+    let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-
-    let predicate = Arc::new(Pred::gt(col!("id"), lit(400i64)));
     let scan = snapshot
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(Arc::new(predicate))
         .with_stats(StatsOptions::none())
         .build()
         .unwrap();
@@ -1977,7 +2020,7 @@ fn test_skip_stats_disables_data_skipping() {
             .count();
     }
 
-    assert_eq!(selected_file_count, 6);
+    assert_eq!(selected_file_count, 2);
 }
 
 /// Calling `with_stats` twice replaces the prior value; the last call wins.
@@ -2069,7 +2112,7 @@ fn test_default_stats_options_no_struct_output() {
 )]
 #[case::id_with_json_without_predicate(
     StatsOptions {
-        synthesize_json: true,
+        emit_json: true,
         struct_stats: StructStats::Columns(vec![column_name!("id")]),
     },
     &["id"],
@@ -2093,21 +2136,21 @@ fn test_default_stats_options_no_struct_output() {
 )]
 #[case::id_predicate_not_requested(
     StatsOptions::struct_columns(vec![column_name!("name")]),
-    &["id", "name"],
+    &["name"],
     Some(col!("id").gt(lit(400i64))),
     "name",
     &[("name_401", "name_500"), ("name_501", "name_600")],
 )]
 #[case::salary_predicate_with_multiple_requested_columns(
     StatsOptions::struct_columns(vec![column_name!("id"), column_name!("name")]),
-    &["id", "name", "salary"],
+    &["id", "name"],
     Some(col!("salary").le(lit(70_000i64))),
     "id",
     &[("1", "100"), ("101", "200")],
 )]
 #[case::salary_requested_with_different_predicate_column(
     StatsOptions::struct_columns(vec![column_name!("salary")]),
-    &["id", "salary"],
+    &["salary"],
     Some(col!("id").gt(lit(500i64))),
     "salary",
     &[("100100", "110000")],
@@ -2235,7 +2278,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
     let result = snapshot
         .scan_builder()
         .with_stats(StatsOptions {
-            synthesize_json: true,
+            emit_json: true,
             struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
         })
         .build();

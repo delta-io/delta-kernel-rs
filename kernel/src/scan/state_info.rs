@@ -127,13 +127,13 @@ fn validate_metadata_columns<'a>(
 /// - `physical_stats_schema` contains data-column stats for `stats_parsed`.
 /// - `physical_partition_schema` contains typed partition values for `partitionValues_parsed`.
 ///
-/// All three arms route through `TableConfiguration::build_expected_stats_schemas`: the
-/// `All` arm with no `requested_physical_columns` filter, and the two scoped arms with
-/// the union of requested + predicate-referenced columns. That path applies the same
+/// The scoped arms route through `TableConfiguration::build_expected_stats_schemas` with the
+/// union of requested + predicate-referenced columns. That path applies the same
 /// `BaseStatsTransform` -> `MinMaxStatsTransform` pipeline writers use, so the read-side
 /// stats schema's shape matches the write-side exactly.
 fn build_data_skipping_schemas(
     struct_stats: &StructStats,
+    emit_json: bool,
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
     table_configuration: &TableConfiguration,
@@ -189,8 +189,14 @@ fn build_data_skipping_schemas(
     };
 
     let stats_schema = match (struct_stats, physical_predicate) {
-        // Full table stats schema for stats_parsed.
-        (StructStats::All, _) => with_data_cols(
+        // JSON synthesis and full structured output need the complete stats shape, including
+        // bookkeeping fields when the table has no indexed data columns.
+        _ if emit_json => Some(
+            table_configuration
+                .build_expected_stats_schemas(None, None)?
+                .physical,
+        ),
+        (StructStats::All, _) => Some(
             table_configuration
                 .build_expected_stats_schemas(None, None)?
                 .physical,
@@ -407,6 +413,7 @@ impl StateInfo {
 
         let (physical_stats_schema, predicate_partition_schema) = build_data_skipping_schemas(
             &stats.struct_stats,
+            stats.emit_json,
             &physical_predicate,
             &predicate_column_names,
             table_configuration,
@@ -476,7 +483,7 @@ pub(crate) mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{MAX_VALUES, MIN_VALUES};
+    use crate::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS, TIGHT_BOUNDS};
     use crate::expressions::{col, column_name, lit, Predicate as Pred};
     use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
     use crate::table_features::TableFeature;
@@ -1041,7 +1048,7 @@ pub(crate) mod tests {
             HashMap::new(),
             vec![],
             StatsOptions {
-                synthesize_json: true,
+                emit_json: false,
                 struct_stats: StructStats::Columns(vec![column_name!("value")]),
             },
         )
@@ -1087,7 +1094,7 @@ pub(crate) mod tests {
             HashMap::new(),
             vec![],
             StatsOptions {
-                synthesize_json: true,
+                emit_json: false,
                 struct_stats: StructStats::Columns(vec![column_name!("value")]),
             },
         )
@@ -1243,7 +1250,7 @@ pub(crate) mod tests {
             props,
             vec![],
             StatsOptions {
-                synthesize_json: true,
+                emit_json: false,
                 struct_stats: StructStats::Columns(vec![column_name!("col_a")]),
             },
         )
@@ -1336,19 +1343,39 @@ pub(crate) mod tests {
         assert_eq!(state_info.physical_stats_columns, cols);
     }
 
+    #[test]
+    fn all_struct_retains_bookkeeping_stats_with_no_indexed_columns() {
+        let stats = get_state_info_with_stats(
+            flat_long_schema(2),
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(0),
+            vec![],
+            StatsOptions::all_struct(),
+        )
+        .unwrap()
+        .physical_stats_schema
+        .expect("structured stats should retain bookkeeping fields");
+        assert!(stats.field(NUM_RECORDS).is_some());
+        assert!(stats.field(TIGHT_BOUNDS).is_some());
+        assert!(stats.field(NULL_COUNT).is_none());
+    }
+
     /// Predicate on a past-cap column: stats schema goes to `None` (no skipping), but
     /// the physical predicate is retained so engines can still apply it per-row.
     #[test]
     fn predicate_on_past_cap_column_drops_stats_schema() {
         let schema = flat_long_schema(5);
         let predicate = Arc::new(col!("c4").gt(lit(10i64)));
-        let state_info = get_state_info(
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             Some(predicate),
             &[],
             num_indexed_cols_config(2),
             vec![],
+            StatsOptions::none(),
         )
         .unwrap();
         assert!(
@@ -1371,13 +1398,14 @@ pub(crate) mod tests {
             col!("c0").gt(lit(10i64)),
             col!("c4").gt(lit(10i64)),
         ));
-        let state_info = get_state_info(
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             Some(predicate),
             &[],
             num_indexed_cols_config(2),
             vec![],
+            StatsOptions::none(),
         )
         .unwrap();
         let stats_schema = state_info
@@ -1417,13 +1445,14 @@ pub(crate) mod tests {
         };
         // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
         let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
-        let state_info = get_state_info(
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             Some(predicate),
             &[],
             num_indexed_cols_config(2),
             vec![],
+            StatsOptions::none(),
         )
         .unwrap();
         assert!(state_info.physical_stats_schema.is_none());

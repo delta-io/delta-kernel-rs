@@ -1025,7 +1025,7 @@ impl LogSegment {
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
     /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
-    fn create_checkpoint_stream(
+    pub(crate) fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
