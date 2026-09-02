@@ -73,14 +73,26 @@ pub(crate) fn iceberg_compat_v2_type_changes_validation(
         return Ok(());
     }
 
-    let mut validator = super::TypeChangesValidator { path: vec![] };
+    let mut validator = super::TypeChangesValidator {
+        path: vec![],
+        feature_label: "icebergCompatV2",
+    };
     validator.transform_struct(tc.logical_schema_ref())
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+    use serde_json::json;
+
     use super::*;
-    use crate::schema::{schema, ArrayType, MapType};
+    use crate::schema::{
+        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+        StructType,
+    };
+    use crate::table_configuration::TableConfiguration;
+    use crate::table_features::TableFeature;
+    use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
 
     #[test]
     fn is_v2_supported_type_accepted_datatypes() {
@@ -124,5 +136,101 @@ mod tests {
         // match delta-spark, which cannot consume such columns on an icebergCompatV2 table.
         assert!(!is_v2_supported_type(&DataType::unshredded_variant()));
         assert!(!is_v2_supported_type(&DataType::VOID));
+    }
+
+    fn table_config_with_schema_and_features(
+        schema: StructType,
+        features: impl IntoIterator<Item = TableFeature>,
+    ) -> TableConfiguration {
+        MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            .with_table_root("file:///t/")
+            .build()
+    }
+
+    fn table_config_with_schema(schema: StructType) -> TableConfiguration {
+        table_config_with_schema_and_features(
+            schema,
+            [TableFeature::IcebergCompatV2, TableFeature::TypeWidening],
+        )
+    }
+
+    fn field_with_type_change(name: &str, from_type: &str, to_type: &str) -> StructField {
+        StructField::nullable(name, DataType::STRING).add_metadata([(
+            ColumnMetadataKey::TypeChanges.as_ref(),
+            MetadataValue::Other(json!([{
+                "fromType": from_type,
+                "toType": to_type,
+                "tableVersion": 2
+            }])),
+        )])
+    }
+
+    #[rstest]
+    #[case::byte_short("byte", "short")]
+    #[case::integer_long("integer", "long")]
+    #[case::float_double("float", "double")]
+    #[case::decimal_same_scale("decimal(10,2)", "decimal(20,2)")]
+    fn v2_type_change_validation_allows_iceberg_promotions(
+        #[case] from_type: &str,
+        #[case] to_type: &str,
+    ) {
+        let table_configuration = table_config_with_schema(schema! {
+            (field_with_type_change("a", from_type, to_type)),
+        });
+
+        iceberg_compat_v2_type_changes_validation(&table_configuration).unwrap();
+    }
+
+    #[rstest]
+    #[case::integer_double("integer", "double")]
+    #[case::integer_decimal("integer", "decimal(11,1)")]
+    #[case::decimal_scale_change("decimal(10,2)", "decimal(20,5)")]
+    #[case::date_timestamp_ntz("date", "timestamp_ntz")]
+    #[case::long_double("long", "double")]
+    fn v2_type_change_validation_rejects_non_iceberg_promotions(
+        #[case] from_type: &str,
+        #[case] to_type: &str,
+    ) {
+        let table_configuration = table_config_with_schema(schema! {
+            (field_with_type_change("a", from_type, to_type)),
+        });
+
+        let err = iceberg_compat_v2_type_changes_validation(&table_configuration)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("icebergCompatV2 does not support type change")
+                && err.contains(from_type)
+                && err.contains(to_type),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_type_change_validation_reports_nested_field_path() {
+        let table_configuration = table_config_with_schema(schema! {
+            nullable "m": { STRING => nullable {
+                (field_with_type_change("inner", "integer", "double")),
+            } },
+        });
+
+        let err = iceberg_compat_v2_type_changes_validation(&table_configuration)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("m.value.inner"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn v2_type_change_validation_skips_tables_without_type_widening_support() {
+        let table_configuration = table_config_with_schema_and_features(
+            schema! {
+                (field_with_type_change("a", "integer", "double")),
+            },
+            [TableFeature::IcebergCompatV2],
+        );
+
+        iceberg_compat_v2_type_changes_validation(&table_configuration).unwrap();
     }
 }

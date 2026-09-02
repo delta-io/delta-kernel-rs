@@ -10,9 +10,7 @@ use crate::schema::PrimitiveType::{
     Binary, Boolean, Byte, Date, Decimal, Double, Float, Integer, Long, Short,
     String as StringType, Timestamp, TimestampNtz,
 };
-use crate::schema::{
-    try_collect_column_defaults, ColumnMetadataKey, DataType, MetadataValue, StructField,
-};
+use crate::schema::{try_collect_column_defaults, DataType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::SchemaTransform;
@@ -82,7 +80,10 @@ pub(crate) fn iceberg_compat_v3_type_changes_validation(
         return Ok(());
     }
 
-    let mut validator = super::TypeChangesValidator { path: vec![] };
+    let mut validator = super::TypeChangesValidator {
+        path: vec![],
+        feature_label: "icebergCompatV3",
+    };
     validator.transform_struct(tc.logical_schema_ref())
 }
 

@@ -242,6 +242,8 @@ fn is_iceberg_allowed_type_change(from: &DataType, to: &DataType) -> bool {
 
 struct TypeChangesValidator {
     path: Vec<String>,
+    /// Feature name reported in error message, e.g. `"icebergCompatV2"`
+    feature_label: &'static str,
 }
 
 impl TypeChangesValidator {
@@ -265,8 +267,8 @@ impl TypeChangesValidator {
         for type_change in type_changes {
             if !is_iceberg_allowed_type_change(&type_change.from_type, &type_change.to_type) {
                 return Err(Error::schema(format!(
-                    "icebergCompatV3 does not support type change on field '{path}': {} -> {}",
-                    type_change.from_type, type_change.to_type
+                    "{} does not support type change on field '{path}': {} -> {}",
+                    self.feature_label, type_change.from_type, type_change.to_type
                 )));
             }
         }
@@ -493,5 +495,36 @@ mod tests {
         };
         v.transform_struct(&schema);
         assert_eq!(v.offender, expected);
+    }
+
+    fn decimal(precision: u8, scale: u8) -> DataType {
+        DataType::decimal(precision, scale).unwrap()
+    }
+
+    #[rstest]
+    // Allowed: integer promotions, float->double, decimal precision increase at equal scale.
+    #[case::byte_short(DataType::BYTE, DataType::SHORT, true)]
+    #[case::byte_integer(DataType::BYTE, DataType::INTEGER, true)]
+    #[case::byte_long(DataType::BYTE, DataType::LONG, true)]
+    #[case::short_integer(DataType::SHORT, DataType::INTEGER, true)]
+    #[case::short_long(DataType::SHORT, DataType::LONG, true)]
+    #[case::integer_long(DataType::INTEGER, DataType::LONG, true)]
+    #[case::float_double(DataType::FLOAT, DataType::DOUBLE, true)]
+    #[case::decimal_precision_increase(decimal(10, 2), decimal(20, 2), true)]
+    // Rejected: promotions Iceberg V2 forbids even though Type Widening permits them, plus
+    // non-widenings.
+    #[case::integer_double(DataType::INTEGER, DataType::DOUBLE, false)]
+    #[case::long_double(DataType::LONG, DataType::DOUBLE, false)]
+    #[case::date_timestamp_ntz(DataType::DATE, DataType::TIMESTAMP_NTZ, false)]
+    #[case::integer_decimal(DataType::INTEGER, decimal(11, 1), false)]
+    #[case::decimal_scale_increase(decimal(10, 2), decimal(20, 5), false)]
+    #[case::decimal_precision_decrease(decimal(20, 2), decimal(10, 2), false)]
+    #[case::no_op_string(DataType::STRING, DataType::STRING, false)]
+    fn iceberg_allowed_type_change_matches_iceberg_v2_rules(
+        #[case] from: DataType,
+        #[case] to: DataType,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_iceberg_allowed_type_change(&from, &to), expected);
     }
 }
