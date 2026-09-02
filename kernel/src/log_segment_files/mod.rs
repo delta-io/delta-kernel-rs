@@ -239,6 +239,16 @@ pub(crate) fn should_process_log_file(file: &ParsedLogPath) -> bool {
     false
 }
 
+/// Controls whether listing adopts discovered checkpoints as the replay base.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CheckpointHandling {
+    /// Adopt the latest complete checkpoint and discard the files it covers.
+    #[default]
+    Adopt,
+    /// Recognize complete checkpoints without adopting them, retaining all listed commits.
+    Ignore,
+}
+
 /// Accumulates and groups log files during listing. Each "group" consists of all files that
 /// share the same version number (e.g., commit, checkpoint parts, CRC files).
 ///
@@ -262,6 +272,8 @@ struct ListingAccumulator {
     end_version: Option<Version>,
     /// The version of the current group being accumulated
     group_version: Option<Version>,
+    /// Whether complete checkpoints replace the current replay base.
+    checkpoint_handling: CheckpointHandling,
 }
 
 impl ListingAccumulator {
@@ -317,9 +329,10 @@ impl ListingAccumulator {
         }
     }
 
-    /// Selects this version's checkpoint. Any of a version's complete checkpoints (see
-    /// [`group_checkpoint_parts`]) describes the same table state; the choice must be stable across
-    /// processes (matching Delta-Spark), so we take the greatest in [`CheckpointInstance`] order.
+    /// Processes this version's checkpoint. Any of a version's complete checkpoints (see
+    /// [`group_checkpoint_parts`]) describes the same table state; when adopting one, the choice
+    /// must be stable across processes (matching Delta-Spark), so we take the greatest in
+    /// [`CheckpointInstance`] order.
     ///
     /// When a complete checkpoint exists we drop the commits/compactions collected so far, keeping
     /// only the latest commit.
@@ -330,6 +343,12 @@ impl ListingAccumulator {
             .filter(|(instance, part_files)| instance.is_complete(part_files))
             .max_by(|(a, _), (b, _)| a.cmp(b))
         {
+            if self.checkpoint_handling == CheckpointHandling::Ignore {
+                // TODO: Return `complete_checkpoint` separately so `Snapshot` can track it outside
+                // its active `LogSegment`. `Snapshot::reduce()` could adopt the latest usable
+                // checkpoint, trim covered log files, and clear `skipped_new_checkpoints`.
+                return;
+            }
             self.output.checkpoint_parts = complete_checkpoint;
             // Keep the commit at the checkpoint version (if any) before clearing all older commits.
             self.output.latest_commit_file = self
@@ -367,11 +386,13 @@ impl LogSegmentFiles {
     /// - `start_version`: start version of the entire listing range provided; in practice, this is
     ///   the lower bound (inclusive) for log_tail entries included in the result
     /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
+    /// - `checkpoint_handling`: whether complete checkpoints replace the replay base
     pub(crate) fn build_log_segment_files(
         fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         end_version: Option<Version>,
+        checkpoint_handling: CheckpointHandling,
     ) -> DeltaResult<Self> {
         // check log_tail is only commits
         // note that LogSegment checks no gaps/duplicates so we don't duplicate that here
@@ -385,6 +406,7 @@ impl LogSegmentFiles {
 
         let mut acc = ListingAccumulator {
             end_version,
+            checkpoint_handling,
             ..Default::default()
         };
 
@@ -442,11 +464,10 @@ impl LogSegmentFiles {
             acc.select_checkpoint_for_group(gv);
         }
 
-        // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
-        // it contains only commits after the most recent checkpoint. The last element is the
-        // highest version commit overall, so we update latest_commit_file to it. If it's empty,
-        // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
-        // or remains None.
+        // When checkpoints are adopted, ascending_commit_files contains only commits after the
+        // most recent checkpoint. When they are ignored, it contains every commit in the listing.
+        // Either way, its last element is the highest commit version overall. If it is empty, keep
+        // the value recorded while adopting the checkpoint, if any.
         if let Some(commit_file) = acc.output.ascending_commit_files.last() {
             acc.output.latest_commit_file = Some(commit_file.clone());
         }
@@ -582,11 +603,32 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
+        Self::list_with_checkpoint_handling(
+            storage,
+            log_root,
+            log_tail,
+            start_version,
+            end_version,
+            CheckpointHandling::Adopt,
+            cancellation_token,
+        )
+    }
+
+    /// List log files with explicit checkpoint handling.
+    pub(crate) fn list_with_checkpoint_handling(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Option<Version>,
+        end_version: Option<Version>,
+        checkpoint_handling: CheckpointHandling,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter =
             list_delta_log_from_storage(storage, log_root, start, end, cancellation_token)?;
-        Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
+        Self::build_log_segment_files(fs_iter, log_tail, start, end_version, checkpoint_handling)
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that
@@ -716,6 +758,12 @@ impl LogSegmentFiles {
 
         let fs_iter = windows.into_iter().rev().flatten().map(Ok);
         let start = found_checkpoint_version.unwrap_or(0);
-        Self::build_log_segment_files(fs_iter, log_tail, start, Some(end_version))
+        Self::build_log_segment_files(
+            fs_iter,
+            log_tail,
+            start,
+            Some(end_version),
+            CheckpointHandling::Adopt,
+        )
     }
 }

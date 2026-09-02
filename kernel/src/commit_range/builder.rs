@@ -10,10 +10,10 @@ use crate::{DeltaResult, Engine, Error, Version};
 ///
 /// Created via [`CommitRange::builder_for`] (path-based) or
 /// [`CommitRange::builder_from`] (snapshot-based). Supports configuring an end version
-/// and the commit ordering. [`Self::build`] performs delta-log listing and contiguity
-/// validation.
-// TODO(#2781): support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
-// `with_max_catalog_version(self, Version)`
+/// and the commit ordering. [`Self::build`] lists the log for a path-based builder or reuses the
+/// commit-file metadata in a snapshot-based builder, then validates contiguity.
+// TODO(#2781): support catalog commits on the path-based builder via
+// `with_log_tail(self, Vec<LogPath>)` and `with_max_catalog_version(self, Version)`.
 pub struct CommitRangeBuilder {
     table_root: String,
     start_version: Version,
@@ -57,12 +57,13 @@ impl CommitRangeBuilder {
         self
     }
 
-    /// List `_delta_log/`, validate contiguity, and produce a [`CommitRange`]. Performs
-    /// filesystem listing but no JSON reads.
+    /// Resolve commit-file metadata, validate contiguity, and produce a [`CommitRange`]. A
+    /// path-based builder lists `_delta_log/`; a snapshot-based builder reuses the snapshot's log
+    /// segment. Neither path reads commit JSON.
     ///
     /// Returns an error if the resolved version range is invalid (start > end), the
-    /// listed commits are non-contiguous, or the requested start version is not present
-    /// on the filesystem.
+    /// commits are non-contiguous, or the requested start version is unavailable from the selected
+    /// source.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;

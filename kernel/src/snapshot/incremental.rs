@@ -10,7 +10,7 @@ use tracing::instrument;
 use super::{IncrementalReplay, Snapshot};
 use crate::cancellation::CancellationTokenRef;
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::LogSegmentFiles;
+use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
     emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
@@ -108,6 +108,7 @@ impl Snapshot {
         target_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
+        checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Arc<Self>> {
@@ -131,6 +132,8 @@ impl Snapshot {
             tracing::Span::current().record("version", existing_snapshot_version);
         }
 
+        let skipped_new_checkpoints = checkpoint_handling == CheckpointHandling::Ignore;
+
         // Assemble the new segment as one fallible unit so a load failure emits exactly once, via
         // the `inspect_err` below.
         let segment_load_start = std::time::Instant::now();
@@ -140,12 +143,17 @@ impl Snapshot {
             existing_snapshot_version,
             log_tail,
             requested_version,
+            checkpoint_handling,
             cancellation_token,
         )
         .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?
         {
             NewSegment::Unchanged => {
-                return Self::reuse_promoting_built_as_latest(&existing_snapshot, built_as_latest);
+                return Self::reuse_with_build_metadata(
+                    &existing_snapshot,
+                    built_as_latest,
+                    skipped_new_checkpoints,
+                );
             }
             NewSegment::Rebuild(new_log_segment) => {
                 emit_log_segment_load(
@@ -225,6 +233,7 @@ impl Snapshot {
             table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
             built_as_latest,
+            skipped_new_checkpoints,
         )?))
     }
 
@@ -241,20 +250,28 @@ impl Snapshot {
         existing_snapshot_version: Version,
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
+        checkpoint_handling: CheckpointHandling,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
-        // Start listing just after the previous segment's checkpoint, if any.
-        let listing_start = existing_log_segment.checkpoint_version.unwrap_or(0) + 1;
-
-        let new_listed_files = LogSegmentFiles::list(
+        let listing_start = match checkpoint_handling {
+            CheckpointHandling::Adopt => existing_log_segment.checkpoint_version.unwrap_or(0) + 1,
+            CheckpointHandling::Ignore => {
+                let Some(listing_start) = existing_snapshot_version.checked_add(1) else {
+                    return Ok(NewSegment::Unchanged);
+                };
+                listing_start
+            }
+        };
+        let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
             storage.as_ref(),
             &log_root,
             log_tail,
             Some(listing_start),
             requested_version,
+            checkpoint_handling,
             cancellation_token,
         )?;
 
@@ -325,7 +342,7 @@ impl Snapshot {
         // (Also reached from Case D.2 when a checkpoint at or below the existing snapshot
         // version was discovered.)
         //
-        // The example below illustrates Case D.2 -> F.
+        // The example below illustrates Case D.2 -> F when adopting new checkpoints.
         #[rustfmt::skip]
         // Example: existing segment = checkpoint@v0 + commit@v1, v2, v3
         //          existing_snapshot_version = v3, listing_start = v1
@@ -414,21 +431,24 @@ impl Snapshot {
         Ok(NewSegment::Combined(combined_log_segment))
     }
 
-    /// Reuse `existing`, promoting its `built_as_latest` flag to `true` if this build confirmed
-    /// latest.
-    fn reuse_promoting_built_as_latest(
+    /// Reuse `existing` when its build metadata already matches this build.
+    fn reuse_with_build_metadata(
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
+        skipped_new_checkpoints: bool,
     ) -> DeltaResult<Arc<Snapshot>> {
-        // Promote only false -> true; every other case reuses the Arc unchanged.
-        if existing.built_as_latest || !built_as_latest {
+        let built_as_latest = existing.built_as_latest || built_as_latest;
+        if existing.built_as_latest == built_as_latest
+            && existing.skipped_new_checkpoints == skipped_new_checkpoints
+        {
             return Ok(existing.clone());
         }
         Ok(Arc::new(Snapshot::new_with_crc(
             existing.log_segment.clone(),
             existing.table_configuration.clone(),
             existing.base_crc().cloned(),
-            true, // reached only when the flag flips false -> true
+            built_as_latest,
+            skipped_new_checkpoints,
         )?))
     }
 
@@ -482,13 +502,14 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
-    use test_utils::delta_path_for_version;
     use test_utils::table_builder::TestTableBuilder;
+    use test_utils::{delta_path_for_version, LoggingTest};
     use url::Url;
 
     use super::*;
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
+    use crate::commit_range::CommitRange;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{
@@ -499,7 +520,7 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
-    use crate::snapshot::commit;
+    use crate::snapshot::{commit, CheckpointWriteResult};
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
     };
@@ -645,6 +666,7 @@ mod tests {
             None,
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
+            CheckpointHandling::Adopt,
             true, /* built_as_latest */
             None, /* cancellation_token */
         )?;
@@ -726,6 +748,7 @@ mod tests {
             Some(2),
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
+            CheckpointHandling::Adopt,
             false, /* built_as_latest */
             None,  /* cancellation_token */
         )?;
@@ -786,6 +809,7 @@ mod tests {
             Some(1),
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
+            CheckpointHandling::Adopt,
             false, /* built_as_latest */
             None,  /* cancellation_token */
         )?;
@@ -799,6 +823,7 @@ mod tests {
             Some(0),
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
+            CheckpointHandling::Adopt,
             false, /* built_as_latest */
             None,  /* cancellation_token */
         );
@@ -813,6 +838,287 @@ mod tests {
     // ============================================================================
     // Tests: incremental builder paths (Cases A/B/C/D.1/D.2/E/F)
     // ============================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_skip_new_checkpoints_preserves_checkpoint_history_across_updates(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        let table_root = ctx.url.as_str();
+
+        commit(
+            table_root,
+            &ctx.store,
+            0,
+            vec![
+                protocol_action(1, 1),
+                metadata_action(json!({})),
+                add_action("file0.parquet"),
+            ],
+        )
+        .await;
+        commit(table_root, &ctx.store, 1, vec![add_action("file1.parquet")]).await;
+        Snapshot::builder_for(table_root)
+            .at_version(1)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref(), None)?;
+
+        commit(table_root, &ctx.store, 2, vec![add_action("file2.parquet")]).await;
+        commit(table_root, &ctx.store, 3, vec![add_action("file3.parquet")]).await;
+        let base = Snapshot::builder_for(table_root)
+            .at_version(3)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(base.log_segment.checkpoint_version, Some(1));
+
+        commit(
+            table_root,
+            &ctx.store,
+            4,
+            vec![
+                protocol_action(1, 2),
+                metadata_action(json!({"skip_new_checkpoints": "true"})),
+            ],
+        )
+        .await;
+        commit(table_root, &ctx.store, 5, vec![add_action("file5.parquet")]).await;
+        Snapshot::builder_for(table_root)
+            .at_version(5)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref(), None)?;
+        commit(table_root, &ctx.store, 6, vec![add_action("file6.parquet")]).await;
+
+        let default_update = Snapshot::builder_from(base.clone())
+            .at_version(6)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(default_update.log_segment.checkpoint_version, Some(5));
+
+        let updated = Snapshot::builder_from(base.clone())
+            .at_version(6)
+            .skip_new_checkpoints()
+            .build(ctx.engine.as_ref())?;
+
+        assert_eq!(updated.version(), 6);
+        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+        assert_eq!(
+            updated.log_segment.listed.checkpoint_parts,
+            base.log_segment.listed.checkpoint_parts
+        );
+        assert_eq!(
+            updated.log_segment.last_checkpoint_metadata,
+            base.log_segment.last_checkpoint_metadata
+        );
+        assert_eq!(
+            updated
+                .log_segment
+                .listed
+                .ascending_commit_files
+                .iter()
+                .map(|file| file.version)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            updated
+                .metadata_configuration()
+                .get("skip_new_checkpoints")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            updated
+                .table_configuration()
+                .protocol()
+                .min_reader_version(),
+            1
+        );
+        assert_eq!(
+            updated
+                .table_configuration()
+                .protocol()
+                .min_writer_version(),
+            2
+        );
+        let range = CommitRange::builder_from(updated.clone(), 4).build(ctx.engine.as_ref())?;
+        assert_eq!(range.start_version(), 4);
+        assert_eq!(range.end_version(), 6);
+
+        for version in 4..=6 {
+            ctx.store
+                .delete(&delta_path_for_version(version, "json"))
+                .await?;
+        }
+        commit(table_root, &ctx.store, 7, vec![add_action("file7.parquet")]).await;
+        let updated_again = Snapshot::builder_from(updated)
+            .at_version(7)
+            .skip_new_checkpoints()
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(
+            updated_again
+                .log_segment
+                .listed
+                .ascending_commit_files
+                .iter()
+                .map(|file| file.version)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 5, 6, 7]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_skip_new_checkpoints_preserves_incremental_builder_boundaries() -> DeltaResult<()>
+    {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?;
+
+        let unchanged = Snapshot::builder_from(base.clone())
+            .skip_new_checkpoints()
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(unchanged, base);
+        assert!(unchanged.is_built_as_latest());
+        assert!(unchanged.skipped_new_checkpoints());
+
+        let refreshed = Snapshot::builder_from(unchanged).build(ctx.engine.as_ref())?;
+        assert!(!refreshed.skipped_new_checkpoints());
+
+        let pinned = Snapshot::builder_from(base.clone())
+            .at_version(1)
+            .skip_new_checkpoints()
+            .build(ctx.engine.as_ref())?;
+        assert!(Arc::ptr_eq(&pinned, &base));
+        assert!(!pinned.skipped_new_checkpoints());
+
+        let older = Snapshot::builder_from(base.clone())
+            .at_version(0)
+            .skip_new_checkpoints()
+            .build(ctx.engine.as_ref())
+            .expect_err("an incremental update cannot move backward");
+        assert!(older
+            .to_string()
+            .contains("older than snapshot hint version"));
+
+        let unavailable = Snapshot::builder_from(base.clone())
+            .at_version(2)
+            .skip_new_checkpoints()
+            .build(ctx.engine.as_ref())
+            .expect_err("version 2 does not exist");
+        assert!(unavailable
+            .to_string()
+            .contains("no new commits were found"));
+
+        commit(
+            ctx.url.as_str(),
+            &ctx.store,
+            2,
+            vec![add_action("file2.parquet")],
+        )
+        .await;
+        let partially_available = Snapshot::builder_from(base)
+            .at_version(3)
+            .skip_new_checkpoints()
+            .build(ctx.engine.as_ref())
+            .expect_err("version 3 is beyond the latest commit");
+        assert!(partially_available
+            .to_string()
+            .contains("end version 2 not the same as the specified end version 3"));
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_full_scan_warns_when_snapshot_skipped_new_checkpoints(
+        #[values(false, true)] skip_new_checkpoints: bool,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(0)
+            .build(ctx.engine.as_ref())?;
+        let builder = Snapshot::builder_from(base).at_version(2);
+        let snapshot = if skip_new_checkpoints {
+            builder.skip_new_checkpoints().build(ctx.engine.as_ref())?
+        } else {
+            builder.build(ctx.engine.as_ref())?
+        };
+        assert_eq!(snapshot.skipped_new_checkpoints(), skip_new_checkpoints);
+
+        let logging = LoggingTest::new();
+        let _incremental_scan = snapshot
+            .clone()
+            .incremental_scan_builder(0)
+            .build(ctx.engine.as_ref())?;
+        assert!(!logging.logs().contains("skip_new_checkpoints()"));
+
+        let _full_scan = snapshot.scan_builder().build()?;
+        assert_eq!(
+            logging.logs().contains("skip_new_checkpoints()"),
+            skip_new_checkpoints
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_clears_skipped_new_checkpoints_warning() -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(0)
+            .build(ctx.engine.as_ref())?;
+        let snapshot = Snapshot::builder_from(base)
+            .at_version(2)
+            .skip_new_checkpoints()
+            .build(ctx.engine.as_ref())?;
+
+        let logging = LoggingTest::new();
+        let _scan = snapshot.clone().scan_builder().build()?;
+        assert!(logging.logs().contains("skip_new_checkpoints()"));
+        drop(logging);
+
+        let (result, checkpointed) = snapshot.checkpoint(ctx.engine.as_ref(), None)?;
+        assert_eq!(result, CheckpointWriteResult::Written);
+        assert!(!checkpointed.skipped_new_checkpoints());
+
+        let logging = LoggingTest::new();
+        let _scan = checkpointed.scan_builder().build()?;
+        assert!(!logging.logs().contains("skip_new_checkpoints()"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_skip_new_checkpoints_rejects_missing_history_hidden_by_newer_checkpoint(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        let table_root = ctx.url.as_str();
+        setup_test_table_with_commits(table_root, &ctx.store, 6).await?;
+
+        let base = Snapshot::builder_for(table_root)
+            .at_version(1)
+            .build(ctx.engine.as_ref())?;
+        Snapshot::builder_for(table_root)
+            .at_version(4)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref(), None)?;
+        ctx.store.delete(&delta_path_for_version(3, "json")).await?;
+
+        let default_update = Snapshot::builder_from(base.clone())
+            .at_version(5)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(default_update.log_segment.checkpoint_version, Some(4));
+
+        let updated = Snapshot::builder_from(base)
+            .at_version(5)
+            .skip_new_checkpoints()
+            .build(ctx.engine.as_ref());
+        let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
+        assert!(error
+            .to_string()
+            .contains("Expected contiguous commit files"));
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
@@ -1319,6 +1625,7 @@ mod tests {
     async fn test_incremental_update_advances_in_memory_crc_within_budget(
         #[case] mode: IncrementalReplay,
         #[case] expected_crc_v: Option<u64>,
+        #[values(false, true)] skip_new_checkpoints: bool,
     ) -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
@@ -1335,9 +1642,13 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_a.crc_at_version().map(|c| c.version), Some(3));
 
-        let updated = Snapshot::builder_from(snapshot_a)
-            .with_incremental_crc_replay(mode)
-            .build(ctx.engine.as_ref())?;
+        let builder = Snapshot::builder_from(snapshot_a).with_incremental_crc_replay(mode);
+        let builder = if skip_new_checkpoints {
+            builder.skip_new_checkpoints()
+        } else {
+            builder
+        };
+        let updated = builder.build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 5);
         assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
         assert_eq!(

@@ -1275,21 +1275,50 @@ pub unsafe extern "C" fn snapshot_builder_build(
 }
 
 fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handle<SharedSnapshot>> {
-    let engine = builder.engine.engine();
-    let mut rust_builder = match builder.source {
-        FfiSnapshotBuilderSource::TableRoot(url) => Snapshot::builder_for(url),
-        FfiSnapshotBuilderSource::ExistingSnapshot(snap) => Snapshot::builder_from(snap),
-    };
-    if let Some(v) = builder.version {
-        rust_builder = rust_builder.at_version(v);
+    let FfiSnapshotBuilder {
+        engine,
+        source,
+        version,
+        log_tail,
+        max_catalog_version,
+    } = builder;
+    let engine = engine.engine();
+
+    fn build<Mode>(
+        mut builder: delta_kernel::snapshot::SnapshotBuilder<Mode>,
+        engine: &dyn Engine,
+        version: Option<Version>,
+        log_tail: Vec<LogPath>,
+        max_catalog_version: Option<Version>,
+    ) -> DeltaResult<SnapshotRef> {
+        if let Some(version) = version {
+            builder = builder.at_version(version);
+        }
+        if !log_tail.is_empty() {
+            builder = builder.with_log_tail(log_tail);
+        }
+        if let Some(max_catalog_version) = max_catalog_version {
+            builder = builder.with_max_catalog_version(max_catalog_version);
+        }
+        builder.build(engine)
     }
-    if !builder.log_tail.is_empty() {
-        rust_builder = rust_builder.with_log_tail(builder.log_tail);
-    }
-    if let Some(mcv) = builder.max_catalog_version {
-        rust_builder = rust_builder.with_max_catalog_version(mcv);
-    }
-    let snapshot = rust_builder.build(engine.as_ref())?;
+
+    let snapshot = match source {
+        FfiSnapshotBuilderSource::TableRoot(url) => build(
+            Snapshot::builder_for(url),
+            engine.as_ref(),
+            version,
+            log_tail,
+            max_catalog_version,
+        ),
+        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => build(
+            Snapshot::builder_from(snapshot),
+            engine.as_ref(),
+            version,
+            log_tail,
+            max_catalog_version,
+        ),
+    }?;
     Ok(snapshot.into())
 }
 

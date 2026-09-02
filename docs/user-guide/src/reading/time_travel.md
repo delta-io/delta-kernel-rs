@@ -1,9 +1,9 @@
 # Time travel and snapshot management
 
 To read a Delta table at a specific version or refresh an existing snapshot to
-pick up new commits, you use Kernel's `SnapshotBuilder` API. The builder
-supports both full construction from a table URL and incremental updates from an
-existing `Snapshot`.
+pick up new commits, you use Kernel's snapshot builder APIs. `SnapshotBuilder`
+loads from a table URL, while `IncrementalSnapshotBuilder` updates an existing
+`Snapshot`.
 
 Before reading this page, make sure you understand
 [Building a Scan](./building_a_scan.md).
@@ -62,9 +62,9 @@ let snapshot = Snapshot::builder_for(&url)
 
 If you already hold a `Snapshot` (which is wrapped in an `Arc` as
 `SnapshotRef`) and want to check for newer commits, use
-`Snapshot::builder_from` instead of rebuilding from scratch. This performs
-an incremental update: Kernel reads only the new commits since the existing
-snapshot's version, avoiding a full log replay.
+`Snapshot::builder_from` instead of rebuilding from scratch. Kernel reuses the
+existing Snapshot and applies only the newer table state, avoiding a full log
+replay.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -123,6 +123,47 @@ let updated = Snapshot::builder_from(snapshot)
 # Ok(())
 # }
 ```
+
+### Retaining commits for conflict checks
+
+To inspect every commit added during a refresh, call `skip_new_checkpoints()` before `build()`.
+This is useful when your connector must check intervening commits before retrying a write.
+
+```rust,no_run
+# extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel::commit_range::CommitRange;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::{DeltaResult, Snapshot};
+# fn example() -> DeltaResult<()> {
+# let url = delta_kernel::try_parse_uri("/tmp/table")?;
+# let store = store_from_url(&url)?;
+# let engine = DefaultEngine::builder(store).build();
+let snapshot = Snapshot::builder_for(&url).build(&engine)?;
+let previous_version = snapshot.version();
+
+let updated = Snapshot::builder_from(snapshot)
+    .skip_new_checkpoints()
+    .build(&engine)?;
+
+if updated.version() > previous_version {
+    let intervening_commits =
+        CommitRange::builder_from(updated.clone(), previous_version + 1).build(&engine)?;
+    // Use intervening_commits to decide whether to rebuild the Transaction.
+}
+# Ok(())
+# }
+```
+
+The update performs one transaction-log listing for commits after the input
+`Snapshot`. `CommitRange::builder_from` reuses the preserved commit-file metadata,
+so it doesn't list the log again. Kernel merges catalog-provided commits into
+the same range and rejects gaps.
+
+Without `skip_new_checkpoints()`, an incremental update may adopt a newer checkpoint and discard
+commit-file metadata covered by it. Skipping new checkpoints keeps that metadata, but increases
+the `Snapshot`'s memory use and may make full scans replay more transaction-log commits.
 
 ## Getting the timestamp of a version
 
@@ -251,8 +292,9 @@ See the `LogHistoryError` variants for the specific failure modes.
 |----------|--------|-----|
 | First read of a table | `Snapshot::builder_for(url)` | You have no existing snapshot to update from. |
 | Time travel to a known version | `Snapshot::builder_for(url).at_version(v)` | You want a specific historical version and have no nearby snapshot. |
-| Polling for new commits | `Snapshot::builder_from(existing)` | Reuses the existing snapshot's state. Kernel reads only new commits. |
+| Polling for new commits | `Snapshot::builder_from(existing)` | Reuses the existing Snapshot and applies only newer table state. |
 | Advancing to a specific newer version | `Snapshot::builder_from(existing).at_version(v)` | Combines incremental update with a target version. |
+| Inspecting commits added during a refresh | `Snapshot::builder_from(existing).skip_new_checkpoints()` | Keeps the complete update range for `CommitRange::builder_from`. |
 
 The key difference is cost. `builder_for` replays the transaction log from the
 most recent checkpoint. `builder_from` replays only the commits after the

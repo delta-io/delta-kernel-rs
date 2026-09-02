@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
@@ -418,6 +418,17 @@ impl ScanBuilder {
             &state_info,
             &self.stats,
         )?;
+
+        let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
+        if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
+            warn!(
+                snapshot_version = self.snapshot.version(),
+                checkpoint_version = ?self.snapshot.log_segment().checkpoint_version,
+                commits_since_checkpoint,
+                "Full scan may replay extra transaction-log commits because the snapshot was \
+                 built with skip_new_checkpoints()"
+            );
+        }
 
         Ok(Scan {
             snapshot: self.snapshot,

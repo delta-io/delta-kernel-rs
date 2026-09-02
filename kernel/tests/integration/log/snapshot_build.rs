@@ -37,11 +37,11 @@ impl TableKind {
     }
 }
 
-fn maybe_attach_max_catalog_version(
-    builder: SnapshotBuilder,
+fn maybe_attach_max_catalog_version<Mode>(
+    builder: SnapshotBuilder<Mode>,
     max_catalog_version: Version,
     kind: TableKind,
-) -> SnapshotBuilder {
+) -> SnapshotBuilder<Mode> {
     match kind {
         TableKind::FileSystem => builder,
         TableKind::CatalogManaged => builder.with_max_catalog_version(max_catalog_version),
