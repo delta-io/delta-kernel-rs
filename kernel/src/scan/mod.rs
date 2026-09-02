@@ -117,23 +117,30 @@ pub struct StatsOptions {
     pub(crate) struct_stats: StructStats,
 }
 
-/// Which struct stats columns appear in `stats_parsed` in scan metadata output.
+/// Controls which structured statistics appear in `stats_parsed`.
+///
+/// Indexed columns are non-partition data columns named by `delta.dataSkippingStatsColumns`, or,
+/// when that property is absent, the first `delta.dataSkippingNumIndexedCols` leaf columns (32 by
+/// default). Extra-indexed columns allow statistics produced outside that declared set, such as
+/// those from a maintenance process, to participate in data skipping.
 #[derive(Clone, Debug)]
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
     /// internal data skipping unless the caller picked [`StatsOptions::none`], which
     /// disables stats reading entirely.
     None,
-    /// Emit all indexed and extra-indexed stats columns.
+    /// Emit all indexed columns and any extra-indexed columns.
     All {
-        /// Columns to include regardless of the table's configured indexed set.
+        /// Columns to include even when they fall outside the indexed set.
         extra_indexed: Vec<ColumnName>,
     },
-    /// Emit requested and extra-indexed stats columns. Predicate columns may also appear.
+    /// Emit requested indexed columns and any extra-indexed columns.
+    ///
+    /// Predicate-referenced columns may also appear.
     Columns {
         /// Indexed columns to emit.
         requested: Vec<ColumnName>,
-        /// Columns to include regardless of the table's configured indexed set.
+        /// Columns to include even when they fall outside the indexed set.
         extra_indexed: Vec<ColumnName>,
     },
 }
