@@ -98,10 +98,8 @@ async fn read_files_impl(
     let files = stream::iter(files).map(move |(url, range)| {
         let store = store.clone();
         async move {
-            // Wasn't checking the scheme before calling to_file_path causing the url path to
-            // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
-            // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
-            // details about why this check is necessary
+            // File URLs need OS path conversion. Other schemes need object-store URL decoding so
+            // already escaped path segments do not get escaped again.
             let path = if url.scheme() == "file" {
                 let file_path = url
                     .to_file_path()
@@ -109,7 +107,7 @@ async fn read_files_impl(
                 Path::from_absolute_path(file_path)
                     .map_err(|e| Error::InvalidTableLocation(format!("Invalid file path: {e}")))?
             } else {
-                Path::from(url.path())
+                Path::from_url_path(url.path())?
             };
             if url.is_presigned() {
                 // have to annotate type here or rustc can't figure it out
@@ -379,6 +377,29 @@ mod tests {
         assert_eq!(data[0], Bytes::from("kernel"));
         assert_eq!(data[1], Bytes::from("data"));
         assert_eq!(data[2], Bytes::from("el-da"));
+    }
+
+    #[tokio::test]
+    async fn read_files_decodes_non_file_url_paths_once() {
+        let store = Arc::new(InMemory::new());
+
+        let data = Bytes::from("kernel-data");
+        store
+            .put(&Path::from("hello, world!"), data.clone().into())
+            .await
+            .unwrap();
+
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let file_url = Url::parse("memory:///hello%2C%20world%21").unwrap();
+
+        let read_back: Vec<Bytes> = storage
+            .read_files(vec![(file_url, None)])
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(read_back, vec![data]);
     }
 
     #[tokio::test]

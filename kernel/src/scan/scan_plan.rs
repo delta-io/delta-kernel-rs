@@ -11,21 +11,20 @@ use url::Url;
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, null_lit, ColumnName, Expression as Expr,
-    ExpressionRef, Predicate,
+    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
+    Predicate,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType, ToSchema as _,
+    StructField, StructType,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
@@ -340,7 +339,6 @@ fn sidecar_actions(
     const FILE_PATH: &str = "path";
     const FILE_SIZE: &str = "size";
     const FILE_MOD: &str = "filemod";
-    const DV: &str = "dv";
     const SIDECAR_SIZE: &str = "sizeInBytes";
     const SIDECAR_FILE_MOD: &str = "modificationTime";
 
@@ -348,7 +346,6 @@ fn sidecar_actions(
         not_null FILE_PATH: STRING,
         not_null FILE_SIZE: LONG,
         not_null FILE_MOD: LONG,
-        nullable DV: (DeletionVectorDescriptor::to_schema()),
         nullable VERSION: LONG,
     };
 
@@ -368,7 +365,6 @@ fn sidecar_actions(
                 col!(SIDECAR_NAME, FILE_PATH),
                 col!(SIDECAR_NAME, SIDECAR_SIZE),
                 col!(SIDECAR_NAME, SIDECAR_FILE_MOD),
-                null_lit(DeletionVectorDescriptor::to_schema()),
                 col!(VERSION),
             ]),
             SIDECAR_FILE_META_SCHEMA.clone(),
@@ -383,7 +379,7 @@ fn sidecar_actions(
         column_name!(FILE_PATH),
         column_name!(FILE_SIZE),
         column_name!(FILE_MOD),
-        column_name!(DV),
+        None,
     )?;
 
     sidecar_files.dynamic_scan(dynamic_scan)
@@ -832,6 +828,10 @@ mod tests {
                 .field(PARTITION_VALUES_PARSED)
                 .is_none(),
             "native parsed partition values are not requested yet"
+        );
+        assert!(
+            dynamic_scan.dv_column.is_none(),
+            "sidecar scan sets no dv column"
         );
         Ok(())
     }
