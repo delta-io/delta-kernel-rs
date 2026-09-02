@@ -1,9 +1,15 @@
 //! Definitions of errors that the delta kernel can encounter
 
+mod delta_error;
+mod delta_error_conditions;
+
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
+
+pub use delta_error::{DeltaError, DeltaErrorParameter};
+pub use delta_error_conditions::DeltaErrorCondition;
 
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
@@ -97,6 +103,10 @@ pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A stable, user-facing Delta failure.
+    #[error(transparent)]
+    Delta(#[from] DeltaError),
+
     /// A failure originating in kernel implementation code.
     #[error(transparent)]
     Kernel(#[from] KernelError),

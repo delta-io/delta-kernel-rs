@@ -69,6 +69,8 @@ jobs:
           cache: false
           toolchain: nightly
           components: rustfmt
+      - name: Verify generated Delta error catalog
+        run: cargo xtask generate-delta-error-conditions --check
       - name: format
         run: cargo +nightly fmt -- --check
       # Separate workspace; the root fmt above does not reach it. See datafusion-executor/Cargo.toml.

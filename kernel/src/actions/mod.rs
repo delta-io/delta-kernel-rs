@@ -1741,6 +1741,7 @@ mod tests {
             let error = match result.unwrap_err() {
                 crate::Error::Kernel(KernelError::Backtraced { source, .. }) => *source,
                 crate::Error::Kernel(error) => error,
+                other => panic!("expected kernel error, got {other:?}"),
             };
             assert!(matches!(error, KernelError::Schema(_)));
         } else {
@@ -1797,6 +1798,7 @@ mod tests {
         let error = match metadata.parse_schema().unwrap_err() {
             crate::Error::Kernel(KernelError::Backtraced { source, .. }) => *source,
             crate::Error::Kernel(error) => error,
+            other => panic!("expected kernel error, got {other:?}"),
         };
         match expected_error {
             "MalformedJson" => {

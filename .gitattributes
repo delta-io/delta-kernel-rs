@@ -1,0 +1,2 @@
+kernel/error_catalog/*.json text eol=lf
+kernel/src/error/delta_error_conditions.rs text eol=lf

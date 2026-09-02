@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/delta-io/delta",
+  "commit": "567800222f70625c617aa00660aae02512d061e1",
+  "path": "spark/src/main/resources/error/delta-error-classes.json",
+  "sha256": "de450614301b3fa62e10f276682410f73236272f4d473d3d2db4f96d7759fbe1"
+}

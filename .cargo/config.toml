@@ -1,4 +1,5 @@
 [alias]
+xtask = "run --locked --package xtask --"
 clippy-no-default-kernel-dependents = [
   "clippy",
   "--locked",

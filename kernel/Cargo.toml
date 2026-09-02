@@ -8,9 +8,13 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 version.workspace = true
-# exclude golden tests + golden test data since they push us over 10MB crate size limit
-# also exlude tests/data since similarly this has large test tables we don't need to ship
-exclude = ["tests/golden_tables.rs", "tests/golden_data/", "tests/data/"]
+# Exclude maintenance-only inputs and large test fixtures that are not needed by crate consumers.
+exclude = [
+  "error_catalog/",
+  "tests/golden_tables.rs",
+  "tests/golden_data/",
+  "tests/data/",
+]
 rust-version.workspace = true
 
 [package.metadata.docs.rs]
