@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{ADD_FIELD, ADD_NAME, ADD_SCHEMA_NO_JSON_STATS, REMOVE_FIELD};
+use crate::actions::{ADD_FIELD, ADD_NAME, ADD_SCHEMA_NO_JSON_STATS, NULL_COUNT, REMOVE_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
@@ -42,7 +42,8 @@ use crate::schema::{
     lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
     StructField, StructType, ToSchema as _,
 };
-use crate::table_features::{ColumnMappingMode, Operation};
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -90,22 +91,21 @@ pub use crate::parallel::parallel_scan_metadata::{
     AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
 };
 
-/// Configures the file statistics returned in scan metadata.
-///
-/// This controls connector-visible output independently of kernel's internal data skipping. When
-/// a predicate is present, kernel may still read the statistics needed to prune files and removes
-/// any internal-only columns before returning scan metadata.
+/// Configures structured-stats and JSON output in scan metadata.
+/// Output is independent of data skipping: predicates may use internal statistics that are removed
+/// from the returned metadata.
 ///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
 /// - [`Self::all_struct`] -- all struct stats without JSON output.
 /// - [`Self::struct_columns`] -- selected struct stats without JSON output.
 /// - [`Self::all`] -- both representations.
-/// - [`Self::none`] -- neither representation.
+/// - [`Self::none`] -- neither representation; predicate-based data skipping remains enabled.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
-    /// Whether to emit JSON stats. When a checkpoint stores only structured stats, kernel
-    /// serializes them to JSON so the output remains populated.
+    /// Whether to surface JSON stats. When a checkpoint writes stats only as a struct, kernel
+    /// re-serializes them to JSON so engines that read JSON stats see a populated value.
+    /// When false, existing and synthesized JSON stats are omitted from scan metadata.
     pub(crate) emit_json: bool,
 
     /// Which struct stats columns to request in `stats_parsed`.
@@ -115,7 +115,7 @@ pub struct StatsOptions {
 /// Which struct stats columns appear in `stats_parsed` in scan metadata output.
 #[derive(Clone, Debug)]
 pub enum StructStats {
-    /// Don't emit `stats_parsed`. Kernel may still read predicate-referenced statistics for data
+    /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for internal data
     /// skipping.
     None,
     /// Emit all indexed stats columns.
@@ -140,7 +140,8 @@ impl StatsOptions {
         Self::default()
     }
 
-    /// All struct stats without JSON output. Compatible checkpoints avoid per-batch `ToJson`.
+    /// All struct stats without JSON output. Compatible checkpoints avoid per-batch `ToJson`;
+    /// commits and checkpoints without compatible structured stats are parsed from JSON.
     pub fn all_struct() -> Self {
         Self {
             emit_json: false,
@@ -148,14 +149,10 @@ impl StatsOptions {
         }
     }
 
-    /// Struct stats projected to the specified columns without JSON output.
-    ///
-    /// An empty `cols` is normalized to [`Self::none`]. This changes only connector-visible
-    /// statistics; kernel still reads predicate-referenced statistics for data skipping.
+    /// Struct stats for the specified columns without JSON output. Predicate-referenced columns
+    /// may still be read internally for data skipping but are removed from scan metadata.
+    /// An empty `cols` is equivalent to [`Self::none`].
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
-        if cols.is_empty() {
-            return Self::none();
-        }
         Self {
             emit_json: false,
             struct_stats: StructStats::Columns(cols),
@@ -281,9 +278,7 @@ impl ScanBuilder {
     /// [`StructType::add_metadata_column`] (row indexes, row ids, file paths) are not supported
     /// and will error at build time.
     ///
-    /// A predicate enables internal data skipping. Statistics output remains controlled by
-    /// [`StatsOptions`], whose default emits JSON stats. Use [`with_stats`](Self::with_stats) to
-    /// request structured stats or suppress statistics output.
+    /// A predicate enables internal data skipping independently of requested statistics output.
     ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
@@ -406,10 +401,17 @@ impl ScanBuilder {
         // per-row partition-value parse done only to build them.
         state_info.skip_row_transforms = self.without_row_transforms;
 
+        let physical_stats_output_schema = build_physical_stats_output_schema(
+            self.snapshot.table_configuration(),
+            &state_info,
+            &self.stats,
+        )?;
+
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
+            physical_stats_output_schema,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
             cancellation_token: self.cancellation_token,
@@ -664,11 +666,53 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
+    physical_stats_output_schema: Option<SchemaRef>,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
     /// Optional cooperative cancellation token supplied via
     /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+}
+
+/// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
+///
+/// For example, if the caller requests `[a, b]` and the predicate references `c`,
+/// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
+/// Returns `None` when no eligible struct stats are requested and errors when a requested column
+/// cannot be resolved.
+fn build_physical_stats_output_schema(
+    table_configuration: &TableConfiguration,
+    state_info: &StateInfo,
+    stats: &StatsOptions,
+) -> DeltaResult<Option<SchemaRef>> {
+    match &stats.struct_stats {
+        StructStats::None => Ok(None),
+        StructStats::All => Ok(state_info.physical_stats_schema.clone()),
+        StructStats::Columns(columns) if columns.is_empty() => Ok(None),
+        StructStats::Columns(columns) => {
+            let logical_schema = table_configuration.logical_schema();
+            let column_mapping_mode = table_configuration.column_mapping_mode();
+            let physical_columns: Vec<_> = columns
+                .iter()
+                .map(|column| {
+                    get_any_level_column_physical_name(&logical_schema, column, column_mapping_mode)
+                })
+                .try_collect()?;
+            let stats_schema = table_configuration
+                .build_expected_stats_schemas(None, Some(&physical_columns))?
+                .physical;
+
+            Ok(stats_schema_with_data_columns(stats_schema))
+        }
+    }
+}
+
+/// Returns `schema` only when it contains stats for at least one data column.
+///
+/// Expected stats schemas always contain `numRecords` and `tightBounds`. `nullCount` is present
+/// only when at least one data column survives stats filtering.
+fn stats_schema_with_data_columns(schema: SchemaRef) -> Option<SchemaRef> {
+    schema.field(NULL_COUNT).is_some().then_some(schema)
 }
 
 impl std::fmt::Debug for Scan {
@@ -683,14 +727,31 @@ impl std::fmt::Debug for Scan {
 }
 
 impl Scan {
-    /// Whether the checkpoint action stream must carry statistics for output or pruning.
-    #[cfg(feature = "declarative-plans")]
-    fn reads_stats(&self) -> bool {
-        self.state_info.reads_stats(self.stats.emit_json)
+    /// Whether the action stream can omit statistics needed by neither output nor pruning.
+    fn skip_stats(&self) -> bool {
+        !self.stats.emit_json && self.state_info.physical_stats_schema.is_none()
     }
 
     fn commit_read_schema(&self) -> SchemaRef {
-        self.state_info.commit_read_schema(self.stats.emit_json)
+        if self.skip_stats() {
+            COMMIT_READ_SCHEMA_NO_JSON_STATS.clone()
+        } else {
+            COMMIT_READ_SCHEMA.clone()
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn stats_schema_for_transform(&self) -> Option<&SchemaRef> {
+        if self.physical_stats_output_schema.is_some()
+            || matches!(
+                &self.state_info.physical_predicate,
+                PhysicalPredicate::Some(_, _)
+            )
+        {
+            self.state_info.physical_stats_schema.as_ref()
+        } else {
+            None
+        }
     }
 
     fn checkpoint_read_options(&self) -> (SchemaRef, Option<PredicateRef>, Option<&StructType>) {
@@ -712,6 +773,7 @@ impl Scan {
     fn replay_options(&self) -> log_replay::ScanStatsOptions {
         log_replay::ScanStatsOptions {
             emit_json: self.stats.emit_json,
+            output_schema: self.physical_stats_output_schema.clone(),
         }
     }
 
@@ -1181,13 +1243,18 @@ impl Scan {
         } else {
             CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
         };
-        let checkpoint_info = self.snapshot.log_segment().checkpoint_read_info(
-            engine.as_ref(),
-            checkpoint_read_schema,
-            self.state_info.physical_stats_schema.as_deref(),
-            self.state_info.physical_partition_schema.as_deref(),
-            None,
-        )?;
+        let checkpoint_info = self
+            .snapshot
+            .log_segment()
+            .create_checkpoint_stream(
+                engine.as_ref(),
+                checkpoint_read_schema,
+                None,
+                self.state_info.physical_stats_schema.as_deref(),
+                self.state_info.physical_partition_schema.as_deref(),
+                None,
+            )?
+            .checkpoint_info;
         let checkpoint_read_schema = checkpoint_info.checkpoint_read_schema.clone();
         let processor = ScanLogReplayProcessor::new(
             engine.as_ref(),

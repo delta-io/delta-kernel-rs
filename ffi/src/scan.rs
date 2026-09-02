@@ -51,11 +51,11 @@ pub struct ExclusiveScanBuilder;
 pub enum FfiStatsOptions {
     /// Emit JSON stats only.
     JsonOnly,
-    /// Emit all indexed struct stats without synthesizing JSON stats.
+    /// Emit all indexed struct stats without JSON stats.
     AllStruct,
     /// Emit both JSON stats and all indexed struct stats.
     All,
-    /// Emit no stats and disable kernel data skipping.
+    /// Emit no stats. Kernel still uses predicate-referenced stats for data skipping.
     None,
     // TODO: Expose StructColumns variant (matching `StatsOptions::struct_columns`)
 }

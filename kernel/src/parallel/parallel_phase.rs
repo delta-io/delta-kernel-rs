@@ -130,7 +130,6 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::arrow::array::{Array, Int64Array, StringArray, StructArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{col, lit};
@@ -150,7 +149,7 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::scan::{ScanBuilder, StatsOptions};
-    use crate::schema::{schema_ref, DataType, StructField, StructType};
+    use crate::schema::{schema_ref, StructField, StructType};
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
@@ -1061,19 +1060,15 @@ mod tests {
         match sequential.finish()? {
             AfterSequentialScanMetadata::Done => {}
             AfterSequentialScanMetadata::Parallel { state, files } => {
+                let state = Arc::new(ParallelState::from_bytes(
+                    engine.as_ref(),
+                    &state.into_bytes()?,
+                )?);
                 let read_schema = state.file_read_schema();
-                let DataType::Struct(add) = read_schema
-                    .field("add")
-                    .expect("checkpoint read schema must contain add")
-                    .data_type()
-                else {
-                    panic!("checkpoint add field must be a struct");
-                };
-                assert!(add.field("stats").is_none());
-                assert!(add.field("stats_parsed").is_none());
+                assert!(!read_schema.contains_col(["add", "stats"]));
+                assert!(!read_schema.contains_col(["add", "stats_parsed"]));
 
-                let mut parallel =
-                    ParallelScanMetadata::try_new(engine.clone(), Arc::from(state), files)?;
+                let mut parallel = ParallelScanMetadata::try_new(engine.clone(), state, files)?;
 
                 let parallel_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
                     metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
@@ -1100,71 +1095,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_struct_stats_output_survives_serde() -> DeltaResult<()> {
+    fn test_parallel_struct_stats_and_predicate_survive_serde() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) =
             load_test_table("v2-parquet-sidecars-struct-stats-only")?;
         let scan = snapshot
             .scan_builder()
             .with_stats(StatsOptions::all_struct())
-            .build()?;
-        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
-        for result in sequential.by_ref() {
-            result?;
-        }
-        let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? else {
-            panic!("expected a parallel checkpoint phase");
-        };
-
-        let state = Arc::new(ParallelState::from_bytes(
-            engine.as_ref(),
-            &state.into_bytes()?,
-        )?);
-        let parallel = ParallelScanMetadata::try_new(engine, state, files)?;
-        let mut selected_files = 0;
-        for result in parallel {
-            let metadata = result?;
-            let (data, selection) = metadata.scan_files.into_parts();
-            let data = ArrowEngineData::try_from_engine_data(data)?;
-            let batch = data.record_batch();
-            let stats_parsed = batch
-                .column_by_name("stats_parsed")
-                .expect("structured stats output")
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .expect("stats_parsed struct");
-            let stats = batch
-                .column_by_name("stats")
-                .expect("JSON stats placeholder")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("stats string");
-            let num_records = stats_parsed
-                .column_by_name("numRecords")
-                .expect("numRecords output")
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("numRecords long");
-            for (row, selected) in selection.into_iter().enumerate() {
-                if selected {
-                    assert!(stats_parsed.is_valid(row));
-                    assert!(!num_records.is_null(row));
-                    assert!(stats.is_null(row));
-                    selected_files += 1;
-                }
-            }
-        }
-        assert!(selected_files > 0);
-        Ok(())
-    }
-
-    #[test]
-    fn test_parallel_none_uses_structured_stats_for_skipping_after_serde() -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) =
-            load_test_table("v2-parquet-sidecars-struct-stats-only")?;
-        let scan = snapshot
-            .scan_builder()
             .with_predicate(Arc::new(col!("id").gt(lit(3i64))))
-            .with_stats(StatsOptions::none())
             .build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
         for result in sequential.by_ref() {
@@ -1173,7 +1110,6 @@ mod tests {
         let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? else {
             panic!("expected a parallel checkpoint phase");
         };
-
         let state = Arc::new(ParallelState::from_bytes(
             engine.as_ref(),
             &state.into_bytes()?,
@@ -1184,7 +1120,7 @@ mod tests {
             let metadata = result?;
             let (data, selection) = metadata.scan_files.into_parts();
             let data = ArrowEngineData::try_from_engine_data(data)?;
-            assert!(data.record_batch().column_by_name("stats_parsed").is_none());
+            assert!(data.record_batch().column_by_name("stats_parsed").is_some());
             selected_files += selection.into_iter().filter(|selected| *selected).count();
         }
         assert_eq!(selected_files, 2);

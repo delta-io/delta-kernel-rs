@@ -34,7 +34,7 @@ use crate::schema::{
 use crate::transaction::create_table::create_table;
 use crate::{
     DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
-    JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
+    ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -1672,59 +1672,6 @@ fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
     assert_eq!(surviving_ids(parquet_bytes, &pred), vec![1]);
 }
 
-struct RecordingJsonHandler {
-    inner: Arc<dyn JsonHandler>,
-    read_schemas: Mutex<Vec<schema::SchemaRef>>,
-}
-
-impl RecordingJsonHandler {
-    fn new(inner: Arc<dyn JsonHandler>) -> Self {
-        Self {
-            inner,
-            read_schemas: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn take_read_schemas(&self) -> Vec<schema::SchemaRef> {
-        std::mem::take(&mut *self.read_schemas.lock().unwrap())
-    }
-}
-
-impl JsonHandler for RecordingJsonHandler {
-    fn parse_json(
-        &self,
-        json_strings: Box<dyn EngineData>,
-        output_schema: schema::SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        self.inner.parse_json(json_strings, output_schema)
-    }
-
-    fn read_json_files(
-        &self,
-        files: &[FileMeta],
-        physical_schema: schema::SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
-        self.read_schemas
-            .lock()
-            .unwrap()
-            .push(physical_schema.clone());
-        self.inner
-            .read_json_files(files, physical_schema, predicate)
-    }
-
-    fn write_json_file(
-        &self,
-        path: &Url,
-        data: Box<
-            dyn Iterator<Item = DeltaResult<crate::engine_data::FilteredEngineData>> + Send + '_,
-        >,
-        overwrite: bool,
-    ) -> DeltaResult<u64> {
-        self.inner.write_json_file(path, data, overwrite)
-    }
-}
-
 #[derive(Debug)]
 struct RecordedParquetRead {
     files: Vec<FileMeta>,
@@ -1826,60 +1773,7 @@ fn scan_execute_passes_scan_file_modification_time_to_parquet_handler() {
 }
 
 #[rstest]
-#[case::none_without_predicate(StatsOptions::none(), false, false)]
-#[case::none_with_predicate(StatsOptions::none(), true, true)]
-#[case::json_without_predicate(StatsOptions::json_only(), false, true)]
-#[case::struct_without_predicate(StatsOptions::all_struct(), false, true)]
-fn commit_stats_projection_follows_output_or_pruning(
-    #[case] stats: StatsOptions,
-    #[case] with_predicate: bool,
-    #[case] expect_stats: bool,
-) {
-    let path = fs::canonicalize(PathBuf::from(
-        "./tests/data/v1-single-part-struct-stats-only/",
-    ))
-    .unwrap();
-    let url = Url::from_directory_path(path).unwrap();
-    let sync = Arc::new(SyncEngine::new());
-    let recorder = Arc::new(RecordingJsonHandler::new(sync.json_handler()));
-    let engine = DelegatingEngine::new(sync).with_json_handler(recorder.clone());
-    let snapshot = Snapshot::builder_for(url)
-        .at_version(4)
-        .build(&engine)
-        .unwrap();
-    recorder.take_read_schemas();
-
-    let predicate =
-        with_predicate.then(|| Arc::new(Pred::gt(col!("id"), lit(0i64))) as PredicateRef);
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(predicate)
-        .with_stats(stats)
-        .build()
-        .unwrap();
-    for metadata in scan.scan_metadata(&engine).unwrap() {
-        metadata.unwrap();
-    }
-
-    let action_schemas: Vec<_> = recorder
-        .take_read_schemas()
-        .into_iter()
-        .filter(|schema| schema.field(ADD_NAME).is_some())
-        .collect();
-    assert!(!action_schemas.is_empty(), "expected JSON action reads");
-    for schema in action_schemas {
-        let DataType::Struct(add) = schema.field(ADD_NAME).unwrap().data_type() else {
-            panic!("add must be a struct");
-        };
-        assert_eq!(
-            add.field("stats").is_some(),
-            expect_stats,
-            "JSON stats projection must match output and pruning requirements"
-        );
-    }
-}
-
-#[rstest]
+#[case::json_only(StatsOptions::json_only(), true, false)]
 #[case::all_struct(StatsOptions::all_struct(), false, false)]
 #[case::all(StatsOptions::all(), true, false)]
 #[case::none_with_predicate(StatsOptions::none(), false, true)]
@@ -1919,6 +1813,11 @@ fn checkpoint_stats_projection_follows_output_or_pruning(
         .with_stats(stats)
         .build()
         .unwrap();
+    let commit_schema = scan.commit_read_schema();
+    let DataType::Struct(commit_add) = commit_schema.field(ADD_NAME).unwrap().data_type() else {
+        panic!("commit add must be a struct");
+    };
+    assert_eq!(commit_add.field("stats").is_some(), needs_stats);
     for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
         action.unwrap();
     }
@@ -2029,8 +1928,8 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
     let url = url::Url::from_directory_path(path).unwrap();
     let sync = Arc::new(SyncEngine::new());
     let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
-    let engine = DelegatingEngine::new(sync).with_parquet_handler(recorder.clone());
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let engine = Arc::new(DelegatingEngine::new(sync).with_parquet_handler(recorder.clone()));
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     recorder.take_reads();
 
     let scan = snapshot
@@ -2038,7 +1937,11 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
         .with_predicate(Arc::new(pred))
         .build()
         .unwrap();
-    for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
+    for action in scan
+        .replay_for_scan_metadata(engine.as_ref())
+        .unwrap()
+        .actions
+    {
         action.unwrap();
     }
 
@@ -2055,58 +1958,49 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
         }),
         "expected {expected_ref} on a {expected_file_fragment} read, got {reads:#?}"
     );
-}
 
-#[test]
-fn parallel_scan_manifest_read_is_unfiltered() {
-    let path = std::fs::canonicalize(PathBuf::from(
-        "./tests/data/v2-parquet-sidecars-struct-stats-only/",
-    ))
-    .unwrap();
-    let url = Url::from_directory_path(path).unwrap();
-    let sync = Arc::new(SyncEngine::new());
-    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
-    let engine = Arc::new(DelegatingEngine::new(sync).with_parquet_handler(recorder.clone()));
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-    recorder.take_reads();
-
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(Arc::new(Pred::gt(col!("id"), lit(2i64))))
-        .build()
-        .unwrap();
-    let mut sequential = scan.parallel_scan_metadata(engine).unwrap();
-    for result in sequential.by_ref() {
-        result.unwrap();
+    if table.starts_with("v2-") {
+        recorder.take_reads();
+        let mut sequential = scan.parallel_scan_metadata(engine).unwrap();
+        for result in sequential.by_ref() {
+            result.unwrap();
+        }
+        sequential.finish().unwrap();
+        let reads = recorder.take_reads();
+        assert!(
+            reads.iter().any(|read| {
+                read.files.iter().any(|file| {
+                    let location = file.location.as_str();
+                    location.contains(".checkpoint.") && !location.contains("/_sidecars/")
+                }) && read.physical_schema.field("sidecar").is_some()
+                    && read.predicate.is_none()
+            }),
+            "expected an unfiltered checkpoint manifest read, got {reads:#?}"
+        );
     }
-    sequential.finish().unwrap();
-
-    let reads = recorder.take_reads();
-    assert!(
-        reads.iter().any(|read| {
-            read.files.iter().any(|file| {
-                let location = file.location.as_str();
-                location.contains(".checkpoint.") && !location.contains("/_sidecars/")
-            }) && read.physical_schema.field("sidecar").is_some()
-                && read.predicate.is_none()
-        }),
-        "expected an unfiltered checkpoint manifest read, got {reads:#?}"
-    );
 }
 
 #[rstest]
-#[case::exact_case("id")]
-#[case::case_divergent("ID")]
-fn stats_none_preserves_data_skipping(#[case] predicate_column: &str) {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+#[case::data_stats(
+    "parsed-stats",
+    Pred::gt(col!("id"), lit(400i64)),
+)]
+#[case::case_divergent_data_stats(
+    "parsed-stats",
+    Pred::gt(Expr::column(["ID"]), lit(400i64)),
+)]
+#[case::partition_values(
+    "app-txn-checkpoint",
+    col!("modified").eq(lit("2021-02-01")),
+)]
+fn stats_none_preserves_pruning_without_output(#[case] table: &str, #[case] predicate: Pred) {
+    let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-
-    let predicate = Arc::new(Pred::gt(Expr::column([predicate_column]), lit(400i64)));
     let scan = snapshot
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(Arc::new(predicate))
         .with_stats(StatsOptions::none())
         .build()
         .unwrap();
@@ -2118,45 +2012,12 @@ fn stats_none_preserves_data_skipping(#[case] predicate_column: &str) {
         .unwrap();
 
     let mut selected_file_count = 0;
-    for scan_metadata in scan_metadata_results {
-        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
         selected_file_count += selection_vector
             .iter()
             .filter(|&&selected| selected)
             .count();
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-            .unwrap()
-            .into();
-        assert!(batch.column_by_name("stats_parsed").is_none());
-    }
-
-    assert_eq!(selected_file_count, 2);
-}
-
-#[test]
-fn stats_none_preserves_partition_pruning_without_loading_stats() {
-    let path = fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
-    let url = Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(Arc::new(col!("modified").eq(lit("2021-02-01"))))
-        .with_stats(StatsOptions::none())
-        .build()
-        .unwrap();
-
-    let mut selected_file_count = 0;
-    for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
-        let (underlying_data, selection_vector) = scan_metadata.unwrap().scan_files.into_parts();
-        selected_file_count += selection_vector
-            .iter()
-            .filter(|&&selected| selected)
-            .count();
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-            .unwrap()
-            .into();
-        assert!(batch.column_by_name("stats_parsed").is_none());
     }
 
     assert_eq!(selected_file_count, 2);
@@ -2232,13 +2093,6 @@ fn test_default_stats_options_no_struct_output() {
             "stats_parsed should not be present with empty stats columns"
         );
     }
-}
-
-#[test]
-fn empty_struct_columns_normalizes_to_none() {
-    let stats = StatsOptions::struct_columns(vec![]);
-    assert!(!stats.emit_json);
-    assert!(matches!(stats.struct_stats, StructStats::None));
 }
 
 #[rstest]

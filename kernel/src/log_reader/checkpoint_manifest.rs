@@ -6,10 +6,10 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{REMOVE_FIELD, SIDECAR_FIELD};
+use crate::actions::{ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::schema::{StructField, StructType};
+use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
 
@@ -36,19 +36,18 @@ impl CheckpointManifestReader {
     /// - `manifest_file`: The checkpoint manifest file to process
     /// - `log_root`: Root URL for resolving sidecar paths
     /// - `engine`: Engine for reading files
-    /// - `add_projection`: Projected Add field required by scan replay
+    /// - `checkpoint_read_schema`: Projected checkpoint schema required by scan replay
     #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         manifest: &ParsedLogPath,
         log_root: Url,
-        add_projection: StructField,
+        checkpoint_read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
-        let manifest_read_schema = Arc::new(StructType::try_new([
-            add_projection,
-            (*REMOVE_FIELD).clone(),
-            (*SIDECAR_FIELD).clone(),
-        ])?);
+        let manifest_read_schema = checkpoint_read_schema
+            .project_as_struct(&[ADD_NAME])?
+            .add([(*REMOVE_FIELD).clone(), (*SIDECAR_FIELD).clone()])?;
+        let manifest_read_schema = Arc::new(manifest_read_schema);
 
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
@@ -144,7 +143,7 @@ mod tests {
             engine.clone(),
             checkpoint_file,
             log_root,
-            (*crate::actions::ADD_FIELD).clone(),
+            crate::scan::CHECKPOINT_READ_SCHEMA.clone(),
         )?;
 
         // Extract add file paths and verify expectations
@@ -226,7 +225,7 @@ mod tests {
             engine.clone(),
             &snapshot.log_segment().listed.checkpoint_parts[0],
             snapshot.log_segment().log_root.clone(),
-            (*crate::actions::ADD_FIELD).clone(),
+            crate::scan::CHECKPOINT_READ_SCHEMA.clone(),
         )?;
 
         let result = manifest_phase.extract_sidecars();

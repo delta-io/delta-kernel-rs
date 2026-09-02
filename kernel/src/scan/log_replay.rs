@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, ScanMetadata};
+use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
@@ -31,17 +31,20 @@ use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
-/// Controls connector-visible statistics during log replay.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+/// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ScanStatsOptions {
-    /// Emit the `stats` JSON value, synthesizing it from `stats_parsed` when necessary.
-    #[serde(alias = "synthesize_json")]
     pub(crate) emit_json: bool,
+    #[serde(default)]
+    pub(crate) output_schema: Option<SchemaRef>,
 }
 
 impl Default for ScanStatsOptions {
     fn default() -> Self {
-        Self { emit_json: true }
+        Self {
+            emit_json: true,
+            output_schema: None,
+        }
     }
 }
 
@@ -65,9 +68,6 @@ struct InternalScanState {
     column_mapping_mode: ColumnMappingMode,
     /// Physical stats schema for reading/parsing stats from checkpoint files
     physical_stats_schema: Option<SchemaRef>,
-    /// Exact stats schema requested in scan metadata output.
-    #[serde(default)]
-    output_stats_schema: Option<SchemaRef>,
     #[serde(default)]
     stats_options: ScanStatsOptions,
     #[serde(default)]
@@ -155,7 +155,6 @@ pub struct ScanLogReplayProcessor {
     /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
     /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
-    /// Projection from the internal pruning schema to connector-visible scan metadata.
     output_transform: Option<Arc<dyn ExpressionEvaluator>>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
@@ -219,7 +218,7 @@ impl ScanLogReplayProcessor {
     /// - `state_info`: StateInfo containing schemas, transforms, and predicates
     /// - `checkpoint_info`: Information about checkpoint reading for stats optimization
     /// - `seen_file_keys`: Pre-computed set of file action keys that have been seen
-    /// - `stats_options`: Read-time output options (see [`ScanStatsOptions`])
+    /// - `stats_options`: Read-time stats options (see [`ScanStatsOptions`])
     /// - `partition_values_options`: Read-time partition value options (see
     ///   [`ScanPartitionValuesOptions`])
     pub(crate) fn new_with_seen_files(
@@ -235,7 +234,7 @@ impl ScanLogReplayProcessor {
             has_partition_values_parsed,
             checkpoint_read_schema,
         } = checkpoint_info.clone();
-        let ScanStatsOptions { emit_json } = stats_options;
+        let emit_json = stats_options.emit_json;
 
         // Create metrics first so we can pass them to DataSkippingFilter
         let metrics = Arc::new(ScanMetrics::default());
@@ -247,24 +246,33 @@ impl ScanLogReplayProcessor {
             _ => None,
         };
 
-        let stats_schema_for_transform = state_info.stats_schema_for_transform().cloned();
+        let stats_schema_for_transform =
+            if stats_options.output_schema.is_some() || physical_predicate.is_some() {
+                state_info.physical_stats_schema.clone()
+            } else {
+                None
+            };
         let partition_schema_for_transform = state_info.physical_partition_schema.clone();
-        let commit_read_schema = state_info.commit_read_schema(emit_json);
+        let commit_read_schema = if emit_json || state_info.physical_stats_schema.is_some() {
+            COMMIT_READ_SCHEMA.clone()
+        } else {
+            super::COMMIT_READ_SCHEMA_NO_JSON_STATS.clone()
+        };
 
-        let internal_schema = scan_row_schema_with_parsed_columns(
+        let output_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
             partition_schema_for_transform.clone(),
         )?;
         let (projected_schema, output_projection) = build_scan_output_projection(
-            internal_schema.as_ref(),
-            state_info.output_stats_schema.as_deref(),
+            output_schema.as_ref(),
+            stats_options.output_schema.as_deref(),
             partition_values_options.parsed_struct,
         )?;
-        let output_transform = if projected_schema == internal_schema {
+        let output_transform = if projected_schema == output_schema {
             None
         } else {
             Some(engine.evaluation_handler().new_expression_evaluator(
-                internal_schema.clone(),
+                output_schema.clone(),
                 output_projection,
                 projected_schema.into(),
             )?)
@@ -284,10 +292,10 @@ impl ScanLogReplayProcessor {
             column_expr_ref!("stats_parsed"),
             partition_schema_for_transform.as_ref(),
             column_expr_ref!("partitionValues_parsed"),
-            // The transform flattens `add.*` to top-level columns, so `path` is non-null exactly
-            // for Add rows.
+            // The transform flattens `add.*` to top-level columns, so `path` is non-null
+            // exactly for Add rows.
             Arc::new(Predicate::is_not_null(col!("path")).into()),
-            internal_schema.clone(),
+            output_schema.clone(),
             &state_info.physical_stats_columns,
             Some(metrics.clone()),
         );
@@ -304,7 +312,7 @@ impl ScanLogReplayProcessor {
                     partition_schema_for_transform.clone(),
                     false,
                 ),
-                internal_schema.clone().into(),
+                output_schema.clone().into(),
             )?,
             // Checkpoint transform: read pre-parsed columns directly when available
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
@@ -316,7 +324,7 @@ impl ScanLogReplayProcessor {
                     partition_schema_for_transform,
                     has_partition_values_parsed,
                 ),
-                internal_schema.clone().into(),
+                output_schema.into(),
             )?,
             output_transform,
             seen_file_keys,
@@ -339,13 +347,6 @@ impl ScanLogReplayProcessor {
 
     pub(crate) fn is_catalog_managed(&self) -> bool {
         self.state_info.is_catalog_managed
-    }
-
-    fn project_output(&self, data: Box<dyn EngineData>) -> DeltaResult<Box<dyn EngineData>> {
-        let Some(transform) = &self.output_transform else {
-            return Ok(data);
-        };
-        transform.evaluate(data.as_ref())
     }
 
     /// Serialize the processor state for distributed processing.
@@ -371,7 +372,6 @@ impl ScanLogReplayProcessor {
             transform_spec,
             column_mapping_mode,
             physical_stats_schema,
-            output_stats_schema,
             physical_partition_schema,
             physical_stats_columns,
             is_catalog_managed,
@@ -392,7 +392,6 @@ impl ScanLogReplayProcessor {
             predicate_schema,
             column_mapping_mode,
             physical_stats_schema,
-            output_stats_schema,
             stats_options: self.stats_options,
             partition_values_options: self.partition_values_options,
             physical_partition_schema,
@@ -454,7 +453,6 @@ impl ScanLogReplayProcessor {
             transform_spec: internal_state.transform_spec,
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
-            output_stats_schema: internal_state.output_stats_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
             physical_stats_columns: internal_state.physical_stats_columns,
             is_catalog_managed: internal_state.is_catalog_managed,
@@ -500,6 +498,10 @@ impl ScanLogReplayProcessor {
                 actions.len()
             ))
         );
+        let transformed = match &self.output_transform {
+            Some(transform) => transform.evaluate(transformed.as_ref())?,
+            None => transformed,
+        };
         Ok((transformed, selection_vector))
     }
 
@@ -826,8 +828,8 @@ fn build_scan_output_projection(
 /// Build the add transform expression with optional stats and partition value parsing.
 ///
 /// # Parameters
-/// - `physical_stats_schema`: Physical-column schema for parsing statistics used by pruning or
-///   connector output, or `None` when neither needs structured statistics.
+/// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
+///   names), or None if parsed stats are not needed for pruning or output.
 /// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true and
 ///   `emit_json` is true, stats output uses `COALESCE(add.stats, ToJson(add.stats_parsed))` so that
 ///   `ScanFile.stats` is populated even when the checkpoint lacks JSON stats
@@ -877,7 +879,6 @@ fn get_add_transform_expr(
         ])),
     ];
 
-    // Add stats_parsed for structured output or internal data skipping.
     if let Some(stats_schema) = physical_stats_schema {
         let stats_parsed_expr = if has_stats_parsed {
             // Checkpoint has stats_parsed column - read directly
@@ -1012,8 +1013,8 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
-        let output = self.project_output(transformed_actions)?;
-        let scan_metadata = ScanMetadata::try_new(output, final_selection, row_transform_exprs)?;
+        let scan_metadata =
+            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1111,8 +1112,8 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
-        let output = self.project_output(transformed_actions)?;
-        let scan_metadata = ScanMetadata::try_new(output, final_selection, row_transform_exprs)?;
+        let scan_metadata =
+            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1132,9 +1133,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// Each row that is selected in the returned `engine_data` _must_ be processed to complete the
 /// scan. Non-selected rows _must_ be ignored.
 ///
-/// Statistics used only for pruning are removed before scan metadata is returned.
-/// Connector-visible statistics are controlled independently by the scan's
-/// [`StatsOptions`](super::StatsOptions).
+/// Statistics used only for pruning are removed from connector-visible scan metadata.
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
@@ -1168,8 +1167,7 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        build_scan_output_projection, get_add_transform_expr, scan_action_iter,
-        scan_row_schema_with_parsed_columns, InternalScanState, ScanLogReplayProcessor,
+        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
         ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
     use crate::actions::get_commit_schema;
@@ -1293,7 +1291,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            output_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
@@ -1621,7 +1618,6 @@ mod tests {
                 transform_spec: None,
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
-                output_stats_schema: None,
                 physical_partition_schema: None,
                 physical_stats_columns: HashSet::new(),
                 is_catalog_managed: false,
@@ -1658,7 +1654,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            output_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
@@ -1691,7 +1686,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            output_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: true,
@@ -1724,7 +1718,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            output_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
@@ -1773,7 +1766,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            output_stats_schema: None,
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
@@ -1806,7 +1798,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            output_stats_schema: None,
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
@@ -1821,34 +1812,6 @@ mod tests {
 
         let res: Result<InternalScanState, _> = serde_json::from_str(&invalid_blob);
         assert_result_error_with_message(res, "unknown field");
-    }
-
-    #[test]
-    fn deserialize_legacy_stats_options() {
-        let options: ScanStatsOptions =
-            serde_json::from_value(serde_json::json!({ "synthesize_json": false })).unwrap();
-        assert!(!options.emit_json);
-
-        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
-        let state = InternalScanState {
-            logical_schema: schema.clone(),
-            physical_schema: schema,
-            predicate_schema: None,
-            transform_spec: None,
-            column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_schema: None,
-            output_stats_schema: None,
-            stats_options: ScanStatsOptions { emit_json: false },
-            partition_values_options: ScanPartitionValuesOptions::default(),
-            physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
-            is_catalog_managed: false,
-            skip_row_transforms: false,
-        };
-        let mut value = serde_json::to_value(state).unwrap();
-        value.as_object_mut().unwrap().remove("stats_options");
-        let state: InternalScanState = serde_json::from_value(value).unwrap();
-        assert!(state.stats_options.emit_json);
     }
 
     #[test]
@@ -1905,7 +1868,10 @@ mod tests {
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
             test_checkpoint_info(),
-            ScanStatsOptions { emit_json: false },
+            ScanStatsOptions {
+                emit_json: false,
+                ..Default::default()
+            },
             ScanPartitionValuesOptions::default(),
         )
         .unwrap();
@@ -1921,45 +1887,6 @@ mod tests {
             found_add = true;
         }
         assert!(found_add);
-    }
-
-    #[test]
-    fn output_projection_recurses_into_nested_stats() {
-        let internal_stats = schema_ref! {
-            nullable "minValues": {
-                nullable "nested": {
-                    nullable "kept": LONG,
-                    nullable "dropped": LONG,
-                },
-            },
-        };
-        let requested_stats = schema_ref! {
-            nullable "minValues": {
-                nullable "nested": {
-                    nullable "kept": LONG,
-                },
-            },
-        };
-        let internal = scan_row_schema_with_parsed_columns(Some(internal_stats), None).unwrap();
-        let (projected, _) =
-            build_scan_output_projection(&internal, Some(&requested_stats), false).unwrap();
-
-        let DataType::Struct(stats) = projected.field("stats_parsed").unwrap().data_type() else {
-            panic!("stats_parsed must be a struct");
-        };
-        let DataType::Struct(min_values) = stats.field("minValues").unwrap().data_type() else {
-            panic!("minValues must be a struct");
-        };
-        let DataType::Struct(nested) = min_values.field("nested").unwrap().data_type() else {
-            panic!("nested stats must be a struct");
-        };
-        assert_eq!(
-            nested
-                .fields()
-                .map(|field| field.name().as_str())
-                .collect::<Vec<_>>(),
-            vec!["kept"]
-        );
     }
 
     /// Verify that Remove actions are not pruned by data skipping. The transform reads from

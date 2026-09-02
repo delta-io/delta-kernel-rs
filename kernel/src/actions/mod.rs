@@ -123,12 +123,7 @@ pub(crate) const STATS_PARSED: &str = "stats_parsed";
 pub(crate) static ADD_SCHEMA: LazyLock<StructType> = LazyLock::new(Add::to_schema);
 
 pub(crate) static ADD_SCHEMA_NO_JSON_STATS: LazyLock<StructType> = LazyLock::new(|| {
-    StructType::new_unchecked(
-        ADD_SCHEMA
-            .fields()
-            .filter(|field| field.name() != STATS)
-            .cloned(),
-    )
+    StructType::new_unchecked(ADD_SCHEMA.fields().filter(|f| f.name() != STATS).cloned())
 });
 
 pub(crate) static ADD_FIELD: LazyLock<StructField> =

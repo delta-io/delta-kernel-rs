@@ -14,7 +14,6 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
-use crate::actions::ADD_NAME;
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::LogReplayProcessor;
@@ -117,23 +116,12 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
         let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
-            [single_part] => {
-                let add_projection =
-                    checkpoint_read_schema
-                        .field(ADD_NAME)
-                        .cloned()
-                        .ok_or_else(|| {
-                            Error::internal_error(
-                                "checkpoint manifest read schema must contain an Add field",
-                            )
-                        })?;
-                Some(CheckpointManifestReader::try_new(
-                    engine,
-                    single_part,
-                    log_segment.log_root.clone(),
-                    add_projection,
-                )?)
-            }
+            [single_part] => Some(CheckpointManifestReader::try_new(
+                engine,
+                single_part,
+                log_segment.log_root.clone(),
+                checkpoint_read_schema,
+            )?),
             _ => None,
         };
 
