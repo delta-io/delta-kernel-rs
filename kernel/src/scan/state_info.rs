@@ -1460,6 +1460,9 @@ pub(crate) mod tests {
         );
     }
 
+    // === physical_stats_columns trims the predicate-derived stats schema ===
+
+    /// Flat schema with `n` long columns named `c0..c{n-1}`.
     fn flat_long_schema(n: usize) -> SchemaRef {
         Arc::new(StructType::new_unchecked(
             (0..n)
@@ -1468,7 +1471,8 @@ pub(crate) mod tests {
         ))
     }
 
-    /// Checks top-level leaves in both `minValues` and `maxValues`.
+    /// Asserts each `present` top-level leaf is in, and each `absent` leaf is out of, both
+    /// `minValues` and `maxValues` of `stats_schema`.
     fn assert_stats_leaves(stats_schema: &SchemaRef, present: &[&str], absent: &[&str]) {
         for stats_field in [MIN_VALUES, MAX_VALUES] {
             let DataType::Struct(inner) = stats_schema
@@ -1493,6 +1497,7 @@ pub(crate) mod tests {
         }
     }
 
+    /// `delta.dataSkippingNumIndexedCols=<n>` configuration map.
     fn num_indexed_cols_config(n: i32) -> HashMap<String, String> {
         let mut m = HashMap::new();
         m.insert(
@@ -1502,12 +1507,16 @@ pub(crate) mod tests {
         m
     }
 
+    /// `delta.dataSkippingStatsColumns=<cols joined by ",">` configuration map.
     fn stats_columns_config(cols: &[&str]) -> HashMap<String, String> {
         let mut m = HashMap::new();
         m.insert("delta.dataSkippingStatsColumns".to_string(), cols.join(","));
         m
     }
 
+    /// Both `delta.dataSkippingStatsColumns` and `delta.dataSkippingNumIndexedCols` set
+    /// simultaneously. Per the Delta protocol, the explicit list takes precedence over the
+    /// cap; this helper exists for tests that exercise that precedence.
     fn both_configs(stats_cols: &[&str], num_indexed: i32) -> HashMap<String, String> {
         let mut m = stats_columns_config(stats_cols);
         m.insert(
@@ -1517,6 +1526,8 @@ pub(crate) mod tests {
         m
     }
 
+    /// `delta.dataSkippingNumIndexedCols` caps the `physical_stats_columns` set to the
+    /// first N leaves.
     #[test]
     fn stats_columns_honors_num_indexed_cols() {
         let schema = flat_long_schema(5);
@@ -1533,6 +1544,8 @@ pub(crate) mod tests {
         assert_eq!(state_info.physical_stats_columns, cols);
     }
 
+    /// Predicate on a past-cap column: stats schema goes to `None` (no skipping), but
+    /// the physical predicate is retained so engines can still apply it per-row.
     #[test]
     fn predicate_on_past_cap_column_drops_stats_schema() {
         let schema = flat_long_schema(5);
@@ -1557,6 +1570,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Indexed AND past-cap: indexed leaf survives in the stats schema, past-cap leaf
+    /// is dropped.
     #[test]
     fn predicate_on_mixed_indexed_and_past_cap_keeps_indexed_only() {
         let schema = flat_long_schema(5);
@@ -1577,9 +1592,12 @@ pub(crate) mod tests {
             .physical_stats_schema
             .as_ref()
             .expect("should have stats schema (indexed arm survives)");
+        // c0 (indexed) survives; c4 (past cap) is dropped.
         assert_stats_leaves(stats_schema, &["c0"], &["c4"]);
     }
 
+    /// `numIndexedCols=2` against `{ a, b, s: { c, d } }` keeps `a, b` and drops the
+    /// entire `s` struct, so a predicate on `s.c` produces no stats schema.
     #[test]
     fn predicate_on_nested_past_cap_leaf_drops_parent_struct() {
         let schema = schema_ref! {
@@ -1590,6 +1608,7 @@ pub(crate) mod tests {
                 nullable "d": LONG,
             },
         };
+        // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
         let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
         let state_info = get_state_info(
             schema,
@@ -1607,6 +1626,8 @@ pub(crate) mod tests {
             .contains(&column_name!("s.c")));
     }
 
+    /// `delta.dataSkippingStatsColumns` selects exactly the listed leaves, regardless of
+    /// their position relative to the (default) cap.
     #[rstest]
     #[case::single(&["c2"], &["c2"])]
     #[case::sparse_subset(&["c0", "c3"], &["c0", "c3"])]
@@ -1630,6 +1651,9 @@ pub(crate) mod tests {
         assert_eq!(state_info.physical_stats_columns, expected_cols);
     }
 
+    /// `numIndexedCols=3` against `{ a, b, s: { c, d } }` keeps `a, b, s.c` and drops
+    /// `s.d`. A predicate on both `s.c` and `s.d` keeps the `s` struct under
+    /// `minValues` / `maxValues` with `c` only.
     #[test]
     fn predicate_on_nested_mixed_keeps_intersection_under_parent_struct() {
         let schema = schema_ref! {
@@ -1683,6 +1707,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// `dataSkippingStatsColumns` with a parent struct path admits every leaf under that
+    /// parent (the trie matches by prefix). `{ a, s: { c, d } }` with the property set to
+    /// `"s"` should produce `{ s.c, s.d }` (and exclude `a`, which is not in the list).
     #[test]
     fn stats_columns_admits_all_children_of_nested_parent_in_explicit_list() {
         let schema = schema_ref! {
@@ -1705,6 +1732,8 @@ pub(crate) mod tests {
         assert_eq!(state_info.physical_stats_columns, expected);
     }
 
+    /// `dataSkippingStatsColumns` ("A") takes precedence over `dataSkippingNumIndexedCols`
+    /// ("B") whether A wants more columns than B allows or fewer.
     #[rstest]
     #[case::a_broader_than_b(&["c0", "c3", "c4"], 2, &["c0", "c3", "c4"])]
     #[case::a_narrower_than_b(&["c0"], 3, &["c0"])]
