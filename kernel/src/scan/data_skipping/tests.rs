@@ -2060,3 +2060,474 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
          Column(stats_parsed.maxValues.stat) > 100), null)"
     );
 }
+
+#[cfg(feature = "geo-type-in-dev")]
+mod geometry {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::actions::{Add, Metadata, MAX_VALUES, MIN_VALUES};
+    use crate::arrow::array::{ArrayRef, AsArray as _, Float64Builder, RecordBatch};
+    use crate::engine::arrow_expression::evaluate_expression::evaluate_expression;
+    use crate::engine::arrow_expression::opaque::{
+        ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp,
+    };
+    use crate::engine::arrow_geometry::parse_geometry_stats_wkt;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::{Expression as Expr, OpaquePredicateOp, ScalarExpressionEvaluator};
+    use crate::geometry::extract_geometry_stats_point_xy;
+    use crate::kernel_predicates::{
+        DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+        IndirectDataSkippingPredicateEvaluator,
+    };
+    use crate::schema::GeometryType;
+    use crate::table_features::TableFeature;
+    use crate::unit_test_utils::{Action, LocalMockTable, MockProtocolBuilder};
+    use crate::Error;
+
+    #[derive(Clone, Copy)]
+    enum GeoBBoxAxis {
+        X,
+        Y,
+    }
+
+    fn test_geometry_type() -> GeometryType {
+        GeometryType::try_new("EPSG:4326").unwrap()
+    }
+
+    fn test_geo_bbox_coord_scalar(
+        eval_expr: &ScalarExpressionEvaluator<'_>,
+        exprs: &[Expr],
+        axis: GeoBBoxAxis,
+    ) -> DeltaResult<Scalar> {
+        let [expr] = exprs else {
+            return Err(Error::invalid_expression(format!(
+                "Geo bbox coordinate expression expects 1 arg, got {}",
+                exprs.len()
+            )));
+        };
+        let Some(value) = eval_expr(expr) else {
+            return Ok(Scalar::Null(DataType::DOUBLE));
+        };
+        let bytes = match value {
+            Scalar::Geometry(geometry) => geometry.into_bytes(),
+            Scalar::Binary(bytes) => bytes,
+            Scalar::Null(_) => return Ok(Scalar::Null(DataType::DOUBLE)),
+            other => {
+                return Err(Error::invalid_expression(format!(
+                    "Geo bbox coordinate expression requires BINARY stats, got {}",
+                    other.data_type()
+                )))
+            }
+        };
+
+        let coord = extract_geometry_stats_point_xy(&test_geometry_type(), &bytes)
+            .map(|(x, y)| match axis {
+                GeoBBoxAxis::X => x,
+                GeoBBoxAxis::Y => y,
+            })
+            .ok();
+        Ok(coord.map_or(Scalar::Null(DataType::DOUBLE), Scalar::from))
+    }
+
+    fn test_geo_bbox_coord_array(
+        args: &[Expr],
+        batch: &RecordBatch,
+        axis: GeoBBoxAxis,
+    ) -> DeltaResult<ArrayRef> {
+        let [expr] = args else {
+            return Err(Error::invalid_expression(format!(
+                "Geo bbox coordinate expression expects 1 arg, got {}",
+                args.len()
+            )));
+        };
+        let input = evaluate_expression(expr, batch, Some(&DataType::BINARY))?;
+        let mut builder = Float64Builder::new();
+        let append_values = |builder: &mut Float64Builder, values: Vec<Option<&[u8]>>| {
+            for value in values {
+                let coord = value
+                    .and_then(|bytes| {
+                        extract_geometry_stats_point_xy(&test_geometry_type(), bytes).ok()
+                    })
+                    .map(|(x, y)| match axis {
+                        GeoBBoxAxis::X => x,
+                        GeoBBoxAxis::Y => y,
+                    });
+                match coord {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+        };
+        if let Some(array) = input.as_binary_opt::<i32>() {
+            append_values(&mut builder, array.iter().collect());
+        } else if let Some(array) = input.as_binary_opt::<i64>() {
+            append_values(&mut builder, array.iter().collect());
+        } else if let Some(array) = input.as_binary_view_opt() {
+            append_values(&mut builder, array.iter().collect());
+        } else {
+            return Err(Error::invalid_expression(format!(
+                "Geo bbox coordinate expression requires BINARY stats, got {}",
+                input.data_type()
+            )));
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    macro_rules! geo_bbox_coord_op {
+        ($name:ident, $axis:expr) => {
+            #[derive(Debug, PartialEq)]
+            struct $name;
+
+            impl ArrowOpaqueExpressionOp for $name {
+                fn name(&self) -> &str {
+                    stringify!($name)
+                }
+
+                fn eval_expr(
+                    &self,
+                    args: &[Expr],
+                    batch: &RecordBatch,
+                    result_type: Option<&DataType>,
+                ) -> DeltaResult<ArrayRef> {
+                    assert!(matches!(result_type, None | Some(&DataType::DOUBLE)));
+                    test_geo_bbox_coord_array(args, batch, $axis)
+                }
+
+                fn eval_expr_scalar(
+                    &self,
+                    eval_expr: &ScalarExpressionEvaluator<'_>,
+                    exprs: &[Expr],
+                ) -> DeltaResult<Scalar> {
+                    test_geo_bbox_coord_scalar(eval_expr, exprs, $axis)
+                }
+            }
+        };
+    }
+
+    geo_bbox_coord_op!(GeoBBoxMinX, GeoBBoxAxis::X);
+    geo_bbox_coord_op!(GeoBBoxMinY, GeoBBoxAxis::Y);
+    geo_bbox_coord_op!(GeoBBoxMaxX, GeoBBoxAxis::X);
+    geo_bbox_coord_op!(GeoBBoxMaxY, GeoBBoxAxis::Y);
+
+    fn test_geo_bbox_min_x(expr: Expr) -> Expr {
+        Expr::arrow_opaque(GeoBBoxMinX, [expr])
+    }
+
+    fn test_geo_bbox_min_y(expr: Expr) -> Expr {
+        Expr::arrow_opaque(GeoBBoxMinY, [expr])
+    }
+
+    fn test_geo_bbox_max_x(expr: Expr) -> Expr {
+        Expr::arrow_opaque(GeoBBoxMaxX, [expr])
+    }
+
+    fn test_geo_bbox_max_y(expr: Expr) -> Expr {
+        Expr::arrow_opaque(GeoBBoxMaxY, [expr])
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct TestGeoBBoxOverlapOp {
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    }
+
+    fn test_geo_bbox_overlap_rewrite(column: &ColumnName, bbox: &TestGeoBBoxOverlapOp) -> Pred {
+        let min_geom = Expr::from(column_name!("stats_parsed", MIN_VALUES).join(column));
+        let max_geom = Expr::from(column_name!("stats_parsed", MAX_VALUES).join(column));
+        Pred::and_from([
+            Pred::le(test_geo_bbox_min_x(min_geom.clone()), lit(bbox.max_x)),
+            Pred::ge(test_geo_bbox_max_x(max_geom.clone()), lit(bbox.min_x)),
+            Pred::le(test_geo_bbox_min_y(min_geom), lit(bbox.max_y)),
+            Pred::ge(test_geo_bbox_max_y(max_geom), lit(bbox.min_y)),
+        ])
+    }
+
+    impl OpaquePredicateOp for TestGeoBBoxOverlapOp {
+        fn name(&self) -> &str {
+            "test_geo_bbox_overlap"
+        }
+
+        fn eval_pred_scalar(
+            &self,
+            _eval_expr: &ScalarExpressionEvaluator<'_>,
+            _eval_pred: &DirectPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> DeltaResult<Option<bool>> {
+            Err(Error::unsupported(
+                "test geo bbox overlap predicate is only implemented for data skipping",
+            ))
+        }
+
+        fn eval_as_data_skipping_predicate(
+            &self,
+            _predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> Option<bool> {
+            None
+        }
+
+        fn as_data_skipping_predicate(
+            &self,
+            _predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+            exprs: &[Expr],
+            inverted: bool,
+        ) -> Option<Pred> {
+            let [Expr::Column(column)] = exprs else {
+                return None;
+            };
+            let pred = test_geo_bbox_overlap_rewrite(column, self);
+            Some(if inverted { Pred::not(pred) } else { pred })
+        }
+    }
+
+    fn test_geo_bbox_overlap_predicate(
+        column: Expr,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    ) -> Pred {
+        Pred::opaque(
+            TestGeoBBoxOverlapOp {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            },
+            [column],
+        )
+    }
+
+    fn test_geo_add_file(path: &str, stats: Option<String>) -> Action {
+        Action::Add(Add {
+            path: path.to_string(),
+            partition_values: HashMap::new(),
+            size: 1024,
+            modification_time: 1_700_000_000_000,
+            data_change: true,
+            stats,
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+        })
+    }
+
+    fn test_geo_stats_json(
+        min_geom: serde_json::Value,
+        max_geom: serde_json::Value,
+        tight: bool,
+    ) -> String {
+        json!({
+            "numRecords": 1,
+            "minValues": { "geom": min_geom },
+            "maxValues": { "geom": max_geom },
+            "nullCount": { "geom": 0 },
+            "tightBounds": tight,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn geo_bbox_coordinate_expressions_extract_expected_points() {
+        let geometry_type = GeometryType::try_new("EPSG:4326").unwrap();
+        let min_geometry = Scalar::Geometry(
+            parse_geometry_stats_wkt(&geometry_type, "POINT(-122.419 37.774)").unwrap(),
+        );
+        let max_geometry = Scalar::Geometry(
+            parse_geometry_stats_wkt(&geometry_type, "POINT(-120.503 38.021)").unwrap(),
+        );
+
+        let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+            (column_name!("stats_parsed.minValues.geom"), min_geometry),
+            (column_name!("stats_parsed.maxValues.geom"), max_geometry),
+        ]));
+
+        expect_eq!(
+            resolver.eval_expr(&test_geo_bbox_min_x(col!("stats_parsed.minValues.geom"))),
+            Some(Scalar::from(-122.419f64)),
+            "bbox min x"
+        );
+        expect_eq!(
+            resolver.eval_expr(&test_geo_bbox_min_y(col!("stats_parsed.minValues.geom"))),
+            Some(Scalar::from(37.774f64)),
+            "bbox min y"
+        );
+        expect_eq!(
+            resolver.eval_expr(&test_geo_bbox_max_x(col!("stats_parsed.maxValues.geom"))),
+            Some(Scalar::from(-120.503f64)),
+            "bbox max x"
+        );
+        expect_eq!(
+            resolver.eval_expr(&test_geo_bbox_max_y(col!("stats_parsed.maxValues.geom"))),
+            Some(Scalar::from(38.021f64)),
+            "bbox max y"
+        );
+    }
+
+    #[test]
+    fn geo_bbox_coordinate_expressions_return_null_for_invalid_geometry_stats() {
+        let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+            column_name!("stats_parsed.minValues.geom"),
+            Scalar::Binary(vec![0x01, 0x02, 0x03]),
+        )]));
+
+        expect_eq!(
+            resolver.eval_expr(&test_geo_bbox_min_x(col!("stats_parsed.minValues.geom"))),
+            Some(Scalar::Null(DataType::DOUBLE)),
+            "invalid WKB keeps the file"
+        );
+    }
+
+    #[test]
+    fn geo_bbox_overlap_predicate_rewrites_expected_shape() {
+        let pred = test_geo_bbox_overlap_predicate(col!("geom"), -121.0, 37.5, -120.5, 37.8);
+        let skipping_pred = as_data_skipping_predicate(&pred).unwrap();
+        let skipping_sql_pred = as_sql_data_skipping_predicate(&pred, &Default::default()).unwrap();
+
+        let skipping_str = skipping_pred.to_string();
+        assert!(skipping_str.contains("GeoBBoxMinX"), "{skipping_str}");
+        assert!(skipping_str.contains("GeoBBoxMaxX"), "{skipping_str}");
+        assert!(skipping_str.contains("GeoBBoxMinY"), "{skipping_str}");
+        assert!(skipping_str.contains("GeoBBoxMaxY"), "{skipping_str}");
+        assert!(
+            skipping_str.contains("stats_parsed.minValues.geom"),
+            "{skipping_str}"
+        );
+        assert!(
+            skipping_str.contains("stats_parsed.maxValues.geom"),
+            "{skipping_str}"
+        );
+        assert!(
+            skipping_str.contains("-120.5")
+                && skipping_str.contains("-121")
+                && skipping_str.contains("37.8")
+                && skipping_str.contains("37.5"),
+            "{skipping_str}"
+        );
+        let sql_str = skipping_sql_pred.to_string();
+        assert!(sql_str.contains("GeoBBoxMinX"), "{sql_str}");
+        assert!(sql_str.contains("GeoBBoxMaxX"), "{sql_str}");
+        assert!(sql_str.contains("GeoBBoxMinY"), "{sql_str}");
+        assert!(sql_str.contains("GeoBBoxMaxY"), "{sql_str}");
+
+        assert!(
+            as_checkpoint_skipping_predicate(
+                &pred,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::from([column_name!("geom")]),
+            )
+            .is_none(),
+            "checkpoint row-group skipping should remain opaque-predicate conservative"
+        );
+    }
+
+    #[tokio::test]
+    async fn geo_bbox_overlap_scan_metadata_prunes_only_disjoint_valid_files() {
+        let mut table = LocalMockTable::new();
+        let schema = schema_ref! {
+            nullable "geom": (DataType::from(test_geometry_type())),
+        };
+        let metadata =
+            Metadata::try_new(None, None, schema, Vec::new(), 0, HashMap::new()).unwrap();
+        let protocol = MockProtocolBuilder::new()
+            .with_features([TableFeature::GeospatialType])
+            .build();
+
+        table
+            .commit([Action::Protocol(protocol), Action::Metadata(metadata)])
+            .await;
+        table
+            .commit([
+                test_geo_add_file(
+                    "overlap.parquet",
+                    Some(test_geo_stats_json(
+                        json!("POINT(-122.419 37.774)"),
+                        json!("POINT(-120.503 38.021)"),
+                        true,
+                    )),
+                ),
+                test_geo_add_file(
+                    "disjoint.parquet",
+                    Some(test_geo_stats_json(
+                        json!("POINT(-119 37)"),
+                        json!("POINT(-118 38)"),
+                        true,
+                    )),
+                ),
+                test_geo_add_file(
+                    "malformed.parquet",
+                    Some(test_geo_stats_json(
+                        json!("not-wkt"),
+                        json!("POINT(-120.503 38.021)"),
+                        true,
+                    )),
+                ),
+                test_geo_add_file(
+                    "non-point.parquet",
+                    Some(test_geo_stats_json(
+                        json!("LINESTRING(-122 37, -120 38)"),
+                        json!("POINT(-120.503 38.021)"),
+                        true,
+                    )),
+                ),
+                test_geo_add_file("missing-stats.parquet", None),
+                test_geo_add_file(
+                    "wide-disjoint.parquet",
+                    Some(test_geo_stats_json(
+                        json!("POINT(-119 37)"),
+                        json!("POINT(-118 38)"),
+                        false,
+                    )),
+                ),
+            ])
+            .await;
+
+        let url = url::Url::from_directory_path(table.table_root()).unwrap();
+        let engine = Arc::new(SyncEngine::new());
+        let scan = crate::Snapshot::builder_for(url)
+            .build(engine.as_ref())
+            .unwrap()
+            .scan_builder()
+            .with_predicate(Arc::new(test_geo_bbox_overlap_predicate(
+                col!("geom"),
+                -121.0,
+                37.5,
+                -120.5,
+                37.8,
+            )))
+            .build()
+            .unwrap();
+
+        let mut selected_paths = Vec::new();
+        for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+            selected_paths = scan_metadata
+                .unwrap()
+                .visit_scan_files(selected_paths, |paths, scan_file| {
+                    paths.push(scan_file.path)
+                })
+                .unwrap();
+        }
+        selected_paths.sort();
+
+        assert_eq!(
+            selected_paths,
+            vec![
+                "malformed.parquet".to_string(),
+                "missing-stats.parquet".to_string(),
+                "non-point.parquet".to_string(),
+                "overlap.parquet".to_string(),
+            ]
+        );
+    }
+}

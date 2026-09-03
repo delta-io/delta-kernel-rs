@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
-use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
-use crate::schema::{DataType, StructType};
+use crate::schema::{DataType, PrimitiveType, StructType};
 use crate::{DeltaResult, Error};
 
 /// Domain metadata structure for clustering columns.
@@ -100,7 +99,7 @@ pub(crate) fn validate_clustering_columns(
 
         let field = schema.field_at(col)?;
         match field.data_type() {
-            DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
+            DataType::Primitive(ptype) if is_clustering_eligible_datatype(ptype) => {}
             dt => {
                 return Err(Error::generic(format!(
                     "Clustering column '{col}' has unsupported type '{dt}'. \
@@ -111,6 +110,23 @@ pub(crate) fn validate_clustering_columns(
         }
     }
     Ok(())
+}
+
+pub(crate) fn is_clustering_eligible_datatype(data_type: &PrimitiveType) -> bool {
+    matches!(
+        data_type,
+        PrimitiveType::Byte
+            | PrimitiveType::Short
+            | PrimitiveType::Integer
+            | PrimitiveType::Long
+            | PrimitiveType::Float
+            | PrimitiveType::Double
+            | PrimitiveType::Date
+            | PrimitiveType::Timestamp
+            | PrimitiveType::TimestampNtz
+            | PrimitiveType::String
+            | PrimitiveType::Decimal(_)
+    )
 }
 
 /// Creates domain metadata for clustering configuration.
@@ -153,6 +169,8 @@ mod tests {
     use super::*;
     use crate::expressions::column_name;
     use crate::schema::{schema, DataType, StructField};
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
 
     #[rstest::rstest]
     #[case::simple(
@@ -335,6 +353,33 @@ mod tests {
             );
             assert!(result.unwrap_err().to_string().contains("unsupported type"));
         }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_validate_clustering_columns_geometry_rejected() {
+        let schema = schema! {
+            nullable "geom": (DataType::from(GeometryType::try_new("EPSG:4326").unwrap())),
+        };
+
+        let result = validate_clustering_columns(&schema, &[column_name!("geom")]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported type"));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_validate_clustering_columns_geography_rejected() {
+        let schema = schema! {
+            nullable "geog": (DataType::from(
+                GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical)
+                    .unwrap()
+            )),
+        };
+
+        let result = validate_clustering_columns(&schema, &[column_name!("geog")]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported type"));
     }
 
     #[test]

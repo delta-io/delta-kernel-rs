@@ -363,24 +363,39 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
     }
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        is_skipping_eligible_datatype(ptype).then_some(Cow::Borrowed(ptype))
+        is_min_max_stats_eligible_datatype(ptype).then_some(Cow::Borrowed(ptype))
     }
 }
 
-/// Checks if a data type is eligible for min/max file skipping.
-///
-/// This is also used to validate clustering column types, since clustering requires
-/// per-file statistics on clustering columns.
-///
-/// Note: Boolean, Binary, and Interval are intentionally excluded as min/max statistics provide
-/// minimal skipping benefit or do not have stable protocol-level ordering semantics.
-///
-/// Void is also excluded: void columns are never materialized to Parquet, so min/max are not
-/// meaningful. When `nullCount` stats are present for a void column, `eval_pred_is_null` can
-/// use them for `IS NULL` / `IS NOT NULL` file skipping.
-///
-/// See: <https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61>
-pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
+/// Checks if a data type is eligible for min/max statistics materialization.
+pub(crate) fn is_min_max_stats_eligible_datatype(data_type: &PrimitiveType) -> bool {
+    matches!(
+        data_type,
+        &PrimitiveType::Byte
+            | &PrimitiveType::Short
+            | &PrimitiveType::Integer
+            | &PrimitiveType::Long
+            | &PrimitiveType::Float
+            | &PrimitiveType::Double
+            | &PrimitiveType::Date
+            | &PrimitiveType::Timestamp
+            | &PrimitiveType::TimestampNtz
+            | &PrimitiveType::String
+            | PrimitiveType::Decimal(_)
+    ) || {
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            matches!(data_type, PrimitiveType::Geometry(_))
+        }
+        #[cfg(not(feature = "geo-type-in-dev"))]
+        {
+            false
+        }
+    }
+}
+
+/// Checks if a data type is eligible for direct ordered min/max comparisons.
+pub(crate) fn is_direct_ordered_skipping_datatype(data_type: &PrimitiveType) -> bool {
     matches!(
         data_type,
         &PrimitiveType::Byte
@@ -399,9 +414,6 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "geo-type-in-dev")]
-    use rstest::rstest;
-
     use super::*;
     use crate::expressions::column_name;
     use crate::schema::schema;
@@ -410,13 +422,22 @@ mod tests {
     use crate::table_properties::TableProperties;
 
     #[cfg(feature = "geo-type-in-dev")]
-    #[rstest]
-    #[case(PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap())))]
-    #[case(PrimitiveType::Geography(Box::new(
-        GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap()
-    )))]
-    fn test_geo_types_are_not_skipping_eligible(#[case] ptype: PrimitiveType) {
-        assert!(!is_skipping_eligible_datatype(&ptype));
+    #[test]
+    fn test_geometry_is_min_max_stats_eligible_but_not_direct_ordered() {
+        let geometry =
+            PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap()));
+        assert!(is_min_max_stats_eligible_datatype(&geometry));
+        assert!(!is_direct_ordered_skipping_datatype(&geometry));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_geography_is_not_min_max_or_direct_ordered_eligible() {
+        let geography = PrimitiveType::Geography(Box::new(
+            GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap(),
+        ));
+        assert!(!is_min_max_stats_eligible_datatype(&geography));
+        assert!(!is_direct_ordered_skipping_datatype(&geography));
     }
 
     fn stats_config_from_table_properties(properties: &TableProperties) -> StatsConfig<'_> {

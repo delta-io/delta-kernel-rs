@@ -16,7 +16,9 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
+use crate::scan::data_skipping::stats_schema::{
+    is_direct_ordered_skipping_datatype, is_min_max_stats_eligible_datatype,
+};
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
 use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
@@ -315,7 +317,7 @@ impl DataSkippingFilter {
                         matches!(
                             f.data_type(),
                             DataType::Primitive(primitive)
-                                if is_skipping_eligible_datatype(primitive)
+                                if is_direct_ordered_skipping_datatype(primitive)
                                     || matches!(
                                         primitive,
                                         PrimitiveType::Boolean | PrimitiveType::Binary
@@ -522,7 +524,10 @@ fn is_partition_value_reference(expr: &Expr) -> bool {
 /// Must match `MinMaxStatsTransform`'s acceptance rule. Otherwise the predicate creator
 /// emits refs to min/max fields the stats schema doesn't contain.
 fn has_min_max_stats(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype))
+    matches!(
+        data_type,
+        DataType::Primitive(ptype) if is_min_max_stats_eligible_datatype(ptype)
+    )
 }
 
 /// Column metadata shared by the data-skipping predicate creators.
