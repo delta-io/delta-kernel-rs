@@ -671,19 +671,20 @@ impl ParseJsonExpression {
 /// target struct is semantic input: field names select partition values, field types determine how
 /// they are parsed, and field order and nullability define the result struct. Names are matched
 /// exactly and case-sensitively against the map keys. With column mapping, both the map keys and
-/// target-schema field names are physical names. Input entries not declared in the target are
-/// ignored.
+/// target-schema field names are physical names.
 ///
-/// # Null and lookup behavior
+/// # Null and Missing Key behavior
 ///
 /// For each input row:
 ///
 /// - A null map produces a null struct, not a non-null struct whose fields are all null.
-/// - A non-null map, including an empty map, produces a non-null struct. A missing key or null map
-///   value produces a null field.
+/// - A non-null map, including an empty map, produces a non-null struct.
+/// - A key that is in the target output schema, but missing from the map, produces a null field.
+/// - A key that is in the input map, but not in the target output schema, is ignored.
+/// - A key with a null value in the input map produces a null field in the output struct.
 /// - Fields appear in target-schema order and must have primitive types.
 /// - Duplicate keys are not valid `partitionValues` input and their result is undefined. Engines
-///   need not detect or reject them, and callers must not depend on which value is selected.
+///   may ignore, reject, or arbitrarily select one; callers must not depend on the behavior.
 ///
 /// # Value parsing
 ///
