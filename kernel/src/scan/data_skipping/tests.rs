@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use rstest::rstest;
 
 use super::*;
+use crate::arrow::array::{ArrayRef, BooleanArray, Float64Array, RecordBatch, StructArray};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+use crate::engine::arrow_expression::evaluate_expression::evaluate_predicate;
 use crate::expressions::{col, column_expr_ref, column_name, lit};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, UnimplementedColumnResolver,
@@ -1375,6 +1378,33 @@ fn test_partition_column_comparison_uses_exact_value() {
         (column_name!("is_add"), Scalar::from(true)),
     ]));
     assert_eq!(resolver.eval(&skipping_pred), TRUE);
+}
+
+#[test]
+fn test_arrow_partition_data_skipping_treats_signed_zero_as_equal() {
+    let partition_columns = test_partition_columns();
+    let partition_values = StructArray::from(vec![(
+        Arc::new(Field::new("part_col", ArrowDataType::Float64, false)),
+        Arc::new(Float64Array::from(vec![-0.0, 0.0])) as ArrayRef,
+    )]);
+    let batch = RecordBatch::try_from_iter([
+        (
+            "partitionValues_parsed",
+            Arc::new(partition_values) as ArrayRef,
+        ),
+        (
+            "is_add",
+            Arc::new(BooleanArray::from(vec![true, true])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+
+    for zero in [0.0, -0.0] {
+        let pred = Pred::eq(col!("part_col"), lit(zero));
+        let skipping_pred = as_sql_data_skipping_predicate(&pred, &partition_columns).unwrap();
+        let result = evaluate_predicate(&skipping_pred, &batch, false).unwrap();
+        assert_eq!(result, BooleanArray::from(vec![true, true]));
+    }
 }
 
 #[test]

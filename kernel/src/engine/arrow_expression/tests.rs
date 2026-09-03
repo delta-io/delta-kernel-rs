@@ -1459,6 +1459,7 @@ fn test_void_scalar_to_array() {
     assert_eq!(array.len(), 5);
     assert_eq!(*array.data_type(), DataType::Null);
 }
+
 // Interval scalars materialize as their physical integer arrays (Int32 months / Int64 micros).
 #[rstest]
 #[case::year_month(Scalar::IntervalYearMonth(30), DataType::Int32)]
@@ -1485,11 +1486,9 @@ fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
         "expected Unsupported, got: {err:?}"
     );
 }
-||||||| parent of 44afbbe3f (fix: use SQL float comparison semantics in Arrow expression evaluator)
-
 // === Negative zero float comparison tests ===
 //
-// Verify that -0.0 and 0.0 compare as equal per SQL semantics.
+// Verify that -0.0 and 0.0 compare as logically equal.
 
 #[rstest]
 #[case::f64(
@@ -1677,14 +1676,14 @@ fn test_float_neg_zero_in_predicate() {
     Scalar::Float(0.0),
     Scalar::Float(f32::NAN),
 )]
-fn test_float_nan_sql_ordering(
+fn test_float_positive_nan_total_ordering(
     #[case] array: ArrayRef,
     #[case] dtype: DataType,
     #[case] zero: Scalar,
     #[case] nan: Scalar,
 ) {
     // Array: [NaN, 0.0, inf, -inf, NULL]
-    // SQL ordering: -inf < 0.0 < inf < NaN
+    // Arrow's total order places this positive NaN above all non-NaN values.
     let schema = Schema::new([Arc::new(Field::new("col", dtype, true))]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
     let col = column_expr!("col");
@@ -1780,9 +1779,9 @@ fn test_float_nan_sql_ordering(
     );
 }
 
-/// Verifies the inverted-distinct branches of `float_sql_distinct` (IS NOT DISTINCT FROM).
+/// Verifies the inverted-distinct branches of `float_logical_distinct`.
 /// `IS NOT DISTINCT FROM` treats nulls as comparable: `NULL <=> NULL` is true, `NULL <=> v`
-/// is false. SQL float semantics: `-0.0 <=> 0.0` is true, `NaN <=> NaN` is true.
+/// is false. Signed zeros and identical NaN values are not distinct.
 #[rstest]
 #[case::f64(
     Arc::new(Float64Array::from(vec![Some(-0.0f64), Some(0.0), Some(1.0), Some(f64::NAN), None])) as ArrayRef,
@@ -1824,7 +1823,7 @@ fn test_float_not_distinct_from(
 }
 
 /// Column-vs-column comparisons exercise `NullBuffer::union` with disjoint null positions,
-/// the `(false, false) => Equal` arm of `sql_float_cmp` for both-NaN rows, and the
+/// the non-null arm of `float_logical_distinct` for both-NaN rows, and the
 /// both-null row where DISTINCT is false and `<=>` is true.
 #[test]
 fn test_float_column_vs_column() {
@@ -1903,6 +1902,21 @@ fn test_float_column_vs_column() {
     );
 }
 
+#[test]
+fn test_float_negative_nan_total_ordering_is_preserved() {
+    let negative_nan = f64::from_bits(f64::NAN.to_bits() | (1 << 63));
+    let array = Arc::new(Float64Array::from(vec![negative_nan, f64::NAN])) as ArrayRef;
+    let schema = Schema::new([Arc::new(Field::new("col", DataType::Float64, false))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
+    let col = col!("col");
+
+    let result = evaluate_predicate(&col.clone().lt(lit(0.0)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![true, false]));
+
+    let result = evaluate_predicate(&col.gt(lit(0.0)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![false, true]));
+}
+
 /// Empty and all-null float arrays should not panic and should produce the expected results.
 #[rstest]
 #[case::empty_f64(Arc::new(Float64Array::from(Vec::<Option<f64>>::new())) as ArrayRef, 0)]
@@ -1956,8 +1970,7 @@ fn test_float_literal_on_left() {
     );
 }
 
-/// Sliced arrays (offset != 0) should produce results aligned to the slice. `float_sql_cmp`
-/// indexes `values()` via the array's `Buffer`, which respects the slice offset.
+/// Sliced arrays (offset != 0) should produce results aligned to the slice.
 #[test]
 fn test_float_sliced_array() {
     let full = Float64Array::from(vec![
@@ -1980,9 +1993,8 @@ fn test_float_sliced_array() {
     );
 }
 
-/// Documents IN-predicate behavior on float lists: Arrow's `in_list` uses Rust IEEE
-/// `PartialEq`, which gets `-0.0 == 0.0` right but treats `NaN != NaN`. The new SQL kernel
-/// disagrees with IN on NaN; aligning them is tracked separately.
+/// Documents that float `IN` uses IEEE equality: signed zeros are equal, but NaN is not equal to
+/// itself.
 #[test]
 fn test_float_nan_in_predicate_uses_ieee_semantics() {
     let field = Arc::new(Field::new("item", DataType::Float64, true));
