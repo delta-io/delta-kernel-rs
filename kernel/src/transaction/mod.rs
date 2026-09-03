@@ -244,6 +244,10 @@ pub struct Transaction<S = ExistingTable> {
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
     column_defaults_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
+    // Versions.
+    #[cfg(feature = "row-tracking-preservation-in-dev")]
+    row_tracking_preservation_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
@@ -356,7 +360,14 @@ impl<S> Transaction<S> {
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
 
-        // Some table features don't yet support removeFiles. Reject here.
+        #[cfg(feature = "row-tracking-preservation-in-dev")]
+        if !self.remove_files_metadata.is_empty() || self.num_dv_updates > 0 {
+            self.effective_table_config
+                .validate_feature_support_for_remove()?;
+            self.ensure_row_tracking_preservation_acknowledged()?;
+        }
+
+        #[cfg(not(feature = "row-tracking-preservation-in-dev"))]
         if !self.remove_files_metadata.is_empty() {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;
@@ -852,6 +863,26 @@ impl<S> Transaction<S> {
             Error::invalid_transaction_state(
                 "Writing data to a table with column defaults requires calling \
                  Transaction::ack_column_defaults() first",
+            )
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "row-tracking-preservation-in-dev")]
+    fn ensure_row_tracking_preservation_acknowledged(&self) -> DeltaResult<()> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::RowTracking)
+        {
+            return Ok(());
+        }
+        require!(
+            self.row_tracking_preservation_acknowledged,
+            Error::invalid_transaction_state(
+                "Data manipulation on a table with Row Tracking enabled requires preserving stable \
+                 Row IDs for copied or updated rows and stable Row Commit Versions for copied \
+                 rows. If you applied these rules correctly, acknowledge this by calling \
+                 Transaction::ack_row_tracking_preservation() before committing",
             )
         );
         Ok(())

@@ -105,6 +105,8 @@ impl Transaction {
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
+            #[cfg(feature = "row-tracking-preservation-in-dev")]
+            row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
@@ -146,6 +148,16 @@ impl Transaction {
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
+    }
+
+    /// Acknowledges that the connector preserved stable Row IDs for copied and updated rows and
+    /// stable Row Commit Versions for copied rows.
+    ///
+    /// Call this before committing file removals or deletion-vector updates on tables with Row
+    /// Tracking enabled.
+    #[cfg(feature = "row-tracking-preservation-in-dev")]
+    pub fn ack_row_tracking_preservation(&mut self) {
+        self.row_tracking_preservation_acknowledged = true;
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to
