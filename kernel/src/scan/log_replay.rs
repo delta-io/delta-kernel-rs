@@ -87,8 +87,8 @@ struct InternalScanState {
     /// still correct.
     #[serde(default)]
     eligible_physical_stats_columns: HashSet<ColumnName>,
-    /// Requested physical stats columns needed to rebuild the same scan state. Defaults to empty
-    /// when deserializing older state.
+    /// Caller-requested physical stats columns preserved across distributed log replay.
+    /// `serde(default)` accepts serialized representations that omit this field.
     #[serde(default)]
     requested_physical_stats_columns: Vec<ColumnName>,
     #[serde(default)]
