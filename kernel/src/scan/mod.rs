@@ -43,7 +43,7 @@ use crate::schema::{
     StructField, StructType, ToSchema as _,
 };
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, Operation};
+use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{
@@ -120,17 +120,31 @@ pub struct StatsOptions {
     pub(crate) struct_stats: StructStats,
 }
 
-/// Which struct stats columns appear in `stats_parsed` in scan metadata output.
+/// Controls which struct stats columns appear in `stats_parsed`.
+///
+/// Indexed columns are non-partition data columns named by `delta.dataSkippingStatsColumns`, or,
+/// when that property is absent, the first `delta.dataSkippingNumIndexedCols` leaf columns (32 by
+/// default). Extra-indexed columns fall outside that set but are known by the connector to have
+/// stats, for example because another writer generated them.
 #[derive(Clone, Debug)]
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
     /// internal data skipping unless the caller picked [`StatsOptions::none`], which
     /// disables stats reading entirely.
     None,
-    /// Emit all indexed stats columns.
-    All,
-    /// Emit at least the specified stats columns. Predicate-referenced columns may also appear.
-    Columns(Vec<ColumnName>),
+    /// Emit all indexed columns, plus the `extra_indexed` columns.
+    AllIndexed {
+        /// Columns outside the indexed set that may have on-disk stats. Names that cannot be
+        /// resolved are omitted with a warning. Missing per-file values read as NULL and do not
+        /// prune.
+        extra_indexed: Vec<ColumnName>,
+    },
+    /// Emit stats for at least the `requested` columns, regardless of the table's indexed set.
+    Columns {
+        /// Columns to request, even outside the indexed set. Names that cannot be resolved return
+        /// an error. Missing per-file values read as NULL and do not prune.
+        requested: Vec<ColumnName>,
+    },
 }
 
 impl Default for StatsOptions {
@@ -155,16 +169,31 @@ impl StatsOptions {
     pub fn all_struct() -> Self {
         Self {
             synthesize_json: false,
-            struct_stats: StructStats::All,
+            struct_stats: StructStats::AllIndexed {
+                extra_indexed: Vec::new(),
+            },
         }
     }
 
-    /// Struct stats for at least the specified columns without JSON synthesis. Predicate-referenced
-    /// columns may also appear because scan paths can retain stats used for data skipping.
+    /// Returns struct stats for at least `cols`, regardless of the table's indexed set.
+    ///
+    /// Names that cannot be resolved return an error. Missing per-file values read as NULL and do
+    /// not prune.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
-            struct_stats: StructStats::Columns(cols),
+            struct_stats: StructStats::Columns { requested: cols },
+        }
+    }
+
+    /// Returns struct stats for all indexed columns and `extra_indexed`.
+    ///
+    /// Extra-indexed columns bypass the table's configured indexed set. Missing on-disk stats read
+    /// as NULL and do not prune; names that cannot be resolved are ignored with a warning.
+    pub fn all_struct_with_extra_indexed(extra_indexed: Vec<ColumnName>) -> Self {
+        Self {
+            synthesize_json: false,
+            struct_stats: StructStats::AllIndexed { extra_indexed },
         }
     }
 
@@ -172,7 +201,9 @@ impl StatsOptions {
     pub fn all() -> Self {
         Self {
             synthesize_json: true,
-            struct_stats: StructStats::All,
+            struct_stats: StructStats::AllIndexed {
+                extra_indexed: Vec::new(),
+            },
         }
     }
 
@@ -181,7 +212,7 @@ impl StatsOptions {
     /// Use when the engine handles its own pruning.
     ///
     /// To get internal predicate-based skipping without `stats_parsed` output, use
-    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `All`/`Columns(_)`.
+    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `AllIndexed`/`Columns`.
     pub fn none() -> Self {
         Self {
             synthesize_json: false,
@@ -694,8 +725,8 @@ pub struct Scan {
 ///
 /// For example, if the caller requests `[a, b]` and the predicate references `c`,
 /// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
-/// Returns `None` when no eligible struct stats are requested and errors when a requested column
-/// cannot be resolved.
+/// Returns `None` when no struct stats are requested. `Columns` names were already resolved
+/// strictly into `StateInfo::requested_physical_stats_columns` when the `StateInfo` was built.
 fn build_physical_stats_output_schema(
     table_configuration: &TableConfiguration,
     state_info: &StateInfo,
@@ -703,21 +734,17 @@ fn build_physical_stats_output_schema(
 ) -> DeltaResult<Option<SchemaRef>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
-        StructStats::All => Ok(state_info.physical_stats_schema.clone()),
-        StructStats::Columns(columns) if columns.is_empty() => Ok(None),
-        StructStats::Columns(columns) => {
-            let logical_schema = table_configuration.logical_schema();
-            let column_mapping_mode = table_configuration.column_mapping_mode();
-            let physical_columns: Vec<_> = columns
-                .iter()
-                .map(|column| {
-                    get_any_level_column_physical_name(&logical_schema, column, column_mapping_mode)
-                })
-                .try_collect()?;
+        StructStats::AllIndexed { .. } => Ok(state_info.physical_stats_schema.clone()),
+        StructStats::Columns { .. } => {
+            // The requested columns are also the output filter, so the emitted schema contains
+            // exactly those columns.
+            let requested = &state_info.requested_physical_stats_columns;
+            if requested.is_empty() {
+                return Ok(None);
+            }
             let stats_schema = table_configuration
-                .build_expected_stats_schemas(None, Some(&physical_columns))?
+                .build_expected_stats_schemas(Some(requested), Some(requested))?
                 .physical;
-
             Ok(stats_schema_with_data_columns(stats_schema))
         }
     }
@@ -1163,7 +1190,7 @@ impl Scan {
             predicate,
             &partition_columns,
             &floating_partition_columns,
-            &self.state_info.physical_stats_columns,
+            &self.state_info.eligible_physical_stats_columns,
         )?;
 
         let mut prefixer = PrefixColumns {

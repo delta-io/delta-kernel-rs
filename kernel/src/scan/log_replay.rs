@@ -80,13 +80,17 @@ struct InternalScanState {
     partition_values_options: ScanPartitionValuesOptions,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
-    /// Physical leaf paths which are expected to have stats collected. Carried alongside
+    /// Physical leaf paths eligible for data skipping. Carried alongside
     /// `physical_stats_schema` so the distributed `DataSkippingFilter` rebuilds the same
     /// filter the sequential phase used. `#[serde(default)]` keeps older blobs readable:
     /// an empty set drops every data-column reference, which means no skipping but is
     /// still correct.
     #[serde(default)]
-    physical_stats_columns: HashSet<ColumnName>,
+    eligible_physical_stats_columns: HashSet<ColumnName>,
+    /// Caller-requested physical stats columns preserved across distributed log replay.
+    /// `serde(default)` accepts serialized representations that omit this field.
+    #[serde(default)]
+    requested_physical_stats_columns: Vec<ColumnName>,
     #[serde(default)]
     is_catalog_managed: bool,
     skip_row_transforms: bool,
@@ -302,7 +306,7 @@ impl ScanLogReplayProcessor {
                 // exactly for Add rows.
                 Arc::new(Predicate::is_not_null(col!("path")).into()),
                 output_schema.clone(),
-                &state_info.physical_stats_columns,
+                &state_info.eligible_physical_stats_columns,
                 Some(metrics.clone()),
             )
         };
@@ -381,7 +385,8 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             physical_partition_schema,
-            physical_stats_columns,
+            eligible_physical_stats_columns,
+            requested_physical_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
         } = self.state_info.as_ref().clone();
@@ -403,7 +408,8 @@ impl ScanLogReplayProcessor {
             stats_options: self.stats_options,
             partition_values_options: self.partition_values_options,
             physical_partition_schema,
-            physical_stats_columns,
+            eligible_physical_stats_columns,
+            requested_physical_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
         };
@@ -462,7 +468,8 @@ impl ScanLogReplayProcessor {
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
-            physical_stats_columns: internal_state.physical_stats_columns,
+            eligible_physical_stats_columns: internal_state.eligible_physical_stats_columns,
+            requested_physical_stats_columns: internal_state.requested_physical_stats_columns,
             is_catalog_managed: internal_state.is_catalog_managed,
             skip_row_transforms: internal_state.skip_row_transforms,
         });
@@ -1292,7 +1299,8 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         });
@@ -1676,7 +1684,8 @@ mod tests {
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
                 physical_partition_schema: None,
-                physical_stats_columns: HashSet::new(),
+                eligible_physical_stats_columns: HashSet::new(),
+                requested_physical_stats_columns: Vec::new(),
                 is_catalog_managed: false,
                 skip_row_transforms: false,
             });
@@ -1712,7 +1721,8 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         });
@@ -1744,7 +1754,8 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: true,
             skip_row_transforms: false,
         });
@@ -1776,7 +1787,8 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: skip,
         });
@@ -1826,7 +1838,8 @@ mod tests {
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         };
@@ -1858,7 +1871,8 @@ mod tests {
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         };
