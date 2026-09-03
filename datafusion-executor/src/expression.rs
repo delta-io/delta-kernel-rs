@@ -398,9 +398,10 @@ fn struct_columns_from_patch(
 /// via [`get_field`]. The whole struct is nulled where the input map row is null, via `<map> IS NOT
 /// NULL`.
 ///
-/// KNOWN DIVERGENCES from the kernel parser, all confined to malformed or non-spec-compliant input
-/// (spec-compliant writers never emit any of these):
-/// - Duplicate keys: `get_field` takes the leftmost entry, the kernel evaluator the rightmost.
+/// KNOWN DIVERGENCES from the kernel parser, confined to malformed or non-spec-compliant values
+/// (spec-compliant writers never emit them):
+/// - Duplicate keys may resolve differently between evaluators. Their behavior is undefined by the
+///   `MapToStruct` contract.
 /// - Boolean: arrow's cast also accepts `"yes"`/`"no"`/`"on"`/`"off"`/`"t"`/`"f"`/`"1"`/`"0"`,
 ///   while kernel accepts only `"true"`/`"false"`.
 /// - Decimal: arrow's cast silently rescales/rounds to the target scale, while kernel requires the
