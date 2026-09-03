@@ -24,7 +24,8 @@ use delta_kernel::{
     FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
-use futures::{ready, StreamExt, TryStreamExt};
+use futures::{ready, FutureExt, StreamExt, TryStreamExt};
+use tokio::sync::mpsc;
 use url::Url;
 
 use crate::executor::TaskExecutor;
@@ -42,6 +43,9 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
     batch_size: NonZero<usize>,
+    /// Number of ordered file chunks to parse concurrently. `None` means
+    /// no parallelism (default).
+    parallel_chunks: Option<NonZero<usize>>,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -51,6 +55,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
             task_executor,
             buffer_size: super::DEFAULT_READ_BUFFER_SIZE,
             batch_size: super::DEFAULT_READ_BATCH_SIZE,
+            parallel_chunks: None,
         }
     }
 
@@ -79,6 +84,13 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     /// [Decoder::with_buffer_size]: delta_kernel::arrow::json::reader::Decoder
     pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Number of ordered file chunks to parse concurrently in [`Self::read_json_files`].
+    /// `None` (the default) means no parallelism, no chunking.
+    pub fn with_parallel_chunks(mut self, parallel_chunks: Option<NonZero<usize>>) -> Self {
+        self.parallel_chunks = parallel_chunks;
         self
     }
 }
@@ -124,7 +136,102 @@ async fn read_json_files_impl(
         .try_flatten()
         .map_ok(|e| -> Box<dyn EngineData> { Box::new(e) });
 
-    Ok(Box::pin(result_stream))
+    Ok(result_stream.boxed())
+}
+
+/// Parallel JSON read by splitting the ordered file list into chunks. Each chunk
+/// uses the original [`read_json_files_impl`] pipeline. The chunk pipelines run
+/// concurrently as tokio tasks and results are concatenated in order.
+///
+/// Yield order is the same as [`read_json_files_impl`].
+async fn read_json_files_parallel_impl(
+    store: Arc<DynObjectStore>,
+    files: Vec<FileMeta>,
+    physical_schema: SchemaRef,
+    predicate: Option<PredicateRef>,
+    batch_size: usize,
+    buffer_size: usize,
+    parallel_chunks: usize,
+) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
+    if files.is_empty() {
+        return Ok(Box::pin(stream::empty()));
+    }
+
+    let num_chunks = parallel_chunks.min(files.len()).max(1);
+    let chunk_size = files.len().div_ceil(num_chunks);
+    let chunks: Vec<Vec<FileMeta>> = files
+        .chunks(chunk_size)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let num_chunks = chunks.len();
+    let per_chunk_buffer = (buffer_size / num_chunks).max(1);
+
+    // Spawn each chunk as a tokio task. Each task streams batches through a
+    // channel as they are produced. We keep the JoinHandle so a panic becomes
+    // JoinFailure instead of a silent hole in the file list.
+    let channel_cap = per_chunk_buffer.saturating_mul(4).max(1);
+    let mut receivers = Vec::new();
+    let mut handles = Vec::new();
+    for chunk in chunks {
+        let (tx, rx) = mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(channel_cap);
+        receivers.push(rx);
+
+        let store = store.clone();
+        let physical_schema = physical_schema.clone();
+        let predicate = predicate.clone();
+
+        let handle = tokio::spawn(async move {
+            let result = read_json_files_impl(
+                store,
+                chunk,
+                physical_schema,
+                predicate,
+                batch_size,
+                per_chunk_buffer,
+            )
+            .await;
+            match result {
+                Ok(batch_stream) => {
+                    let mut batch_stream = std::pin::pin!(batch_stream);
+                    while let Some(batch) = batch_stream.next().await {
+                        if tx.send(batch).await.is_err() {
+                            // Consumer dropped the stream; stop this chunk.
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Drain in chunk order. After each channel closes, join the task.
+    let result_stream = stream::iter(receivers.into_iter().zip(handles))
+        .flat_map(|(rx, handle)| drain_chunk(rx, handle));
+
+    Ok(result_stream.boxed())
+}
+
+/// Drain `rx` then join `handle`. A panicked task is `Error::JoinFailure`, not EOF.
+fn drain_chunk(
+    rx: mpsc::Receiver<DeltaResult<Box<dyn EngineData>>>,
+    handle: tokio::task::JoinHandle<()>,
+) -> impl futures::Stream<Item = DeltaResult<Box<dyn EngineData>>> {
+    let batches = stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let join = stream::once(async move { handle.await.map_err(Error::join_failure) }).filter_map(
+        |result| async move {
+            match result {
+                Ok(()) => None,
+                Err(e) => Some(Err(e)),
+            }
+        },
+    );
+    batches.chain(join)
 }
 
 /// Internal async implementation of write_json_file
@@ -176,14 +283,31 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let future = read_json_files_impl(
-            self.store.clone(),
-            files.to_vec(),
-            physical_schema,
-            predicate,
-            self.batch_size.get(),
-            self.buffer_size.get(),
-        );
+        let store = self.store.clone();
+        let files = files.to_vec();
+        let batch_size = self.batch_size.get();
+        let buffer_size = self.buffer_size.get();
+        let future = match self.parallel_chunks {
+            Some(parallel_chunks) => read_json_files_parallel_impl(
+                store,
+                files,
+                physical_schema,
+                predicate,
+                batch_size,
+                buffer_size,
+                parallel_chunks.get(),
+            )
+            .boxed(),
+            None => read_json_files_impl(
+                store,
+                files,
+                physical_schema,
+                predicate,
+                batch_size,
+                buffer_size,
+            )
+            .boxed(),
+        };
         super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
             future,
@@ -283,6 +407,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
+    use std::time::Duration;
 
     use delta_kernel::actions::get_commit_schema;
     use delta_kernel::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
@@ -304,6 +429,93 @@ mod tests {
 
     use super::*;
     use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
+
+    /// Wraps an inner store and sleeps on every ObjectStore API before forwarding.
+    /// Completes whatever was requested; never waits for a path that was not asked for.
+    #[derive(Debug)]
+    struct LatencyStore<T: ObjectStore> {
+        inner: T,
+        delay: Duration,
+    }
+
+    impl<T: ObjectStore> LatencyStore<T> {
+        fn new(inner: T, delay: Duration) -> Self {
+            Self { inner, delay }
+        }
+
+        async fn delay(&self) {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+        }
+    }
+
+    impl<T: ObjectStore> std::fmt::Display for LatencyStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LatencyStore(delay={:?})", self.delay)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<T: ObjectStore> delta_kernel::object_store::ObjectStore for LatencyStore<T> {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.delay().await;
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.delay().await;
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            self.delay().await;
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.delay().await;
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.delay().await;
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.delay().await;
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests. Note
     /// that since the keys are resolved in order, requests to subsequent keys in the order will
@@ -831,6 +1043,89 @@ mod tests {
                 })
                 .collect();
             assert_eq!(all_values, (0..1000).collect_vec());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn test_read_json_files_parallel_ordering() {
+        // Parallel impl does not issue every GET up front, so OrderedGetStore
+        // would hang. LatencyStore delays each requested GET and always completes it.
+        const N: i32 = 10_000;
+        let ordered_paths: Vec<Path> = (0..N)
+            .map(|i| Path::from(format!("test/path{i}")))
+            .collect();
+
+        let memory_store = InMemory::new();
+        for (i, path) in ordered_paths.iter().enumerate() {
+            memory_store
+                .put(path, Bytes::from(format!("{{\"val\": {i}}}")).into())
+                .await
+                .unwrap();
+        }
+
+        let store = Arc::new(LatencyStore::new(memory_store, Duration::from_millis(1)));
+        let ordered_file_meta: Vec<_> = ordered_paths
+            .iter()
+            .map(|path| {
+                let store = store.clone();
+                async move {
+                    let url = Url::parse(&format!("memory:/{path}")).unwrap();
+                    let location = Path::from(path.as_ref());
+                    let meta = store.head(&location).await.unwrap();
+                    FileMeta {
+                        location: url,
+                        last_modified: meta.last_modified.timestamp_millis(),
+                        size: meta.size,
+                    }
+                }
+            })
+            .collect();
+        let files = future::join_all(ordered_file_meta).await;
+
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_buffer_size(NonZero::new(1000).expect("buffer_size is non-zero"))
+        .with_parallel_chunks(NonZero::new(100));
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let data: Vec<RecordBatch> = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .map_ok(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        let all_values: Vec<i32> = data
+            .iter()
+            .flat_map(|batch| {
+                let val_col: &Int32Array = batch.column(0).as_primitive();
+                (0..val_col.len()).map(|i| val_col.value(i)).collect_vec()
+            })
+            .collect();
+        assert_eq!(all_values, (0..N).collect_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drain_chunk_panicked_task_is_join_failure_not_eof() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(1);
+        let handle = tokio::spawn(async {
+            panic!("chunk task panicked");
+        });
+        drop(tx);
+
+        let items: Vec<_> = drain_chunk(rx, handle).collect().await;
+        assert_eq!(
+            items.len(),
+            1,
+            "panicked chunk must yield an error, not EOF"
+        );
+        match &items[0] {
+            Err(Error::JoinFailure(_)) => {}
+            Err(_) => panic!("expected JoinFailure, got a different error"),
+            Ok(_) => panic!("expected JoinFailure, got a batch"),
         }
     }
 
