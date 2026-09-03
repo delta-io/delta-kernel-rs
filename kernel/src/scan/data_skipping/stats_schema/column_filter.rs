@@ -418,11 +418,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_required_struct_column_expands_to_leaves() {
-        // A required struct past the cap must contribute its leaf paths, not the parent path,
-        // so leaf predicates (matched by exact membership in the gate) can prune.
-        let props = make_props_with_num_cols(1);
+    #[rstest::rstest]
+    #[case::all_struct_leaves_past_cap(
+        1,
+        vec![column_name!("a"), column_name!("s.x"), column_name!("s.y")],
+    )]
+    #[case::indexed_struct_leaf_is_not_duplicated(
+        3,
+        vec![
+            column_name!("a"),
+            column_name!("b"),
+            column_name!("s.x"),
+            column_name!("s.y"),
+        ],
+    )]
+    fn test_required_struct_column_expands_to_leaves(
+        #[case] num_indexed_cols: u64,
+        #[case] expected: Vec<ColumnName>,
+    ) {
+        let props = make_props_with_num_cols(num_indexed_cols);
         let required_cols = vec![column_name!("s")];
         let schema = schema! {
             nullable "a": LONG,
@@ -434,41 +448,7 @@ mod tests {
         };
 
         let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
-
-        // "a" is within the limit; "s" expands to its leaves.
-        assert_eq!(
-            columns,
-            vec![column_name!("a"), column_name!("s.x"), column_name!("s.y"),]
-        );
-    }
-
-    #[test]
-    fn test_required_struct_column_leaf_dedups_within_limit() {
-        // When the cap already covers some of a required struct's leaves, expansion adds only the
-        // ones past the cap and does not duplicate the covered leaf.
-        let props = make_props_with_num_cols(3);
-        let required_cols = vec![column_name!("s")];
-        let schema = schema! {
-            nullable "a": LONG,
-            nullable "b": LONG,
-            nullable "s": {
-                nullable "x": LONG,
-                nullable "y": LONG,
-            },
-        };
-
-        let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
-
-        // a, b, s.x fall within the limit of 3; only s.y is added by the required expansion.
-        assert_eq!(
-            columns,
-            vec![
-                column_name!("a"),
-                column_name!("b"),
-                column_name!("s.x"),
-                column_name!("s.y"),
-            ]
-        );
+        assert_eq!(columns, expected);
     }
 
     #[test]

@@ -338,44 +338,6 @@ fn surviving_paths_with_stats(
     Ok(paths)
 }
 
-#[rstest]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn past_cap_stats_column_enables_pruning_via_extra_indexed_or_requested(
-    #[values(false, true)] use_parallel: bool,
-    // Both entry points bypass the cap through the same cap-exempt mechanism: `All`'s
-    // best-effort `extra_indexed`, and `Columns`'s explicit `requested`.
-    #[values(
-        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
-        StatsOptions::struct_columns(vec![column_name!("c2")])
-    )]
-    bypass_stats: StatsOptions,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(false).await?;
-    let predicate = || Arc::new(Pred::gt(col!("c2"), lit(60i64)));
-
-    let default_survivors = surviving_paths_with_stats(
-        &table_path,
-        engine.clone(),
-        predicate(),
-        StatsOptions::all_struct(),
-        use_parallel,
-    )?;
-    assert_eq!(
-        default_survivors.len(),
-        3,
-        "c2 is capped out by default, so every file survives"
-    );
-
-    let pruned =
-        surviving_paths_with_stats(&table_path, engine, predicate(), bypass_stats, use_parallel)?;
-    assert_eq!(
-        pruned.len(),
-        1,
-        "with c2 exempt from the cap, only file C (c2 == 100 > 60) survives"
-    );
-    Ok(())
-}
-
 /// The pieces of the emitted `stats_parsed` output a test asserts on.
 struct StatsParsedOutput {
     /// Field names present in `minValues`, i.e. the emitted output columns.
@@ -473,18 +435,23 @@ async fn past_cap_column_surfaces_in_stats_parsed_output(
     Ok(())
 }
 
-/// Verifies that checkpoint reads recover past-cap stats from JSON when struct stats omit them.
+/// The checkpoint case verifies JSON recovery when struct stats omit the past-cap column.
 #[rstest]
+#[case::json_commits(false)]
+#[case::checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn past_cap_stats_recovered_from_checkpoint(
+async fn past_cap_stats_column_enables_pruning(
+    #[case] checkpoint: bool,
     #[values(false, true)] use_parallel: bool,
+    // Both entry points bypass the cap through the same cap-exempt mechanism: `All`'s
+    // best-effort `extra_indexed`, and `Columns`'s explicit `requested`.
     #[values(
         StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
         StatsOptions::struct_columns(vec![column_name!("c2")])
     )]
     bypass_stats: StatsOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(true).await?;
+    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(checkpoint).await?;
     let predicate = || Arc::new(Pred::gt(col!("c2"), lit(60i64)));
 
     let default_survivors = surviving_paths_with_stats(
@@ -497,7 +464,7 @@ async fn past_cap_stats_recovered_from_checkpoint(
     assert_eq!(
         default_survivors.len(),
         3,
-        "c2 is capped out, so without the bypass every file survives"
+        "c2 is capped out, so every file survives without the bypass"
     );
 
     let pruned =
@@ -505,7 +472,7 @@ async fn past_cap_stats_recovered_from_checkpoint(
     assert_eq!(
         pruned.len(),
         1,
-        "reading from the checkpoint, only file C (c2 == 100 > 60) survives"
+        "with c2 exempt from the cap, only file C (c2 == 100 > 60) survives"
     );
     Ok(())
 }
