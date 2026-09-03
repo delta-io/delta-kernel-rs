@@ -33,6 +33,8 @@ pub(crate) fn writer_options() -> ArrowWriterOptions {
 
 #[cfg(feature = "arrow-conversion")]
 pub mod arrow_conversion;
+#[cfg(all(feature = "default-engine-base", feature = "geo-type-in-dev"))]
+pub(crate) mod arrow_geometry;
 
 #[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;

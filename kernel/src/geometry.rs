@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
+use geo_traits::{CoordTrait, PointTrait};
 use geoarrow_array::array::WkbArray;
-use geoarrow_array::cast::{from_wkb, to_wkb};
+use geoarrow_array::cast::{from_wkb, to_wkb, AsGeoArrowArray};
+use geoarrow_array::GeoArrowArrayAccessor;
 use geoarrow_arrow_array_58::BinaryArray as GeoBinaryArray;
 use geoarrow_schema::{
-    GeoArrowType, GeometryType as GeoArrowGeometryType, Metadata as GeoArrowMetadata,
+    Dimension, GeoArrowType, GeometryType as GeoArrowGeometryType, Metadata as GeoArrowMetadata,
+    PointType,
 };
 
 use crate::schema::GeometryType;
@@ -14,6 +17,26 @@ pub(crate) fn normalize_geometry_wkb(_ty: &GeometryType, bytes: &[u8]) -> DeltaR
     let geometry = parse_wkb_geometry(bytes)?;
     let wkb = to_wkb::<i32>(geometry.as_ref()).map_err(geoarrow_error)?;
     Ok(wkb.inner().value(0).to_vec())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn extract_geometry_stats_point_xy(
+    _ty: &GeometryType,
+    bytes: &[u8],
+) -> DeltaResult<(f64, f64)> {
+    let binary = GeoBinaryArray::from(vec![Some(bytes)]);
+    let wkb = WkbArray::new(binary, Arc::new(GeoArrowMetadata::default()));
+    let point_type = PointType::new(Dimension::XY, Arc::new(GeoArrowMetadata::default()));
+    let point = from_wkb(&wkb, GeoArrowType::Point(point_type)).map_err(geoarrow_error)?;
+    let point = point.as_point();
+    let point = point
+        .get(0)
+        .map_err(geoarrow_error)?
+        .ok_or_else(|| Error::generic("Geometry stats point may not be null"))?;
+    let coord = point
+        .coord()
+        .ok_or_else(|| Error::generic("Geometry stats point may not be empty"))?;
+    Ok((coord.x(), coord.y()))
 }
 
 fn parse_wkb_geometry(bytes: &[u8]) -> DeltaResult<Arc<dyn geoarrow_array::GeoArrowArray>> {
@@ -30,18 +53,15 @@ fn geoarrow_error(err: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn zero_point_wkb() -> Vec<u8> {
-        vec![
-            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ]
-    }
+    use crate::engine::arrow_geometry::parse_geometry_stats_wkt;
 
     #[test]
     fn normalize_geometry_wkb_round_trips_point() {
         let ty = GeometryType::try_new("EPSG:4326").unwrap();
-        let bytes = zero_point_wkb();
-        assert_eq!(normalize_geometry_wkb(&ty, &bytes).unwrap(), bytes);
+        let parsed = parse_geometry_stats_wkt(&ty, "POINT(-122.419 37.774)").unwrap();
+        let bytes = normalize_geometry_wkb(&ty, parsed.bytes()).unwrap();
+        let (x, y) = extract_geometry_stats_point_xy(&ty, &bytes).unwrap();
+        assert_eq!((x, y), (-122.419, 37.774));
     }
 
     #[test]

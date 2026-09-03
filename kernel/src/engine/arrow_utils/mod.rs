@@ -14,9 +14,9 @@ use tracing::debug;
 use self::apply_schema::apply_schema_to_struct;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
-    make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray,
+    make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, BinaryBuilder,
+    GenericListArray, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions,
+    StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::{cast_with_options, CastOptions};
@@ -28,6 +28,8 @@ use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
 use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::engine::arrow_geometry::parse_geometry_stats_wkt;
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
@@ -1211,10 +1213,9 @@ fn parse_json_inner<'a>(
             decode_with_arrow_json(json_strings, num_rows, arrow_target)
         }
         Cow::Owned(relaxed) => {
-            let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
             let arrow_relaxed = Arc::new(ArrowSchema::try_from_kernel(&relaxed)?);
             let decoded = decode_with_arrow_json(json_strings, num_rows, arrow_relaxed)?;
-            safe_cast_back(decoded, &arrow_target)
+            safe_cast_back(decoded, &schema)
         }
     }
 }
@@ -1282,6 +1283,8 @@ impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
         use PrimitiveType::*;
         match ptype {
             Timestamp | TimestampNtz | Date | Decimal(_) => Cow::Owned(String),
+            #[cfg(feature = "geo-type-in-dev")]
+            Geometry(_) => Cow::Owned(String),
             _ => Cow::Borrowed(ptype),
         }
     }
@@ -1301,7 +1304,8 @@ impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
 
 /// Safe-casts each column of `decoded` back to its target type. `safe: true` produces
 /// per-cell NULL on parse failure rather than failing the whole batch.
-fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<RecordBatch> {
+fn safe_cast_back(decoded: RecordBatch, kernel_target: &SchemaRef) -> DeltaResult<RecordBatch> {
+    let target = Arc::new(ArrowSchema::try_from_kernel(kernel_target.as_ref())?);
     let opts = CastOptions {
         safe: true,
         ..Default::default()
@@ -1309,8 +1313,11 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<
     let (_, columns, row_count) = decoded.into_parts();
     let columns = columns
         .into_iter()
+        .zip(kernel_target.fields())
         .zip(target.fields().iter())
-        .map(|(arr, field)| cast_array_to_type(arr, field.data_type(), &opts))
+        .map(|((arr, field), arrow_field)| {
+            cast_array_to_kernel_type(arr, field.data_type(), arrow_field.data_type(), &opts)
+        })
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(RecordBatch::try_new_with_options(
         target.clone(),
@@ -1363,6 +1370,111 @@ pub(crate) fn coerce_columns_to_schema(
         .zip(target.fields().iter())
         .map(|(arr, field)| cast_array_to_type(arr, field.data_type(), &opts))
         .collect()
+}
+
+fn cast_array_to_kernel_type(
+    array: ArrowArrayRef,
+    target: &DataType,
+    arrow_target: &ArrowDataType,
+    opts: &CastOptions<'_>,
+) -> DeltaResult<ArrowArrayRef> {
+    match target {
+        #[cfg(feature = "geo-type-in-dev")]
+        DataType::Primitive(PrimitiveType::Geometry(geometry_type)) => {
+            cast_geometry_string_array(array, geometry_type)
+        }
+        DataType::Struct(struct_type) => {
+            let s = array.as_struct_opt().ok_or_else(|| {
+                Error::generic(format!(
+                    "cannot cast {} to a struct target",
+                    array.data_type()
+                ))
+            })?;
+            let target_fields = match arrow_target {
+                ArrowDataType::Struct(fields) => fields,
+                _ => {
+                    return Err(Error::generic(format!(
+                        "cannot cast {} to non-struct arrow target {arrow_target}",
+                        array.data_type()
+                    )))
+                }
+            };
+            let nulls = s.nulls().cloned();
+            require!(
+                s.columns().len() == struct_type.fields().len()
+                    && s.columns().len() == target_fields.len(),
+                Error::generic(format!(
+                    "cannot cast struct with {} children to target with {} fields",
+                    s.columns().len(),
+                    target_fields.len()
+                ))
+            );
+            let new_children = s
+                .columns()
+                .iter()
+                .zip(struct_type.fields())
+                .zip(target_fields.iter())
+                .map(|((child, field), arrow_field)| {
+                    cast_array_to_kernel_type(
+                        child.clone(),
+                        field.data_type(),
+                        arrow_field.data_type(),
+                        opts,
+                    )
+                })
+                .collect::<DeltaResult<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new(
+                target_fields.clone(),
+                new_children,
+                nulls,
+            )?))
+        }
+        _ => cast_array_to_type(array, arrow_target, opts),
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn cast_geometry_string_array(
+    array: ArrowArrayRef,
+    geometry_type: &crate::schema::GeometryType,
+) -> DeltaResult<ArrowArrayRef> {
+    let mut builder = BinaryBuilder::new();
+    match array.data_type() {
+        ArrowDataType::Utf8 => {
+            append_geometry_strings(&mut builder, array.as_string::<i32>().iter(), geometry_type)
+        }
+        ArrowDataType::LargeUtf8 => {
+            append_geometry_strings(&mut builder, array.as_string::<i64>().iter(), geometry_type)
+        }
+        ArrowDataType::Utf8View => {
+            append_geometry_strings(&mut builder, array.as_string_view().iter(), geometry_type)
+        }
+        ArrowDataType::Binary => return Ok(array),
+        _ => {
+            for _ in 0..array.len() {
+                builder.append_null();
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn append_geometry_strings<'a>(
+    builder: &mut BinaryBuilder,
+    values: impl Iterator<Item = Option<&'a str>>,
+    geometry_type: &crate::schema::GeometryType,
+) {
+    for raw in values {
+        match raw.and_then(|raw| {
+            (!raw.trim().is_empty())
+                .then(|| parse_geometry_stats_wkt(geometry_type, raw).ok())
+                .flatten()
+        }) {
+            Some(geometry) => builder.append_value(geometry.into_bytes()),
+            None => builder.append_null(),
+        }
+    }
 }
 
 /// Casts one Arrow [`ArrowArray`] of any type to `target`.
@@ -1586,6 +1698,8 @@ mod tests {
     use crate::parquet::basic::{Encoding, Type as PhysicalType};
     use crate::parquet::file::metadata::ColumnChunkMetaData;
     use crate::parquet::schema::types::{SchemaDescriptor, Type};
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::GeometryType;
     use crate::schema::{
         schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec,
         MetadataValue, StructField, StructType,
@@ -2025,6 +2139,62 @@ mod tests {
         for col in batch.columns() {
             assert_eq!(col.null_count(), 3);
         }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_parse_json_impl_geometry_stats_parse_to_binary() {
+        let geometry = DataType::from(GeometryType::try_new("EPSG:4326").unwrap());
+        let schema = schema_ref! {
+            nullable "minValues": {
+                nullable "geom": (geometry.clone()),
+            },
+            nullable "maxValues": {
+                nullable "geom": (geometry),
+            },
+        };
+        let inputs: Vec<Option<&str>> = vec![Some(
+            r#"{"minValues": {"geom": "POINT(-122.419 37.774)"}, "maxValues": {"geom": "POINT(-120.503 38.021)"}}"#,
+        )];
+
+        let batch = parse_json_impl(&StringArray::from(inputs), schema).unwrap();
+        let min_values = batch.column_by_name("minValues").unwrap().as_struct();
+        let max_values = batch.column_by_name("maxValues").unwrap().as_struct();
+        let min_geom = min_values.column_by_name("geom").unwrap();
+        let max_geom = max_values.column_by_name("geom").unwrap();
+
+        assert_eq!(min_geom.data_type(), &ArrowDataType::Binary);
+        assert_eq!(max_geom.data_type(), &ArrowDataType::Binary);
+        assert_eq!(min_geom.null_count(), 0);
+        assert_eq!(max_geom.null_count(), 0);
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_parse_json_impl_geometry_stats_bad_values_become_null() {
+        let geometry = DataType::from(GeometryType::try_new("EPSG:4326").unwrap());
+        let schema = schema_ref! {
+            nullable "minValues": {
+                nullable "geom": (geometry),
+            },
+        };
+        let inputs: Vec<Option<&str>> = vec![
+            Some(r#"{"minValues": {"geom": "POINT(1 2)"}}"#),
+            Some(r#"{"minValues": {"geom": "LINESTRING(0 0, 1 1)"}}"#),
+            Some(r#"{"minValues": {"geom": "not-wkt"}}"#),
+            Some(r#"{"minValues": {"geom": 5}}"#),
+            Some(r#"{"minValues": {"geom": ""}}"#),
+        ];
+
+        let batch = parse_json_impl(&StringArray::from(inputs), schema).unwrap();
+        let min_values = batch.column_by_name("minValues").unwrap().as_struct();
+        let geom = min_values.column_by_name("geom").unwrap();
+
+        assert!(!geom.is_null(0));
+        assert!(geom.is_null(1));
+        assert!(geom.is_null(2));
+        assert!(geom.is_null(3));
+        assert!(geom.is_null(4));
     }
 
     #[test]
