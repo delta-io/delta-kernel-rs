@@ -17,7 +17,6 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
-use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
@@ -746,7 +745,7 @@ impl LogSegment {
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
         let commit_stream =
-            CommitReader::try_new(engine, self, commit_read_schema, cancellation_token)?;
+            self.read_commit_actions(engine, commit_read_schema, cancellation_token)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
@@ -782,6 +781,31 @@ impl LogSegment {
             None,
         )?;
         Ok(result.actions)
+    }
+
+    /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
+    /// true`).
+    ///
+    /// Files are returned in descending version order, as log replay expects. Only the commit
+    /// cover is read; checkpoints and sidecars are not consulted.
+    #[internal_api]
+    pub(crate) fn read_commit_actions(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        let commit_files = self.find_commit_cover();
+        let actions = engine
+            .json_handler()
+            .read_json_files_with_cancellation(
+                &commit_files,
+                schema,
+                None,
+                cancellation_token.cloned(),
+            )?
+            .map_ok(|batch| ActionsBatch::new(batch, true));
+        Ok(actions)
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
