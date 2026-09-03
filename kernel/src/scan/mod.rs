@@ -1188,7 +1188,7 @@ impl Scan {
             predicate,
             &partition_columns,
             &floating_partition_columns,
-            &self.state_info.physical_stats_columns,
+            &self.state_info.eligible_physical_stats_columns,
         )?;
 
         let mut prefixer = PrefixColumns {

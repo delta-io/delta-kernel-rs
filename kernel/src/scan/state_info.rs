@@ -38,14 +38,13 @@ pub(crate) struct StateInfo {
     /// predicate-referenced columns, for partition pruning) or the engine requested the typed
     /// struct in scan output (all partition columns).
     pub(crate) physical_partition_schema: Option<SchemaRef>,
-    /// Physical leaf paths which are expected to have stats collected.
+    /// Physical leaf paths eligible for data skipping.
     ///
-    /// Differs from `physical_stats_schema` in that this is the per-table membership set
-    /// (predicate-independent). `physical_stats_schema` is the per-scan projection shape
-    /// (predicate-trimmed).
-    ///
-    /// Read-path mirror of `WriteState.stats_columns`.
-    pub(crate) physical_stats_columns: HashSet<ColumnName>,
+    /// This combines the table's indexed columns with caller-requested columns and gates which
+    /// predicate references may use stats. It can be broader than
+    /// [`Self::requested_physical_stats_columns`], which preserves the caller's selection for
+    /// `stats_parsed` output.
+    pub(crate) eligible_physical_stats_columns: HashSet<ColumnName>,
     /// Caller-requested physical stats columns used for data skipping and `stats_parsed` output.
     /// `Columns` resolves names strictly; `All` resolves them best-effort.
     pub(crate) requested_physical_stats_columns: Vec<ColumnName>,
@@ -429,9 +428,9 @@ impl StateInfo {
 
         // Stats-eligible column set. Partition columns are excluded; they flow through
         // `partitionValues_parsed` instead.
-        let physical_stats_columns =
+        let eligible_physical_stats_columns =
             table_configuration.physical_stats_columns_set(requested_physical_stats_columns_ref);
-        // Observability: predicate refs outside `physical_stats_columns` get folded to NULL
+        // Observability: predicate refs outside `eligible_physical_stats_columns` fold to NULL
         // by the gate. Surface the dropped set so an engine operator can see what got folded.
         // The filter walk is bounded by predicate width but still does a physical-name
         // resolution per ref, so gate it on the log level to skip the work when DEBUG is off.
@@ -441,7 +440,9 @@ impl StateInfo {
                 .filter(|c| {
                     get_any_level_column_physical_name(&table_schema, c, column_mapping_mode)
                         .ok()
-                        .is_some_and(|physical| !physical_stats_columns.contains(&physical))
+                        .is_some_and(|physical| {
+                            !eligible_physical_stats_columns.contains(&physical)
+                        })
                 })
                 .collect();
             if !dropped.is_empty() {
@@ -522,7 +523,7 @@ impl StateInfo {
             column_mapping_mode,
             physical_stats_schema,
             physical_partition_schema,
-            physical_stats_columns,
+            eligible_physical_stats_columns,
             requested_physical_stats_columns,
             is_catalog_managed: table_configuration.is_catalog_managed(),
             skip_row_transforms: false,
@@ -1467,7 +1468,7 @@ pub(crate) mod tests {
         );
     }
 
-    // === physical_stats_columns trims the predicate-derived stats schema ===
+    // === eligible_physical_stats_columns trims the predicate-derived stats schema ===
 
     /// Flat schema with `n` long columns named `c0..c{n-1}`.
     fn flat_long_schema(n: usize) -> SchemaRef {
@@ -1533,7 +1534,7 @@ pub(crate) mod tests {
         m
     }
 
-    /// `delta.dataSkippingNumIndexedCols` caps the `physical_stats_columns` set to the
+    /// `delta.dataSkippingNumIndexedCols` caps the `eligible_physical_stats_columns` set to the
     /// first N leaves.
     #[test]
     fn stats_columns_honors_num_indexed_cols() {
@@ -1548,7 +1549,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let cols = HashSet::from_iter([column_name!("c0"), column_name!("c1")]);
-        assert_eq!(state_info.physical_stats_columns, cols);
+        assert_eq!(state_info.eligible_physical_stats_columns, cols);
     }
 
     /// Predicate on a past-cap column: stats schema goes to `None` (no skipping), but
@@ -1627,9 +1628,9 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(state_info.physical_stats_schema.is_none());
-        assert!(!state_info.physical_stats_columns.is_empty());
+        assert!(!state_info.eligible_physical_stats_columns.is_empty());
         assert!(!state_info
-            .physical_stats_columns
+            .eligible_physical_stats_columns
             .contains(&column_name!("s.c")));
     }
 
@@ -1655,7 +1656,7 @@ pub(crate) mod tests {
         .unwrap();
         let expected_cols: HashSet<ColumnName> =
             expected.iter().map(|s| ColumnName::new([*s])).collect();
-        assert_eq!(state_info.physical_stats_columns, expected_cols);
+        assert_eq!(state_info.eligible_physical_stats_columns, expected_cols);
     }
 
     /// `numIndexedCols=3` against `{ a, b, s: { c, d } }` keeps `a, b, s.c` and drops
@@ -1736,7 +1737,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let expected = HashSet::from_iter([column_name!("s.c"), column_name!("s.d")]);
-        assert_eq!(state_info.physical_stats_columns, expected);
+        assert_eq!(state_info.eligible_physical_stats_columns, expected);
     }
 
     /// `dataSkippingStatsColumns` ("A") takes precedence over `dataSkippingNumIndexedCols`
@@ -1761,7 +1762,7 @@ pub(crate) mod tests {
         .unwrap();
         let expected_cols: HashSet<ColumnName> =
             expected.iter().map(|s| ColumnName::new([*s])).collect();
-        assert_eq!(state_info.physical_stats_columns, expected_cols);
+        assert_eq!(state_info.eligible_physical_stats_columns, expected_cols);
     }
 
     #[rstest]
@@ -1827,7 +1828,7 @@ pub(crate) mod tests {
         assert_stats_leaves(stats_schema, present, absent);
         let expected: HashSet<ColumnName> =
             expected_set.iter().map(|s| ColumnName::new([*s])).collect();
-        assert_eq!(state_info.physical_stats_columns, expected);
+        assert_eq!(state_info.eligible_physical_stats_columns, expected);
     }
 
     #[test]
@@ -1848,7 +1849,7 @@ pub(crate) mod tests {
             .expect("stats schema present because c4 is extra_indexed");
         assert_stats_leaves(stats_schema, &["c4"], &[]);
         assert!(state_info
-            .physical_stats_columns
+            .eligible_physical_stats_columns
             .contains(&column_name!("c4")));
     }
 
@@ -1891,7 +1892,7 @@ pub(crate) mod tests {
             );
         }
         assert!(state_info
-            .physical_stats_columns
+            .eligible_physical_stats_columns
             .contains(&column_name!("s.d")));
     }
 
@@ -1918,14 +1919,14 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(state_info
-            .physical_stats_columns
+            .eligible_physical_stats_columns
             .contains(&column_name!("s.c")));
         assert!(state_info
-            .physical_stats_columns
+            .eligible_physical_stats_columns
             .contains(&column_name!("s.d")));
         assert!(
             !state_info
-                .physical_stats_columns
+                .eligible_physical_stats_columns
                 .contains(&column_name!("s")),
             "the parent path must not stand in for its leaves"
         );
@@ -1960,7 +1961,7 @@ pub(crate) mod tests {
             .expect("stats schema present");
         assert_stats_leaves(stats_schema, &["phys_a", "phys_c"], &["col_c", "phys_b"]);
         assert!(state_info
-            .physical_stats_columns
+            .eligible_physical_stats_columns
             .contains(&column_name!("phys_c")));
     }
 }
