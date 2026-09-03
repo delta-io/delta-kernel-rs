@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaResult, DeltaResultIterator};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -172,9 +172,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
-        actions: Box<
-            dyn Iterator<Item = DeltaResult<delta_kernel::FilteredEngineData>> + Send + '_,
-        >,
+        actions: DeltaResultIterator<'_, delta_kernel::FilteredEngineData>,
         commit_metadata: delta_kernel::committer::CommitMetadata,
     ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
         // We hold this guard until the end of the function so we stay in the tokio context until
