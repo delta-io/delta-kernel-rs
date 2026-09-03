@@ -3653,7 +3653,11 @@ mod tests {
             snapshot_builder_set_version(&mut ptr, 99);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(result, KernelError::MissingVersionError, None);
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::MissingVersionError,
+            Some("Table version 1 is missing or unavailable for this log operation."),
+        );
 
         unsafe { free_engine(engine) }
         Ok(())

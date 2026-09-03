@@ -205,7 +205,7 @@ pub enum Error {
 
     /// One or more table versions required by a log operation are unavailable.
     ///
-    /// The payload is the first missing version.
+    /// The payload is the lowest version that the operation requires but cannot obtain.
     #[error("Table version {0} is missing or unavailable for this log operation.")]
     MissingVersion(Version),
 

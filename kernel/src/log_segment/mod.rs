@@ -209,7 +209,7 @@ impl LogSegment {
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
         validate_commit_file_types(&listed_files.ascending_commit_files)?;
-        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
+        validate_commit_files_sorted(&listed_files.ascending_commit_files)?;
 
         // Filter commits before/at checkpoint version
         let checkpoint_version =
@@ -223,6 +223,7 @@ impl LogSegment {
                 None
             };
 
+        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
         validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,
@@ -1606,7 +1607,7 @@ fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     Ok(())
 }
 
-fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     if let Some(pair) = commits
         .windows(2)
         .find(|pair| pair[0].version >= pair[1].version)
@@ -1616,7 +1617,10 @@ fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()
             pair[0], pair[1]
         )));
     }
+    Ok(())
+}
 
+fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for pair in commits.windows(2) {
         let expected_version = pair[0].version + 1;
         if expected_version != pair[1].version {
