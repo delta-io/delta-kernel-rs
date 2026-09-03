@@ -368,20 +368,6 @@ impl From<EngineExecError> for Error {
     }
 }
 
-#[cfg(test)]
-mod error_code_tests {
-    use super::*;
-
-    #[test]
-    fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
-        assert_eq!(
-            KernelError::from(Error::RowTrackingChangeFeedUnsupported(7)),
-            KernelError::RowTrackingChangeFeedUnsupported
-        );
-        assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
-    }
-}
-
 #[cfg(all(test, feature = "declarative-plans"))]
 mod tests {
     use rstest::rstest;
@@ -417,5 +403,19 @@ mod tests {
     ) {
         let err: Error = exec_error(etype, "boom").into();
         assert_eq!(err.to_string(), expected);
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            KernelError::from(Error::RowTrackingChangeFeedUnsupported(7)),
+            KernelError::RowTrackingChangeFeedUnsupported
+        );
+        assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
     }
 }

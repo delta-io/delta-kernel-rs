@@ -20,6 +20,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [dependencies]
 bytes = "1.10"
 prost = { version = "0.13", optional = true }
+serde_json = { version = "1.0.142", optional = true }
 tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
@@ -53,7 +54,7 @@ rstest = "0.23"
 default = ["default-engine-rustls", "arrow"]
 default-engine-native-tls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/native-tls", "default-engine-base"]
 default-engine-rustls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/rustls", "default-engine-base"]
-delta-kernel-unity-catalog = [ "dep:delta-kernel-unity-catalog", "dep:unity-catalog-delta-client-api" ]
+delta-kernel-unity-catalog = [ "dep:delta-kernel-unity-catalog", "dep:unity-catalog-delta-client-api", "dep:serde_json" ]
 arrow = ["arrow-59"]
 arrow-59 = ["delta_kernel/arrow-59"]
 arrow-58 = ["delta_kernel/arrow-58"]

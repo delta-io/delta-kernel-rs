@@ -57,6 +57,10 @@ pub enum DeltaTableRequirement {
 pub enum DeltaTableUpdate {
     /// Register a new staged commit with the catalog.
     AddCommit { commit: Commit },
+    /// Update the table's Delta protocol.
+    UpdateProtocol { protocol: serde_json::Value },
+    /// Update the table's Delta metadata.
+    UpdateMetadata { metadata: serde_json::Value },
     /// Inform the catalog of the latest published version.
     SetLatestBackfilledVersion {
         #[serde(rename = "latest-published-version")]
@@ -109,8 +113,7 @@ impl UpdateTableRequest {
     /// # Errors
     ///
     /// Returns an error if a singleton entry appears more than once. The UC `updateTable` endpoint
-    /// accepts at most one each of `AssertTableUuid`, `AssertEtag`, `AddCommit`, and
-    /// `SetLatestBackfilledVersion`.
+    /// accepts at most one of each requirement or update type.
     pub fn new(
         requirements: Vec<DeltaTableRequirement>,
         updates: Vec<DeltaTableUpdate>,
@@ -145,6 +148,18 @@ impl UpdateTableRequest {
                     .to_string(),
             ));
         }
+        if num_updates(|u| matches!(u, DeltaTableUpdate::UpdateProtocol { .. })) > 1 {
+            return Err(crate::error::Error::Generic(
+                "update_table request must not contain more than one UpdateProtocol update"
+                    .to_string(),
+            ));
+        }
+        if num_updates(|u| matches!(u, DeltaTableUpdate::UpdateMetadata { .. })) > 1 {
+            return Err(crate::error::Error::Generic(
+                "update_table request must not contain more than one UpdateMetadata update"
+                    .to_string(),
+            ));
+        }
         Ok(Self {
             requirements,
             updates,
@@ -174,6 +189,22 @@ impl UpdateTableRequest {
             DeltaTableUpdate::SetLatestBackfilledVersion {
                 latest_published_version,
             } => Some(*latest_published_version),
+            _ => None,
+        })
+    }
+
+    /// The protocol update payload in this request, if present.
+    pub fn protocol(&self) -> Option<&serde_json::Value> {
+        self.updates.iter().find_map(|u| match u {
+            DeltaTableUpdate::UpdateProtocol { protocol } => Some(protocol),
+            _ => None,
+        })
+    }
+
+    /// The metadata update payload in this request, if present.
+    pub fn metadata(&self) -> Option<&serde_json::Value> {
+        self.updates.iter().find_map(|u| match u {
+            DeltaTableUpdate::UpdateMetadata { metadata } => Some(metadata),
             _ => None,
         })
     }
@@ -472,6 +503,27 @@ mod tests {
     }
 
     #[test]
+    fn update_protocol_wire_shape() {
+        let v = serde_json::to_value(DeltaTableUpdate::UpdateProtocol {
+            protocol: serde_json::json!({"minReaderVersion": 3, "minWriterVersion": 7}),
+        })
+        .unwrap();
+        assert_eq!(v["action"], "update-protocol");
+        assert_eq!(v["protocol"]["minReaderVersion"], 3);
+        assert_eq!(v["protocol"]["minWriterVersion"], 7);
+    }
+
+    #[test]
+    fn update_metadata_wire_shape() {
+        let v = serde_json::to_value(DeltaTableUpdate::UpdateMetadata {
+            metadata: serde_json::json!({"id": "test-id"}),
+        })
+        .unwrap();
+        assert_eq!(v["action"], "update-metadata");
+        assert_eq!(v["metadata"]["id"], "test-id");
+    }
+
+    #[test]
     fn requirement_assert_table_uuid_wire_shape() {
         let v = serde_json::to_value(DeltaTableRequirement::AssertTableUuid {
             uuid: "abc".to_string(),
@@ -598,12 +650,50 @@ mod tests {
             "more than one AddCommit must be rejected"
         );
 
+        assert!(
+            UpdateTableRequest::new(
+                vec![],
+                vec![
+                    DeltaTableUpdate::UpdateProtocol {
+                        protocol: serde_json::json!({"minReaderVersion": 1}),
+                    },
+                    DeltaTableUpdate::UpdateProtocol {
+                        protocol: serde_json::json!({"minReaderVersion": 2}),
+                    },
+                ],
+            )
+            .is_err(),
+            "more than one UpdateProtocol must be rejected"
+        );
+
+        assert!(
+            UpdateTableRequest::new(
+                vec![],
+                vec![
+                    DeltaTableUpdate::UpdateMetadata {
+                        metadata: serde_json::json!({"id": "a"}),
+                    },
+                    DeltaTableUpdate::UpdateMetadata {
+                        metadata: serde_json::json!({"id": "b"}),
+                    },
+                ],
+            )
+            .is_err(),
+            "more than one UpdateMetadata must be rejected"
+        );
+
         // A single AddCommit alongside the other singletons is accepted.
         assert!(UpdateTableRequest::new(
             vec![],
             vec![
                 DeltaTableUpdate::AddCommit {
                     commit: sample_commit(),
+                },
+                DeltaTableUpdate::UpdateProtocol {
+                    protocol: serde_json::json!({"minReaderVersion": 3}),
+                },
+                DeltaTableUpdate::UpdateMetadata {
+                    metadata: serde_json::json!({"id": "test-id"}),
                 },
                 DeltaTableUpdate::SetLatestBackfilledVersion {
                     latest_published_version: 3,
@@ -635,6 +725,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.staged_commit(), None);
+    }
+
+    #[test]
+    fn protocol_and_metadata_return_payloads_when_present() {
+        let protocol = serde_json::json!({"minReaderVersion": 3});
+        let metadata = serde_json::json!({"id": "test-id"});
+        let req = UpdateTableRequest::new(
+            vec![],
+            vec![
+                DeltaTableUpdate::UpdateProtocol {
+                    protocol: protocol.clone(),
+                },
+                DeltaTableUpdate::UpdateMetadata {
+                    metadata: metadata.clone(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(req.protocol(), Some(&protocol));
+        assert_eq!(req.metadata(), Some(&metadata));
     }
 
     #[test]
