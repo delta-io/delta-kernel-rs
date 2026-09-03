@@ -59,6 +59,19 @@ env:
 # are installed via taiki-e/install-action, which fetches prebuilt binaries.
 
 jobs:
+  ai-review-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Validate AI reviewer config
+        run: >-
+          python3 -m unittest discover
+          --start-directory .github/omnigent/tests
+          --pattern test_inline_review.py
+
   format:
     runs-on: ubuntu-latest
     steps:
