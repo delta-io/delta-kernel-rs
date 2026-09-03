@@ -14,7 +14,7 @@ use itertools::Itertools;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, FileMeta};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta};
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -34,7 +34,7 @@ use crate::{DeltaResult, Engine, EngineData, FileMeta};
 #[internal_api]
 pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
     processor: P,
-    leaf_checkpoint_reader: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>>>,
+    leaf_checkpoint_reader: DeltaResultIteratorStatic<ActionsBatch>,
 }
 
 impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
@@ -76,7 +76,7 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     #[allow(unused)]
     pub(crate) fn new_from_iter(
         processor: P,
-        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
+        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
         let leaf_checkpoint_reader = iter
             .into_iter()

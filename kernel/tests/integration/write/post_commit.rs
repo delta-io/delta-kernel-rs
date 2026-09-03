@@ -121,7 +121,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
 }
 
 #[tokio::test]
-async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_table(
+async fn test_write_context_builder_rejects_partition_values_on_unpartitioned_table(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_int_schema();
 
@@ -132,12 +132,14 @@ async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_t
         let txn = begin_transaction(snapshot.clone(), &engine)?.with_engine_info("test");
         let write_state = txn.write_state()?;
 
-        let result = write_state.partitioned_write_context(HashMap::from([(
-            "nonexistent".to_string(),
-            Scalar::String("val".into()),
-        )]));
-        let err =
-            result.expect_err("should fail with partitioned_write_context on unpartitioned table");
+        let result = write_state
+            .write_context_builder()
+            .with_partition_values(HashMap::from([(
+                "nonexistent".to_string(),
+                Scalar::String("val".into()),
+            )]))
+            .build();
+        let err = result.expect_err("partition values should fail on an unpartitioned table");
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("table is not partitioned"),

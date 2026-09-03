@@ -57,6 +57,90 @@ pub struct WriteState {
     pub(super) random_prefix_length: NonZero<usize>,
 }
 
+/// Builds a [`BoundWriteContext`].
+#[derive(Debug)]
+pub struct WriteContextBuilder {
+    write_state: Arc<WriteState>,
+    partition_values: Option<HashMap<String, Scalar>>,
+}
+
+impl WriteContextBuilder {
+    /// Binds one typed value for each logical partition column.
+    ///
+    /// Values are validated and serialized according to the Delta protocol when
+    /// [`build`](Self::build) is called, then keyed by physical column name in the returned
+    /// context. Null-equivalent values require nullable partition columns.
+    ///
+    /// Names are matched case-insensitively and normalized to schema case. The map must contain
+    /// every partition column and no other keys.
+    pub fn with_partition_values(mut self, partition_values: HashMap<String, Scalar>) -> Self {
+        self.partition_values = Some(partition_values);
+        self
+    }
+
+    /// Builds the write context.
+    ///
+    /// Returns an error if partition values are present for an unpartitioned table, absent for a
+    /// partitioned table, or invalid.
+    pub fn build(self) -> DeltaResult<BoundWriteContext> {
+        let is_partitioned = !self.write_state.logical_partition_columns.is_empty();
+        require!(
+            is_partitioned || self.partition_values.is_none(),
+            Error::invalid_partition_values(
+                "table is not partitioned; partition values are not allowed"
+            )
+        );
+        require!(
+            !is_partitioned || self.partition_values.is_some(),
+            Error::invalid_partition_values("table is partitioned; partition values are required")
+        );
+        let normalized = self
+            .partition_values
+            .map(|partition_values| {
+                validate_partition_values(
+                    &self.write_state.logical_partition_columns,
+                    &self.write_state.full_logical_schema,
+                    partition_values,
+                )
+            })
+            .transpose()?;
+
+        let mut serialized = HashMap::with_capacity(normalized.as_ref().map_or(0, HashMap::len));
+        if let Some(normalized) = &normalized {
+            for logical_name in &self.write_state.logical_partition_columns {
+                let scalar = normalized.get(logical_name).ok_or_else(|| {
+                    Error::internal_error(format!(
+                        "partition column '{logical_name}' missing after validation"
+                    ))
+                })?;
+                let value = serialize_partition_value(scalar)?;
+                let physical_name = self
+                    .write_state
+                    .full_logical_schema
+                    .field(logical_name)
+                    .ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "partition column '{logical_name}' not found in schema after validation"
+                        ))
+                    })?
+                    .physical_name(self.write_state.column_mapping_mode)
+                    .to_string();
+                serialized.insert(physical_name, value);
+            }
+        }
+        let logical_to_physical = Arc::new(
+            self.write_state
+                .generate_logical_to_physical(normalized.as_ref())?,
+        );
+
+        Ok(BoundWriteContext {
+            write_state: self.write_state,
+            logical_to_physical,
+            physical_partition_values: serialized,
+        })
+    }
+}
+
 #[derive(Serialize)]
 struct WriteStateWire<'a> {
     version: u32,
@@ -70,90 +154,15 @@ struct DecodedWriteStateWire {
 }
 
 impl WriteState {
-    pub(super) fn new(table_config: &TableConfiguration, stats_columns: Vec<ColumnName>) -> Self {
-        let props = table_config.table_properties();
-        Self {
-            table_root: table_config.table_root().clone(),
-            full_logical_schema: table_config.logical_schema(),
-            logical_schema: table_config.logical_schema_without_partition_columns(),
-            physical_schema: table_config.physical_write_schema(),
-            column_mapping_mode: table_config.column_mapping_mode(),
-            stats_columns,
-            logical_partition_columns: table_config.logical_partition_columns().to_vec(),
-            materialize_partition_columns: table_config.should_materialize_partition_columns(),
-            randomize_file_prefixes: props.should_randomize_file_prefixes(),
-            random_prefix_length: props.random_prefix_length(),
-        }
-    }
-
-    /// Creates a write context bound to one partition.
+    /// Creates a builder for a write context.
     ///
-    /// `partition_values` must contain one typed value for every logical partition column and no
-    /// other keys. Names are matched case-insensitively and normalized to schema case. Values are
-    /// validated, serialized according to the Delta protocol, and keyed by physical column name in
-    /// the returned context. Null-equivalent values require nullable partition columns.
-    ///
-    /// The context materializes partition columns when required by the table protocol. Input data
-    /// passed to its logical-to-physical expression must omit partition columns.
-    ///
-    /// Returns an error if the table is unpartitioned or the keys or values are invalid.
-    pub fn partitioned_write_context(
-        self: &Arc<Self>,
-        partition_values: HashMap<String, Scalar>,
-    ) -> DeltaResult<BoundWriteContext> {
-        require!(
-            !self.logical_partition_columns.is_empty(),
-            Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
-        );
-        let normalized = validate_partition_values(
-            &self.logical_partition_columns,
-            &self.full_logical_schema,
-            partition_values,
-        )?;
-
-        let mut serialized = HashMap::with_capacity(normalized.len());
-        for logical_name in &self.logical_partition_columns {
-            let scalar = normalized.get(logical_name).ok_or_else(|| {
-                Error::internal_error(format!(
-                    "partition column '{logical_name}' missing after validation"
-                ))
-            })?;
-            let value = serialize_partition_value(scalar)?;
-            let physical_name = self
-                .full_logical_schema
-                .field(logical_name)
-                .ok_or_else(|| {
-                    Error::internal_error(format!(
-                        "partition column '{logical_name}' not found in schema after validation"
-                    ))
-                })?
-                .physical_name(self.column_mapping_mode)
-                .to_string();
-            serialized.insert(physical_name, value);
-        }
-        let logical_to_physical = Arc::new(self.generate_logical_to_physical(Some(&normalized))?);
-
-        Ok(BoundWriteContext {
+    /// For an unpartitioned table, call [`WriteContextBuilder::build`] directly. For a partitioned
+    /// table, call [`WriteContextBuilder::with_partition_values`] first.
+    pub fn write_context_builder(self: &Arc<Self>) -> WriteContextBuilder {
+        WriteContextBuilder {
             write_state: Arc::clone(self),
-            logical_to_physical,
-            physical_partition_values: serialized,
-        })
-    }
-
-    /// Creates a write context for writing data to an unpartitioned table.
-    ///
-    /// Returns an error if the table has partition columns.
-    pub fn unpartitioned_write_context(self: &Arc<Self>) -> DeltaResult<BoundWriteContext> {
-        require!(
-            self.logical_partition_columns.is_empty(),
-            Error::generic("table is partitioned; use partitioned_write_context() instead")
-        );
-        let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
-        Ok(BoundWriteContext {
-            write_state: Arc::clone(self),
-            logical_to_physical,
-            physical_partition_values: HashMap::new(),
-        })
+            partition_values: None,
+        }
     }
 
     /// Encodes this write state as opaque, versioned JSON bytes for transport.
@@ -186,6 +195,22 @@ impl WriteState {
             ))
         );
         Ok(Arc::new(wire.write_state))
+    }
+
+    pub(super) fn new(table_config: &TableConfiguration, stats_columns: Vec<ColumnName>) -> Self {
+        let props = table_config.table_properties();
+        Self {
+            table_root: table_config.table_root().clone(),
+            full_logical_schema: table_config.logical_schema(),
+            logical_schema: table_config.logical_schema_without_partition_columns(),
+            physical_schema: table_config.physical_write_schema(),
+            column_mapping_mode: table_config.column_mapping_mode(),
+            stats_columns,
+            logical_partition_columns: table_config.logical_partition_columns().to_vec(),
+            materialize_partition_columns: table_config.should_materialize_partition_columns(),
+            randomize_file_prefixes: props.should_randomize_file_prefixes(),
+            random_prefix_length: props.random_prefix_length(),
+        }
     }
 
     fn generate_logical_to_physical(
@@ -313,8 +338,16 @@ mod tests {
         assert_eq!(decoded.logical_schema, original.logical_schema);
 
         let values = || HashMap::from([("year".to_string(), Scalar::Integer(2024))]);
-        let original_context = original.partitioned_write_context(values()).unwrap();
-        let decoded_context = decoded.partitioned_write_context(values()).unwrap();
+        let original_context = original
+            .write_context_builder()
+            .with_partition_values(values())
+            .build()
+            .unwrap();
+        let decoded_context = decoded
+            .write_context_builder()
+            .with_partition_values(values())
+            .build()
+            .unwrap();
 
         assert!(Arc::ptr_eq(&original, &original_context.write_state));
         assert!(Arc::ptr_eq(&decoded, &decoded_context.write_state));

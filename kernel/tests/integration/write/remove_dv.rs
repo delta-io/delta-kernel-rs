@@ -100,7 +100,7 @@ async fn append_only_enforces_data_change_for_file_actions(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
-    let write_context = txn.write_state()?.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let arrow_schema: Arc<ArrowSchema> =
         Arc::new(write_context.physical_schema().as_ref().try_into_arrow()?);
     for value in [1, 2, 3] {
@@ -1978,10 +1978,13 @@ async fn test_remove_files_partitioned_with_parsed_columns(
             Ok(Box::new(ArrowEngineData::new(data)))
         });
         for (data, partition_val) in append_data.into_iter().zip(["usa", "japan"]) {
-            let ctx = write_state.partitioned_write_context(HashMap::from([(
-                partition_col.to_string(),
-                Scalar::String(partition_val.into()),
-            )]))?;
+            let ctx = write_state
+                .write_context_builder()
+                .with_partition_values(HashMap::from([(
+                    partition_col.to_string(),
+                    Scalar::String(partition_val.into()),
+                )]))
+                .build()?;
             let add_meta = engine.write_parquet(data?.as_ref(), &ctx).await?;
             txn.add_files(add_meta);
         }

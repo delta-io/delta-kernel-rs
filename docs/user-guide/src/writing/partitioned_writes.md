@@ -56,7 +56,10 @@ let partitions: Vec<(HashMap<String, Scalar>, RecordBatch)> = todo!("group your 
 
 for (partition_values, batch) in partitions {
     // 1. Create a BoundWriteContext for this partition
-    let wc = write_state.partitioned_write_context(partition_values)?;
+    let wc = write_state
+        .write_context_builder()
+        .with_partition_values(partition_values)
+        .build()?;
 
     // 2. Write the data (the logical write schema excludes partition columns)
     let data = ArrowEngineData::new(batch);
@@ -72,15 +75,18 @@ txn.commit(&engine)?;
 # }
 ```
 
-Each `partitioned_write_context` call takes a `HashMap<String, Scalar>` mapping logical
-partition column names to typed values:
+Each builder can take a `HashMap<String, Scalar>` mapping logical partition column names to typed
+values:
 
 ```rust,ignore
 let partition_values = HashMap::from([
     ("year".to_string(), Scalar::Integer(2024)),
     ("month".to_string(), Scalar::Integer(3)),
 ]);
-let wc = write_state.partitioned_write_context(partition_values)?;
+let wc = write_state
+    .write_context_builder()
+    .with_partition_values(partition_values)
+    .build()?;
 ```
 
 For distributed writes, encode the state on the coordinator and decode it on each worker before
@@ -94,7 +100,10 @@ send_to_workers(encoded);
 
 // Worker
 let write_state = WriteState::decode(&encoded)?;
-let wc = write_state.partitioned_write_context(partition_values)?;
+let wc = write_state
+    .write_context_builder()
+    .with_partition_values(partition_values)
+    .build()?;
 ```
 
 Key points:
@@ -119,8 +128,8 @@ Key points:
 ## Grouping data by partition values
 
 How you group data by partition values is up to your connector. Kernel's contract is
-that each `partitioned_write_context` call receives a `HashMap<String, Scalar>` for one
-distinct partition, and the corresponding data files contain only that partition's rows.
+that each write-context builder receives a `HashMap<String, Scalar>` for one distinct partition,
+and the corresponding data files contain only that partition's rows.
 
 Kernel provides `serialize_partition_value` as a public utility for building hashable
 group keys from `Scalar` values. It returns a `DeltaResult<Option<String>>` per value,
@@ -128,8 +137,7 @@ which you can collect into a `Vec<Option<String>>` group key for use in a `HashM
 
 ## Partition value validation
 
-`partitioned_write_context` validates the provided values before creating the
-`BoundWriteContext`:
+`WriteContextBuilder::build` validates the provided values before creating the `BoundWriteContext`:
 
 | Check | Example |
 |-------|---------|
@@ -138,13 +146,12 @@ which you can collect into a `Vec<Option<String>>` group key for use in a `HashM
 | Type mismatch | `Scalar::String("2024")` for an `INTEGER` column |
 | Duplicate after case normalization | Both `"YEAR"` and `"year"` provided |
 
-If validation fails, `partitioned_write_context` returns an error before any data reaches
-disk.
+If validation fails, `build` returns an error before any data reaches disk.
 
 ## What Kernel handles
 
-When you call `partitioned_write_context`, Kernel performs the following steps internally.
-Your connector does not need to implement any of this:
+When you build a partitioned write context, Kernel performs the following steps internally. Your
+connector does not need to implement any of this:
 
 1. **Key validation**: all partition columns present, no extra keys
 2. **Case normalization**: keys matched case-insensitively against the schema

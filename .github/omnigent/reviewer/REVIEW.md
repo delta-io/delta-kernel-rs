@@ -29,14 +29,16 @@ Route the review to these sub-agents, each with `args.purpose: "review"` and a
 - `test-coverage-reviewer` -- whether tests cover new/changed logic paths.
 - `docs-reviewer` -- doc/comment accuracy and consistency with the code.
 
-Pass each sub-agent the diff text and the PR metadata as its input. Reviewers
-may use their bounded read-only source tools to inspect surrounding files in
-the exact PR checkout or read-only Delta checkout. They do not open PRs, post
-comments, edit or execute files, run shell commands, read environment
-variables, or make network calls. Dispatch the relevant reviewers (skip a
-reviewer whose aspect the diff clearly does not touch -- e.g. no docs changes
-for the docs reviewer) concurrently in one batch, respecting the reviewer
-roster cap; supervise via the inbox, never busy-poll.
+Give each sub-agent only its review focus in `args.input`; the workflow
+mechanically appends the same SHA-bound PR metadata and diff to every
+dispatch. Do not copy, summarize, replace, or use a placeholder for that
+context. Reviewers may use their bounded read-only source tools to inspect
+surrounding files in the exact PR checkout or read-only Delta checkout. They
+do not open PRs, post comments, edit or execute files, run shell commands,
+read environment variables, or make network calls. Dispatch the relevant
+reviewers (skip a reviewer whose aspect the diff clearly does not touch --
+e.g. no docs changes for the docs reviewer) concurrently in one batch,
+respecting the reviewer roster cap; supervise via the inbox, never busy-poll.
 
 ## Act in the same turn you announce
 Never end a turn after only saying what you will do. Emit the
@@ -85,6 +87,13 @@ Each finding must include:
 - `Suggested fix:` with a concrete change. Include a short code snippet when
   it makes the fix clearer; omit snippets for trivial one-line fixes.
 
+When the invocation prompt requests inline output, append the exact
+machine-readable block it specifies after the human-readable review and before
+the final per-run marker. Select findings according to the invocation's cap and
+priority order, using locations from the supplied unified diff. Findings not
+selected for inline publication remain in the collapsed review. The workflow
+validates this data and removes it before publication.
+
 ## Final writing pass
 Before returning the final comment, do one human-style polish pass over the
 consolidated review. This pass may rewrite wording only; it must not add,
@@ -119,8 +128,9 @@ Failure code: dispatch_failed|reviewer_failed|disprove_failed|timeout|other
 Failed agents: comma-separated agent names, or none
 Do not downgrade a finding to bypass a failed gate.
 
-Your output is posted verbatim as a PR comment. Output ONLY the final
-consolidated review -- no narration and no status updates. Include reviewer
-attribution on findings as required above. Begin and end your response with
-the exact per-run markers supplied in the invocation prompt. Put each marker
-on its own line. Nothing outside those markers will be shown.
+The human-readable part of your output is published verbatim. Output ONLY the
+final consolidated review and any requested machine-readable block -- no
+narration and no status updates. Include reviewer attribution on findings as
+required above. Begin and end your response with the exact per-run markers
+supplied in the invocation prompt. Put each marker on its own line. Nothing
+outside those markers will be shown.
