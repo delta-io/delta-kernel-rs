@@ -1,16 +1,16 @@
-//! Integration tests for `Transaction::with_external_root_manifest`.
+//! Integration tests for `Transaction::with_root_manifest_file`.
 #![cfg(feature = "adaptive-metadata-in-dev")]
 
-use std::sync::Arc;
+use std::collections::HashMap;
 
-use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::{Engine, FileMeta};
 use serde_json::json;
+use tempfile::TempDir;
 use test_utils::{
     begin_transaction, create_table, create_table_with_column_mapping_mode, engine_store_setup,
+    read_actions_from_commit,
 };
 use url::Url;
 
@@ -28,35 +28,19 @@ const WRITER_FEATURES: &[&str] = &[
     "adaptiveMetadata-preview",
 ];
 
-/// Reads the raw actions of type `action_type` (e.g. `"checkpoint"`) from a commit file.
-async fn read_commit_actions(
-    store: &DynObjectStore,
-    table_url: &Url,
-    version: u64,
-    action_type: &str,
-) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let commit_path = table_url.join(&format!("_delta_log/{version:020}.json"))?;
-    let path = Path::from_url_path(commit_path.path())?;
-    let content = store.get(&path).await?.bytes().await?;
-    let parsed: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&content)
-        .into_iter::<serde_json::Value>()
-        .collect::<Result<_, _>>()?;
-    Ok(parsed
-        .into_iter()
-        .filter_map(|v| v.get(action_type).cloned())
-        .collect())
-}
-
-/// Creates a table supporting `adaptiveMetadata-preview` (and its full dependency chain) at
-/// version 0, and loads a snapshot at that version.
+/// Creates a file-backed table supporting `adaptiveMetadata-preview` (and its full dependency
+/// chain) at version 0, and loads a snapshot at that version. The returned [`TempDir`] must be kept
+/// alive for the table's lifetime.
 async fn setup_adaptive_metadata_table(
     table_name: &str,
-) -> Result<(impl Engine, Arc<DynObjectStore>, Url, SnapshotRef), Box<dyn std::error::Error>> {
-    let (store, engine, table_url) = engine_store_setup(table_name, None);
+) -> Result<(impl Engine, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
+    let (store, engine, table_url) = engine_store_setup(table_name, Some(&dir_url));
     let schema = schema_ref! { nullable "id": INTEGER };
 
     create_table_with_column_mapping_mode(
-        store.clone(),
+        store,
         table_url.clone(),
         schema,
         &[],
@@ -67,26 +51,28 @@ async fn setup_adaptive_metadata_table(
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    Ok((engine, store, table_url, snapshot))
+    // Return the snapshot's canonicalized root (macOS resolves `/var` -> `/private/var`) so
+    // manifest paths match the locality check.
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+    let table_root = snapshot.table_root().clone();
+    Ok((engine, temp_dir, table_root, snapshot))
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_with_external_root_manifest_produces_a_self_contained_checkpoint_action(
+async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_action(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (engine, store, table_url, snapshot) =
-        setup_adaptive_metadata_table("external_root_manifest_checkpoint").await?;
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_file_checkpoint").await?;
 
     let file = FileMeta {
         location: table_url.join("metadata/root-v1.parquet")?,
         last_modified: 0,
         size: 1024,
     };
-    let txn = begin_transaction(snapshot, &engine)?.with_external_root_manifest(file.clone())?;
+    let txn = begin_transaction(snapshot, &engine)?.with_root_manifest_file(file.clone())?;
     txn.commit(&engine)?.unwrap_committed();
 
-    let checkpoint_actions =
-        read_commit_actions(store.as_ref(), &table_url, 1, "checkpoint").await?;
+    let checkpoint_actions = read_actions_from_commit(&table_url, 1, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);
     let entries = checkpoint_actions[0]
         .as_array()
@@ -106,26 +92,26 @@ async fn test_with_external_root_manifest_produces_a_self_contained_checkpoint_a
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_with_external_root_manifest_rejects_a_file_outside_the_table_root(
+async fn test_with_root_manifest_file_rejects_a_file_outside_the_table_root(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (engine, _store, _table_url, snapshot) =
-        setup_adaptive_metadata_table("external_root_manifest_locality").await?;
+    let (engine, _temp_dir, _table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_file_locality").await?;
 
     let file = FileMeta {
         location: Url::parse("memory:///elsewhere/root.parquet")?,
         last_modified: 0,
         size: 1024,
     };
-    let result = begin_transaction(snapshot, &engine)?.with_external_root_manifest(file);
+    let result = begin_transaction(snapshot, &engine)?.with_root_manifest_file(file);
     assert!(result.is_err());
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_with_external_root_manifest_merges_domain_metadata_and_transactions(
+async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (engine, store, table_url, snapshot) =
-        setup_adaptive_metadata_table("external_root_manifest_merge").await?;
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_file_merge").await?;
 
     let txn = begin_transaction(snapshot, &engine)?
         .with_domain_metadata("my.domain".to_string(), "v1".to_string())
@@ -138,19 +124,18 @@ async fn test_with_external_root_manifest_merges_domain_metadata_and_transaction
         size: 1024,
     };
     let txn = begin_transaction(snapshot, &engine)?
-        .with_external_root_manifest(file)?
+        .with_root_manifest_file(file)?
         .with_domain_metadata("my.domain".to_string(), "v2".to_string())
         .with_transaction_id("app-2".to_string(), 7);
     txn.commit(&engine)?.unwrap_committed();
 
-    let checkpoint_actions =
-        read_commit_actions(store.as_ref(), &table_url, 2, "checkpoint").await?;
+    let checkpoint_actions = read_actions_from_commit(&table_url, 2, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);
     let entries = checkpoint_actions[0]
         .as_array()
         .expect("checkpoint is an array");
 
-    let domain_metadata: std::collections::HashMap<String, String> = entries
+    let domain_metadata: HashMap<String, String> = entries
         .iter()
         .filter_map(|e| e.get("domainMetadata"))
         .map(|dm| {
@@ -162,7 +147,7 @@ async fn test_with_external_root_manifest_merges_domain_metadata_and_transaction
         .collect();
     assert_eq!(domain_metadata.get("my.domain"), Some(&"v2".to_string()));
 
-    let transactions: std::collections::HashMap<String, i64> = entries
+    let transactions: HashMap<String, i64> = entries
         .iter()
         .filter_map(|e| e.get("txn"))
         .map(|txn| {
@@ -179,9 +164,9 @@ async fn test_with_external_root_manifest_merges_domain_metadata_and_transaction
 }
 
 #[tokio::test]
-async fn test_with_external_root_manifest_requires_the_feature(
+async fn test_with_root_manifest_file_requires_the_feature(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, engine, table_url) = engine_store_setup("external_root_manifest_no_feature", None);
+    let (store, engine, table_url) = engine_store_setup("root_manifest_file_no_feature", None);
     let schema = schema_ref! { nullable "id": INTEGER };
     create_table(store, table_url.clone(), schema, &[], true, vec![], vec![]).await?;
 
@@ -190,8 +175,8 @@ async fn test_with_external_root_manifest_requires_the_feature(
         last_modified: 0,
         size: 1024,
     };
-    let result = test_utils::load_and_begin_transaction(table_url.as_str(), &engine)?
-        .with_external_root_manifest(file);
-    assert!(result.is_err());
+    let txn = test_utils::load_and_begin_transaction(table_url.as_str(), &engine)?
+        .with_root_manifest_file(file)?;
+    assert!(txn.commit(&engine).is_err());
     Ok(())
 }
