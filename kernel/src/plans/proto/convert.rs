@@ -10,6 +10,8 @@ use super::schema::SimplePrimitiveType as Simple;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::expressions::GeometryData;
 use crate::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
@@ -551,6 +553,8 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::IntervalDayTime(v) => Value::IntervalDayTime(*v),
             Scalar::Date(v) => Value::Date(*v),
             Scalar::Binary(v) => Value::Binary(v.clone()),
+            #[cfg(feature = "geo-type-in-dev")]
+            Scalar::Geometry(geometry) => Value::Geometry(geometry.into()),
             Scalar::Decimal(decimal) => Value::Decimal(decimal.into()),
             Scalar::Null(data_type) => Value::Null(data_type.into()),
             Scalar::Struct(struct_data) => Value::Struct(struct_data.into()),
@@ -566,6 +570,16 @@ impl From<&DecimalData> for proto_expr::DecimalData {
         proto_expr::DecimalData {
             bits: decimal.bits().to_be_bytes().to_vec(),
             decimal_type: Some((*decimal.ty()).into()),
+        }
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<&GeometryData> for proto_expr::GeometryData {
+    fn from(geometry: &GeometryData) -> Self {
+        proto_expr::GeometryData {
+            geometry_type: Some(geometry.ty().into()),
+            wkb: geometry.bytes().to_vec(),
         }
     }
 }
@@ -975,6 +989,8 @@ mod tests {
     #[cfg(feature = "geo-type-in-dev")]
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::expressions::GeometryData;
     use crate::expressions::{
         col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
         DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
@@ -1886,6 +1902,20 @@ mod tests {
     #[case(Scalar::TimestampNtz(9), "timestamp_ntz")]
     #[case(Scalar::Date(9), "date")]
     #[case(Scalar::Binary(vec![1, 2, 3]), "binary")]
+    #[cfg(feature = "geo-type-in-dev")]
+    #[case(
+        Scalar::Geometry(
+            GeometryData::try_new(
+                GeometryType::try_new("EPSG:4326").unwrap(),
+                vec![
+                    1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0,
+                ],
+            )
+            .unwrap(),
+        ),
+        "geometry"
+    )]
     #[case(
         Scalar::Decimal(
             DecimalData::try_new(1234i128, DecimalType::try_new(10, 2).unwrap()).unwrap(),
@@ -1933,6 +1963,8 @@ mod tests {
             Value::IntervalDayTime(_) => "interval_day_time",
             Value::Date(_) => "date",
             Value::Binary(_) => "binary",
+            #[cfg(feature = "geo-type-in-dev")]
+            Value::Geometry(_) => "geometry",
             Value::Decimal(_) => "decimal",
             Value::Null(_) => "null",
             Value::Struct(_) => "struct",

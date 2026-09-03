@@ -11,6 +11,8 @@ use strum::AsRefStr;
 
 use crate::error::add_scalar_path_context;
 use crate::schema::derive_macro_utils::{GetStructField, ToDataType};
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::GeometryType;
 use crate::schema::{
     parse_interval_type, ArrayType, DataType, DecimalType, IntervalField, IntervalFieldRange,
     MapType, PrimitiveType, StructField, StructType,
@@ -61,6 +63,44 @@ impl DecimalData {
 
     pub fn scale(&self) -> u8 {
         self.ty.scale()
+    }
+}
+
+/// Canonical geometry scalar data backed by WKB bytes and its logical geometry type.
+#[cfg(feature = "geo-type-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeometryData {
+    ty: GeometryType,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl GeometryData {
+    /// Creates a geometry scalar from logical type metadata and WKB bytes.
+    ///
+    /// The input bytes are normalized to canonical WKB before storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bytes` are not valid WKB for a geometry value.
+    pub fn try_new(ty: GeometryType, bytes: impl Into<Vec<u8>>) -> DeltaResult<Self> {
+        let bytes = crate::geometry::normalize_geometry_wkb(&ty, &bytes.into())?;
+        Ok(Self { ty, bytes })
+    }
+
+    /// Returns the logical geometry type metadata carried by this value.
+    pub fn ty(&self) -> &GeometryType {
+        &self.ty
+    }
+
+    /// Returns the canonical WKB payload for this geometry value.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this geometry and returns its canonical WKB bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 
@@ -349,6 +389,9 @@ pub enum Scalar {
     Date(i32),
     /// Binary data
     Binary(Vec<u8>),
+    /// Geometry value encoded as canonical WKB plus its logical geometry type.
+    #[cfg(feature = "geo-type-in-dev")]
+    Geometry(GeometryData),
     /// Decimal value with a given precision and scale.
     Decimal(DecimalData),
     /// Null value with a given data type.
@@ -378,6 +421,8 @@ impl Scalar {
             Self::IntervalDayTime(_) => DataType::INTERVAL_DAY_TIME,
             Self::Date(_) => DataType::DATE,
             Self::Binary(_) => DataType::BINARY,
+            #[cfg(feature = "geo-type-in-dev")]
+            Self::Geometry(geometry) => DataType::from(geometry.ty().clone()),
             Self::Decimal(d) => DataType::from(*d.ty()),
             Self::Null(data_type) => data_type.clone(),
             Self::Struct(data) => DataType::struct_type_unchecked(data.fields.clone()),
@@ -497,6 +542,8 @@ impl Display for Scalar {
             Self::IntervalDayTime(micros) => write!(f, "{micros}"),
             Self::Date(d) => write!(f, "{d}"),
             Self::Binary(b) => write!(f, "{b:?}"),
+            #[cfg(feature = "geo-type-in-dev")]
+            Self::Geometry(geometry) => write!(f, "{} {:?}", geometry.ty(), geometry.bytes()),
             Self::Decimal(d) => match d.scale().cmp(&0) {
                 Ordering::Equal => {
                     write!(f, "{}", d.bits())
@@ -620,6 +667,10 @@ impl Scalar {
             (Date(_), _) => None,
             (Binary(a), Binary(b)) => a.partial_cmp(b),
             (Binary(_), _) => None,
+            #[cfg(feature = "geo-type-in-dev")]
+            (Geometry(_), Geometry(_)) => None,
+            #[cfg(feature = "geo-type-in-dev")]
+            (Geometry(_), _) => None,
             (Decimal(d1), Decimal(d2)) => (d1.ty() == d2.ty())
                 .then(|| d1.bits().partial_cmp(&d2.bits()))
                 .flatten(),
@@ -714,6 +765,13 @@ impl From<Vec<u8>> for Scalar {
 impl From<bytes::Bytes> for Scalar {
     fn from(b: bytes::Bytes) -> Self {
         Self::Binary(b.into())
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<GeometryData> for Scalar {
+    fn from(geometry: GeometryData) -> Self {
+        Self::Geometry(geometry)
     }
 }
 
@@ -1282,6 +1340,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::expressions::GeometryData;
     use crate::expressions::{col, lit, BinaryPredicateOp};
     use crate::schema::{schema, ToSchema as _};
     use crate::table_features::TableFeature;
@@ -1863,6 +1923,28 @@ mod tests {
         } else {
             panic!("Expected Binary scalar");
         }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_geometry_data_round_trips_and_geometry_scalars_are_unordered() {
+        let geometry_type = crate::schema::GeometryType::try_new("EPSG:4326").unwrap();
+        let bytes = vec![
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let geometry = GeometryData::try_new(geometry_type.clone(), bytes.clone()).unwrap();
+
+        assert_eq!(geometry.ty(), &geometry_type);
+        assert_eq!(geometry.bytes(), bytes.as_slice());
+        assert_eq!(geometry.clone().into_bytes(), bytes);
+
+        let scalar = Scalar::Geometry(geometry.clone());
+        assert_eq!(scalar.data_type(), DataType::from(geometry_type));
+        assert_eq!(
+            scalar.logical_partial_cmp(&Scalar::Geometry(geometry)),
+            None,
+            "geometry scalars should not participate in ordered scalar comparisons"
+        );
     }
 
     const INTERVAL_YM_LITERAL: &str = "INTERVAL '1-0' YEAR TO MONTH";

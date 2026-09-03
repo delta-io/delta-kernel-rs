@@ -20,6 +20,8 @@ use crate::arrow::array::types::{
 };
 use crate::arrow::array::Array;
 use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
+#[cfg(feature = "geo-type-in-dev")]
+use crate::expressions::GeometryData;
 use crate::expressions::Scalar;
 use crate::schema::DataType;
 use crate::{DeltaResult, Error};
@@ -119,6 +121,50 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
             "unsupported Arrow type for primitive scalar extraction: {other:?}"
         ))),
     }
+}
+
+/// Extracts a kernel [`Scalar`] from the given row of an Arrow array using the caller-provided
+/// logical `data_type`.
+///
+/// This supports logical geo types backed by Arrow `Binary`/`LargeBinary`, which cannot be
+/// inferred from the physical Arrow type alone.
+///
+/// # Errors
+///
+/// Returns the same errors as [`extract_primitive_scalar`], plus an error if the physical Arrow
+/// value is incompatible with `data_type`.
+pub fn extract_scalar(
+    array: &dyn Array,
+    row_idx: usize,
+    data_type: &DataType,
+) -> DeltaResult<Scalar> {
+    #[cfg(feature = "geo-type-in-dev")]
+    if let DataType::Primitive(crate::schema::PrimitiveType::Geometry(geometry_type)) = data_type {
+        if row_idx >= array.len() {
+            return Err(Error::generic(format!(
+                "row index {row_idx} out of bounds for array of length {}",
+                array.len()
+            )));
+        }
+        if array.is_null(row_idx) {
+            return Ok(Scalar::Null(data_type.clone()));
+        }
+        let bytes = match array.data_type() {
+            ArrowDataType::Binary => array.as_binary::<i32>().value(row_idx).to_vec(),
+            ArrowDataType::LargeBinary => array.as_binary::<i64>().value(row_idx).to_vec(),
+            ArrowDataType::BinaryView => array.as_binary_view().value(row_idx).to_vec(),
+            other => {
+                return Err(Error::generic(format!(
+                    "unsupported Arrow type for geometry scalar extraction: {other:?}"
+                )))
+            }
+        };
+        return Ok(Scalar::Geometry(GeometryData::try_new(
+            geometry_type.as_ref().clone(),
+            bytes,
+        )?));
+    }
+    extract_primitive_scalar(array, row_idx)
 }
 
 /// Maps an Arrow data type to a kernel [`DataType`] for primitive types only.
@@ -596,5 +642,34 @@ mod tests {
             Scalar::Double(v) => assert!(v.is_nan(), "expected NaN double"),
             other => panic!("expected float/double NaN, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_extract_scalar_geometry_returns_typed_geometry() {
+        let geometry_type = crate::schema::GeometryType::try_new("EPSG:4326").unwrap();
+        let bytes = vec![
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let array = Arc::new(BinaryArray::from_vec(vec![bytes.as_slice()])) as ArrayRef;
+
+        let scalar =
+            extract_scalar(array.as_ref(), 0, &DataType::from(geometry_type.clone())).unwrap();
+        assert_eq!(
+            scalar,
+            Scalar::Geometry(GeometryData::try_new(geometry_type, bytes).unwrap())
+        );
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_extract_scalar_geometry_null_returns_typed_null() {
+        let geometry_type = crate::schema::GeometryType::try_new("EPSG:4326").unwrap();
+        let array = new_null_array(&ArrowDataType::Binary, 1);
+
+        assert_eq!(
+            extract_scalar(array.as_ref(), 0, &DataType::from(geometry_type.clone())).unwrap(),
+            Scalar::Null(DataType::from(geometry_type))
+        );
     }
 }

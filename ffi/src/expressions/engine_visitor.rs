@@ -588,6 +588,8 @@ fn visit_expression_scalar(
             buf.as_ptr(),
             buf.len()
         ),
+        #[cfg(feature = "geo-type-in-dev")]
+        Scalar::Geometry(_) => visit_unknown(visitor, sibling_list_id, "geometry_literal"),
         Scalar::Decimal(v) => {
             call!(
                 visitor,
@@ -771,7 +773,11 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::expressions::GeometryData;
     use delta_kernel::expressions::{lit, Expression, Scalar};
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::schema::GeometryType;
     use rstest::rstest;
 
     use super::*;
@@ -790,6 +796,10 @@ mod tests {
         Column {
             sibling_list_id: usize,
             parts: Vec<String>,
+        },
+        Unknown {
+            sibling_list_id: usize,
+            name: String,
         },
     }
 
@@ -844,6 +854,19 @@ mod tests {
         builder.events.push(LiteralEvent::Column {
             sibling_list_id,
             parts,
+        });
+    }
+
+    extern "C" fn visit_unknown(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let name = unsafe { String::try_from_slice(&name).unwrap() };
+        builder.events.push(LiteralEvent::Unknown {
+            sibling_list_id,
+            name,
         });
     }
 
@@ -925,7 +948,7 @@ mod tests {
             visit_field_patch: ignore_field_patch,
             visit_opaque_expr: ignore_opaque_expr,
             visit_opaque_pred: ignore_opaque_pred,
-            visit_unknown: ignore_string_slice,
+            visit_unknown,
         }
     }
 
@@ -991,5 +1014,33 @@ mod tests {
 
         assert_eq!(top_level_id, 0);
         assert_eq!(builder.events, vec![expected]);
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn visit_expression_geometry_literal_is_reported_as_unknown() {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+        let geometry = GeometryData::try_new(
+            GeometryType::try_new("EPSG:4326").unwrap(),
+            vec![
+                1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+
+        let top_level_id = visit_expression_internal(
+            &Expression::Literal(Scalar::Geometry(geometry)),
+            &mut visitor,
+        );
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Unknown {
+                sibling_list_id: 0,
+                name: "geometry_literal".to_string(),
+            }]
+        );
     }
 }

@@ -68,6 +68,11 @@ message DecimalData {
   delta.kernel.schema.DecimalType decimal_type = 2;
 }
 
+message GeometryData {
+  delta.kernel.schema.GeometryType geometry_type = 1;
+  bytes wkb = 2;
+}
+
 message ArrayData {
   delta.kernel.schema.ArrayType array_type = 1;
   repeated Scalar elements = 2;
@@ -112,6 +117,7 @@ message Scalar {
     MapData map = 17;
     int32 interval_year_month = 18; // year-month interval: signed month count
     int64 interval_day_time = 19;   // day-time interval: signed microsecond count
+    GeometryData geometry = 20;
   }
 }
 

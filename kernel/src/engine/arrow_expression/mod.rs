@@ -104,6 +104,8 @@ impl Scalar {
             IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, *val),
             Date(val) => append_val_n_as!(array::Date32Builder, *val),
             Binary(val) => append_val_as!(array::BinaryBuilder, val),
+            #[cfg(feature = "geo-type-in-dev")]
+            Geometry(geometry) => append_val_as!(array::BinaryBuilder, geometry.bytes()),
             // precision and scale were already set at builder construction time
             Decimal(val) => append_val_n_as!(array::Decimal128Builder, val.bits()),
             Struct(data) => {
@@ -220,8 +222,14 @@ impl Scalar {
             DataType::INTERVAL_YEAR_MONTH => append_nulls_as!(array::Int32Builder),
             DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
             #[cfg(feature = "geo-type-in-dev")]
-            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
-                return Err(Error::unsupported("Geo is not supported as scalar yet."));
+            DataType::Primitive(PrimitiveType::Geometry(_)) => {
+                append_nulls_as!(array::BinaryBuilder)
+            }
+            #[cfg(feature = "geo-type-in-dev")]
+            DataType::Primitive(PrimitiveType::Geography(_)) => {
+                return Err(Error::unsupported(
+                    "Geography is not supported as scalar yet.",
+                ));
             }
         }
         Ok(())

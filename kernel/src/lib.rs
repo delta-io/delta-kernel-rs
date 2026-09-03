@@ -98,6 +98,8 @@ pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+#[cfg(feature = "geo-type-in-dev")]
+pub(crate) mod geometry;
 pub mod incremental_scan;
 mod log_compaction;
 mod log_path;

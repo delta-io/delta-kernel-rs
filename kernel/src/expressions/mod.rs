@@ -13,6 +13,8 @@ pub use self::column_names::{
     col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
     ColumnName,
 };
+#[cfg(feature = "geo-type-in-dev")]
+pub use self::scalars::GeometryData;
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,

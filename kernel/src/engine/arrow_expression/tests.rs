@@ -6,9 +6,9 @@ use Predicate as Pred;
 
 use super::*;
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray,
+    create_array, Array, ArrayRef, AsArray as _, BinaryViewArray, BooleanArray, GenericStringArray,
+    Int32Array, Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames,
+    StringArray, StringBuilder, StringViewArray, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -20,6 +20,8 @@ use crate::engine::arrow_expression::opaque::{
     ArrowOpaquePredicateOp,
 };
 use crate::engine::arrow_utils::apply_schema::apply_schema;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::expressions::GeometryData;
 use crate::expressions::*;
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -248,6 +250,21 @@ fn test_literal_type_array() {
     let result = evaluate_predicate(&not_in_op, &batch, true).unwrap();
     let in_expected = BooleanArray::from(vec![false]);
     assert_eq!(result, in_expected);
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[test]
+fn test_geometry_scalar_to_array_uses_binary_storage() {
+    let geometry_type = crate::schema::GeometryType::try_new("EPSG:4326").unwrap();
+    let bytes = vec![
+        1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let scalar = Scalar::Geometry(GeometryData::try_new(geometry_type, bytes.clone()).unwrap());
+
+    let array = scalar.to_array(2).unwrap();
+    let binary = array.as_binary::<i32>();
+    assert_eq!(binary.value(0), bytes.as_slice());
+    assert_eq!(binary.value(1), bytes.as_slice());
 }
 
 #[test]
@@ -1474,10 +1491,17 @@ fn test_interval_scalar_to_array(#[case] scalar: Scalar, #[case] arrow_type: Dat
 }
 
 #[cfg(feature = "geo-type-in-dev")]
-#[rstest]
-#[case(geometry_type("EPSG:4326"))]
-#[case(geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical))]
-fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
+#[test]
+fn test_geometry_append_null_uses_binary_storage() {
+    let mut builder: Box<dyn crate::arrow::array::ArrayBuilder> =
+        Box::new(crate::arrow::array::BinaryBuilder::new());
+    Scalar::append_null(builder.as_mut(), &geometry_type("EPSG:4326"), 1).unwrap();
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[test]
+fn test_geography_append_null_unsupported() {
+    let dt = geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical);
     let mut builder: Box<dyn crate::arrow::array::ArrayBuilder> =
         Box::new(crate::arrow::array::BinaryBuilder::new());
     let err = Scalar::append_null(builder.as_mut(), &dt, 1).unwrap_err();

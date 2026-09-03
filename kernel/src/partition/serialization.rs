@@ -97,6 +97,14 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
         Scalar::Binary(b) if b.is_empty() => Ok(None),
         Scalar::Binary(b) => Ok(Some(format_binary(b)?)),
+        #[cfg(feature = "geo-type-in-dev")]
+        Scalar::Geometry(_) | Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => {
+            Err(Error::generic(format!(
+                "cannot serialize partition value: type {:?} is not a valid partition column type",
+                value.data_type()
+            )))
+        }
+        #[cfg(not(feature = "geo-type-in-dev"))]
         Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => Err(Error::generic(format!(
             "cannot serialize partition value: type {:?} is not a valid partition column type",
             value.data_type()
@@ -247,7 +255,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{ArrayData, MapData, Scalar, StructData};
+    use crate::expressions::{ArrayData, GeometryData, MapData, Scalar, StructData};
     use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField};
 
     // ============================================================================
@@ -638,5 +646,19 @@ mod tests {
         )
         .unwrap();
         assert!(serialize_partition_value(&Scalar::Map(data)).is_err());
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_non_null_geometry_returns_error() {
+        let geometry_type = crate::schema::GeometryType::try_new("EPSG:4326").unwrap();
+        let geometry = GeometryData::try_new(
+            geometry_type,
+            vec![
+                1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        assert!(serialize_partition_value(&Scalar::Geometry(geometry)).is_err());
     }
 }

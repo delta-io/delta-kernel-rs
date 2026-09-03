@@ -372,11 +372,11 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::IntervalYearMonth => Ok(ArrowDataType::Int32),
                     PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
                     #[cfg(feature = "geo-type-in-dev")]
-                    PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
-                        Err(ArrowError::SchemaError(format!(
-                            "Geo types are not yet supported in the default engine: {p}"
-                        )))
-                    }
+                    PrimitiveType::Geometry(_) => Ok(ArrowDataType::Binary),
+                    #[cfg(feature = "geo-type-in-dev")]
+                    PrimitiveType::Geography(_) => Err(ArrowError::SchemaError(format!(
+                        "Geo types are not yet supported in the default engine: {p}"
+                    ))),
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -681,12 +681,7 @@ mod tests {
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
-    #[case(geometry_type("EPSG:4326"))]
     #[case(geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical))]
-    #[case(DataType::from(schema! {
-        nullable "g": (geometry_type("EPSG:4326")),
-    }))]
-    #[case(DataType::from(ArrayType::new(geometry_type("EPSG:4326"), true)))]
     #[case(DataType::from(MapType::new(
         DataType::STRING,
         geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
@@ -696,6 +691,21 @@ mod tests {
         let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
         let err = result.unwrap_err();
         assert!(matches!(err, ArrowError::SchemaError(_)), "got: {err:?}");
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(geometry_type("EPSG:4326"))]
+    #[case(DataType::from(schema! {
+        nullable "g": (geometry_type("EPSG:4326")),
+    }))]
+    #[case(DataType::from(ArrayType::new(geometry_type("EPSG:4326"), true)))]
+    fn test_geometry_type_arrow_conversion_supported(#[case] dt: DataType) {
+        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
+        assert!(
+            result.is_ok(),
+            "expected Geometry to convert, got {result:?}"
+        );
     }
 
     #[test]
