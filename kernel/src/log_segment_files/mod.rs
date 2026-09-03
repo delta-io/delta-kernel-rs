@@ -18,7 +18,7 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
-use crate::cancellation::{check_cancelled, CancellableIterator, CancellationTokenRef};
+use crate::cancellation::CancellationTokenRef;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -66,9 +66,8 @@ pub(crate) struct LogSegmentFiles {
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
 ///
-/// With a `cancellation_token`, the listing becomes cancellable: the engine may interrupt its own
-/// I/O, and the returned iterator is polled against the token so cancellation arrives as a terminal
-/// [`Error::Cancelled`] rather than an early end.
+/// With a `cancellation_token`, [`StorageHandler::list_from_with_cancellation`] owns cancellation
+/// for the underlying listing. This pipeline preserves any cancellation error through its filters.
 #[internal_api]
 pub(crate) fn list_delta_log_from_storage(
     storage: &dyn StorageHandler,
@@ -107,11 +106,7 @@ pub(crate) fn list_delta_log_from_storage(
             Ok(path) => path.version <= end_version,
             Err(_) => true,
         });
-    // Wrap the filtered pipeline so cancellation is checked as the iterator is consumed, outside
-    // the version `take_while` above. Checked inside, a cancelled listing would end with `None` and
-    // be indistinguishable from a complete one; outside, it surfaces as a terminal
-    // `Error::Cancelled`.
-    Ok(CancellableIterator::new(files, cancellation_token.cloned()))
+    Ok(files)
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
@@ -692,9 +687,6 @@ impl LogSegmentFiles {
         // [lower, upper - 1].
         let mut upper = end_version + 1;
         while upper > 0 {
-            // Each window is collected eagerly, so check between windows too: a long backward scan
-            // would otherwise keep going after cancellation.
-            check_cancelled(cancellation_token)?;
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
             let window_files: Vec<_> = list_delta_log_from_storage(
                 storage,

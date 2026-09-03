@@ -44,6 +44,8 @@ write commit and checkpoint files.
 | `put(path, data, overwrite)` | Write raw bytes to a path (fails if `overwrite` is false and file exists) |
 | `head(path)` | Get file metadata (size, modification time) without reading content |
 
+Storage listing and byte reads also have cancellation-aware variants described below.
+
 ### JsonHandler
 
 Reads and writes JSON. Kernel uses this for Delta log commits (the `_delta_log/*.json`
@@ -81,26 +83,26 @@ query, a dropped RPC, a closed session. Kernel supports this cooperatively throu
 [`CancellationToken`] that a caller attaches to a scan (see
 [Advanced reads with scan_metadata()](../reading/scan_metadata.md#cancelling-a-scan)).
 
-Cancellation reaches the handlers in two ways, and an engine can honor either or both:
+Cancellation-aware handlers respond at two boundaries:
 
-- **Between batches.** Kernel polls the token at each action-batch boundary regardless of what the
-  handler does, so even a handler that ignores the token entirely still stops promptly between
-  reads.
-- **During a read.** The `read_*_with_cancellation` variants above hand the token down into the
-  read itself. Overriding them lets a cooperative engine interrupt an I/O that is already in
-  flight — the case that matters when one file read blocks for a long time — instead of waiting for
-  it to finish before the next batch-boundary check.
+- **Before starting work.** Cancellation-aware handler methods check the token before starting. Their
+  iterator-producing defaults also check before each pull, preventing new I/O after cancellation.
+- **In flight.** An Engine can additionally interrupt I/O already in flight. This matters when
+  one request may otherwise block for a noticeable time.
 
 These variants are optional. Their default implementations return early if the token is already
-cancelled and otherwise delegate to the plain `read_parquet_files` / `read_json_files` /
-`read_parquet_footer`, so an existing handler keeps working unchanged and simply doesn't interrupt
-mid-read. Whenever cancellation is observed, the read surfaces `Error::Cancelled` as a terminal
-error — never a short or empty result that could be mistaken for a complete one.
+cancelled and otherwise delegate to their plain versions so that an existing handler keeps working
+unchanged and simply doesn't interrupt mid-read. Cancellation can race with successful completion,
+so a request already in flight may complete normally. Custom cancellation-aware handler
+implementations own this behavior because Kernel does not add another polling layer around their
+iterators.
 
 For how to implement the cancellation-aware variants, see
 [Implementing the Engine Trait](../connector/implementing_engine.md#cancellation-aware-reads).
+The public API defines the full [Engine operation cancellation contract].
 
 [`CancellationToken`]: https://docs.rs/delta_kernel/latest/delta_kernel/cancellation/trait.CancellationToken.html
+[Engine operation cancellation contract]: https://docs.rs/delta_kernel/latest/delta_kernel/cancellation/index.html#engine-operation-contract
 
 ### EvaluationHandler
 

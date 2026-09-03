@@ -198,10 +198,9 @@ impl SnapshotBuilder {
 
     /// Supply a [`CancellationToken`] so building the snapshot can be abandoned partway.
     ///
-    /// Kernel polls the token as it consumes the log listing, and a cancellation-aware [`Engine`]
-    /// additionally races its listing and log reads against it. On cancellation
-    /// [`build`](Self::build) returns [`Error::Cancelled`] rather than a snapshot built from a
-    /// partial listing. With no token the build is not cancellable.
+    /// Kernel forwards the token (if any) to cancellation-aware [`Engine`] listing and read
+    /// operations. Work that completes concurrently with cancellation may still succeed.
+    /// Passing `None` means the build is not cancellable.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
     /// [`Error::Cancelled`]: crate::Error::Cancelled

@@ -1,6 +1,4 @@
-//! Integration coverage for `ScanBuilder::with_cancellation_token`: a cancelled scan must
-//! surface `Error::Cancelled` through the real Default Engine and can never be mistaken for a
-//! complete listing.
+//! Integration coverage for passing `ScanBuilder` cancellation through the real Default Engine.
 
 use std::sync::Arc;
 
@@ -46,14 +44,12 @@ async fn json_only_table() -> Result<(Arc<InMemory>, &'static str), Box<dyn std:
     Ok((storage, table_root))
 }
 
-// A scan whose builder was given an already-cancelled token yields exactly one
-// `Error::Cancelled` and then ends -- it never produces a (partial) complete-looking listing.
-// Parametrized over stats mode because a predicate/stats scan takes a different replay path
-// (checkpoint parquet reads + stats parsing) than the JSON-only default, and both must honor the
-// token: `None` is the plain default (no `with_stats` call), `Some` opts into struct stats.
+// End-to-end coverage that a scan passes an already-cancelled token to its commit read before
+// producing metadata. Stats output changes the projected action schema and replay transforms;
+// cancellation must behave the same with either configuration.
 #[rstest]
-#[case::json_default(None)]
-#[case::with_stats(Some(StatsOptions::all_struct()))]
+#[case::default(None)]
+#[case::structured_stats(Some(StatsOptions::all_struct()))]
 #[tokio::test]
 async fn precancelled_scan_yields_cancelled(
     #[case] stats: Option<StatsOptions>,
@@ -69,16 +65,12 @@ async fn precancelled_scan_yields_cancelled(
     }
     let scan = builder.build()?;
 
-    // Cancellation surfaces as `Error::Cancelled`, never as a complete listing. It may arrive
-    // either from the eager setup reads that `scan_metadata` performs (returning `Err` directly)
-    // or as the iterator's terminal item -- assert whichever, and that no successful batch and no
-    // silent `None`-only stream is ever produced.
+    // Cancellation may arrive from eager setup reads or from the lazy iterator.
     assert_cancelled(scan.scan_metadata(&engine));
     Ok(())
 }
 
-/// Asserts that a scan_metadata result represents cancellation: either the call itself returned
-/// `Err(Cancelled)`, or the iterator yields `Err(Cancelled)` before any `Ok` and then fuses.
+/// Asserts that `scan_metadata` reports cancellation before producing any data.
 fn assert_cancelled<
     I: Iterator<Item = delta_kernel::DeltaResult<delta_kernel::scan::ScanMetadata>>,
 >(
@@ -91,10 +83,6 @@ fn assert_cancelled<
             assert!(
                 matches!(iter.next(), Some(Err(Error::Cancelled))),
                 "cancelled scan must yield Err(Cancelled), never an Ok batch or bare None"
-            );
-            assert!(
-                iter.next().is_none(),
-                "iterator must fuse after cancellation"
             );
         }
     }
@@ -124,13 +112,9 @@ async fn uncancelled_json_scan_completes() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-// Cancelling a LIVE token after iteration has started surfaces exactly ONE terminal
-// `Err(Cancelled)` and then fuses -- exercising both cancellation layers (kernel batch-boundary
-// poll + the engine yielding its own cancelled error), the composition the pre-cancelled tests
-// can't reach. Guards against the double-emit the two layers would otherwise produce.
+// End-to-end coverage that cancellation is checked between scan iterator pulls.
 #[tokio::test(flavor = "multi_thread")]
-async fn mid_stream_cancellation_yields_exactly_one_error() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn mid_stream_cancellation_yields_cancelled() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, table_root) = json_only_table().await?;
     let engine = DefaultEngineBuilder::new(storage).build();
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -150,10 +134,6 @@ async fn mid_stream_cancellation_yields_exactly_one_error() -> Result<(), Box<dy
     token.cancel();
 
     assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
-    assert!(
-        iter.next().is_none(),
-        "iterator must fuse after the single error"
-    );
     Ok(())
 }
 

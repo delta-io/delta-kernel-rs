@@ -1,12 +1,28 @@
 //! Cooperative cancellation for long-running Kernel reads.
 //!
 //! Kernel never does I/O itself and owns no async runtime, so cancellation is *cooperative* and
-//! *runtime-agnostic*: a caller supplies a [`CancellationToken`] (via
-//! [`ScanBuilder::with_cancellation_token`](crate::scan::ScanBuilder::with_cancellation_token)),
-//! Kernel polls it at action-batch boundaries, and cancellation-aware [`Engine`](crate::Engine)
-//! reads may race their I/O against it. Cancellation is always surfaced as
-//! [`Error::Cancelled`] -- never as normal iterator exhaustion -- so a partial listing can never be
-//! mistaken for a complete one.
+//! *runtime-agnostic*: a caller supplies a [`CancellationToken`] and Kernel passes it to
+//! cancellation-aware [`Engine`](crate::Engine) operations. Those operations own cancellation for
+//! the I/O and iterators they produce. Kernel polls the token only for work that bypasses an
+//! Engine handler, such as cached scan metadata.
+//!
+//! # Engine operation contract
+//!
+//! A cancellation-aware Engine operation must check the token before initiating I/O. If that check
+//! reports cancellation, it must immediately fail with [`Error::Cancelled`]. Cancellation can race
+//! with the check, and an I/O request that had already started may complete normally. This does not
+//! permit draining an arbitrary prefetch queue before terminating.
+//!
+//! Iterator-producing operations should check the token before each pull that could initiate more
+//! I/O, and terminate promptly when cancellation is reported. They must not initiate replacement or
+//! additional I/O after such a check reports cancellation. They may still return data from I/O
+//! that was already in flight, and may interrupt that I/O when the Engine supports it. If an
+//! iterator stops early because of cancellation, it must surface [`Error::Cancelled`] rather than
+//! normal exhaustion.
+//!
+//! A custom `*_with_cancellation` implementation replaces the provided implementation and owns
+//! this contract itself. The provided iterator implementations check before delegating and before
+//! each pull, but cannot interrupt work inside the delegated operation.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,8 +41,7 @@ pub type CancelledFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// Returns `Err(Error::Cancelled)` if `token` is present and already cancelled, else `Ok(())`.
 ///
-/// Used to fail fast before starting a setup/read operation (e.g. a footer read or a sidecar
-/// listing) so cancelled work is not begun.
+/// Used as a pre-flight check to avoid starting an already-cancelled operation.
 pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> DeltaResult<()> {
     match token {
         Some(t) if t.is_cancelled() => Err(Error::Cancelled),
@@ -37,8 +52,9 @@ pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> DeltaResu
 /// A cooperative cancellation signal supplied by a caller.
 ///
 /// Implementors wrap whatever their runtime provides (e.g. `tokio_util::sync::CancellationToken`).
-/// Kernel and cancellation-aware engines only *consume* it: Kernel polls [`is_cancelled`] between
-/// action batches, while an async engine may await [`cancelled_future`] to wake blocked I/O.
+/// Kernel and cancellation-aware engines only *consume* it: [`is_cancelled`] provides a
+/// synchronous pre-flight check, while an async engine may `select!` to race in-flight I/O against
+/// [`cancelled_future`].
 ///
 /// # Recovering the underlying token
 ///
@@ -88,17 +104,12 @@ pub trait CancellationToken: AsAny {
 /// [`Error::Cancelled`] rather than silent truncation.
 ///
 /// Before each pull, the token is polled: if cancelled, one `Err(Error::Cancelled)` is yielded
-/// and every subsequent call returns `None` (the iterator is fused). An `Err(Error::Cancelled)`
-/// arriving from the inner iterator (e.g. a cancellation-aware engine interrupting a read) fuses
-/// it the same way, so a token shared with the engine still yields exactly one terminal error.
-/// With no token, or before cancellation, items pass through unchanged. This is deliberately
-/// **not** `take_while`, which would end the iterator with `None` and make a cancelled listing
-/// look complete.
+/// and every subsequent call returns `None`. Any error or normal exhaustion also terminates the
+/// iterator. With no token, or before cancellation, inner items pass through unchanged.
 pub(crate) struct CancellableIterator<I> {
     inner: I,
     token: Option<CancellationTokenRef>,
-    /// Set once cancellation has been observed and the terminal error emitted, fusing the
-    /// iterator to `None` thereafter.
+    /// Set once the inner iterator has returned an error or reached normal exhaustion.
     done: bool,
 }
 
@@ -122,17 +133,11 @@ where
         if self.done {
             return None;
         }
-        if self.token.as_ref().is_some_and(|t| t.is_cancelled()) {
-            self.done = true;
-            return Some(Err(Error::Cancelled));
-        }
-        let item = self.inner.next();
-        // A cancellation-aware engine can itself surface `Err(Cancelled)` from an interrupted
-        // read. Fuse on it so the composed pipeline still yields exactly one terminal error
-        // rather than this layer re-injecting a second one on the next poll.
-        if matches!(item, Some(Err(Error::Cancelled))) {
-            self.done = true;
-        }
+        let item = match self.token.as_ref() {
+            Some(token) if token.is_cancelled() => Some(Err(Error::Cancelled)),
+            _ => self.inner.next(),
+        };
+        self.done = !matches!(&item, Some(Ok(_)));
         item
     }
 }
@@ -210,18 +215,14 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
-    // An `Err(Cancelled)` from the inner iterator (as a cancellation-aware engine emits) must
-    // fuse this layer, so a token shared between engine and kernel yields exactly ONE terminal
-    // error, not two. Regression guard for the double-emit the layered pipeline would otherwise
-    // produce. The token is left uncancelled so the fuse comes solely from the inner error.
     #[test]
-    fn inner_cancelled_error_fuses_without_double_emit() {
+    fn inner_error_terminates_iteration() {
         let token: CancellationTokenRef = Arc::new(TestToken::default());
-        let inner = vec![Ok(0), Err(Error::Cancelled), Ok(99)].into_iter();
+        let inner = vec![Ok(0), Err(Error::generic("boom")), Ok(99)].into_iter();
         let mut iter = CancellableIterator::new(inner, Some(token));
         assert!(matches!(iter.next(), Some(Ok(0))));
-        assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
-        // Fused on the inner error: the trailing Ok is never yielded, and no second error.
+        assert!(matches!(iter.next(), Some(Err(Error::Generic(_)))));
+        // Fused on the inner error: the trailing Ok is never yielded.
         assert!(iter.next().is_none());
     }
 

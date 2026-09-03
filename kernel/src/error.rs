@@ -343,8 +343,8 @@ pub enum Error {
 
     /// The operation was cancelled via a [`CancellationToken`](crate::CancellationToken).
     ///
-    /// Surfaced by cancellation-aware reads as a terminal error, distinct from normal iterator
-    /// exhaustion. See [`CancellableIterator`](crate::cancellation) for the enforced contract.
+    /// Surfaced by cancellation-aware operations when a cancellation is detected. See the
+    /// [Engine operation cancellation contract](crate::cancellation#engine-operation-contract).
     #[error("Operation cancelled")]
     Cancelled,
 }

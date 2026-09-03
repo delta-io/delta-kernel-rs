@@ -13,7 +13,7 @@ use crate::actions::{
     action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA,
     SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
-use crate::cancellation::{CancellableIterator, CancellationTokenRef};
+use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -996,8 +996,8 @@ impl LogSegment {
         }
     }
 
-    /// Reads a parquet footer schema, threading the cancellation token so a cancelled request can
-    /// stop before or during the read (the read itself fails fast on an already-cancelled token).
+    /// Reads a parquet footer schema, passing the cancellation token to the Engine. Engines may
+    /// additionally use it to interrupt a read already in flight.
     fn read_footer_schema(
         engine: &dyn Engine,
         file: &FileMeta,
@@ -1245,11 +1245,6 @@ impl LogSegment {
                 )?,
             _ => return Ok(vec![]),
         };
-
-        // Unlike the checkpoint/commit reads that feed the wrapped scan-action stream, this loop
-        // consumes batches locally, so wrap it to poll the token between batches even against an
-        // engine whose reader ignores it.
-        let batches = CancellableIterator::new(batches, cancellation_token.cloned());
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();
