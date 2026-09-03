@@ -266,7 +266,7 @@ impl ParallelScanMetadata {
 
     pub fn new_from_iter(
         state: Arc<ParallelState>,
-        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
+        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
         Self {
             processor: ParallelPhase::new_from_iter(state.clone(), iter),

@@ -11,7 +11,7 @@ use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
 use crate::unit_test_utils::TestCancellationToken;
-use crate::{Engine as _, FileMeta};
+use crate::{DeltaResultIteratorStatic, Engine as _, FileMeta, StorageHandler};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
@@ -164,10 +164,7 @@ impl CountingStorageHandler {
 }
 
 impl StorageHandler for CountingStorageHandler {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         self.list_from_count.fetch_add(1, Ordering::Relaxed);
         let items_listed = self.items_listed.clone();
         let iter = self.inner.list_from(path)?;
@@ -179,7 +176,7 @@ impl StorageHandler for CountingStorageHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
@@ -366,16 +363,13 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
     // have nothing — e.g. a purely catalog-managed table.
     struct EmptyStorageHandler;
     impl StorageHandler for EmptyStorageHandler {
-        fn list_from(
-            &self,
-            _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
             panic!("read_files should not be called during listing");
         }
         fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
@@ -1778,10 +1772,7 @@ struct FiniteListingHandler {
 }
 
 impl StorageHandler for FiniteListingHandler {
-    fn list_from(
-        &self,
-        _path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         let log_root = self.log_root.clone();
         let pulled = self.items_pulled.clone();
         let iter = (0..self.count as u64).map(move |version| {
@@ -1798,7 +1789,7 @@ impl StorageHandler for FiniteListingHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
@@ -1910,10 +1901,7 @@ struct CancelAfterListingHandler {
 }
 
 impl StorageHandler for CancelAfterListingHandler {
-    fn list_from(
-        &self,
-        _path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         self.list_calls.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(CancelOnExhaustion {
             token: self.token.clone(),
@@ -1924,7 +1912,7 @@ impl StorageHandler for CancelAfterListingHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
