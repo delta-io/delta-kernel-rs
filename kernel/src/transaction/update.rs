@@ -17,7 +17,7 @@ use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use super::external_root_manifest::ExternalRootManifest;
+use super::root_manifest_file::RootManifestFile;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
@@ -114,7 +114,7 @@ impl Transaction {
             dv_matched_files: vec![],
             num_dv_updates: 0,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            external_root_manifest: None,
+            root_manifest_file: None,
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })
@@ -154,14 +154,14 @@ impl Transaction {
         self
     }
 
-    /// Commits `file` as the table's root manifest.
+    /// Stages `file` to be committed as the table's root manifest. Errors if `file` is not located
+    /// under the table root.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub fn with_external_root_manifest(mut self, file: FileMeta) -> DeltaResult<Self> {
+    pub fn with_root_manifest_file(mut self, file: FileMeta) -> DeltaResult<Self> {
         let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
             Error::internal_error("read_snapshot() called on create-table transaction")
         })?;
-        let commit = ExternalRootManifest::new(file, read_snapshot)?;
-        self.external_root_manifest = Some(commit);
+        self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot)?);
         Ok(self)
     }
 

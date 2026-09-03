@@ -76,7 +76,7 @@ impl AlterTableTransaction {
             dv_matched_files: vec![],
             num_dv_updates: 0,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            external_root_manifest: None,
+            root_manifest_file: None,
             physical_clustering_columns: None,
             _state: PhantomData,
         })

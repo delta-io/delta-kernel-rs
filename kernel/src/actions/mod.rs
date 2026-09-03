@@ -1398,6 +1398,31 @@ impl ContentRoot {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointAction {
+    /// Builds a checkpoint action at `version` with all `transactions` and `domain_metadata`
+    /// inlined and no sidecars.
+    // TODO: spill transactions and domain metadata into sidecars once the adaptiveMetadata sidecar
+    // format is defined.
+    #[internal_api]
+    pub(crate) fn new(
+        version: i64,
+        content_root: ContentRoot,
+        protocol: Protocol,
+        metadata: Metadata,
+        transactions: Vec<SetTransaction>,
+        domain_metadata: Vec<DomainMetadata>,
+    ) -> Self {
+        CheckpointAction {
+            version,
+            content_root,
+            protocol,
+            metadata,
+            transactions,
+            domain_metadata,
+            txn_sidecars: vec![],
+            domain_metadata_sidecars: vec![],
+        }
+    }
+
     /// Parse the first `checkpoint` action in `data`, ignoring any later ones. Rows without a
     /// `checkpoint` action are skipped, so `Ok(None)` means the batch had none at all.
     ///

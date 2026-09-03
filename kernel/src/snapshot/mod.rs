@@ -10,13 +10,6 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::visitors::{DomainMetadataVisitor, SetTransactionVisitor};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{
-    CheckpointAction, SetTransaction, CHECKPOINT_ACTION_FIELD, DOMAIN_METADATA_FIELD,
-    SET_TRANSACTION_FIELD,
-};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -37,16 +30,12 @@ use crate::metrics::{
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::schema::StructType;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::RowVisitor as _;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
 mod builder;
@@ -754,82 +743,6 @@ impl Snapshot {
             .into_values()
             .filter(|domain| !domain.is_internal())
             .collect())
-    }
-
-    /// Domain metadata, set transactions, and the latest checkpoint action on this snapshot.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn scan_non_content_metadata(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<(
-        Vec<DomainMetadata>,
-        Vec<SetTransaction>,
-        Option<CheckpointAction>,
-    )> {
-        // Domain metadata/set transactions each come from exactly one source: an at-version CRC
-        // (`Complete`), or a log scan. Modeling this as an enum rather than two correlated
-        // `Option`s makes that mutual exclusion a type-level fact instead of a runtime invariant.
-        enum DomainMetadataSource {
-            FromCrc(Vec<DomainMetadata>),
-            Scan(DomainMetadataVisitor),
-        }
-        enum SetTransactionSource {
-            FromCrc(Vec<SetTransaction>),
-            Scan(SetTransactionVisitor),
-        }
-
-        let crc = self.crc_at_version();
-
-        // TODO: once Snapshot caches checkpoint_action like protocol/metadata, read it from
-        // there instead of always scanning for it here.
-        let mut fields = vec![CHECKPOINT_ACTION_FIELD.clone()];
-        let mut domain_metadata_source = match crc.map(|crc| &crc.domain_metadata_state) {
-            Some(DomainMetadataState::Complete(map)) => {
-                DomainMetadataSource::FromCrc(map.values().cloned().collect())
-            }
-            _ => {
-                fields.push(DOMAIN_METADATA_FIELD.clone());
-                DomainMetadataSource::Scan(DomainMetadataVisitor::new(None))
-            }
-        };
-        let mut set_transaction_source = match crc.map(|crc| &crc.set_transaction_state) {
-            Some(SetTransactionState::Complete(map)) => {
-                SetTransactionSource::FromCrc(map.values().cloned().collect())
-            }
-            _ => {
-                fields.push(SET_TRANSACTION_FIELD.clone());
-                SetTransactionSource::Scan(SetTransactionVisitor::new(None))
-            }
-        };
-
-        let schema = StructType::try_new(fields)?.into();
-        let mut checkpoint_action = None;
-        for batch in self.log_segment().read_actions(engine, schema)? {
-            let batch = batch?;
-            let data = batch.actions.as_ref();
-            if checkpoint_action.is_none() {
-                checkpoint_action = CheckpointAction::try_new_from_data(data)?;
-            }
-            if let DomainMetadataSource::Scan(visitor) = &mut domain_metadata_source {
-                visitor.visit_rows_of(data)?;
-            }
-            if let SetTransactionSource::Scan(visitor) = &mut set_transaction_source {
-                visitor.visit_rows_of(data)?;
-            }
-        }
-
-        let domain_metadata = match domain_metadata_source {
-            DomainMetadataSource::FromCrc(domain_metadata) => domain_metadata,
-            DomainMetadataSource::Scan(visitor) => {
-                visitor.into_domain_metadatas().into_values().collect()
-            }
-        };
-        let transactions = match set_transaction_source {
-            SetTransactionSource::FromCrc(transactions) => transactions,
-            SetTransactionSource::Scan(visitor) => visitor.set_transactions.into_values().collect(),
-        };
-
-        Ok((domain_metadata, transactions, checkpoint_action))
     }
 
     /// Returns file-level statistics, or `None` if this snapshot has no CRC at its version (none
