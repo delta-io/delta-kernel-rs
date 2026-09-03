@@ -237,12 +237,15 @@ async fn test_append_partitioned(
                     partition_col.to_string(),
                     Scalar::String(partition_val.into()),
                 )]);
-                let write_context = match &encoded_write_state {
-                    Some(encoded) => WriteState::decode(encoded)
-                        .and_then(|state| state.partitioned_write_context(partition_values)),
-                    None => write_state.partitioned_write_context(partition_values),
-                }
-                .unwrap();
+                let state = match &encoded_write_state {
+                    Some(encoded) => WriteState::decode(encoded).unwrap(),
+                    None => Arc::clone(&write_state),
+                };
+                let write_context = state
+                    .write_context_builder()
+                    .with_partition_values(partition_values)
+                    .build()
+                    .unwrap();
                 let engine = engine.clone();
                 tokio::task::spawn(async move {
                     engine
@@ -367,7 +370,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.write_state()?.unpartitioned_write_context()?);
+        let write_context = Arc::new(txn.write_state()?.write_context_builder().build()?);
         let tasks = append_data.into_iter().map(|data| {
             // arc clones
             let engine = engine.clone();
@@ -414,7 +417,7 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )?);
-        let write_context = txn.write_state()?.unpartitioned_write_context()?;
+        let write_context = txn.write_state()?.write_context_builder().build()?;
 
         // Corrupt the addFile at the second batch.
         let valid_meta = engine.write_parquet(&data, &write_context).await?;
@@ -506,10 +509,13 @@ async fn commit_rejects_add_with_invalid_partition_keys(
     let data_schema = schema! { nullable "d": INTEGER };
     let data_schema: Arc<ArrowSchema> = Arc::new((&data_schema).try_into_arrow()?);
     let make_add = |write_state: &Arc<WriteState>, p1: &str, p2: i32| {
-        let wc = write_state.partitioned_write_context(HashMap::from([
-            ("p1".to_string(), Scalar::String(p1.into())),
-            ("p2".to_string(), Scalar::Integer(p2)),
-        ]))?;
+        let wc = write_state
+            .write_context_builder()
+            .with_partition_values(HashMap::from([
+                ("p1".to_string(), Scalar::String(p1.into())),
+                ("p2".to_string(), Scalar::Integer(p2)),
+            ]))
+            .build()?;
         let data = RecordBatch::try_new(
             data_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1]))],

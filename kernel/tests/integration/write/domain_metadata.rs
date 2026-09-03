@@ -35,7 +35,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
 
     // write context does not conflict with domain metadata
-    let _write_context = txn.write_state()?.unpartitioned_write_context()?;
+    let _write_context = txn.write_state()?.write_context_builder().build()?;
 
     // set multiple domain metadata
     let domain1 = "app.config";

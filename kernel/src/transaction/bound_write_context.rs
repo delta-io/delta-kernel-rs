@@ -14,9 +14,10 @@ use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
 /// A write context for a specific partition or an unpartitioned table. Created by a
-/// [`WriteState`](super::WriteState).
+/// [`WriteContextBuilder`](super::WriteContextBuilder).
 ///
-/// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
+/// Note: clustered tables are unpartitioned and use [`WriteContextBuilder::build`] without calling
+/// [`with_partition_values`].
 ///
 /// Contains both table-wide state and per-partition state (serialized partition values with
 /// physical column names as keys). How you use a `BoundWriteContext` depends on your engine:
@@ -29,10 +30,10 @@ use crate::{DeltaResult, Error};
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
-/// [`WriteState::partitioned_write_context`]: super::WriteState::partitioned_write_context
-/// [`WriteState::unpartitioned_write_context`]: super::WriteState::unpartitioned_write_context
 /// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
+/// [`WriteContextBuilder::build`]: super::WriteContextBuilder::build
+/// [`with_partition_values`]: super::WriteContextBuilder::with_partition_values
 #[derive(Debug)]
 pub struct BoundWriteContext {
     pub(super) write_state: Arc<WriteState>,
@@ -244,7 +245,7 @@ impl BoundWriteContext {
     ///
     /// ```rust,ignore
     /// let write_state = transaction.write_state()?;
-    /// let write_context = write_state.unpartitioned_write_context()?;
+    /// let write_context = write_state.write_context_builder().build()?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// ```
     // TODO(#2357): generate the random prefix internally based on table properties

@@ -379,10 +379,11 @@ pub enum FileType {
 /// [`ScanParquet::file_constant_columns`]. Each named input field must have the same type and
 /// nullability as its output field. See the example below.
 ///
-/// `dv_column` names a nullable column on the upstream row holding a Delta
+/// `dv_column`, when set, names a nullable column on the upstream row holding a Delta
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
 /// and drops file rows whose row index appears in the DV. A NULL value for a given
-/// input row means "no DV for this file", so all file rows are emitted.
+/// input row means "no DV for this file", so all file rows are emitted. `None` means the
+/// scan has no deletion-vector column at all, so no DV is applied and every file row is emitted.
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
 ///
@@ -442,8 +443,9 @@ pub struct DynamicScan {
     pub file_size_column: ColumnName,
     /// Non-nullable input column with the last-modified timestamp in milliseconds since epoch.
     pub last_modified_column: ColumnName,
-    /// Nullable input column with the schema of [`DeletionVectorDescriptor`].
-    pub dv_column: ColumnName,
+    /// Optional nullable input column with the schema of [`DeletionVectorDescriptor`]; `None`
+    /// when the scanned files never carry deletion vectors.
+    pub dv_column: Option<ColumnName>,
 }
 
 impl DynamicScan {
@@ -455,7 +457,7 @@ impl DynamicScan {
     /// # Errors
     ///
     /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
-    /// metadata or deletion-vector column is absent from `input_schema`, has an incompatible type,
+    /// metadata column or a configured deletion-vector column is absent, has an incompatible type,
     /// or has invalid nullability; or when a file-constant column is absent from either schema, is
     /// a metadata column, or has different input and output types or nullability.
     #[allow(clippy::too_many_arguments)]
@@ -468,7 +470,7 @@ impl DynamicScan {
         path_column: ColumnName,
         file_size_column: ColumnName,
         last_modified_column: ColumnName,
-        dv_column: ColumnName,
+        dv_column: Option<ColumnName>,
     ) -> DeltaResult<Self> {
         let schema = output_schema.into();
         let file_constant_columns = file_constant_columns
@@ -497,9 +499,9 @@ impl DynamicScan {
     /// # Errors
     ///
     /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
-    /// metadata or deletion-vector column is absent, has an incompatible type, or has invalid
-    /// nullability; or when a file-constant column is absent from either schema, is a metadata
-    /// column, or has different input and output types or nullability.
+    /// metadata column or a configured deletion-vector column is absent, has an incompatible type,
+    /// or has invalid nullability; or when a file-constant column is absent from either schema, is
+    /// a metadata column, or has different input and output types or nullability.
     pub fn validate_input(&self, input_schema: &SchemaRef) -> DeltaResult<()> {
         static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
             LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
@@ -520,30 +522,28 @@ impl DynamicScan {
             &self.file_constant_columns,
         )?;
 
-        let fields = input_schema
-            .fields_of_path(&self.dv_column)
-            .map_err(|err| {
+        if let Some(dv_column) = &self.dv_column {
+            let fields = input_schema.fields_of_path(dv_column).map_err(|err| {
                 Error::generic(format!(
-                    "dynamic scan: deletion-vector column `{}` is invalid: {err}",
-                    self.dv_column
+                    "dynamic scan: deletion-vector column `{dv_column}` is invalid: {err}"
                 ))
             })?;
-        let Some((field, _ancestors)) = fields.split_last() else {
-            return Err(Error::internal_error("fields_of_path returned no fields"));
-        };
-        let expected = &*DELETION_VECTOR_DATA_TYPE;
-        if field.data_type() != expected {
-            return Err(Error::generic(format!(
-                "dynamic scan: deletion-vector column `{}` must have type {expected}, found {}",
-                self.dv_column,
-                field.data_type()
-            )));
-        }
-        if !field.is_nullable() {
-            return Err(Error::generic(format!(
-                "dynamic scan: deletion-vector column `{}` must be nullable",
-                self.dv_column
-            )));
+            let Some((field, _ancestors)) = fields.split_last() else {
+                return Err(Error::internal_error("fields_of_path returned no fields"));
+            };
+            let expected = &*DELETION_VECTOR_DATA_TYPE;
+            if field.data_type() != expected {
+                return Err(Error::generic(format!(
+                    "dynamic scan: deletion-vector column `{dv_column}` must have type \
+                     {expected}, found {}",
+                    field.data_type()
+                )));
+            }
+            if !field.is_nullable() {
+                return Err(Error::generic(format!(
+                    "dynamic scan: deletion-vector column `{dv_column}` must be nullable"
+                )));
+            }
         }
 
         Ok(())

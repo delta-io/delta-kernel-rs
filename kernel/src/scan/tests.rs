@@ -524,10 +524,12 @@ fn test_without_row_transforms_rejects_execute() {
     );
 }
 
-/// Row commit version metadata columns are unsupported by scans, so requesting one errors at
-/// build time regardless of `without_row_transforms`.
+/// Row commit version metadata columns require a row-tracking-enabled table, including when row
+/// transforms are disabled.
 #[rstest]
-fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_transforms: bool) {
+fn test_scan_rejects_row_commit_version_when_row_tracking_is_disabled(
+    #[values(false, true)] without_row_transforms: bool,
+) {
     let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
     let schema = Arc::new(
         snapshot
@@ -541,10 +543,10 @@ fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_trans
     }
     let err = builder
         .build()
-        .expect_err("row commit version columns are unsupported by scans");
+        .expect_err("row commit version columns require row tracking");
     assert!(
         err.to_string()
-            .contains("Row commit versions not supported"),
+            .contains("Row commit versions are not enabled on this table"),
         "unexpected error: {err}"
     );
 }
@@ -1674,7 +1676,7 @@ fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
 
 #[derive(Debug)]
 struct RecordedParquetRead {
-    files: Vec<String>,
+    files: Vec<FileMeta>,
     physical_schema: schema::SchemaRef,
     predicate: Option<PredicateRef>,
 }
@@ -1705,7 +1707,7 @@ impl ParquetHandler for RecordingParquetHandler {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         self.reads.lock().unwrap().push(RecordedParquetRead {
-            files: files.iter().map(|file| file.location.to_string()).collect(),
+            files: files.to_vec(),
             physical_schema: physical_schema.clone(),
             predicate: predicate.clone(),
         });
@@ -1724,6 +1726,52 @@ impl ParquetHandler for RecordingParquetHandler {
     ) -> DeltaResult<()> {
         self.inner.write_parquet_file(location, data)
     }
+}
+
+#[test_log::test]
+fn scan_execute_passes_scan_file_modification_time_to_parquet_handler() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = Arc::new(DelegatingEngine::new(sync).with_parquet_handler(recorder.clone()));
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    fn collect_file_modification_times(
+        file_modification_times: &mut Vec<(String, i64)>,
+        scan_file: ScanFile,
+    ) {
+        file_modification_times.push((scan_file.path.to_string(), scan_file.modification_time));
+    }
+
+    let mut expected = Vec::new();
+    for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        expected = scan_metadata
+            .unwrap()
+            .visit_scan_files(expected, collect_file_modification_times)
+            .unwrap();
+    }
+    recorder.take_reads();
+
+    let _: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+    let reads = recorder.take_reads();
+    let mut actual: Vec<_> = reads
+        .into_iter()
+        .flat_map(|read| read.files)
+        .filter_map(|file| {
+            file.location
+                .to_string()
+                .strip_prefix(url.as_str())
+                .map(|path| (path.to_string(), file.last_modified))
+        })
+        .collect();
+
+    expected.sort_unstable();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
 }
 
 #[rstest]
@@ -1781,7 +1829,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
         .filter(|read| {
             read.files
                 .iter()
-                .any(|file| file.contains(expected_file_fragment))
+                .any(|file| file.location.as_str().contains(expected_file_fragment))
                 && read.physical_schema.field("add").is_some()
         })
         .collect();
@@ -1891,7 +1939,7 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
         reads.iter().any(|read| {
             read.files
                 .iter()
-                .any(|file| file.contains(expected_file_fragment))
+                .any(|file| file.location.as_str().contains(expected_file_fragment))
                 && read
                     .predicate
                     .as_ref()
