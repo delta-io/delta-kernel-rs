@@ -282,8 +282,11 @@ async fn boundary_c1_prunes_all(
 
 /// Builds a table whose JSON commits contain stats beyond the current read cap.
 ///
-/// Files are written under the default cap before the read cap is lowered without checkpointing.
+/// Files are written under the default cap, then the read cap is lowered. With `checkpoint`, a
+/// checkpoint is written after lowering the cap: the default `writeStatsAsJson` preserves the
+/// original `add.stats` verbatim, so the past-cap stats survive into the checkpoint.
 async fn build_table_with_past_cap_stats(
+    checkpoint: bool,
 ) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
     let schema = capped_schema();
     let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -302,13 +305,16 @@ async fn build_table_with_past_cap_stats(
         .await?;
     }
     // Lower the read cap without rewriting the existing Add stats.
-    set_table_properties(
+    let snapshot = set_table_properties(
         &table_path,
         &table_url,
         engine.as_ref(),
         snapshot.version(),
         &[("delta.dataSkippingNumIndexedCols", "2")],
     )?;
+    if checkpoint {
+        snapshot.checkpoint(engine.as_ref(), None)?;
+    }
     Ok((tmp_dir, table_path, engine))
 }
 
@@ -344,7 +350,7 @@ async fn past_cap_stats_column_enables_pruning_via_extra_indexed_or_requested(
     )]
     bypass_stats: StatsOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats().await?;
+    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(false).await?;
     let predicate = || Arc::new(Pred::gt(col!("c2"), lit(60i64)));
 
     let default_survivors = surviving_paths_with_stats(
@@ -459,7 +465,7 @@ async fn past_cap_column_surfaces_in_stats_parsed_output(
     #[case] stats: StatsOptions,
     #[case] expected_min_fields: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats().await?;
+    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(false).await?;
     let url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().with_stats(stats).build()?;
@@ -467,6 +473,45 @@ async fn past_cap_column_surfaces_in_stats_parsed_output(
     let output = read_stats_parsed_output(&scan, engine, "c2")?;
     assert_eq!(output.min_value_fields, expected_min_fields);
     assert_eq!(output.probe_min_max, vec![(10, 10), (50, 50), (100, 100)]);
+    Ok(())
+}
+
+/// Reading from a checkpoint, the cap bypass still recovers a past-cap column's stats: the default
+/// `writeStatsAsJson` preserved the original `add.stats`, and checkpoint discovery reads it back
+/// when the structured stats omit the column.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn past_cap_stats_recovered_from_checkpoint(
+    #[values(false, true)] use_parallel: bool,
+    #[values(
+        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
+        StatsOptions::struct_columns(vec![column_name!("c2")])
+    )]
+    bypass_stats: StatsOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(true).await?;
+    let predicate = || Arc::new(Pred::gt(col!("c2"), lit(60i64)));
+
+    let default_survivors = surviving_paths_with_stats(
+        &table_path,
+        engine.clone(),
+        predicate(),
+        StatsOptions::all_struct(),
+        use_parallel,
+    )?;
+    assert_eq!(
+        default_survivors.len(),
+        3,
+        "c2 is capped out, so without the bypass every file survives"
+    );
+
+    let pruned =
+        surviving_paths_with_stats(&table_path, engine, predicate(), bypass_stats, use_parallel)?;
+    assert_eq!(
+        pruned.len(),
+        1,
+        "reading from the checkpoint, only file C (c2 == 100 > 60) survives"
+    );
     Ok(())
 }
 
