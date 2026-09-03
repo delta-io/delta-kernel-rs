@@ -21,10 +21,8 @@ use url::Url;
 use crate::cancellation::{check_cancelled, CancellableIterator, CancellationTokenRef};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
-use crate::path::{
-    may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
-};
-use crate::{DeltaResult, Error, StorageHandler, Version};
+use crate::path::{CheckpointInstance, LogPathFileType, ParsedLogPath};
+use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -58,9 +56,10 @@ pub(crate) struct LogSegmentFiles {
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
 /// `[start_version, end_version]`. The iterator handles parsing, filtering out non-listable
-/// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
-/// underlying listing at the first path past the version-named region, so directories like
-/// `_staged_commits/` and `_sidecars/` are never paged through.
+/// files (e.g. dot-prefixed files), and stopping at `end_version`.
+///
+/// [`StorageHandler::list_from`] is single-directory, so subdirectories like `_staged_commits/`
+/// and `_sidecars/` are never listed.
 ///
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
@@ -78,40 +77,62 @@ pub(crate) fn list_delta_log_from_storage(
     cancellation_token: Option<&CancellationTokenRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
-    let log_root_str = log_root.to_string();
-    let files = storage
-        .list_from_with_cancellation(&start_from, cancellation_token.cloned())?
-        // The listing is sorted by full path, so nothing relevant follows the first relative path
-        // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
-        // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
-        // A path that doesn't strip the log_root prefix is kept; parsing discards it.
-        // TODO(#2740): push the bound into the listing request itself.
-        .take_while(move |meta_res| match meta_res {
-            Ok(meta) => meta
-                .location
-                .as_str()
-                .strip_prefix(&log_root_str)
-                .is_none_or(may_begin_listable_log_path),
-            Err(_) => true,
-        })
-        .map(|meta| ParsedLogPath::try_from(meta?))
-        // NOTE: this filters out .crc files etc which start with "." - some engines
-        // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
-        // doesn't care about these files. Critically, note these are _different_ than
-        // normal `version.crc` files which are listed + captured normally. Additionally
-        // we likely aren't even 'seeing' these files since lexicographically the string
-        // "." comes before the string "0".
-        .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
-        .take_while(move |path_res| match path_res {
-            // discard any path with too-large version; keep errors
-            Ok(path) => path.version <= end_version,
-            Err(_) => true,
-        });
+    let files = debug_assert_direct_children(
+        log_root,
+        storage.list_from_with_cancellation(&start_from, cancellation_token.cloned())?,
+    )
+    .map(|meta| ParsedLogPath::try_from(meta?))
+    // NOTE: this filters out .crc files etc which start with "." - some engines
+    // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
+    // doesn't care about these files. Critically, note these are _different_ than
+    // normal `version.crc` files which are listed + captured normally. Additionally
+    // we likely aren't even 'seeing' these files since lexicographically the string
+    // "." comes before the string "0".
+    .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
+    .take_while(move |path_res| match path_res {
+        // discard any path with too-large version; keep errors
+        Ok(path) => path.version <= end_version,
+        Err(_) => true,
+    });
     // Wrap the filtered pipeline so cancellation is checked as the iterator is consumed, outside
     // the version `take_while` above. Checked inside, a cancelled listing would end with `None` and
     // be indistinguishable from a complete one; outside, it surfaces as a terminal
     // `Error::Cancelled`.
     Ok(CancellableIterator::new(files, cancellation_token.cloned()))
+}
+
+/// True if `child` is a direct child of the directory `dir`.
+#[cfg(debug_assertions)]
+fn is_single_directory_child(dir: &Url, child: &Url) -> bool {
+    dir.make_relative(child)
+        .is_none_or(|rel| !rel.contains('/'))
+}
+
+/// Debug-only guard catching a [`StorageHandler::list_from`] that recurses into subdirectories.
+#[cfg(debug_assertions)]
+fn debug_assert_direct_children(
+    dir: &Url,
+    iter: impl Iterator<Item = DeltaResult<FileMeta>>,
+) -> impl Iterator<Item = DeltaResult<FileMeta>> {
+    let dir = dir.clone();
+    iter.inspect(move |res| {
+        if let Ok(meta) = res {
+            debug_assert!(
+                is_single_directory_child(&dir, &meta.location),
+                "list_from returned '{}', not a direct child of '{}'",
+                meta.location,
+                dir,
+            );
+        }
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_direct_children(
+    _dir: &Url,
+    iter: impl Iterator<Item = DeltaResult<FileMeta>>,
+) -> impl Iterator<Item = DeltaResult<FileMeta>> {
+    iter
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.

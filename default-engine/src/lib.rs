@@ -29,6 +29,7 @@ use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use self::storage::EngineStore;
 
 pub mod executor;
 pub mod file_stream;
@@ -210,14 +211,22 @@ pub struct DefaultEngine<E: TaskExecutor> {
 ///     .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
 ///     .build();
 /// ```
-#[derive(Debug)]
 pub struct DefaultEngineBuilder<E> {
-    object_store: Arc<DynObjectStore>,
+    store: EngineStore,
     /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
     task_executor: E,
     /// Read-path I/O concurrency config applied to the JSON and Parquet handlers. `None` fields
     /// fall back to the handlers' defaults.
     io_config: ReadIoConfig,
+}
+
+impl<E> std::fmt::Debug for DefaultEngineBuilder<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DefaultEngineBuilder")
+            .field("store", &self.store)
+            .field("io_config", &self.io_config)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Read-path I/O tuning for [`DefaultEngine`]'s JSON and Parquet handlers.
@@ -237,19 +246,37 @@ struct ReadIoConfig {
 pub struct DefaultTaskExecutor;
 
 impl DefaultEngineBuilder<DefaultTaskExecutor> {
-    /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
-    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+    /// Create a new [`DefaultEngineBuilder`] with the default executor.
+    ///
+    /// For cloud stores, prefer [`from_url_opts`](Self::from_url_opts): a `dyn ObjectStore` cannot
+    /// expose provider-specific paginated listing support.
+    pub fn new(store: impl Into<EngineStore>) -> Self {
         Self {
-            object_store,
+            store: store.into(),
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
         }
     }
 
+    /// Create a [`DefaultEngineBuilder`] from a URL and object-store options, enabling delimiter
+    /// pushdown for S3/GCS/Azure. Prefer this over [`new`](Self::new) for cloud.
+    pub fn from_url_opts<I, K, V>(url: &Url, options: I) -> DeltaResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        Ok(Self {
+            store: EngineStore::from_url_opts(url, options)?,
+            task_executor: DefaultTaskExecutor,
+            io_config: ReadIoConfig::default(),
+        })
+    }
+
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        DefaultEngine::new_with_opts(self.object_store, task_executor, self.io_config)
+        DefaultEngine::new_with_opts(self.store, task_executor, self.io_config)
     }
 }
 
@@ -262,7 +289,7 @@ impl<E> DefaultEngineBuilder<E> {
         task_executor: Arc<F>,
     ) -> DefaultEngineBuilder<Arc<F>> {
         DefaultEngineBuilder {
-            object_store: self.object_store,
+            store: self.store,
             task_executor,
             io_config: self.io_config,
         }
@@ -293,7 +320,7 @@ impl<E> DefaultEngineBuilder<E> {
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.io_config)
+        DefaultEngine::new_with_opts(self.store, self.task_executor, self.io_config)
     }
 }
 
@@ -309,13 +336,14 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
-    fn new_with_opts(
-        object_store: Arc<DynObjectStore>,
-        task_executor: Arc<E>,
-        io_config: ReadIoConfig,
-    ) -> Self {
+    fn new_with_opts(store: EngineStore, task_executor: Arc<E>, io_config: ReadIoConfig) -> Self {
+        let EngineStore {
+            object_store,
+            paginated,
+        } = store;
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
+            paginated,
             task_executor.clone(),
         ));
 

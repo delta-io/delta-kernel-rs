@@ -37,26 +37,36 @@ impl StorageHandler for SyncStorageHandler {
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
 
-        // For directory URLs, prefix == offset and the offset acts as a lower bound that still
-        // includes everything underneath (since `dir/a` > `dir` lexicographically). For file
-        // URLs, the prefix is the parent directory and the offset filters out files at-or-below.
+        // Directory URLs list the directory itself (prefix == offset). File URLs list the parent
+        // directory after the file. The retain below narrows the raw listing to direct children.
         let prefix = if url_path.path().ends_with('/') {
             offset.clone()
         } else {
             let mut parts: Vec<_> = offset.parts().collect();
-            parts.pop();
+            if parts.pop().is_none() {
+                return Err(Error::generic(format!(
+                    "Offset path must not be a root directory. Got: '{url_path}'"
+                )));
+            }
             Path::from_iter(parts)
         };
 
-        // LocalFileSystem and InMemory do not return sorted listings, so we collect and sort
-        // to give callers a deterministic order.
+        // `list_with_offset` recurses, so filter to direct children (one path part left after the
+        // prefix).
         let mut metas: Vec<_> = futures::executor::block_on(
             store
                 .list_with_offset(Some(&prefix), &offset)
                 .collect::<Vec<_>>(),
         )
         .into_iter()
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
+        metas.retain(|meta| {
+            meta.location
+                .prefix_match(&prefix)
+                .is_some_and(|parts| parts.count() == 1)
+        });
+        // LocalFileSystem and InMemory do not return sorted listings, so sort for a deterministic
+        // order.
         metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
 
         let iter = metas.into_iter().map(move |meta| {
@@ -224,10 +234,9 @@ mod tests {
         Ok(())
     }
 
-    /// `list_from` against an [`ObjectStore`] must walk subdirectories, matching the local FS
-    /// implementation that uses `read_dir` recursively.
+    /// `list_from` is single-directory: files nested in subdirectories are excluded.
     #[tokio::test]
-    async fn list_from_store_is_recursive() {
+    async fn list_from_store_is_single_directory() {
         let store = std::sync::Arc::new(InMemory::new());
         store
             .put(
@@ -256,7 +265,15 @@ mod tests {
             .iter()
             .map(|f| f.location.path().to_string())
             .collect();
-        assert_eq!(names, vec!["/a/file1.json", "/a/sub/file2.json"]);
+        assert_eq!(names, vec!["/a/file1.json"]);
+    }
+
+    #[test]
+    fn list_from_root_offset_errors() {
+        let storage = SyncStorageHandler::new(Some(std::sync::Arc::new(InMemory::new())));
+        // Authority-only URL: empty path, not directory-like, so the offset has no parent.
+        let url = Url::parse("memory://bucket").unwrap();
+        assert!(matches!(storage.list_from(&url), Err(Error::Generic(_))));
     }
 
     #[test]

@@ -138,7 +138,7 @@ fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
 /// A [`StorageHandler`] wrapper that counts the number of `list_from` calls and the number of
 /// items consumed from the returned iterators. Used to verify that
 /// `list_with_backward_checkpoint_scan` issues the expected number of storage listing requests,
-/// and that listing terminates without consuming files past the version-named region.
+/// and that single-directory listing never yields files from subdirectories.
 struct CountingStorageHandler {
     inner: Arc<dyn StorageHandler>,
     list_from_count: AtomicU32,
@@ -484,14 +484,13 @@ async fn test_listing_omits_staged_commits() {
 }
 
 #[tokio::test]
-async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() {
+async fn test_listing_never_yields_staged_commits_in_subdirectory() {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
         (2, LogPathFileType::Commit, CommitSource::Filesystem),
     ];
-    // Staged commits sort after every version-named file ('_' > '9'), so a sorted listing
-    // reaches them only after all relevant files. None should be consumed beyond the first.
+    // Staged commits live under `_staged_commits/`, never yielded by single-directory listing.
     log_files
         .extend((0..100).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
 
@@ -504,19 +503,17 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the single staged commit that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    // Only the 3 direct-child commits are listed.
+    assert_eq!(storage.items_listed(), 3);
 }
 
-// Any path past the version-named region stops the listing, not just `_staged_commits/`:
-// checkpoint sidecars under `_sidecars/` and non-underscore names whose first byte sorts
-// past '9' (e.g. 'Z'). Both sentinels sort before `_staged_commits/`, so no staged commit
-// is ever consumed.
+// Direct-child files that are not log files (a stray `_last_checkpoint` or a name sorting past
+// '9' such as 'Z') are listed but excluded from the log segment by parsing.
 #[rstest]
-#[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet")]
+#[case::last_checkpoint("_delta_log/_last_checkpoint")]
 #[case::non_underscore_sentinel("_delta_log/Zsentinel")]
 #[tokio::test]
-async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_path: &str) {
+async fn test_listing_ignores_direct_child_non_log_files(#[case] sentinel_path: &str) {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -533,14 +530,12 @@ async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_pat
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the sentinel that stops the listing
+    // 3 commits plus the direct-child sentinel.
     assert_eq!(storage.items_listed(), 4);
 }
 
 #[tokio::test]
-async fn test_listing_stops_at_last_checkpoint_marker() {
-    // In a real table `_last_checkpoint` sorts before `_staged_commits/` ('_la' < '_st'), so
-    // it is the path that stops the listing.
+async fn test_listing_with_checkpoint_and_crc_omits_staged_commits() {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -568,8 +563,7 @@ async fn test_listing_stops_at_last_checkpoint_marker() {
     assert_eq!(latest_crc.unwrap().version, 2);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 5 version-named files plus the `_last_checkpoint` that stops the listing; no staged
-    // commit is ever consumed
+    // 5 version-named direct children plus `_last_checkpoint`. Staged commits are never listed.
     assert_eq!(storage.items_listed(), 6);
 }
 
@@ -1375,7 +1369,55 @@ fn find_complete_checkpoint_version_cases(
 ) {
     assert_eq!(find_complete_checkpoint_version(&files), expected);
 }
+/// A recursive result trips the direct-child assertion in `list_delta_log_from_storage`.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "not a direct child")]
+fn list_delta_log_from_storage_rejects_recursive_listing() {
+    use crate::{FileSlice, StorageHandler};
 
+    struct RecursingStorage;
+    impl StorageHandler for RecursingStorage {
+        fn list_from(
+            &self,
+            _path: &Url,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+            let nested = FileMeta {
+                location: Url::parse(
+                    "memory:///_delta_log/_staged_commits/00000000000000000001.abc.json",
+                )
+                .unwrap(),
+                last_modified: 0,
+                size: 1,
+            };
+            Ok(Box::new(std::iter::once(Ok(nested))))
+        }
+        fn read_files(
+            &self,
+            _files: Vec<FileSlice>,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn copy_atomic(&self, _src: &Url, _dst: &Url) -> DeltaResult<()> {
+            Ok(())
+        }
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+            Ok(())
+        }
+        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+            unreachable!()
+        }
+        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let iter =
+        list_delta_log_from_storage(&RecursingStorage, &log_root, 0, Version::MAX, None).unwrap();
+    // The assert fires lazily as the item is pulled.
+    let _ = iter.collect::<Vec<_>>();
+}
 /// [`crate::path::tests::parse_log_path`] stamped with this module's filesystem size marker. Unlike
 /// [`make_parsed_log_path_with_source`], whose url is always `<version>.json`, this works for
 /// checkpoint paths, whose file name takes part in checkpoint selection.
