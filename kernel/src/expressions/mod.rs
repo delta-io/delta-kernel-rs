@@ -705,8 +705,11 @@ impl ParseJsonExpression {
 ///   round or rescale.
 /// - BOOLEAN: accept case-insensitive `true` or `false`, with no numeric or yes/no aliases.
 /// - DATE: parse `{year}-{month}-{day}`.
-/// - TIMESTAMP: parse either a space-separated timestamp without a zone, interpreted as UTC, or an
-///   ISO 8601 timestamp with an explicit offset, normalized to UTC.
+/// - TIMESTAMP: parse either 1) an ISO 8601 timestamp with an explicit offset, normalized to UTC;
+///   or 2) a space-separated timestamp without a zone. Currently, kernel expects case 2 to be
+///   interpreted as UTC, however the protocol specifies that it should be interpreted in the
+///   writer's time zone. TODO: MapToStruct needs to be updated to take in a timezone as a
+///   parameter.
 /// - TIMESTAMP_NTZ: parse a space-separated timestamp without an offset and preserve the local
 ///   wall-clock value.
 /// - Interval types: parse an ANSI interval literal accepted by [`PrimitiveType::parse_scalar`].
