@@ -1900,6 +1900,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn extra_indexed_struct_column_widens_gate_to_leaves() {
+        // A struct named as extra_indexed must widen the skipping gate to its leaf paths, not the
+        // parent path, so a leaf predicate (matched by exact membership) can still prune.
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+            StatsOptions::all_struct_with_extra_indexed(vec![column_name!("s")]),
+        )
+        .unwrap();
+        assert!(state_info
+            .physical_stats_columns
+            .contains(&column_name!("s.c")));
+        assert!(state_info
+            .physical_stats_columns
+            .contains(&column_name!("s.d")));
+        assert!(
+            !state_info
+                .physical_stats_columns
+                .contains(&column_name!("s")),
+            "the parent path must not stand in for its leaves"
+        );
+    }
+
+    #[test]
     fn extra_indexed_column_resolves_physical_name_under_column_mapping() {
         let schema = schema_ref! {
             (cm_field("col_a", 1, "phys_a", DataType::LONG)),

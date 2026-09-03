@@ -129,24 +129,25 @@ impl<'col> StatsColumnFilter<'col> {
             self.collect_field(field, result);
         }
 
-        // Pass 2: Add required columns not already included
-        // Uses O(n) contains check, but required columns are typically few (1-4)
+        // Pass 2: add required columns not covered by Pass 1. The gate matches leaves by exact
+        // membership, so a struct column contributes its leaf paths (matching the leaf-expanded
+        // stats schema), not the parent path.
         if let Some(required_cols) = self.required_columns {
             for col in required_cols {
-                if result.contains(col) {
+                let Ok(field) = schema.field_at(col) else {
+                    tracing::warn!(
+                        "Required column '{}' not found in table schema; skipping",
+                        col
+                    );
                     continue;
-                }
-                // Verify the required column exists in schema before adding
-                if schema.field_at(col).is_ok() {
+                };
+                let mut path: Vec<String> = col.iter().map(String::from).collect();
+                let before = result.len();
+                collect_required_leaf_paths(&mut path, field.data_type(), result);
+                if result.len() > before {
                     tracing::warn!(
                         "Required column '{}' exceeds dataSkippingNumIndexedCols limit; \
                          adding anyway",
-                        col
-                    );
-                    result.push(col.clone());
-                } else {
-                    tracing::warn!(
-                        "Required column '{}' not found in table schema; skipping",
                         col
                     );
                 }
@@ -239,6 +240,32 @@ impl<'col> StatsColumnFilter<'col> {
         }
 
         self.path.pop();
+    }
+}
+
+/// Appends the leaf paths under `data_type` (rooted at `path`) to `result`, skipping any already
+/// present. A non-struct type contributes `path` itself; a struct expands to each descendant leaf.
+/// This mirrors how a required struct column's leaves land in the stats schema, keeping the gate
+/// set consistent with that schema.
+fn collect_required_leaf_paths(
+    path: &mut Vec<String>,
+    data_type: &DataType,
+    result: &mut Vec<ColumnName>,
+) {
+    match data_type {
+        DataType::Struct(struct_type) => {
+            for child in struct_type.fields() {
+                path.push(child.name.clone());
+                collect_required_leaf_paths(path, child.data_type(), result);
+                path.pop();
+            }
+        }
+        _ => {
+            let name = ColumnName::new(&*path);
+            if !result.contains(&name) {
+                result.push(name);
+            }
+        }
     }
 }
 
@@ -389,6 +416,59 @@ mod tests {
                 column_name!("id"),
                 column_name!("name"),
                 column_name!("user.address.city"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_required_struct_column_expands_to_leaves() {
+        // A required struct past the cap must contribute its leaf paths, not the parent path,
+        // so leaf predicates (matched by exact membership in the gate) can prune.
+        let props = make_props_with_num_cols(1);
+        let required_cols = vec![column_name!("s")];
+        let schema = schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "x": LONG,
+                nullable "y": LONG,
+            },
+        };
+
+        let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
+
+        // "a" is within the limit; "s" expands to its leaves.
+        assert_eq!(
+            columns,
+            vec![column_name!("a"), column_name!("s.x"), column_name!("s.y"),]
+        );
+    }
+
+    #[test]
+    fn test_required_struct_column_leaf_dedups_within_limit() {
+        // When the cap already covers some of a required struct's leaves, expansion adds only the
+        // ones past the cap and does not duplicate the covered leaf.
+        let props = make_props_with_num_cols(3);
+        let required_cols = vec![column_name!("s")];
+        let schema = schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "x": LONG,
+                nullable "y": LONG,
+            },
+        };
+
+        let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
+
+        // a, b, s.x fall within the limit of 3; only s.y is added by the required expansion.
+        assert_eq!(
+            columns,
+            vec![
+                column_name!("a"),
+                column_name!("b"),
+                column_name!("s.x"),
+                column_name!("s.y"),
             ]
         );
     }

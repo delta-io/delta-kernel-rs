@@ -14,7 +14,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Int64Array, RecordBatch};
+use delta_kernel::arrow::array::{Array, BooleanArray, Int64Array, RecordBatch, StructArray};
+use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
@@ -36,7 +37,7 @@ use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadEx
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     add_commit, create_table_and_load_snapshot, install_thread_local_metrics_reporter,
-    test_table_setup_mt, write_batch_to_table, CapturingReporter,
+    into_record_batch, test_table_setup_mt, write_batch_to_table, CapturingReporter,
 };
 use url::Url;
 
@@ -366,6 +367,106 @@ async fn past_cap_stats_column_enables_pruning_via_extra_indexed_or_requested(
         1,
         "with c2 exempt from the cap, only file C (c2 == 100 > 60) survives"
     );
+    Ok(())
+}
+
+/// The pieces of the emitted `stats_parsed` output a test asserts on.
+struct StatsParsedOutput {
+    /// Field names present in `minValues`, i.e. the emitted output columns.
+    min_value_fields: Vec<String>,
+    /// `(min, max)` of the probe column on every emitted file, sorted.
+    probe_min_max: Vec<(i64, i64)>,
+}
+
+/// Reads the emitted `stats_parsed` output: the field names in `minValues` and the `(min, max)`
+/// pair for `probe` on every emitted file -- the engine-facing values a path-only test never
+/// checks.
+fn read_stats_parsed_output(
+    scan: &Scan,
+    engine: Arc<TestEngine>,
+    probe: &str,
+) -> Result<StatsParsedOutput, Box<dyn std::error::Error>> {
+    let mut min_fields: Option<Vec<String>> = None;
+    let mut min_max = Vec::new();
+    for sm in scan.scan_metadata(engine.as_ref())? {
+        let (data, selection) = sm?.scan_files.into_parts();
+        // Keep only selected rows; deselected rows are non-Add actions with null stats.
+        let batch = filter_record_batch(&into_record_batch(data), &BooleanArray::from(selection))?;
+        let struct_at = |parent: &StructArray, name: &str| -> Result<StructArray, String> {
+            parent
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+                .cloned()
+                .ok_or_else(|| format!("{name} missing or not a struct"))
+        };
+        let stats = batch
+            .column_by_name("stats_parsed")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+            .cloned()
+            .ok_or("stats_parsed missing from scan output")?;
+        let min_values = struct_at(&stats, "minValues")?;
+        let max_values = struct_at(&stats, "maxValues")?;
+        let null_count = struct_at(&stats, "nullCount")?;
+        assert!(
+            null_count.column_by_name(probe).is_some(),
+            "nullCount should carry {probe}"
+        );
+
+        min_fields.get_or_insert_with(|| {
+            min_values
+                .fields()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect()
+        });
+        let int_col = |parent: &StructArray, name: &str| -> Result<Int64Array, String> {
+            parent
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .cloned()
+                .ok_or_else(|| format!("{name}.{probe} missing or not i64"))
+        };
+        let probe_min = int_col(&min_values, probe)?;
+        let probe_max = int_col(&max_values, probe)?;
+        for row in 0..batch.num_rows() {
+            min_max.push((probe_min.value(row), probe_max.value(row)));
+        }
+    }
+    min_max.sort_unstable();
+    Ok(StatsParsedOutput {
+        min_value_fields: min_fields.unwrap_or_default(),
+        probe_min_max: min_max,
+    })
+}
+
+/// The engine-facing `stats_parsed` output must carry a past-cap column with correct values, not
+/// merely enable pruning. Files carry `c2` values 10, 50, and 100 (constant per file).
+#[rstest]
+#[case::extra_only_via_all(
+    StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
+    &["c0", "c1", "c2"],
+)]
+#[case::requested_only(
+    StatsOptions::struct_columns(vec![column_name!("c2")]),
+    &["c2"],
+)]
+#[case::requested_plus_extra(
+    StatsOptions::struct_columns(vec![column_name!("c1"), column_name!("c2")]),
+    &["c1", "c2"],
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn past_cap_column_surfaces_in_stats_parsed_output(
+    #[case] stats: StatsOptions,
+    #[case] expected_min_fields: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats().await?;
+    let url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().with_stats(stats).build()?;
+
+    let output = read_stats_parsed_output(&scan, engine, "c2")?;
+    assert_eq!(output.min_value_fields, expected_min_fields);
+    assert_eq!(output.probe_min_max, vec![(10, 10), (50, 50), (100, 100)]);
     Ok(())
 }
 
