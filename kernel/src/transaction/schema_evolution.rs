@@ -2,23 +2,31 @@
 //! apply schema changes to produce an evolved schema.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
+
+use delta_kernel_derive::internal_api;
 
 use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    find_max_column_id_in_schema, try_assign_flat_column_mapping_info, validate_column_mapping_id,
-    ColumnMappingMode,
+    find_max_column_id_in_schema, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
+    validate_column_mapping_id, ColumnMappingMode,
 };
+use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::utils::FoldWithOption as _;
 use crate::DeltaResult;
 
 /// A schema evolution operation to be applied to a table.
 ///
 /// Operations are validated and applied in order during
-/// [`apply_schema_operations`]. Each operation sees the schema state after all prior operations
+/// `apply_schema_operations`. Each operation sees the schema state after all prior operations
 /// have been applied.
 #[derive(Debug, Clone)]
+#[internal_api]
 pub(crate) enum SchemaOperation {
     /// Add a column or nested field to the table schema.
     AddColumn {
@@ -253,6 +261,57 @@ pub(crate) fn apply_schema_operations(
         schema: schema.into(),
         new_max_column_id,
     })
+}
+
+/// Applies schema changes and validates the resulting table configuration.
+///
+/// # Errors
+///
+/// Returns an error when an operation is invalid, the evolved schema violates Delta schema
+/// rules, or the evolved metadata is incompatible with the table protocol.
+pub(crate) fn evolve_table_config(
+    table_config: &TableConfiguration,
+    operations: Vec<SchemaOperation>,
+) -> DeltaResult<TableConfiguration> {
+    let schema = Arc::unwrap_or_clone(table_config.logical_schema());
+    let column_mapping_mode = table_config.column_mapping_mode();
+    let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+    // Whether the pre-alter schema already carried column-mapping metadata -- the only fact the
+    // strip below needs from it. Captured as a bool (not a clone) before
+    // `apply_schema_operations` consumes `schema` by value. Short-circuits outside
+    // `None` mode, where no strip fires.
+    let current_has_cm = column_mapping_mode == ColumnMappingMode::None
+        && schema_has_column_mapping_metadata(&schema);
+    let SchemaEvolutionResult {
+        schema: evolved_schema,
+        new_max_column_id,
+    } = apply_schema_operations(
+        schema,
+        operations,
+        column_mapping_mode,
+        current_max_column_id,
+    )?;
+
+    // Only in `None` mode: if this evolution introduced column-mapping annotations into a table
+    // that was clean before it, strip them; residual annotations already present on the table are
+    // left in place (see `strip_stray_column_mapping_metadata`).
+    let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
+        strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
+            .map_or(evolved_schema, Arc::new)
+    } else {
+        evolved_schema
+    };
+
+    let evolved_metadata = table_config
+        .metadata()
+        .clone()
+        .with_schema(evolved_schema.clone())?
+        .fold_with(new_max_column_id, |evolved_metadata, id| {
+            evolved_metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+        });
+
+    // Validates the evolved metadata against the protocol.
+    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
 }
 
 #[cfg(test)]

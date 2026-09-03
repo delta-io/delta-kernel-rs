@@ -37,7 +37,8 @@ use crate::table_features::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
     V3_VALIDATOR,
 };
-use crate::utils::current_time_ms;
+use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
+use crate::utils::{current_time_ms, require};
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -132,6 +133,50 @@ impl Transaction {
     pub fn with_operation(mut self, operation: String) -> Self {
         self.operation = Some(operation);
         self
+    }
+
+    /// Stages schema changes for this transaction. Call before staging data-file actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are
+    /// enabled, data-file actions have already been staged, or an operation is invalid for the
+    /// current schema or table configuration.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn with_schema_changes(
+        mut self,
+        changes: Vec<SchemaOperation>,
+    ) -> DeltaResult<Self> {
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergCompatV3)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
+            ));
+        }
+        require!(
+            !changes.is_empty(),
+            Error::generic("with_schema_changes requires at least one schema operation")
+        );
+        require!(
+            !self.has_data_file_actions(),
+            Error::invalid_transaction_state(
+                "with_schema_changes must be called before staging data files"
+            )
+        );
+        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
+        self.should_emit_metadata = true;
+        Ok(self)
     }
 
     /// Remove domain metadata from the Delta log.
