@@ -89,6 +89,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      pull-requests: write
     outputs:
       allowed: ${{ steps.access.outputs.allowed }}
       auth_subject: ${{ steps.trigger.outputs.auth_subject }}
@@ -186,6 +187,7 @@ jobs:
           esac
 
       - name: Acknowledge /review command
+        continue-on-error: true
         if: >-
           github.event_name == 'issue_comment' &&
           steps.trigger.outputs.skip != 'true' &&
@@ -196,8 +198,8 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
-            -f content=eyes --silent || true
+          gh api --method POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes --silent
 
   review:
     name: AI PR Review

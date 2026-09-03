@@ -86,6 +86,23 @@ class InlineReviewTest(unittest.TestCase):
         for side in self.inline_review.INLINE_FINDING_SIDES:
             self.assertIn(side, prompt)
 
+    def test_reviewer_contract_matches_configured_prompt(self) -> None:
+        reviewer_dir = Path(__file__).parents[1] / "reviewer"
+        contract = (reviewer_dir / "REVIEW.md").read_text()
+        _, separator, standalone_prompt = contract.partition("\n---\n\n")
+        self.assertTrue(separator)
+
+        config = (reviewer_dir / "config.yaml").read_text()
+        _, separator, prompt_block = config.partition("prompt: |\n")
+        self.assertTrue(separator)
+        configured_lines = []
+        for line in prompt_block.splitlines():
+            if line and not line.startswith("  "):
+                break
+            configured_lines.append(line[2:])
+
+        self.assertEqual(standalone_prompt.strip(), "\n".join(configured_lines).strip())
+
     def test_diff_positions_tracks_both_sides_and_context(self) -> None:
         self.assertEqual(
             self.inline_review.diff_positions(DIFF),
