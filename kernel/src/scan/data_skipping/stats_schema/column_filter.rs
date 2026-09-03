@@ -3,6 +3,8 @@
 //! This module contains [`StatsColumnFilter`], which determines which columns
 //! should have statistics collected based on table configuration.
 
+use std::collections::HashSet;
+
 use crate::column_trie::ColumnTrie;
 use crate::schema::{ColumnName, DataType, Schema, StructField};
 use crate::table_properties::DataSkippingNumIndexedCols;
@@ -132,6 +134,7 @@ impl<'col> StatsColumnFilter<'col> {
         // Required struct columns expand to leaf paths because membership is exact and stats
         // schemas contain leaves rather than their parent struct.
         if let Some(required_cols) = self.required_columns {
+            let mut seen: HashSet<_> = result.iter().cloned().collect();
             for col in required_cols {
                 let Ok(field) = schema.field_at(col) else {
                     tracing::warn!(
@@ -142,7 +145,7 @@ impl<'col> StatsColumnFilter<'col> {
                 };
                 let mut path: Vec<String> = col.iter().map(String::from).collect();
                 let before = result.len();
-                collect_required_leaf_paths(&mut path, field.data_type(), result);
+                collect_required_leaf_paths(&mut path, field.data_type(), result, &mut seen);
                 if result.len() > before {
                     tracing::warn!(
                         "Required column '{}' exceeds dataSkippingNumIndexedCols limit; \
@@ -249,18 +252,19 @@ fn collect_required_leaf_paths(
     path: &mut Vec<String>,
     data_type: &DataType,
     result: &mut Vec<ColumnName>,
+    seen: &mut HashSet<ColumnName>,
 ) {
     match data_type {
         DataType::Struct(struct_type) => {
             for child in struct_type.fields() {
                 path.push(child.name.clone());
-                collect_required_leaf_paths(path, child.data_type(), result);
+                collect_required_leaf_paths(path, child.data_type(), result, seen);
                 path.pop();
             }
         }
         _ => {
             let name = ColumnName::new(&*path);
-            if !result.contains(&name) {
+            if seen.insert(name.clone()) {
                 result.push(name);
             }
         }

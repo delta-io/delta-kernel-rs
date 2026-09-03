@@ -186,7 +186,7 @@ fn build_data_skipping_schemas(
     };
 
     let stats_schema = match (struct_stats, physical_predicate) {
-        (StructStats::All { .. }, _) => with_data_cols(
+        (StructStats::AllIndexed { .. }, _) => with_data_cols(
             table_configuration
                 .build_expected_stats_schemas(requested_physical_stats_columns, None)?
                 .physical,
@@ -211,6 +211,7 @@ fn build_data_skipping_schemas(
                 .build_expected_stats_schemas(None, Some(&predicate_refs_physical))?
                 .physical,
         ),
+        // No struct stats requested and no predicate: nothing to read or emit, so no stats schema.
         (_, _) => None,
     };
     Ok((stats_schema, predicate_partition_schema))
@@ -413,9 +414,9 @@ impl StateInfo {
         };
 
         // Resolve requested names once for both stats eligibility and schema construction.
-        // `Columns` is strict; `All` treats extra-indexed names as best-effort hints.
+        // `Columns` is strict; `AllIndexed` treats extra-indexed names as best-effort hints.
         let requested_physical_stats_columns: Vec<ColumnName> = match &stats.struct_stats {
-            StructStats::All { extra_indexed } => {
+            StructStats::AllIndexed { extra_indexed } => {
                 resolve_physical_columns(table_configuration, extra_indexed)
             }
             StructStats::Columns { requested } => {

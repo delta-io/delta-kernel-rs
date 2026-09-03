@@ -130,14 +130,13 @@ pub enum StructStats {
     /// disables stats reading entirely.
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
-    All {
+    AllIndexed {
         /// Columns outside the indexed set that may have on-disk stats. Names that cannot be
         /// resolved are omitted with a warning. Missing per-file values read as NULL and do not
         /// prune.
         extra_indexed: Vec<ColumnName>,
     },
     /// Emit stats for at least the `requested` columns, regardless of the table's indexed set.
-    /// Predicate-referenced stats columns may also appear.
     Columns {
         /// Columns to request, even outside the indexed set. Names that cannot be resolved return
         /// an error. Missing per-file values read as NULL and do not prune.
@@ -167,7 +166,7 @@ impl StatsOptions {
     pub fn all_struct() -> Self {
         Self {
             synthesize_json: false,
-            struct_stats: StructStats::All {
+            struct_stats: StructStats::AllIndexed {
                 extra_indexed: Vec::new(),
             },
         }
@@ -175,8 +174,8 @@ impl StatsOptions {
 
     /// Returns struct stats for at least `cols`, regardless of the table's indexed set.
     ///
-    /// Predicate-referenced stats columns may also appear. Names that cannot be resolved return an
-    /// error. Missing per-file values read as NULL and do not prune.
+    /// Names that cannot be resolved return an error. Missing per-file values read as NULL and do
+    /// not prune.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
@@ -191,7 +190,7 @@ impl StatsOptions {
     pub fn all_struct_with_extra_indexed(extra_indexed: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
-            struct_stats: StructStats::All { extra_indexed },
+            struct_stats: StructStats::AllIndexed { extra_indexed },
         }
     }
 
@@ -199,7 +198,7 @@ impl StatsOptions {
     pub fn all() -> Self {
         Self {
             synthesize_json: true,
-            struct_stats: StructStats::All {
+            struct_stats: StructStats::AllIndexed {
                 extra_indexed: Vec::new(),
             },
         }
@@ -210,7 +209,7 @@ impl StatsOptions {
     /// Use when the engine handles its own pruning.
     ///
     /// To get internal predicate-based skipping without `stats_parsed` output, use
-    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `All`/`Columns`.
+    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `AllIndexed`/`Columns`.
     pub fn none() -> Self {
         Self {
             synthesize_json: false,
@@ -732,7 +731,7 @@ fn build_physical_stats_output_schema(
 ) -> DeltaResult<Option<SchemaRef>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
-        StructStats::All { .. } => Ok(state_info.physical_stats_schema.clone()),
+        StructStats::AllIndexed { .. } => Ok(state_info.physical_stats_schema.clone()),
         StructStats::Columns { .. } => {
             // The requested columns are also the output filter, so the emitted schema contains
             // exactly those columns.

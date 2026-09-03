@@ -352,7 +352,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     let parsed_stats_requested = match &struct_stats {
         StructStats::None => false,
         StructStats::Columns { requested } => !requested.is_empty(),
-        StructStats::All { .. } => true,
+        StructStats::AllIndexed { .. } => true,
     };
     if !parsed_stats_requested {
         let declarative_schema = actual.first().expect("declarative metadata").schema();
