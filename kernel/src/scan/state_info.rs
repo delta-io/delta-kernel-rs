@@ -46,10 +46,8 @@ pub(crate) struct StateInfo {
     ///
     /// Read-path mirror of `WriteState.stats_columns`.
     pub(crate) physical_stats_columns: HashSet<ColumnName>,
-    /// Physical names of the columns exempt from the indexed-column cap for this scan: the
-    /// `requested` set for [`StructStats::Columns`], or `extra_indexed` for [`StructStats::All`].
-    /// Resolved once at construction (strictly for `Columns`, best-effort for `All`) and reused to
-    /// build the `stats_parsed` output schema. Empty when no columns bypass the cap.
+    /// Cap-exempt physical columns used for data skipping and `stats_parsed` output. `Columns`
+    /// resolves names strictly; `All` resolves them best-effort.
     pub(crate) cap_exempt_stats_columns: Vec<ColumnName>,
     /// Whether the table is catalog-managed, used to label scan metric events. Converted to a
     /// [`TableType`](crate::metrics::TableType) at event construction.
@@ -147,9 +145,8 @@ fn validate_metadata_columns<'a>(
 
 /// Builds the physical stats and partition schemas used by scan metadata and data skipping.
 ///
-/// `cap_exempt_physical` is the scan's cap-exempt column set (`requested` for
-/// [`StructStats::Columns`], `extra_indexed` for [`StructStats::All`]); it bypasses the table's
-/// configured indexed set and, on the `Columns` arm, also narrows the output.
+/// `cap_exempt_physical` bypasses the table's indexed set. For [`StructStats::Columns`], it also
+/// selects the emitted columns.
 fn build_data_skipping_schemas(
     struct_stats: &StructStats,
     physical_predicate: &PhysicalPredicate,
@@ -218,10 +215,8 @@ fn build_data_skipping_schemas(
     Ok((stats_schema, predicate_partition_schema))
 }
 
-/// Resolves logical column names to physical names, warning and omitting unresolved names.
-///
-/// Best-effort: used for `extra_indexed` (a hint) and for predicate references, where an
-/// unresolvable name is dropped rather than failing the scan.
+/// Resolves logical column names best-effort, warning and omitting names that cannot be resolved.
+/// Used for `extra_indexed` and predicate references.
 fn resolve_physical_columns(
     table_configuration: &TableConfiguration,
     logical: &[ColumnName],
@@ -240,10 +235,10 @@ fn resolve_physical_columns(
         .collect()
 }
 
-/// Resolves logical column names to physical names, erroring on any name that does not resolve.
+/// Resolves every logical column name to its physical name.
 ///
-/// Used for [`StructStats::Columns`] requested columns: an explicit ask, so an unknown name is a
-/// caller error rather than something to silently drop.
+/// Returns an error if any name cannot be resolved. Used for the `requested` columns in
+/// [`StructStats::Columns`].
 fn resolve_physical_columns_strict(
     table_configuration: &TableConfiguration,
     logical: &[ColumnName],
@@ -416,10 +411,8 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Columns exempt from the indexed-column cap for this scan, resolved once and fed into
-        // both the stats-eligibility gate and the stats schema. `Columns` names an explicit set,
-        // so an unknown name is a hard error; `All`'s extra columns are a best-effort hint, so an
-        // unknown name is dropped with a warning.
+        // Resolve cap-exempt names once for both stats eligibility and schema construction.
+        // `Columns` is strict; `All` treats extra-indexed names as best-effort hints.
         let cap_exempt_stats_columns: Vec<ColumnName> = match &stats.struct_stats {
             StructStats::All { extra_indexed } => {
                 resolve_physical_columns(table_configuration, extra_indexed)

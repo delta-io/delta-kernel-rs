@@ -87,8 +87,8 @@ struct InternalScanState {
     /// still correct.
     #[serde(default)]
     physical_stats_columns: HashSet<ColumnName>,
-    /// Columns exempt from the indexed-column cap. Carried alongside `physical_stats_schema` for a
-    /// faithful round-trip; `#[serde(default)]` keeps older blobs readable.
+    /// Cap-exempt physical columns needed to rebuild the same scan state. Defaults to empty when
+    /// deserializing older state.
     #[serde(default)]
     cap_exempt_stats_columns: Vec<ColumnName>,
     #[serde(default)]

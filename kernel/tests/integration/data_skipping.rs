@@ -342,7 +342,7 @@ fn surviving_paths_with_stats(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn past_cap_stats_column_enables_pruning_via_extra_indexed_or_requested(
     #[values(false, true)] use_parallel: bool,
-    // Both entry points bypass the cap through the same limit-exempt mechanism: `All`'s
+    // Both entry points bypass the cap through the same cap-exempt mechanism: `All`'s
     // best-effort `extra_indexed`, and `Columns`'s explicit `requested`.
     #[values(
         StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
@@ -384,9 +384,7 @@ struct StatsParsedOutput {
     probe_min_max: Vec<(i64, i64)>,
 }
 
-/// Reads the emitted `stats_parsed` output: the field names in `minValues` and the `(min, max)`
-/// pair for `probe` on every emitted file -- the engine-facing values a path-only test never
-/// checks.
+/// Reads the emitted field names and per-file `(min, max)` values for `probe` from `stats_parsed`.
 fn read_stats_parsed_output(
     scan: &Scan,
     engine: Arc<TestEngine>,
@@ -445,8 +443,7 @@ fn read_stats_parsed_output(
     })
 }
 
-/// The engine-facing `stats_parsed` output must carry a past-cap column with correct values, not
-/// merely enable pruning. Files carry `c2` values 10, 50, and 100 (constant per file).
+/// Verifies that `stats_parsed` contains a past-cap column and its per-file values.
 #[rstest]
 #[case::extra_only_via_all(
     StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
@@ -476,9 +473,7 @@ async fn past_cap_column_surfaces_in_stats_parsed_output(
     Ok(())
 }
 
-/// Reading from a checkpoint, the cap bypass still recovers a past-cap column's stats: the default
-/// `writeStatsAsJson` preserved the original `add.stats`, and checkpoint discovery reads it back
-/// when the structured stats omit the column.
+/// Verifies that checkpoint reads recover past-cap stats from JSON when struct stats omit them.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn past_cap_stats_recovered_from_checkpoint(

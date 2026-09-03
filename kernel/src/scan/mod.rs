@@ -121,7 +121,8 @@ pub struct StatsOptions {
 ///
 /// Indexed columns are non-partition data columns named by `delta.dataSkippingStatsColumns`, or,
 /// when that property is absent, the first `delta.dataSkippingNumIndexedCols` leaf columns (32 by
-/// default).
+/// default). Extra-indexed columns fall outside that set but are known by the connector to have
+/// stats, for example because another writer generated them.
 #[derive(Clone, Debug)]
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
@@ -130,18 +131,15 @@ pub enum StructStats {
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
     All {
-        /// Columns to include even when they fall outside the indexed set. Best-effort: an
-        /// unresolvable name is ignored with a warning, and a file with no on-disk stats for one
-        /// reads as NULL (which prunes nothing).
+        /// Columns outside the indexed set that may have on-disk stats. Names that cannot be
+        /// resolved are omitted with a warning. Missing per-file values read as NULL and do not
+        /// prune.
         extra_indexed: Vec<ColumnName>,
     },
     /// Emit stats for exactly the `requested` columns, regardless of the table's indexed set.
-    ///
-    /// Predicate-referenced columns may also appear, so kernel can still prune internally.
     Columns {
-        /// Columns to emit stats for, exempt from `delta.dataSkippingNumIndexedCols` and
-        /// `delta.dataSkippingStatsColumns`. An unresolvable name is a hard error. A file with no
-        /// on-disk stats for a column reads as NULL (which prunes nothing).
+        /// Columns to emit, even outside the indexed set. Names that cannot be resolved return an
+        /// error. Missing per-file values read as NULL and do not prune.
         requested: Vec<ColumnName>,
     },
 }
@@ -174,10 +172,10 @@ impl StatsOptions {
         }
     }
 
-    /// Struct stats for exactly `cols` without JSON synthesis, regardless of the table's indexed
-    /// set -- a column past `delta.dataSkippingNumIndexedCols` still gets stats. Predicate-
-    /// referenced columns may also appear because scan paths retain stats used for data skipping.
-    /// An unresolvable column name is a hard error.
+    /// Returns struct stats for exactly `cols`, regardless of the table's indexed set.
+    ///
+    /// Names that cannot be resolved return an error. Missing per-file values read as NULL and do
+    /// not prune.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
@@ -735,8 +733,8 @@ fn build_physical_stats_output_schema(
         StructStats::None => Ok(None),
         StructStats::All { .. } => Ok(state_info.physical_stats_schema.clone()),
         StructStats::Columns { .. } => {
-            // `requested` bypasses the indexed-column cap, so it serves as both the limit-exempt
-            // set and the output filter: the emitted schema is exactly the requested columns.
+            // `requested` is both the cap exemption and the output filter, so the emitted schema
+            // contains exactly those columns.
             let requested = &state_info.cap_exempt_stats_columns;
             if requested.is_empty() {
                 return Ok(None);

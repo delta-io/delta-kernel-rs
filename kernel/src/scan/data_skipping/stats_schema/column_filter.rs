@@ -129,9 +129,8 @@ impl<'col> StatsColumnFilter<'col> {
             self.collect_field(field, result);
         }
 
-        // Pass 2: add required columns not covered by Pass 1. The gate matches leaves by exact
-        // membership, so a struct column contributes its leaf paths (matching the leaf-expanded
-        // stats schema), not the parent path.
+        // Required struct columns expand to leaf paths because membership is exact and stats
+        // schemas contain leaves rather than their parent struct.
         if let Some(required_cols) = self.required_columns {
             for col in required_cols {
                 let Ok(field) = schema.field_at(col) else {
@@ -243,10 +242,9 @@ impl<'col> StatsColumnFilter<'col> {
     }
 }
 
-/// Appends the leaf paths under `data_type` (rooted at `path`) to `result`, skipping any already
-/// present. A non-struct type contributes `path` itself; a struct expands to each descendant leaf.
-/// This mirrors how a required struct column's leaves land in the stats schema, keeping the gate
-/// set consistent with that schema.
+/// Appends missing leaf paths under `data_type`, rooted at `path`, to `result`.
+///
+/// Structs expand to descendant leaves so exact membership matches the leaf-based stats schema.
 fn collect_required_leaf_paths(
     path: &mut Vec<String>,
     data_type: &DataType,
