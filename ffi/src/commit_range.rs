@@ -590,7 +590,11 @@ mod tests {
             ))
         };
         let result = unsafe { commit_range_builder_build(builder) };
-        assert_extern_result_error_with_message(result, KernelError::MissingVersionError, None);
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::MissingVersionError,
+            Some("Table version 5 is missing or unavailable for this log operation."),
+        );
 
         unsafe { free_engine(engine) }
         Ok(())

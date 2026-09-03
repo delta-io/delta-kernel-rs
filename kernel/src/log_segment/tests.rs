@@ -2526,6 +2526,39 @@ fn test_validate_checkpoint_commit_gap_reports_first_missing_version() {
 }
 
 #[test]
+fn test_checkpoint_covers_gap_before_retained_commits() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let result = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path(
+                "file:///_delta_log/00000000000000000005.checkpoint.parquet",
+            )],
+            ascending_commit_files: vec![
+                create_log_path("file:///_delta_log/00000000000000000004.json"),
+                create_log_path("file:///_delta_log/00000000000000000006.json"),
+                create_log_path("file:///_delta_log/00000000000000000007.json"),
+            ],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000007.json",
+            )),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let versions = result
+        .listed
+        .ascending_commit_files
+        .iter()
+        .map(|commit| commit.version)
+        .collect_vec();
+    assert_eq!(versions, vec![6, 7]);
+}
+
+#[test]
 fn test_try_new_crc_at_end_version_is_ok() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
