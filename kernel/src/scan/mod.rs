@@ -136,10 +136,11 @@ pub enum StructStats {
         /// prune.
         extra_indexed: Vec<ColumnName>,
     },
-    /// Emit stats for exactly the `requested` columns, regardless of the table's indexed set.
+    /// Emit stats for at least the `requested` columns, regardless of the table's indexed set.
+    /// Predicate-referenced stats columns may also appear.
     Columns {
-        /// Columns to emit, even outside the indexed set. Names that cannot be resolved return an
-        /// error. Missing per-file values read as NULL and do not prune.
+        /// Columns to request, even outside the indexed set. Names that cannot be resolved return
+        /// an error. Missing per-file values read as NULL and do not prune.
         requested: Vec<ColumnName>,
     },
 }
@@ -172,10 +173,10 @@ impl StatsOptions {
         }
     }
 
-    /// Returns struct stats for exactly `cols`, regardless of the table's indexed set.
+    /// Returns struct stats for at least `cols`, regardless of the table's indexed set.
     ///
-    /// Names that cannot be resolved return an error. Missing per-file values read as NULL and do
-    /// not prune.
+    /// Predicate-referenced stats columns may also appear. Names that cannot be resolved return an
+    /// error. Missing per-file values read as NULL and do not prune.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
@@ -723,7 +724,7 @@ pub struct Scan {
 /// For example, if the caller requests `[a, b]` and the predicate references `c`,
 /// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
 /// Returns `None` when no struct stats are requested. `Columns` names were already resolved
-/// (strictly) into `StateInfo::cap_exempt_stats_columns` when the `StateInfo` was built.
+/// strictly into `StateInfo::requested_physical_stats_columns` when the `StateInfo` was built.
 fn build_physical_stats_output_schema(
     table_configuration: &TableConfiguration,
     state_info: &StateInfo,
@@ -733,9 +734,9 @@ fn build_physical_stats_output_schema(
         StructStats::None => Ok(None),
         StructStats::All { .. } => Ok(state_info.physical_stats_schema.clone()),
         StructStats::Columns { .. } => {
-            // `requested` is both the cap exemption and the output filter, so the emitted schema
-            // contains exactly those columns.
-            let requested = &state_info.cap_exempt_stats_columns;
+            // The requested columns are also the output filter, so the emitted schema contains
+            // exactly those columns.
+            let requested = &state_info.requested_physical_stats_columns;
             if requested.is_empty() {
                 return Ok(None);
             }

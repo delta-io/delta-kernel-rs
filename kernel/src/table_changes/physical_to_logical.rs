@@ -194,7 +194,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
-            cap_exempt_stats_columns: Vec::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         }
@@ -421,7 +421,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
-            cap_exempt_stats_columns: Vec::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         };

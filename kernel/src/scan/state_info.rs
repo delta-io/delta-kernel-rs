@@ -46,9 +46,9 @@ pub(crate) struct StateInfo {
     ///
     /// Read-path mirror of `WriteState.stats_columns`.
     pub(crate) physical_stats_columns: HashSet<ColumnName>,
-    /// Cap-exempt physical columns used for data skipping and `stats_parsed` output. `Columns`
-    /// resolves names strictly; `All` resolves them best-effort.
-    pub(crate) cap_exempt_stats_columns: Vec<ColumnName>,
+    /// Caller-requested physical stats columns used for data skipping and `stats_parsed` output.
+    /// `Columns` resolves names strictly; `All` resolves them best-effort.
+    pub(crate) requested_physical_stats_columns: Vec<ColumnName>,
     /// Whether the table is catalog-managed, used to label scan metric events. Converted to a
     /// [`TableType`](crate::metrics::TableType) at event construction.
     pub(crate) is_catalog_managed: bool,
@@ -145,13 +145,13 @@ fn validate_metadata_columns<'a>(
 
 /// Builds the physical stats and partition schemas used by scan metadata and data skipping.
 ///
-/// `cap_exempt_physical` bypasses the table's indexed set. For [`StructStats::Columns`], it also
-/// selects the emitted columns.
+/// `requested_physical_stats_columns` bypasses the table's indexed set and seeds the scan's stats
+/// schema. Predicate references may add other indexed columns.
 fn build_data_skipping_schemas(
     struct_stats: &StructStats,
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
-    cap_exempt_physical: Option<&[ColumnName]>,
+    requested_physical_stats_columns: Option<&[ColumnName]>,
     table_configuration: &TableConfiguration,
 ) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
     // Narrow the table's typed partition schema to the columns the predicate references. The
@@ -189,17 +189,19 @@ fn build_data_skipping_schemas(
     let stats_schema = match (struct_stats, physical_predicate) {
         (StructStats::All { .. }, _) => with_data_cols(
             table_configuration
-                .build_expected_stats_schemas(cap_exempt_physical, None)?
+                .build_expected_stats_schemas(requested_physical_stats_columns, None)?
                 .physical,
         ),
-        // `requested` (carried in `cap_exempt_physical`) bypasses the cap and narrows the output;
-        // predicate refs union in so the filter still lets kernel prune.
-        (StructStats::Columns { .. }, _) if cap_exempt_physical.is_some() => {
-            let mut filter = cap_exempt_physical.unwrap_or_default().to_vec();
+        // Requested columns bypass the indexed set and seed the stats schema; predicate refs join
+        // the schema so kernel can still prune.
+        (StructStats::Columns { .. }, _) if requested_physical_stats_columns.is_some() => {
+            let mut filter = requested_physical_stats_columns
+                .unwrap_or_default()
+                .to_vec();
             union_extra_into_filter(&mut filter, &predicate_refs_physical);
             with_data_cols(
                 table_configuration
-                    .build_expected_stats_schemas(cap_exempt_physical, Some(&filter))?
+                    .build_expected_stats_schemas(requested_physical_stats_columns, Some(&filter))?
                     .physical,
             )
         }
@@ -411,9 +413,9 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Resolve cap-exempt names once for both stats eligibility and schema construction.
+        // Resolve requested names once for both stats eligibility and schema construction.
         // `Columns` is strict; `All` treats extra-indexed names as best-effort hints.
-        let cap_exempt_stats_columns: Vec<ColumnName> = match &stats.struct_stats {
+        let requested_physical_stats_columns: Vec<ColumnName> = match &stats.struct_stats {
             StructStats::All { extra_indexed } => {
                 resolve_physical_columns(table_configuration, extra_indexed)
             }
@@ -422,12 +424,13 @@ impl StateInfo {
             }
             StructStats::None => Vec::new(),
         };
-        let cap_exempt =
-            (!cap_exempt_stats_columns.is_empty()).then_some(cap_exempt_stats_columns.as_slice());
+        let requested_physical_stats_columns_ref = (!requested_physical_stats_columns.is_empty())
+            .then_some(requested_physical_stats_columns.as_slice());
 
         // Stats-eligible column set. Partition columns are excluded; they flow through
         // `partitionValues_parsed` instead.
-        let physical_stats_columns = table_configuration.physical_stats_columns_set(cap_exempt);
+        let physical_stats_columns =
+            table_configuration.physical_stats_columns_set(requested_physical_stats_columns_ref);
         // Observability: predicate refs outside `physical_stats_columns` get folded to NULL
         // by the gate. Surface the dropped set so an engine operator can see what got folded.
         // The filter walk is bounded by predicate width but still does a physical-name
@@ -483,7 +486,7 @@ impl StateInfo {
             &stats.struct_stats,
             &physical_predicate,
             &predicate_column_names,
-            cap_exempt,
+            requested_physical_stats_columns_ref,
             table_configuration,
         )?;
 
@@ -520,7 +523,7 @@ impl StateInfo {
             physical_stats_schema,
             physical_partition_schema,
             physical_stats_columns,
-            cap_exempt_stats_columns,
+            requested_physical_stats_columns,
             is_catalog_managed: table_configuration.is_catalog_managed(),
             skip_row_transforms: false,
         })

@@ -415,7 +415,7 @@ fn read_stats_parsed_output(
     StatsOptions::struct_columns(vec![column_name!("c2")]),
     &["c2"],
 )]
-#[case::requested_plus_extra(
+#[case::multiple_requested_columns(
     StatsOptions::struct_columns(vec![column_name!("c1"), column_name!("c2")]),
     &["c1", "c2"],
 )]
@@ -443,7 +443,7 @@ async fn past_cap_column_surfaces_in_stats_parsed_output(
 async fn past_cap_stats_column_enables_pruning(
     #[case] checkpoint: bool,
     #[values(false, true)] use_parallel: bool,
-    // Both entry points bypass the cap through the same cap-exempt mechanism: `All`'s
+    // Both entry points add requested physical stats columns: `All`'s
     // best-effort `extra_indexed`, and `Columns`'s explicit `requested`.
     #[values(
         StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c2")]),
