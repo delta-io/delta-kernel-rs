@@ -14,6 +14,7 @@ use crate::actions::{
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
+use crate::error::delta_errors;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
@@ -33,15 +34,17 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, FileMeta, KernelError, Predicate, PredicateRef, RowVisitor,
+    DeltaResult, Engine, Error, FileMeta, KernelError, Predicate, PredicateRef, RowVisitor,
     StorageHandler, Version,
 };
 
 mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
+mod version_probe;
 
 pub(crate) use domain_metadata_replay::DomainMetadataMap;
+use version_probe::{probe_snapshot_history, SnapshotHistory};
 
 #[cfg(test)]
 mod crc_tests;
@@ -127,6 +130,55 @@ pub(crate) struct LogSegment {
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
+enum LogSegmentValidationError {
+    CommitGap {
+        previous: Box<ParsedLogPath>,
+        next: Box<ParsedLogPath>,
+    },
+    CheckpointCommitGap {
+        checkpoint: Version,
+        next_commit: Version,
+    },
+    Empty,
+    EndVersionMismatch {
+        actual: Version,
+        requested: Version,
+    },
+    Other(Error),
+}
+
+impl LogSegmentValidationError {
+    fn into_error(self) -> Error {
+        match self {
+            Self::CommitGap { previous, next, .. } => KernelError::generic(format!(
+                "Expected contiguous commit files, but found gap: {previous:?} -> {next:?}"
+            ))
+            .into(),
+            Self::CheckpointCommitGap {
+                checkpoint,
+                next_commit,
+                ..
+            } => KernelError::invalid_checkpoint(format!(
+                "Gap between checkpoint version {checkpoint} and next commit {next_commit}"
+            ))
+            .into(),
+            Self::Empty => KernelError::generic("No files in log segment").into(),
+            Self::EndVersionMismatch { actual, requested } => KernelError::generic(format!(
+                "LogSegment end version {actual} not the same as the specified end version \
+                 {requested}"
+            ))
+            .into(),
+            Self::Other(error) => error,
+        }
+    }
+}
+
+impl From<Error> for LogSegmentValidationError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
 /// Returns the column whose non-nullness identifies a row containing `action_name`.
 fn action_presence_witness(action_name: &str) -> Option<ColumnName> {
     action_presence_leaf(action_name).map(|leaf| ColumnName::new([action_name, leaf]))
@@ -201,11 +253,26 @@ impl LogSegment {
 
     #[internal_api]
     pub(crate) fn try_new(
-        mut listed_files: LogSegmentFiles,
+        listed_files: LogSegmentFiles,
         log_root: Url,
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
     ) -> DeltaResult<Self> {
+        Self::try_new_validated(
+            listed_files,
+            log_root,
+            end_version,
+            last_checkpoint_metadata,
+        )
+        .map_err(LogSegmentValidationError::into_error)
+    }
+
+    fn try_new_validated(
+        mut listed_files: LogSegmentFiles,
+        log_root: Url,
+        end_version: Option<Version>,
+        last_checkpoint_metadata: Option<LastCheckpointHint>,
+    ) -> Result<Self, LogSegmentValidationError> {
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
         validate_commit_file_types(&listed_files.ascending_commit_files)?;
@@ -247,6 +314,270 @@ impl LogSegment {
         info!(segment = %log_segment.summary());
 
         Ok(log_segment)
+    }
+
+    /// Builds a snapshot log segment and translates discovery failures into Delta errors.
+    ///
+    /// The requested and catalog versions define the target, while known snapshot and checkpoint
+    /// versions contribute trusted history bounds. Returns a validated segment. On failure, this
+    /// preserves structural errors for present target artifacts and otherwise reports the most
+    /// specific table, version, gap, or log-file condition supported by the visible history.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_for_snapshot(
+        listed_files: LogSegmentFiles,
+        log_root: Url,
+        end_version: Option<Version>,
+        requested_version: Option<Version>,
+        last_checkpoint_metadata: Option<LastCheckpointHint>,
+        storage: &dyn StorageHandler,
+        log_tail: &[ParsedLogPath],
+        max_catalog_version: Option<Version>,
+        known_snapshot_version: Option<Version>,
+        known_checkpoint_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<Self> {
+        let selected_checkpoint_version = listed_files
+            .checkpoint_parts
+            .first()
+            .map(|checkpoint| checkpoint.version);
+        match Self::try_new_validated(
+            listed_files,
+            log_root.clone(),
+            end_version,
+            last_checkpoint_metadata,
+        ) {
+            Err(LogSegmentValidationError::CommitGap { previous, next, .. })
+                if requested_version.is_some() || known_snapshot_version.is_some() =>
+            {
+                let original = delta_errors::versions_not_contiguous(
+                    previous.version,
+                    next.version,
+                    requested_version,
+                );
+                Err(Self::classify_snapshot_listing_failure(
+                    original,
+                    storage,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                    requested_version,
+                    max_catalog_version,
+                    known_snapshot_version,
+                    selected_checkpoint_version.or(known_checkpoint_version),
+                    cancellation_token,
+                ))
+            }
+            Err(LogSegmentValidationError::CommitGap { previous, next, .. }) => {
+                Err(delta_errors::versions_not_contiguous(
+                    previous.version,
+                    next.version,
+                    requested_version,
+                ))
+            }
+            Err(LogSegmentValidationError::CheckpointCommitGap { checkpoint, .. })
+                if requested_version.is_some() || known_snapshot_version.is_some() =>
+            {
+                let original = delta_errors::log_file_not_found(
+                    requested_version,
+                    Some(checkpoint),
+                    &log_root,
+                );
+                Err(Self::classify_snapshot_listing_failure(
+                    original,
+                    storage,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                    requested_version,
+                    max_catalog_version,
+                    known_snapshot_version,
+                    selected_checkpoint_version.or(known_checkpoint_version),
+                    cancellation_token,
+                ))
+            }
+            Err(LogSegmentValidationError::CheckpointCommitGap { checkpoint, .. }) => Err(
+                delta_errors::log_file_not_found(requested_version, Some(checkpoint), &log_root),
+            ),
+            Err(LogSegmentValidationError::Empty) => Err(Self::classify_snapshot_listing_failure(
+                LogSegmentValidationError::Empty.into_error(),
+                storage,
+                &log_root,
+                log_tail,
+                end_version,
+                requested_version,
+                max_catalog_version,
+                known_snapshot_version,
+                selected_checkpoint_version.or(known_checkpoint_version),
+                cancellation_token,
+            )),
+            Err(error @ LogSegmentValidationError::EndVersionMismatch { actual, requested })
+                if actual < requested =>
+            {
+                Err(Self::classify_snapshot_listing_failure(
+                    error.into_error(),
+                    storage,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                    requested_version,
+                    max_catalog_version,
+                    known_snapshot_version,
+                    selected_checkpoint_version.or(known_checkpoint_version),
+                    cancellation_token,
+                ))
+            }
+            Ok(log_segment)
+                if known_snapshot_version.is_none()
+                    && log_segment.checkpoint_version.is_none()
+                    && log_segment
+                        .listed
+                        .ascending_commit_files
+                        .first()
+                        .is_some_and(|commit| commit.version != 0) =>
+            {
+                Err(delta_errors::log_file_not_found(
+                    requested_version,
+                    None,
+                    &log_root,
+                ))
+            }
+            Ok(log_segment) => {
+                if let Some(known_snapshot_version) = known_snapshot_version {
+                    let checkpoint_reanchors = log_segment
+                        .checkpoint_version
+                        .is_some_and(|checkpoint| checkpoint > known_snapshot_version);
+                    if !checkpoint_reanchors {
+                        if let Some(first_new_commit) = log_segment
+                            .listed
+                            .ascending_commit_files
+                            .iter()
+                            .find(|commit| commit.version > known_snapshot_version)
+                        {
+                            if known_snapshot_version.checked_add(1)
+                                != Some(first_new_commit.version)
+                            {
+                                return Err(delta_errors::versions_not_contiguous(
+                                    known_snapshot_version,
+                                    first_new_commit.version,
+                                    requested_version,
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(log_segment)
+            }
+            Err(LogSegmentValidationError::Other(error)) => Err(error),
+            Err(error) => Err(error.into_error()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn classify_snapshot_listing_failure(
+        original: Error,
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        log_tail: &[ParsedLogPath],
+        end_version: Option<Version>,
+        requested_version: Option<Version>,
+        max_catalog_version: Option<Version>,
+        known_snapshot_version: Option<Version>,
+        checkpoint_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> Error {
+        let history = match probe_snapshot_history(
+            storage,
+            log_root,
+            log_tail,
+            max_catalog_version,
+            end_version,
+            known_snapshot_version,
+            cancellation_token,
+        ) {
+            Ok(history) => history,
+            Err(error @ Error::Kernel(KernelError::Cancelled)) => return error,
+            Err(_) => return original,
+        };
+
+        match history {
+            SnapshotHistory::NoHistory => {
+                if let Some(known_snapshot_version) = known_snapshot_version {
+                    if let Some(requested_version) = requested_version {
+                        return delta_errors::version_not_found(
+                            requested_version,
+                            known_snapshot_version,
+                            known_snapshot_version,
+                        );
+                    }
+                    return delta_errors::log_file_not_found(None, checkpoint_version, log_root);
+                }
+                delta_errors::table_not_found(
+                    log_root
+                        .as_str()
+                        .strip_suffix("_delta_log/")
+                        .unwrap_or(log_root.as_str()),
+                )
+            }
+            SnapshotHistory::Available {
+                target_artifact_present: true,
+                ..
+            }
+            | SnapshotHistory::Gap {
+                target_artifact_present: true,
+                ..
+            }
+            | SnapshotHistory::Unrecreatable => original,
+            SnapshotHistory::Available {
+                earliest,
+                latest,
+                target_artifact_present: false,
+            } => {
+                let (earliest, latest) = known_snapshot_version
+                    .map_or((earliest, latest), |known| {
+                        (earliest.min(known), latest.max(known))
+                    });
+                if let Some(requested_version) = requested_version {
+                    if requested_version < earliest || requested_version > latest {
+                        delta_errors::version_not_found(requested_version, earliest, latest)
+                    } else {
+                        delta_errors::log_file_not_found(
+                            Some(requested_version),
+                            checkpoint_version,
+                            log_root,
+                        )
+                    }
+                } else if max_catalog_version.is_some() {
+                    delta_errors::log_file_not_found(None, checkpoint_version, log_root)
+                } else {
+                    original
+                }
+            }
+            SnapshotHistory::Gap {
+                earliest,
+                latest,
+                start,
+                end,
+                target_artifact_present: false,
+            } => {
+                let (earliest, latest) = known_snapshot_version
+                    .map_or((earliest, latest), |known| {
+                        (earliest.min(known), latest.max(known))
+                    });
+                if let Some(requested_version) = requested_version {
+                    if requested_version < earliest || requested_version > latest {
+                        delta_errors::version_not_found(requested_version, earliest, latest)
+                    } else {
+                        delta_errors::log_file_not_found(
+                            Some(requested_version),
+                            checkpoint_version,
+                            log_root,
+                        )
+                    }
+                } else {
+                    delta_errors::versions_not_contiguous(start, end, None)
+                }
+            }
+        }
     }
 
     /// Returns the checkpoint version from the `_last_checkpoint` hint
@@ -328,17 +659,43 @@ impl LogSegment {
         metric_context: SnapshotLoadMetricContext,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
+        Self::for_snapshot_with_max_catalog_version(
+            storage,
+            log_root,
+            log_tail,
+            time_travel_version,
+            None,
+            metric_context,
+            cancellation_token,
+        )
+    }
+
+    /// Constructs a snapshot log segment bounded by an optional catalog maximum.
+    ///
+    /// The time-travel version takes precedence over the catalog maximum. Returns the validated
+    /// segment and emits load metrics; propagates listing, cancellation, and classified Delta
+    /// discovery errors.
+    pub(crate) fn for_snapshot_with_max_catalog_version(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        time_travel_version: impl Into<Option<Version>>,
+        max_catalog_version: Option<Version>,
+        metric_context: SnapshotLoadMetricContext,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
         let build = || {
             let checkpoint_hint =
                 LastCheckpointHint::try_read(storage, &log_root, cancellation_token)?;
-            Self::for_snapshot_impl(
+            Self::for_snapshot_impl_with_max_catalog_version(
                 storage,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
+                max_catalog_version,
                 cancellation_token,
             )
         };
@@ -361,6 +718,7 @@ impl LogSegment {
     }
 
     // factored out for testing
+    #[cfg(test)]
     pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -369,10 +727,27 @@ impl LogSegment {
         time_travel_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        // The end_version is the time_travel_version, if present
-        // TODO: When max catalog version is implemented, we would use that as end_version if
-        // time_travel_version is not present
-        let end_version = time_travel_version;
+        Self::for_snapshot_impl_with_max_catalog_version(
+            storage,
+            log_root,
+            log_tail,
+            checkpoint_hint,
+            time_travel_version,
+            None,
+            cancellation_token,
+        )
+    }
+
+    fn for_snapshot_impl_with_max_catalog_version(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+        time_travel_version: Option<Version>,
+        max_catalog_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<Self> {
+        let end_version = time_travel_version.or(max_catalog_version);
 
         // Keep the hint only if it points at or before end_version, or if there is no end_version
         // bound
@@ -391,16 +766,40 @@ impl LogSegment {
         //    checkpoint found)
         // 4. no usable_hint,      end_version is None  --> list from v0 unbounded
 
+        let probe_log_tail = log_tail.clone();
         let listed_files = match (usable_hint, end_version) {
             // Cases 1 and 2
-            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
-                cp,
-                storage,
-                &log_root,
-                log_tail,
-                end_version,
-                cancellation_token,
-            )?,
+            (Some(cp), end_version) => {
+                match LogSegmentFiles::list_with_checkpoint_hint(
+                    cp,
+                    storage,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                    time_travel_version,
+                    cancellation_token,
+                ) {
+                    Ok(listed_files) => listed_files,
+                    Err(Error::Delta(error))
+                        if error.condition()
+                            == crate::DeltaErrorCondition::DeltaLogFileNotFound =>
+                    {
+                        return Err(Self::classify_snapshot_listing_failure(
+                            Error::Delta(error),
+                            storage,
+                            &log_root,
+                            &probe_log_tail,
+                            end_version,
+                            time_travel_version,
+                            max_catalog_version,
+                            None,
+                            Some(cp.version),
+                            cancellation_token,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             // Case 3
             (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
                 storage,
@@ -415,7 +814,19 @@ impl LogSegment {
             }
         };
 
-        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
+        LogSegment::try_new_for_snapshot(
+            listed_files,
+            log_root,
+            end_version,
+            time_travel_version,
+            checkpoint_hint,
+            storage,
+            &probe_log_tail,
+            max_catalog_version,
+            None,
+            None,
+            cancellation_token,
+        )
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
@@ -1561,14 +1972,15 @@ fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     Ok(())
 }
 
-fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+fn validate_commit_files_contiguous(
+    commits: &[ParsedLogPath],
+) -> Result<(), LogSegmentValidationError> {
     for pair in commits.windows(2) {
-        if pair[0].version + 1 != pair[1].version {
-            return Err(KernelError::generic(format!(
-                "Expected contiguous commit files, but found gap: {:?} -> {:?}",
-                pair[0], pair[1]
-            ))
-            .into());
+        if pair[0].version.checked_add(1) != Some(pair[1].version) {
+            return Err(LogSegmentValidationError::CommitGap {
+                previous: Box::new(pair[0].clone()),
+                next: Box::new(pair[1].clone()),
+            });
         }
     }
     Ok(())
@@ -1582,15 +1994,14 @@ fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()
 fn validate_checkpoint_commit_gap(
     checkpoint_version: Option<Version>,
     commits: &[ParsedLogPath],
-) -> DeltaResult<()> {
+) -> Result<(), LogSegmentValidationError> {
     if let (Some(checkpoint_version), Some(first_commit)) = (checkpoint_version, commits.first()) {
-        require!(
-            checkpoint_version + 1 == first_commit.version,
-            KernelError::InvalidCheckpoint(format!(
-                "Gap between checkpoint version {checkpoint_version} and next commit {}",
-                first_commit.version
-            ))
-        );
+        if checkpoint_version.checked_add(1) != Some(first_commit.version) {
+            return Err(LogSegmentValidationError::CheckpointCommitGap {
+                checkpoint: checkpoint_version,
+                next_commit: first_commit.version,
+            });
+        }
     }
     Ok(())
 }
@@ -1605,19 +2016,19 @@ fn validate_end_version(
     commits: &[ParsedLogPath],
     checkpoint_parts: &[ParsedLogPath],
     end_version: Option<Version>,
-) -> DeltaResult<Version> {
+) -> Result<Version, LogSegmentValidationError> {
     let effective_version = commits
         .last()
         .or(checkpoint_parts.first())
-        .ok_or(KernelError::generic("No files in log segment"))?
+        .ok_or(LogSegmentValidationError::Empty)?
         .version;
     if let Some(end_version) = end_version {
-        require!(
-            effective_version == end_version,
-            KernelError::generic(format!(
-                "LogSegment end version {effective_version} not the same as the specified end version {end_version}"
-            ))
-        );
+        if effective_version != end_version {
+            return Err(LogSegmentValidationError::EndVersionMismatch {
+                actual: effective_version,
+                requested: end_version,
+            });
+        }
     }
     Ok(effective_version)
 }

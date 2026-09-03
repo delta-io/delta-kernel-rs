@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
@@ -42,12 +43,12 @@ use crate::schema::{
 };
 use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
-    create_log_path_with_size, string_array_to_engine_data, Action,
+    create_log_path_with_size, string_array_to_engine_data, Action, TestCancellationToken,
 };
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
-    StorageHandler,
+    CancellationTokenRef, DeltaErrorCondition, DeltaResult, DeltaResultIteratorStatic, EngineData,
+    Error, FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter, ParquetHandler,
+    Predicate, PredicateRef, RowVisitor, StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -310,10 +311,664 @@ fn staged_commit_log_paths(versions: &[Version]) -> Vec<ParsedLogPath> {
         .collect()
 }
 
+fn assert_delta_error<T>(
+    result: DeltaResult<T>,
+    expected_condition: DeltaErrorCondition,
+    expected_parameters: &[(&str, &str)],
+) {
+    let error = match result {
+        Err(Error::Delta(error)) => error,
+        Err(error) => panic!("expected Delta error, got {error}"),
+        Ok(_) => panic!("expected Delta error, got success"),
+    };
+    assert_eq!(error.condition(), expected_condition);
+    assert_eq!(
+        error
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name(), parameter.value()))
+            .collect::<Vec<_>>(),
+        expected_parameters
+    );
+}
+
+struct CancelOnSecondList {
+    inner: Arc<dyn StorageHandler>,
+    token: Arc<TestCancellationToken>,
+    list_calls: Arc<AtomicU32>,
+}
+
+impl StorageHandler for CancelOnSecondList {
+    fn list_from(
+        &self,
+        path: &Url,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        if self.list_calls.fetch_add(1, Ordering::Relaxed) == 1 {
+            self.token.cancel();
+        }
+        self.inner.list_from(path)
+    }
+
+    fn read_files(
+        &self,
+        _files: Vec<crate::FileSlice>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        panic!("read_files should not be called during history probing")
+    }
+
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        panic!("put should not be called during history probing")
+    }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        panic!("copy_atomic should not be called during history probing")
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        panic!("head should not be called during history probing")
+    }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during history probing")
+    }
+}
+
 /// Gets the file size from the store for use in FileMeta
 async fn get_file_size(store: &Arc<InMemory>, path: &str) -> u64 {
     let object_meta = store.head(&Path::from(path)).await.unwrap();
     object_meta.size
+}
+
+#[rstest]
+#[case::latest(None)]
+#[case::explicit_version(Some(5))]
+#[tokio::test]
+async fn empty_snapshot_history_reports_table_not_found(#[case] version: Option<Version>) {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&[], None).await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, version, None),
+        DeltaErrorCondition::DeltaTableNotFound,
+        &[("tableName", "memory:///")],
+    );
+}
+
+#[tokio::test]
+async fn empty_snapshot_history_with_catalog_bound_reports_table_not_found() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&[], None).await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl_with_max_catalog_version(
+            storage.as_ref(),
+            log_root,
+            vec![],
+            None,
+            None,
+            Some(3),
+            None,
+        ),
+        DeltaErrorCondition::DeltaTableNotFound,
+        &[("tableName", "memory:///")],
+    );
+}
+
+#[rstest]
+#[case::latest(None, None)]
+#[case::explicit_version(Some(1), None)]
+#[case::catalog_bound(None, Some(1))]
+#[tokio::test]
+async fn empty_snapshot_history_with_stale_checkpoint_hint_reports_table_not_found(
+    #[case] time_travel_version: Option<Version>,
+    #[case] max_catalog_version: Option<Version>,
+) {
+    let checkpoint_hint = LastCheckpointHint {
+        version: 1,
+        ..Default::default()
+    };
+    let (storage, log_root) =
+        build_log_with_paths_and_checkpoint(&[], Some(&checkpoint_hint)).await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl_with_max_catalog_version(
+            storage.as_ref(),
+            log_root,
+            vec![],
+            Some(checkpoint_hint),
+            time_travel_version,
+            max_catalog_version,
+            None,
+        ),
+        DeltaErrorCondition::DeltaTableNotFound,
+        &[("tableName", "memory:///")],
+    );
+}
+
+#[tokio::test]
+async fn explicit_version_above_visible_history_reports_available_bounds() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+        ],
+        None,
+    )
+    .await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(3), None),
+        DeltaErrorCondition::DeltaVersionNotFound,
+        &[("userVersion", "3"), ("earliest", "0"), ("latest", "1")],
+    );
+}
+
+#[tokio::test]
+async fn snapshot_commit_gap_reports_adjacent_versions() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(2, "json"),
+        ],
+        None,
+    )
+    .await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None),
+        DeltaErrorCondition::DeltaVersionsNotContiguous,
+        &[
+            ("versionList", "0, 2"),
+            ("startVersion", "0"),
+            ("endVersion", "2"),
+            ("versionToLoad", "-1"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn probe_classifies_target_relative_to_gapped_history() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(4, "json"),
+        ],
+        None,
+    )
+    .await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(
+            storage.as_ref(),
+            log_root.clone(),
+            vec![],
+            None,
+            Some(5),
+            None,
+        ),
+        DeltaErrorCondition::DeltaVersionNotFound,
+        &[("userVersion", "5"), ("earliest", "0"), ("latest", "4")],
+    );
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(
+            storage.as_ref(),
+            log_root.clone(),
+            vec![],
+            None,
+            Some(2),
+            None,
+        ),
+        DeltaErrorCondition::DeltaLogFileNotFound,
+        &[
+            ("version", "2"),
+            ("checkpointVersion", "-1"),
+            ("logPath", "memory:///_delta_log/"),
+        ],
+    );
+
+    let maximum = Version::MAX.to_string();
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(
+            storage.as_ref(),
+            log_root,
+            vec![],
+            None,
+            Some(Version::MAX),
+            None,
+        ),
+        DeltaErrorCondition::DeltaVersionNotFound,
+        &[
+            ("userVersion", maximum.as_str()),
+            ("earliest", "0"),
+            ("latest", "4"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_beyond_checkpoint_gap_reports_version_not_found() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+        ],
+        None,
+    )
+    .await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5), None),
+        DeltaErrorCondition::DeltaVersionNotFound,
+        &[("userVersion", "5"), ("earliest", "0"), ("latest", "2")],
+    );
+}
+
+#[rstest]
+#[case::latest(None, "LATEST")]
+#[case::explicit_version(Some(2), "2")]
+#[tokio::test]
+async fn checkpoint_commit_gap_reports_log_file_not_found(
+    #[case] version: Option<Version>,
+    #[case] expected_version: &str,
+) {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+        ],
+        None,
+    )
+    .await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, version, None),
+        DeltaErrorCondition::DeltaLogFileNotFound,
+        &[
+            ("version", expected_version),
+            ("checkpointVersion", "0"),
+            ("logPath", "memory:///_delta_log/"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn snapshot_without_commit_zero_or_checkpoint_reports_log_file_not_found() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+        ],
+        None,
+    )
+    .await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None),
+        DeltaErrorCondition::DeltaLogFileNotFound,
+        &[
+            ("version", "LATEST"),
+            ("checkpointVersion", "-1"),
+            ("logPath", "memory:///_delta_log/"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn later_checkpoint_preserves_outer_available_bounds() {
+    let paths = [
+        delta_path_for_version(0, "json"),
+        delta_path_for_version(1, "json"),
+        delta_path_for_version(5, "checkpoint.parquet"),
+        delta_path_for_version(6, "json"),
+    ];
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(
+            storage.as_ref(),
+            log_root.clone(),
+            vec![],
+            None,
+            Some(3),
+            None,
+        ),
+        DeltaErrorCondition::DeltaLogFileNotFound,
+        &[
+            ("version", "3"),
+            ("checkpointVersion", "-1"),
+            ("logPath", "memory:///_delta_log/"),
+        ],
+    );
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(7), None),
+        DeltaErrorCondition::DeltaVersionNotFound,
+        &[("userVersion", "7"), ("earliest", "0"), ("latest", "6")],
+    );
+}
+
+#[tokio::test]
+async fn retained_checkpoint_defines_earliest_available_version() {
+    let paths = [
+        delta_path_for_version(2, "checkpoint.parquet"),
+        delta_path_for_version(3, "json"),
+        delta_path_for_version(4, "json"),
+        delta_path_for_version(5, "json"),
+    ];
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(6), None),
+        DeltaErrorCondition::DeltaVersionNotFound,
+        &[("userVersion", "6"), ("earliest", "2"), ("latest", "5")],
+    );
+}
+
+#[rstest]
+#[case::known_snapshot_extends_latest(2, DeltaErrorCondition::DeltaVersionNotFound)]
+#[case::known_snapshot_extends_earliest(10, DeltaErrorCondition::DeltaLogFileNotFound)]
+#[tokio::test]
+async fn known_snapshot_extends_probed_history_bounds(
+    #[case] checkpoint: Version,
+    #[case] expected_condition: DeltaErrorCondition,
+) {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[delta_path_for_version(checkpoint, "checkpoint.parquet")],
+        None,
+    )
+    .await;
+    let listed =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], None, Some(6), None).unwrap();
+    let result = LogSegment::try_new_for_snapshot(
+        listed,
+        log_root,
+        Some(6),
+        Some(6),
+        None,
+        storage.as_ref(),
+        &[],
+        None,
+        Some(5),
+        None,
+        None,
+    );
+
+    let error = match result {
+        Err(Error::Delta(error)) => error,
+        Err(error) => panic!("expected Delta error, got {error}"),
+        Ok(_) => panic!("version 6 must not be reconstructable"),
+    };
+    assert_eq!(error.condition(), expected_condition);
+    if checkpoint == 2 {
+        assert_eq!(error.parameter("userVersion"), Some("6"));
+        assert_eq!(error.parameter("earliest"), Some("2"));
+        assert_eq!(error.parameter("latest"), Some("5"));
+    } else {
+        assert_eq!(error.parameter("version"), Some("6"));
+    }
+}
+
+#[tokio::test]
+async fn known_snapshot_reanchors_catalog_latest_after_obsolete_history_gap() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(2, "json"),
+        ],
+        None,
+    )
+    .await;
+    let listed =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(1), Some(6), None).unwrap();
+
+    assert_delta_error(
+        LogSegment::try_new_for_snapshot(
+            listed,
+            log_root,
+            Some(6),
+            None,
+            None,
+            storage.as_ref(),
+            &[],
+            Some(6),
+            Some(5),
+            None,
+            None,
+        ),
+        DeltaErrorCondition::DeltaLogFileNotFound,
+        &[
+            ("version", "LATEST"),
+            ("checkpointVersion", "-1"),
+            ("logPath", "memory:///_delta_log/"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn known_snapshot_reanchor_preserves_later_history_gap() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(4, "json"),
+        ],
+        None,
+    )
+    .await;
+    let listed =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(1), Some(5), None).unwrap();
+
+    assert_delta_error(
+        LogSegment::try_new_for_snapshot(
+            listed,
+            log_root,
+            Some(5),
+            None,
+            None,
+            storage.as_ref(),
+            &[],
+            Some(5),
+            Some(1),
+            None,
+            None,
+        ),
+        DeltaErrorCondition::DeltaVersionsNotContiguous,
+        &[
+            ("versionList", "2, 4"),
+            ("startVersion", "2"),
+            ("endVersion", "4"),
+            ("versionToLoad", "-1"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn known_snapshot_anchors_visible_commit_suffix() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    )
+    .await;
+    let listed =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(1), Some(8), None).unwrap();
+
+    assert_delta_error(
+        LogSegment::try_new_for_snapshot(
+            listed,
+            log_root,
+            Some(8),
+            Some(8),
+            None,
+            storage.as_ref(),
+            &[],
+            None,
+            Some(5),
+            None,
+            None,
+        ),
+        DeltaErrorCondition::DeltaVersionNotFound,
+        &[("userVersion", "8"), ("earliest", "5"), ("latest", "7")],
+    );
+}
+
+#[tokio::test]
+async fn cancellation_during_history_probe_is_preserved() {
+    let (inner, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+        ],
+        None,
+    )
+    .await;
+    let token = Arc::new(TestCancellationToken::default());
+    let list_calls = Arc::new(AtomicU32::new(0));
+    let storage = CancelOnSecondList {
+        inner,
+        token: token.clone(),
+        list_calls: list_calls.clone(),
+    };
+    let token_ref: CancellationTokenRef = token;
+
+    let result =
+        LogSegment::for_snapshot_impl(&storage, log_root, vec![], None, Some(3), Some(&token_ref));
+    assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
+    assert_eq!(list_calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn unusable_checkpoint_at_target_preserves_structural_error() {
+    let (store, log_root) = new_in_memory_store();
+    for version in [0, 1] {
+        store
+            .put(
+                &delta_path_for_version(version, "json"),
+                bytes::Bytes::from_static(b"kernel-data").into(),
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .put(
+            &delta_path_for_version(2, "checkpoint.parquet"),
+            bytes::Bytes::new().into(),
+        )
+        .await
+        .unwrap();
+    let engine = SyncEngine::new_with_store(store);
+
+    assert_result_error_with_message(
+        LogSegment::for_snapshot_impl(
+            engine.storage_handler().as_ref(),
+            log_root,
+            vec![],
+            None,
+            Some(2),
+            None,
+        ),
+        "Generic delta kernel error: LogSegment end version 1 not the same as the specified end \
+         version 2",
+    );
+}
+
+#[tokio::test]
+async fn catalog_max_version_miss_is_not_time_travel_version_not_found() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+        ],
+        None,
+    )
+    .await;
+    let log_tail = staged_commit_log_paths(&[2, 3]);
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl_with_max_catalog_version(
+            storage.as_ref(),
+            log_root,
+            log_tail,
+            None,
+            None,
+            Some(4),
+            None,
+        ),
+        DeltaErrorCondition::DeltaLogFileNotFound,
+        &[
+            ("version", "LATEST"),
+            ("checkpointVersion", "-1"),
+            ("logPath", "memory:///_delta_log/"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn catalog_latest_with_deleted_hinted_checkpoint_reports_latest() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+        ],
+        None,
+    )
+    .await;
+    let checkpoint_hint = LastCheckpointHint {
+        version: 1,
+        ..Default::default()
+    };
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl_with_max_catalog_version(
+            storage.as_ref(),
+            log_root,
+            vec![],
+            Some(checkpoint_hint),
+            None,
+            Some(1),
+            None,
+        ),
+        DeltaErrorCondition::DeltaLogFileNotFound,
+        &[
+            ("version", "LATEST"),
+            ("checkpointVersion", "1"),
+            ("logPath", "memory:///_delta_log/"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn maximum_version_request_finishes_with_version_not_found() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(Version::MAX, "crc"),
+        ],
+        None,
+    )
+    .await;
+    let maximum = Version::MAX.to_string();
+
+    assert_delta_error(
+        LogSegment::for_snapshot_impl(
+            storage.as_ref(),
+            log_root,
+            vec![],
+            None,
+            Some(Version::MAX),
+            None,
+        ),
+        DeltaErrorCondition::DeltaVersionNotFound,
+        &[
+            ("userVersion", maximum.as_str()),
+            ("earliest", "0"),
+            ("latest", "1"),
+        ],
+    );
 }
 
 #[tokio::test]
@@ -633,10 +1288,15 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         None,
         None,
     );
-    assert_result_error_with_message(
+    assert_delta_error(
         log_segment,
-        "Invalid Checkpoint: Had a _last_checkpoint hint but didn't find any checkpoints",
-    )
+        DeltaErrorCondition::DeltaLogFileNotFound,
+        &[
+            ("version", "LATEST"),
+            ("checkpointVersion", "5"),
+            ("logPath", "memory:///_delta_log/"),
+        ],
+    );
 }
 
 /// v5 holds three complete checkpoints (classic, 2-part, 3-part), so the 3-part one always wins.

@@ -65,7 +65,7 @@ impl Snapshot {
     /// Case C.1:   C1 .. S1 .. T                   empty        -          error (T unreachable)
     /// Case C.2:   C1 .. S1                        empty        -          return existing
     /// Case D.1:   C1 .. S1 .. C2 ===== S2         [C1+1, S2]   [C2, S2]   rebuild from C2
-    /// Case D.2:   C1 . C2 .. S1 ====== S2         [C1+1, S2]   (S1, S2]   advance base, -> F
+    /// Case D.2:   C1 . C2 .. S1 ====== S2         [C1+1, S2]   (S1, S2]   use C2 if viable, -> F
     /// Case E:     C1 .. S1 (= S2)                 [C1+1, S1]   -          return existing
     /// Case F:     C1 .. S1 ====== S2              [C1+1, S2]   (S1, S2]   incremental update
     /// ```
@@ -87,9 +87,10 @@ impl Snapshot {
     ///       base instead of replaying those commits. Build a fresh snapshot from `C2`.
     ///     - **D.2.** `C2 <= S1`: the existing snapshot's P+M (at `S1`) already reflects everything
     ///       `C2` would tell us, so we skip reading `C2` for P+M. Fall through to case F to replay
-    ///       only commits `> S1` for P+M; the combined segment uses `C2` as its checkpoint base,
-    ///       producing a better log segment with fewer deltas above the checkpoint (e.g. faster
-    ///       distributed log replay).
+    ///       only commits `> S1` for P+M. When the visible commit chain from `C2` reaches `S1`, the
+    ///       combined segment uses `C2` as its checkpoint base, producing a better log segment with
+    ///       fewer deltas above the checkpoint (e.g. faster distributed log replay). Otherwise, the
+    ///       cached snapshot remains the only viable anchor and `C2` is ignored.
     ///   - **E.** Listing contains commits but no new checkpoint, and `S2 == S1`: return the
     ///     existing snapshot.
     ///   - **F.** Listing contains new commits (no new checkpoint, or fall through from D.2): run
@@ -100,7 +101,7 @@ impl Snapshot {
     /// [`SnapshotBuilder::at_version`]: crate::snapshot::SnapshotBuilder::at_version
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
     #[allow(clippy::too_many_arguments)]
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, target_version, cancellation_token))]
+    #[cfg(test)]
     pub(super) fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
@@ -111,20 +112,47 @@ impl Snapshot {
         built_as_latest: bool,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Arc<Self>> {
+        Self::try_new_from_with_max_catalog_version(
+            existing_snapshot,
+            log_tail,
+            engine,
+            target_version,
+            None,
+            metric_context,
+            incremental_replay,
+            built_as_latest,
+            cancellation_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, target_version, cancellation_token))]
+    pub(super) fn try_new_from_with_max_catalog_version(
+        existing_snapshot: Arc<Snapshot>,
+        log_tail: Vec<ParsedLogPath>,
+        engine: &dyn Engine,
+        target_version: impl Into<Option<Version>>,
+        max_catalog_version: Option<Version>,
+        metric_context: SnapshotLoadMetricContext,
+        incremental_replay: IncrementalReplay,
+        built_as_latest: bool,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<Arc<Self>> {
         let existing_log_segment = &existing_snapshot.log_segment;
         let existing_snapshot_version = existing_snapshot.version();
         let requested_version = target_version.into();
-        if let Some(requested_version) = requested_version {
-            tracing::Span::current().record("version", requested_version);
+        let end_version = requested_version.or(max_catalog_version);
+        if let Some(end_version) = end_version {
+            tracing::Span::current().record("version", end_version);
             // Case A: re-requesting the same version.
-            if requested_version == existing_snapshot_version {
+            if end_version == existing_snapshot_version {
                 return Ok(existing_snapshot.clone());
             }
             // Case B: incremental path only moves forward.
-            if requested_version < existing_snapshot_version {
+            if end_version < existing_snapshot_version {
                 return Err(KernelError::Generic(format!(
-                    "Requested snapshot version {requested_version} is older than snapshot \
-                    hint version {existing_snapshot_version}"
+                    "Requested snapshot version {end_version} is older than snapshot \
+                     hint version {existing_snapshot_version}"
                 ))
                 .into());
             }
@@ -140,7 +168,9 @@ impl Snapshot {
             existing_log_segment,
             existing_snapshot_version,
             log_tail,
+            end_version,
             requested_version,
+            max_catalog_version,
             cancellation_token,
         )
         .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?
@@ -236,48 +266,87 @@ impl Snapshot {
     /// List the log after the existing snapshot and assemble the new [`NewSegment`] for this
     /// incremental update. Returns a non-failure [`NewSegment`] on the C/D.1/E/F cases; a
     /// propagated `Err` is a genuine listing/assembly failure.
+    #[allow(clippy::too_many_arguments)]
     fn build_new_segment(
         engine: &dyn Engine,
         existing_log_segment: &LogSegment,
         existing_snapshot_version: Version,
         log_tail: Vec<ParsedLogPath>,
+        end_version: Option<Version>,
         requested_version: Option<Version>,
+        max_catalog_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
         // Start listing just after the previous segment's checkpoint, if any.
-        let listing_start = existing_log_segment.checkpoint_version.unwrap_or(0) + 1;
+        let Some(listing_start) = existing_log_segment
+            .checkpoint_version
+            .map_or(Some(1), |version| version.checked_add(1))
+        else {
+            return Ok(NewSegment::Unchanged);
+        };
 
-        let new_listed_files = LogSegmentFiles::list(
+        let probe_log_tail = log_tail.clone();
+        let mut new_listed_files = LogSegmentFiles::list(
             storage.as_ref(),
             &log_root,
             log_tail,
             Some(listing_start),
-            requested_version,
+            end_version,
             cancellation_token,
         )?;
+
+        let selected_checkpoint_version = new_listed_files
+            .checkpoint_parts
+            .first()
+            .map(|checkpoint| checkpoint.version);
+        if selected_checkpoint_version.is_none_or(|version| version <= existing_snapshot_version) {
+            let replay_anchor = selected_checkpoint_version
+                .or(existing_log_segment.checkpoint_version)
+                .unwrap_or(0);
+            let listing_reaches_existing_snapshot = Self::commit_chain_reaches_version(
+                &new_listed_files.ascending_commit_files,
+                replay_anchor,
+                existing_snapshot_version,
+            );
+            if !listing_reaches_existing_snapshot {
+                // The cached snapshot is the only usable anchor. Ignore artifacts at or below it
+                // so deleted history cannot make an otherwise valid incremental replay fail.
+                new_listed_files.checkpoint_parts.clear();
+                new_listed_files
+                    .ascending_commit_files
+                    .retain(|path| path.version > existing_snapshot_version);
+                new_listed_files
+                    .ascending_compaction_files
+                    .retain(|path| path.version > existing_snapshot_version);
+                if new_listed_files
+                    .latest_commit_file
+                    .as_ref()
+                    .is_some_and(|path| path.version <= existing_snapshot_version)
+                {
+                    new_listed_files.latest_commit_file = None;
+                }
+                if new_listed_files
+                    .latest_crc_file
+                    .as_ref()
+                    .is_some_and(|path| path.version <= existing_snapshot_version)
+                {
+                    new_listed_files.latest_crc_file = None;
+                }
+            }
+        }
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log
         // listing above will only return the checkpoint and not the commit.
-        if new_listed_files.ascending_commit_files().is_empty()
+        if end_version.is_none()
+            && new_listed_files.ascending_commit_files().is_empty()
             && new_listed_files.checkpoint_parts().is_empty()
         {
-            return match requested_version {
-                // Case C.1: caller requested a specific version (necessarily >
-                // existing_snapshot_version since cases A and B were handled above), but
-                // no such commit exists in the log.
-                Some(requested_version) => Err(KernelError::Generic(format!(
-                    "Requested snapshot version {requested_version} is not available: \
-                     no new commits were found after existing snapshot version \
-                     {existing_snapshot_version}"
-                ))
-                .into()),
-                // Case C.2: no new commits and no explicit target; latest is existing.
-                None => Ok(NewSegment::Unchanged),
-            };
+            // Case C.2: no new commits and no explicit target; latest is existing.
+            return Ok(NewSegment::Unchanged);
         }
 
         // create a log segment just from existing_checkpoint.version -> new_version
@@ -288,8 +357,19 @@ impl Snapshot {
         // hint. If the new segment has a checkpoint, we will return it as is. Otherwise, we
         // will preserve last_checkpoint_metadata when merging the new log segment with the
         // old one.
-        let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
+        let mut new_log_segment = LogSegment::try_new_for_snapshot(
+            new_listed_files,
+            log_root.clone(),
+            end_version,
+            requested_version,
+            None,
+            storage.as_ref(),
+            &probe_log_tail,
+            max_catalog_version,
+            Some(existing_snapshot_version),
+            existing_log_segment.checkpoint_version,
+            cancellation_token,
+        )?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < existing_snapshot_version {
@@ -310,8 +390,8 @@ impl Snapshot {
                 // at or above the new checkpoint still advances per `incremental_replay`.
                 return Ok(NewSegment::Rebuild(new_log_segment));
             }
-            // Case D.2: checkpoint at or below existing snapshot; fall through to case F to
-            // replay only the new commits and advance the checkpoint base.
+            // Case D.2: a viable checkpoint at or below the existing snapshot falls through to
+            // case F to replay only the new commits and advance the checkpoint base.
         }
 
         // Case E: no new checkpoint, version did not advance; return existing.
@@ -477,6 +557,24 @@ impl Snapshot {
             None => files.to_vec(),
         }
     }
+
+    fn commit_chain_reaches_version(
+        commits: &[ParsedLogPath],
+        anchor: Version,
+        target: Version,
+    ) -> bool {
+        if anchor >= target {
+            return true;
+        }
+        let mut previous = anchor;
+        for commit in commits.iter().take_while(|commit| commit.version <= target) {
+            if previous.checked_add(1) != Some(commit.version) {
+                return false;
+            }
+            previous = commit.version;
+        }
+        previous == target
+    }
 }
 
 #[cfg(test)]
@@ -506,6 +604,7 @@ mod tests {
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
     };
+    use crate::{DeltaErrorCondition, Error};
 
     // ============================================================================
     // Helpers
@@ -594,6 +693,27 @@ mod tests {
         let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
 
         Ok(IncrementalSnapshotTestContext { store, url, engine })
+    }
+
+    fn assert_delta_error<T>(
+        result: DeltaResult<T>,
+        expected_condition: DeltaErrorCondition,
+        expected_parameters: &[(&str, &str)],
+    ) {
+        let error = match result {
+            Err(Error::Delta(error)) => error,
+            Err(error) => panic!("expected Delta error, got {error}"),
+            Ok(_) => panic!("expected Delta error, got success"),
+        };
+        assert_eq!(error.condition(), expected_condition);
+        assert_eq!(
+            error
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.name(), parameter.value()))
+                .collect::<Vec<_>>(),
+            expected_parameters
+        );
     }
 
     /// Compares two Snapshots field-by-field. LogSegment fields are compared individually,
@@ -818,6 +938,32 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn incremental_snapshot_history_proves_table_exists_after_log_deletion() -> DeltaResult<()>
+    {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?;
+
+        for version in [0, 1] {
+            ctx.store
+                .delete(&delta_path_for_version(version, "json"))
+                .await
+                .map_err(KernelError::from)?;
+        }
+
+        assert_delta_error(
+            Snapshot::builder_from(base)
+                .at_version(2)
+                .build(ctx.engine.as_ref()),
+            DeltaErrorCondition::DeltaVersionNotFound,
+            &[("userVersion", "2"), ("earliest", "1"), ("latest", "1")],
+        );
+        Ok(())
+    }
+
     // ============================================================================
     // Tests: incremental builder paths (Cases A/B/C/D.1/D.2/E/F)
     // ============================================================================
@@ -878,6 +1024,36 @@ mod tests {
         assert_eq!(updated.version(), 3);
         assert_eq!(updated.log_segment.checkpoint_version, Some(2));
         compare_snapshots(&updated, &fresh);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_snapshot_uses_existing_anchor_when_stale_checkpoint_cannot_reach_it(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 7).await?;
+
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(5)
+            .build(ctx.engine.as_ref())?;
+        Snapshot::builder_for(ctx.url.as_str())
+            .at_version(2)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref(), None)?;
+
+        for version in 3..=5 {
+            ctx.store
+                .delete(&delta_path_for_version(version, "json"))
+                .await
+                .map_err(KernelError::from)?;
+        }
+
+        let updated = Snapshot::builder_from(base)
+            .at_version(6)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(updated.version(), 6);
+        assert_eq!(updated.log_segment.checkpoint_version, None);
 
         Ok(())
     }
@@ -1118,11 +1294,13 @@ mod tests {
             .build(&engine)?;
         assert_eq!(snapshot, expected);
         // version exceeds latest version of the table = err
-        assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
-            Err(crate::Error::Kernel(KernelError::Generic(msg)))
-                if msg == "Requested snapshot version 1 is not available: no new commits were found after existing snapshot version 0"
-        ));
+        assert_delta_error(
+            Snapshot::builder_from(base_snapshot.clone())
+                .at_version(1)
+                .build(&engine),
+            DeltaErrorCondition::DeltaVersionNotFound,
+            &[("userVersion", "1"), ("earliest", "0"), ("latest", "0")],
+        );
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
         let store_3a = store.fork();
@@ -1188,11 +1366,13 @@ mod tests {
         let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
-        assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
-            Err(crate::Error::Kernel(KernelError::Generic(msg)))
-                if msg == "LogSegment end version 1 not the same as the specified end version 2"
-        ));
+        assert_delta_error(
+            Snapshot::builder_from(base_snapshot.clone())
+                .at_version(2)
+                .build(&engine),
+            DeltaErrorCondition::DeltaVersionNotFound,
+            &[("userVersion", "2"), ("earliest", "0"), ("latest", "1")],
+        );
 
         // ii. commits have (new protocol, no metadata)
         let store_3c_ii = store.fork();
@@ -2179,46 +2359,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_version_regression_emits_log_segment_load_failure() -> DeltaResult<()>
-    {
+    async fn test_incremental_latest_reuses_cached_snapshot_when_visible_history_regresses(
+    ) -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?; // v0..=v5
-        let base = Snapshot::builder_for(ctx.url.as_str())
-            .at_version(5)
-            .build(ctx.engine.as_ref())?;
+        let base = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        assert_eq!(base.version(), 5);
 
-        // Simulate commits incorrectly deleted from the log: re-listing now tops out below v5, so
-        // the new segment's end version is older than the base and the regression branch fires.
-        ctx.store
-            .delete(&delta_path_for_version(5, "json"))
-            .await
-            .map_err(KernelError::from)?;
-        ctx.store
-            .delete(&delta_path_for_version(4, "json"))
-            .await
-            .map_err(KernelError::from)?;
+        // Simulate old commits being deleted after the snapshot was cached. An unbounded refresh
+        // with nothing above v5 can reuse that trusted snapshot without reconstructing it.
+        for version in [1, 3, 4, 5] {
+            ctx.store
+                .delete(&delta_path_for_version(version, "json"))
+                .await
+                .map_err(KernelError::from)?;
+        }
 
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let result = Snapshot::builder_from(base).build(ctx.engine.as_ref());
-        assert!(result.is_err());
+        let updated = Snapshot::builder_from(base.clone()).build(ctx.engine.as_ref())?;
+        assert!(Arc::ptr_eq(&updated, &base));
 
         let events = reporter.events();
-        let failure = events
-            .iter()
-            .find_map(|e| match e {
-                MetricEvent::LogSegmentLoadFailure(f) => Some(f),
-                _ => None,
-            })
-            .expect("expected a LogSegmentLoadFailure");
-        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::LogSegmentLoadSuccess(_))),
-            "no success event should fire on the failure path"
+                .any(|e| matches!(e, MetricEvent::LogSegmentLoadFailure(_))),
+            "reusing the cached snapshot must not emit a load failure"
         );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::gap_immediately_after_anchor(8, vec![1, 3, 4, 5, 6], 7, "5", "7")]
+    #[case::gap_after_first_new_commit(9, vec![1, 3, 4, 5, 7], 8, "6", "8")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_snapshot_reports_gaps_above_cached_anchor(
+        #[case] commit_count: u64,
+        #[case] deleted_versions: Vec<u64>,
+        #[case] target: u64,
+        #[case] expected_start: &str,
+        #[case] expected_end: &str,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, commit_count).await?;
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(5)
+            .build(ctx.engine.as_ref())?;
+
+        for version in deleted_versions {
+            ctx.store
+                .delete(&delta_path_for_version(version, "json"))
+                .await
+                .map_err(KernelError::from)?;
+        }
+
+        let result = Snapshot::builder_from(base)
+            .at_version(target)
+            .build(ctx.engine.as_ref());
+        let error = match result {
+            Err(Error::Delta(error)) => error,
+            Err(error) => panic!("expected Delta error, got {error}"),
+            Ok(_) => panic!("gap above cached snapshot must be rejected"),
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaVersionsNotContiguous
+        );
+        assert_eq!(error.parameter("startVersion"), Some(expected_start));
+        assert_eq!(error.parameter("endVersion"), Some(expected_end));
+        assert_eq!(error.parameter("versionToLoad"), Some(expected_end));
+
         Ok(())
     }
 

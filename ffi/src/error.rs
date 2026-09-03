@@ -76,6 +76,7 @@ pub enum FFIKernelError {
     RowTrackingChangeFeedUnsupported = 44,
     CancelledError = 45,
     InvalidTransactionStateError = 46,
+    DeltaError = 47,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -158,6 +159,7 @@ impl From<Error> for FFIKernelError {
     fn from(error: Error) -> Self {
         match error {
             Error::Kernel(error) => error.into(),
+            Error::Delta(_) => Self::DeltaError,
             _ => Self::UnknownError,
         }
     }
@@ -364,6 +366,7 @@ impl From<EngineExecError> for KernelError {
             // preserve the code + message in the error string.
             code @ (FFIKernelError::UnknownError
             | FFIKernelError::FFIError
+            | FFIKernelError::DeltaError
             | FFIKernelError::ExtractError
             | FFIKernelError::IOErrorError
             | FFIKernelError::InvalidUrlError
@@ -402,6 +405,28 @@ mod error_code_tests {
             FFIKernelError::RowTrackingChangeFeedUnsupported
         );
         assert_eq!(FFIKernelError::RowTrackingChangeFeedUnsupported as i32, 44);
+    }
+
+    #[test]
+    fn appended_error_codes_have_stable_discriminants() {
+        assert_eq!(FFIKernelError::InvalidTransactionStateError as i32, 46);
+        assert_eq!(FFIKernelError::DeltaError as i32, 47);
+    }
+
+    #[test]
+    fn inbound_delta_error_code_falls_back_to_generic_kernel_error() {
+        let message: Handle<ExclusiveRustString> =
+            Box::new("engine delta error".to_string()).into();
+        let error: KernelError = EngineExecError {
+            etype: FFIKernelError::DeltaError,
+            message,
+        }
+        .into();
+
+        assert_eq!(
+            error.to_string(),
+            "Generic delta kernel error: engine execution error (DeltaError): engine delta error"
+        );
     }
 }
 

@@ -2183,7 +2183,11 @@ mod tests {
             snapshot_builder_set_version(&mut ptr, 1);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(snapshot_at_non_existent_version, FFIKernelError::GenericError, Some("Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1"));
+        assert_extern_result_error_with_message(
+            snapshot_at_non_existent_version,
+            FFIKernelError::DeltaError,
+            Some("Cannot time travel Delta table to version 1. Available versions: [0, 0]."),
+        );
 
         let snapshot_table_root_str =
             unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
@@ -3649,7 +3653,11 @@ mod tests {
             snapshot_builder_set_version(&mut ptr, 99);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::DeltaError,
+            Some("Cannot time travel Delta table to version 99. Available versions: [0, 0]."),
+        );
 
         unsafe { free_engine(engine) }
         Ok(())

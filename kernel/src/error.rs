@@ -2,6 +2,7 @@
 
 mod delta_error;
 mod delta_error_conditions;
+pub(crate) mod delta_errors;
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::convert::Infallible;

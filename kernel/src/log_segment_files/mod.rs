@@ -19,12 +19,15 @@ use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::cancellation::{check_cancelled, CancellableIterator, CancellationTokenRef};
+use crate::error::delta_errors;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
-use crate::{DeltaResult, KernelError, StorageHandler, Version};
+#[cfg(test)]
+use crate::KernelError;
+use crate::{DeltaResult, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -68,7 +71,7 @@ pub(crate) struct LogSegmentFiles {
 ///
 /// With a `cancellation_token`, the listing becomes cancellable: the engine may interrupt its own
 /// I/O, and the returned iterator is polled against the token so cancellation arrives as a terminal
-/// [`KernelError::Cancelled`] rather than an early end.
+/// [`crate::KernelError::Cancelled`] rather than an early end.
 #[internal_api]
 pub(crate) fn list_delta_log_from_storage(
     storage: &dyn StorageHandler,
@@ -604,6 +607,7 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
+        requested_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let listed_files = Self::list(
@@ -633,10 +637,11 @@ impl LogSegmentFiles {
             //     the drop leaves commits 0-2 behind, the new table writes its own 0, 1, 2, ...,
             //     and listing from version 0 sees one contiguous sequence whose low versions belong
             //     to two different tables and replays it as a single history.
-            return Err(KernelError::invalid_checkpoint(
-                "Had a _last_checkpoint hint but didn't find any checkpoints",
-            )
-            .into());
+            return Err(delta_errors::log_file_not_found(
+                requested_version,
+                Some(checkpoint_metadata.version),
+                log_root,
+            ));
         };
         if latest_checkpoint.version != checkpoint_metadata.version {
             info!(
@@ -665,7 +670,10 @@ impl LogSegmentFiles {
     ///
     /// To find the checkpoint without a full forward listing from version 0, this scans backward
     /// from `end_version` in windows of size [`BACKWARD_SCAN_WINDOW_SIZE`], stopping as soon as
-    /// a complete checkpoint is found (or version 0 is reached).
+    /// a complete checkpoint is found, version 0 is reached, or an uncovered empty window proves
+    /// the requested target is above the visible suffix. The empty-window shortcut may return an
+    /// incomplete listing; snapshot construction performs one full history probe to classify the
+    /// resulting discovery error.
     /// Then, all files from the windows that were scanned are combined with `log_tail` to produce a
     /// log segment rooted at the checkpoint version (or version 0 if no checkpoint) with all
     /// commits after the checkpoint version. A log_tail commit at exactly the checkpoint
@@ -689,33 +697,40 @@ impl LogSegmentFiles {
         // Scan backward in 1000-version windows, collecting ALL file types, until a complete
         // checkpoint is found or the log is exhausted.
         let mut windows: Vec<Vec<ParsedLogPath>> = Vec::new();
-        let mut found_checkpoint_version: Option<Version> = None;
-        // upper is the exclusive upper bound of the next window; adding 1 includes end_version
-        // in the first window. The inclusive range passed to list_delta_log_from_storage is
-        // [lower, upper - 1].
-        let mut upper = end_version + 1;
-        while upper > 0 {
+        // Both bounds are inclusive. Keeping the upper bound inclusive avoids overflowing when a
+        // caller asks for `Version::MAX`.
+        let mut upper = end_version;
+        let found_checkpoint_version = loop {
             // Each window is collected eagerly, so check between windows too: a long backward scan
             // would otherwise keep going after cancellation.
             check_cancelled(cancellation_token)?;
-            let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
-            let window_files: Vec<_> = list_delta_log_from_storage(
-                storage,
-                log_root,
-                lower,
-                upper - 1,
-                cancellation_token,
-            )?
-            .try_collect()?;
+            let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE - 1);
+            let window_files: Vec<_> =
+                list_delta_log_from_storage(storage, log_root, lower, upper, cancellation_token)?
+                    .try_collect()?;
+            check_cancelled(cancellation_token)?;
 
-            found_checkpoint_version = find_complete_checkpoint_version(&window_files);
+            let checkpoint_version = find_complete_checkpoint_version(&window_files);
+            let uncovered_empty_window = window_files.is_empty()
+                && !log_tail
+                    .iter()
+                    .any(|path| (lower..=upper).contains(&path.version));
             windows.push(window_files);
 
-            if found_checkpoint_version.is_some() {
-                break;
+            if checkpoint_version.is_some() {
+                break checkpoint_version;
             }
-            upper = lower;
-        }
+            // A target above all visible history can otherwise require an impractical number of
+            // empty windows (notably for `Version::MAX`). Snapshot error classification performs
+            // one complete probe after this empty result.
+            if uncovered_empty_window {
+                break None;
+            }
+            let Some(next_upper) = lower.checked_sub(1) else {
+                break None;
+            };
+            upper = next_upper;
+        };
 
         let fs_iter = windows.into_iter().rev().flatten().map(Ok);
         let start = found_checkpoint_version.unwrap_or(0);

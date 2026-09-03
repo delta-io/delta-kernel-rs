@@ -1,11 +1,12 @@
 //! Validation for TIMESTAMP_NTZ feature support
 
 use super::TableFeature;
+use crate::error::delta_errors;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{DeltaResult, KernelError};
+use crate::DeltaResult;
 
 /// Validates that if a table schema contains TIMESTAMP_NTZ columns, the table must have the
 /// TimestampWithoutTimezone feature in both reader and writer features.
@@ -14,9 +15,7 @@ pub(crate) fn validate_timestamp_ntz_feature_support(tc: &TableConfiguration) ->
     if !protocol.has_table_feature(&TableFeature::TimestampWithoutTimezone) {
         require!(
             !schema_contains_timestamp_ntz(&tc.logical_schema()),
-            KernelError::unsupported(
-                "Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features"
-            )
+            delta_errors::features_protocol_metadata_mismatch(["timestampNtz"])
         );
     }
     Ok(())
@@ -78,7 +77,7 @@ mod tests {
             &protocol_with,
             &protocol_without,
             &[&nested_schema_with],
-            "Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features",
+            "timestampNtz",
         );
     }
 }

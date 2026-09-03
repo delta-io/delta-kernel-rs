@@ -17,6 +17,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
+use crate::error::delta_errors;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
@@ -660,16 +661,28 @@ impl TableConfiguration {
         match &info.kernel_support {
             KernelSupport::Supported => {}
             KernelSupport::NotSupported => {
-                return Err(KernelError::unsupported(format!(
-                    "Feature '{feature}' is not supported"
-                ))
-                .into())
+                return Err(self.unsupported_features([feature], operation));
             }
             KernelSupport::Custom(check) => {
                 check(&self.protocol, &self.table_properties, operation)?;
             }
         };
         self.validate_feature_requirements(feature)
+    }
+
+    fn unsupported_features(
+        &self,
+        features: impl IntoIterator<Item = impl ToString>,
+        operation: Operation,
+    ) -> crate::Error {
+        match operation {
+            Operation::Scan | Operation::Cdf => {
+                delta_errors::unsupported_features_for_read(&self.table_root, features)
+            }
+            Operation::Write => {
+                delta_errors::unsupported_features_for_write(&self.table_root, features)
+            }
+        }
     }
 
     /// Returns all reader features enabled for this table based on protocol version.
@@ -724,10 +737,18 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        check_reader_version_range(&self.protocol)?;
+        check_reader_version_range(&self.protocol, &self.table_root)?;
 
-        // Check all enabled reader features have kernel support
-        for feature in self.get_enabled_reader_features() {
+        let features = self.get_enabled_reader_features();
+        let unsupported = features
+            .iter()
+            .filter(|feature| matches!(feature.info().kernel_support, KernelSupport::NotSupported))
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            return Err(self.unsupported_features(unsupported, operation));
+        }
+
+        for feature in features {
             self.check_feature_support(&feature, operation)?;
         }
 
@@ -747,15 +768,23 @@ impl TableConfiguration {
         );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
-            return Err(KernelError::unsupported(format!(
-                "Unsupported minimum writer version {}",
-                self.protocol.min_writer_version()
-            ))
-            .into());
+            return Err(delta_errors::invalid_protocol_version(
+                &self.table_root,
+                self.protocol.min_reader_version(),
+                self.protocol.min_writer_version(),
+            ));
         }
 
-        // Check all enabled writer features have kernel support
-        for feature in self.get_enabled_writer_features() {
+        let features = self.get_enabled_writer_features();
+        let unsupported = features
+            .iter()
+            .filter(|feature| matches!(feature.info().kernel_support, KernelSupport::NotSupported))
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            return Err(self.unsupported_features(unsupported, Operation::Write));
+        }
+
+        for feature in features {
             self.check_feature_support(&feature, Operation::Write)?;
         }
 
@@ -972,7 +1001,28 @@ mod test {
         test_schema_with_map_and_column_mapping, MockProtocolBuilder,
         MockTableConfigurationBuilder,
     };
-    use crate::KernelError;
+    use crate::{DeltaErrorCondition, DeltaResult, Error, KernelError};
+
+    fn assert_delta_error<T>(
+        result: DeltaResult<T>,
+        expected_condition: DeltaErrorCondition,
+        expected_parameters: &[(&str, &str)],
+    ) {
+        let error = match result {
+            Err(Error::Delta(error)) => error,
+            Err(error) => panic!("expected Delta error, got {error}"),
+            Ok(_) => panic!("expected Delta error, got success"),
+        };
+        assert_eq!(error.condition(), expected_condition);
+        assert_eq!(
+            error
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.name(), parameter.value()))
+                .collect::<Vec<_>>(),
+            expected_parameters
+        );
+    }
 
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
@@ -1073,7 +1123,7 @@ mod test {
                             .build(),
                     )
                     .build(),
-                Ok(()),
+                None,
             ),
             (
                 // Should succeed even if AppendOnly is supported but not enabled
@@ -1085,7 +1135,7 @@ mod test {
                             .build(),
                     )
                     .build(),
-                Ok(()),
+                None,
             ),
             (
                 // Should succeed since AppendOnly is enabled
@@ -1097,7 +1147,7 @@ mod test {
                             .build(),
                     )
                     .build(),
-                Ok(()),
+                None,
             ),
             (
                 // Writer version > 7 is not supported
@@ -1105,9 +1155,7 @@ mod test {
                     .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
                     .with_protocol(MockProtocolBuilder::new().with_versions(1, 8).build())
                     .build(),
-                Err(KernelError::unsupported(
-                    "Unsupported minimum writer version 8",
-                )),
+                Some(DeltaErrorCondition::DeltaInvalidProtocolVersion),
             ),
             // Column mapping is now supported for writes.
             (
@@ -1120,7 +1168,7 @@ mod test {
                             .build(),
                     )
                     .build(),
-                Ok(()),
+                None,
             ),
             (
                 // Column mapping + AppendOnly, no CDF enabled: should succeed
@@ -1132,7 +1180,7 @@ mod test {
                             .build(),
                     )
                     .build(),
-                Ok(()),
+                None,
             ),
             (
                 // Should succeed since change data feed is not enabled
@@ -1144,21 +1192,23 @@ mod test {
                             .build(),
                     )
                     .build(),
-                Ok(()),
+                None,
             ),
         ];
 
-        for (table_configuration, result) in cases {
-            match (
-                table_configuration.ensure_operation_supported(Operation::Write),
-                result,
-            ) {
-                (Ok(()), Ok(())) => { /* Correct result */ }
-                (actual_result, Err(expected)) => {
-                    assert_result_error_with_message(actual_result, &expected.to_string());
-                }
-                (Err(actual_result), Ok(())) => {
-                    panic!("Expected Ok but got error: {actual_result}");
+        for (table_configuration, expected_condition) in cases {
+            let result = table_configuration.ensure_operation_supported(Operation::Write);
+            match expected_condition {
+                None => result.expect("write should be supported"),
+                Some(expected_condition) => {
+                    let error = result.expect_err("writer version must be rejected");
+                    assert!(
+                        matches!(
+                            error,
+                            Error::Delta(ref error) if error.condition() == expected_condition
+                        ),
+                        "expected {expected_condition:?}, got {error:?}"
+                    );
                 }
             }
         }
@@ -1365,8 +1415,11 @@ mod test {
                 .try_build()
         };
 
-        let result = ntz_config(&[]);
-        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
+        assert_delta_error(
+            ntz_config(&[]),
+            DeltaErrorCondition::DeltaFeaturesProtocolMetadataMismatch,
+            &[("features", "timestampNtz")],
+        );
 
         let result = ntz_config(&[TableFeature::TimestampWithoutTimezone]);
         assert!(
@@ -1414,8 +1467,11 @@ mod test {
                 .try_build()
         };
 
-        let result = variant_config(&[]);
-        assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
+        assert_delta_error(
+            variant_config(&[]),
+            DeltaErrorCondition::DeltaFeaturesProtocolMetadataMismatch,
+            &[("features", "variantType")],
+        );
 
         let result = variant_config(&[TableFeature::VariantType]);
         assert!(
@@ -1831,9 +1887,19 @@ mod test {
                     .build(),
             )
             .build();
-        assert_result_error_with_message(
-            config.ensure_operation_supported(operation),
-            "Feature 'geospatial' is not supported",
+        let expected_condition = match operation {
+            Operation::Scan | Operation::Cdf => {
+                DeltaErrorCondition::DeltaUnsupportedFeaturesForRead
+            }
+            Operation::Write => DeltaErrorCondition::DeltaUnsupportedFeaturesForWrite,
+        };
+        let error = config.ensure_operation_supported(operation);
+        assert!(
+            matches!(
+                error,
+                Err(Error::Delta(error)) if error.condition() == expected_condition
+            ),
+            "expected {expected_condition:?}, got {error:?}"
         );
     }
 
@@ -2687,56 +2753,62 @@ mod test {
     // `validate_feature_requirements` reads only `feature_requirements`, which is compiled
     // regardless of the `adaptive-metadata-in-dev` gate, so these cases run in the default build.
     // See the adaptiveMetadata RFC (delta-io/delta#6978) for the enablement rules being checked.
+    enum FeatureRequirementExpectation {
+        Ok,
+        Kernel(&'static str),
+        AdaptiveMetadataColumnMappingMode,
+    }
+
     #[rstest]
     #[case::all_satisfied(
         all_adaptive_metadata_props(),
         Some(ColumnMappingMode::Id),
         all_adaptive_metadata_deps(),
-        None
+        FeatureRequirementExpectation::Ok
     )]
     // Column mapping enabled but in `name` mode -> the `id`-mode Custom check fires.
     #[case::cm_name_mode_rejected(
         all_adaptive_metadata_props(),
         Some(ColumnMappingMode::Name),
         all_adaptive_metadata_deps(),
-        Some("column mapping in 'id' mode")
+        FeatureRequirementExpectation::AdaptiveMetadataColumnMappingMode
     )]
     // Column mapping feature absent entirely -> the `Enabled(ColumnMapping)` arm fires first.
     #[case::column_mapping_not_supported(
         all_adaptive_metadata_props(),
         None,
         adaptive_metadata_deps_without(TableFeature::ColumnMapping),
-        Some("requires 'columnMapping' to be enabled")
+        FeatureRequirementExpectation::Kernel("requires 'columnMapping' to be enabled")
     )]
     #[case::row_tracking_not_enabled(
         adaptive_metadata_props_without(ENABLE_ROW_TRACKING),
         Some(ColumnMappingMode::Id),
         all_adaptive_metadata_deps(),
-        Some("requires 'rowTracking' to be enabled")
+        FeatureRequirementExpectation::Kernel("requires 'rowTracking' to be enabled")
     )]
     #[case::domain_metadata_not_supported(
         all_adaptive_metadata_props(),
         Some(ColumnMappingMode::Id),
         adaptive_metadata_deps_without(TableFeature::DomainMetadata),
-        Some("requires 'domainMetadata' to be enabled")
+        FeatureRequirementExpectation::Kernel("requires 'domainMetadata' to be enabled")
     )]
     #[case::deletion_vectors_not_enabled(
         adaptive_metadata_props_without(ENABLE_DELETION_VECTORS),
         Some(ColumnMappingMode::Id),
         all_adaptive_metadata_deps(),
-        Some("requires 'deletionVectors' to be enabled")
+        FeatureRequirementExpectation::Kernel("requires 'deletionVectors' to be enabled")
     )]
     #[case::in_commit_timestamp_not_enabled(
         adaptive_metadata_props_without(ENABLE_IN_COMMIT_TIMESTAMPS),
         Some(ColumnMappingMode::Id),
         all_adaptive_metadata_deps(),
-        Some("requires 'inCommitTimestamp' to be enabled")
+        FeatureRequirementExpectation::Kernel("requires 'inCommitTimestamp' to be enabled")
     )]
     fn test_adaptive_metadata_feature_requirements(
         #[case] props: Vec<(&str, &str)>,
         #[case] cm_mode: Option<ColumnMappingMode>,
         #[case] deps: Vec<TableFeature>,
-        #[case] expected_error_substring: Option<&str>,
+        #[case] expected: FeatureRequirementExpectation,
     ) {
         // Reader+writer features (adaptiveMetadata-preview itself, columnMapping, deletionVectors)
         // must appear in both protocol lists to count as supported.
@@ -2764,9 +2836,22 @@ mod test {
             )
             .build();
         let result = config.validate_feature_requirements(&TableFeature::AdaptiveMetadataPreview);
-        match expected_error_substring {
-            Some(msg) => assert_result_error_with_message(result, msg),
-            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        match expected {
+            FeatureRequirementExpectation::Ok => {
+                assert!(result.is_ok(), "expected Ok, got {result:?}")
+            }
+            FeatureRequirementExpectation::Kernel(message) => {
+                assert_result_error_with_message(result, message)
+            }
+            FeatureRequirementExpectation::AdaptiveMetadataColumnMappingMode => assert_delta_error(
+                result,
+                DeltaErrorCondition::DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+                &[
+                    ("feature", "adaptiveMetadata-preview"),
+                    ("prop", "delta.columnMapping.mode"),
+                    ("mode", "name"),
+                ],
+            ),
         }
     }
 

@@ -31,7 +31,7 @@ use crate::unit_test_utils::{
     assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
     MockTableConfigurationBuilder,
 };
-use crate::{DeltaResult, Engine, KernelError, Predicate, Version};
+use crate::{DeltaErrorCondition, DeltaResult, Engine, KernelError, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
@@ -582,7 +582,9 @@ async fn row_tracking_protocol_failure_preserves_the_underlying_error() {
     assert!(
         matches!(
             &result,
-            Err(crate::Error::Kernel(KernelError::Unsupported(_)))
+            Err(crate::Error::Delta(error))
+                if error.condition()
+                    == DeltaErrorCondition::DeltaUnsupportedFeaturesForRead
         ),
         "expected the protocol support error, got {result:?}"
     );

@@ -21,7 +21,13 @@ Every handle has a corresponding `free_*` function (e.g. `free_engine`, `free_sn
 
 Fallible functions return `ExternResult` (tagged union of Ok/Err). The caller provides an
 `allocate_error` callback when creating the engine; kernel calls this to allocate errors in
-the caller's memory space.
+the caller's memory space. Existing `FFIKernelError` discriminants `0..=46` retain their ABI
+values, and user-facing Delta errors use the appended `DeltaError = 47` code. The existing
+allocator callback signature is unchanged and receives the rendered message as a borrowed
+`KernelStringSlice`; an allocator that retains it must copy it before returning. `DeltaError` is
+an outbound classification. If an engine returns code 47 through an upcall, kernel preserves its
+message in a generic kernel error because the engine cannot author a structured Delta condition
+through `EngineExecError`.
 
 ## Key Files
 

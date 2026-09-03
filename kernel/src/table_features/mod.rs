@@ -25,8 +25,10 @@ use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
 pub(crate) use timestamp_ntz::{
     schema_contains_timestamp_ntz, validate_timestamp_ntz_feature_support,
 };
+use url::Url;
 
 use crate::actions::Protocol;
+use crate::error::delta_errors;
 use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
@@ -648,8 +650,12 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::Custom(|_protocol, properties| {
             require!(
                 properties.column_mapping_mode == Some(ColumnMappingMode::Id),
-                KernelError::invalid_protocol(
-                    "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
+                delta_errors::adaptive_metadata_requires_column_mapping_id_mode(
+                    match properties.column_mapping_mode {
+                        Some(ColumnMappingMode::Id) => "id",
+                        Some(ColumnMappingMode::Name) => "name",
+                        Some(ColumnMappingMode::None) | None => "none",
+                    }
                 )
             );
             Ok(())
@@ -898,8 +904,8 @@ pub(crate) fn auto_enable_property_driven_features(
 
 /// Enforce that `protocol.min_reader_version()` lies within
 /// [`MIN_VALID_RW_VERSION`]..=[`MAX_VALID_READER_VERSION`]. Below the minimum yields
-/// [`KernelError::InvalidProtocol`]; above the maximum yields [`KernelError::Unsupported`].
-pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()> {
+/// [`KernelError::InvalidProtocol`]; above the maximum yields `DELTA_INVALID_PROTOCOL_VERSION`.
+pub(crate) fn check_reader_version_range(protocol: &Protocol, table_root: &Url) -> DeltaResult<()> {
     require!(
         protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
         KernelError::InvalidProtocol(format!(
@@ -908,11 +914,11 @@ pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()>
         ))
     );
     if protocol.min_reader_version() > MAX_VALID_READER_VERSION {
-        return Err(KernelError::unsupported(format!(
-            "Unsupported minimum reader version {}",
-            protocol.min_reader_version()
-        ))
-        .into());
+        return Err(delta_errors::invalid_protocol_version(
+            table_root,
+            protocol.min_reader_version(),
+            protocol.min_writer_version(),
+        ));
     }
     Ok(())
 }
@@ -921,20 +927,19 @@ pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()>
 ///
 /// Unlike `TableConfiguration::ensure_operation_supported`, this does not require a
 /// `Metadata` action or any table properties.
-pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> DeltaResult<()> {
-    check_reader_version_range(protocol)?;
+pub(crate) fn ensure_table_can_be_read(protocol: &Protocol, table_root: &Url) -> DeltaResult<()> {
+    check_reader_version_range(protocol, table_root)?;
 
-    for feature in extract_enabled_reader_features(protocol) {
-        match feature.info().kernel_support {
-            KernelSupport::Supported => {}
-            KernelSupport::NotSupported => {
-                return Err(KernelError::unsupported(format!(
-                    "Feature '{feature}' is not supported by kernel",
-                ))
-                .into());
-            }
-            KernelSupport::Custom(_) => {}
-        }
+    let features = extract_enabled_reader_features(protocol);
+    let unsupported = features
+        .iter()
+        .filter(|feature| matches!(feature.info().kernel_support, KernelSupport::NotSupported))
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        return Err(delta_errors::unsupported_features_for_read(
+            table_root,
+            unsupported,
+        ));
     }
 
     Ok(())
@@ -945,6 +950,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::DeltaErrorCondition;
 
     #[test]
     fn test_unknown_features() {
@@ -985,7 +991,8 @@ mod tests {
     enum ExpectRead {
         Ok,
         InvalidProtocol,
-        Unsupported,
+        InvalidProtocolVersion,
+        UnsupportedFeatures,
     }
 
     #[rstest]
@@ -995,7 +1002,7 @@ mod tests {
     )]
     #[case::reader_version_above_maximum(
         Protocol::new_unchecked(99, 1, None, None),
-        ExpectRead::Unsupported
+        ExpectRead::InvalidProtocolVersion
     )]
     #[case::legacy_reader_v1(Protocol::try_new_legacy(1, 1).unwrap(), ExpectRead::Ok)]
     #[case::legacy_reader_v2(Protocol::try_new_legacy(2, 5).unwrap(), ExpectRead::Ok)]
@@ -1017,7 +1024,7 @@ mod tests {
             [TableFeature::unknown("notARealFeature")],
         )
         .unwrap(),
-        ExpectRead::Unsupported
+        ExpectRead::UnsupportedFeatures
     )]
     #[case::custom_support_feature(
         Protocol::try_new_modern(
@@ -1048,11 +1055,12 @@ mod tests {
                 [TableFeature::AdaptiveMetadataPreview],
             )
             .unwrap(),
-            ExpectRead::Unsupported
+            ExpectRead::UnsupportedFeatures
         )
     )]
     fn validate_protocol_for_read(#[case] protocol: Protocol, #[case] expected: ExpectRead) {
-        let result = ensure_table_can_be_read(&protocol);
+        let table_root = Url::parse("memory:///table").unwrap();
+        let result = ensure_table_can_be_read(&protocol, &table_root);
         match expected {
             ExpectRead::Ok => result.expect("protocol must be readable"),
             ExpectRead::InvalidProtocol => assert!(
@@ -1062,12 +1070,23 @@ mod tests {
                 ),
                 "expected InvalidProtocol, got: {result:?}"
             ),
-            ExpectRead::Unsupported => assert!(
+            ExpectRead::InvalidProtocolVersion => assert!(
                 matches!(
                     result,
-                    Err(crate::Error::Kernel(KernelError::Unsupported(_)))
+                    Err(crate::Error::Delta(ref error))
+                        if error.condition()
+                            == DeltaErrorCondition::DeltaInvalidProtocolVersion
                 ),
-                "expected Unsupported, got: {result:?}"
+                "expected DELTA_INVALID_PROTOCOL_VERSION, got: {result:?}"
+            ),
+            ExpectRead::UnsupportedFeatures => assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::Delta(ref error))
+                        if error.condition()
+                            == DeltaErrorCondition::DeltaUnsupportedFeaturesForRead
+                ),
+                "expected DELTA_UNSUPPORTED_FEATURES_FOR_READ, got: {result:?}"
             ),
         }
     }

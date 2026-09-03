@@ -5,13 +5,14 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use crate::cancellation::CancellationTokenRef;
+use crate::error::delta_errors;
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{LogSegmentLoadType, MetricId, SnapshotLoadMetricContext};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
-use crate::utils::{require, try_parse_uri};
+use crate::utils::{is_missing_local_path, require, try_parse_uri};
 use crate::{DeltaResult, Engine, KernelError, Snapshot, Version};
 
 /// Builder for creating [`Snapshot`] instances.
@@ -292,43 +293,56 @@ impl SnapshotBuilder {
             correlation_id,
             load_type,
         };
+        let is_path_based = table_root.is_some();
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
 
         // Pre-build validations for catalog-managed tables
         Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
 
-        // Use time-travel version if set, otherwise fall back to max_catalog_version. Passing this
-        // as the version to LogSegment::for_snapshot does NOT skip the _last_checkpoint hint --
-        // the hint is still used when its version <= effective_version.
-        let effective_version = version.or(max_catalog_version);
-
         // A snapshot is latest when no explicit time-travel version is requested, or when the
         // requested version is exactly the max_catalog_version.
         let built_as_latest = version.is_none() || version == max_catalog_version;
 
         let result = if let Some(table_root) = table_root {
-            try_parse_uri(table_root).and_then(|table_url| {
-                let log_segment = LogSegment::for_snapshot(
-                    engine.storage_handler().as_ref(),
-                    table_url
+            if is_missing_local_path(&table_root)? {
+                Err(delta_errors::table_not_found(table_root))
+            } else {
+                try_parse_uri(table_root).and_then(|table_url| {
+                    let log_root = table_url
                         .join("_delta_log/")
-                        .map_err(crate::KernelError::from)?,
-                    log_tail,
-                    effective_version,
-                    metric_context.clone(),
-                    cancellation_token.as_ref(),
-                )?;
-                Snapshot::try_new_from_log_segment(
-                    table_url,
-                    log_segment,
-                    engine,
-                    metric_context,
-                    incremental_replay,
-                    built_as_latest,
-                )
-                .map(Into::into)
-            })
+                        .map_err(crate::KernelError::from)?;
+                    let log_segment = if let Some(max_catalog_version) = max_catalog_version {
+                        LogSegment::for_snapshot_with_max_catalog_version(
+                            engine.storage_handler().as_ref(),
+                            log_root,
+                            log_tail,
+                            version,
+                            Some(max_catalog_version),
+                            metric_context.clone(),
+                            cancellation_token.as_ref(),
+                        )?
+                    } else {
+                        LogSegment::for_snapshot(
+                            engine.storage_handler().as_ref(),
+                            log_root,
+                            log_tail,
+                            version,
+                            metric_context.clone(),
+                            cancellation_token.as_ref(),
+                        )?
+                    };
+                    Snapshot::try_new_from_log_segment(
+                        table_url,
+                        log_segment,
+                        engine,
+                        metric_context,
+                        incremental_replay,
+                        built_as_latest,
+                    )
+                    .map(Into::into)
+                })
+            }
         } else {
             existing_snapshot
                 .ok_or_else(|| {
@@ -338,11 +352,12 @@ impl SnapshotBuilder {
                 })
                 .map_err(crate::Error::from)
                 .and_then(|existing_snapshot| {
-                    Snapshot::try_new_from(
+                    Snapshot::try_new_from_with_max_catalog_version(
                         existing_snapshot,
                         log_tail,
                         engine,
-                        effective_version,
+                        version,
+                        max_catalog_version,
                         metric_context,
                         incremental_replay,
                         built_as_latest,
@@ -353,7 +368,11 @@ impl SnapshotBuilder {
 
         // Post-build validations for catalog-managed tables
         let result = result.and_then(|snapshot| {
-            Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
+            Self::validate_catalog_managed_build_result(
+                &snapshot,
+                max_catalog_version,
+                is_path_based,
+            )?;
             Ok(snapshot)
         });
         if let Ok(ref snapshot) = result {
@@ -377,11 +396,8 @@ impl SnapshotBuilder {
         // Log tail must be sorted ascending and contiguous (no gaps or duplicates)
         for pair in log_tail.windows(2) {
             require!(
-                pair[0].version + 1 == pair[1].version,
-                KernelError::LogTailVersionsNotContiguous {
-                    first_version: pair[0].version,
-                    second_version: pair[1].version,
-                }
+                pair[0].version.checked_add(1) == Some(pair[1].version),
+                delta_errors::versions_not_contiguous(pair[0].version, pair[1].version, version,)
             );
         }
 
@@ -443,17 +459,25 @@ impl SnapshotBuilder {
     fn validate_catalog_managed_build_result(
         snapshot: &SnapshotRef,
         max_catalog_version: Option<Version>,
+        is_path_based: bool,
     ) -> DeltaResult<()> {
         let is_catalog_managed = snapshot.table_configuration().is_catalog_managed();
 
-        require!(
-            !is_catalog_managed || max_catalog_version.is_some(),
-            KernelError::MaxCatalogVersion(
+        if is_catalog_managed && max_catalog_version.is_none() {
+            if is_path_based {
+                return Err(
+                    delta_errors::path_based_access_to_catalog_managed_table_blocked(
+                        snapshot.table_root(),
+                    ),
+                );
+            }
+            return Err(KernelError::MaxCatalogVersion(
                 "Max catalog version is required when loading a catalog-managed table. \
                  Use with_max_catalog_version()."
-                    .to_string()
+                    .to_string(),
             )
-        );
+            .into());
+        }
         if let Some(max_catalog_version) = max_catalog_version {
             require!(
                 is_catalog_managed,
@@ -511,6 +535,7 @@ mod tests {
 
     use itertools::Itertools;
     use serde_json::json;
+    use tempfile::tempdir;
     use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
@@ -521,6 +546,7 @@ mod tests {
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
+    use crate::DeltaErrorCondition;
 
     fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
@@ -565,6 +591,29 @@ mod tests {
         assert_eq!(snapshot.version(), 0);
 
         Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::plain_path(false)]
+    #[case::file_uri(true)]
+    fn missing_local_table_root_reports_table_not_found(#[case] use_file_uri: bool) {
+        let temp_dir = tempdir().unwrap();
+        let missing_root = temp_dir.path().join("missing-table");
+        let table_name = if use_file_uri {
+            url::Url::from_directory_path(&missing_root)
+                .unwrap()
+                .to_string()
+        } else {
+            missing_root.display().to_string()
+        };
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+
+        let result = SnapshotBuilder::new_for(&table_name).build(&engine);
+        let crate::Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error");
+        };
+        assert_eq!(error.condition(), DeltaErrorCondition::DeltaTableNotFound);
+        assert_eq!(error.parameter("tableName"), Some(table_name.as_str()));
     }
 
     #[test_log::test(tokio::test)]
@@ -994,7 +1043,9 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+                Err(crate::Error::Delta(error))
+                    if error.condition()
+                        == DeltaErrorCondition::DeltaPathBasedAccessToCatalogManagedTableBlocked
             ));
 
             Ok(())
@@ -1105,14 +1156,16 @@ mod tests {
         }
 
         #[rstest::rstest]
-        #[case::gap(vec![1, 3], vec![1, 3], 3)]
-        #[case::duplicates(vec![1], vec![1, 1], 1)]
-        #[case::unsorted(vec![1, 2], vec![2, 1], 2)]
+        #[case::gap(vec![1, 3], vec![1, 3], 3, "1", "3")]
+        #[case::duplicates(vec![1], vec![1, 1], 1, "1", "1")]
+        #[case::unsorted(vec![1, 2], vec![2, 1], 2, "2", "1")]
         #[test_log::test(tokio::test)]
         async fn test_non_contiguous_log_tail_errors(
             #[case] commit_versions: Vec<u64>,
             #[case] log_tail_versions: Vec<u64>,
             #[case] mcv: u64,
+            #[case] expected_start: &str,
+            #[case] expected_end: &str,
         ) -> Result<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             for v in &commit_versions {
@@ -1132,12 +1185,18 @@ mod tests {
                 .with_max_catalog_version(mcv)
                 .build(engine.as_ref());
 
-            assert!(matches!(
-                result,
-                Err(crate::Error::Kernel(
-                    KernelError::LogTailVersionsNotContiguous { .. }
-                ))
-            ));
+            let error = match result {
+                Err(crate::Error::Delta(error)) => error,
+                Err(error) => panic!("expected Delta error, got {error}"),
+                Ok(_) => panic!("expected non-contiguous log tail error"),
+            };
+            assert_eq!(
+                error.condition(),
+                DeltaErrorCondition::DeltaVersionsNotContiguous
+            );
+            assert_eq!(error.parameter("startVersion"), Some(expected_start));
+            assert_eq!(error.parameter("endVersion"), Some(expected_end));
+            assert_eq!(error.parameter("versionToLoad"), Some("-1"));
 
             Ok(())
         }

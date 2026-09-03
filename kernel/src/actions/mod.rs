@@ -13,6 +13,7 @@ use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
+use crate::error::delta_errors;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -796,9 +797,7 @@ impl Protocol {
                 }
                 Ok(())
             }
-            (Some(_), None) => Err(KernelError::invalid_protocol(
-                "Reader features should be present in writer features",
-            )),
+            (Some(_), None) => Err(delta_errors::read_feature_protocol_requires_write()),
         }?;
 
         Ok(Protocol {
@@ -1610,7 +1609,8 @@ mod tests {
     use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
-        Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
+        DeltaErrorCondition, Engine, Error, EvaluationHandler, IntoEngineData, JsonHandler,
+        ParquetHandler, StorageHandler,
     };
 
     #[rstest]
@@ -2184,6 +2184,26 @@ mod tests {
             Some(vec![TableFeature::AppendOnly]),
         );
         assert!(protocol.is_ok());
+    }
+
+    #[test]
+    fn reader_feature_protocol_without_writer_features_is_structured() {
+        let result = Protocol::try_new(
+            3,
+            6,
+            Some(vec![TableFeature::DeletionVectors]),
+            TableFeature::NO_LIST,
+        );
+        let error = match result {
+            Err(Error::Delta(error)) => error,
+            Err(error) => panic!("expected Delta error, got {error}"),
+            Ok(_) => panic!("reader features without writer features must be rejected"),
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaReadFeatureProtocolRequiresWrite
+        );
+        assert_eq!(error.parameter("writerVersion"), Some("7"));
     }
 
     #[test]

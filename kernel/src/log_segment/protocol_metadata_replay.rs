@@ -18,6 +18,7 @@ use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::error::delta_errors;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
@@ -47,9 +48,18 @@ impl LogSegment {
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
-            (None, Some(_), _) => Err(KernelError::MissingMetadata.into()),
-            (Some(_), None, _) => Err(KernelError::MissingProtocol.into()),
-            (None, None, _) => Err(KernelError::MissingMetadataAndProtocol.into()),
+            (None, Some(_), _) => Err(delta_errors::state_recover_error(
+                "metadata",
+                self.end_version,
+            )),
+            (Some(_), None, _) => Err(delta_errors::state_recover_error(
+                "protocol",
+                self.end_version,
+            )),
+            (None, None, _) => Err(delta_errors::state_recover_error(
+                "protocol",
+                self.end_version,
+            )),
         }
     }
 
@@ -476,18 +486,20 @@ fn pm_versions_from_plan_output(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    #[cfg(feature = "declarative-plans")]
     use std::sync::Arc;
 
     use itertools::Itertools;
+    use rstest::rstest;
     use test_log::test;
+    use test_utils::{add_commit, METADATA};
 
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
+    use crate::object_store::memory::InMemory;
     #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
-    use crate::Snapshot;
+    use crate::{DeltaErrorCondition, Error, Snapshot};
     #[cfg(feature = "declarative-plans")]
     use crate::{DeltaResult, KernelError};
 
@@ -580,6 +592,51 @@ mod tests {
 
         assert_eq!(snapshot.version(), 5);
         assert_eq!(snapshot.schema().fields().count(), 5);
+    }
+
+    #[derive(Clone, Copy)]
+    enum MissingState {
+        Metadata,
+        Protocol,
+        Both,
+    }
+
+    #[rstest]
+    #[case::metadata(MissingState::Metadata, "metadata")]
+    #[case::protocol(MissingState::Protocol, "protocol")]
+    #[case::metadata_and_protocol(MissingState::Both, "protocol")]
+    #[tokio::test]
+    async fn missing_snapshot_state_uses_state_recover_error(
+        #[case] missing: MissingState,
+        #[case] expected_operation: &str,
+    ) {
+        let mut actions = METADATA.lines();
+        let commit_info = actions.next().unwrap();
+        let protocol = actions.next().unwrap();
+        let metadata = actions.next().unwrap();
+        let body = match missing {
+            MissingState::Metadata => protocol,
+            MissingState::Protocol => metadata,
+            MissingState::Both => commit_info,
+        };
+
+        let store = Arc::new(InMemory::new());
+        add_commit("memory:///", store.as_ref(), 0, body.to_string())
+            .await
+            .unwrap();
+        let engine = SyncEngine::new_with_store(store);
+        let result = Snapshot::builder_for("memory:///").build(&engine);
+        let error = match result {
+            Err(Error::Delta(error)) => error,
+            Err(error) => panic!("expected Delta error, got {error}"),
+            Ok(_) => panic!("snapshot with missing state must fail"),
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaStateRecoverError
+        );
+        assert_eq!(error.parameter("operation"), Some(expected_operation));
+        assert_eq!(error.parameter("version"), Some("0"));
     }
 
     #[cfg(feature = "declarative-plans")]

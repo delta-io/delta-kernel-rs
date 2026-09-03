@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::history_manager::{first_version_after, latest_version_as_of, HistoryCommitType};
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::Snapshot;
+use delta_kernel::{DeltaErrorCondition, Error, Snapshot};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
@@ -461,10 +461,15 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
         .with_log_tail(log_tail)
         .build(engine.as_ref());
 
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("LogSegment end version 3 not the same as the specified end version 4"));
+    let error = match result {
+        Err(Error::Delta(error)) => error,
+        Err(error) => panic!("expected Delta error, got {error}"),
+        Ok(_) => panic!("log tail behind the requested version must fail"),
+    };
+    assert_eq!(error.condition(), DeltaErrorCondition::DeltaVersionNotFound);
+    assert_eq!(error.parameter("userVersion"), Some("4"));
+    assert_eq!(error.parameter("earliest"), Some("0"));
+    assert_eq!(error.parameter("latest"), Some("3"));
 
     Ok(())
 }

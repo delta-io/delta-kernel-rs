@@ -1,11 +1,12 @@
 //! Utility functions for the variant type and variant-related table features.
 
+use crate::error::delta_errors;
 use crate::schema::{Schema, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{DeltaResult, KernelError};
+use crate::DeltaResult;
 
 /// Schema visitor that checks if any column in the schema uses VARIANT type
 pub(crate) struct UsesVariant;
@@ -32,9 +33,7 @@ pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> 
     {
         require!(
             !schema_contains_variant_type(&tc.logical_schema()),
-            KernelError::unsupported(
-                "Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features"
-            )
+            delta_errors::features_protocol_metadata_mismatch(["variantType"])
         );
     }
     Ok(())
@@ -87,8 +86,6 @@ mod tests {
         };
         let protocol_without =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
-        let err_msg = "Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features";
-
         for (reader, writer) in [
             (TableFeature::VariantType, TableFeature::VariantType),
             (
@@ -114,7 +111,7 @@ mod tests {
                 &protocol_with,
                 &protocol_without,
                 &[&nested_schema_with],
-                err_msg,
+                "variantType",
             );
         }
     }

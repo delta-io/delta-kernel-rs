@@ -1632,6 +1632,7 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
         vec![],
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -1954,10 +1955,9 @@ impl StorageHandler for CancelAfterListingHandler {
     }
 }
 
-// The backward scan collects each window eagerly and re-checks the token at the top of every
-// window. Window 1 lists an empty window and succeeds; the token flips as that listing is
-// exhausted, so it is window 2's up-front check -- not window 1's -- that surfaces the cancellation
-// (exactly one listing ran).
+// The backward scan collects each window eagerly and re-checks the token after collection. The
+// token flips as the empty first listing is exhausted, so the post-collection check surfaces the
+// cancellation before the empty-window fast path can return success (exactly one listing ran).
 #[test]
 fn backward_scan_checks_cancellation_between_windows() {
     let log_root = Url::parse("memory:///_delta_log/").unwrap();

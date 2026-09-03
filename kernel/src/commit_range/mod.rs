@@ -241,6 +241,7 @@ fn with_version_context(version: Version, err: crate::Error) -> crate::Error {
         crate::Error::Kernel(KernelError::InvalidProtocol(msg)) => {
             KernelError::InvalidProtocol(format!("commit v={version}: {msg}")).into()
         }
+        error @ crate::Error::Delta(_) => error,
         other => KernelError::generic(format!("commit v={version}: {other}")).into(),
     }
 }
@@ -328,7 +329,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::RowVisitor;
     use crate::object_store::memory::InMemory;
-    use crate::Snapshot;
+    use crate::{DeltaErrorCondition, Snapshot};
 
     /// Open a `CommitRange` over `table-with-dv-small` with a matching anchor snapshot.
     /// `start_version` drives both the range's start version and the snapshot's version.
@@ -695,7 +696,11 @@ mod tests {
     #[rstest::rstest]
     #[case::too_high_reader_version(
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#,
-        |err: &crate::Error| matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
+        |err: &crate::Error| matches!(
+            err,
+            crate::Error::Delta(error)
+                if error.condition() == DeltaErrorCondition::DeltaInvalidProtocolVersion
+        ),
     )]
     #[case::too_low_reader_version(
         r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
@@ -926,12 +931,17 @@ mod tests {
             .expect(
                 "commits must reject snapshot with unsupported feature before iteration begins",
             );
-        match err {
-            crate::Error::Kernel(KernelError::Unsupported(msg)) => {
-                assert!(msg.contains("futureFeature"), "got: {msg}")
-            }
-            other => panic!("expected KernelError::Unsupported, got: {other:?}"),
-        }
+        assert!(
+            matches!(
+                &err,
+                crate::Error::Delta(error)
+                    if error.condition()
+                        == DeltaErrorCondition::DeltaUnsupportedFeaturesForRead
+            ),
+            "expected DELTA_UNSUPPORTED_FEATURES_FOR_READ, got: {err:?}"
+        );
+        assert!(err.to_string().contains("futureFeature"), "got: {err}");
+        assert!(!err.to_string().contains("commit v="), "got: {err}");
     }
 
     #[rstest::rstest]
@@ -975,9 +985,15 @@ mod tests {
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
             assert!(
-                matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
-                "expected KernelError::Unsupported, got: {err:?}",
+                matches!(
+                    err,
+                    crate::Error::Delta(ref error)
+                        if error.condition()
+                            == DeltaErrorCondition::DeltaInvalidProtocolVersion
+                ),
+                "expected DELTA_INVALID_PROTOCOL_VERSION, got: {err:?}",
             );
+            assert!(!err.to_string().contains("commit v="), "got: {err}");
         } else {
             result.expect("snapshot-less range must drain cleanly");
         }
@@ -1002,13 +1018,21 @@ mod tests {
         assert_eq!(v1_commit.version(), 1);
 
         let v0_result = iter.next().expect("v=0 commit yield slot");
-        match v0_result {
+        let err = match v0_result {
+            Err(error) => error,
             Ok(_) => panic!("v=0 must reject during iter.next()"),
-            Err(crate::Error::Kernel(KernelError::Unsupported(msg))) => {
-                assert!(msg.contains("futureFeature"), "got: {msg}")
-            }
-            Err(other) => panic!("expected KernelError::Unsupported, got: {other:?}"),
-        }
+        };
+        assert!(
+            matches!(
+                &err,
+                crate::Error::Delta(error)
+                    if error.condition()
+                        == DeltaErrorCondition::DeltaUnsupportedFeaturesForRead
+            ),
+            "expected DELTA_UNSUPPORTED_FEATURES_FOR_READ, got: {err:?}"
+        );
+        assert!(err.to_string().contains("futureFeature"), "got: {err}");
+        assert!(!err.to_string().contains("commit v="), "got: {err}");
     }
 
     const ICT_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["inCommitTimestamp"]}}"#;

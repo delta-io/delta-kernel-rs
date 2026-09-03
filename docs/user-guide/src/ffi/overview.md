@@ -406,8 +406,12 @@ Because the engine allocates these errors, the engine is also responsible for fr
 them. Kernel returns the error pointer immediately and does not retain it.
 
 The `EngineError` struct contains an `FFIKernelError` enum that classifies the error type
-(e.g., `GenericError`, `FileNotFoundError`, `InvalidUrlError`). The error message
-string passed to `allocate_error` is only valid for the duration of the callback, so
+(for example, `GenericError`, `FileNotFoundError`, or `InvalidUrlError`). Existing error codes
+retain their values from 0 through 46. Code 47, `DeltaError`, identifies a user-facing Delta
+failure. The callback receives its rendered message through the existing `KernelStringSlice`
+argument.
+
+The message string passed to `allocate_error` is valid only for the duration of the callback, so
 you must copy it if you need to keep it.
 
 ## C examples

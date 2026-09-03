@@ -64,7 +64,7 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
     let uri_type = resolve_uri_type(uri)?;
     let url = match uri_type {
         UriType::LocalPath(path) => {
-            if !path.exists() {
+            if !path.try_exists().map_err(KernelError::from)? {
                 // When we support writes, create a directory if we can
                 return Err(KernelError::InvalidTableLocation(format!(
                     "Path does not exist: {path:?}"
@@ -92,6 +92,17 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
         UriType::Url(url) => url,
     };
     Ok(url)
+}
+
+/// Returns whether a table URI resolves to a local path that does not exist.
+///
+/// Returns an error when a file URI cannot be converted to a local path or local path metadata
+/// cannot be read.
+pub(crate) fn is_missing_local_path(uri: impl AsRef<str>) -> DeltaResult<bool> {
+    Ok(match resolve_uri_type(uri)? {
+        UriType::LocalPath(path) => !path.try_exists().map_err(KernelError::from)?,
+        UriType::Url(_) => false,
+    })
 }
 
 #[allow(unused)]

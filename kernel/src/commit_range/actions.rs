@@ -211,7 +211,7 @@ impl CommitAction {
     fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> DeltaResult<()> {
         match (table_config, &self.protocol) {
             (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
-            (None, Some(protocol)) => ensure_table_can_be_read(protocol),
+            (None, Some(protocol)) => ensure_table_can_be_read(protocol, &self.table_root),
             (None, None) => Ok(()),
         }
     }

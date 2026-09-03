@@ -684,6 +684,7 @@ mod tests {
     use super::*;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
+    use crate::log_segment_files::LogSegmentFiles;
     use crate::object_store::memory::InMemory;
     use crate::table_features::TableFeature;
 
@@ -1057,15 +1058,18 @@ mod tests {
         .await
         .unwrap();
         let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
-        let segment = LogSegment::for_snapshot_impl(
+        let listed = LogSegmentFiles::list(
             engine.storage_handler().as_ref(),
-            log_root,
+            &log_root,
             vec![],
             None,
             Some(1),
             None,
         )
         .unwrap();
+        // Construct the segment directly so this CRC invariant remains isolated from snapshot
+        // discovery, which correctly rejects a fresh history that begins after version zero.
+        let segment = LogSegment::try_new(listed, log_root, Some(1), None).unwrap();
         assert_result_error_with_message(
             segment.build_crc_from_version_zero(&engine),
             "log appears truncated without a checkpoint",

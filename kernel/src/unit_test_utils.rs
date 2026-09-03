@@ -42,7 +42,8 @@ use crate::table_properties::COLUMN_MAPPING_MODE;
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
 use crate::{
-    DeltaResult, Engine, EngineData, FileMeta, KernelError, Snapshot, SnapshotRef, Version,
+    DeltaErrorCondition, DeltaResult, Engine, EngineData, Error, FileMeta, KernelError, Snapshot,
+    SnapshotRef, Version,
 };
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
@@ -345,7 +346,7 @@ pub(crate) fn assert_schema_feature_validation(
     protocol_with: &Protocol,
     protocol_without: &Protocol,
     extra_err_schemas: &[&StructType],
-    err_msg: &str,
+    feature: &str,
 ) {
     let try_build = |schema: &StructType, protocol: &Protocol| {
         MockTableConfigurationBuilder::new()
@@ -356,9 +357,20 @@ pub(crate) fn assert_schema_feature_validation(
     try_build(schema_with, protocol_with).expect("feature present + supported");
     try_build(schema_without, protocol_without).expect("feature absent + unsupported");
     try_build(schema_without, protocol_with).expect("feature absent + supported");
-    assert_result_error_with_message(try_build(schema_with, protocol_without), err_msg);
+    let assert_mismatch = |result| match result {
+        Err(Error::Delta(error)) => {
+            assert_eq!(
+                error.condition(),
+                DeltaErrorCondition::DeltaFeaturesProtocolMetadataMismatch
+            );
+            assert_eq!(error.parameter("features"), Some(feature));
+        }
+        Err(error) => panic!("expected Delta feature mismatch, got {error}"),
+        Ok(_) => panic!("expected Delta feature mismatch, got success"),
+    };
+    assert_mismatch(try_build(schema_with, protocol_without));
     for schema in extra_err_schemas {
-        assert_result_error_with_message(try_build(schema, protocol_without), err_msg);
+        assert_mismatch(try_build(schema, protocol_without));
     }
 }
 
