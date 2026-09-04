@@ -40,7 +40,10 @@ use crate::plans::ir::nodes::{
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
-use crate::{DeltaResult, EvaluationHandler as _, FileMeta, KernelError, StorageHandler as _};
+use crate::{
+    DeltaResult, EngineResult, Error, EvaluationHandler as _, FileMeta, KernelError,
+    StorageHandler as _,
+};
 
 /// A synchronous, test-only [`PlanExecutor`].
 ///
@@ -91,14 +94,22 @@ impl SyncPlanExecutor {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<DeltaResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<DeltaResult<FileMeta>> = self
+                    .storage
+                    .list_from(&url)?
+                    .map(|result| result.map_err(Error::from))
+                    .collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
                 // `StorageHandler::read_files` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let bytes: Vec<DeltaResult<Bytes>> = self.storage.read_files(files)?.collect();
+                let bytes: Vec<DeltaResult<Bytes>> = self
+                    .storage
+                    .read_files(files)?
+                    .map(|result| result.map_err(Error::from))
+                    .collect();
                 Ok(PlanResult::Bytes(Box::new(bytes.into_iter())))
             }
             IoOperation::WriteBytes {
@@ -213,7 +224,7 @@ impl SyncPlanExecutor {
             let metas = [file.meta.clone()];
             let read_schema = read_schema.clone();
             // The two constructors have distinct `impl Iterator` types, so box to unify the arms.
-            let data: Box<dyn Iterator<Item = DeltaResult<ArrowEngineData>>> = match file_type {
+            let data: Box<dyn Iterator<Item = EngineResult<ArrowEngineData>>> = match file_type {
                 FileType::Json => Box::new(read_files_arrow(
                     store,
                     &metas,

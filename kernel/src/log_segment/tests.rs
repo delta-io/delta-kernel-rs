@@ -78,11 +78,11 @@ fn process_sidecars(
         .try_collect()?;
 
     // Read the sidecar files and return an iterator of sidecar file batches
-    Ok(Some(parquet_handler.read_parquet_files(
-        &sidecar_files,
-        checkpoint_read_schema,
-        meta_predicate,
-    )?))
+    Ok(Some(
+        parquet_handler
+            .read_parquet_files(&sidecar_files, checkpoint_read_schema, meta_predicate)?
+            .map(|result| result.map_err(Into::into)),
+    ))
 }
 
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of
@@ -237,7 +237,7 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> crate::EngineResult<FileDataReadResultIterator> {
         self.0.read_parquet_files(files, physical_schema, None)
     }
 
@@ -249,7 +249,7 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
         self.0.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> crate::EngineResult<ParquetFooter> {
         self.0.read_parquet_footer(file)
     }
 }
@@ -342,7 +342,7 @@ impl StorageHandler for CancelOnSecondList {
     fn list_from(
         &self,
         path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> crate::EngineResult<Box<dyn Iterator<Item = crate::EngineResult<FileMeta>>>> {
         if self.list_calls.fetch_add(1, Ordering::Relaxed) == 1 {
             self.token.cancel();
         }
@@ -352,23 +352,23 @@ impl StorageHandler for CancelOnSecondList {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> crate::EngineResult<Box<dyn Iterator<Item = crate::EngineResult<bytes::Bytes>>>> {
         panic!("read_files should not be called during history probing")
     }
 
-    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> crate::EngineResult<()> {
         panic!("put should not be called during history probing")
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> crate::EngineResult<()> {
         panic!("copy_atomic should not be called during history probing")
     }
 
-    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, _path: &Url) -> crate::EngineResult<FileMeta> {
         panic!("head should not be called during history probing")
     }
 
-    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+    fn delete(&self, _path: &Url) -> crate::EngineResult<()> {
         panic!("delete should not be called during history probing")
     }
 }
@@ -1958,11 +1958,13 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
     .flatten();
 
     // Assert that an error is returned when trying to read sidecar files that do not exist
-    let err = iter.next().unwrap();
-    assert_result_error_with_message(
-        err,
-        "File not found: _delta_log/_sidecars/sidecarfile1.parquet",
-    );
+    let Err(Error::Engine(crate::EngineError::FileNotFound { path, source })) =
+        iter.next().unwrap()
+    else {
+        panic!("expected a missing sidecar engine error");
+    };
+    assert_eq!(path, "_delta_log/_sidecars/sidecarfile1.parquet");
+    assert!(source.is_some());
 
     Ok(())
 }

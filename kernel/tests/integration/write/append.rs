@@ -2,6 +2,7 @@
 //! partitioned appends, and schema-mismatch rejection).
 
 use std::collections::HashMap;
+use std::error::Error as _;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{new_null_array, Int32Array, StringArray};
@@ -392,17 +393,16 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         });
 
         let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        assert!(add_files_metadata.all(|res| match res {
-            Err(delta_kernel::Error::Kernel(KernelError::Arrow(
-                ArrowError::InvalidArgumentError(_),
-            ))) => true,
-            Err(delta_kernel::Error::Kernel(KernelError::Backtraced { source, .. }))
-                if matches!(
-                    &*source,
-                    KernelError::Arrow(ArrowError::InvalidArgumentError(_))
-                ) =>
-                true,
-            _ => false,
+        assert!(add_files_metadata.all(|result| {
+            let Err(error @ delta_kernel::Error::Engine(_)) = result else {
+                return false;
+            };
+            std::iter::successors(error.source(), |&source| source.source()).any(|source| {
+                matches!(
+                    source.downcast_ref::<ArrowError>(),
+                    Some(ArrowError::InvalidArgumentError(_))
+                )
+            })
         }));
     }
     Ok(())

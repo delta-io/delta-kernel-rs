@@ -35,7 +35,7 @@ use crate::engine::arrow_expression::opaque::{
 };
 use crate::engine::arrow_utils::{parse_json_impl, prim_array_cmp};
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
-use crate::error::{DeltaResult, KernelError};
+use crate::error::{DeltaResult, EngineError, KernelError};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
@@ -1005,30 +1005,43 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
     }
     match prim {
         PrimitiveType::Date => {
-            let days = Date32Type::parse(raw).ok_or_else(|| {
-                KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
+            let days = Date32Type::parse(raw).ok_or_else(|| EngineError::ParseError {
+                value: raw.to_string(),
+                data_type: DataType::Primitive(prim.clone()),
+                source: None,
             })?;
             return Ok(Some(Scalar::Date(days)));
         }
         PrimitiveType::Timestamp => {
             let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| {
-                    KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
+                .map_err(|source| EngineError::ParseError {
+                    value: raw.to_string(),
+                    data_type: DataType::Primitive(prim.clone()),
+                    source: Some(Box::new(source)),
                 })?
                 .timestamp_micros();
             return Ok(Some(Scalar::Timestamp(micros)));
         }
         PrimitiveType::TimestampNtz => {
             let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| {
-                    KernelError::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
+                .map_err(|source| EngineError::ParseError {
+                    value: raw.to_string(),
+                    data_type: DataType::Primitive(prim.clone()),
+                    source: Some(Box::new(source)),
                 })?
                 .timestamp_micros();
             return Ok(Some(Scalar::TimestampNtz(micros)));
         }
         _ => {}
     }
-    let scalar = prim.parse_scalar(raw)?;
+    let scalar = prim.parse_scalar(raw).map_err(|source| match &source {
+        KernelError::ParseError(value, data_type) => EngineError::ParseError {
+            value: value.clone(),
+            data_type: data_type.clone(),
+            source: Some(Box::new(source)),
+        },
+        _ => EngineError::external(source),
+    })?;
     Ok((!matches!(scalar, Scalar::Null(_))).then_some(scalar))
 }
 

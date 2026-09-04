@@ -18,8 +18,8 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler,
-    KernelError, ParquetHandler, StorageHandler,
+    CancellationTokenRef, DeltaResult, Engine, EngineData, EngineError, EngineResult,
+    EngineResultIteratorStatic, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
 use futures::future::{self, Either};
 use futures::stream::{BoxStream, StreamExt as _};
@@ -53,8 +53,8 @@ pub mod storage;
 /// Delta Kernel's synchronous handler traits.
 pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
-    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, T>>> + Send + 'static,
-) -> DeltaResult<Box<dyn Iterator<Item = T> + Send>> {
+    stream_future: impl Future<Output = EngineResult<BoxStream<'static, T>>> + Send + 'static,
+) -> EngineResult<Box<dyn Iterator<Item = T> + Send>> {
     Ok(Box::new(BlockingStreamIterator {
         stream: Some(task_executor.block_on(stream_future)?),
         task_executor,
@@ -62,25 +62,25 @@ pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor
 }
 
 /// Like [`stream_future_to_iter`], but each blocking poll is raced against the cancellation
-/// token. When the token fires, the iterator yields a single `Err(KernelError::Cancelled)` and then
+/// token. When the token fires, the iterator yields a single `Err(EngineError::Cancelled)` and then
 /// ends, abandoning the in-flight read (dropping the stream releases its buffered work).
 ///
-/// Restricted to `DeltaResult` streams so cancellation can be surfaced as an item. With a `None`
+/// Restricted to `EngineResult` streams so cancellation can be surfaced as an item. With a `None`
 /// token, behavior is identical to [`stream_future_to_iter`].
 pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
-    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, DeltaResult<U>>>>
+    stream_future: impl Future<Output = EngineResult<BoxStream<'static, EngineResult<U>>>>
         + Send
         + 'static,
     cancellation_token: Option<CancellationTokenRef>,
-) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<U>> + Send>> {
+) -> EngineResult<EngineResultIteratorStatic<U>> {
     let Some(token) = cancellation_token else {
         return stream_future_to_iter(task_executor, stream_future);
     };
     // Race even the initial stream-producing future against cancellation.
     let stream = match block_on_or_cancelled(&task_executor, token.clone(), stream_future) {
         Some(result) => result?,
-        None => return Err(KernelError::Cancelled.into()),
+        None => return Err(EngineError::Cancelled),
     };
     Ok(Box::new(CancellableStreamIterator {
         stream: Some(stream),
@@ -138,15 +138,15 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 
 /// Cancellation-aware counterpart to [`BlockingStreamIterator`]: each `next()` races the blocking
 /// `stream.next()` against the token and, once cancelled, drops the stream and yields exactly one
-/// terminal `Err(KernelError::Cancelled)`.
+/// terminal `Err(EngineError::Cancelled)`.
 struct CancellableStreamIterator<U: Send + 'static, E: executor::TaskExecutor> {
-    stream: Option<BoxStream<'static, DeltaResult<U>>>,
+    stream: Option<BoxStream<'static, EngineResult<U>>>,
     task_executor: Arc<E>,
     token: CancellationTokenRef,
 }
 
 impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStreamIterator<U, E> {
-    type Item = DeltaResult<U>;
+    type Item = EngineResult<U>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut stream = self.stream.take()?;
@@ -163,7 +163,7 @@ impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStrea
             }
             // Cancelled: `stream` was moved into the (now-dropped) future, releasing buffered
             // work. Emit one terminal error; the taken `self.stream` stays `None`, fusing us.
-            None => Some(Err(KernelError::Cancelled.into())),
+            None => Some(Err(EngineError::Cancelled)),
         }
     }
 }
@@ -379,8 +379,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         write_context: &BoundWriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
-        let input_schema = Schema::try_from_arrow(data.record_batch().schema())
-            .map_err(delta_kernel::KernelError::from)?;
+        let input_schema =
+            Schema::try_from_arrow(data.record_batch().schema()).map_err(EngineError::external)?;
         let output_schema = write_context.physical_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
@@ -411,7 +411,15 @@ pub fn build_add_file_metadata(
     write_context: &BoundWriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let add_path = write_context.resolve_file_path(file_metadata.location())?;
-    file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)
+    Ok(file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)?)
+}
+
+/// Converts an engine-owned legacy helper's failure, retaining existing engine classifications.
+pub(crate) fn engine_error(error: delta_kernel::Error) -> EngineError {
+    match error {
+        delta_kernel::Error::Engine(error) => error,
+        error => EngineError::external(error),
+    }
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
@@ -464,10 +472,98 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
+    use delta_kernel::arrow::array::StringArray;
+    use delta_kernel::engine_data::FilteredEngineData;
     use delta_kernel::object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::{Error, KernelError, Snapshot};
+    use delta_kernel_default_engine_test_utils::string_array_to_engine_data;
+    use rstest::rstest;
     use test_utils::engine_contract::test_arrow_engine;
 
     use super::*;
+
+    #[rstest]
+    fn writer_input_errors_preserve_classification_and_source(
+        #[values("delta", "kernel", "engine", "cancelled")] provenance: &str,
+        #[values(false, true)] parquet: bool,
+        #[values(false, true)] after_batch: bool,
+    ) {
+        let engine = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
+        let input_error: Error = match provenance {
+            "delta" => {
+                let error = Snapshot::builder_for("memory:///missing/")
+                    .build(&engine)
+                    .unwrap_err();
+                assert!(matches!(&error, Error::Delta(_)));
+                error
+            }
+            "kernel" => KernelError::MissingData("upstream sentinel".into()).into(),
+            "engine" => EngineError::external(std::io::Error::other("upstream sentinel")).into(),
+            "cancelled" => EngineError::Cancelled.into(),
+            _ => unreachable!(),
+        };
+        let expected_classification = std::mem::discriminant(&input_error);
+        let expected_message = input_error.to_string();
+        let expected_source = input_error
+            .source()
+            .map(|source| std::ptr::from_ref(source).cast::<()>());
+        let mut batches = Vec::new();
+        if after_batch {
+            batches.push(Ok(string_array_to_engine_data(StringArray::from(vec![
+                "value",
+            ]))));
+        }
+        batches.push(Err(input_error));
+
+        let path = Url::parse("memory:///output/data").unwrap();
+        let error = if parquet {
+            engine
+                .parquet_handler()
+                .write_parquet_file(path, Box::new(batches.into_iter()))
+                .unwrap_err()
+        } else {
+            let data = batches
+                .into_iter()
+                .map(|batch| batch.map(FilteredEngineData::with_all_rows_selected));
+            engine
+                .json_handler()
+                .write_json_file(&path, Box::new(data), false)
+                .unwrap_err()
+        };
+        assert_eq!(std::mem::discriminant(&error), expected_classification);
+        assert_eq!(error.to_string(), expected_message);
+        assert_eq!(
+            error
+                .source()
+                .map(|source| std::ptr::from_ref(source).cast::<()>()),
+            expected_source
+        );
+    }
+
+    #[test]
+    fn engine_owned_legacy_failures_preserve_existing_engine_classification() {
+        assert!(matches!(
+            engine_error(EngineError::Cancelled.into()),
+            EngineError::Cancelled
+        ));
+        let error = EngineError::file_not_found("memory:///missing");
+        assert!(matches!(
+            engine_error(error.into()),
+            EngineError::FileNotFound { .. }
+        ));
+        let error = EngineError::external(std::io::Error::other("native sentinel"));
+        let EngineError::External {
+            source: Some(source),
+            ..
+        } = engine_error(error.into())
+        else {
+            panic!("Expected an external engine error");
+        };
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+    }
 
     #[test]
     fn test_default_engine() {
@@ -591,7 +687,7 @@ mod tests {
         // 0, 1, then a pending tail that never resolves on its own.
         let make_stream = async move {
             let head = stream::iter(vec![Ok(0i32), Ok(1i32)]);
-            let tail = stream::once(std::future::pending::<DeltaResult<i32>>());
+            let tail = stream::once(std::future::pending::<EngineResult<i32>>());
             Ok(head.chain(tail).boxed())
         };
         let mut iter = stream_future_to_cancellable_iter(executor, make_stream, Some(ct)).unwrap();
@@ -605,10 +701,7 @@ mod tests {
             firing.cancel();
         });
 
-        assert!(matches!(
-            iter.next(),
-            Some(Err(delta_kernel::Error::Kernel(KernelError::Cancelled)))
-        ));
+        assert!(matches!(iter.next(), Some(Err(EngineError::Cancelled))));
         assert!(
             iter.next().is_none(),
             "iterator must fuse after cancellation"

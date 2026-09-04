@@ -547,7 +547,7 @@ impl IntoEngineData for Metadata {
             self.configuration.into(),
         ];
 
-        engine.evaluation_handler().create_one(schema, &values)
+        Ok(engine.evaluation_handler().create_one(schema, &values)?)
     }
 }
 
@@ -1312,7 +1312,9 @@ impl IntoEngineData for CheckpointAction {
 
         let array_type = ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false);
         let array = Scalar::Array(ArrayData::try_new(array_type, elements)?);
-        engine.evaluation_handler().create_many(schema, &[&[array]])
+        Ok(engine
+            .evaluation_handler()
+            .create_many(schema, &[&[array]])?)
     }
 }
 

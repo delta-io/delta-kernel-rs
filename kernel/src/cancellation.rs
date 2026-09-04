@@ -5,14 +5,14 @@
 //! [`ScanBuilder::with_cancellation_token`](crate::scan::ScanBuilder::with_cancellation_token)),
 //! Kernel polls it at action-batch boundaries, and cancellation-aware [`Engine`](crate::Engine)
 //! reads may race their I/O against it. Cancellation is always surfaced as
-//! [`KernelError::Cancelled`] -- never as normal iterator exhaustion -- so a partial listing can
-//! never be mistaken for a complete one.
+//! [`KernelError::Cancelled`] for Kernel checks or [`EngineError::Cancelled`] for engine reads,
+//! never as normal iterator exhaustion, so a partial listing cannot look complete.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{AsAny, DeltaResult, KernelError};
+use crate::{AsAny, DeltaResult, EngineError, EngineResult, KernelError};
 
 /// A shared, thread-safe cancellation token. Held as an `Arc` because the lazy scan iterator and
 /// the engine reads it drives can outlive the builder call and run on other threads.
@@ -32,6 +32,14 @@ pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> DeltaResu
     match token {
         Some(t) if t.is_cancelled() => Err(KernelError::Cancelled.into()),
         _ => Ok(()),
+    }
+}
+
+pub(crate) fn check_engine_cancelled(token: Option<&CancellationTokenRef>) -> EngineResult<()> {
+    if token.is_some_and(|token| token.is_cancelled()) {
+        Err(EngineError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 
@@ -134,6 +142,7 @@ where
         if matches!(
             item,
             Some(Err(crate::Error::Kernel(KernelError::Cancelled)))
+                | Some(Err(crate::Error::Engine(EngineError::Cancelled)))
         ) {
             self.done = true;
         }
@@ -145,6 +154,8 @@ where
 mod tests {
     use std::future::ready;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    use rstest::rstest;
 
     use super::*;
 
@@ -224,15 +235,18 @@ mod tests {
     // fuse this layer, so a token shared between engine and kernel yields exactly ONE terminal
     // error, not two. Regression guard for the double-emit the layered pipeline would otherwise
     // produce. The token is left uncancelled so the fuse comes solely from the inner error.
-    #[test]
-    fn inner_cancelled_error_fuses_without_double_emit() {
+    #[rstest]
+    #[case(crate::Error::Kernel(KernelError::Cancelled))]
+    #[case(crate::Error::Engine(EngineError::Cancelled))]
+    fn inner_cancelled_error_fuses_without_double_emit(#[case] error: crate::Error) {
         let token: CancellationTokenRef = Arc::new(TestToken::default());
-        let inner = vec![Ok(0), Err(KernelError::Cancelled.into()), Ok(99)].into_iter();
+        let inner = vec![Ok(0), Err(error), Ok(99)].into_iter();
         let mut iter = CancellableIterator::new(inner, Some(token));
         assert!(matches!(iter.next(), Some(Ok(0))));
         assert!(matches!(
             iter.next(),
             Some(Err(crate::Error::Kernel(KernelError::Cancelled)))
+                | Some(Err(crate::Error::Engine(EngineError::Cancelled)))
         ));
         // Fused on the inner error: the trailing Ok is never yielded, and no second error.
         assert!(iter.next().is_none());
@@ -244,7 +258,13 @@ mod tests {
         let ct: CancellationTokenRef = token.clone();
         assert!(check_cancelled(Some(&ct)).is_ok());
         assert!(check_cancelled(None).is_ok());
+        assert!(check_engine_cancelled(Some(&ct)).is_ok());
+        assert!(check_engine_cancelled(None).is_ok());
         token.cancel();
+        assert!(matches!(
+            check_engine_cancelled(Some(&ct)),
+            Err(EngineError::Cancelled)
+        ));
         assert!(matches!(
             check_cancelled(Some(&ct)),
             Err(crate::Error::Kernel(KernelError::Cancelled))

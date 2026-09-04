@@ -22,7 +22,11 @@ deserializes the full batch into in-memory structs.
 
 ## Errors
 
-`Error` separates stable `DeltaError` conditions from `KernelError` failures. Kernel failures use
+`Error` separates stable `DeltaError` conditions, `EngineError` failures, and `KernelError`
+failures. Handlers and evaluators return `EngineResult`, including lazy read-iterator items.
+JSON/Parquet writers retain `DeltaResult` to preserve failures from their Kernel-provided input
+iterators; their own failures use `Error::Engine`. EngineData visitors and declarative-plan APIs
+retain `DeltaResult`. Kernel failures use
 specific variants or module-owned typed errors re-exported through `error`; dependency errors retain
 their native sources. `Error::with_context` adds operation, commit, or file context only to Kernel
 failures. `Context` and `Backtraced` retain the underlying FFI error code.

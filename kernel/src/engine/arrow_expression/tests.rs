@@ -13,6 +13,7 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+use crate::arrow::error::ArrowError;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
@@ -34,6 +35,43 @@ use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::EvaluationHandlerExtension as _;
+
+#[rstest]
+fn evaluator_partition_parse_error_retains_native_source(
+    #[values(KernelDataType::TIMESTAMP, KernelDataType::TIMESTAMP_NTZ)] output_type: KernelDataType,
+) {
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    builder.keys().append_value("value");
+    builder.values().append_value("not-a-timestamp");
+    builder.append(true).unwrap();
+    let batch =
+        RecordBatch::try_from_iter([("partition_values", Arc::new(builder.finish()) as ArrayRef)])
+            .unwrap();
+    let partition_values_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, true);
+    let input_schema = schema_ref! { nullable "partition_values": (partition_values_type) };
+    let output_schema = schema! { nullable "value": (output_type.clone()) };
+    let evaluator = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            input_schema,
+            Arc::new(Expr::map_to_struct(col!("partition_values"))),
+            output_schema.into(),
+        )
+        .unwrap();
+    let Err(error) = evaluator.evaluate(&ArrowEngineData::new(batch)) else {
+        panic!("expected partition parsing to fail");
+    };
+    let EngineError::ParseError {
+        value,
+        data_type,
+        source: Some(source),
+    } = error
+    else {
+        panic!("expected a structured parse error with its native source, got {error:?}");
+    };
+    assert_eq!(value, "not-a-timestamp");
+    assert_eq!(data_type, output_type);
+    assert!(source.is::<ArrowError>());
+}
 
 #[test]
 fn test_array_column() {
@@ -1373,10 +1411,18 @@ fn test_create_many_wrong_field_type_returns_error(
     let Err(error) = handler.create_many(schema, &rows) else {
         panic!("expected scalar append to fail");
     };
+    let EngineError::External {
+        source: Some(source),
+        ..
+    } = &error
+    else {
+        panic!("expected an external engine error, got {error:?}");
+    };
+    let error = source.downcast_ref::<crate::Error>().unwrap();
     let crate::Error::Kernel(KernelError::Context {
         context: ErrorContext::Operation("append scalar to row"),
         source,
-    }) = &error
+    }) = error
     else {
         panic!("expected scalar append operation context, got {error:?}");
     };

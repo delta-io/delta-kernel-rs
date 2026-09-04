@@ -26,8 +26,8 @@ use crate::object_store::local::LocalFileSystem;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{
-    DeltaResult, Engine, EvaluationHandler, FileMeta, JsonHandler, KernelError, ParquetHandler,
-    PredicateRef, SchemaRef, StorageHandler,
+    Engine, EngineError, EngineResult, EvaluationHandler, FileMeta, JsonHandler, KernelError,
+    ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
 };
 
 pub(crate) mod json;
@@ -119,22 +119,23 @@ impl Engine for SyncEngine {
 pub(super) fn resolve_scope(
     default_store: Option<&Arc<DynObjectStore>>,
     url: &Url,
-) -> DeltaResult<(Arc<DynObjectStore>, Url, Path)> {
+) -> EngineResult<(Arc<DynObjectStore>, Url, Path)> {
     if let Some(store) = default_store {
         let mut base_url = url.clone();
         base_url.set_path("/");
-        let path = Path::from_url_path(url.path()).map_err(KernelError::from)?;
+        let path = Path::from_url_path(url.path())?;
         return Ok((store.clone(), base_url, path));
     }
     if url.scheme() != "file" {
-        return Err(KernelError::unsupported(format!(
+        return Err(EngineError::external(KernelError::unsupported(format!(
             "SyncEngine without an explicit store can only access file:// URLs, got: {url}"
-        ))
-        .into());
+        ))));
     }
-    let file_path = url
-        .to_file_path()
-        .map_err(|()| KernelError::invalid_table_location(format!("Invalid file URL: {url}")))?;
+    let file_path = url.to_file_path().map_err(|()| {
+        EngineError::external(KernelError::invalid_table_location(format!(
+            "Invalid file URL: {url}"
+        )))
+    })?;
     // Use the deepest existing ancestor of the URL's directory as the store prefix:
     // `LocalFileSystem::new_with_prefix` canonicalizes its argument (which requires the path
     // to exist), and operating on a non-existent path is a valid case for `list_from` on a
@@ -145,29 +146,34 @@ pub(super) fn resolve_scope(
         file_path
             .parent()
             .ok_or_else(|| {
-                KernelError::invalid_table_location(format!("File URL has no parent: {url}"))
+                EngineError::external(KernelError::invalid_table_location(format!(
+                    "File URL has no parent: {url}"
+                )))
             })?
             .to_path_buf()
     };
     let mut prefix = target_dir.as_path();
     while !prefix.exists() {
         prefix = prefix.parent().ok_or_else(|| {
-            KernelError::invalid_table_location(format!("No existing ancestor for {target_dir:?}"))
+            EngineError::external(KernelError::invalid_table_location(format!(
+                "No existing ancestor for {target_dir:?}"
+            )))
         })?;
     }
     let prefix = prefix.to_path_buf();
     let relative = file_path
         .strip_prefix(&prefix)
-        .map_err(|source| KernelError::from(std::io::Error::other(source)))?;
+        .map_err(EngineError::external)?;
     let path = Path::from_iter(relative.components().filter_map(|c| match c {
         std::path::Component::Normal(s) => s.to_str().map(String::from),
         _ => None,
     }));
     let base_url = Url::from_directory_path(&prefix).map_err(|()| {
-        KernelError::invalid_table_location(format!("Could not URL-encode prefix {prefix:?}"))
+        EngineError::external(KernelError::invalid_table_location(format!(
+            "Could not URL-encode prefix {prefix:?}"
+        )))
     })?;
-    let store: Arc<DynObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(&prefix).map_err(KernelError::from)?);
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&prefix)?);
     Ok((store, base_url, path))
 }
 
@@ -175,10 +181,10 @@ pub(super) fn resolve_scope(
 pub(super) fn get_bytes(
     default_store: Option<&Arc<DynObjectStore>>,
     location: &Url,
-) -> DeltaResult<Bytes> {
+) -> EngineResult<Bytes> {
     let (store, _, path) = resolve_scope(default_store, location)?;
-    let get_result = futures::executor::block_on(store.get(&path)).map_err(KernelError::from)?;
-    Ok(futures::executor::block_on(get_result.bytes()).map_err(KernelError::from)?)
+    let get_result = futures::executor::block_on(store.get(&path))?;
+    Ok(futures::executor::block_on(get_result.bytes())?)
 }
 
 /// Write `data` to `location` via [`resolve_scope`].
@@ -186,18 +192,18 @@ pub(super) fn get_bytes(
 /// For `file://` URLs the parent directory is created if missing (matching the local FS
 /// behavior callers expect; `LocalFileSystem::put` itself does not create parents). When
 /// `overwrite` is false, an existing file at `location` produces
-/// [`KernelError::FileAlreadyExists`].
+/// [`EngineError::FileAlreadyExists`].
 pub(super) fn put_bytes(
     default_store: Option<&Arc<DynObjectStore>>,
     location: &Url,
     data: Bytes,
     overwrite: bool,
-) -> DeltaResult<()> {
+) -> EngineResult<()> {
     if location.scheme() == "file" {
         if let Ok(file_path) = location.to_file_path() {
             if let Some(parent) = file_path.parent() {
                 if !parent.exists() {
-                    std::fs::create_dir_all(parent).map_err(KernelError::from)?;
+                    std::fs::create_dir_all(parent)?;
                 }
             }
         }
@@ -211,14 +217,17 @@ pub(super) fn put_bytes(
             ..Default::default()
         }
     };
-    futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(|e| {
-        match e {
-            crate::object_store::Error::AlreadyExists { .. } => {
-                KernelError::FileAlreadyExists(location.to_string())
+    futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(
+        |source| match source {
+            source @ crate::object_store::Error::AlreadyExists { .. } => {
+                EngineError::FileAlreadyExists {
+                    path: location.to_string(),
+                    source: Some(Box::new(source)),
+                }
             }
-            other => KernelError::from(other),
-        }
-    })?;
+            other => EngineError::from(other),
+        },
+    )?;
     Ok(())
 }
 
@@ -229,10 +238,10 @@ fn read_files_arrow<F, I>(
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     mut try_create_from_bytes: F,
-) -> impl Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static
+) -> impl Iterator<Item = EngineResult<ArrowEngineData>> + Send + 'static
 where
-    I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> DeltaResult<I> + Send + 'static,
+    I: Iterator<Item = EngineResult<ArrowEngineData>> + Send + 'static,
+    F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> EngineResult<I> + Send + 'static,
 {
     debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
     let files = files.to_vec(); // Clone for static iterator (clippy hates chained to_vec+into_iter)

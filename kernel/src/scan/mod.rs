@@ -400,7 +400,8 @@ impl ScanBuilder {
     ///
     /// Cancellation is cooperative: kernel polls the token at each action-batch boundary, and a
     /// cancellation-aware [`Engine`] additionally races its checkpoint/commit reads against it.
-    /// On cancellation the scan surfaces [`KernelError::Cancelled`] -- either returned directly
+    /// On cancellation the scan surfaces [`KernelError::Cancelled`] for Kernel checks or
+    /// [`crate::EngineError::Cancelled`] for interrupted engine reads, either returned directly
     /// from [`scan_metadata`](Scan::scan_metadata) when the token is already cancelled before
     /// replay begins, or as the terminal item of its iterator -- never as a silent early
     /// `None`, so a cancelled listing cannot be mistaken for a complete one. With no token the

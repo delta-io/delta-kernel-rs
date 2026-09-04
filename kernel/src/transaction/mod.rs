@@ -317,7 +317,7 @@ where
             adds_expr.clone(),
             as_log_add_schema(output_schema.clone()).into(),
         )?;
-        adds_evaluator.evaluate(add_files_batch?.deref())
+        Ok(adds_evaluator.evaluate(add_files_batch?.deref())?)
     }))
 }
 
@@ -1447,11 +1447,11 @@ impl<S> Transaction<S> {
                 coalesce_stats_with_parsed,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
-            evaluation_handler.new_expression_evaluator(
+            Ok(evaluation_handler.new_expression_evaluator(
                 input_schema.clone(),
                 expr,
                 target_schema.clone().into(),
-            )
+            )?)
         };
 
         // Build two evaluators: one for the common case where scan files do not include a
@@ -3117,7 +3117,8 @@ mod tests {
                 Scalar::Array(ArrayData::try_new(score_type, [30i32])?),
             ],
         )?);
-        ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
+        Ok(ArrowEvaluationHandler
+            .create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])?)
     }
 
     /// Validates that [`BoundWriteContext::logical_to_physical`] correctly renames fields at all

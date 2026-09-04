@@ -16,13 +16,19 @@ pub mod json;
 pub mod parquet;
 pub mod storage;
 
+#[cfg(test)]
+mod error_tests;
+
 use json::PlanBasedJsonHandler;
 use parquet::PlanBasedParquetHandler;
 use storage::PlanBasedStorageHandler;
 
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::plans::PlanExecutor;
-use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
+use crate::{
+    Engine, EngineError, Error, EvaluationHandler, JsonHandler, KernelError, ParquetHandler,
+    StorageHandler,
+};
 
 /// An [`Engine`] that routes operations through a [`PlanExecutor`].
 ///
@@ -92,6 +98,33 @@ impl Engine for PlanBasedEngine {
     }
 }
 
+fn into_engine_error(error: Error) -> EngineError {
+    match error {
+        Error::Engine(error) => error,
+        Error::Kernel(error) => {
+            let mut cause = &error;
+            while let KernelError::Context { source, .. } | KernelError::Backtraced { source, .. } =
+                cause
+            {
+                cause = source;
+            }
+            match cause {
+                KernelError::FileNotFound(path) => EngineError::FileNotFound {
+                    path: path.clone(),
+                    source: Some(Box::new(error)),
+                },
+                KernelError::FileAlreadyExists(path) => EngineError::FileAlreadyExists {
+                    path: path.clone(),
+                    source: Some(Box::new(error)),
+                },
+                KernelError::Cancelled => EngineError::Cancelled,
+                _ => EngineError::external(error),
+            }
+        }
+        error => EngineError::external(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -106,7 +139,7 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
-    use crate::{Engine as _, EngineData, KernelError};
+    use crate::{Engine as _, EngineData, EngineError};
 
     fn plan_engine(fallback: Option<Arc<dyn crate::Engine>>) -> PlanBasedEngine {
         PlanBasedEngine::new(fallback, Arc::new(SyncPlanExecutor::default()))
@@ -196,7 +229,7 @@ mod tests {
             .expect_err("no fallback is configured");
         assert!(matches!(
             json_err,
-            crate::Error::Kernel(KernelError::Unsupported(_))
+            crate::Error::Engine(EngineError::External { .. })
         ));
 
         let parquet_err = engine
@@ -205,7 +238,7 @@ mod tests {
             .expect_err("no fallback is configured");
         assert!(matches!(
             parquet_err,
-            crate::Error::Kernel(KernelError::Unsupported(_))
+            crate::Error::Engine(EngineError::External { .. })
         ));
     }
 }

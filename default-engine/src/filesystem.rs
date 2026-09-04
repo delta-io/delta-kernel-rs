@@ -4,7 +4,7 @@ use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, FileMeta, FileSlice, KernelError, StorageHandler,
+    CancellationTokenRef, EngineError, EngineResult, FileMeta, FileSlice, StorageHandler,
 };
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -46,20 +46,21 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
-) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
+) -> EngineResult<BoxStream<'static, EngineResult<FileMeta>>> {
     // The offset is used for list-after; the prefix is used to restrict the listing to a specific
     // directory. Unfortunately, `Path` provides no easy way to check whether a name is
     // directory-like, because it strips trailing /, so we're reduced to manually checking the
     // original URL.
-    let offset = Path::from_url_path(path.path()).map_err(delta_kernel::KernelError::from)?;
+    let offset = Path::from_url_path(path.path())?;
     let prefix = if path.path().ends_with('/') {
         offset.clone()
     } else {
         let mut parts = offset.parts().collect_vec();
         if parts.pop().is_none() {
-            return Err(KernelError::InvalidTableLocation(format!(
-                "Offset path must not be a root directory. Got: '{path}'",
-            ))
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Offset path must not be a root directory. Got: '{path}'"),
+            )
             .into());
         }
         Path::from_iter(parts)
@@ -70,8 +71,8 @@ async fn list_from_impl(
     let stream =
         store
             .list_with_offset(Some(&prefix), &offset)
-            .map(move |meta| -> DeltaResult<_> {
-                let meta = meta.map_err(delta_kernel::KernelError::from)?;
+            .map(move |meta| -> EngineResult<_> {
+                let meta = meta?;
                 let mut location = path.clone();
                 location.set_path(&format!("/{}", meta.location.as_ref()));
                 Ok(FileMeta {
@@ -86,7 +87,7 @@ async fn list_from_impl(
         let mut items: Vec<_> = stream.try_collect().await?;
         items.sort_unstable();
         Ok(Box::pin(stream::iter(
-            items.into_iter().map(Ok::<FileMeta, delta_kernel::Error>),
+            items.into_iter().map(Ok::<FileMeta, EngineError>),
         )))
     } else {
         Ok(Box::pin(stream))
@@ -98,7 +99,7 @@ async fn read_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileSlice>,
     readahead: usize,
-) -> DeltaResult<BoxStream<'static, DeltaResult<Bytes>>> {
+) -> EngineResult<BoxStream<'static, EngineResult<Bytes>>> {
     let files = stream::iter(files).map(move |(url, range)| {
         let store = store.clone();
         async move {
@@ -108,32 +109,26 @@ async fn read_files_impl(
             // details about why this check is necessary
             let path = if url.scheme() == "file" {
                 let file_path = url.to_file_path().map_err(|_| {
-                    KernelError::InvalidTableLocation(format!("Invalid file URL: {url}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid file URL: {url}"),
+                    )
                 })?;
-                Path::from_absolute_path(file_path).map_err(|e| {
-                    KernelError::InvalidTableLocation(format!("Invalid file path: {e}"))
-                })?
+                Path::from_absolute_path(file_path)?
             } else {
                 Path::from(url.path())
             };
             if url.is_presigned() {
                 // have to annotate type here or rustc can't figure it out
-                Ok::<bytes::Bytes, delta_kernel::Error>(
-                    reqwest::get(url)
-                        .await
-                        .map_err(KernelError::from)?
-                        .bytes()
-                        .await
-                        .map_err(KernelError::from)?,
-                )
+                Ok::<bytes::Bytes, EngineError>(reqwest::get(url).await?.bytes().await?)
             } else if let Some(rng) = range {
                 Ok(store
                     .get_range(&path, rng)
                     .await
-                    .map_err(KernelError::from)?)
+                    .map_err(EngineError::from)?)
             } else {
-                let result = store.get(&path).await.map_err(KernelError::from)?;
-                Ok(result.bytes().await.map_err(KernelError::from)?)
+                let result = store.get(&path).await?;
+                Ok(result.bytes().await?)
             }
         }
     });
@@ -148,26 +143,21 @@ async fn copy_atomic_impl(
     store: Arc<DynObjectStore>,
     src_path: Path,
     dest_path: Path,
-) -> DeltaResult<()> {
+) -> EngineResult<()> {
     // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
     // necessarily atomic, but since the source file is immutable, we aren't exposed to the
     // possibility of source file changing while we do the PUT.
     let data = store
         .get(&src_path)
         .await
-        .map_err(delta_kernel::KernelError::from)?
+        .map_err(EngineError::from)?
         .bytes()
         .await
-        .map_err(delta_kernel::KernelError::from)?;
+        .map_err(EngineError::from)?;
     store
         .put_opts(&dest_path, data.into(), PutMode::Create.into())
         .await
-        .map_err(|e| match e {
-            object_store::Error::AlreadyExists { .. } => {
-                KernelError::FileAlreadyExists(dest_path.into())
-            }
-            e => e.into(),
-        })?;
+        .map_err(EngineError::from)?;
     Ok(())
 }
 
@@ -177,35 +167,32 @@ async fn put_impl(
     path: Path,
     data: Bytes,
     overwrite: bool,
-) -> DeltaResult<()> {
+) -> EngineResult<()> {
     let put_mode = if overwrite {
         PutMode::Overwrite
     } else {
         PutMode::Create
     };
     let result = store.put_opts(&path, data.into(), put_mode.into()).await;
-    result.map_err(|e| match e {
-        object_store::Error::AlreadyExists { .. } => KernelError::FileAlreadyExists(path.into()),
-        e => e.into(),
-    })?;
+    result?;
     Ok(())
 }
 
 /// Native async implementation for delete.
-async fn delete_impl(store: Arc<DynObjectStore>, path: Path) -> DeltaResult<()> {
+async fn delete_impl(store: Arc<DynObjectStore>, path: Path) -> EngineResult<()> {
     match store.delete(&path).await {
         Ok(()) => Ok(()),
         Err(object_store::Error::NotFound { .. }) => Ok(()),
-        Err(e) => Err(KernelError::from(e).into()),
+        Err(error) => Err(error.into()),
     }
 }
 
 /// Native async implementation for head
-async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta> {
+async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> EngineResult<FileMeta> {
     let meta = store
-        .head(&Path::from_url_path(url.path()).map_err(delta_kernel::KernelError::from)?)
+        .head(&Path::from_url_path(url.path())?)
         .await
-        .map_err(delta_kernel::KernelError::from)?;
+        .map_err(EngineError::from)?;
     Ok(FileMeta {
         location: url,
         last_modified: meta.last_modified.timestamp_millis(),
@@ -217,7 +204,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     fn list_from(
         &self,
         path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<FileMeta>>>> {
         self.list_from_with_cancellation(path, None)
     }
 
@@ -225,7 +212,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<FileMeta>>>> {
         let future = list_from_impl(self.inner.clone(), path.clone());
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
@@ -244,7 +231,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<Bytes>>>> {
         self.read_files_with_cancellation(files, None)
     }
 
@@ -252,7 +239,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<Bytes>>>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
@@ -262,27 +249,26 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
-        let path = Path::from_url_path(path.path()).map_err(delta_kernel::KernelError::from)?;
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> EngineResult<()> {
+        let path = Path::from_url_path(path.path())?;
         self.task_executor
             .block_on(put_impl(self.inner.clone(), path, data, overwrite))
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
-        let src_path = Path::from_url_path(src.path()).map_err(delta_kernel::KernelError::from)?;
-        let dest_path =
-            Path::from_url_path(dest.path()).map_err(delta_kernel::KernelError::from)?;
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> EngineResult<()> {
+        let src_path = Path::from_url_path(src.path())?;
+        let dest_path = Path::from_url_path(dest.path())?;
         let future = copy_atomic_impl(self.inner.clone(), src_path, dest_path);
         self.task_executor.block_on(future)
     }
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &Url) -> EngineResult<FileMeta> {
         let future = head_impl(self.inner.clone(), path.clone());
         self.task_executor.block_on(future)
     }
 
-    fn delete(&self, path: &Url) -> DeltaResult<()> {
-        let path = Path::from_url_path(path.path()).map_err(delta_kernel::KernelError::from)?;
+    fn delete(&self, path: &Url) -> EngineResult<()> {
+        let path = Path::from_url_path(path.path())?;
         self.task_executor
             .block_on(delete_impl(self.inner.clone(), path))
     }
@@ -491,9 +477,10 @@ mod tests {
         // copy to existing fails
         assert!(matches!(
             handler.copy_atomic(&src_url, &dest_url),
-            Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(
-                _
-            )))
+            Err(EngineError::FileAlreadyExists {
+                source: Some(_),
+                ..
+            })
         ));
 
         // copy from non-existing fails
@@ -536,7 +523,10 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(delta_kernel::Error::Kernel(KernelError::FileNotFound(_)))
+            Err(EngineError::FileNotFound {
+                source: Some(_),
+                ..
+            })
         ));
     }
 
@@ -570,9 +560,10 @@ mod tests {
         let new_data = Bytes::from("updated");
         assert!(matches!(
             handler.put(&file_url, new_data.clone(), false),
-            Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(
-                _
-            )))
+            Err(EngineError::FileAlreadyExists {
+                source: Some(_),
+                ..
+            })
         ));
 
         // Put with overwrite=true should succeed
@@ -600,7 +591,10 @@ mod tests {
 
         assert!(matches!(
             handler.head(&file_url),
-            Err(delta_kernel::Error::Kernel(KernelError::FileNotFound(_)))
+            Err(EngineError::FileNotFound {
+                source: Some(_),
+                ..
+            })
         ));
     }
 
@@ -611,7 +605,10 @@ mod tests {
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         assert!(matches!(
             handler.head(&missing_url),
-            Err(delta_kernel::Error::Kernel(KernelError::FileNotFound(_)))
+            Err(EngineError::FileNotFound {
+                source: Some(_),
+                ..
+            })
         ));
         handler.delete(&missing_url).unwrap();
     }
@@ -624,15 +621,9 @@ mod tests {
         let token: CancellationTokenRef = Arc::new(test_utils::TestCancellationToken::cancelled());
 
         let listed = handler.list_from_with_cancellation(&url, Some(token.clone()));
-        assert!(matches!(
-            listed,
-            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
-        ));
+        assert!(matches!(listed, Err(EngineError::Cancelled)));
 
         let read = handler.read_files_with_cancellation(vec![(url, None)], Some(token));
-        assert!(matches!(
-            read,
-            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
-        ));
+        assert!(matches!(read, Err(EngineError::Cancelled)));
     }
 }

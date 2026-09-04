@@ -17,8 +17,8 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    KernelError, ParquetFooter, ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, EngineError, EngineResult,
+    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 pub(crate) struct SyncParquetHandler {
@@ -36,9 +36,10 @@ pub(super) fn try_create_from_parquet(
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     file_location: String,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let metadata = ArrowReaderMetadata::load(&data, reader_options()).map_err(KernelError::from)?;
-    let (requested_ordering, mask) = parquet_read_plan(&schema, &metadata)?;
+) -> EngineResult<impl Iterator<Item = EngineResult<ArrowEngineData>>> {
+    let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
+    let (requested_ordering, mask) =
+        parquet_read_plan(&schema, &metadata).map_err(EngineError::external)?;
 
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
         .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
@@ -49,16 +50,20 @@ pub(super) fn try_create_from_parquet(
             builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
         });
 
-    let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-    let stream = builder.build().map_err(KernelError::from)?;
+    let mut row_indexes = row_indexes
+        .map(|builder| builder.build())
+        .transpose()
+        .map_err(EngineError::external)?;
+    let stream = builder.build()?;
     Ok(stream.map(move |rbr| {
         fixup_parquet_read(
-            rbr.map_err(KernelError::from)?,
+            rbr.map_err(EngineError::from)?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
             Some(&schema),
         )
+        .map_err(EngineError::external)
     }))
 }
 
@@ -68,7 +73,7 @@ impl ParquetHandler for SyncParquetHandler {
         files: &[FileMeta],
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         let iter = read_files_arrow(
             self.store.as_ref(),
             files,
@@ -94,9 +99,12 @@ impl ParquetHandler for SyncParquetHandler {
         mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         let first_batch = data.next().ok_or_else(|| {
-            crate::KernelError::missing_data("Cannot write parquet file with empty data iterator")
+            EngineError::external(crate::KernelError::missing_data(
+                "Cannot write parquet file with empty data iterator",
+            ))
         })??;
-        let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
+        let first_arrow =
+            ArrowEngineData::try_from_engine_data(first_batch).map_err(EngineError::external)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
         let mut buf = Vec::new();
@@ -105,22 +113,23 @@ impl ParquetHandler for SyncParquetHandler {
             first_record_batch.schema(),
             writer_options(),
         )
-        .map_err(KernelError::from)?;
+        .map_err(EngineError::from)?;
         writer
             .write(&first_record_batch)
-            .map_err(KernelError::from)?;
+            .map_err(EngineError::from)?;
         for result in data {
             let engine_data = result?;
-            let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
+            let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)
+                .map_err(EngineError::external)?;
             let batch: crate::arrow::array::RecordBatch = (*arrow_data).into();
-            writer.write(&batch).map_err(KernelError::from)?;
+            writer.write(&batch).map_err(EngineError::from)?;
         }
-        writer.close().map_err(KernelError::from)?;
+        writer.close().map_err(EngineError::from)?;
 
-        put_bytes(self.store.as_ref(), &location, buf.into(), true)
+        Ok(put_bytes(self.store.as_ref(), &location, buf.into(), true)?)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> EngineResult<ParquetFooter> {
         parquet_footer(self.store.as_ref(), file)
     }
 }
@@ -129,12 +138,10 @@ impl ParquetHandler for SyncParquetHandler {
 pub(super) fn parquet_footer(
     store: Option<&Arc<DynObjectStore>>,
     file: &FileMeta,
-) -> DeltaResult<ParquetFooter> {
+) -> EngineResult<ParquetFooter> {
     let data = get_bytes(store, &file.location)?;
-    let metadata = ArrowReaderMetadata::load(&data, reader_options()).map_err(KernelError::from)?;
-    let schema = Arc::new(
-        StructType::try_from_arrow(metadata.schema().as_ref()).map_err(KernelError::from)?,
-    );
+    let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
+    let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
     Ok(ParquetFooter { schema })
 }
 

@@ -31,6 +31,11 @@ Delta condition through `EngineExecError`. `GenericError = 5` is reserved for le
 callbacks, never emitted by Kernel. New semantic error codes are appended without renumbering
 existing codes. `Context` and `Backtraced` wrappers preserve the underlying FFI classification.
 
+Rust `Error::Engine` maps recognized engine kinds to explicit FFI codes. Corrupt files and external
+engine failures have appended codes. The C-facing `EngineError` allocation header is distinct from
+Rust's `delta_kernel::EngineError`; alias imports rather than renaming the ABI type. Deferred plan
+callbacks keep their code-and-message decoding contract.
+
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions

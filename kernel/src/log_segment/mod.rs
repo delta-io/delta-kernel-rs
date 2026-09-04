@@ -580,7 +580,10 @@ impl LogSegment {
             cancellation_token,
         ) {
             Ok(history) => history,
-            Err(error @ Error::Kernel(KernelError::Cancelled)) => return error,
+            Err(
+                error @ (Error::Kernel(KernelError::Cancelled)
+                | Error::Engine(crate::EngineError::Cancelled)),
+            ) => return error,
             Err(_) => return original,
         };
 
@@ -1664,7 +1667,8 @@ impl LogSegment {
         // (true) or a checkpoint file (false).
         let actions_iter = actions
             .map_ok(|batch| ActionsBatch::new(batch, false))
-            .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
+            .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)))
+            .map(|result| result.map_err(Error::from));
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
@@ -1706,7 +1710,10 @@ impl LogSegment {
         // Unlike the checkpoint/commit reads that feed the wrapped scan-action stream, this loop
         // consumes batches locally, so wrap it to poll the token between batches even against an
         // engine whose reader ignores it.
-        let batches = CancellableIterator::new(batches, cancellation_token.cloned());
+        let batches = CancellableIterator::new(
+            batches.map(|result| result.map_err(Error::from)),
+            cancellation_token.cloned(),
+        );
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();

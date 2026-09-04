@@ -250,7 +250,7 @@ impl Iterator for IncrementalScanStream {
             match self.actions.next()? {
                 Err(e) => {
                     self.errored = true;
-                    return Some(Err(e));
+                    return Some(Err(e.into()));
                 }
                 Ok(batch) => match process_batch(
                     batch,
@@ -279,7 +279,7 @@ impl IncrementalScanStream {
     /// # Errors
     /// - [`KernelError::IOError`], [`KernelError::ObjectStore`], or [`KernelError::Reqwest`] on
     ///   transient I/O while reading commit JSONs. Retryable by rebuilding the stream.
-    /// - [`KernelError::FileNotFound`] if a commit was vacuumed between
+    /// - [`crate::EngineError::FileNotFound`] if a commit was vacuumed between
     ///   [`IncrementalScanBuilder::build`] and stream consumption. Rebuilding will likely return
     ///   `Ok(None)` (commits unavailable); fall back to [`crate::Snapshot::scan_builder`].
     /// - [`KernelError::MalformedJson`] or [`KernelError::Arrow`] (default-engine) on commit JSON

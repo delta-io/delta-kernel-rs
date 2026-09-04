@@ -36,7 +36,8 @@ impl CommitReader {
                 None,
                 cancellation_token.cloned(),
             )?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
+            .map_ok(|batch| ActionsBatch::new(batch, true))
+            .map(|result| result.map_err(Into::into));
 
         Ok(Self {
             actions: Box::new(actions),

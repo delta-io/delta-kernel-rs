@@ -1,5 +1,5 @@
 //! Integration coverage for `ScanBuilder::with_cancellation_token`: a cancelled scan must
-//! surface `KernelError::Cancelled` through the real Default Engine and can never be mistaken for a
+//! surface Kernel or Engine cancellation through the real Default Engine, never be mistaken for a
 //! complete listing.
 
 use std::sync::Arc;
@@ -9,8 +9,8 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::{
-    CancellationToken as _, CancellationTokenRef, DeltaResult, Engine, FileMeta, FileSlice,
-    JsonHandler, KernelError, ParquetHandler, Snapshot, StorageHandler,
+    CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, JsonHandler,
+    KernelError, ParquetHandler, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -85,13 +85,19 @@ fn assert_cancelled<
     result: delta_kernel::DeltaResult<I>,
 ) {
     match result {
-        Err(delta_kernel::Error::Kernel(KernelError::Cancelled)) => {}
+        Err(
+            delta_kernel::Error::Kernel(KernelError::Cancelled)
+            | delta_kernel::Error::Engine(delta_kernel::EngineError::Cancelled),
+        ) => {}
         Err(other) => panic!("expected Cancelled, got {other:?}"),
         Ok(mut iter) => {
             assert!(
                 matches!(
                     iter.next(),
-                    Some(Err(delta_kernel::Error::Kernel(KernelError::Cancelled)))
+                    Some(Err(delta_kernel::Error::Kernel(KernelError::Cancelled)
+                        | delta_kernel::Error::Engine(
+                            delta_kernel::EngineError::Cancelled
+                        )))
                 ),
                 "cancelled scan must yield Err(Cancelled), never an Ok batch or bare None"
             );
@@ -154,7 +160,10 @@ async fn mid_stream_cancellation_yields_exactly_one_error() -> Result<(), Box<dy
 
     assert!(matches!(
         iter.next(),
-        Some(Err(delta_kernel::Error::Kernel(KernelError::Cancelled)))
+        Some(Err(delta_kernel::Error::Kernel(KernelError::Cancelled)
+            | delta_kernel::Error::Engine(
+                delta_kernel::EngineError::Cancelled
+            )))
     ));
     assert!(
         iter.next().is_none(),
@@ -307,7 +316,8 @@ async fn precancelled_snapshot_build_yields_cancelled() -> Result<(), Box<dyn st
     assert!(
         matches!(
             result,
-            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled)
+                | delta_kernel::Error::Engine(delta_kernel::EngineError::Cancelled))
         ),
         "a cancelled snapshot build must surface KernelError::Cancelled"
     );
@@ -345,7 +355,8 @@ impl StorageHandler for CancelOnListHandler {
     fn list_from(
         &self,
         path: &url::Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> delta_kernel::EngineResult<Box<dyn Iterator<Item = delta_kernel::EngineResult<FileMeta>>>>
+    {
         self.inner.list_from(path)
     }
 
@@ -353,7 +364,8 @@ impl StorageHandler for CancelOnListHandler {
         &self,
         path: &url::Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> delta_kernel::EngineResult<Box<dyn Iterator<Item = delta_kernel::EngineResult<FileMeta>>>>
+    {
         self.token.cancel();
         self.inner
             .list_from_with_cancellation(path, cancellation_token)
@@ -362,7 +374,9 @@ impl StorageHandler for CancelOnListHandler {
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> delta_kernel::EngineResult<
+        Box<dyn Iterator<Item = delta_kernel::EngineResult<bytes::Bytes>>>,
+    > {
         self.inner.read_files(files)
     }
 
@@ -370,24 +384,31 @@ impl StorageHandler for CancelOnListHandler {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> delta_kernel::EngineResult<
+        Box<dyn Iterator<Item = delta_kernel::EngineResult<bytes::Bytes>>>,
+    > {
         self.inner
             .read_files_with_cancellation(files, cancellation_token)
     }
 
-    fn put(&self, path: &url::Url, data: bytes::Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(
+        &self,
+        path: &url::Url,
+        data: bytes::Bytes,
+        overwrite: bool,
+    ) -> delta_kernel::EngineResult<()> {
         self.inner.put(path, data, overwrite)
     }
 
-    fn copy_atomic(&self, src: &url::Url, dest: &url::Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &url::Url, dest: &url::Url) -> delta_kernel::EngineResult<()> {
         self.inner.copy_atomic(src, dest)
     }
 
-    fn head(&self, path: &url::Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &url::Url) -> delta_kernel::EngineResult<FileMeta> {
         self.inner.head(path)
     }
 
-    fn delete(&self, path: &url::Url) -> DeltaResult<()> {
+    fn delete(&self, path: &url::Url) -> delta_kernel::EngineResult<()> {
         self.inner.delete(path)
     }
 }
@@ -435,7 +456,8 @@ async fn snapshot_build_cancelled_during_listing() -> Result<(), Box<dyn std::er
     assert!(
         matches!(
             result,
-            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled)
+                | delta_kernel::Error::Engine(delta_kernel::EngineError::Cancelled))
         ),
         "cancellation during listing must surface from build()"
     );
@@ -461,7 +483,8 @@ async fn precancelled_incremental_snapshot_build_yields_cancelled(
     assert!(
         matches!(
             result,
-            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled)
+                | delta_kernel::Error::Engine(delta_kernel::EngineError::Cancelled))
         ),
         "a cancelled incremental snapshot build must surface KernelError::Cancelled"
     );

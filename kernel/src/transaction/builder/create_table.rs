@@ -160,17 +160,17 @@ fn ensure_table_does_not_exist(
                     "Table already exists at path: {table_path}"
                 ))
                 .into()),
-                Some(Err(crate::Error::Kernel(KernelError::FileNotFound(_)))) | None => {
+                Some(Err(crate::EngineError::FileNotFound { .. })) | None => {
                     // Path doesn't exist or empty - OK for new table
                     Ok(())
                 }
                 Some(Err(e)) => {
                     // Real error (permissions, network, etc.) - propagate
-                    Err(e)
+                    Err(e.into())
                 }
             }
         }
-        Err(crate::Error::Kernel(KernelError::FileNotFound(_))) => {
+        Err(crate::EngineError::FileNotFound { .. }) => {
             // Directory doesn't exist - this is expected for a new table.
             // The storage layer will create the full path (including _delta_log/)
             // when the commit writes the first log file via write_json_file().
@@ -178,7 +178,7 @@ fn ensure_table_does_not_exist(
         }
         Err(e) => {
             // Real error - propagate
-            Err(e)
+            Err(e.into())
         }
     }
 }

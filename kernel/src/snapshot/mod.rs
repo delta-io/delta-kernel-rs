@@ -1080,7 +1080,8 @@ impl Snapshot {
                 )?);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
-            Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
+            Err(crate::Error::Engine(crate::EngineError::FileAlreadyExists { .. }))
+            | Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
                 info!(
                     "Another writer beat us to writing CRC file at {}",
                     crc_path.location
@@ -1269,7 +1270,8 @@ impl Snapshot {
 
         let info = match write_result {
             Ok(info) => info,
-            Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
+            Err(crate::Error::Engine(crate::EngineError::FileAlreadyExists { .. }))
+            | Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
                 // NOTE: Per write_parquet_file's documentation, it should silently overwrite
                 // existing files, so we log a warning but still return the correct result.
                 warn!(

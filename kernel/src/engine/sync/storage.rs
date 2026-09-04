@@ -7,7 +7,7 @@ use url::Url;
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{DeltaResult, FileMeta, FileSlice, KernelError, StorageHandler};
+use crate::{EngineError, EngineResult, FileMeta, FileSlice, StorageHandler};
 
 pub(crate) struct SyncStorageHandler {
     store: Option<Arc<DynObjectStore>>,
@@ -34,7 +34,7 @@ impl StorageHandler for SyncStorageHandler {
     fn list_from(
         &self,
         url_path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<FileMeta>>>> {
         let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
 
         // For directory URLs, prefix == offset and the offset acts as a lower bound that still
@@ -57,13 +57,13 @@ impl StorageHandler for SyncStorageHandler {
         )
         .into_iter()
         .collect::<Result<_, _>>()
-        .map_err(KernelError::from)?;
+        .map_err(EngineError::from)?;
         metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
 
         let iter = metas.into_iter().map(move |meta| {
             let location = base_url
                 .join(meta.location.as_ref())
-                .map_err(KernelError::from)?;
+                .map_err(EngineError::from)?;
             Ok(FileMeta {
                 location,
                 last_modified: meta.last_modified.timestamp_millis(),
@@ -76,31 +76,33 @@ impl StorageHandler for SyncStorageHandler {
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<Bytes>>>> {
         let store = self.store.clone();
-        let results: Vec<DeltaResult<Bytes>> = files
+        let results: Vec<EngineResult<Bytes>> = files
             .into_iter()
             .map(|(url, _range_opt)| {
                 let (s, _, path) = resolve_scope(store.as_ref(), &url)?;
                 let get_result =
-                    futures::executor::block_on(s.get(&path)).map_err(KernelError::from)?;
-                Ok(futures::executor::block_on(get_result.bytes()).map_err(KernelError::from)?)
+                    futures::executor::block_on(s.get(&path)).map_err(EngineError::from)?;
+                futures::executor::block_on(get_result.bytes()).map_err(EngineError::from)
             })
             .collect();
         Ok(Box::new(results.into_iter()))
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> EngineResult<()> {
         put_bytes(self.store.as_ref(), path, data, overwrite)
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
-        unimplemented!("SyncStorageHandler does not implement copy");
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> EngineResult<()> {
+        Err(EngineError::external(crate::KernelError::unsupported(
+            "SyncStorageHandler does not implement copy",
+        )))
     }
 
-    fn head(&self, url: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, url: &Url) -> EngineResult<FileMeta> {
         let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
-        let meta = futures::executor::block_on(store.head(&path)).map_err(KernelError::from)?;
+        let meta = futures::executor::block_on(store.head(&path)).map_err(EngineError::from)?;
         Ok(FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
@@ -108,12 +110,12 @@ impl StorageHandler for SyncStorageHandler {
         })
     }
 
-    fn delete(&self, url: &Url) -> DeltaResult<()> {
+    fn delete(&self, url: &Url) -> EngineResult<()> {
         let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
         match futures::executor::block_on(store.delete(&path)) {
             Ok(()) => Ok(()),
             Err(crate::object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(KernelError::from(e).into()),
+            Err(error) => Err(EngineError::from(error)),
         }
     }
 }
@@ -132,7 +134,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
     use crate::utils::current_time_duration;
-    use crate::{KernelError, StorageHandler};
+    use crate::{EngineError, StorageHandler};
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
     fn get_json_filename(index: usize) -> String {
@@ -281,7 +283,7 @@ mod tests {
         let url = Url::from_file_path(tmp_dir.path().join("missing.json")).unwrap();
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            crate::Error::Kernel(KernelError::FileNotFound(_))
+            EngineError::FileNotFound { .. }
         ));
     }
 
@@ -320,10 +322,7 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from("second"), false)
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::Kernel(KernelError::FileAlreadyExists(_))
-        ));
+        assert!(matches!(err, EngineError::FileAlreadyExists { .. }));
 
         // With overwrite, it should succeed.
         storage
@@ -349,7 +348,7 @@ mod tests {
 
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            crate::Error::Kernel(KernelError::FileNotFound(_))
+            EngineError::FileNotFound { .. }
         ));
     }
 
@@ -361,7 +360,7 @@ mod tests {
 
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            crate::Error::Kernel(KernelError::FileNotFound(_))
+            EngineError::FileNotFound { .. }
         ));
         storage.delete(&url).unwrap();
     }

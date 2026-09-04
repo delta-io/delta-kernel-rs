@@ -13,11 +13,14 @@ use crate::arrow::datatypes::{
 };
 use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
-use crate::error::{DeltaResult, ErrorContext, KernelError};
+use crate::error::{DeltaResult, Error, ErrorContext, KernelError};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
-use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
+use crate::{
+    EngineData, EngineError, EngineResult, EvaluationHandler, ExpressionEvaluator,
+    PredicateEvaluator,
+};
 
 pub mod evaluate_expression;
 pub mod opaque;
@@ -257,7 +260,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+    ) -> EngineResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
             _input_schema: schema,
             expression,
@@ -269,7 +272,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         &self,
         schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
+    ) -> EngineResult<Arc<dyn PredicateEvaluator>> {
         Ok(Arc::new(DefaultPredicateEvaluator {
             _input_schema: schema,
             predicate,
@@ -279,21 +282,25 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     /// Create a single-row array with all-null leaf values. Note that if a nested struct is
     /// included in the `output_type`, the entire struct will be NULL (instead of a not-null struct
     /// with NULL fields).
-    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
+    fn null_row(&self, output_schema: SchemaRef) -> EngineResult<Box<dyn EngineData>> {
         let fields = output_schema.fields();
         let arrays = fields
-            .map(|field| Scalar::Null(field.data_type().clone()).to_array(1))
+            .map(|field| {
+                Scalar::Null(field.data_type().clone())
+                    .to_array(1)
+                    .map_err(EngineError::external)
+            })
             .try_collect()?;
         let record_batch = RecordBatch::try_new(
             Arc::new(
                 output_schema
                     .as_ref()
                     .try_into_arrow()
-                    .map_err(crate::KernelError::from)?,
+                    .map_err(EngineError::from)?,
             ),
             arrays,
         )
-        .map_err(crate::KernelError::from)?;
+        .map_err(EngineError::from)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 
@@ -301,12 +308,12 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         &self,
         schema: SchemaRef,
         rows: &[&[Scalar]],
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> EngineResult<Box<dyn EngineData>> {
         let arrow_schema: Arc<ArrowSchema> = Arc::new(
             schema
                 .as_ref()
                 .try_into_arrow()
-                .map_err(crate::KernelError::from)?,
+                .map_err(EngineError::from)?,
         );
         if rows.is_empty() {
             return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
@@ -318,13 +325,14 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         let num_fields = schema.fields().len();
         for (row_idx, row) in rows.iter().enumerate() {
             if row.len() != num_fields {
-                return Err(KernelError::invalid_struct_data(format!(
-                    "Row {} has {} scalars but schema has {} fields",
-                    row_idx,
-                    row.len(),
-                    num_fields
-                ))
-                .into());
+                return Err(EngineError::external(KernelError::invalid_struct_data(
+                    format!(
+                        "Row {} has {} scalars but schema has {} fields",
+                        row_idx,
+                        row.len(),
+                        num_fields
+                    ),
+                )));
             }
         }
 
@@ -347,14 +355,15 @@ impl EvaluationHandler for ArrowEvaluationHandler {
                                 actual: row[col_idx].data_type().to_string(),
                             })
                             .with_context(ErrorContext::Operation("append scalar to row"))
-                    })?;
+                    })
+                    .map_err(EngineError::external)?;
             }
         }
 
         let arrays: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
 
         Ok(Box::new(ArrowEngineData::new(
-            RecordBatch::try_new(arrow_schema, arrays).map_err(crate::KernelError::from)?,
+            RecordBatch::try_new(arrow_schema, arrays).map_err(EngineError::from)?,
         )))
     }
 }
@@ -367,9 +376,9 @@ pub struct DefaultExpressionEvaluator {
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
-    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+    fn evaluate(&self, batch: &dyn EngineData) -> EngineResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
-        let batch = extract_record_batch(batch)?;
+        let batch = extract_record_batch(batch).map_err(EngineError::external)?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
         //     return Err(KernelError::invalid_struct_data(format!(
@@ -385,22 +394,25 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
                 // output schema to existing data without changing it, e.g. for column mapping.
                 let array = match patch.input_path() {
                     None => Arc::new(StructArray::from(batch.clone())),
-                    Some(path) => extract_column(batch, path)?,
+                    Some(path) => extract_column(batch, path).map_err(EngineError::external)?,
                 };
-                apply_schema(&array, &self.output_type)?
+                apply_schema(&array, &self.output_type).map_err(EngineError::external)?
             }
             (expr, output_type @ DataType::Struct(_)) => {
-                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
-                apply_schema(&array_ref, output_type)?
+                let array_ref = evaluate_expression(expr, batch, Some(output_type))
+                    .map_err(into_engine_error)?;
+                apply_schema(&array_ref, output_type).map_err(EngineError::external)?
             }
             (expr, output_type) => {
-                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
-                let array_ref = apply_schema_to(&array_ref, output_type)?;
-                let arrow_type = ArrowDataType::try_from_kernel(output_type)
-                    .map_err(crate::KernelError::from)?;
+                let array_ref = evaluate_expression(expr, batch, Some(output_type))
+                    .map_err(into_engine_error)?;
+                let array_ref =
+                    apply_schema_to(&array_ref, output_type).map_err(EngineError::external)?;
+                let arrow_type =
+                    ArrowDataType::try_from_kernel(output_type).map_err(EngineError::from)?;
                 let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
                 RecordBatch::try_new(Arc::new(schema), vec![array_ref])
-                    .map_err(crate::KernelError::from)?
+                    .map_err(EngineError::from)?
             }
         };
 
@@ -415,9 +427,9 @@ pub struct DefaultPredicateEvaluator {
 }
 
 impl PredicateEvaluator for DefaultPredicateEvaluator {
-    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+    fn evaluate(&self, batch: &dyn EngineData) -> EngineResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
-        let batch = extract_record_batch(batch)?;
+        let batch = extract_record_batch(batch).map_err(EngineError::external)?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
         //     return Err(KernelError::invalid_struct_data(format!(
@@ -426,14 +438,21 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         //         batch.schema()
         //     )));
         // };
-        let array = evaluate_predicate(&self.predicate, batch, false)?;
+        let array = evaluate_predicate(&self.predicate, batch, false).map_err(into_engine_error)?;
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "output",
             ArrowDataType::Boolean,
             true,
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
-            .map_err(crate::KernelError::from)?;
+            .map_err(EngineError::from)?;
         Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+}
+
+fn into_engine_error(error: Error) -> EngineError {
+    match error {
+        Error::Engine(error) => error,
+        error => EngineError::external(error),
     }
 }

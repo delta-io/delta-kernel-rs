@@ -14,7 +14,7 @@ use crate::actions::{
 use crate::cancellation::CancellationTokenRef;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, FileMeta, KernelError, StorageHandler, Version};
+use crate::{DeltaResult, FileMeta, StorageHandler, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -201,10 +201,14 @@ impl LastCheckpointHint {
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage
-            .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())?
-            .next()
+        let mut reads = match storage
+            .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())
         {
+            Ok(reads) => reads,
+            Err(crate::EngineError::FileNotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        match reads.next() {
             Some(Ok(data)) => {
                 let result: Option<LastCheckpointHint> =
                     Self::from_bytes_with_oversized_fields_dropped(&data)
@@ -213,11 +217,11 @@ impl LastCheckpointHint {
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
-            Some(Err(crate::Error::Kernel(KernelError::FileNotFound(_)))) => {
+            Some(Err(crate::EngineError::FileNotFound { .. })) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
-            Some(Err(err)) => Err(err),
+            Some(Err(err)) => Err(err.into()),
             None => {
                 warn!("empty _last_checkpoint file");
                 Ok(None)
@@ -727,33 +731,45 @@ mod tests {
         Ok(())
     }
 
-    /// A storage handler whose every method panics, so a test can prove an operation never touched
-    /// storage.
-    struct NoIoStorageHandler;
+    struct HintReadStorageHandler {
+        missing_lazy: Option<bool>,
+    }
 
-    impl StorageHandler for NoIoStorageHandler {
+    impl StorageHandler for HintReadStorageHandler {
         fn list_from(
             &self,
             _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        ) -> crate::EngineResult<Box<dyn Iterator<Item = crate::EngineResult<FileMeta>>>> {
             panic!("list_from should not be called");
         }
         fn read_files(
             &self,
-            _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
-            panic!("read_files should not be called");
+            files: Vec<crate::FileSlice>,
+        ) -> crate::EngineResult<Box<dyn Iterator<Item = crate::EngineResult<bytes::Bytes>>>>
+        {
+            let lazy = self.missing_lazy.expect("read_files should not be called");
+            let error = crate::EngineError::file_not_found(&files[0].0);
+            if lazy {
+                Ok(Box::new(std::iter::once(Err(error))))
+            } else {
+                Err(error)
+            }
         }
-        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        fn put(
+            &self,
+            _path: &Url,
+            _data: bytes::Bytes,
+            _overwrite: bool,
+        ) -> crate::EngineResult<()> {
             panic!("put should not be called");
         }
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> crate::EngineResult<()> {
             panic!("copy_atomic should not be called");
         }
-        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        fn head(&self, _path: &Url) -> crate::EngineResult<FileMeta> {
             panic!("head should not be called");
         }
-        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        fn delete(&self, _path: &Url) -> crate::EngineResult<()> {
             panic!("delete should not be called");
         }
     }
@@ -767,10 +783,22 @@ mod tests {
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
         let token: CancellationTokenRef =
             std::sync::Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled());
-        let result = LastCheckpointHint::try_read(&NoIoStorageHandler, &log_root, Some(&token));
+        let storage = HintReadStorageHandler { missing_lazy: None };
+        let result = LastCheckpointHint::try_read(&storage, &log_root, Some(&token));
         assert!(matches!(
             result,
-            Err(crate::Error::Kernel(KernelError::Cancelled))
+            Err(crate::Error::Engine(crate::EngineError::Cancelled))
         ));
+    }
+
+    #[rstest]
+    fn missing_hint_recovers_from_eager_and_lazy_errors(#[values(false, true)] lazy: bool) {
+        let storage = HintReadStorageHandler {
+            missing_lazy: Some(lazy),
+        };
+        let log_root = Url::parse("memory:///_delta_log/").unwrap();
+        assert!(LastCheckpointHint::try_read(&storage, &log_root, None)
+            .unwrap()
+            .is_none());
     }
 }

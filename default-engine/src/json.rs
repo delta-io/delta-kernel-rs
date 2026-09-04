@@ -1,6 +1,5 @@
 //! Default Json handler implementation
 
-use std::io::BufReader;
 use std::num::NonZero;
 use std::sync::Arc;
 use std::task::Poll;
@@ -15,18 +14,17 @@ use delta_kernel::engine::arrow_utils::{
 };
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{
-    self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode,
-};
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _, PutMode};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator,
-    FileMeta, FileSize, JsonHandler, KernelError, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, EngineError, EngineResult,
+    FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use url::Url;
 
+use crate::engine_error;
 use crate::executor::TaskExecutor;
 
 #[derive(Debug)]
@@ -91,16 +89,18 @@ async fn read_json_files_impl(
     _predicate: Option<PredicateRef>,
     batch_size: usize,
     buffer_size: usize,
-) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
+) -> EngineResult<BoxStream<'static, EngineResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
     }
 
     // Build Arrow schema from only the real JSON columns, omitting any metadata columns
     // (e.g. FilePath) that the JSON reader cannot populate from the file content.
-    let json_arrow_schema = Arc::new(json_arrow_schema(&physical_schema)?);
+    let json_arrow_schema = Arc::new(json_arrow_schema(&physical_schema).map_err(engine_error)?);
     // Build the reorder index vec once; apply it to every batch via reorder_struct_array.
-    let reorder_indices: Arc<[_]> = build_json_reorder_indices(&physical_schema)?.into();
+    let reorder_indices: Arc<[_]> = build_json_reorder_indices(&physical_schema)
+        .map_err(engine_error)?
+        .into();
 
     // An iterator of futures that open each file and post-process each resulting batch.
     let file_futures = files.into_iter().map(move |file| {
@@ -112,9 +112,11 @@ async fn read_json_files_impl(
             let batch_stream = open_json_file(store, json_arrow_schema, batch_size, file).await?;
             // Re-insert synthesized metadata columns (e.g. file path) at their schema positions.
             let tagged = batch_stream
-                .map(move |result| fixup_json_read(result?, &reorder_indices, &file_path))
+                .map(move |result| {
+                    fixup_json_read(result?, &reorder_indices, &file_path).map_err(engine_error)
+                })
                 .boxed();
-            Ok::<_, delta_kernel::Error>(tagged)
+            Ok::<_, EngineError>(tagged)
         }
     });
 
@@ -134,7 +136,7 @@ async fn write_json_file_impl(
     path: Url,
     buffer: Vec<u8>,
     overwrite: bool,
-) -> DeltaResult<FileSize> {
+) -> EngineResult<FileSize> {
     let size = buffer.len() as FileSize;
     let put_mode = if overwrite {
         PutMode::Overwrite
@@ -142,14 +144,9 @@ async fn write_json_file_impl(
         PutMode::Create
     };
 
-    let path = Path::from_url_path(path.path()).map_err(delta_kernel::KernelError::from)?;
+    let path = Path::from_url_path(path.path())?;
     let result = store.put_opts(&path, buffer.into(), put_mode.into()).await;
-    result.map_err(|e| match e {
-        object_store::Error::AlreadyExists { .. } => {
-            KernelError::FileAlreadyExists(path.to_string())
-        }
-        e => e.into(),
-    })?;
+    result?;
     Ok(size)
 }
 
@@ -158,8 +155,8 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        arrow_parse_json(json_strings, output_schema)
+    ) -> EngineResult<Box<dyn EngineData>> {
+        arrow_parse_json(json_strings, output_schema).map_err(engine_error)
     }
 
     fn read_json_files(
@@ -167,7 +164,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         self.read_json_files_with_cancellation(files, physical_schema, predicate, None)
     }
 
@@ -177,7 +174,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         let future = read_json_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -200,97 +197,90 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<FileSize> {
-        self.task_executor.block_on(write_json_file_impl(
+        Ok(self.task_executor.block_on(write_json_file_impl(
             self.store.clone(),
             path.clone(),
             to_json_bytes(data)?,
             overwrite,
-        ))
+        ))?)
     }
 }
 
 /// Opens a JSON file and returns a stream of record batches
+///
+/// Syntax failures and incomplete records are corrupt files; schema conversion failures remain
+/// external errors. Each file stream stops after its first failure.
 async fn open_json_file(
     store: Arc<DynObjectStore>,
     schema: ArrowSchemaRef,
     batch_size: usize,
     file_meta: FileMeta,
-) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
-    let path =
-        Path::from_url_path(file_meta.location.path()).map_err(delta_kernel::KernelError::from)?;
-    let result = store
-        .get(&path)
-        .await
-        .map_err(delta_kernel::KernelError::from)?;
+) -> EngineResult<BoxStream<'static, EngineResult<RecordBatch>>> {
+    let path = Path::from_url_path(file_meta.location.path())?;
+    let result = store.get(&path).await.map_err(EngineError::from)?;
     let builder = ReaderBuilder::new(schema)
         .with_batch_size(batch_size)
         .with_coerce_primitive(true);
-    match result.payload {
-        GetResultPayload::File(file, _) => {
-            let reader = builder
-                .build(BufReader::new(file))
-                .map_err(delta_kernel::KernelError::from)?;
-            let reader = futures::stream::iter(reader)
-                .map_err(|error| delta_kernel::Error::from(KernelError::from(error)));
-
-            // Emit exactly one error, then stop the stream. We check seen_error BEFORE
-            // updating it so the first error passes through, but subsequent items don't.
-            // This is necessary because Arrow's Reader loops the same error indefinitely.
-            let mut seen_error = false;
-            let reader = reader.take_while(move |result| {
-                let return_this = !seen_error;
-                if result.is_err() {
-                    seen_error = true;
-                }
-                futures::future::ready(return_this)
-            });
-            Ok(reader.boxed())
+    let mut decoder = builder.build_decoder().map_err(EngineError::from)?;
+    let mut input = result.into_stream().map_err(EngineError::from);
+    let mut buffered = Bytes::new();
+    let mut finished = false;
+    let stream = futures::stream::poll_fn(move |cx| {
+        if finished {
+            return Poll::Ready(None);
         }
-        GetResultPayload::Stream(s) => {
-            let mut decoder = builder
-                .build_decoder()
-                .map_err(delta_kernel::KernelError::from)?;
-            let mut input = s.map_err(|error| delta_kernel::Error::from(KernelError::from(error)));
-            let mut buffered = Bytes::new();
-            let s = futures::stream::poll_fn(move |cx| {
-                loop {
-                    if buffered.is_empty() {
-                        buffered = match ready!(input.poll_next_unpin(cx)) {
-                            Some(Ok(b)) => b,
-                            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                            None => break,
-                        };
+        loop {
+            if buffered.is_empty() {
+                buffered = match ready!(input.poll_next_unpin(cx)) {
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(error)) => {
+                        finished = true;
+                        return Poll::Ready(Some(Err(error)));
                     }
-
-                    // NB (from Decoder::decode docs):
-                    // Read JSON objects from `buf` (param), returning the number of bytes read
-                    //
-                    // This method returns once `batch_size` objects have been parsed since the
-                    // last call to [`Self::flush`], or `buf` is exhausted. Any remaining bytes
-                    // should be included in the next call to [`Self::decode`]
-                    let decoded = match decoder.decode(buffered.as_ref()) {
-                        Ok(decoded) => decoded,
-                        Err(e) => return Poll::Ready(Some(Err(KernelError::from(e).into()))),
-                    };
-
-                    let read = buffered.len();
-                    buffered.advance(decoded);
-                    if decoded != read {
+                    None => {
+                        finished = true;
                         break;
                     }
-                }
+                };
+            }
 
-                Poll::Ready(
-                    decoder
-                        .flush()
-                        .map_err(KernelError::from)
-                        .map_err(delta_kernel::Error::from)
-                        .transpose(),
-                )
-            });
-            Ok(s.boxed())
+            let decoded = match decoder.decode(buffered.as_ref()) {
+                Ok(decoded) => decoded,
+                Err(source) => {
+                    finished = true;
+                    return Poll::Ready(Some(Err(EngineError::CorruptFile {
+                        path: file_meta.location.to_string(),
+                        source: Some(Box::new(source)),
+                    })));
+                }
+            };
+
+            let read = buffered.len();
+            buffered.advance(decoded);
+            if decoded != read {
+                break;
+            }
         }
-    }
+
+        let incomplete_record = decoder.has_partial_record();
+        Poll::Ready(
+            decoder
+                .flush()
+                .map_err(|source| {
+                    finished = true;
+                    if incomplete_record {
+                        EngineError::CorruptFile {
+                            path: file_meta.location.to_string(),
+                            source: Some(Box::new(source)),
+                        }
+                    } else {
+                        EngineError::from(source)
+                    }
+                })
+                .transpose(),
+        )
+    });
+    Ok(stream.boxed())
 }
 
 #[cfg(test)]
@@ -304,23 +294,26 @@ mod tests {
     use delta_kernel::actions::get_commit_schema;
     use delta_kernel::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
     use delta_kernel::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use delta_kernel::arrow::error::ArrowError;
     use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+        self, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
     };
     use delta_kernel::schema::schema_ref;
+    use delta_kernel::{Engine, KernelError};
     use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
     use futures::future;
     use itertools::Itertools;
+    use rstest::rstest;
     use serde_json::json;
     use test_utils::engine_contract::test_json_handler_file_path_contract;
-    use tracing::info;
 
     use super::*;
     use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
+    use crate::DefaultEngineBuilder;
 
     /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests. Note
     /// that since the keys are resolved in order, requests to subsequent keys in the order will
@@ -690,65 +683,69 @@ mod tests {
         );
     }
 
-    use std::io::Write;
-
-    use delta_kernel::Engine;
-    use tempfile::NamedTempFile;
-
-    use crate::DefaultEngineBuilder;
-
-    fn make_invalid_named_temp() -> (NamedTempFile, Url) {
-        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        write!(temp_file, r#"this is not valid json"#).expect("Failed to write to temp file");
-        let path = temp_file.path();
-        let file_url = Url::from_file_path(path).expect("Failed to create file URL");
-
-        info!("Created temporary malformed file at: {file_url}");
-        (temp_file, file_url)
-    }
-
-    #[test]
-    fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
-        let _ = tracing_subscriber::fmt().try_init();
-        let (_temp_file1, file_url1) = make_invalid_named_temp();
-        let (_temp_file2, file_url2) = make_invalid_named_temp();
-        let schema = schema_ref! { nullable "name": BOOLEAN };
-        let default_engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build();
-
-        // Helper to check that we get expected number of errors then stream ends
-        let check_errors = |file_urls: Vec<_>, expected_errors: usize| {
-            let file_vec: Vec<_> = file_urls
-                .into_iter()
-                .map(|url| FileMeta::new(url, 1, 1))
-                .collect();
-
-            let mut iter = default_engine
-                .json_handler()
-                .read_json_files(&file_vec, schema.clone(), None)
-                .unwrap();
-
-            for _ in 0..expected_errors {
-                assert!(
-                    iter.next().unwrap().is_err(),
-                    "Read succeeded unexpectedly. The JSON should have been invalid."
-                );
-            }
-
-            assert!(
-                iter.next().is_none(),
-                "The stream should end once the read result fails"
-            );
+    #[rstest]
+    #[case::malformed("this is not valid json", true)]
+    #[case::truncated(r#"{"name": true"#, true)]
+    #[case::schema_mismatch(r#"{"name": {"nested": true}}"#, false)]
+    fn test_read_json_errors_retain_sources_and_stop_each_file(
+        #[case] contents: &str,
+        #[case] corrupt: bool,
+        #[values(false, true)] local: bool,
+        #[values(1, 2)] file_count: usize,
+    ) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let (store, root): (Arc<DynObjectStore>, Url) = if local {
+            (
+                Arc::new(LocalFileSystem::new()),
+                Url::from_directory_path(tempdir.path()).unwrap(),
+            )
+        } else {
+            (Arc::new(InMemory::new()), Url::parse("memory:///").unwrap())
         };
-
-        // CASE 1: Single failing file
-        info!("\nAttempting to read single malformed JSON file...");
-        check_errors(vec![file_url1.clone()], 1);
-
-        // CASE 2: Two failing files
-        info!("\nAttempting to read two malformed JSON files...");
-        check_errors(vec![file_url1, file_url2], 2);
-
-        Ok(())
+        let schema = schema_ref! { nullable "name": BOOLEAN };
+        let engine = DefaultEngineBuilder::new(store).build();
+        let files: Vec<_> = (0..file_count)
+            .map(|index| {
+                let location = root.join(&format!("{index}.json")).unwrap();
+                engine
+                    .storage_handler()
+                    .put(
+                        &location,
+                        Bytes::copy_from_slice(contents.as_bytes()),
+                        false,
+                    )
+                    .unwrap();
+                engine.storage_handler().head(&location).unwrap()
+            })
+            .collect();
+        let mut batches = engine
+            .json_handler()
+            .read_json_files(&files, schema, None)
+            .unwrap();
+        for file in files {
+            let error = batches
+                .next()
+                .unwrap()
+                .err()
+                .expect("JSON read should fail");
+            let source = match error {
+                EngineError::CorruptFile {
+                    path,
+                    source: Some(source),
+                } if corrupt => {
+                    assert_eq!(path, file.location.to_string());
+                    source
+                }
+                EngineError::External {
+                    source: Some(source),
+                    ..
+                } if !corrupt => source,
+                error => panic!("Unexpected JSON read error: {error:?}"),
+            };
+            assert!(source.downcast_ref::<ArrowError>().is_some());
+        }
+        assert!(batches.next().is_none());
+        assert!(batches.next().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -928,8 +925,12 @@ mod tests {
         } else {
             // Verify the second write fails with FileAlreadyExists error
             match result {
-                Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(err_path))) => {
-                    assert_eq!(err_path, object_path.to_string());
+                Err(delta_kernel::Error::Engine(EngineError::FileAlreadyExists {
+                    path,
+                    source,
+                })) => {
+                    assert_eq!(path, object_path.to_string());
+                    assert!(source.is_some());
                 }
                 _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),
             }

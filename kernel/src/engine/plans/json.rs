@@ -5,12 +5,14 @@ use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
+use super::into_engine_error;
 use crate::engine::arrow_utils;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    FilteredEngineData, JsonHandler, KernelError, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, EngineError, EngineResult,
+    FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
+    PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
@@ -41,8 +43,8 @@ impl JsonHandler for PlanBasedJsonHandler {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        arrow_utils::parse_json(json_strings, output_schema)
+    ) -> EngineResult<Box<dyn EngineData>> {
+        arrow_utils::parse_json(json_strings, output_schema).map_err(EngineError::external)
     }
 
     fn read_json_files(
@@ -50,13 +52,20 @@ impl JsonHandler for PlanBasedJsonHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
-        let query = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)?.build()?;
-        self.executor
-            .execute_op(Operation::QueryPlan(query))?
-            .into_data()
+        let query = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)
+            .and_then(|builder| builder.build())
+            .map_err(EngineError::external)?;
+        let results = self
+            .executor
+            .execute_op(Operation::QueryPlan(query))
+            .and_then(|result| result.into_data())
+            .map_err(into_engine_error)?;
+        Ok(Box::new(
+            results.map(|result| result.map_err(into_engine_error)),
+        ))
     }
 
     fn write_json_file(
@@ -66,10 +75,10 @@ impl JsonHandler for PlanBasedJsonHandler {
         overwrite: bool,
     ) -> DeltaResult<FileSize> {
         let Some(fallback) = &self.fallback else {
-            return Err(KernelError::unsupported(
+            return Err(EngineError::external(KernelError::unsupported(
                 "PlanBasedJsonHandler does not support write_json_file yet, and no fallback \
                  handler is configured",
-            )
+            ))
             .into());
         };
         debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
@@ -97,7 +106,7 @@ mod tests {
     use crate::engine_data::FilteredEngineData;
     use crate::schema::{schema_ref, SchemaRef};
     use crate::{
-        DeltaResult, Engine as _, EngineData, FileDataReadResultIterator, FileMeta,
+        Engine as _, EngineData, EngineResult, FileDataReadResultIterator, FileMeta,
         JsonHandler as _, ParquetHandler as _,
     };
 
@@ -190,7 +199,7 @@ mod tests {
     #[rstest]
     #[case(make_handler().read_json_files(&[], test_schema(), None))]
     #[case(make_parquet_handler().read_parquet_files(&[], test_schema(), None))]
-    fn empty_input_yields_no_rows(#[case] res: DeltaResult<FileDataReadResultIterator>) {
+    fn empty_input_yields_no_rows(#[case] res: EngineResult<FileDataReadResultIterator>) {
         let rows: usize = res.unwrap().map(|batch| batch.unwrap().len()).sum();
         assert_eq!(rows, 0);
     }

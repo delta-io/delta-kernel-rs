@@ -54,7 +54,7 @@ pub enum IoOperation {
     ///
     /// Returns [`PlanResult::Unit`](crate::plans::PlanResult::Unit) on success. If `overwrite`
     /// is false and the file already exists, the executor should return
-    /// [`KernelError::FileAlreadyExists`](crate::KernelError::FileAlreadyExists).
+    /// [`EngineError::FileAlreadyExists`](crate::EngineError::FileAlreadyExists).
     WriteBytes {
         url: Url,
         data: Bytes,
@@ -68,7 +68,7 @@ pub enum IoOperation {
     /// Atomically copy a file from `source` to `destination`.
     ///
     /// The copy must be atomic: if `destination` already exists, the executor should return
-    /// [`KernelError::FileAlreadyExists`](crate::KernelError::FileAlreadyExists) without modifying
+    /// [`EngineError::FileAlreadyExists`](crate::EngineError::FileAlreadyExists) without modifying
     /// it.
     /// Returns [`PlanResult::Unit`](crate::plans::PlanResult::Unit) on success.
     AtomicCopy { source: Url, destination: Url },

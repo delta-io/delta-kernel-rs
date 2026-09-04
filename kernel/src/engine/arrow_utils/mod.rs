@@ -1548,10 +1548,10 @@ pub(crate) fn to_json_bytes(
     let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
-        let batch = filter_to_record_batch(chunk?)?;
-        writer.write(&batch).map_err(crate::KernelError::from)?;
+        let batch = filter_to_record_batch(chunk?).map_err(crate::EngineError::external)?;
+        writer.write(&batch).map_err(crate::EngineError::from)?;
     }
-    writer.finish().map_err(crate::KernelError::from)?;
+    writer.finish().map_err(crate::EngineError::from)?;
     Ok(writer.into_inner())
 }
 

@@ -176,8 +176,13 @@ mod tests {
             .expect_err("write_json_file has no plan-execution path and no fallback");
         assert!(
             matches!(
-                err,
-                delta_kernel::Error::Kernel(delta_kernel::KernelError::Unsupported(_))
+                &err,
+                delta_kernel::Error::Engine(delta_kernel::EngineError::External {
+                    source: Some(source), ..
+                }) if matches!(
+                    source.downcast_ref::<delta_kernel::KernelError>(),
+                    Some(delta_kernel::KernelError::Unsupported(_))
+                )
             ),
             "expected an unsupported error, got: {err:?}",
         );

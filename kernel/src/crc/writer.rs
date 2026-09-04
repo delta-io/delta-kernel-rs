@@ -17,7 +17,7 @@ use crate::{DeltaResult, Engine, KernelError};
 ///
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
-/// `Err(KernelError::FileAlreadyExists)`.
+/// `Error::Engine(EngineError::FileAlreadyExists { .. })`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
     require!(
         crc.file_stats_state.is_complete(),
@@ -44,6 +44,7 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
     engine
         .storage_handler()
         .put(path, data.into(), false /* overwrite */)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -235,7 +236,9 @@ mod tests {
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(
             result,
-            Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_)))
+            Err(crate::Error::Engine(
+                crate::EngineError::FileAlreadyExists { .. }
+            ))
         ));
     }
 

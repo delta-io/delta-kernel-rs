@@ -9,7 +9,7 @@ use crate::metrics::events::emit_parquet_read_completed;
 use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
-    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData,
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, EngineResult,
     FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
@@ -61,7 +61,7 @@ impl ParquetHandler for MeteredParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         let inner = self
             .inner
             .read_parquet_files(files, physical_schema, predicate)?;
@@ -74,7 +74,7 @@ impl ParquetHandler for MeteredParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         let inner = self.inner.read_parquet_files_with_cancellation(
             files,
             physical_schema,
@@ -92,7 +92,7 @@ impl ParquetHandler for MeteredParquetHandler {
         self.inner.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> EngineResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 
@@ -100,7 +100,7 @@ impl ParquetHandler for MeteredParquetHandler {
         &self,
         file: &FileMeta,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<ParquetFooter> {
+    ) -> EngineResult<ParquetFooter> {
         self.inner
             .read_parquet_footer_with_cancellation(file, cancellation_token)
     }
@@ -130,7 +130,7 @@ mod tests {
             _files: &[FileMeta],
             _physical_schema: SchemaRef,
             _predicate: Option<PredicateRef>,
-        ) -> DeltaResult<FileDataReadResultIterator> {
+        ) -> EngineResult<FileDataReadResultIterator> {
             Ok(Box::new(std::iter::empty()))
         }
 
@@ -140,7 +140,7 @@ mod tests {
             _physical_schema: SchemaRef,
             _predicate: Option<PredicateRef>,
             _cancellation_token: Option<CancellationTokenRef>,
-        ) -> DeltaResult<FileDataReadResultIterator> {
+        ) -> EngineResult<FileDataReadResultIterator> {
             self.cancellation_read_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(Box::new(std::iter::empty()))
@@ -154,7 +154,7 @@ mod tests {
             Ok(())
         }
 
-        fn read_parquet_footer(&self, _file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        fn read_parquet_footer(&self, _file: &FileMeta) -> EngineResult<ParquetFooter> {
             unreachable!("not exercised in these tests")
         }
     }

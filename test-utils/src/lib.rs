@@ -1699,7 +1699,7 @@ impl JsonHandler for CapturingJsonHandler {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> delta_kernel::EngineResult<Box<dyn EngineData>> {
         self.inner.parse_json(json_strings, output_schema)
     }
 
@@ -1708,7 +1708,7 @@ impl JsonHandler for CapturingJsonHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> delta_kernel::EngineResult<FileDataReadResultIterator> {
         self.inner
             .read_json_files(files, physical_schema, predicate)
     }
@@ -1719,7 +1719,7 @@ impl JsonHandler for CapturingJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> delta_kernel::EngineResult<FileDataReadResultIterator> {
         capture_first_token(&self.seen, &cancellation_token);
         self.inner.read_json_files_with_cancellation(
             files,
@@ -1750,7 +1750,7 @@ impl ParquetHandler for CapturingParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> delta_kernel::EngineResult<FileDataReadResultIterator> {
         self.inner
             .read_parquet_files(files, physical_schema, predicate)
     }
@@ -1761,7 +1761,7 @@ impl ParquetHandler for CapturingParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> delta_kernel::EngineResult<FileDataReadResultIterator> {
         capture_first_token(&self.seen, &cancellation_token);
         self.inner.read_parquet_files_with_cancellation(
             files,
@@ -1774,12 +1774,12 @@ impl ParquetHandler for CapturingParquetHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        data: FileDataReadResultIterator,
+        data: delta_kernel::DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         self.inner.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> delta_kernel::EngineResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 }

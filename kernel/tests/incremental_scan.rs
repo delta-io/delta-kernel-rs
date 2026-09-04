@@ -448,7 +448,7 @@ async fn missing_commit_file_surfaces_error_during_iteration(
     assert!(
         matches!(
             err,
-            delta_kernel::Error::Kernel(delta_kernel::KernelError::FileNotFound(_))
+            delta_kernel::Error::Engine(delta_kernel::EngineError::FileNotFound { .. })
         ),
         "expected FileNotFound, got {err:?}"
     );

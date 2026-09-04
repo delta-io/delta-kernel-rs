@@ -1704,7 +1704,7 @@ impl ParquetHandler for RecordingParquetHandler {
         files: &[FileMeta],
         physical_schema: schema::SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> crate::EngineResult<FileDataReadResultIterator> {
         self.reads.lock().unwrap().push(RecordedParquetRead {
             files: files.iter().map(|file| file.location.to_string()).collect(),
             physical_schema: physical_schema.clone(),
@@ -1714,7 +1714,7 @@ impl ParquetHandler for RecordingParquetHandler {
             .read_parquet_files(files, physical_schema, predicate)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> crate::EngineResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 
@@ -2208,11 +2208,11 @@ impl ParquetHandler for EmptyParquetHandler {
         _files: &[FileMeta],
         _schema: schema::SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> crate::EngineResult<FileDataReadResultIterator> {
         Ok(Box::new(std::iter::empty()))
     }
 
-    fn read_parquet_footer(&self, _file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, _file: &FileMeta) -> crate::EngineResult<ParquetFooter> {
         unimplemented!()
     }
 

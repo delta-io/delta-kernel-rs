@@ -5,8 +5,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use url::Url;
 
+use super::into_engine_error;
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use crate::{DeltaResult, FileMeta, FileSlice, KernelError, StorageHandler};
+use crate::{EngineError, EngineResult, FileMeta, FileSlice, KernelError, StorageHandler};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
 pub struct PlanBasedStorageHandler {
@@ -14,12 +15,15 @@ pub struct PlanBasedStorageHandler {
 }
 
 impl PlanBasedStorageHandler {
+    /// Creates a handler that executes storage operations through `executor`.
     pub fn new(executor: Arc<dyn PlanExecutor>) -> Self {
         Self { executor }
     }
 
-    fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
-        self.executor.execute_op(Operation::IoOperation(op))
+    fn execute_io(&self, op: IoOperation) -> EngineResult<PlanResult> {
+        self.executor
+            .execute_op(Operation::IoOperation(op))
+            .map_err(into_engine_error)
     }
 }
 
@@ -27,61 +31,81 @@ impl StorageHandler for PlanBasedStorageHandler {
     fn list_from(
         &self,
         path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        Ok(self
+    ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<FileMeta>>>> {
+        let results = self
             .execute_io(IoOperation::file_listing(path.clone()))?
-            .into_file_meta()?)
+            .into_file_meta()
+            .map_err(into_engine_error)?;
+        Ok(Box::new(
+            results.map(|result| result.map_err(into_engine_error)),
+        ))
     }
 
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        Ok(self
+    ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<Bytes>>>> {
+        let results = self
             .execute_io(IoOperation::read_bytes(files))?
-            .into_bytes()?)
+            .into_bytes()
+            .map_err(into_engine_error)?;
+        Ok(Box::new(
+            results.map(|result| result.map_err(into_engine_error)),
+        ))
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> EngineResult<()> {
         self.execute_io(IoOperation::atomic_copy(src.clone(), dest.clone()))?
             .into_unit()
+            .map_err(into_engine_error)
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> EngineResult<()> {
         self.execute_io(IoOperation::write_bytes(path.clone(), data, overwrite))?
             .into_unit()
+            .map_err(into_engine_error)
     }
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &Url) -> EngineResult<FileMeta> {
         let mut results = self
             .execute_io(IoOperation::head_file(path.clone()))?
-            .into_file_meta()?;
-        let first = results.next().transpose()?.ok_or_else(|| {
-            KernelError::Plan(crate::plans::PlanError::OutputCount {
-                operation: "head file",
-                expected: 1,
-                actual_at_least: 0,
-            })
-        })?;
-        if results.next().transpose()?.is_some() {
-            return Err(KernelError::Plan(crate::plans::PlanError::OutputCount {
-                operation: "head file",
-                expected: 1,
-                actual_at_least: 2,
-            })
-            .into());
+            .into_file_meta()
+            .map_err(into_engine_error)?;
+        let first = results
+            .next()
+            .transpose()
+            .map_err(into_engine_error)?
+            .ok_or_else(|| {
+                EngineError::external(KernelError::Plan(crate::plans::PlanError::OutputCount {
+                    operation: "head file",
+                    expected: 1,
+                    actual_at_least: 0,
+                }))
+            })?;
+        if results
+            .next()
+            .transpose()
+            .map_err(into_engine_error)?
+            .is_some()
+        {
+            return Err(EngineError::external(KernelError::Plan(
+                crate::plans::PlanError::OutputCount {
+                    operation: "head file",
+                    expected: 1,
+                    actual_at_least: 2,
+                },
+            )));
         }
         Ok(first)
     }
 
-    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+    fn delete(&self, _path: &Url) -> EngineResult<()> {
         // TODO(#2820): implement here once supported as IoOperation.
         // Intentionally do not use a fallback because we expect this SHOULD be implemented via
         // plan-execution.
-        Err(
-            KernelError::unsupported("PlanBasedStorageHandler does not yet implement delete")
-                .into(),
-        )
+        Err(EngineError::external(KernelError::unsupported(
+            "PlanBasedStorageHandler does not yet implement delete",
+        )))
     }
 }
 
@@ -99,7 +123,7 @@ mod tests {
 
     use super::PlanBasedStorageHandler;
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::{KernelError, StorageHandler as _};
+    use crate::{EngineError, StorageHandler as _};
 
     fn make_handler() -> PlanBasedStorageHandler {
         PlanBasedStorageHandler::new(Arc::new(SyncPlanExecutor::default()))
@@ -162,10 +186,7 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from_static(b"second"), false)
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::Kernel(KernelError::FileAlreadyExists(_))
-        ));
+        assert!(matches!(err, EngineError::FileAlreadyExists { .. }));
 
         // With `overwrite = true`, the second write succeeds.
         storage
@@ -187,9 +208,6 @@ mod tests {
         // Errors on missing file
         let url = Url::from_file_path(tmp.path().join("missing.json")).unwrap();
         let err = make_handler().head(&url).unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::Kernel(KernelError::FileNotFound(_))
-        ));
+        assert!(matches!(err, EngineError::FileNotFound { .. }));
     }
 }

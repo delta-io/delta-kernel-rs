@@ -3,6 +3,7 @@
 mod delta_error;
 mod delta_error_conditions;
 pub(crate) mod delta_errors;
+mod engine_error;
 mod ffi_contract;
 
 use std::backtrace::{Backtrace, BacktraceStatus};
@@ -12,6 +13,9 @@ use std::str::Utf8Error;
 
 pub use delta_error::{DeltaError, DeltaErrorParameter};
 pub use delta_error_conditions::DeltaErrorCondition;
+pub use engine_error::{
+    EngineError, EngineResult, EngineResultIterator, EngineResultIteratorStatic,
+};
 pub use ffi_contract::FfiContractError;
 
 #[cfg(feature = "need-arrow")]
@@ -120,12 +124,15 @@ pub type DeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + 
 pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
 
 /// An error returned by a Delta Kernel operation.
-#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A stable, user-facing Delta failure.
     #[error(transparent)]
     Delta(#[from] DeltaError),
+
+    /// A failure originating in an engine operation.
+    #[error(transparent)]
+    Engine(#[from] EngineError),
 
     /// A failure originating in kernel implementation code.
     #[error(transparent)]

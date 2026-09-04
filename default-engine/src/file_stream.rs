@@ -6,7 +6,7 @@ use std::task::{ready, Context, Poll};
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::{DeltaResult, FileMeta};
+use delta_kernel::{EngineResult, FileMeta};
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
@@ -14,7 +14,7 @@ use futures::FutureExt;
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 /// cbindgen:ignore
 pub type FileOpenFuture =
-    BoxFuture<'static, DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>>>;
+    BoxFuture<'static, EngineResult<BoxStream<'static, EngineResult<RecordBatch>>>>;
 
 /// Generic API for opening a file using an [`ObjectStore`] and resolving to a
 /// stream of [`RecordBatch`]
@@ -23,7 +23,7 @@ pub type FileOpenFuture =
 pub trait FileOpener: Send + Unpin {
     /// Asynchronously open the specified file and return a stream
     /// of [`RecordBatch`]
-    fn open(&self, file_meta: FileMeta, range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture>;
+    fn open(&self, file_meta: FileMeta, range: Option<Range<i64>>) -> EngineResult<FileOpenFuture>;
 }
 
 /// Describes the behavior of the `FileStream` if file opening or scanning fails
@@ -42,7 +42,7 @@ pub enum OnError {
 /// is ready
 enum NextOpen {
     Pending(FileOpenFuture),
-    Ready(DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>>),
+    Ready(EngineResult<BoxStream<'static, EngineResult<RecordBatch>>>),
 }
 
 enum FileStreamState {
@@ -58,7 +58,7 @@ enum FileStreamState {
     /// returned by [`FileOpener::open`]
     Scan {
         /// The reader instance
-        reader: BoxStream<'static, DeltaResult<RecordBatch>>,
+        reader: BoxStream<'static, EngineResult<RecordBatch>>,
         /// A [`FileOpenFuture`] for the next file to be processed,
         /// and its corresponding partition column values, if any.
         /// This allows the next file to be opened in parallel while the
@@ -95,7 +95,7 @@ impl FileStream {
         files: impl IntoIterator<Item = FileMeta>,
         schema: ArrowSchemaRef,
         file_opener: Box<dyn FileOpener>,
-    ) -> DeltaResult<Self> {
+    ) -> EngineResult<Self> {
         Ok(Self {
             file_iter: files.into_iter().collect(),
             projected_schema: schema,
@@ -118,12 +118,12 @@ impl FileStream {
     ///
     /// Since file opening is mostly IO (and may involve a
     /// bunch of sequential IO), it can be parallelized with decoding.
-    fn start_next_file(&mut self) -> Option<DeltaResult<FileOpenFuture>> {
+    fn start_next_file(&mut self) -> Option<EngineResult<FileOpenFuture>> {
         let file_meta = self.file_iter.pop_front()?;
         Some(self.file_opener.open(file_meta, None))
     }
 
-    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<DeltaResult<RecordBatch>>> {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<EngineResult<RecordBatch>>> {
         loop {
             match &mut self.state {
                 FileStreamState::Idle => match self.start_next_file().transpose() {
@@ -221,7 +221,7 @@ impl FileStream {
 }
 
 impl Stream for FileStream {
-    type Item = DeltaResult<RecordBatch>;
+    type Item = EngineResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_inner(cx)

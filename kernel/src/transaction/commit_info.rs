@@ -107,7 +107,7 @@ impl<S> Transaction<S> {
                     Arc::new(wrapped_expr),
                     wrapped_schema.into(),
                 )?;
-                evaluator.evaluate(engine_commit_info.as_ref())
+                Ok(evaluator.evaluate(engine_commit_info.as_ref())?)
             }
             None => kernel_commit_info.into_engine_data(LOG_COMMIT_INFO_SCHEMA.clone(), engine),
         }

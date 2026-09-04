@@ -159,7 +159,10 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
+            Err(delta_kernel::Error::Engine(delta_kernel::EngineError::FileAlreadyExists {
+                ..
+            }))
+            | Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
                 info!("version 0 commit conflict: commit file already exists");
                 Ok(CommitResponse::Conflict { version: 0 })
             }
@@ -294,8 +297,8 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
                 Ok(_) => (),
-                Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(_))) => (),
-                Err(e) => return Err(e),
+                Err(delta_kernel::EngineError::FileAlreadyExists { .. }) => (),
+                Err(e) => return Err(e.into()),
             }
         }
 

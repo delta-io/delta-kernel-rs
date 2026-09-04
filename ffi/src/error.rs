@@ -1,4 +1,4 @@
-use delta_kernel::{DeltaResult, Error, KernelError};
+use delta_kernel::{DeltaResult, EngineError as RustEngineError, Error, KernelError};
 
 use crate::handle::Handle;
 use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelStringSlice};
@@ -112,6 +112,8 @@ pub enum FFIKernelError {
     LogCompactionError = 80,
     ArrowEngineError = 81,
     PlanError = 82,
+    CorruptFileError = 83,
+    ExternalEngineError = 84,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -233,6 +235,20 @@ impl From<Error> for FFIKernelError {
         match error {
             Error::Kernel(error) => error.into(),
             Error::Delta(_) => Self::DeltaError,
+            Error::Engine(error) => error.into(),
+        }
+    }
+}
+
+impl From<RustEngineError> for FFIKernelError {
+    fn from(error: RustEngineError) -> Self {
+        match error {
+            RustEngineError::FileNotFound { .. } => Self::FileNotFoundError,
+            RustEngineError::FileAlreadyExists { .. } => Self::FileAlreadyExists,
+            RustEngineError::CorruptFile { .. } => Self::CorruptFileError,
+            RustEngineError::Cancelled => Self::CancelledError,
+            RustEngineError::ParseError { .. } => Self::ParseError,
+            RustEngineError::External { .. } => Self::ExternalEngineError,
             _ => Self::UnknownError,
         }
     }
@@ -448,6 +464,8 @@ impl From<EngineExecError> for KernelError {
             | FFIKernelError::LogCompactionError
             | FFIKernelError::ArrowEngineError
             | FFIKernelError::PlanError
+            | FFIKernelError::CorruptFileError
+            | FFIKernelError::ExternalEngineError
             | FFIKernelError::IntegerConversionError
             | FFIKernelError::NumericOverflowError
             | FFIKernelError::JsonSerializationError
@@ -615,12 +633,58 @@ mod error_code_tests {
         assert_eq!(FFIKernelError::LogCompactionError as i32, 80);
         assert_eq!(FFIKernelError::ArrowEngineError as i32, 81);
         assert_eq!(FFIKernelError::PlanError as i32, 82);
+        assert_eq!(FFIKernelError::CorruptFileError as i32, 83);
+        assert_eq!(FFIKernelError::ExternalEngineError as i32, 84);
     }
 
     #[test]
     fn appended_error_codes_have_stable_discriminants() {
         assert_eq!(FFIKernelError::InvalidTransactionStateError as i32, 46);
         assert_eq!(FFIKernelError::DeltaError as i32, 47);
+    }
+
+    #[rstest::rstest]
+    #[case(
+        RustEngineError::file_not_found("missing"),
+        FFIKernelError::FileNotFoundError
+    )]
+    #[case(
+        RustEngineError::file_already_exists("existing"),
+        FFIKernelError::FileAlreadyExists
+    )]
+    #[case(
+        RustEngineError::CorruptFile { path: "corrupt".into(), source: None },
+        FFIKernelError::CorruptFileError
+    )]
+    #[case(RustEngineError::Cancelled, FFIKernelError::CancelledError)]
+    #[case(
+        RustEngineError::ParseError {
+            value: "bad".into(),
+            data_type: delta_kernel::schema::DataType::INTEGER,
+            source: None,
+        },
+        FFIKernelError::ParseError
+    )]
+    #[case(
+        RustEngineError::external(std::io::Error::other("native failure")),
+        FFIKernelError::ExternalEngineError
+    )]
+    fn engine_errors_have_explicit_ffi_codes(
+        #[case] error: RustEngineError,
+        #[case] expected: FFIKernelError,
+    ) {
+        assert_eq!(FFIKernelError::from(Error::Engine(error)), expected);
+    }
+
+    #[test]
+    fn public_error_categories_are_exhaustive() {
+        let error = Error::from(RustEngineError::Cancelled);
+        let category = match error {
+            Error::Delta(_) => "delta",
+            Error::Engine(_) => "engine",
+            Error::Kernel(_) => "kernel",
+        };
+        assert_eq!(category, "engine");
     }
 
     #[test]

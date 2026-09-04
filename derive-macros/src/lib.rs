@@ -444,7 +444,7 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
                         .map_err(delta_kernel::KernelError::from)?),*
                 ];
                 let evaluator = engine.evaluation_handler();
-                evaluator.create_one(schema, &values)
+                Ok(evaluator.create_one(schema, &values)?)
             }
         }
     };

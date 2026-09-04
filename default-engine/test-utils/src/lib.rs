@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel::arrow::array::{RecordBatch, StringArray};
 use delta_kernel::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::{DeltaResult, EngineData, KernelError};
+use delta_kernel::{DeltaResult, EngineData, EngineResult, KernelError};
 
 /// Convert an `EngineData` into a `RecordBatch`. Panics if the underlying engine data is not
 /// `ArrowEngineData`.
@@ -24,13 +24,11 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
 }
 
 /// `?`-friendly variant of [`into_record_batch`] for use inside iterators that yield
-/// `DeltaResult<Box<dyn EngineData>>`.
+/// `EngineResult<Box<dyn EngineData>>`. Retains read failures and reports conversion failures.
 pub fn try_into_record_batch(
-    engine_data: DeltaResult<Box<dyn EngineData>>,
+    engine_data: EngineResult<Box<dyn EngineData>>,
 ) -> DeltaResult<RecordBatch> {
-    engine_data
-        .and_then(ArrowEngineData::try_from_engine_data)
-        .map(Into::into)
+    ArrowEngineData::try_from_engine_data(engine_data?).map(Into::into)
 }
 
 /// Wrap a `StringArray` into the single-column `EngineData` shape expected by `parse_json`.

@@ -790,7 +790,7 @@ pub(crate) fn create_last_checkpoint_data(
     add_actions_counter: i64,
     size_in_bytes: i64,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    engine.evaluation_handler().create_one(
+    Ok(engine.evaluation_handler().create_one(
         LAST_CHECKPOINT_SCHEMA.clone(),
         &[
             version.into(),
@@ -799,7 +799,7 @@ pub(crate) fn create_last_checkpoint_data(
             size_in_bytes.into(),
             add_actions_counter.into(),
         ],
-    )
+    )?)
 }
 
 /// Writes one sidecar file. Returns `None` if the splitter yielded no rows for this sidecar.

@@ -410,7 +410,7 @@ impl ParsedLogPath<FileMeta> {
                     .ok_or_else(|| KernelError::missing_data("inCommitTimestamp in commit file"))
                     .map_err(crate::Error::from)
             }
-            Some(Err(err)) => Err(err),
+            Some(Err(err)) => Err(err.into()),
             None => Err(KernelError::missing_data("commit actions").into()),
         }
     }

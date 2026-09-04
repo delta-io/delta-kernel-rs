@@ -54,7 +54,8 @@ impl Committer for FileSystemCommitter {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
+            Err(crate::Error::Engine(crate::EngineError::FileAlreadyExists { .. }))
+            | Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
                 info!(
                     conflicting_version = version,
                     "Filesystem commit conflict: target version already exists"

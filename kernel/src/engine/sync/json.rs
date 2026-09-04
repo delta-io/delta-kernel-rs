@@ -15,8 +15,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    JsonHandler, KernelError, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, EngineError, EngineResult,
+    FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, PredicateRef,
 };
 
 pub(crate) struct SyncJsonHandler {
@@ -34,19 +34,20 @@ pub(super) fn try_create_from_json(
     schema: SchemaRef,
     _predicate: Option<PredicateRef>,
     file_location: String,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let json_schema = Arc::new(json_arrow_schema(&schema)?);
-    let reorder_indices = build_json_reorder_indices(&schema)?;
+) -> EngineResult<impl Iterator<Item = EngineResult<ArrowEngineData>>> {
+    let json_schema = Arc::new(json_arrow_schema(&schema).map_err(EngineError::external)?);
+    let reorder_indices = build_json_reorder_indices(&schema).map_err(EngineError::external)?;
     let json = ReaderBuilder::new(json_schema)
         .with_coerce_primitive(true)
         .build(BufReader::new(Cursor::new(data)))
-        .map_err(KernelError::from)?
+        .map_err(EngineError::from)?
         .map(move |data| {
             fixup_json_read(
-                data.map_err(KernelError::from)?,
+                data.map_err(EngineError::from)?,
                 &reorder_indices,
                 &file_location,
             )
+            .map_err(EngineError::external)
         });
     Ok(json)
 }
@@ -57,7 +58,7 @@ impl JsonHandler for SyncJsonHandler {
         files: &[FileMeta],
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         let iter = read_files_arrow(
             self.store.as_ref(),
             files,
@@ -72,8 +73,8 @@ impl JsonHandler for SyncJsonHandler {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        arrow_parse_json(json_strings, output_schema)
+    ) -> EngineResult<Box<dyn EngineData>> {
+        arrow_parse_json(json_strings, output_schema).map_err(EngineError::external)
     }
 
     fn write_json_file(
@@ -101,6 +102,7 @@ mod tests {
     use super::*;
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use crate::KernelError;
 
     // Helper function to create test data
     fn create_test_data(values: Vec<&str>) -> DeltaResult<Box<dyn EngineData>> {
@@ -168,7 +170,7 @@ mod tests {
             // Verify the second write fails with FileAlreadyExists error
             assert!(matches!(
                 result,
-                Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_)))
+                Err(crate::Error::Engine(EngineError::FileAlreadyExists { .. }))
             ));
         }
 

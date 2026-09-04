@@ -96,7 +96,7 @@ mod tests {
     use crate::engine::test_delegating::DelegatingEngine;
     use crate::metrics::MetricEvent;
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
-    use crate::{DeltaResult, FileMeta, FileSlice};
+    use crate::{EngineResult, FileMeta, FileSlice};
 
     /// Minimal storage handler used in tests: returns N preconfigured FileMeta items.
     #[derive(Debug)]
@@ -108,26 +108,26 @@ mod tests {
         fn list_from(
             &self,
             _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<FileMeta>>>> {
             let results: Vec<_> = self.list_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
         fn read_files(
             &self,
             _files: Vec<FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+        ) -> EngineResult<Box<dyn Iterator<Item = EngineResult<Bytes>>>> {
             Ok(Box::new(std::iter::empty()))
         }
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> EngineResult<()> {
             Ok(())
         }
-        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> DeltaResult<()> {
+        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> EngineResult<()> {
             Ok(())
         }
-        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        fn head(&self, _path: &Url) -> EngineResult<FileMeta> {
             unreachable!("not exercised")
         }
-        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        fn delete(&self, _path: &Url) -> EngineResult<()> {
             Ok(())
         }
     }

@@ -200,8 +200,9 @@ impl SnapshotBuilder {
     ///
     /// Kernel polls the token as it consumes the log listing, and a cancellation-aware [`Engine`]
     /// additionally races its listing and log reads against it. On cancellation
-    /// [`build`](Self::build) returns [`KernelError::Cancelled`] rather than a snapshot built from
-    /// a partial listing. With no token the build is not cancellable.
+    /// [`build`](Self::build) returns [`KernelError::Cancelled`] for Kernel checks or
+    /// [`crate::EngineError::Cancelled`] for interrupted engine reads rather than a snapshot built
+    /// from a partial listing. With no token the build is not cancellable.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
     /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled

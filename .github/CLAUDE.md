@@ -8,6 +8,8 @@ Error-classification changes require both all-feature and no-default-feature bui
 separate Arrow-version and DataFusion workspace checks: root workspace feature unification does
 not validate those configurations. FFI error-code tests must preserve existing numeric values,
 exercise appended classifications, and check that context wrappers do not hide the leaf code.
+Engine-error changes must also cover eager and lazy failures, writer input-error preservation,
+and cancellation fusion without strengthening storage iterator `Send` bounds.
 
 ## Triggers: restrict `push` to long-lived branches
 

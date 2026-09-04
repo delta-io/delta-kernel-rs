@@ -53,8 +53,7 @@ pub mod tokio {
     use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
 
-    use delta_kernel::error::ErrorContext;
-    use delta_kernel::{DeltaResult, KernelError};
+    use delta_kernel::{DeltaResult, EngineError};
     use futures::future::BoxFuture;
     use futures::{Future, TryFutureExt};
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
@@ -182,7 +181,7 @@ pub mod tokio {
         {
             Box::pin(
                 tokio::task::spawn_blocking(task)
-                    .map_err(|error| delta_kernel::Error::from(KernelError::join_failure(error))),
+                    .map_err(|error| delta_kernel::Error::from(EngineError::external(error))),
             )
         }
 
@@ -242,9 +241,9 @@ pub mod tokio {
                 builder.max_blocking_threads(max_blocking);
             }
 
-            let runtime = builder.build().map_err(|source| {
-                KernelError::from(source)
-                    .with_context(ErrorContext::Operation("create Tokio runtime"))
+            let runtime = builder.build().map_err(|source| EngineError::External {
+                message: format!("create Tokio runtime: {source}"),
+                source: Some(Box::new(source)),
             })?;
 
             let handle = runtime.handle().clone();
@@ -311,7 +310,7 @@ pub mod tokio {
         {
             Box::pin(
                 tokio::task::spawn_blocking(task)
-                    .map_err(|error| delta_kernel::Error::from(KernelError::join_failure(error))),
+                    .map_err(|error| delta_kernel::Error::from(EngineError::external(error))),
             )
         }
 

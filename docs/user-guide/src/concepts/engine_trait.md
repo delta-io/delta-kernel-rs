@@ -94,8 +94,10 @@ Cancellation reaches the handlers in two ways, and an engine can honor either or
 These variants are optional. Their default implementations return early if the token is already
 cancelled and otherwise delegate to the plain `read_parquet_files` / `read_json_files` /
 `read_parquet_footer`, so an existing handler keeps working unchanged and simply doesn't interrupt
-mid-read. Whenever cancellation is observed, the read surfaces `KernelError::Cancelled` as a terminal
-error — never a short or empty result that could be mistaken for a complete one.
+mid-read. Engine reads report `EngineError::Cancelled`; Kernel's own checks report
+`KernelError::Cancelled`. At the public API these use `Error::Engine` and `Error::Kernel`,
+respectively.
+Both are terminal errors, never short or empty results that could be mistaken for complete ones.
 
 For how to implement the cancellation-aware variants, see
 [Implementing the Engine Trait](../connector/implementing_engine.md#cancellation-aware-reads).
