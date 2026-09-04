@@ -28,6 +28,7 @@ use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
 };
 use crate::metrics::MetricId;
+use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
@@ -102,6 +103,7 @@ impl Transaction {
             commit_timestamp,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: vec![],
+            external_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
@@ -174,6 +176,29 @@ impl Transaction {
     #[cfg(feature = "row-tracking-preservation-in-dev")]
     pub fn ack_row_tracking_preservation(&mut self) {
         self.row_tracking_preservation_acknowledged = true;
+    }
+
+    /// Set the row-tracking high-water mark for content committed outside the kernel's add-file
+    /// path.
+    ///
+    /// This is a dedicated system-domain operation: callers cannot use
+    /// [`Self::with_domain_metadata`] to modify `delta.rowTracking` or any other `delta.*`
+    /// domain. The transaction validates the row-tracking and domain-metadata table features and
+    /// prevents the high-water mark from regressing when the transaction is committed.
+    #[internal_api]
+    #[allow(dead_code)] // used in FFI
+    pub(crate) fn with_row_tracking_high_water_mark(
+        mut self,
+        high_water_mark: i64,
+    ) -> DeltaResult<Self> {
+        if self.external_row_tracking_high_water_mark.is_some() {
+            return Err(Error::generic(
+                "Row-tracking high-water mark already specified in this transaction",
+            ));
+        }
+        self.external_row_tracking_high_water_mark =
+            Some(RowTrackingDomainMetadata::new(high_water_mark));
+        Ok(self)
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to

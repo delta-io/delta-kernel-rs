@@ -12,13 +12,14 @@ impl<S> Transaction<S> {
     ///
     /// Enforces the following rules:
     /// - DomainMetadata feature must be supported if any domain operations are present
-    /// - System domains (in system_domain_metadata_additions) must correspond to a known feature
+    /// - System domains must correspond to a known feature
     /// - User domains cannot use the delta.* prefix (system-reserved)
     /// - Domain removals are not allowed in create-table transactions
-    /// - No duplicate domains within a single transaction (across both user and system)
+    /// - No duplicate domains within a single transaction (across user and system operations)
     pub(super) fn validate_domain_metadata_operations(&self) -> DeltaResult<()> {
         // Feature validation (applies to all transactions with domain operations)
         let has_domain_ops = !self.system_domain_metadata_additions.is_empty()
+            || self.external_row_tracking_high_water_mark.is_some()
             || !self.user_domain_metadata_additions.is_empty()
             || !self.user_domain_removals.is_empty();
 
@@ -39,12 +40,12 @@ impl<S> Transaction<S> {
         let is_create = self.is_create_table();
         let mut seen_domains = HashSet::with_capacity(
             self.system_domain_metadata_additions.len()
+                + usize::from(self.external_row_tracking_high_water_mark.is_some())
                 + self.user_domain_metadata_additions.len()
                 + self.user_domain_removals.len(),
         );
 
-        // Validate SYSTEM domain additions (from transforms, e.g., clustering)
-        // System domains are only populated during create-table
+        // Validate system-domain additions produced by create-table transforms.
         for dm in &self.system_domain_metadata_additions {
             let domain = dm.domain();
 
@@ -55,6 +56,16 @@ impl<S> Transaction<S> {
             if !seen_domains.insert(domain) {
                 return Err(Error::generic(format!(
                     "Metadata for domain {domain} already specified in this transaction"
+                )));
+            }
+        }
+
+        // Validate the dedicated existing-table row-tracking operation with the other domains.
+        if self.external_row_tracking_high_water_mark.is_some() {
+            self.validate_system_domain_feature(ROW_TRACKING_DOMAIN_NAME)?;
+            if !seen_domains.insert(ROW_TRACKING_DOMAIN_NAME) {
+                return Err(Error::generic(format!(
+                    "Metadata for domain {ROW_TRACKING_DOMAIN_NAME} already specified in this transaction"
                 )));
             }
         }
@@ -110,8 +121,9 @@ impl<S> Transaction<S> {
     /// Validate that a system domain corresponds to a known feature and that the feature is
     /// supported.
     ///
-    /// This prevents arbitrary `delta.*` domains from being added during table creation.
-    /// Each known system domain must have its corresponding feature enabled in the protocol.
+    /// This prevents arbitrary `delta.*` domains from entering a transaction through internal
+    /// transforms or dedicated system-domain operations. Each known system domain must have its
+    /// corresponding feature enabled in the protocol.
     fn validate_system_domain_feature(&self, domain: &str) -> DeltaResult<()> {
         let table_config = &self.effective_table_config;
 
@@ -206,7 +218,33 @@ impl<S> Transaction<S> {
         // Generate removal actions (empty for create-table due to validation above)
         let removal_actions = self.generate_user_domain_removal_actions(engine)?;
 
-        // Generate row tracking domain action.
+        let row_tracking_high_watermark = match (
+            &self.external_row_tracking_high_water_mark,
+            row_tracking_high_watermark,
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(Error::generic(
+                    "An explicit row-tracking high-water mark cannot be combined with \
+                         kernel-managed add files",
+                ));
+            }
+            (Some(external), None) => {
+                let current =
+                    RowTrackingDomainMetadata::get_high_water_mark(self.read_snapshot()?, engine)?
+                        .unwrap_or(RowTrackingDomainMetadata::MISSING_ROW_ID_HIGH_WATERMARK);
+                if external.high_water_mark() < current {
+                    return Err(Error::generic(format!(
+                        "Row-tracking high-water mark {} cannot be less than the current \
+                             value {current}",
+                        external.high_water_mark()
+                    )));
+                }
+                Some(external.clone())
+            }
+            (None, generated) => generated,
+        };
+
+        // Generate the single row-tracking domain action, if any.
         let row_tracking_domain_action = row_tracking_high_watermark
             .map(DomainMetadata::try_from)
             .transpose()?
