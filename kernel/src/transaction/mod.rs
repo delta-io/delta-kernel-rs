@@ -881,8 +881,7 @@ impl<S> Transaction<S> {
             Error::invalid_transaction_state(
                 "Data manipulation on a table with Row Tracking enabled requires preserving stable \
                  Row IDs for copied or updated rows and stable Row Commit Versions for copied \
-                 rows. If you applied these rules correctly, acknowledge this by calling \
-                 Transaction::ack_row_tracking_preservation() before committing",
+                 rows. See Transaction::ack_row_tracking_preservation() for more details",
             )
         );
         Ok(())

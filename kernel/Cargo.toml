@@ -133,7 +133,8 @@ adaptive-metadata-in-dev = []
 # (geometry/geography) type work. TODO(#2949): remove once full geo support ships.
 geo-type-in-dev = []
 # Experimental feature flag guarding Row Tracking preservation for file removals and
-# deletion-vector updates. TODO(#3227): remove once preservation support is ready.
+# deletion-vector updates. TODO(#3227): remove the flag and emit `delta.rowTracking.preserved` in
+# CommitInfo tags when preservation support is ready.
 row-tracking-preservation-in-dev = []
 
 # Enables shared Arrow-based engine support modules (arrow_data, arrow_expression,

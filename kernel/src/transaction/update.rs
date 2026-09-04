@@ -150,11 +150,24 @@ impl Transaction {
         self
     }
 
-    /// Acknowledges that the connector preserved stable Row IDs for copied and updated rows and
-    /// stable Row Commit Versions for copied rows.
+    /// Acknowledges that the connector correctly preserves Stable Row IDs and Stable Row Commit
+    /// Versions. That is:
     ///
-    /// Call this before committing file removals or deletion-vector updates on tables with Row
-    /// Tracking enabled.
+    /// - Copied or updated rows retain their Stable Row IDs.
+    /// - Copied rows retain their Stable Row Commit Versions.
+    /// - The connector preserves these values in the materialized Row ID and Row Commit Version
+    ///   columns.
+    /// - The connector also satisfies all protocol MUST requirements for those columns.
+    ///
+    /// See [Row Tracking] in the Delta protocol for more details.
+    ///
+    /// The Delta protocol specifies this preservation as a SHOULD requirement. Kernel requires it
+    /// for compatibility.
+    ///
+    /// This acknowledgment is required before committing Remove actions or deletion-vector updates
+    /// on tables with Row Tracking enabled.
+    ///
+    /// [Row Tracking]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#row-tracking
     #[cfg(feature = "row-tracking-preservation-in-dev")]
     pub fn ack_row_tracking_preservation(&mut self) {
         self.row_tracking_preservation_acknowledged = true;

@@ -202,6 +202,7 @@ mod row_tracking_preservation {
     async fn remove_files_requires_row_tracking_preservation_acknowledgment(
         #[case] test_case: RemoveTestCase,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // === Create the table and insert data ===
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
         let schema = schema_ref! { nullable "number": INTEGER };
         let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -230,6 +231,7 @@ mod row_tracking_preservation {
         .await?
         .unwrap_committed();
 
+        // === Stage file removal and optionally acknowledge preservation ===
         let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
         let scan = snapshot.clone().scan_builder().build()?;
         let scan_files = scan
@@ -245,6 +247,7 @@ mod row_tracking_preservation {
             txn.ack_row_tracking_preservation();
         }
 
+        // === Commit and verify the result ===
         if let Some(expected_error) = test_case.expected_error() {
             assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
         } else {
@@ -262,6 +265,7 @@ mod row_tracking_preservation {
     #[tokio::test]
     async fn deletion_vector_update_requires_preservation_acknowledgment(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // === Create a Row Tracking table with deletion vectors and insert data ===
         let tmp_dir = tempfile::tempdir()?;
         let (_schema, table_url, engine, store) = setup_number_table_with_features(
             &tmp_dir,
@@ -279,6 +283,7 @@ mod row_tracking_preservation {
         .await?
         .unwrap_post_commit_snapshot();
 
+        // === Stage a deletion-vector update without preservation acknowledgment ===
         let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
         let write_context = txn.write_state()?.write_context_builder().build()?;
         let mut deletion_vector = KernelDeletionVector::new();
@@ -295,6 +300,7 @@ mod row_tracking_preservation {
                 .map(Ok),
         )?;
 
+        // === Verify the commit is rejected ===
         assert_result_error_with_message(
             txn.commit(engine.as_ref()),
             "Transaction::ack_row_tracking_preservation()",
