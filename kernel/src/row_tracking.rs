@@ -12,7 +12,7 @@ use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Snapshot};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RowTrackingDomainMetadata {
     // NB: The Delta spec does not rule out negative high water marks
@@ -31,6 +31,11 @@ impl RowTrackingDomainMetadata {
         RowTrackingDomainMetadata {
             row_id_high_water_mark,
         }
+    }
+
+    /// Returns the highest row ID represented by this metadata.
+    pub(crate) fn high_water_mark(&self) -> i64 {
+        self.row_id_high_water_mark
     }
 
     /// Creates the initial row tracking domain metadata for a newly created table.

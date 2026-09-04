@@ -230,11 +230,10 @@ pub struct Transaction<S = ExistingTable> {
     commit_timestamp: i64,
     // User-provided domain metadata additions (via with_domain_metadata API).
     user_domain_metadata_additions: Vec<DomainMetadata>,
-    // System-generated domain metadata (from transforms, e.g., clustering).
-    // TODO(#1779): Currently only populated during CREATE TABLE. For inserts, row tracking
-    // domain metadata is handled separately via `row_tracking_high_watermark` parameter in
-    // `generate_domain_metadata_actions`. Consider unifying system domain handling.
+    // System-generated domain metadata from transforms, e.g. clustering.
     system_domain_metadata_additions: Vec<DomainMetadata>,
+    // Row-tracking state supplied for content whose row IDs were assigned outside kernel.
+    external_row_tracking_high_water_mark: Option<RowTrackingDomainMetadata>,
     // Domain names to remove in this transaction. The configuration values are fetched during
     // commit from the log to preserve the pre-image in tombstones.
     user_domain_removals: Vec<String>,
