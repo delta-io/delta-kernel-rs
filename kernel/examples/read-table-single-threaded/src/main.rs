@@ -1,13 +1,12 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
-use arrow::util::pretty::print_batches;
+use clap::Parser;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
+use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::{DeltaResult, Snapshot};
-
-use clap::Parser;
 use itertools::Itertools;
 
 /// An example program that dumps out the data of a delta table.
@@ -57,7 +56,8 @@ fn try_main() -> DeltaResult<()> {
             };
             let batch_rows = batch.num_rows();
             let result = match cli.scan_args.limit {
-                Some(limit) if **rows_so_far >= limit => return None, // over the limit, stop iteration
+                // over the limit, stop iteration
+                Some(limit) if **rows_so_far >= limit => return None,
                 Some(limit) => {
                     let batch = if **rows_so_far + batch_rows > limit {
                         common::truncate_batch(batch, limit - **rows_so_far)

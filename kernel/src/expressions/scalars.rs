@@ -1,15 +1,31 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::hash::Hash;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use strum::AsRefStr;
 
-use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField};
+use crate::error::add_scalar_path_context;
+use crate::schema::derive_macro_utils::{GetStructField, ToDataType};
+use crate::schema::{
+    parse_interval_type, ArrayType, DataType, DecimalType, IntervalField, IntervalFieldRange,
+    MapType, PrimitiveType, StructField, StructType,
+};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
+
+/// Pairs [`Into<Scalar>`] with [`ToDataType`] for infallible container conversions.
+///
+/// `Option<T: IntoScalar>` is not itself `IntoScalar`: nullability belongs to the owning
+/// struct/array/map rather than its value type. See [`ToDataType`] for the pairing contract.
+#[internal_api]
+pub(crate) trait IntoScalar: Into<Scalar> + ToDataType {}
+
+impl<T: Into<Scalar> + ToDataType> IntoScalar for T {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecimalData {
@@ -98,6 +114,39 @@ impl ArrayData {
     pub fn array_elements(&self) -> &[Scalar] {
         &self.elements
     }
+
+    /// Consume this array and return its elements.
+    #[internal_api]
+    pub(crate) fn into_elements(self) -> Vec<Scalar> {
+        self.elements
+    }
+
+    /// Infallible constructor used by `From<Vec<T>>` and `From<Vec<Option<T>>` where we know the
+    /// resulting `Scalar::data_type` is `T:to_data_type`.
+    fn from_elements<T: ToDataType>(
+        elements: impl IntoIterator<Item = impl Into<Scalar>>,
+        contains_null: bool,
+    ) -> Self {
+        Self {
+            tpe: ArrayType::new(T::to_data_type(), contains_null),
+            elements: elements.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Builds [`ArrayData`] from a Rust `Vec` whose element type implements both `Into<Scalar>` and
+/// [`ToSchema`](delta_kernel::schema::ToSchema).
+impl<T: IntoScalar> From<Vec<T>> for ArrayData {
+    fn from(vec: Vec<T>) -> Self {
+        Self::from_elements::<T>(vec, false)
+    }
+}
+
+/// Like [`From<Vec<T>> for ArrayData`], but elements may be null (`contains_null = true`).
+impl<T: IntoScalar> From<Vec<Option<T>>> for ArrayData {
+    fn from(vec: Vec<Option<T>>) -> Self {
+        Self::from_elements::<T>(vec, true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,6 +205,39 @@ impl MapData {
     pub fn map_type(&self) -> &MapType {
         &self.data_type
     }
+
+    /// Consume this map and return its key/value pairs.
+    #[internal_api]
+    pub(crate) fn into_pairs(self) -> Vec<(Scalar, Scalar)> {
+        self.pairs
+    }
+
+    /// Infallible constructor used by `From<HashMap<K, V>>` / `From<HashMap<K, Option<V>>>`
+    /// where key/value scalars are known to match `K`/`V`'s [`ToDataType`].
+    fn from_pairs<K: ToDataType, V: ToDataType>(
+        pairs: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
+        value_contains_null: bool,
+    ) -> Self {
+        Self {
+            data_type: MapType::new(K::to_data_type(), V::to_data_type(), value_contains_null),
+            pairs: Vec::from_iter(pairs.into_iter().map(|(k, v)| (k.into(), v.into()))),
+        }
+    }
+}
+
+/// Builds [`MapData`] from a Rust [`HashMap`] whose key/value types implement both `Into<Scalar>`
+/// and [`ToSchema`](delta_kernel::schema::ToSchema).
+impl<K: IntoScalar, V: IntoScalar> From<HashMap<K, V>> for MapData {
+    fn from(map: HashMap<K, V>) -> Self {
+        Self::from_pairs::<K, V>(map, false)
+    }
+}
+
+/// Like [`From<HashMap<K, V>> for MapData`], but values may be null (`value_contains_null = true`).
+impl<K: IntoScalar, V: IntoScalar> From<HashMap<K, Option<V>>> for MapData {
+    fn from(map: HashMap<K, Option<V>>) -> Self {
+        Self::from_pairs::<K, V>(map, true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -205,12 +287,29 @@ impl StructData {
         Ok(Self { fields, values })
     }
 
+    /// Infallible constructor used by `From<T>` where `schema` and `values` are produced using
+    /// [`ToSchema`](delta_kernel::schema::ToSchema) and `Into<Scalar>`. Does not re-validate types
+    /// or lengths.
+    #[internal_api]
+    pub(crate) fn from_values_unchecked(schema: StructType, values: Vec<Scalar>) -> Self {
+        Self {
+            fields: schema.into_fields().collect(),
+            values,
+        }
+    }
+
     pub fn fields(&self) -> &[StructField] {
         &self.fields
     }
 
     pub fn values(&self) -> &[Scalar] {
         &self.values
+    }
+
+    /// Consume this struct and return its fields and values.
+    #[internal_api]
+    pub(crate) fn into_parts(self) -> (Vec<StructField>, Vec<Scalar>) {
+        (self.fields, self.values)
     }
 }
 
@@ -219,7 +318,8 @@ impl StructData {
 ///
 /// NOTE: `PartialEq` uses physical (structural) comparison semantics.
 /// For SQL NULL semantics, use [`Scalar::logical_eq`] or [`Scalar::logical_partial_cmp`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AsRefStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum Scalar {
     /// 32bit integer
     Integer(i32),
@@ -241,6 +341,10 @@ pub enum Scalar {
     Timestamp(i64),
     /// Microsecond precision timestamp, with no timezone.
     TimestampNtz(i64),
+    /// Year-month interval, stored as a signed 32bit count of months (matches Spark Catalyst).
+    IntervalYearMonth(i32),
+    /// Day-time interval, stored as a signed 64bit count of microseconds (matches Spark Catalyst).
+    IntervalDayTime(i64),
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
     Date(i32),
     /// Binary data
@@ -270,6 +374,8 @@ impl Scalar {
             Self::Boolean(_) => DataType::BOOLEAN,
             Self::Timestamp(_) => DataType::TIMESTAMP,
             Self::TimestampNtz(_) => DataType::TIMESTAMP_NTZ,
+            Self::IntervalYearMonth(_) => DataType::INTERVAL_YEAR_MONTH,
+            Self::IntervalDayTime(_) => DataType::INTERVAL_DAY_TIME,
             Self::Date(_) => DataType::DATE,
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(d) => DataType::from(*d.ty()),
@@ -285,11 +391,28 @@ impl Scalar {
         matches!(self, Self::Null(_))
     }
 
+    /// Constructs a null `Scalar` of the given type. Accepts anything convertible into a
+    /// [`DataType`], so container types like [`StructType`], [`ArrayType`], and [`MapType`]
+    /// can be passed directly without an explicit `DataType::from(...)` wrapper.
+    ///
+    /// [`StructType`]: crate::schema::StructType
+    /// [`ArrayType`]: crate::schema::ArrayType
+    /// [`MapType`]: crate::schema::MapType
+    pub fn null(data_type: impl Into<DataType>) -> Self {
+        Self::Null(data_type.into())
+    }
+
     /// Constructs a Decimal value from raw parts
     pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;
         let dval = DecimalData::try_new(bits, dtype)?;
         Ok(Self::Decimal(dval))
+    }
+
+    /// Error for a failed conversion of this scalar into the Rust type named by `target`.
+    #[internal_api]
+    pub(crate) fn conversion_error(&self, target: &str) -> Error {
+        Error::scalar_conversion(target, self.as_ref())
     }
 
     /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
@@ -341,7 +464,9 @@ impl Scalar {
         Some(result)
     }
 
-    /// Attempts to divide two scalars, returning None if they were incompatible.
+    /// Attempts to divide two scalars, truncating toward zero. Returns None if they were
+    /// incompatible, if `other` is zero, or on overflow. Only the integral types divide; a float or
+    /// decimal operand is treated as incompatible.
     pub fn try_div(&self, other: &Scalar) -> Option<Scalar> {
         use Scalar::*;
         let result = match (self, other) {
@@ -368,6 +493,8 @@ impl Display for Scalar {
             Self::Boolean(b) => write!(f, "{b}"),
             Self::Timestamp(ts) => write!(f, "{ts}"),
             Self::TimestampNtz(ts) => write!(f, "{ts}"),
+            Self::IntervalYearMonth(months) => write!(f, "{months}"),
+            Self::IntervalDayTime(micros) => write!(f, "{micros}"),
             Self::Date(d) => write!(f, "{d}"),
             Self::Binary(b) => write!(f, "{b:?}"),
             Self::Decimal(d) => match d.scale().cmp(&0) {
@@ -485,6 +612,10 @@ impl Scalar {
             (Timestamp(_), _) => None,
             (TimestampNtz(a), TimestampNtz(b)) => a.partial_cmp(b),
             (TimestampNtz(_), _) => None,
+            (IntervalYearMonth(a), IntervalYearMonth(b)) => a.partial_cmp(b),
+            (IntervalYearMonth(_), _) => None,
+            (IntervalDayTime(a), IntervalDayTime(b)) => a.partial_cmp(b),
+            (IntervalDayTime(_), _) => None,
             (Date(a), Date(b)) => a.partial_cmp(b),
             (Date(_), _) => None,
             (Binary(a), Binary(b)) => a.partial_cmp(b),
@@ -493,10 +624,11 @@ impl Scalar {
                 .then(|| d1.bits().partial_cmp(&d2.bits()))
                 .flatten(),
             (Decimal(_), _) => None,
-            (Null(_), _) => None, // NOTE: NULL values are incomparable by definition (SQL NULL semantics)
+            // NOTE: NULL values are incomparable by definition (SQL NULL semantics)
+            (Null(_), _) => None,
             (Struct(_), _) => None, // TODO: Support Struct?
-            (Array(_), _) => None, // TODO: Support Array?
-            (Map(_), _) => None,  // TODO: Support Map?
+            (Array(_), _) => None,  // TODO: Support Array?
+            (Map(_), _) => None,    // TODO: Support Map?
         }
     }
 }
@@ -573,99 +705,38 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+impl From<Vec<u8>> for Scalar {
+    fn from(b: Vec<u8>) -> Self {
+        Self::Binary(b)
+    }
+}
+
 impl From<bytes::Bytes> for Scalar {
     fn from(b: bytes::Bytes) -> Self {
         Self::Binary(b.into())
     }
 }
 
-impl<T> TryFrom<Vec<T>> for Scalar
+impl<T> From<Vec<T>> for Scalar
 where
-    T: Into<Scalar> + ToDataType,
+    Vec<T>: Into<ArrayData>,
 {
-    type Error = Error;
-
-    fn try_from(vec: Vec<T>) -> Result<Self, Self::Error> {
-        let array_type = ArrayType::new(T::to_data_type(), false);
-        let array_data = ArrayData::try_new(array_type, vec)?;
-        Ok(array_data.into())
+    fn from(vec: Vec<T>) -> Self {
+        Self::Array(vec.into())
     }
 }
 
-impl<T> TryFrom<Vec<Option<T>>> for Scalar
+impl<K, V> From<HashMap<K, V>> for Scalar
 where
-    T: Into<Scalar> + ToDataType,
+    HashMap<K, V>: Into<MapData>,
 {
-    type Error = Error;
-
-    fn try_from(vec: Vec<Option<T>>) -> Result<Self, Self::Error> {
-        let array_type = ArrayType::new(T::to_data_type(), true);
-        let array_data = ArrayData::try_new(array_type, vec)?;
-        Ok(array_data.into())
-    }
-}
-
-impl<T> TryFrom<Option<Vec<T>>> for Scalar
-where
-    T: Into<Scalar> + ToDataType,
-{
-    type Error = Error;
-
-    fn try_from(opt: Option<Vec<T>>) -> Result<Self, Self::Error> {
-        match opt {
-            Some(vec) => vec.try_into(),
-            None => Ok(Self::Null(ArrayType::new(T::to_data_type(), false).into())),
-        }
-    }
-}
-
-impl<K, V> TryFrom<HashMap<K, V>> for Scalar
-where
-    K: Into<Scalar> + ToDataType,
-    V: Into<Scalar> + ToDataType,
-{
-    type Error = Error;
-
-    fn try_from(map: HashMap<K, V>) -> Result<Self, Self::Error> {
-        let map_type = MapType::new(K::to_data_type(), V::to_data_type(), false);
-        let map_data = MapData::try_new(map_type, map)?;
-        Ok(map_data.into())
-    }
-}
-
-impl<K, V> TryFrom<HashMap<K, Option<V>>> for Scalar
-where
-    K: Into<Scalar> + ToDataType,
-    V: Into<Scalar> + ToDataType,
-{
-    type Error = Error;
-
-    fn try_from(map: HashMap<K, Option<V>>) -> Result<Self, Self::Error> {
-        let map_type = MapType::new(K::to_data_type(), V::to_data_type(), true);
-        let map_data = MapData::try_new(map_type, map)?;
-        Ok(map_data.into())
-    }
-}
-
-impl<K, V> TryFrom<Option<HashMap<K, V>>> for Scalar
-where
-    K: Into<Scalar> + ToDataType,
-    V: Into<Scalar> + ToDataType,
-{
-    type Error = Error;
-
-    fn try_from(opt: Option<HashMap<K, V>>) -> Result<Self, Self::Error> {
-        match opt {
-            Some(map) => map.try_into(),
-            None => Ok(Self::Null(
-                MapType::new(K::to_data_type(), V::to_data_type(), false).into(),
-            )),
-        }
+    fn from(map: HashMap<K, V>) -> Self {
+        Self::Map(map.into())
     }
 }
 
 // NOTE: We "cheat" and use the macro support trait `ToDataType`
-impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
+impl<T: IntoScalar> From<Option<T>> for Scalar {
     fn from(t: Option<T>) -> Self {
         match t {
             Some(t) => t.into(),
@@ -686,13 +757,186 @@ impl From<MapData> for Scalar {
     }
 }
 
-// TODO: add more From impls
+impl From<StructData> for Scalar {
+    fn from(struct_data: StructData) -> Self {
+        Self::Struct(struct_data)
+    }
+}
+
+// ===== Scalar -> rust conversions, inverting the `From<T> for Scalar` impls above =====
+
+/// Inverts the corresponding `From<T> for Scalar` conversion. The generated `try_from` matches on
+/// the single `Scalar` variant its forward counterpart produces and returns a conversion error for
+/// every other variant.
+///
+/// Matching is by variant, not by physical representation, so a target type is never produced from
+/// a variant that merely shares its in-memory layout: `i64` accepts `Long` but rejects `Timestamp`,
+/// `TimestampNtz`, and `IntervalDayTime`; `i32` accepts `Integer` but rejects `Date` and
+/// `IntervalYearMonth`. This keeps `Scalar` <-> rust conversions type-preserving, so a value's data
+/// type survives the round trip rather than collapsing onto whichever variant shares its layout.
+macro_rules! impl_try_from_scalar {
+    ( $(($variant:ident, $rust_type:ty)),* $(,)? ) => {
+        $(
+            impl TryFrom<Scalar> for $rust_type {
+                type Error = Error;
+
+                fn try_from(scalar: Scalar) -> DeltaResult<Self> {
+                    match scalar {
+                        Scalar::$variant(value) => Ok(value.into()),
+                        other => Err(other.conversion_error(stringify!($rust_type))),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_try_from_scalar!(
+    (Byte, i8),
+    (Short, i16),
+    (Integer, i32),
+    (Long, i64),
+    (Float, f32),
+    (Double, f64),
+    (Boolean, bool),
+    (String, String),
+    (Binary, bytes::Bytes),
+    (Decimal, DecimalData),
+    (Array, ArrayData),
+    (Map, MapData),
+    (Struct, StructData),
+);
+
+/// Null becomes `None` when its typed null matches `T::to_data_type`; anything else must convert
+/// to `T`.
+impl<T: TryFrom<Scalar, Error = Error> + ToDataType> TryFrom<Scalar> for Option<T> {
+    type Error = Error;
+
+    fn try_from(scalar: Scalar) -> DeltaResult<Self> {
+        match scalar {
+            Scalar::Null(data_type) => {
+                let expected = T::to_data_type();
+                require!(
+                    data_type == expected,
+                    Error::scalar_conversion(expected.kind_name(), data_type.kind_name())
+                );
+                Ok(None)
+            }
+            other => Ok(Some(T::try_from(other)?)),
+        }
+    }
+}
+
+/// Extracts an array scalar's elements. Use `Vec<Option<T>>` for arrays that contain nulls.
+impl<T> TryFrom<Scalar> for Vec<T>
+where
+    T: GetStructField + TryFrom<Scalar, Error = Error>,
+{
+    type Error = Error;
+
+    fn try_from(scalar: Scalar) -> DeltaResult<Self> {
+        let array: ArrayData = scalar.try_into()?;
+        let element = T::get_struct_field("element");
+        let expected = ArrayType::new(element.data_type().clone(), element.is_nullable());
+        require!(
+            array.array_type() == &expected,
+            Error::scalar_conversion(
+                format!(
+                    "array<{}, contains_null={}>",
+                    expected.element_type().kind_name(),
+                    expected.contains_null()
+                ),
+                format!(
+                    "array<{}, contains_null={}>",
+                    array.array_type().element_type().kind_name(),
+                    array.array_type().contains_null()
+                ),
+            )
+        );
+        array
+            .into_elements()
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                T::try_from(value)
+                    .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
+            })
+            .try_collect()
+    }
+}
+
+/// Extracts a map scalar's entries. Use `HashMap<K, Option<V>>` for maps with null values.
+impl<K, V> TryFrom<Scalar> for HashMap<K, V>
+where
+    K: TryFrom<Scalar, Error = Error> + Eq + Hash,
+    V: GetStructField + TryFrom<Scalar, Error = Error>,
+    K: ToDataType,
+{
+    type Error = Error;
+
+    fn try_from(scalar: Scalar) -> DeltaResult<Self> {
+        let map: MapData = scalar.try_into()?;
+        let value = V::get_struct_field("value");
+        let expected = MapType::new(
+            K::to_data_type(),
+            value.data_type().clone(),
+            value.is_nullable(),
+        );
+        require!(
+            map.map_type() == &expected,
+            Error::scalar_conversion(
+                format!(
+                    "map<{}, {}, value_contains_null={}>",
+                    expected.key_type().kind_name(),
+                    expected.value_type().kind_name(),
+                    expected.value_contains_null()
+                ),
+                format!(
+                    "map<{}, {}, value_contains_null={}>",
+                    map.map_type().key_type().kind_name(),
+                    map.map_type().value_type().kind_name(),
+                    map.map_type().value_contains_null()
+                ),
+            )
+        );
+        map.into_pairs()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (key, value))| {
+                let key = K::try_from(key)
+                    .map_err(|error| add_scalar_path_context(error, format!("[{index}].key")))?;
+                let value = V::try_from(value)
+                    .map_err(|error| add_scalar_path_context(error, format!("[{index}].value")))?;
+                Ok((key, value))
+            })
+            .try_collect()
+    }
+}
 
 impl PrimitiveType {
     fn data_type(&self) -> DataType {
         DataType::Primitive(self.clone())
     }
 
+    /// Parses a serialized string into a [`Scalar`] of this primitive type, per the Delta
+    /// protocol's [partition value serialization] rules. An empty string parses as
+    /// [`Scalar::Null`].
+    ///
+    /// Note: the scan read path does not use this empty-string handling for partition values; it
+    /// applies a type-dependent cast instead (empty string on a string or binary column surfaces as
+    /// an empty value rather than null).
+    ///
+    /// Timestamp and TimestampNtz accept the space-separated form `{year}-{month}-{day}
+    /// {hour}:{minute}:{second}[.{fraction}]`. Timestamp (only) also accepts ISO 8601 / RFC 3339
+    /// strings such as `1970-01-01T00:00:00.123456Z`; an explicit offset is honored and the value
+    /// is normalized to UTC. The spec stores timestamp partition values either without a zone
+    /// (interpreted in the writer's local time zone) or adjusted to UTC with a `Z` suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ParseError`] if `raw` is not a valid encoding of this type.
+    ///
+    /// [partition value serialization]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
     pub fn parse_scalar(&self, raw: &str) -> Result<Scalar, Error> {
         use PrimitiveType::*;
 
@@ -710,6 +954,7 @@ impl PrimitiveType {
             Long => self.parse_str_as_scalar(raw, Scalar::Long),
             Float => self.parse_str_as_scalar(raw, Scalar::Float),
             Double => self.parse_str_as_scalar(raw, Scalar::Double),
+            Void => Err(self.parse_error(raw)),
             Boolean => {
                 if raw.eq_ignore_ascii_case("true") {
                     Ok(Scalar::Boolean(true))
@@ -728,20 +973,18 @@ impl PrimitiveType {
                 let days = date.signed_duration_since(DateTime::UNIX_EPOCH).num_days() as i32;
                 Ok(Scalar::Date(days))
             }
-            // NOTE: Timestamp and TimestampNtz are both parsed into microsecond since unix epoch.
-            // They may both have the format `{year}-{month}-{day} {hour}:{minute}:{second}`.
-            // Timestamps may additionally be encoded as a ISO 8601 formatted string such as
-            // `1970-01-01T00:00:00.123456Z`.
-            //
-            // The difference arises mostly in how they are to be handled on the engine side - i.e. timestampNTZ
-            // is not adjusted to UTC, this is just so we can (de-)serialize it as a date sting.
-            // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+            // NOTE: Timestamp and TimestampNtz are both parsed into microseconds since unix
+            // epoch. The difference arises mostly in how they are to be handled on the engine
+            // side - i.e. timestampNTZ is not adjusted to UTC, this is just so we can
+            // (de-)serialize it as a date string.
             TimestampNtz | Timestamp => {
                 let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
 
                 if timestamp.is_err() && *self == Timestamp {
-                    // Note: `%+` specifies the ISO 8601 / RFC 3339 format
-                    timestamp = NaiveDateTime::parse_from_str(raw, "%+");
+                    // `%+` is chrono's relaxed ISO 8601 / RFC 3339 parser: unlike the stricter
+                    // DateTime::parse_from_rfc3339, it also accepts a space or lowercase `t`
+                    // separator and colon-less offsets (e.g. `+0530`).
+                    timestamp = DateTime::parse_from_str(raw, "%+").map(|dt| dt.naive_utc());
                 }
                 let timestamp = timestamp.map_err(|_| self.parse_error(raw))?;
                 let timestamp = Utc.from_utc_datetime(&timestamp);
@@ -755,6 +998,37 @@ impl PrimitiveType {
                     _ => unreachable!(),
                 }
             }
+            IntervalYearMonth => parse_year_month_interval(raw)
+                .map(Scalar::IntervalYearMonth)
+                .ok_or_else(|| self.parse_error(raw)),
+            IntervalDayTime => parse_day_time_interval(raw)
+                .map(Scalar::IntervalDayTime)
+                .ok_or_else(|| self.parse_error(raw)),
+            // Kernel does not support parsing text into Geometry/Geography types yet.
+            #[cfg(feature = "geo-type-in-dev")]
+            Geometry(_) | Geography(_) => Err(Error::Unsupported(format!(
+                "parse_scalar is not supported for {self:?}"
+            ))),
+        }
+    }
+
+    /// Casts an empty partition-value string to its target [`Scalar`], or `None` for a null value.
+    ///
+    /// An empty string is a value for a string or binary column (the empty string / empty bytes)
+    /// but has no representation for any other type, so it casts to null there. This aligns with
+    /// Spark, which reads the partition-value map as a non-ANSI SQL cast, and is the empty-string
+    /// rule the scan read path applies, in place of [`parse_scalar`]'s null-for-every-type
+    /// handling.
+    ///
+    /// A literal empty string only reaches this path from a foreign writer, since kernel
+    /// serializes its own empty and null partition values to JSON null on write.
+    ///
+    /// [`parse_scalar`]: PrimitiveType::parse_scalar
+    pub(crate) fn empty_string_partition_cast(&self) -> Option<Scalar> {
+        match self {
+            PrimitiveType::String => Some(Scalar::String(String::new())),
+            PrimitiveType::Binary => Some(Scalar::Binary(Vec::new())),
+            _ => None,
         }
     }
 
@@ -765,7 +1039,8 @@ impl PrimitiveType {
     /// Parse a string as a scalar value, returning an error if the string is not parseable.
     ///
     /// The `f` function is used to convert the parsed value into a `Scalar`.
-    /// The desired type that `FromStr::parse` should parse into is inferred from the parameter type of `f`.
+    /// The desired type that `FromStr::parse` should parse into is inferred from the parameter type
+    /// of `f`.
     fn parse_str_as_scalar<T: std::str::FromStr>(
         &self,
         raw: &str,
@@ -778,15 +1053,15 @@ impl PrimitiveType {
     }
 
     fn parse_decimal(raw: &str, dtype: DecimalType) -> Result<Scalar, Error> {
+        let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent
             Some(pos) => {
                 let (base, exp) = raw.split_at(pos);
                 // exp now has '[e/E][exponent]', strip the 'e/E' and parse it
-                (base, exp[1..].parse()?)
+                (base, exp[1..].parse().map_err(|_| parse_error())?)
             }
         };
-        let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         require!(!base.is_empty(), parse_error());
 
         // now split on any '.' and parse
@@ -811,22 +1086,249 @@ impl PrimitiveType {
         let scale: u8 = scale.try_into().map_err(|_| parse_error())?;
         require!(scale == dtype.scale(), parse_error());
         let int: i128 = match frac_part {
-            None => int_part.parse()?,
-            Some(frac_part) => format!("{int_part}{frac_part}").parse()?,
+            None => int_part.parse().map_err(|_| parse_error())?,
+            Some(frac_part) => format!("{int_part}{frac_part}")
+                .parse()
+                .map_err(|_| parse_error())?,
         };
-        Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
+        DecimalData::try_new(int, dtype)
+            .map(Scalar::Decimal)
+            .map_err(|_| parse_error())
     }
+}
+
+// === ANSI interval literal parsing ===
+//
+// Spark serializes interval partition values as ANSI interval literal strings, e.g.
+// `INTERVAL '1-0' YEAR TO MONTH` (= 12 months) and
+// `INTERVAL '1 12:30:45.000000' DAY TO SECOND`. Kernel represents intervals as their
+// physical integer (i32 months / i64 microseconds), so these parsers convert literals to
+// their physical representation.
+//
+// Currently, there's no DAT test for DAY TO SECOND partition values.
+// TODO: Unify SQL literal parsing with `expressions/sql.rs`.
+
+/// Extracts the quoted body and field range of an ANSI interval literal.
+fn extract_interval_literal(raw: &str) -> Option<(&str, IntervalFieldRange)> {
+    let trimmed = raw.trim();
+    if !trimmed.get(..8)?.eq_ignore_ascii_case("INTERVAL") {
+        return None;
+    }
+    let rest = trimmed[8..].trim_start().strip_prefix('\'')?;
+    let (body, after) = rest.split_once('\'')?;
+    let field_range = after
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .join(" ");
+    let interval_type = parse_interval_type(&format!("interval {field_range}"))?;
+    Some((body, interval_type))
+}
+
+fn interval_magnitude(body: &str) -> Option<(bool, &str)> {
+    let (negative, magnitude) = body.strip_prefix('-').map_or((false, body), |m| (true, m));
+    (!magnitude.starts_with('-') && !magnitude.contains('+')).then_some((negative, magnitude))
+}
+
+fn signed_i32(magnitude: u32, negative: bool) -> Option<i32> {
+    let signed = if negative {
+        -(magnitude as i64)
+    } else {
+        magnitude as i64
+    };
+    i32::try_from(signed).ok()
+}
+
+fn signed_i64(magnitude: u64, negative: bool) -> Option<i64> {
+    let signed = if negative {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    i64::try_from(signed).ok()
+}
+
+fn parse_seconds(raw: &str) -> Option<(u64, u64)> {
+    match raw.split_once('.') {
+        Some((seconds, fraction)) => {
+            if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            // Fractional precision beyond microseconds is truncated.
+            let fraction: String = fraction
+                .chars()
+                .chain(std::iter::repeat('0'))
+                .take(6)
+                .collect();
+            Some((seconds.parse().ok()?, fraction.parse().ok()?))
+        }
+        None => Some((raw.parse().ok()?, 0)),
+    }
+}
+
+fn parse_clock(raw: &str, has_seconds: bool) -> Option<(u64, u64, u64, u64)> {
+    let mut parts = raw.split(':');
+    let hours = parts.next()?.parse().ok()?;
+    let minutes = parts.next()?.parse::<u64>().ok()?;
+    let (seconds, micros) = if has_seconds {
+        parse_seconds(parts.next()?)?
+    } else {
+        (0, 0)
+    };
+    (parts.next().is_none() && minutes < 60 && seconds < 60)
+        .then_some((hours, minutes, seconds, micros))
+}
+
+fn checked_day_time_micros(
+    days: u64,
+    hours: u64,
+    minutes: u64,
+    seconds: u64,
+    micros: u64,
+) -> Option<u64> {
+    days.checked_mul(24)?
+        .checked_add(hours)?
+        .checked_mul(60)?
+        .checked_add(minutes)?
+        .checked_mul(60)?
+        .checked_add(seconds)?
+        .checked_mul(1_000_000)?
+        .checked_add(micros)
+}
+
+/// Parses a year-month interval literal into a signed total month count.
+fn parse_year_month_interval(raw: &str) -> Option<i32> {
+    use IntervalField::*;
+
+    let (body, field_range) = extract_interval_literal(raw)?;
+    let (negative, magnitude) = interval_magnitude(body)?;
+    let total = match (field_range.start, field_range.end) {
+        (Year, Year) => magnitude.parse::<u32>().ok()?.checked_mul(12)?,
+        (Month, Month) => magnitude.parse().ok()?,
+        (Year, Month) => {
+            let (years, months) = magnitude.split_once('-')?;
+            let months = months.parse::<u32>().ok()?;
+            if months >= 12 {
+                return None;
+            }
+            years
+                .parse::<u32>()
+                .ok()?
+                .checked_mul(12)?
+                .checked_add(months)?
+        }
+        _ => return None,
+    };
+    signed_i32(total, negative)
+}
+
+/// Parses a day-time interval literal into a signed total microsecond count.
+fn parse_day_time_interval(raw: &str) -> Option<i64> {
+    use IntervalField::*;
+
+    let (body, field_range) = extract_interval_literal(raw)?;
+    let (negative, magnitude) = interval_magnitude(body)?;
+    let (days, hours, minutes, seconds, micros) = match (field_range.start, field_range.end) {
+        (Day, Day) => (magnitude.parse().ok()?, 0, 0, 0, 0),
+        (Hour, Hour) => (0, magnitude.parse().ok()?, 0, 0, 0),
+        (Minute, Minute) => (0, 0, magnitude.parse().ok()?, 0, 0),
+        (Second, Second) => {
+            let (seconds, micros) = parse_seconds(magnitude)?;
+            (0, 0, 0, seconds, micros)
+        }
+        (Day, Hour) => {
+            let (days, hours) = magnitude.split_once(' ')?;
+            let hours = hours.parse::<u64>().ok()?;
+            if hours >= 24 {
+                return None;
+            }
+            (days.parse().ok()?, hours, 0, 0, 0)
+        }
+        (Day, Minute) | (Day, Second) => {
+            let (days, time) = magnitude.split_once(' ')?;
+            let (hours, minutes, seconds, micros) = parse_clock(time, field_range.end == Second)?;
+            if hours >= 24 {
+                return None;
+            }
+            (days.parse().ok()?, hours, minutes, seconds, micros)
+        }
+        (Hour, Minute) | (Hour, Second) => {
+            let (hours, minutes, seconds, micros) =
+                parse_clock(magnitude, field_range.end == Second)?;
+            (0, hours, minutes, seconds, micros)
+        }
+        (Minute, Second) => {
+            let (minutes, seconds) = magnitude.split_once(':')?;
+            let (seconds, micros) = parse_seconds(seconds)?;
+            if seconds >= 60 {
+                return None;
+            }
+            (0, 0, minutes.parse().ok()?, seconds, micros)
+        }
+        _ => return None,
+    };
+    signed_i64(
+        checked_day_time_micros(days, hours, minutes, seconds, micros)?,
+        negative,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::f32::consts::PI;
+    use std::fmt::Debug;
 
-    use crate::expressions::{column_expr, BinaryPredicateOp};
-    use crate::utils::test_utils::assert_result_error_with_message;
-    use crate::{Expression as Expr, Predicate as Pred};
+    use bytes::Bytes;
+    use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData};
+    use rstest::rstest;
 
     use super::*;
+    use crate::expressions::{col, lit, BinaryPredicateOp};
+    use crate::schema::{schema, ToSchema as _};
+    use crate::table_features::TableFeature;
+    use crate::unit_test_utils::assert_result_error_with_message;
+    use crate::Predicate as Pred;
+
+    #[rstest]
+    #[case::truncates(Scalar::Integer(7), Scalar::Integer(2), Some(Scalar::Integer(3)))]
+    #[case::zero_divisor(Scalar::Integer(7), Scalar::Integer(0), None)]
+    #[case::floats_unsupported(Scalar::Double(7.0), Scalar::Double(2.0), None)]
+    fn test_try_div_truncates_and_returns_none_for_zero_divisor_and_floats(
+        #[case] left: Scalar,
+        #[case] right: Scalar,
+        #[case] expected: Option<Scalar>,
+    ) {
+        assert_eq!(left.try_div(&right), expected);
+    }
+
+    #[test]
+    fn test_void_parse_scalar() {
+        // Empty string should produce Null (like all primitive types)
+        let scalar = PrimitiveType::Void.parse_scalar("").unwrap();
+        assert_eq!(scalar, Scalar::Null(DataType::VOID));
+
+        // Non-empty string should fail
+        PrimitiveType::Void.parse_scalar("anything").unwrap_err();
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest::rstest]
+    #[case(PrimitiveType::Geometry(Box::new(
+        crate::schema::GeometryType::try_new("EPSG:4326").unwrap()
+    )))]
+    #[case(PrimitiveType::Geography(Box::new(
+        crate::schema::GeographyType::try_new(
+            "EPSG:4326",
+            crate::schema::EdgeInterpolationAlgorithm::Spherical,
+        )
+        .unwrap()
+    )))]
+    fn test_geo_parse_scalar_unsupported(#[case] ptype: PrimitiveType) {
+        let err = ptype.parse_scalar("anything").unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported, got: {err:?}"
+        );
+    }
 
     #[test]
     fn test_bad_decimal() {
@@ -835,6 +1337,7 @@ mod tests {
         PrimitiveType::parse_decimal("0.12345", dtype).expect_err("should have failed");
         PrimitiveType::parse_decimal("12345", dtype).expect_err("should have failed");
     }
+
     #[test]
     fn test_decimal_display() {
         let s = Scalar::decimal(123456789, 9, 2).unwrap();
@@ -948,8 +1451,10 @@ mod tests {
 
     fn expect_fail_parse(raw: &str, prec: u8, scale: u8) {
         let s = PrimitiveType::decimal(prec, scale).unwrap();
-        let res = s.parse_scalar(raw);
-        assert!(res.is_err(), "Fail on {raw}");
+        match s.parse_scalar(raw) {
+            Err(Error::ParseError(..)) => {}
+            other => panic!("expected ParseError for {raw:?}, got {other:?}"),
+        }
     }
 
     #[test]
@@ -986,18 +1491,13 @@ mod tests {
             elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
         });
 
-        let column = column_expr!("item");
-        let array_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(10), array.clone());
-        let array_not_op = Pred::not(Pred::binary(
-            BinaryPredicateOp::In,
-            Expr::literal(10),
-            array,
-        ));
-        let column_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(PI), column.clone());
+        let array_op = Pred::binary(BinaryPredicateOp::In, lit(10), array.clone());
+        let array_not_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(10), array));
+        let column_op = Pred::binary(BinaryPredicateOp::In, lit(PI), col!("item"));
         let column_not_op = Pred::not(Pred::binary(
             BinaryPredicateOp::In,
-            Expr::literal("Cool"),
-            column,
+            lit("Cool"),
+            col!("item"),
         ));
         assert_eq!(&format!("{array_op}"), "10 IN (1, 2, 3)");
         assert_eq!(&format!("{array_not_op}"), "NOT(10 IN (1, 2, 3))");
@@ -1054,48 +1554,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_timestamp_parse() {
-        let assert_timestamp_eq = |scalar_string, micros| {
-            let scalar = PrimitiveType::Timestamp
-                .parse_scalar(scalar_string)
-                .unwrap();
-            assert_eq!(scalar, Scalar::Timestamp(micros));
+    #[rstest]
+    #[case::seconds("2011-01-11 13:06:07", 1294751167000000)]
+    #[case::fractional_seconds("2011-01-11 13:06:07.123456", 1294751167123456)]
+    #[case::epoch("1970-01-01 00:00:00", 0)]
+    fn test_timestamp_space_form_parse(
+        #[values(PrimitiveType::Timestamp, PrimitiveType::TimestampNtz)] p_type: PrimitiveType,
+        #[case] raw: &str,
+        #[case] micros: i64,
+    ) {
+        let expected = match p_type {
+            PrimitiveType::Timestamp => Scalar::Timestamp(micros),
+            PrimitiveType::TimestampNtz => Scalar::TimestampNtz(micros),
+            _ => unreachable!(),
         };
-        assert_timestamp_eq("1971-07-22T03:06:40.678910Z", 49000000678910);
-        assert_timestamp_eq("1971-07-22T03:06:40Z", 49000000000000);
-        assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
-        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
-        assert_timestamp_eq("1970-01-01 00:00:00", 0);
+        assert_eq!(p_type.parse_scalar(raw).unwrap(), expected);
     }
 
-    #[test]
-    fn test_timestamp_ntz_parse() {
-        let assert_timestamp_eq = |scalar_string, micros| {
-            let scalar = PrimitiveType::TimestampNtz
-                .parse_scalar(scalar_string)
-                .unwrap();
-            assert_eq!(scalar, Scalar::TimestampNtz(micros));
-        };
-        assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
-        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
-        assert_timestamp_eq("1970-01-01 00:00:00", 0);
+    #[rstest]
+    #[case::z_fractional("1971-07-22T03:06:40.678910Z", 49000000678910)]
+    #[case::z_seconds("1971-07-22T03:06:40Z", 49000000000000)]
+    #[case::z("2024-06-15T14:30:00Z", 1718461800000000)]
+    #[case::lowercase_t_z("2024-06-15t14:30:00z", 1718461800000000)]
+    #[case::zero_offset("2024-06-15T14:30:00+00:00", 1718461800000000)]
+    #[case::negative_zero_offset("2024-06-15T14:30:00-00:00", 1718461800000000)]
+    #[case::positive_offset("2024-06-15T14:30:00+05:00", 1718443800000000)] // 09:30:00Z
+    #[case::negative_offset("2024-06-15T14:30:00-05:00", 1718479800000000)] // 19:30:00Z
+    #[case::half_hour_offset("2024-06-15T14:30:00+05:30", 1718442000000000)] // 09:00:00Z
+    #[case::colonless_offset("2024-06-15T14:30:00+0530", 1718442000000000)] // 09:00:00Z
+    #[case::fractional_with_offset("2024-06-15T14:30:00.456+05:00", 1718443800456000)]
+    #[case::space_separator_with_offset("2024-06-15 14:30:00+05:00", 1718443800000000)]
+    #[case::pre_epoch_after_normalization("1970-01-01T00:00:00+05:00", -18000000000)]
+    fn test_timestamp_iso8601_parse(#[case] raw: &str, #[case] micros: i64) {
+        let scalar = PrimitiveType::Timestamp.parse_scalar(raw).unwrap();
+        assert_eq!(scalar, Scalar::Timestamp(micros));
     }
 
-    #[test]
-    fn test_timestamp_parse_fails() {
-        let assert_timestamp_fails = |p_type: &PrimitiveType, scalar_string| {
-            let res = p_type.parse_scalar(scalar_string);
-            assert!(res.is_err());
-        };
-
-        let p_type = PrimitiveType::TimestampNtz;
-        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40.678910Z");
-        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40Z");
-        assert_timestamp_fails(&p_type, "1971-07-22");
-
-        let p_type = PrimitiveType::Timestamp;
-        assert_timestamp_fails(&p_type, "1971-07-22");
+    #[rstest]
+    // TimestampNtz has no ISO 8601 fallback: rejects Z, offsets, and date-only
+    #[case::ntz_z_fractional(PrimitiveType::TimestampNtz, "1971-07-22T03:06:40.678910Z")]
+    #[case::ntz_z(PrimitiveType::TimestampNtz, "1971-07-22T03:06:40Z")]
+    #[case::ntz_offset(PrimitiveType::TimestampNtz, "2024-06-15T14:30:00+05:00")]
+    #[case::ntz_space_offset(PrimitiveType::TimestampNtz, "2024-06-15 14:30:00+05:00")]
+    #[case::ntz_date_only(PrimitiveType::TimestampNtz, "1971-07-22")]
+    // Timestamp rejects date-only and the T-form without a trailing Z or offset
+    #[case::date_only(PrimitiveType::Timestamp, "1971-07-22")]
+    #[case::zoneless_t_form(PrimitiveType::Timestamp, "2024-06-15T14:30:00")]
+    // out-of-range offsets and UTC normalizations that overflow chrono's datetime range
+    // error cleanly rather than being misinterpreted
+    #[case::offset_out_of_range(PrimitiveType::Timestamp, "2024-06-15T14:30:00+24:00")]
+    #[case::normalization_overflow(PrimitiveType::Timestamp, "-262143-01-01T00:00:00+05:00")]
+    fn test_timestamp_parse_fails(#[case] p_type: PrimitiveType, #[case] raw: &str) {
+        assert!(p_type.parse_scalar(raw).is_err());
     }
 
     #[test]
@@ -1131,15 +1641,47 @@ mod tests {
         assert!(!null.logical_eq(&null));
     }
 
+    fn assert_into_scalar_matches_to_data_type<T: IntoScalar>(value: T) {
+        let scalar: Scalar = value.into();
+        assert!(!scalar.is_null());
+        assert_eq!(scalar.data_type(), T::to_data_type());
+    }
+
     #[test]
-    fn test_hashmap_conversion() -> DeltaResult<()> {
+    fn into_scalar_matches_to_data_type() {
+        assert_into_scalar_matches_to_data_type(true);
+        assert_into_scalar_matches_to_data_type(1i8);
+        assert_into_scalar_matches_to_data_type(1i16);
+        assert_into_scalar_matches_to_data_type(1i32);
+        assert_into_scalar_matches_to_data_type(1i64);
+        assert_into_scalar_matches_to_data_type(1.0f32);
+        assert_into_scalar_matches_to_data_type(1.0f64);
+        assert_into_scalar_matches_to_data_type("x".to_string());
+        assert_into_scalar_matches_to_data_type(Bytes::from_static(b"x"));
+        assert_into_scalar_matches_to_data_type(TableFeature::DeletionVectors);
+
+        assert_into_scalar_matches_to_data_type(vec![1i8, 2, 3]);
+        assert_into_scalar_matches_to_data_type(vec![1, 2, 3]);
+        assert_into_scalar_matches_to_data_type(vec![Some(1i32), None]);
+        assert_into_scalar_matches_to_data_type(HashMap::from([
+            ("key1".to_string(), 42i32),
+            ("key2".to_string(), 100i32),
+        ]));
+        assert_into_scalar_matches_to_data_type(HashMap::from([
+            ("key1".to_string(), Some(42i32)),
+            ("key2".to_string(), None),
+        ]));
+    }
+
+    #[test]
+    fn test_hashmap_conversion() {
         // Create a simple HashMap with string keys and integer values
         let mut map = HashMap::new();
         map.insert("key1".to_string(), 42i32);
         map.insert("key2".to_string(), 100i32);
 
         // Convert HashMap to Scalar
-        let scalar = Scalar::try_from(map)?;
+        let scalar = Scalar::from(map);
 
         // Verify the scalar is of Map type
         assert!(matches!(scalar, Scalar::Map(_)));
@@ -1161,12 +1703,10 @@ mod tests {
         let entry2 = (Scalar::String("key2".to_string()), Scalar::Integer(100));
         assert!(pairs.contains(&entry1), "Missing key1 -> 42 pair");
         assert!(pairs.contains(&entry2), "Missing key2 -> 100 pair");
-
-        Ok(())
     }
 
     #[test]
-    fn test_hashmap_conversion_with_nullable_values() -> DeltaResult<()> {
+    fn test_hashmap_conversion_with_nullable_values() {
         // Create a HashMap with string keys and optional integer values
         let mut map = HashMap::new();
         map.insert("key1".to_string(), Some(42i32));
@@ -1174,7 +1714,7 @@ mod tests {
         map.insert("key3".to_string(), Some(100i32));
 
         // Convert HashMap to Scalar
-        let scalar = Scalar::try_from(map)?;
+        let scalar = Scalar::from(map);
 
         // Verify the scalar is of Map type
         assert!(matches!(scalar, Scalar::Map(_)));
@@ -1201,17 +1741,15 @@ mod tests {
         assert!(pairs.contains(&entry1), "Missing key1 -> 42 pair");
         assert!(pairs.contains(&entry2), "Missing key2 -> null pair");
         assert!(pairs.contains(&entry3), "Missing key3 -> 100 pair");
-
-        Ok(())
     }
 
     #[test]
-    fn test_vec_conversion() -> DeltaResult<()> {
+    fn test_vec_conversion() {
         // Create a simple Vec with integer values
         let vec = vec![42i32, 100i32, 200i32];
 
         // Convert Vec to Scalar
-        let scalar = Scalar::try_from(vec)?;
+        let scalar = Scalar::from(vec);
 
         // Verify the scalar is of Array type
         assert!(matches!(scalar, Scalar::Array(_)));
@@ -1232,17 +1770,15 @@ mod tests {
         assert_eq!(elements[0], Scalar::Integer(42));
         assert_eq!(elements[1], Scalar::Integer(100));
         assert_eq!(elements[2], Scalar::Integer(200));
-
-        Ok(())
     }
 
     #[test]
-    fn test_vec_conversion_with_nullable_values() -> DeltaResult<()> {
+    fn test_vec_conversion_with_nullable_values() {
         // Create a Vec with optional integer values
         let vec = vec![Some(42i32), None, Some(100i32)];
 
         // Convert Vec to Scalar
-        let scalar = Scalar::try_from(vec)?;
+        let scalar = Scalar::from(vec);
 
         // Verify the scalar is of Array type
         assert!(matches!(scalar, Scalar::Array(_)));
@@ -1264,15 +1800,13 @@ mod tests {
         assert_eq!(elements[0], Scalar::Integer(42));
         assert!(elements[1].is_null());
         assert_eq!(elements[2], Scalar::Integer(100));
-
-        Ok(())
     }
 
     #[test]
-    fn test_vec_conversion_different_types() -> DeltaResult<()> {
+    fn test_vec_conversion_different_types() {
         // Test with string Vec
         let string_vec = vec!["hello".to_string(), "world".to_string()];
-        let string_scalar = Scalar::try_from(string_vec)?;
+        let string_scalar = Scalar::from(string_vec);
 
         if let Scalar::Array(array_data) = string_scalar {
             let expected_array_type = ArrayType::new(DataType::STRING, false);
@@ -1283,7 +1817,7 @@ mod tests {
 
         // Test with bool Vec
         let bool_vec = vec![true, false, true];
-        let bool_scalar = Scalar::try_from(bool_vec)?;
+        let bool_scalar = Scalar::from(bool_vec);
 
         if let Scalar::Array(array_data) = bool_scalar {
             let expected_array_type = ArrayType::new(DataType::BOOLEAN, false);
@@ -1291,8 +1825,6 @@ mod tests {
         } else {
             panic!("Expected Array scalar");
         }
-
-        Ok(())
     }
 
     #[test]
@@ -1314,6 +1846,13 @@ mod tests {
             panic!("Expected Binary scalar");
         }
 
+        // Owned Vec moves into Binary without reallocation via slice.
+        let owned = vec![9u8, 8, 7];
+        let from_vec: Scalar = owned.into();
+        assert_eq!(from_vec, Scalar::Binary(vec![9, 8, 7]));
+        let from_slice: Scalar = [9u8, 8, 7].as_slice().into();
+        assert_eq!(from_slice, Scalar::Binary(vec![9, 8, 7]));
+
         // Test with empty bytes
         let empty_bytes = bytes::Bytes::new();
         let empty_scalar: Scalar = empty_bytes.into();
@@ -1324,5 +1863,434 @@ mod tests {
         } else {
             panic!("Expected Binary scalar");
         }
+    }
+
+    const INTERVAL_YM_LITERAL: &str = "INTERVAL '1-0' YEAR TO MONTH";
+    const INTERVAL_YM_LITERAL_LARGER: &str = "INTERVAL '2-0' YEAR TO MONTH";
+    const INTERVAL_DT_LITERAL: &str = "INTERVAL '0 01:00:00.000000' DAY TO SECOND";
+    const INTERVAL_DT_LITERAL_LARGER: &str = "INTERVAL '0 02:00:00.000000' DAY TO SECOND";
+
+    #[test]
+    fn interval_parse_and_data_type() {
+        let ym = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        assert_eq!(ym.data_type(), DataType::INTERVAL_YEAR_MONTH);
+
+        let dt = PrimitiveType::IntervalDayTime
+            .parse_scalar(INTERVAL_DT_LITERAL)
+            .unwrap();
+        assert_eq!(dt.data_type(), DataType::INTERVAL_DAY_TIME);
+    }
+
+    #[test]
+    fn interval_logical_partial_cmp() {
+        let ym = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        let ym_larger = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL_LARGER)
+            .unwrap();
+        assert_eq!(ym.logical_partial_cmp(&ym_larger), Some(Ordering::Less));
+        assert_eq!(ym_larger.logical_partial_cmp(&ym), Some(Ordering::Greater));
+        assert_eq!(ym.logical_partial_cmp(&ym), Some(Ordering::Equal));
+
+        let dt = PrimitiveType::IntervalDayTime
+            .parse_scalar(INTERVAL_DT_LITERAL)
+            .unwrap();
+        let dt_larger = PrimitiveType::IntervalDayTime
+            .parse_scalar(INTERVAL_DT_LITERAL_LARGER)
+            .unwrap();
+        assert_eq!(dt.logical_partial_cmp(&dt_larger), Some(Ordering::Less));
+
+        // Comparison is defined only within a family; everything else is incomparable.
+        assert_eq!(ym.logical_partial_cmp(&dt), None);
+        assert_eq!(ym.logical_partial_cmp(&Scalar::Integer(0)), None);
+    }
+
+    #[test]
+    fn interval_logical_eq() {
+        let ym = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        let ym_same = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        assert!(ym.logical_eq(&ym_same));
+        // SQL NULL semantics: NULL is not equal to anything, including a like-typed value.
+        assert!(!ym.logical_eq(&Scalar::null(DataType::INTERVAL_YEAR_MONTH)));
+    }
+
+    #[test]
+    fn test_year_month_interval_literal_parse() {
+        // Values observed in the DAT intv_003 workload, plus negatives and zero.
+        let cases = [
+            ("INTERVAL '1-0' YEAR TO MONTH", 12),
+            ("INTERVAL '2-6' YEAR TO MONTH", 30),
+            ("INTERVAL '0-0' YEAR TO MONTH", 0),
+            ("INTERVAL '0-11' YEAR TO MONTH", 11),
+            ("INTERVAL '-1-6' YEAR TO MONTH", -18),
+        ];
+        for (literal, months) in cases {
+            assert_eq!(
+                PrimitiveType::IntervalYearMonth
+                    .parse_scalar(literal)
+                    .unwrap(),
+                Scalar::IntervalYearMonth(months),
+                "parsing {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_day_time_interval_literal_parse() {
+        let cases = [
+            ("INTERVAL '0 00:00:00.000000' DAY TO SECOND", 0_i64),
+            (
+                "INTERVAL '1 12:30:45.000000' DAY TO SECOND",
+                131_445_000_000,
+            ),
+            ("INTERVAL '0 00:00:00.000005' DAY TO SECOND", 5),
+            (
+                "INTERVAL '-1 00:00:00.000000' DAY TO SECOND",
+                -86_400_000_000,
+            ),
+        ];
+        for (literal, micros) in cases {
+            assert_eq!(
+                PrimitiveType::IntervalDayTime
+                    .parse_scalar(literal)
+                    .unwrap(),
+                Scalar::IntervalDayTime(micros),
+                "parsing {literal}"
+            );
+        }
+        // Fractional seconds shorter than 6 digits are right-padded to microseconds.
+        assert_eq!(
+            PrimitiveType::IntervalDayTime
+                .parse_scalar("INTERVAL '0 00:00:00.5' DAY TO SECOND")
+                .unwrap(),
+            Scalar::IntervalDayTime(500_000)
+        );
+    }
+
+    #[test]
+    fn test_interval_literal_parse_rejects_malformed() {
+        for bad in [
+            "1-0",                              // missing INTERVAL/unit
+            "INTERVAL '1-0' DAY TO SECOND",     // unit mismatch
+            "INTERVAL 'x-0' YEAR TO MONTH",     // non-numeric
+            "INTERVAL '1' YEAR TO MONTH",       // missing '-'
+            "INTERVAL '1-12' YEAR TO MONTH",    // month field out of range
+            "INTERVAL '+5' YEAR",               // leading plus sign
+            "INTERVAL '1-+5' YEAR TO MONTH",    // embedded plus sign
+            "INTERVAL '1 12:30' DAY TO SECOND", // missing seconds field
+            "INTERVAL '0.+5' SECOND",           // fractional plus sign
+            "INTERVAL '0 00:00:00.123456xyz' DAY TO SECOND",
+            "INTERVAL '5.' SECOND",
+            "INTERVAL '0.123456.789' SECOND",
+        ] {
+            assert!(
+                PrimitiveType::IntervalYearMonth.parse_scalar(bad).is_err()
+                    && PrimitiveType::IntervalDayTime.parse_scalar(bad).is_err(),
+                "expected {bad} to fail parsing as both interval families"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case("INTERVAL '1 24' DAY TO HOUR")]
+    #[case("INTERVAL '1 00:60' DAY TO MINUTE")]
+    #[case("INTERVAL '1 00:00:60' DAY TO SECOND")]
+    #[case("INTERVAL '00:60' HOUR TO MINUTE")]
+    #[case("INTERVAL '00:00:60' HOUR TO SECOND")]
+    #[case("INTERVAL '00:60' MINUTE TO SECOND")]
+    #[case("INTERVAL '1 02:03:04:05' DAY TO SECOND")]
+    fn test_day_time_interval_rejects_out_of_range_subordinate(#[case] bad: &str) {
+        assert!(
+            PrimitiveType::IntervalDayTime.parse_scalar(bad).is_err(),
+            "{bad}"
+        );
+    }
+
+    #[rstest]
+    #[case("INTERVAL '1' YEAR", Scalar::IntervalYearMonth(12))]
+    #[case("INTERVAL '-6' MONTH", Scalar::IntervalYearMonth(-6))]
+    #[case("INTERVAL '2-6' YEAR TO MONTH", Scalar::IntervalYearMonth(30))]
+    #[case("INTERVAL '1' DAY", Scalar::IntervalDayTime(86_400_000_000))]
+    #[case("INTERVAL '25' HOUR", Scalar::IntervalDayTime(90_000_000_000))]
+    #[case("INTERVAL '90' MINUTE", Scalar::IntervalDayTime(5_400_000_000))]
+    #[case("INTERVAL '1.5' SECOND", Scalar::IntervalDayTime(1_500_000))]
+    #[case("INTERVAL '1 02' DAY TO HOUR", Scalar::IntervalDayTime(93_600_000_000))]
+    #[case(
+        "INTERVAL '1 02:03' DAY TO MINUTE",
+        Scalar::IntervalDayTime(93_780_000_000)
+    )]
+    #[case(
+        "INTERVAL '1 02:03:04.5' DAY TO SECOND",
+        Scalar::IntervalDayTime(93_784_500_000)
+    )]
+    #[case(
+        "INTERVAL '25:30' HOUR TO MINUTE",
+        Scalar::IntervalDayTime(91_800_000_000)
+    )]
+    #[case(
+        "INTERVAL '25:30:45.25' HOUR TO SECOND",
+        Scalar::IntervalDayTime(91_845_250_000)
+    )]
+    #[case(
+        "INTERVAL '90:45.25' MINUTE TO SECOND",
+        Scalar::IntervalDayTime(5_445_250_000)
+    )]
+    fn test_narrowed_interval_literal_parse(#[case] literal: &str, #[case] expected: Scalar) {
+        assert_eq!(
+            expected
+                .data_type()
+                .as_primitive_opt()
+                .unwrap()
+                .parse_scalar(literal)
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_interval_literal_overflow_rejected() {
+        assert_eq!(
+            parse_year_month_interval("INTERVAL '178956970-8' YEAR TO MONTH"),
+            None
+        );
+        assert_eq!(
+            parse_year_month_interval("INTERVAL '-178956970-9' YEAR TO MONTH"),
+            None
+        );
+        assert_eq!(
+            parse_day_time_interval("INTERVAL '9223372036854.775808' SECOND"),
+            None
+        );
+        assert_eq!(
+            parse_day_time_interval("INTERVAL '-9223372036854.775809' SECOND"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_interval_literal_case_whitespace_and_fraction_truncation() {
+        assert_eq!(
+            parse_year_month_interval("  interval   '1-0'   year   to   month  "),
+            Some(12)
+        );
+        assert_eq!(
+            parse_day_time_interval("INTERVAL '0.1234567' SECOND"),
+            Some(123_456)
+        );
+    }
+
+    /// `TryFrom<Scalar>` must invert `Into<Scalar>` and produce the expected data type.
+    fn assert_round_trip<T>(value: T, expected_type: impl Into<DataType>)
+    where
+        T: Clone + Debug + PartialEq + Into<Scalar> + TryFrom<Scalar, Error = Error>,
+    {
+        let scalar: Scalar = value.clone().into();
+        assert_eq!(scalar.data_type(), expected_type.into());
+        assert_eq!(T::try_from(scalar).unwrap(), value);
+    }
+
+    #[test]
+    fn scalar_conversions_round_trip() {
+        assert_round_trip(1i8, DataType::BYTE);
+        assert_round_trip(2i16, DataType::SHORT);
+        assert_round_trip(3i32, DataType::INTEGER);
+        assert_round_trip(4i64, DataType::LONG);
+        assert_round_trip(PI, DataType::FLOAT);
+        assert_round_trip(6.0f64, DataType::DOUBLE);
+        assert_round_trip(true, DataType::BOOLEAN);
+        assert_round_trip("seven".to_string(), DataType::STRING);
+        assert_round_trip(Bytes::from_static(b"eight"), DataType::BINARY);
+        let decimal_type = DecimalType::try_new(2, 1).unwrap();
+        assert_round_trip(DecimalData::try_new(9, decimal_type).unwrap(), decimal_type);
+        assert_round_trip(vec![10i32, 11], ArrayType::new(DataType::INTEGER, false));
+        assert_round_trip(
+            vec![Some(12i32), None],
+            ArrayType::new(DataType::INTEGER, true),
+        );
+        assert_round_trip(
+            HashMap::from([("k".to_string(), "v".to_string())]),
+            MapType::new(DataType::STRING, DataType::STRING, false),
+        );
+        assert_round_trip(
+            HashMap::from([("k".to_string(), None as Option<String>)]),
+            MapType::new(DataType::STRING, DataType::STRING, true),
+        );
+        assert_round_trip(Some(13i32), DataType::INTEGER);
+        assert_round_trip(None::<i32>, DataType::INTEGER);
+    }
+
+    #[rstest]
+    #[case::long(Scalar::Long(1), "expected i32, found long")]
+    #[case::date(Scalar::Date(1), "expected i32, found date")]
+    #[case::interval_year_month(
+        Scalar::IntervalYearMonth(1),
+        "expected i32, found interval_year_month"
+    )]
+    #[case::string(Scalar::from("1"), "expected i32, found string")]
+    #[case::null(Scalar::null(DataType::INTEGER), "expected i32, found null")]
+    fn i32_conversion_rejects_other_variants(#[case] scalar: Scalar, #[case] expected: &str) {
+        assert_result_error_with_message(i32::try_from(scalar), expected);
+    }
+
+    #[rstest]
+    #[case::timestamp(Scalar::Timestamp(1), "expected i64, found timestamp")]
+    #[case::timestamp_ntz(Scalar::TimestampNtz(1), "expected i64, found timestamp_ntz")]
+    #[case::interval_day_time(Scalar::IntervalDayTime(1), "expected i64, found interval_day_time")]
+    #[case::integer(Scalar::Integer(1), "expected i64, found integer")]
+    fn i64_conversion_rejects_other_variants(#[case] scalar: Scalar, #[case] expected: &str) {
+        assert_result_error_with_message(i64::try_from(scalar), expected);
+    }
+
+    #[test]
+    fn null_option_requires_matching_element_data_type() {
+        assert_eq!(
+            Option::<i32>::try_from(Scalar::null(DataType::INTEGER)).unwrap(),
+            None
+        );
+        assert_result_error_with_message(
+            Option::<i32>::try_from(Scalar::null(DataType::STRING)),
+            "expected integer, found string",
+        );
+    }
+
+    #[test]
+    fn array_with_nulls_requires_optional_element_type() {
+        let scalar = Scalar::from(vec![Some(1i32), None]);
+        assert_result_error_with_message(
+            Vec::<i32>::try_from(scalar),
+            "expected array<integer, contains_null=false>, found array<integer, contains_null=true>",
+        );
+    }
+
+    #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
+    struct Address {
+        city: String,
+        zip: Option<i32>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
+    struct Person {
+        id: i32,
+        address: Address,
+        display_names: Vec<String>,
+    }
+
+    fn test_person() -> Person {
+        Person {
+            id: 1,
+            address: Address {
+                city: "NYC".to_string(),
+                zip: None,
+            },
+            display_names: vec!["ace".to_string()],
+        }
+    }
+
+    #[test]
+    fn derived_struct_conversions_round_trip() {
+        assert_round_trip(test_person(), Person::to_schema());
+    }
+
+    #[rstest]
+    #[case::not_a_struct(Scalar::Long(1), "expected Person, found long")]
+    #[case::wrong_field_type(
+        Scalar::Struct(StructData::from_values_unchecked(
+            Person::to_schema(),
+            vec![
+                Scalar::from("not an integer"),
+                Scalar::from(Address { city: "NYC".to_string(), zip: None }),
+                Scalar::from(vec!["ace".to_string()]),
+            ],
+        )),
+        "id: expected i32, found string"
+    )]
+    fn derived_struct_conversion_rejects_mismatched_scalars(
+        #[case] scalar: Scalar,
+        #[case] expected: &str,
+    ) {
+        assert_result_error_with_message(Person::try_from(scalar), expected);
+    }
+
+    #[test]
+    fn derived_struct_conversion_requires_exact_field_count() {
+        let values = vec![Scalar::from(1)];
+        let struct_data = StructData::from_values_unchecked(Person::to_schema(), values);
+        assert_result_error_with_message(
+            Person::try_from(struct_data),
+            "expected 3 struct values, found 1 struct values",
+        );
+    }
+
+    #[test]
+    fn derived_struct_conversion_matches_fields_by_name() {
+        let person = test_person();
+        let Scalar::Struct(data) = Scalar::from(person.clone()) else {
+            unreachable!()
+        };
+        let (mut fields, mut values) = data.into_parts();
+        fields.swap(0, 2);
+        values.swap(0, 2);
+        let reordered = StructData::try_new(fields, values).unwrap();
+        assert_eq!(Person::try_from(reordered).unwrap(), person);
+    }
+
+    #[test]
+    fn derived_struct_conversion_builds_nested_error_path_while_unwinding() {
+        let address = StructData::from_values_unchecked(
+            Address::to_schema(),
+            vec![Scalar::from(7), Scalar::null(DataType::INTEGER)],
+        );
+        let person = StructData::from_values_unchecked(
+            Person::to_schema(),
+            vec![
+                Scalar::from(1),
+                Scalar::from(address),
+                Scalar::from(vec!["ace".to_string()]),
+            ],
+        );
+        assert_result_error_with_message(
+            Person::try_from(person),
+            "address.city: expected String, found integer",
+        );
+    }
+
+    #[test]
+    fn container_conversion_adds_index_to_nested_error_path() {
+        let address = StructData::from_values_unchecked(
+            Address::to_schema(),
+            vec![Scalar::from(7), Scalar::null(DataType::INTEGER)],
+        );
+        let array = ArrayData::try_new(
+            ArrayType::new(Address::to_schema(), false),
+            [Scalar::from(address)],
+        )
+        .unwrap();
+        assert_result_error_with_message(
+            Vec::<Address>::try_from(Scalar::from(array)),
+            "[0].city: expected String, found integer",
+        );
+    }
+
+    #[test]
+    fn derived_struct_conversion_checks_null_field_data_type() {
+        // `Option::try_from` rejects a typed null whose data type does not match `T`.
+        let address = StructData::from_values_unchecked(
+            schema! {
+                not_null "city": STRING,
+                nullable "zip": STRING,
+            },
+            vec![Scalar::from("NYC"), Scalar::null(DataType::STRING)],
+        );
+        assert_result_error_with_message(
+            Address::try_from(address),
+            "zip: expected integer, found string",
+        );
     }
 }

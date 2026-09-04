@@ -1,0 +1,15 @@
+[package]
+name = "delta_kernel_default_engine_test_utils"
+description = "Shared test helpers for delta_kernel_default_engine's own test suite."
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[package.metadata.release]
+release = false
+
+[dependencies]
+delta_kernel = { path = "../../kernel" }

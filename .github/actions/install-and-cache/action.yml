@@ -1,0 +1,101 @@
+# This is copied from https://github.com/tecolicom/actions-install-and-cache
+# which is Copyright 2022 Office TECOLI, LLC
+
+name: install-and-cache generic backend
+description: 'GitHub Action to run installer and cache the result'
+branding:
+  color: orange
+  icon:  type
+
+inputs:
+  run:     { required: true,  type: string }
+  path:    { required: true,  type: string }
+  cache:   { required: false, type: string, default: yes }
+  key:     { required: false, type: string }
+  sudo:    { required: false, type: string }
+  verbose: { required: false, type: string, default: false }
+
+outputs:
+  cache-hit:
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+
+    - id: setup
+      shell: bash
+      run: |
+        : setup install-and-cache
+        define() { IFS='\n' read -r -d '' ${1} || true ; }
+        define script <<'EOS_cad8_c24e_'
+        ${{ inputs.run }}
+        EOS_cad8_c24e_
+        directory="${{ inputs.path }}"
+        given_key="${{ inputs.key }}"
+        archive= key=
+        case "${{ inputs.cache }}" in
+            yes|workflow)
+                cache="${{ inputs.cache }}"
+                uname -mrs
+                hash=$( (uname -mrs ; cat <<< "$script" ; echo $directory) | \
+                        (md5sum||md5) | awk '{print $1}' )
+                key="${hash}${given_key:+-$given_key}"
+                [ "$cache" == 'workflow' ] && \
+                    key+="-${{ github.run_id }}-${{ github.run_attempt }}"
+                archive=$HOME/archive-$hash.tz
+                ;;
+            *)
+                cache=no
+                ;;
+        esac
+        # use "--recursive-unlink" option if GNU tar is found
+        if tar --version | grep GNU > /dev/null
+        then
+            tar="tar --recursive-unlink"
+        elif gtar --version | grep GNU > /dev/null
+        then
+            tar="gtar --recursive-unlink"
+        else
+            tar=tar
+        fi
+        sed 's/^ *//' << END >> $GITHUB_OUTPUT
+            cache=$cache
+            archive=$archive
+            key=$key
+            tar=$tar
+        END
+
+    - id: cache
+      if: steps.setup.outputs.cache != 'no'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.setup.outputs.archive }}
+        key:  ${{ steps.setup.outputs.key }}
+
+    - id: extract
+      if: steps.setup.outputs.cache != 'no' && steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        : extract
+        archive="${{ steps.setup.outputs.archive }}"
+        verbose="${{ inputs.verbose }}"
+        tar="${{ steps.setup.outputs.tar }}"
+        ls -l $archive
+        if [ -s $archive ]
+        then
+            opt=-Pxz
+            [[ $verbose == yes || $verbose == true ]] && opt+=v
+            sudo $tar -C / $opt -f $archive
+        else
+            echo "$archive is empty"
+        fi
+
+    - id: install-and-archive
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: tecolicom/actions-install-and-archive@9d5afb27f9900f2df47fe40de58fbd837032bddf # v1.3
+      with:
+        run:     ${{ inputs.run }}
+        archive: ${{ steps.setup.outputs.archive }}
+        path:    ${{ inputs.path }}
+        sudo:    ${{ inputs.sudo }}

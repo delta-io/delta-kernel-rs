@@ -1,0 +1,157 @@
+use std::future::Future;
+
+use reqwest::{header, Client, Response, StatusCode};
+use tracing::warn;
+
+use crate::config::ClientConfig;
+use crate::error::{Error, Result};
+
+/// Build a configured HTTP client from the given config.
+pub fn build_http_client(config: &ClientConfig) -> Result<Client> {
+    let headers = header::HeaderMap::from_iter([
+        (
+            header::AUTHORIZATION,
+            header::HeaderValue::from_str(&format!("Bearer {}", config.token))?,
+        ),
+        (
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        ),
+        // Identifies the calling client to UC.
+        (
+            header::USER_AGENT,
+            header::HeaderValue::from_str(config.user_agent())?,
+        ),
+    ]);
+
+    let client = Client::builder()
+        .default_headers(headers)
+        .timeout(config.timeout)
+        .connect_timeout(config.connect_timeout)
+        .build()?;
+
+    Ok(client)
+}
+
+/// Execute a request with retry logic for server errors and request failures.
+/// Retries up to `max_retries` times with linear backoff: delay = `retry_base_delay * attempt`.
+pub async fn execute_with_retry<F, Fut>(config: &ClientConfig, f: F) -> Result<Response>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<Response, reqwest::Error>>,
+{
+    for retry in 0..=config.max_retries {
+        match f().await {
+            Ok(response) if !response.status().is_server_error() => return Ok(response),
+            Ok(response) if retry < config.max_retries => {
+                warn!(
+                    "Server error {}, retrying (attempt {}/{})",
+                    response.status(),
+                    retry + 1,
+                    config.max_retries
+                );
+            }
+            Ok(response) => {
+                return Err(Error::HttpStatusError {
+                    status: response.status().as_u16(),
+                    message: "Server error".to_string(),
+                })
+            }
+            Err(e) if retry < config.max_retries => {
+                warn!(
+                    "Request failed, retrying (attempt {}/{}): {}",
+                    retry + 1,
+                    config.max_retries,
+                    e
+                );
+            }
+            Err(e) => return Err(Error::from(e)),
+        }
+
+        tokio::time::sleep(config.retry_base_delay * (retry + 1)).await;
+    }
+
+    // this is actually unreachable since we return in the loop for Ok/Err after all retries
+    Err(Error::MaxRetriesExceeded)
+}
+
+pub async fn execute_without_retry<F, Fut>(f: F) -> Result<Response>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<Response, reqwest::Error>>,
+{
+    f().await.map_err(Error::from)
+}
+
+/// Handle HTTP response and deserialize.
+pub async fn handle_response<T>(response: Response) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if response.status().is_success() {
+        response.json::<T>().await.map_err(Error::from)
+    } else {
+        Err(error_from_response(response).await)
+    }
+}
+
+/// Handle a response that carries no body (or a body the caller ignores). Preserves the server's
+/// error message on failure without decoding the success body.
+pub async fn handle_empty_response(response: Response) -> Result<()> {
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(error_from_response(response).await)
+    }
+}
+
+/// Build an error from a non-success response, preserving the server's body and mapping
+/// authentication / not-found statuses.
+async fn error_from_response(response: Response) -> Error {
+    let status = response.status();
+    let error_body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "Unknown error".to_string());
+
+    match status {
+        StatusCode::UNAUTHORIZED => {
+            unity_catalog_delta_client_api::Error::AuthenticationFailed.into()
+        }
+        StatusCode::NOT_FOUND => Error::HttpStatusError {
+            status: status.as_u16(),
+            message: format!("Resource not found: {error_body}"),
+        },
+        _ => Error::HttpStatusError {
+            status: status.as_u16(),
+            message: error_body,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ClientConfig;
+
+    #[test]
+    fn build_http_client_accepts_composed_user_agent() {
+        let config = ClientConfig::build("example.com", "t")
+            .with_additional_user_agent([("Spark", "3.5.0")])
+            .build()
+            .unwrap();
+        build_http_client(&config).expect("composed user_agent must be a valid header value");
+    }
+
+    #[test]
+    fn build_http_client_rejects_invalid_additional_user_agent_chars() {
+        let config = ClientConfig::build("example.com", "t")
+            .with_additional_user_agent([("bad\nname", "1.0")])
+            .build()
+            .unwrap();
+        assert!(matches!(
+            build_http_client(&config),
+            Err(Error::InvalidHeaderValue(_))
+        ));
+    }
+}

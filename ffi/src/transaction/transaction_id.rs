@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use delta_kernel::transaction::Transaction;
+use delta_kernel::{DeltaResult, Snapshot};
+
 use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::transaction::ExclusiveTransaction;
@@ -8,17 +11,15 @@ use crate::{
     SharedSnapshot, TryFromStringSlice,
 };
 
-use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, Snapshot};
-
-/// Associates an app_id and version with a transaction. These will be applied to the table on commit.
+/// Associates an app_id and version with a transaction. These will be applied to the table on
+/// commit.
 ///
 /// # Returns
 /// A new handle to the transaction that will set the `app_id` version to `version` on commit
 ///
 /// # Safety
-/// Caller is responsible for passing [valid][Handle#Validity] handles. The `app_id` string slice must be valid.
-/// CONSUMES TRANSACTION
+/// Caller is responsible for passing [valid][Handle#Validity] handles. The `app_id` string slice
+/// must be valid. CONSUMES TRANSACTION
 #[no_mangle]
 pub unsafe extern "C" fn with_transaction_id(
     txn: Handle<ExclusiveTransaction>,
@@ -46,8 +47,8 @@ fn with_transaction_id_impl(
 /// The version number if found, or an error of type `MissingDataError` when the app_id was not set
 ///
 /// # Safety
-/// Caller must ensure [valid][Handle#Validity] handles are provided for snapshot and engine. The `app_id`
-/// string slice must be valid.
+/// Caller must ensure [valid][Handle#Validity] handles are provided for snapshot and engine. The
+/// `app_id` string slice must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn get_app_id_version(
     snapshot: Handle<SharedSnapshot>,
@@ -73,43 +74,33 @@ fn get_app_id_version_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::ffi_test_utils::ok_or_panic;
-    use crate::kernel_string_slice;
-    use crate::tests::get_default_engine;
-    use crate::transaction::{commit, transaction};
-    use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::Snapshot;
     use std::sync::Arc;
-    use tempfile::tempdir;
+
+    use delta_kernel::schema::schema_ref;
+    use delta_kernel::Snapshot;
     use test_utils::setup_test_tables;
-    use url::Url;
+
+    use super::*;
+    use crate::ffi_test_utils::{engine_handle_for_store, ok_or_panic};
+    use crate::transaction::{commit, free_committed_transaction, transaction};
+    use crate::{free_engine, free_snapshot, kernel_string_slice};
 
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
-    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
-        // Create a temporary local directory for use during this test
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-
         // create a simple table: one int column named 'number'
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "number": INTEGER };
 
-        for (table_url, engine, _store, _table_name) in
-            setup_test_tables(schema, &[], Some(&tmp_dir_local_url), "test_table").await?
+        for (table_url, engine, store, _table_name) in
+            setup_test_tables(schema, &[], None, "test_table").await?
         {
-            let table_path = table_url.to_file_path().unwrap();
-            let table_path_str = table_path.to_str().unwrap();
-            let default_engine_handle = get_default_engine(table_path_str);
+            let table_url_str = table_url.as_str();
+            let default_engine_handle = engine_handle_for_store(store);
 
             // Start the transaction
             let txn = ok_or_panic(unsafe {
                 transaction(
-                    kernel_string_slice!(table_path_str),
+                    kernel_string_slice!(table_url_str),
                     default_engine_handle.shallow_copy(),
                 )
             });
@@ -135,7 +126,9 @@ mod tests {
             });
 
             // commit!
-            ok_or_panic(unsafe { commit(txn, default_engine_handle.shallow_copy()) });
+            let committed =
+                ok_or_panic(unsafe { commit(txn, default_engine_handle.shallow_copy()) });
+            unsafe { free_committed_transaction(committed) };
 
             let snapshot: Arc<Snapshot> = Snapshot::builder_for(table_url.clone())
                 .at_version(1)
@@ -146,10 +139,12 @@ mod tests {
             assert_eq!(snapshot.get_app_id_version("app_id2", &engine)?, Some(2));
             assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
 
-            // Check versions through ffi handles
+            // Check versions through ffi handles. `get_app_id_version` borrows the handle, so
+            // one handle serves all three calls and is freed once at the end.
+            let snapshot_handle: Handle<SharedSnapshot> = snapshot.clone().into();
             let version1 = ok_or_panic(unsafe {
                 get_app_id_version(
-                    Handle::from(snapshot.clone()),
+                    snapshot_handle.shallow_copy(),
                     kernel_string_slice!(app_id1),
                     default_engine_handle.shallow_copy(),
                 )
@@ -158,7 +153,7 @@ mod tests {
 
             let version2 = ok_or_panic(unsafe {
                 get_app_id_version(
-                    Handle::from(snapshot.clone()),
+                    snapshot_handle.shallow_copy(),
                     kernel_string_slice!(app_id2),
                     default_engine_handle.shallow_copy(),
                 )
@@ -168,12 +163,15 @@ mod tests {
             let app_id3 = "app_id3";
             let version3 = ok_or_panic(unsafe {
                 get_app_id_version(
-                    Handle::from(snapshot.clone()),
+                    snapshot_handle.shallow_copy(),
                     kernel_string_slice!(app_id3),
                     default_engine_handle.shallow_copy(),
                 )
             });
             assert_eq!(version3, OptionalValue::None);
+
+            unsafe { free_snapshot(snapshot_handle) };
+            unsafe { free_engine(default_engine_handle) };
         }
         Ok(())
     }

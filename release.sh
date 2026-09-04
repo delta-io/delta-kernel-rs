@@ -7,8 +7,8 @@
 ###################################################################################################
 
 # This is a script to automate a large portion of the release process for the crates we publish to
-# crates.io. Currently only `delta_kernel` (in the kernel/ dir) and `delta_kernel_derive` (in the
-# derive-macros/ dir) are released.
+# crates.io. Currently `delta_kernel` (in the kernel/ dir), `delta_kernel_derive` (in the
+# derive-macros/ dir), and `delta_kernel_default_engine` (in the default-engine/ dir) are released.
 
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
@@ -122,8 +122,10 @@ handle_release_branch() {
 # Handle main branch workflow (publish and tag)
 handle_main_branch() {
     # could potentially just use full 'cargo release' command here
+    # publish order matters: each crate depends on the previous at the same workspace version
     publish "delta_kernel_derive"
     publish "delta_kernel"
+    publish "delta_kernel_default_engine"
 
     # hack: just redo getting the version
     local version

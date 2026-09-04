@@ -4,20 +4,22 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = ["arrow"]
+arrow = ["arrow-59"]
+arrow-59 = ["common/arrow-59"]
+arrow-58 = ["common/arrow-58"]
+
 [dependencies]
-arrow = { version = "57", features = ["prettyprint", "chrono-tz"] }
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
-# NB: common depends on 'arrow' (latest) so have to match here
-common = { path = "../common" }
+common = { path = "../common", default-features = false }
 delta_kernel = { path = "../../../kernel", features = [
-  "arrow",
-  "default-engine-rustls",
+  "default-engine-base",
   "internal-api",
 ] }
+delta_kernel_default_engine = { path = "../../../default-engine", features = ["rustls"] }
 env_logger = "0.11.8"
-object_store = { version = "0.12.3", features = ["aws", "azure", "gcp", "http"] }
-parquet = { version = "57" }
 tokio = { version = "1.0", features = ["full"] }
 url = "2"
 bytes = "1.11.0"

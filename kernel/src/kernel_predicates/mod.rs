@@ -3,6 +3,10 @@
 //! and parquet row group filtering. The evaluation is normally performed over [`Scalar`] values,
 //! but data skipping "evaluation" actually produces a transformed predicate that replaces column
 //! references with stats column references, which log replay will instruct the engine to evaluate.
+use std::cmp::Ordering;
+
+use tracing::{debug, warn};
+
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
     Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
@@ -10,9 +14,6 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
-
-use std::cmp::Ordering;
-use tracing::{debug, warn};
 
 pub(crate) mod parquet_stats_skipping;
 
@@ -26,7 +27,8 @@ mod tests;
 // below with generic lifetimes allows `&'r DynFoo<'a>` (again with `'a: 'r`). Unfortunately,
 // generic lifetimes cannot be hidden, so we end up with `&DynFoo<'_>` at every use site.
 
-/// A predicate evaluator that directly evaluates predicates, resolving column references to scalar values.
+/// A predicate evaluator that directly evaluates predicates, resolving column references to scalar
+/// values.
 pub type DirectPredicateEvaluator<'a> = dyn KernelPredicateEvaluator<Output = bool> + 'a;
 
 /// A data skipping predicate evaluator that directly applies data skipping, resolving column
@@ -124,6 +126,22 @@ pub trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
+    /// A (possibly inverted) comparison between `CAST(<col> AS target)` and a scalar, e.g.
+    /// `CAST(<col> AS DATE) < <value>`. The scalar is always on the right (the caller commutes the
+    /// operator for `<value> op CAST(<col>)`). Unsupported by default so a cast never drives file
+    /// pruning. A per-row evaluator that resolves the column to its exact value can override it; a
+    /// range-based evaluator can only do so soundly when the cast preserves order over the range.
+    fn eval_pred_cast(
+        &self,
+        _op: BinaryPredicateOp,
+        _col: &ColumnName,
+        _target: &DataType,
+        _val: &Scalar,
+        _inverted: bool,
+    ) -> Option<Self::Output> {
+        None
+    }
+
     /// Dispatches an opaque predicate.
     fn eval_pred_opaque(
         &self,
@@ -177,17 +195,20 @@ pub trait KernelPredicateEvaluator {
             Expr::Opaque(OpaqueExpression { op, exprs }) => {
                 self.eval_pred_expr_opaque(op, exprs, inverted)
             }
-            Expr::Struct(_)
-            | Expr::Transform(_)
+            Expr::Struct(..)
+            | Expr::StructPatch(_)
             | Expr::Unary(_)
             | Expr::Binary(_)
             | Expr::Variadic(_)
             | Expr::ParseJson(_)
+            | Expr::MapToStruct(_)
+            | Expr::Cast(_)
             | Expr::Unknown(_) => None,
         }
     }
 
-    /// Dispatches a (possibly inverted) unary expression to each operator's specific implementation.
+    /// Dispatches a (possibly inverted) unary expression to each operator's specific
+    /// implementation.
     fn eval_pred_unary(
         &self,
         op: UnaryPredicateOp,
@@ -204,13 +225,15 @@ pub trait KernelPredicateEvaluator {
                 Expr::Literal(val) => self.eval_pred_scalar_is_null(val, inverted),
                 Expr::Column(col) => self.eval_pred_is_null(col, inverted),
                 Expr::Predicate(_)
-                | Expr::Struct(_)
-                | Expr::Transform(_)
+                | Expr::Struct(..)
+                | Expr::StructPatch(_)
                 | Expr::Unary(_)
                 | Expr::Binary(_)
                 | Expr::Variadic(_)
                 | Expr::Opaque(_)
                 | Expr::ParseJson { .. }
+                | Expr::MapToStruct(_)
+                | Expr::Cast(_)
                 | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
@@ -254,7 +277,8 @@ pub trait KernelPredicateEvaluator {
         None // TODO?
     }
 
-    /// Dispatches a (possibly inverted) binary expression to each operator's specific implementation.
+    /// Dispatches a (possibly inverted) binary expression to each operator's specific
+    /// implementation.
     ///
     /// NOTE: Only binary operators that produce boolean outputs are supported.
     fn eval_pred_binary(
@@ -265,7 +289,7 @@ pub trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output> {
         use BinaryPredicateOp::*;
-        use Expr::{Column, Literal};
+        use Expr::{Cast, Column, Literal};
 
         match (left, right) {
             (Column(a), Column(b)) => self.eval_pred_binary_columns(op, a, b, inverted),
@@ -284,6 +308,21 @@ pub trait KernelPredicateEvaluator {
                 Equal => self.eval_pred_eq(col, val, inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => None, // arg order is semantically important
+            },
+            (Cast(c), Literal(val)) => match c.expr.as_ref() {
+                Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
+                _ => None,
+            },
+            (Literal(val), Cast(c)) => match c.expr.as_ref() {
+                // Commute so the cast column is on the left.
+                Column(col) => match op {
+                    LessThan => self.eval_pred_cast(GreaterThan, col, &c.target, val, inverted),
+                    GreaterThan => self.eval_pred_cast(LessThan, col, &c.target, val, inverted),
+                    Equal => self.eval_pred_cast(Equal, col, &c.target, val, inverted),
+                    Distinct => self.eval_pred_cast(Distinct, col, &c.target, val, inverted),
+                    In => None, // arg order is semantically important
+                },
+                _ => None,
             },
             _ => {
                 debug!("Unsupported binary operand(s): {left:?} {op:?} {right:?}");
@@ -323,6 +362,10 @@ pub trait KernelPredicateEvaluator {
     }
 
     /// Evaluates a (possibly inverted) predicate with SQL WHERE semantics.
+    ///
+    /// NOTE: A NULL literal in a boolean position is treated as unknown (not false), because
+    /// callers like `build_actions_meta_predicate` use NULL as a sentinel for unsupported arms.
+    /// Treating it as false would let `AND(supported, NULL)` incorrectly prune files.
     ///
     /// By default, [`Self::eval_pred`] behaves badly for comparisons involving NULL columns
     /// (e.g. `a < 10` when `a` is NULL), because the comparison correctly evaluates to NULL, but
@@ -428,7 +471,8 @@ pub trait KernelPredicateEvaluator {
         use Pred::*;
         match pred {
             Junction(JunctionPredicate { op, preds }) => {
-                // Recursively invoke `eval_pred_sql_where` instead of the usual `eval_pred` for AND/OR.
+                // Recursively invoke `eval_pred_sql_where` instead of the usual `eval_pred` for
+                // AND/OR.
                 let mut preds = preds
                     .iter()
                     .map(|pred| self.eval_pred_sql_where(pred, inverted));
@@ -454,10 +498,6 @@ pub trait KernelPredicateEvaluator {
                 .into_iter();
                 self.finish_eval_pred_junction(JunctionPredicateOp::And, &mut preds, false)
             }
-            BooleanExpression(Expr::Literal(val)) if val.is_null() => {
-                // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
-                self.eval_pred_scalar(&Scalar::from(false), false)
-            }
             BooleanExpression(Expr::Predicate(pred)) => self.eval_pred_sql_where(pred, inverted),
             // Process all remaining predicates normally, because they are not proven safe. Indeed,
             // predicates like DISTINCT and IS [NOT] NULL are known-unsafe under SQL semantics:
@@ -478,7 +518,6 @@ pub trait KernelPredicateEvaluator {
             // = AND(TRUE, FALSE, TRUE)
             // = FALSE
             // ```
-            //
             _ => self.eval_pred(pred, inverted),
         }
     }
@@ -495,8 +534,8 @@ pub trait KernelPredicateEvaluator {
     }
 }
 
-/// A collection of provided methods from the [`KernelPredicateEvaluator`] trait, factored out to allow
-/// reuse by multiple bool-output predicate evaluator implementations.
+/// A collection of provided methods from the [`KernelPredicateEvaluator`] trait, factored out to
+/// allow reuse by multiple bool-output predicate evaluator implementations.
 pub struct KernelPredicateEvaluatorDefaults;
 impl KernelPredicateEvaluatorDefaults {
     /// Directly evaluates a boolean scalar. See [`KernelPredicateEvaluator::eval_pred_scalar`].
@@ -531,7 +570,8 @@ impl KernelPredicateEvaluatorDefaults {
         Some(matched != inverted)
     }
 
-    /// Directly evaluates a boolean comparison. See [`KernelPredicateEvaluator::eval_pred_binary_scalars`].
+    /// Directly evaluates a boolean comparison. See
+    /// [`KernelPredicateEvaluator::eval_pred_binary_scalars`].
     pub fn eval_pred_binary_scalars(
         op: BinaryPredicateOp,
         left: &Scalar,
@@ -624,7 +664,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
             Expr::Literal(value) => Some(value.clone()),
             Expr::Column(name) => self.resolve_column(name),
             Expr::Predicate(pred) => self.eval_pred(pred, false).map(Scalar::from),
-            Expr::Struct(_) | Expr::Transform(_) | Expr::Unary(_) => None, // TODO?
+            Expr::Struct(..) | Expr::StructPatch(_) | Expr::Unary(_) => None, // TODO?
             Expr::Binary(BinaryExpression { op, left, right }) => {
                 let op_fn = match op {
                     BinaryExpressionOp::Plus => Scalar::try_add,
@@ -641,9 +681,35 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
-            Expr::ParseJson(_) => None, // ParseJson is not expected to be a top-level predicate expression
+            Expr::Cast(c) => cast_scalar(self.eval_expr(&c.expr)?, &c.target),
+            // ParseJson and MapToStruct produce structured output, not scalar values
+            Expr::ParseJson(_) | Expr::MapToStruct(_) => None,
             Expr::Unknown(_) => None,
         }
+    }
+}
+
+/// Casts a scalar following SQL `CAST` semantics: a string source is parsed into a primitive target
+/// via [`PrimitiveType::parse_scalar`](crate::schema::PrimitiveType::parse_scalar), and a source
+/// already of the target type passes through. An unparseable string yields `Scalar::Null`.
+///
+/// String-to-primitive, identity, and null-source conversions are handled; any other source/target
+/// combination yields `None`, including numeric/temporal casts like `Long -> Int` that the arrow
+/// path can perform. The accepted string formats are a strict subset of arrow's (e.g. arrow parses
+/// the hyphen-less `20240115` as a date but `parse_scalar` does not), so this path is only ever
+/// more conservative than arrow: a form it rejects becomes NULL, never a differing non-null value.
+fn cast_scalar(value: Scalar, target: &DataType) -> Option<Scalar> {
+    if value.data_type() == *target {
+        return Some(value);
+    }
+    match (value, target) {
+        (Scalar::String(raw), DataType::Primitive(ptype)) => Some(
+            ptype
+                .parse_scalar(&raw)
+                .unwrap_or_else(|_| Scalar::Null(target.clone())),
+        ),
+        (Scalar::Null(_), _) => Some(Scalar::Null(target.clone())),
+        _ => None,
     }
 }
 
@@ -685,6 +751,18 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
     fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
         self.eval_pred_binary_scalars(BinaryPredicateOp::Equal, &col, val, inverted)
+    }
+
+    fn eval_pred_cast(
+        &self,
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<bool> {
+        let col = cast_scalar(self.resolve_column(col)?, target)?;
+        self.eval_pred_binary_scalars(op, &col, val, inverted)
     }
 
     fn eval_pred_binary_scalars(
@@ -802,6 +880,20 @@ pub trait DataSkippingPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
+    /// See [`KernelPredicateEvaluator::eval_pred_cast`].
+    ///
+    /// Implementations may evaluate exact values or rewrite casts over exact-value references. A
+    /// bound-based consumer of a rewritten predicate must independently prove that the cast
+    /// preserves those bounds.
+    fn eval_pred_cast(
+        &self,
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
     /// See [`KernelPredicateEvaluator::eval_pred_opaque`].
     fn eval_pred_opaque(
         &self,
@@ -829,7 +921,8 @@ pub trait DataSkippingPredicateEvaluator {
     ) -> Option<Self::Output>;
 
     /// Performs a partial comparison against a column min-stat. See
-    /// [`KernelPredicateEvaluatorDefaults::partial_cmp_scalars`] for details of the comparison semantics.
+    /// [`KernelPredicateEvaluatorDefaults::partial_cmp_scalars`] for details of the comparison
+    /// semantics.
     fn partial_cmp_min_stat(
         &self,
         col: &ColumnName,
@@ -842,7 +935,8 @@ pub trait DataSkippingPredicateEvaluator {
     }
 
     /// Performs a partial comparison against a column max-stat. See
-    /// [`KernelPredicateEvaluatorDefaults::partial_cmp_scalars`] for details of the comparison semantics.
+    /// [`KernelPredicateEvaluatorDefaults::partial_cmp_scalars`] for details of the comparison
+    /// semantics.
     fn partial_cmp_max_stat(
         &self,
         col: &ColumnName,
@@ -966,6 +1060,17 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         _inverted: bool,
     ) -> Option<Self::Output> {
         None
+    }
+
+    fn eval_pred_cast(
+        &self,
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        DataSkippingPredicateEvaluator::eval_pred_cast(self, op, col, target, val, inverted)
     }
 
     fn eval_pred_opaque(

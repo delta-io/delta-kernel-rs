@@ -4,11 +4,13 @@
 //! using field IDs as the primary mechanism for identifying fields across schema versions.
 //! Supports nested field comparison within structs, arrays, and maps.
 
-// Allow dead code warnings since this API is not yet used by other modules
+// This module is not used outside the diff subsystem; suppress unused-code warnings.
 #![allow(dead_code)]
 
-use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
 use std::collections::{HashMap, HashSet};
+
+use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
+use crate::expressions::joined_column_name;
 
 /// Represents the difference between two schemas
 #[derive(Debug, Clone, PartialEq)]
@@ -28,7 +30,7 @@ pub(crate) struct SchemaDiff {
 pub(crate) struct FieldChange {
     /// The field that was added or removed
     pub(crate) field: StructField,
-    /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
+    /// The path to this field (e.g., column_name!("user.address.street"))
     pub(crate) path: ColumnName,
 }
 
@@ -39,7 +41,7 @@ pub(crate) struct FieldUpdate {
     pub(crate) before: StructField,
     /// The field as it exists in the new schema
     pub(crate) after: StructField,
-    /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
+    /// The path to this field (e.g., column_name!("user.address.street"))
     pub(crate) path: ColumnName,
     /// The types of changes that occurred (can be multiple, e.g. renamed + nullability changed)
     pub(crate) change_types: Vec<FieldChangeType>,
@@ -108,7 +110,8 @@ impl SchemaDiff {
         self.added_fields.len() + self.removed_fields.len() + self.updated_fields.len()
     }
 
-    /// Returns true if there are any breaking changes (removed fields, type changes, or tightened nullability)
+    /// Returns true if there are any breaking changes (removed fields, type changes, or tightened
+    /// nullability)
     pub(crate) fn has_breaking_changes(&self) -> bool {
         self.breaking_changes
     }
@@ -193,16 +196,18 @@ struct FieldWithPath {
 /// * `after` - The after/new schema to compare against
 ///
 /// # Returns
-/// A `SchemaDiff` describing all changes including nested fields, or an error if the schemas are invalid
+/// A `SchemaDiff` describing all changes including nested fields, or an error if the schemas are
+/// invalid
 fn compute_schema_diff(
     before: &StructType,
     after: &StructType,
 ) -> Result<SchemaDiff, SchemaDiffError> {
     // Collect all fields with their paths from both schemas
-    let empty_path: Vec<String> = vec![];
-    let before_fields =
-        collect_all_fields_with_paths(before, &ColumnName::new(empty_path.clone()))?;
-    let after_fields = collect_all_fields_with_paths(after, &ColumnName::new(empty_path))?;
+    let root = ColumnName::default();
+    let mut before_fields = Vec::new();
+    collect_all_fields_with_paths(before, &root, &mut before_fields)?;
+    let mut after_fields = Vec::new();
+    collect_all_fields_with_paths(after, &root, &mut after_fields)?;
 
     // Build maps by field ID
     let before_by_id = build_field_map_by_id(&before_fields)?;
@@ -338,37 +343,25 @@ fn compute_has_breaking_changes(
         })
 }
 
-/// Filters field changes to keep only the least common ancestors (LCA).
+/// Filters field changes by removing descendants of already-reported ancestors.
 ///
-/// This filters out descendant fields when their parent is also in the set.
-/// For example, if both "user" and "user.name" are in the input, this returns only "user"
-/// since reporting "user.name" would be redundant.
+/// A field is dropped if any of its ancestors is also present in the input:
+/// reporting both would be redundant.
+/// Two fields that merely share a common ancestor not present in the input
+/// are both kept.
 ///
-/// The algorithm is O(n) where n is the number of fields:
+/// The algorithm is O(n * d) where n is the number of fields and d is max path depth:
 /// 1. Put all paths in a HashSet for O(1) lookup
-/// 2. For each field, check if its immediate parent is in the set
-/// 3. Keep only fields whose parent is NOT in the set
+/// 2. For each field, walk up its parent chain
+/// 3. Keep only fields with no ancestor present in the set
 fn filter_ancestor_fields(fields: Vec<FieldChange>) -> Vec<FieldChange> {
     // Build a set of all paths for O(1) lookup (owned to avoid lifetime issues)
     let all_paths: HashSet<ColumnName> = fields.iter().map(|f| f.path.clone()).collect();
 
-    // Filter to keep only fields whose parent is NOT in the set
+    // Filter to keep only fields whose ancestors are NOT in the set
     fields
         .into_iter()
-        .filter(|field_change| {
-            let path_parts = field_change.path.path();
-
-            // Top-level fields (length 1) have no parent, so keep them
-            if path_parts.len() == 1 {
-                return true;
-            }
-
-            // Construct parent path by removing the last component
-            let parent_path = ColumnName::new(&path_parts[..path_parts.len() - 1]);
-
-            // Keep this field only if its parent was NOT in the input set
-            !all_paths.contains(&parent_path)
-        })
+        .filter(|field_change| !has_added_ancestor(&field_change.path, &all_paths))
         .collect()
 }
 
@@ -443,39 +436,74 @@ fn validate_physical_name(
     }
 }
 
-// TEMPORARY for PR 2: This simplified version only collects top-level fields.
-// In PR 3, this will be updated to the full implementation that recursively
-// collects nested fields by calling collect_fields_from_datatype().
-// The full implementation is in the original murali-db/schema-evol branch.
+/// Recursively collects all reachable struct fields from a data type with their paths
+///
+/// This helper function handles deep nesting like `array<array<struct<...>>>` or
+/// `map<array<struct<...>>, array<struct<...>>>` by recursing through container layers.
+fn collect_fields_from_datatype(
+    data_type: &DataType,
+    parent_path: &ColumnName,
+    out: &mut Vec<FieldWithPath>,
+) -> Result<(), SchemaDiffError> {
+    match data_type {
+        DataType::Struct(struct_type) => {
+            // Collect fields from this struct
+            collect_all_fields_with_paths(struct_type, parent_path, out)?;
+        }
+        DataType::Array(array_type) => {
+            // TODO: Add IcebergCompatV2 support - check that array nested field IDs remain stable
+            // For IcebergCompatV2, arrays should have a field ID on the array itself and nested
+            // field IDs must not be added or removed (they must stay the same across versions).
+            // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
+
+            // For arrays, we use "element" as the path segment and recurse into element type
+            let element_path = joined_column_name!(parent_path, "element");
+            collect_fields_from_datatype(array_type.element_type(), &element_path, out)?;
+        }
+        DataType::Map(map_type) => {
+            // TODO: Add IcebergCompatV2 support - check that map nested field IDs remain stable
+            // For IcebergCompatV2, maps should have field IDs on key/value and nested field IDs
+            // must not be added or removed (they must stay the same across versions).
+            // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
+
+            // For maps, we use "key" and "value" as path segments and recurse into both types
+            let key_path = joined_column_name!(parent_path, "key");
+            collect_fields_from_datatype(map_type.key_type(), &key_path, out)?;
+
+            let value_path = joined_column_name!(parent_path, "value");
+            collect_fields_from_datatype(map_type.value_type(), &value_path, out)?;
+        }
+        _ => {
+            // Primitive types don't have nested fields
+        }
+    }
+
+    Ok(())
+}
+
 /// Recursively collects all struct fields with their paths from a schema
 fn collect_all_fields_with_paths(
     schema: &StructType,
     parent_path: &ColumnName,
-) -> Result<Vec<FieldWithPath>, SchemaDiffError> {
-    let mut fields = Vec::new();
-
+    out: &mut Vec<FieldWithPath>,
+) -> Result<(), SchemaDiffError> {
     for field in schema.fields() {
         let field_path = parent_path.join(&ColumnName::new([field.name()]));
 
         // Only struct fields can have field IDs in column mapping
         let field_id = get_field_id_for_path(field, &field_path)?;
 
-        fields.push(FieldWithPath {
+        out.push(FieldWithPath {
             field: field.clone(),
             path: field_path.clone(),
             field_id,
         });
 
-        // TEMPORARY: Commented out for PR 2 (flat schemas only)
-        // This will be uncommented in PR 3 to enable nested field collection.
         // Recursively collect nested struct fields from the field's data type
-        // fields.extend(collect_fields_from_datatype(
-        //     field.data_type(),
-        //     &field_path,
-        // )?);
+        collect_fields_from_datatype(field.data_type(), &field_path, out)?;
     }
 
-    Ok(fields)
+    Ok(())
 }
 
 /// Builds a map from field ID to FieldWithPath
@@ -573,8 +601,10 @@ fn check_field_nullability_change(
 /// Checks for container nullability changes.
 ///
 /// Returns:
-/// - `Some(FieldChangeType::ContainerNullabilityLoosened)` if nullability was relaxed (false -> true)
-/// - `Some(FieldChangeType::ContainerNullabilityTightened)` if nullability was restricted (true -> false)
+/// - `Some(FieldChangeType::ContainerNullabilityLoosened)` if nullability was relaxed (false ->
+///   true)
+/// - `Some(FieldChangeType::ContainerNullabilityTightened)` if nullability was restricted (true ->
+///   false)
 /// - `None` if nullability didn't change
 fn check_container_nullability_change(
     before_nullable: bool,
@@ -590,14 +620,17 @@ fn check_container_nullability_change(
 /// Classifies a type change between two data types.
 ///
 /// Returns:
-/// - A `Vec<FieldChangeType>` containing all changes detected (type changed or container nullability changed)
+/// - A `Vec<FieldChangeType>` containing all changes detected (type changed or container
+///   nullability changed)
 /// - An empty vec if the types are the same container with nested changes handled elsewhere
 ///
 /// This function handles the following cases:
-/// 1. **Struct containers**: Changes to nested fields are captured via field IDs, so return empty vec
+/// 1. **Struct containers**: Changes to nested fields are captured via field IDs, so return empty
+///    vec
 /// 2. **Array containers**:
 ///    - If element types match and only nullability changed, return the specific nullability change
-///    - If element types are both structs with same nullability, nested changes handled via field IDs (return empty vec)
+///    - If element types are both structs with same nullability, nested changes handled via field
+///      IDs (return empty vec)
 ///    - Otherwise, it's a type change
 /// 3. **Map containers**: Similar logic to arrays, but for both key and value types
 /// 4. **Different container types or primitives**: Type change
@@ -700,12 +733,15 @@ fn has_metadata_changes(before: &StructField, after: &StructField) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::expressions::column_name;
+    use crate::schema::{schema, ArrayType, DataType, MapType, StructField};
 
     fn create_field_with_id(
         name: &str,
-        data_type: DataType,
+        data_type: impl Into<DataType>,
         nullable: bool,
         id: i64,
     ) -> StructField {
@@ -713,17 +749,21 @@ mod tests {
             ("delta.columnMapping.id", MetadataValue::Number(id)),
             (
                 "delta.columnMapping.physicalName",
-                MetadataValue::String(format!("col_{}", id)),
+                MetadataValue::String(format!("col_{id}")),
             ),
         ])
     }
 
+    fn updated_paths(diff: &SchemaDiff) -> HashSet<ColumnName> {
+        diff.updated_fields.iter().map(|u| u.path.clone()).collect()
+    }
+
     #[test]
     fn test_identical_schemas() {
-        let schema = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1),
-            create_field_with_id("name", DataType::STRING, false, 2),
-        ]);
+        let schema = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+            (create_field_with_id("name", DataType::STRING, false, 2)),
+        };
 
         let diff = SchemaDiff::new(&schema, &schema).unwrap();
         assert!(diff.is_empty());
@@ -732,15 +772,17 @@ mod tests {
 
     #[test]
     fn test_change_count() {
-        let before = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1),
-            create_field_with_id("name", DataType::STRING, false, 2),
-        ]);
+        let before = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+            (create_field_with_id("name", DataType::STRING, false, 2)),
+        };
 
-        let after = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, true, 1), // Changed
-            create_field_with_id("email", DataType::STRING, false, 3), // Added
-        ]);
+        let after = schema! {
+            // Changed
+            (create_field_with_id("id", DataType::LONG, true, 1)),
+            // Added
+            (create_field_with_id("email", DataType::STRING, false, 3)),
+        };
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -753,19 +795,20 @@ mod tests {
 
     #[test]
     fn test_top_level_added_field() {
-        let before =
-            StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
+        let before = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+        };
 
-        let after = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1),
-            create_field_with_id("name", DataType::STRING, false, 2),
-        ]);
+        let after = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+            (create_field_with_id("name", DataType::STRING, false, 2)),
+        };
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
-        assert_eq!(diff.added_fields[0].path, ColumnName::new(["name"]));
+        assert_eq!(diff.added_fields[0].path, column_name!("name"));
         assert_eq!(diff.added_fields[0].field.name(), "name");
         assert!(diff.has_breaking_changes()); // Adding non-nullable field is breaking
     }
@@ -773,13 +816,14 @@ mod tests {
     #[test]
     fn test_added_required_field_is_breaking() {
         // Adding a non-nullable (required) field is breaking
-        let before =
-            StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
+        let before = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+        };
 
-        let after = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1),
-            create_field_with_id("required_field", DataType::STRING, false, 2), // Non-nullable
-        ]);
+        let after = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+            (create_field_with_id("required_field", DataType::STRING, false, 2)),
+        };
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 1);
@@ -791,13 +835,14 @@ mod tests {
     #[test]
     fn test_added_nullable_field_is_not_breaking() {
         // Adding a nullable (optional) field is NOT breaking
-        let before =
-            StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
+        let before = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+        };
 
-        let after = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1),
-            create_field_with_id("optional_field", DataType::STRING, true, 2), // Nullable
-        ]);
+        let after = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+            (create_field_with_id("optional_field", DataType::STRING, true, 2)),
+        };
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 1);
@@ -809,23 +854,24 @@ mod tests {
     #[test]
     fn test_physical_name_validation() {
         // Test: Physical names present and unchanged - valid schema evolution (just a rename)
-        let before = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
-            .add_metadata([
+        let before = schema! {
+            (StructField::not_null("name", DataType::STRING).add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
                     MetadataValue::String("col_1".to_string()),
                 ),
-            ])]);
-        let after =
-            StructType::new_unchecked([StructField::new("full_name", DataType::STRING, false)
-                .add_metadata([
-                    ("delta.columnMapping.id", MetadataValue::Number(1)),
-                    (
-                        "delta.columnMapping.physicalName",
-                        MetadataValue::String("col_1".to_string()),
-                    ),
-                ])]);
+            ])),
+        };
+        let after = schema! {
+            (StructField::not_null("full_name", DataType::STRING).add_metadata([
+                ("delta.columnMapping.id", MetadataValue::Number(1)),
+                (
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String("col_1".to_string()),
+                ),
+            ])),
+        };
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 0);
@@ -838,22 +884,24 @@ mod tests {
         assert!(!diff.has_breaking_changes()); // Rename is not breaking
 
         // Test: Physical name changed - INVALID (returns error)
-        let before = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
-            .add_metadata([
+        let before = schema! {
+            (StructField::not_null("name", DataType::STRING).add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
                     MetadataValue::String("col_001".to_string()),
                 ),
-            ])]);
-        let after = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
-            .add_metadata([
+            ])),
+        };
+        let after = schema! {
+            (StructField::not_null("name", DataType::STRING).add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
                     MetadataValue::String("col_002".to_string()),
                 ),
-            ])]);
+            ])),
+        };
 
         let result = SchemaDiff::new(&before, &after);
         assert!(matches!(
@@ -862,16 +910,19 @@ mod tests {
         ));
 
         // Test: Missing physical name in one schema - INVALID (returns error)
-        let before = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
-            .add_metadata([
+        let before = schema! {
+            (StructField::not_null("name", DataType::STRING).add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
                     MetadataValue::String("col_1".to_string()),
                 ),
-            ])]);
-        let after = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
-            .add_metadata([("delta.columnMapping.id", MetadataValue::Number(1))])]);
+            ])),
+        };
+        let after = schema! {
+            (StructField::not_null("name", DataType::STRING)
+                .add_metadata([("delta.columnMapping.id", MetadataValue::Number(1))])),
+        };
 
         let result = SchemaDiff::new(&before, &after);
         assert!(matches!(
@@ -883,18 +934,17 @@ mod tests {
     #[test]
     fn test_multiple_change_types() {
         // Test that a field with multiple simultaneous changes produces FieldChangeType::Multiple
-        let before = StructType::new_unchecked([create_field_with_id(
-            "user_name",
-            DataType::STRING,
-            false,
-            1,
-        )
-        .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])]);
+        let before = schema! {
+            (create_field_with_id("user_name", DataType::STRING, false, 1)
+                .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])),
+        };
 
-        let after = StructType::new_unchecked([
-            create_field_with_id("userName", DataType::STRING, true, 1) // Renamed + nullability loosened
-                .add_metadata([("custom", MetadataValue::String("new_value".to_string()))]), // Metadata changed
-        ]);
+        let after = schema! {
+            // Metadata changed
+            // Renamed + nullability loosened
+            (create_field_with_id("userName", DataType::STRING, true, 1)
+                .add_metadata([("custom", MetadataValue::String("new_value".to_string()))])),
+        };
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -919,19 +969,19 @@ mod tests {
 
     #[test]
     fn test_multiple_with_breaking_change() {
-        // Test that Multiple changes are correctly identified as breaking when they contain breaking changes
-        let before = StructType::new_unchecked([create_field_with_id(
-            "user_name",
-            DataType::STRING,
-            true,
-            1,
-        )
-        .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])]);
+        // Test that Multiple changes are correctly identified as breaking when they contain
+        // breaking changes
+        let before = schema! {
+            (create_field_with_id("user_name", DataType::STRING, true, 1)
+                .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])),
+        };
 
-        let after = StructType::new_unchecked([
-            create_field_with_id("userName", DataType::STRING, false, 1) // Renamed + nullability TIGHTENED
-                .add_metadata([("custom", MetadataValue::String("new_value".to_string()))]), // Metadata changed
-        ]);
+        let after = schema! {
+            // Metadata changed
+            // Renamed + nullability tightened
+            (create_field_with_id("userName", DataType::STRING, false, 1)
+                .add_metadata([("custom", MetadataValue::String("new_value".to_string()))])),
+        };
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -956,10 +1006,10 @@ mod tests {
     #[test]
     fn test_duplicate_field_id_error() {
         // Test that duplicate field IDs in the same schema produce an error
-        let schema_with_duplicates = StructType::new_unchecked([
-            create_field_with_id("field1", DataType::STRING, false, 1),
-            create_field_with_id("field2", DataType::STRING, false, 1), // Same ID!
-        ]);
+        let schema_with_duplicates = schema! {
+            (create_field_with_id("field1", DataType::STRING, false, 1)),
+            (create_field_with_id("field2", DataType::STRING, false, 1)),
+        };
 
         let result = SchemaDiff::new(&schema_with_duplicates, &schema_with_duplicates);
 
@@ -967,8 +1017,8 @@ mod tests {
         match result {
             Err(SchemaDiffError::DuplicateFieldId { id, path1, path2 }) => {
                 assert_eq!(id, 1);
-                assert_eq!(path1, ColumnName::new(["field1"]));
-                assert_eq!(path2, ColumnName::new(["field2"]));
+                assert_eq!(path1, column_name!("field1"));
+                assert_eq!(path2, column_name!("field2"));
             }
             _ => panic!("Expected DuplicateFieldId error"),
         }
@@ -988,16 +1038,16 @@ mod tests {
             added_fields: vec![
                 FieldChange {
                     field: top_level_field.clone(),
-                    path: ColumnName::new(["name"]), // Top-level (depth 1)
+                    path: column_name!("name"), // Top-level (depth 1)
                 },
                 FieldChange {
                     field: nested_field.clone(),
-                    path: ColumnName::new(["address", "street"]), // Nested (depth 2)
+                    path: column_name!("address.street"), // Nested (depth 2)
                 },
             ],
             removed_fields: vec![FieldChange {
                 field: deeply_nested_field.clone(),
-                path: ColumnName::new(["user", "address", "city"]), // Deeply nested (depth 3)
+                path: column_name!("user.address.city"), // Deeply nested (depth 3)
             }],
             updated_fields: vec![],
             breaking_changes: false,
@@ -1006,19 +1056,1749 @@ mod tests {
         // Test top_level_changes - should only return depth 1 fields
         let (top_added, top_removed, top_updated) = diff.top_level_changes();
         assert_eq!(top_added.len(), 1);
-        assert_eq!(top_added[0].path, ColumnName::new(["name"]));
+        assert_eq!(top_added[0].path, column_name!("name"));
         assert_eq!(top_removed.len(), 0);
         assert_eq!(top_updated.len(), 0);
 
         // Test nested_changes - should only return depth > 1 fields
         let (nested_added, nested_removed, nested_updated) = diff.nested_changes();
         assert_eq!(nested_added.len(), 1);
-        assert_eq!(nested_added[0].path, ColumnName::new(["address", "street"]));
+        assert_eq!(nested_added[0].path, column_name!("address.street"));
         assert_eq!(nested_removed.len(), 1);
-        assert_eq!(
-            nested_removed[0].path,
-            ColumnName::new(["user", "address", "city"])
-        );
+        assert_eq!(nested_removed[0].path, column_name!("user.address.city"));
         assert_eq!(nested_updated.len(), 0);
+    }
+
+    #[test]
+    fn test_ancestor_filtering() {
+        // Test that when a parent struct is added/removed, its children aren't reported separately
+        let without_user = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+        };
+
+        let with_user = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+            (create_field_with_id(
+                "user",
+                schema! {
+                    (create_field_with_id("name", DataType::STRING, false, 3)),
+                    (create_field_with_id("email", DataType::STRING, true, 4)),
+                    (create_field_with_id(
+                        "address",
+                        schema! {
+                            (create_field_with_id("street", DataType::STRING, false, 6)),
+                            (create_field_with_id("city", DataType::STRING, false, 7)),
+                        },
+                        true,
+                        5,
+                    )),
+                },
+                false,
+                2,
+            )),
+        };
+
+        // CASE 1: Adding a parent struct - only parent should be reported, not nested fields
+        let diff = SchemaDiff::new(&without_user, &with_user).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, column_name!("user"));
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 0);
+        // The filtered paths would have been: user.name, user.email, user.address,
+        // user.address.street, user.address.city
+        assert!(diff.has_breaking_changes()); // Adding non-nullable struct field is breaking
+
+        // CASE 2: Removing a parent struct - only parent should be reported, not nested fields
+        let diff = SchemaDiff::new(&with_user, &without_user).unwrap();
+
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.removed_fields[0].path, column_name!("user"));
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 0);
+        assert!(!diff.has_breaking_changes()); // Removing fields is safe
+    }
+
+    #[test]
+    fn test_array_of_struct_addition_reports_only_ancestor_field() {
+        // Before: no fields. After: items: array<struct<name: string>>
+        // Expected: added_fields == [items], not [items, items.element.name]
+        let before = schema! {};
+        let after = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id("name", DataType::STRING, false, 2)),
+                    },
+                    false,
+                ),
+                true,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, column_name!("items"));
+
+        let (nested_added, nested_removed, nested_updated) = diff.nested_changes();
+        assert_eq!(nested_added.len(), 0);
+        assert_eq!(nested_removed.len(), 0);
+        assert_eq!(nested_updated.len(), 0);
+    }
+
+    #[test]
+    fn test_container_with_nested_changes_not_reported_as_type_change() {
+        // Test that when a struct's nested fields change, the struct itself isn't reported as
+        // TypeChanged
+        let before = schema! {
+            (create_field_with_id(
+                "user",
+                schema! {
+                    (create_field_with_id("name", DataType::STRING, false, 2)),
+                    (create_field_with_id("email", DataType::STRING, true, 3)),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "user",
+                schema! {
+                    // Renamed
+                    (create_field_with_id("full_name", DataType::STRING, false, 2)),
+                    (create_field_with_id("email", DataType::STRING, true, 3)),
+                    // Added
+                    (create_field_with_id("age", DataType::INTEGER, true, 4)),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        // Should see the nested field changes but NOT a type change on the parent struct
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, column_name!("user.age"));
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("user.full_name"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+
+        // Crucially, there should be NO update reported for the "user" field itself
+        // even though its DataType::Struct contains different nested fields
+        let top_level_updates: Vec<_> = diff
+            .updated_fields
+            .iter()
+            .filter(|u| u.path.path().len() == 1)
+            .collect();
+        assert_eq!(top_level_updates.len(), 0);
+
+        // Not a breaking change since it's just a rename and an added nullable field
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_actual_struct_type_change_still_reported() {
+        // Test that actual type changes (not just nested content changes) are still reported
+        let before = schema! {
+            (create_field_with_id("data", DataType::STRING, false, 1)),
+        };
+
+        let after = schema! {
+            // Changed from STRING to STRUCT
+            (create_field_with_id(
+                "data",
+                schema! {
+                    (create_field_with_id("nested", DataType::STRING, false, 2)),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        // This IS a real type change from primitive to struct
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("data"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::TypeChanged]
+        );
+        assert!(diff.has_breaking_changes());
+
+        // The new nested field should also be reported as added
+        assert_eq!(diff.added_fields[0].path, column_name!("data.nested"));
+        assert!(diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_array_with_struct_element_changes() {
+        // Test that array containers aren't reported as changed when their struct elements change
+        let before = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id("name", DataType::STRING, false, 2)),
+                    },
+                    true,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(
+                    schema! {
+                        // Renamed
+                        (create_field_with_id("title", DataType::STRING, false, 2)),
+                    },
+                    true,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        // Should only see the nested field rename, not a change to the array container
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            column_name!("items.element.title")
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+
+        // No change should be reported for the "items" array itself
+        let array_updates: Vec<_> = diff
+            .updated_fields
+            .iter()
+            .filter(|u| u.path == column_name!("items"))
+            .collect();
+        assert_eq!(array_updates.len(), 0);
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_ancestor_filtering_with_mixed_changes() {
+        let before = schema! {
+            (create_field_with_id("existing", DataType::STRING, false, 1)),
+            (create_field_with_id(
+                "existing_struct",
+                schema! {
+                    (create_field_with_id("old_name", DataType::STRING, false, 3)),
+                },
+                false,
+                2,
+            )),
+        };
+
+        let after = schema! {
+            // Changed nullability
+            (create_field_with_id("existing", DataType::STRING, true, 1)),
+            (create_field_with_id(
+                "existing_struct",
+                schema! {
+                    // Renamed
+                    (create_field_with_id("new_name", DataType::STRING, false, 3)),
+                },
+                true, // Changed nullability
+                2,
+            )),
+            (create_field_with_id(
+                "new_struct", // Completely new struct
+                schema! {
+                    (create_field_with_id("nested_field", DataType::INTEGER, false, 5)),
+                },
+                false,
+                4,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        // Should see: existing changed, existing_struct changed, existing_struct.old_name->new_name
+        // renamed, new_struct added
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, column_name!("new_struct"));
+
+        assert_eq!(diff.updated_fields.len(), 3);
+        let paths = updated_paths(&diff);
+        assert!(paths.contains(&column_name!("existing")));
+        assert!(paths.contains(&column_name!("existing_struct")));
+        assert!(paths.contains(&column_name!("existing_struct.new_name")));
+
+        // Added a non-nullable struct "new_struct"
+        assert!(diff.has_breaking_changes());
+
+        // nested_field should NOT appear as added since new_struct is its ancestor
+    }
+
+    #[test]
+    fn test_nested_field_rename() {
+        let before = schema! {
+            (create_field_with_id(
+                "user",
+                schema! {
+                    (create_field_with_id("name", DataType::STRING, false, 2)),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "user",
+                schema! {
+                    // Renamed!
+                    (create_field_with_id("full_name", DataType::STRING, false, 2)),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, column_name!("user.full_name"));
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
+        assert!(!diff.has_breaking_changes()); // Rename is not breaking
+    }
+
+    #[test]
+    fn test_nested_field_added() {
+        let before = schema! {
+            (create_field_with_id(
+                "user",
+                schema! {
+                    (create_field_with_id("name", DataType::STRING, false, 2)),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "user",
+                schema! {
+                    (create_field_with_id("name", DataType::STRING, false, 2)),
+                    // Added!
+                    (create_field_with_id("age", DataType::INTEGER, true, 3)),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 0);
+
+        let added = &diff.added_fields[0];
+        assert_eq!(added.path, column_name!("user.age"));
+        assert_eq!(added.field.name(), "age");
+        assert!(!diff.has_breaking_changes()); // Adding nullable field is not breaking
+    }
+
+    #[test]
+    fn test_deeply_nested_changes() {
+        let before = schema! {
+            (create_field_with_id(
+                "level1",
+                schema! {
+                    (create_field_with_id(
+                        "level2",
+                        schema! {
+                            (create_field_with_id("deep_field", DataType::STRING, false, 3)),
+                        },
+                        false,
+                        2,
+                    )),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "level1",
+                schema! {
+                    (create_field_with_id(
+                        "level2",
+                        schema! {
+                            // Renamed!
+                            (create_field_with_id(
+                                "very_deep_field",
+                                DataType::STRING,
+                                false,
+                                3,
+                            )),
+                        },
+                        false,
+                        2,
+                    )),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, column_name!("level1.level2.very_deep_field"));
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
+    }
+
+    #[test]
+    fn test_top_level_vs_nested_filtering() {
+        let before = schema! {
+            (create_field_with_id("top_field", DataType::STRING, false, 1)),
+            (create_field_with_id(
+                "user",
+                schema! {
+                    (create_field_with_id("name", DataType::STRING, false, 3)),
+                },
+                false,
+                2,
+            )),
+        };
+
+        let after = schema! {
+            // Renamed top-level
+            (create_field_with_id("renamed_top", DataType::STRING, false, 1)),
+            (create_field_with_id(
+                "user",
+                schema! {
+                    // Renamed nested
+                    (create_field_with_id("full_name", DataType::STRING, false, 3)),
+                    // Added nested
+                    (create_field_with_id("age", DataType::INTEGER, true, 4)),
+                },
+                false,
+                2,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        let (top_added, _, top_updated) = diff.top_level_changes();
+        let (nested_added, _, nested_updated) = diff.nested_changes();
+
+        assert_eq!(top_added.len(), 0);
+        assert_eq!(top_updated.len(), 1);
+        assert_eq!(top_updated[0].path, column_name!("renamed_top"));
+
+        assert_eq!(nested_added.len(), 1);
+        assert_eq!(nested_added[0].path, column_name!("user.age"));
+        assert_eq!(nested_updated.len(), 1);
+        assert_eq!(nested_updated[0].path, column_name!("user.full_name"));
+    }
+
+    #[test]
+    fn test_mixed_changes() {
+        let before = schema! {
+            (create_field_with_id("id", DataType::LONG, false, 1)),
+            (create_field_with_id(
+                "user",
+                schema! {
+                    (create_field_with_id("name", DataType::STRING, false, 3)),
+                    (create_field_with_id("email", DataType::STRING, true, 4)),
+                },
+                false,
+                2,
+            )),
+        };
+
+        let after = schema! {
+            // Renamed top-level
+            (create_field_with_id("identifier", DataType::LONG, false, 1)),
+            (create_field_with_id(
+                "user",
+                schema! {
+                    // Renamed nested
+                    (create_field_with_id("full_name", DataType::STRING, false, 3)),
+                    // Added nested
+                    (// email removed (id=4)
+                    create_field_with_id("age", DataType::INTEGER, true, 5)),
+                },
+                false,
+                2,
+            )),
+            // Added top-level
+            (create_field_with_id("created_at", DataType::TIMESTAMP, false, 6)),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        // Check totals
+        assert_eq!(diff.added_fields.len(), 2);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 2);
+
+        // Check specific changes
+        let added_paths: HashSet<ColumnName> =
+            diff.added_fields.iter().map(|f| f.path.clone()).collect();
+        assert!(added_paths.contains(&column_name!("user.age")));
+        assert!(added_paths.contains(&column_name!("created_at")));
+
+        let removed_paths: HashSet<ColumnName> =
+            diff.removed_fields.iter().map(|f| f.path.clone()).collect();
+        assert!(removed_paths.contains(&column_name!("user.email")));
+
+        let paths = updated_paths(&diff);
+        assert!(paths.contains(&column_name!("identifier")));
+        assert!(paths.contains(&column_name!("user.full_name")));
+    }
+
+    #[test]
+    fn test_array_element_struct_field_changes() {
+        let before = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id("name", DataType::STRING, false, 2)),
+                        (create_field_with_id("removed_field", DataType::INTEGER, true, 3)),
+                    },
+                    true,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(
+                    schema! {
+                        // Renamed!
+                        (create_field_with_id("title", DataType::STRING, false, 2)),
+                        // Added!
+                        (create_field_with_id("added_field", DataType::STRING, true, 4)),
+                    },
+                    true,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        // Check added field
+        assert_eq!(
+            diff.added_fields[0].path,
+            column_name!("items.element.added_field")
+        );
+
+        // Check removed field
+        assert_eq!(
+            diff.removed_fields[0].path,
+            column_name!("items.element.removed_field")
+        );
+
+        // Check updated field (rename)
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, column_name!("items.element.title"));
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
+
+        assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
+    }
+
+    #[test]
+    fn test_doubly_nested_array_type_change() {
+        // Test that we can detect type changes in doubly nested arrays: array<array<int>> ->
+        // array<array<double>>
+        let before = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(ArrayType::new(DataType::INTEGER, false), false),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(ArrayType::new(DataType::DOUBLE, false), false),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        // The entire field should be reported as TypeChanged since we can't recurse into
+        // non-struct array elements (no field IDs at intermediate levels)
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::TypeChanged]
+        );
+
+        assert!(diff.has_breaking_changes()); // Type change is breaking
+    }
+
+    #[test]
+    fn test_array_primitive_element_type_change() {
+        // Test direct primitive element type change: array<string> -> array<int>
+        let before = schema! {
+            (create_field_with_id("items", ArrayType::new(DataType::STRING, false), false, 1)),
+        };
+
+        let after = schema! {
+            (create_field_with_id("items", ArrayType::new(DataType::INTEGER, false), false, 1)),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::TypeChanged]
+        );
+        assert!(diff.has_breaking_changes()); // Type change is breaking
+    }
+
+    #[test]
+    fn test_nested_array_nullability_loosened() {
+        // Test: array<array<int> not null> -> array<array<int>>
+        // Outer array element nullability loosened (safe change)
+        let before = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(DataType::INTEGER, false),
+                    false, // Outer array elements are non-nullable
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(DataType::INTEGER, false),
+                    true, // Outer array elements now nullable
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_nested_array_nullability_tightened() {
+        // Test: array<array<int>> -> array<array<int> not null>
+        // Outer array element nullability tightened (breaking change)
+        let before = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(DataType::INTEGER, false),
+                    true, // Outer array elements are nullable
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(DataType::INTEGER, false),
+                    false, // Outer array elements now non-nullable
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
+    fn test_nested_array_inner_nullability_loosened() {
+        // Test: array<array<int not null>> -> array<array<int>>
+        // Inner array element nullability loosened (safe change)
+        let before = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(DataType::INTEGER, false), /* Inner elements non-nullable */
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(DataType::INTEGER, true), /* Inner elements now nullable */
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_nested_array_inner_nullability_tightened() {
+        // Test: array<array<int>> -> array<array<int not null>>
+        // Inner array element nullability tightened (breaking change)
+        let before = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(DataType::INTEGER, true), /* Inner elements nullable */
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(DataType::INTEGER, false), /* Inner elements now non-nullable */
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("matrix"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
+    fn test_array_nullability_loosened() {
+        let before = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(DataType::STRING, false), /* Non-nullable
+                                                          * elements */
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(DataType::STRING, true), /* Nullable elements now */
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_array_nullability_tightened() {
+        let before = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(DataType::STRING, true), // Nullable elements
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(DataType::STRING, false), // Non-nullable now
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+    #[test]
+    fn test_map_value_struct_field_changes() {
+        let before = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    DataType::STRING,
+                    schema! {
+                        (create_field_with_id("value", DataType::INTEGER, false, 2)),
+                        (create_field_with_id("removed_field", DataType::STRING, true, 3)),
+                    },
+                    true,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    DataType::STRING,
+                    schema! {
+                        // Renamed!
+                        (create_field_with_id("count", DataType::INTEGER, false, 2)),
+                        // Added!
+                        (create_field_with_id("added_field", DataType::STRING, true, 4)),
+                    },
+                    true,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        // Check added field
+        assert_eq!(
+            diff.added_fields[0].path,
+            column_name!("lookup.value.added_field")
+        );
+
+        // Check removed field
+        assert_eq!(
+            diff.removed_fields[0].path,
+            column_name!("lookup.value.removed_field")
+        );
+
+        // Check updated field (rename)
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, column_name!("lookup.value.count"));
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
+
+        assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
+    }
+
+    #[test]
+    fn test_array_struct_element_nullability_loosened() {
+        // Test: array<struct<name: string> not null> -> array<struct<name: string>>
+        // Struct element nullability loosened (safe change)
+        let before = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id("name", DataType::STRING, false, 2)),
+                    },
+                    false, // Struct elements non-nullable
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id("name", DataType::STRING, false, 2)),
+                    },
+                    true, // Struct elements now nullable
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_map_nullability_loosened() {
+        let before = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    false, // Non-nullable values
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    true, // Nullable values now
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("lookup"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_array_struct_element_nullability_tightened() {
+        // Test: array<struct<name: string>> -> array<struct<name: string> not null>
+        // Struct element nullability tightened (breaking change)
+        let before = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id("name", DataType::STRING, false, 2)),
+                    },
+                    true, // Struct elements nullable
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id("name", DataType::STRING, false, 2)),
+                    },
+                    false, // Struct elements now non-nullable
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
+    fn test_map_nullability_tightened() {
+        let before = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    true, // Nullable values
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    false, // Non-nullable now
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("lookup"));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_array_combined_nullability_and_type_change() {
+        // Test that both nullability and type change can be exercised at once in a single diff.
+        // Before: items: array<string> not null (elements non-nullable)
+        // After: items: array<int> (elements nullable, type changed)
+        let before = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(DataType::STRING, false), /* Non-nullable
+                                                          * elements */
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "items",
+                ArrayType::new(DataType::INTEGER, true), /* Nullable, type changed */
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, column_name!("items"));
+        // Should have both TypeChanged and ContainerNullabilityLoosened
+        let change_types = &diff.updated_fields[0].change_types;
+        assert!(change_types.contains(&FieldChangeType::TypeChanged));
+        assert!(change_types.contains(&FieldChangeType::ContainerNullabilityLoosened));
+        assert!(diff.has_breaking_changes()); // Type change is breaking
+    }
+
+    #[test]
+    fn test_map_with_struct_key() {
+        // Test that maps with struct keys can be diffed
+        let before = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    schema! {
+                        (create_field_with_id("id", DataType::INTEGER, false, 2)),
+                    },
+                    DataType::STRING,
+                    true,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    schema! {
+                        (create_field_with_id(
+                            "identifier", // Renamed key field
+                            DataType::INTEGER,
+                            false,
+                            2,
+                        )),
+                    },
+                    DataType::STRING,
+                    true,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        // Should see the nested key field renamed
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            column_name!("lookup.key.identifier")
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+    }
+
+    #[test]
+    fn test_nested_struct_in_array_in_struct_field_changes() {
+        // struct<items: array<struct<inner: struct<a int, b string>>>>
+        let before = schema! {
+            (create_field_with_id(
+                "data",
+                schema! {
+                    (create_field_with_id(
+                        "items",
+                        ArrayType::new(
+                            schema! {
+                                (create_field_with_id(
+                                    "inner",
+                                    schema! {
+                                        (create_field_with_id("a", DataType::INTEGER, false, 3)),
+                                        (create_field_with_id(
+                                            "removed",
+                                            DataType::STRING,
+                                            true,
+                                            4,
+                                        )),
+                                    },
+                                    false,
+                                    2,
+                                )),
+                            },
+                            false,
+                        ),
+                        false,
+                        5,
+                    )),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "data",
+                schema! {
+                    (create_field_with_id(
+                        "items",
+                        ArrayType::new(
+                            schema! {
+                                (create_field_with_id(
+                                    "inner",
+                                    schema! {
+                                        // Renamed!
+                                        (create_field_with_id(
+                                            "renamed_a",
+                                            DataType::INTEGER,
+                                            false,
+                                            3,
+                                        )),
+                                        // Added!
+                                        (create_field_with_id(
+                                            "added",
+                                            DataType::LONG,
+                                            true,
+                                            6,
+                                        )),
+                                    },
+                                    false,
+                                    2,
+                                )),
+                            },
+                            false,
+                        ),
+                        false,
+                        5,
+                    )),
+                },
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.added_fields[0].path,
+            column_name!("data.items.element.inner.added")
+        );
+        assert_eq!(
+            diff.removed_fields[0].path,
+            column_name!("data.items.element.inner.removed")
+        );
+        assert_eq!(
+            diff.updated_fields[0].path,
+            column_name!("data.items.element.inner.renamed_a")
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_nested_map_within_struct_within_map() {
+        // map<string, struct<nested: map<int, struct<x int>>>>
+        let before = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    DataType::STRING,
+                    schema! {
+                        (create_field_with_id(
+                            "nested",
+                            MapType::new(
+                                DataType::INTEGER,
+                                schema! {
+                                    (create_field_with_id("x", DataType::INTEGER, false, 3)),
+                                },
+                                false,
+                            ),
+                            false,
+                            2,
+                        )),
+                    },
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "lookup",
+                MapType::new(
+                    DataType::STRING,
+                    schema! {
+                        (create_field_with_id(
+                            "nested",
+                            MapType::new(
+                                DataType::INTEGER,
+                                schema! {
+                                    // Renamed!
+                                    (create_field_with_id(
+                                        "renamed_x",
+                                        DataType::INTEGER,
+                                        false,
+                                        3,
+                                    )),
+                                },
+                                false,
+                            ),
+                            false,
+                            2,
+                        )),
+                    },
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            column_name!("lookup.value.nested.value.renamed_x")
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_doubly_nested_array_with_struct_elements() {
+        // array<array<struct<x int>>>
+        let before = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(
+                        schema! {
+                            (create_field_with_id("x", DataType::INTEGER, false, 2)),
+                        },
+                        false,
+                    ),
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "matrix",
+                ArrayType::new(
+                    ArrayType::new(
+                        schema! {
+                            // Renamed!
+                            (create_field_with_id("renamed_x", DataType::INTEGER, false, 2)),
+                            // Added!
+                            (create_field_with_id("y", DataType::INTEGER, true, 3)),
+                        },
+                        false,
+                    ),
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.added_fields[0].path,
+            column_name!("matrix.element.element.y")
+        );
+        assert_eq!(
+            diff.updated_fields[0].path,
+            column_name!("matrix.element.element.renamed_x")
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_map_with_array_of_struct_key_and_value() {
+        // map<array<struct<a int>>, array<struct<b int>>>
+        let before = schema! {
+            (create_field_with_id(
+                "complex_map",
+                MapType::new(
+                    ArrayType::new(
+                        schema! {
+                            (create_field_with_id("key_field", DataType::INTEGER, false, 2)),
+                        },
+                        false,
+                    ),
+                    ArrayType::new(
+                        schema! {
+                            (create_field_with_id("value_field", DataType::STRING, false, 3)),
+                        },
+                        false,
+                    ),
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "complex_map",
+                MapType::new(
+                    ArrayType::new(
+                        schema! {
+                            // Renamed!
+                            (create_field_with_id(
+                                "renamed_key_field",
+                                DataType::INTEGER,
+                                false,
+                                2,
+                            )),
+                        },
+                        false,
+                    ),
+                    ArrayType::new(
+                        schema! {
+                            // Renamed!
+                            (create_field_with_id(
+                                "renamed_value_field",
+                                DataType::STRING,
+                                false,
+                                3,
+                            )),
+                        },
+                        false,
+                    ),
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 2);
+
+        let paths = updated_paths(&diff);
+        assert!(paths.contains(&column_name!("complex_map.key.element.renamed_key_field")));
+        assert!(paths.contains(&column_name!(
+            "complex_map.value.element.renamed_value_field"
+        )));
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_map_struct_key_nested_map_value() {
+        // map<struct<id int>, map<struct<key int>, struct<data string>>>
+        let before = schema! {
+            (create_field_with_id(
+                "nested_maps",
+                MapType::new(
+                    schema! {
+                        (create_field_with_id("outer_key", DataType::INTEGER, false, 2)),
+                    },
+                    MapType::new(
+                        schema! {
+                            (create_field_with_id("inner_key", DataType::INTEGER, false, 3)),
+                        },
+                        schema! {
+                            (create_field_with_id("data", DataType::STRING, false, 4)),
+                            (create_field_with_id("removed", DataType::INTEGER, true, 5)),
+                        },
+                        false,
+                    ),
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "nested_maps",
+                MapType::new(
+                    schema! {
+                        (create_field_with_id(
+                            "renamed_outer_key", // Renamed!
+                            DataType::INTEGER,
+                            false,
+                            2,
+                        )),
+                    },
+                    MapType::new(
+                        schema! {
+                            (create_field_with_id(
+                                "renamed_inner_key", // Renamed!
+                                DataType::INTEGER,
+                                false,
+                                3,
+                            )),
+                        },
+                        schema! {
+                            // Renamed!
+                            (create_field_with_id("renamed_data", DataType::STRING, false, 4)),
+                            // Added!
+                            (create_field_with_id("added", DataType::LONG, true, 6)),
+                        },
+                        false,
+                    ),
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 3);
+
+        assert_eq!(
+            diff.added_fields[0].path,
+            column_name!("nested_maps.value.value.added")
+        );
+        assert_eq!(
+            diff.removed_fields[0].path,
+            column_name!("nested_maps.value.value.removed")
+        );
+
+        let paths = updated_paths(&diff);
+        assert!(paths.contains(&column_name!("nested_maps.key.renamed_outer_key")));
+        assert!(paths.contains(&column_name!("nested_maps.value.key.renamed_inner_key")));
+        assert!(paths.contains(&column_name!("nested_maps.value.value.renamed_data")));
+
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_deeply_nested_nullability_tightening_is_breaking() {
+        // array<struct<items: array<struct<value int nullable>>>> -> array<struct<items:
+        // array<struct<value int not null>>>>
+        let before = schema! {
+            (create_field_with_id(
+                "wrapper",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id(
+                            "items",
+                            ArrayType::new(
+                                schema! {
+                                    // Nullable
+                                    (create_field_with_id("value", DataType::INTEGER, true, 3)),
+                                },
+                                false,
+                            ),
+                            false,
+                            2,
+                        )),
+                    },
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "wrapper",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id(
+                            "items",
+                            ArrayType::new(
+                                schema! {
+                                    // Non-nullable now - BREAKING!
+                                    (create_field_with_id(
+                                        "value",
+                                        DataType::INTEGER,
+                                        false,
+                                        3,
+                                    )),
+                                },
+                                false,
+                            ),
+                            false,
+                            2,
+                        )),
+                    },
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            column_name!("wrapper.element.items.element.value")
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::NullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_deeply_nested_container_nullability_tightening_is_breaking() {
+        // array<struct<items: array<struct<value int> nullable>>> -> array<struct<items:
+        // array<struct<value int> not null>>>
+        let before = schema! {
+            (create_field_with_id(
+                "wrapper",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id(
+                            "items",
+                            ArrayType::new(
+                                schema! {
+                                    (create_field_with_id("value", DataType::INTEGER, false, 3)),
+                                },
+                                true, // Array elements are nullable
+                            ),
+                            false,
+                            2,
+                        )),
+                    },
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let after = schema! {
+            (create_field_with_id(
+                "wrapper",
+                ArrayType::new(
+                    schema! {
+                        (create_field_with_id(
+                            "items",
+                            ArrayType::new(
+                                schema! {
+                                    (create_field_with_id("value", DataType::INTEGER, false, 3)),
+                                },
+                                false, // Array elements now non-nullable - BREAKING!
+                            ),
+                            false,
+                            2,
+                        )),
+                    },
+                    false,
+                ),
+                false,
+                1,
+            )),
+        };
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            column_name!("wrapper.element.items")
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes());
     }
 }

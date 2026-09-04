@@ -1,10 +1,10 @@
 //! Field classifier implementations for different scan types (regular and CDF scans)
 
+use crate::scan::transform_spec::FieldTransformSpec;
 use crate::schema::StructField;
 use crate::table_changes::{
     CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
 };
-use crate::transforms::FieldTransformSpec;
 
 /// Trait for classifying fields during StateInfo construction.  Allows different scan types
 /// (regular, CDF) to customize field handling. Note that the default set of field handling occurs
@@ -13,7 +13,8 @@ use crate::transforms::FieldTransformSpec;
 pub(crate) trait TransformFieldClassifier {
     /// Classify a field and return its transform spec.
     /// Returns None if the field is physical (should be read from parquet).
-    /// Returns Some(spec) if the field needs transformation (partition, metadata-derived, or dynamic).
+    /// Returns Some(spec) if the field needs transformation (partition, metadata-derived, or
+    /// dynamic).
     fn classify_field(
         &self,
         field: &StructField,

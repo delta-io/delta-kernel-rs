@@ -3,23 +3,19 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::actions::deletion_vector::deletion_treemap_to_bools;
-use crate::scan::get_transform_for_row;
-use crate::schema::Schema;
-use crate::utils::require;
-use crate::ExpressionRef;
-use crate::{
-    actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
-    engine_data::{GetData, RowVisitor, TypedGetData as _},
-    schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
-    DeltaResult, Engine, EngineData, Error,
-};
 use roaring::RoaringTreemap;
 use serde::Deserialize;
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
+use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
+use crate::actions::visitors::visit_deletion_vector_at;
+use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
+use crate::scan::get_transform_for_row;
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef};
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -126,8 +122,8 @@ pub struct ScanFile {
     pub stats: Option<Stats>,
     /// A [`DvInfo`] struct, which allows getting the selection vector for this file
     pub dv_info: DvInfo,
-    /// An optional expression that, if present, _must_ be applied to physical data to convert it to
-    /// the correct logical format
+    /// An optional expression that, if present, _must_ be applied to physical data to convert it
+    /// to the correct logical format
     pub transform: Option<ExpressionRef>,
     /// a `HashMap<String, String>` which map partition names to the value they have in this file
     pub partition_values: HashMap<String, String>,
@@ -163,28 +159,30 @@ impl ScanMetadata {
     pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
         let mut visitor = ScanFileVisitor {
             callback,
-            selection_vector: self.scan_files.selection_vector(),
             transforms: &self.scan_file_transforms,
             context,
         };
-        visitor.visit_rows_of(self.scan_files.data())?;
+        visitor.visit_rows_of(&self.scan_files)?;
         Ok(visitor.context)
     }
 }
 // add some visitor magic for engines
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
-    selection_vector: &'a [bool],
     transforms: &'a [Option<ExpressionRef>],
     context: T,
 }
-impl<T> RowVisitor for ScanFileVisitor<'_, T> {
+impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| SCAN_ROW_SCHEMA.leaves(None));
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
         require!(
             getters.len() == 14,
             Error::InternalError(format!(
@@ -192,11 +190,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                 getters.len()
             ))
         );
-        for row_index in 0..row_count {
-            if !self.selection_vector[row_index] {
-                // skip skipped rows
-                continue;
-            }
+        for row_index in rows {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;

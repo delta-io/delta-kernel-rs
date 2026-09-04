@@ -1,9 +1,24 @@
 //! Utility functions used for tests in this crate.
 
-use crate::error::{EngineError, ExternResult, KernelError};
-use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 use std::os::raw::c_void;
 use std::ptr::NonNull;
+#[cfg(test)]
+use std::sync::Arc;
+
+#[cfg(test)]
+use delta_kernel::object_store::memory::InMemory;
+#[cfg(test)]
+use delta_kernel_default_engine::DefaultEngineBuilder;
+#[cfg(test)]
+use test_utils::add_commit;
+
+use crate::error::{EngineError, ExternResult, KernelError};
+#[cfg(test)]
+use crate::{
+    engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
+    SharedExternEngine, SharedSnapshot,
+};
+use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
 // Used to allocate EngineErrors with test information from Rust tests
 #[cfg(test)]
@@ -56,26 +71,86 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
     }
 }
 
+/// Build a latest-version snapshot via the FFI builder API. Panics on error.
+#[cfg(test)]
+pub(crate) unsafe fn build_snapshot(
+    path: KernelStringSlice,
+    engine: crate::handle::Handle<SharedExternEngine>,
+) -> crate::handle::Handle<SharedSnapshot> {
+    let builder = ok_or_panic(get_snapshot_builder(path, engine));
+    ok_or_panic(snapshot_builder_build(builder))
+}
+
+/// Wrap an already-seeded object store in an engine handle. Caller must free it.
+///
+/// Needed because `get_default_engine` resolves the store from the URL, so a `memory://` path
+/// builds a fresh (empty) `InMemory` rather than the seeded one.
+#[cfg(test)]
+pub(crate) fn engine_handle_for_store(
+    store: Arc<delta_kernel::object_store::DynObjectStore>,
+) -> crate::handle::Handle<SharedExternEngine> {
+    let engine = DefaultEngineBuilder::new(store).build();
+    engine_to_handle(Arc::new(engine), allocate_err)
+}
+
+/// Create an in-memory engine and snapshot from the given commit data. Returns
+/// `(engine_handle, snapshot_handle)` -- the caller must free both when done.
+#[cfg(test)]
+pub(crate) async fn setup_snapshot(
+    commit_data: String,
+) -> Result<
+    (
+        crate::handle::Handle<crate::SharedExternEngine>,
+        crate::handle::Handle<crate::SharedSnapshot>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let table_root = "memory:///";
+    let storage = Arc::new(InMemory::new());
+    add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
+    let engine = DefaultEngineBuilder::new(storage.clone()).build();
+    let engine = engine_to_handle(Arc::new(engine), allocate_err);
+    let snap = unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+    Ok((engine, snap))
+}
+
 /// Check error type and message while also recovering the error to prevent leaks
 pub(crate) fn assert_extern_result_error_with_message<T>(
     res: ExternResult<T>,
     expected_etype: KernelError,
-    expected_message: &str,
+    opt_message: Option<&str>,
 ) {
     match res {
         ExternResult::Err(e) => {
             let error = unsafe { recover_error(e) };
             assert_eq!(error.etype, expected_etype);
-            assert_eq!(error.message, expected_message);
+            if let Some(expected_message) = opt_message {
+                assert_eq!(error.message, expected_message);
+            }
         }
-        _ => panic!("Expected error of type '{expected_etype:?}' and message '{expected_message}'"),
+        _ => panic!("Expected error of type '{expected_etype:?}' and message '{opt_message:?}'"),
     }
+}
+
+/// Assert that `timestamp` (milliseconds since the Unix epoch) was written within the last day.
+#[cfg(test)]
+pub(crate) fn assert_timestamp_is_recent(timestamp: i64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let one_day_ms = 24 * 60 * 60 * 1000;
+    assert!(
+        (now_ms - one_day_ms..=now_ms).contains(&timestamp),
+        "commit timestamp {timestamp} not within one day of now {now_ms}"
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::panic;
+
+    use super::*;
 
     #[test]
     fn test_ok_or_panic_with_error() {
@@ -107,18 +182,15 @@ mod tests {
 
         assert!(
             panic_str.contains("Got engine error with type"),
-            "Panic message should contain 'Got engine error with type', got: {}",
-            panic_str
+            "Panic message should contain 'Got engine error with type', got: {panic_str}"
         );
         assert!(
             panic_str.contains("GenericError"),
-            "Panic message should contain error type 'GenericError', got: {}",
-            panic_str
+            "Panic message should contain error type 'GenericError', got: {panic_str}"
         );
         assert!(
             panic_str.contains(message),
-            "Panic message should contain error message 'Test error message', got: {}",
-            panic_str
+            "Panic message should contain error message 'Test error message', got: {panic_str}"
         );
     }
 

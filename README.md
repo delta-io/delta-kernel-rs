@@ -1,4 +1,4 @@
-# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.85+]][rustc]
+# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] ![Crates.io MSRV](https://img.shields.io/crates/msrv/delta_kernel)
 
 [build-status]: https://img.shields.io/github/actions/workflow/status/delta-io/delta-kernel-rs/build.yml?branch=main
 [actions]: https://github.com/delta-io/delta-kernel-rs/actions/workflows/build.yml?query=branch%3Amain
@@ -22,10 +22,17 @@ is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
 Delta-kernel-rs is split into a few different crates:
 
 - kernel: The actual core kernel crate
+- default-engine: The default Arrow/Tokio-based `Engine` implementation, published as
+  `delta_kernel_default_engine`
 - acceptance: Acceptance tests that validate correctness  via the [Delta Acceptance Tests][dat]
 - derive-macros: A crate for our [derive-macros] to live in
 - ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
   directory for more information.
+- unity-catalog-delta-client-api: Transport-agnostic client traits and wire models for the Unity
+  Catalog Delta Tables API
+- unity-catalog-delta-rest-client: REST/HTTP client for the Unity Catalog Delta Tables API
+- delta-kernel-unity-catalog: Unity Catalog integration for the kernel, providing a catalog
+  `Committer` and helpers for catalog-managed tables
 
 ## Building
 By default we build only the `kernel` and `acceptance` crates, which will also build `derive-macros`
@@ -40,31 +47,49 @@ cargo test --all-features
 This will build the kernel, run all unit tests, fetch the [Delta Acceptance Tests][dat] data and run
 the acceptance tests against it.
 
+CI also checks no-default-features builds in smaller pieces so that dependent crates do not
+accidentally enable kernel features. To run the same checks locally, use:
+
+```sh
+cargo clippy-no-default-kernel-dependents
+cargo check-no-default-kernel
+cargo check-no-default-engine
+cargo clippy-no-default-kernel-leaves
+```
+
 In general, you will want to depend on `delta-kernel-rs` by adding it as a dependency to your
 `Cargo.toml`, (that is, for rust projects using cargo) for other projects please see the [FFI]
 module. The core kernel includes facilities for reading and writing delta tables, and allows the
 consumer to implement their own `Engine` trait in order to build engine-specific implementations of
 the various `Engine` APIs that the kernel relies on (e.g. implement an engine-specific
-`read_json_files()` using the native engine JSON reader). If there is no need to implement the
-consumer's own `Engine` trait, the kernel has a feature flag to enable a default, asynchronous
-`Engine` implementation built with [Arrow] and [Tokio].
+`read_json_files()` using the native engine JSON reader). If you do not need a custom `Engine`,
+add the `delta_kernel_default_engine` crate to get the default asynchronous `Engine` implementation
+built with [Arrow] and [Tokio].
 
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.19.0"
+delta_kernel = "0.28.0"
 
-# or turn on the default engine, based on latest arrow
-delta_kernel = { version = "0.19.0", features = ["default-engine", "arrow"] }
+# or pull in the default Arrow/Tokio engine alongside the kernel
+delta_kernel = "0.28.0"
+delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
 ```
 
 ### Feature flags
-There are more feature flags in addition to the `default-engine` flag shown above. Relevant flags
-include:
+`delta_kernel_default_engine` exposes the following feature flags:
 
 | Feature flag  | Description   |
 | ------------- | ------------- |
-| `default-engine`    | Turn on the 'default' engine: async, arrow-based `Engine` implementation  |
+| `rustls`      | Use the rustls TLS backend for HTTPS object stores  |
+| `native-tls`  | Use the native-tls TLS backend for HTTPS object stores  |
+| `arrow-58`    | Build against arrow 58 (see Arrow versioning below) |
+| `arrow-59`    | Build against arrow 59 (see Arrow versioning below) |
+
+The `delta_kernel` crate itself exposes a few additional flags:
+
+| Feature flag  | Description   |
+| ------------- | ------------- |
 | `arrow-conversion`  | Conversion utilities for arrow/kernel schema interoperation |
 | `arrow-expression`  | Expression system implementation for arrow |
 
@@ -74,8 +99,8 @@ are still unstable. We therefore may break APIs within minor releases (that is, 
 we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
 ## Arrow versioning
-If you enable the `default-engine` feature, you get an implementation of the `Engine` trait that
-uses [Arrow] as its data format.
+If you depend on `delta_kernel_default_engine` (with either the `rustls` or `native-tls` feature),
+you get an implementation of the `Engine` trait that uses [Arrow] as its data format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
 frequently. To enable engines that already integrate arrow to also integrate kernel and not force
@@ -85,12 +110,12 @@ arrow versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow-56`: Use arrow version 56
-- `arrow-57`: Use arrow version 57
+- `arrow-58`: Use arrow version 58
+- `arrow-59`: Use arrow version 59
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
   the latest arrow version at every arrow version release. Only removing old arrow versions will
   cause a breaking change for kernel. If you require a specific version N of arrow, you should
-  specify it directly with `arrow-N`, e.g. `arrow-56`.
+  specify it directly with `arrow-N`, e.g. `arrow-58`.
 
 Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
 specified flag. This also means that if you use `--all-features` you will get the latest version of

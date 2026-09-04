@@ -6,19 +6,18 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{Add, Remove, Sidecar, ADD_NAME};
-use crate::actions::{REMOVE_NAME, SIDECAR_NAME};
+use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
 #[allow(unused)]
 pub(crate) struct CheckpointManifestReader {
-    actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    actions: DeltaResultIteratorStatic<ActionsBatch>,
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
     is_complete: bool,
@@ -41,13 +40,11 @@ impl CheckpointManifestReader {
         manifest: &ParsedLogPath,
         log_root: Url,
     ) -> DeltaResult<Self> {
-        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = LazyLock::new(|| {
-            Arc::new(StructType::new_unchecked([
-                StructField::nullable(ADD_NAME, Add::to_schema()),
-                StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-                StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-            ]))
-        });
+        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+            (&SIDECAR_FIELD),
+        };
 
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
@@ -118,14 +115,15 @@ impl Iterator for CheckpointManifestReader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use itertools::Itertools;
+
     use super::*;
     use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
+    use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
     use crate::SnapshotRef;
-
-    use itertools::Itertools;
-    use std::sync::Arc;
 
     /// Helper function to test manifest phase with expected add paths and sidecars
     fn verify_manifest_phase(
@@ -136,8 +134,8 @@ mod tests {
     ) -> DeltaResult<()> {
         let log_segment = snapshot.log_segment();
         let log_root = log_segment.log_root.clone();
-        assert_eq!(log_segment.checkpoint_parts.len(), 1);
-        let checkpoint_file = &log_segment.checkpoint_parts[0];
+        assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
+        let checkpoint_file = &log_segment.listed.checkpoint_parts[0];
         let mut manifest_phase =
             CheckpointManifestReader::try_new(engine.clone(), checkpoint_file, log_root)?;
 
@@ -218,7 +216,7 @@ mod tests {
 
         let manifest_phase = CheckpointManifestReader::try_new(
             engine.clone(),
-            &snapshot.log_segment().checkpoint_parts[0],
+            &snapshot.log_segment().listed.checkpoint_parts[0],
             snapshot.log_segment().log_root.clone(),
         )?;
 

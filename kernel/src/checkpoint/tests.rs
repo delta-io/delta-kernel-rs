@@ -1,31 +1,35 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::action_reconciliation::{
-    deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
-};
-use crate::actions::{Add, Metadata, Protocol, Remove};
-use crate::arrow::array::{ArrayRef, StructArray};
-use crate::arrow::datatypes::{DataType, Schema};
-use crate::arrow::{
-    array::{create_array, RecordBatch},
-    datatypes::Field,
-};
-use crate::checkpoint::create_last_checkpoint_data;
-use crate::committer::FileSystemCommitter;
-use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use crate::engine::default::DefaultEngineBuilder;
-use crate::log_replay::HasSelectionVector;
-use crate::schema::{DataType as KernelDataType, StructField, StructType};
-use crate::utils::test_utils::Action;
-use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
-
-use object_store::local::LocalFileSystem;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{from_slice, json, Value};
 use tempfile::tempdir;
-use test_utils::delta_path_for_version;
+use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
 use url::Url;
+
+use crate::action_reconciliation::{
+    deleted_file_retention_timestamp_with_time, ActionReconciliationIterator,
+    ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
+};
+use crate::actions::{Add, Metadata, Protocol, Remove};
+use crate::arrow::array::{create_array, Array, AsArray, RecordBatch, StructArray};
+use crate::arrow::datatypes::{DataType, Field, Schema};
+use crate::checkpoint::{
+    create_last_checkpoint_data, CheckpointWriter, LastCheckpointHintStats,
+    CHECKPOINT_ACTIONS_SCHEMA_V2,
+};
+use crate::committer::FileSystemCommitter;
+use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
+use crate::engine::sync::SyncEngine;
+use crate::log_replay::HasSelectionVector;
+use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
+use crate::object_store::ObjectStoreExt as _;
+use crate::schema::{schema_ref, DataType as KernelDataType, StructField};
+use crate::table_features::TableFeature;
+use crate::transaction::create_table::create_table;
+use crate::unit_test_utils::Action;
+use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -50,10 +54,10 @@ fn test_deleted_file_retention_timestamp(
 #[tokio::test]
 async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
-    // Protocol action does not include the v2Checkpoint reader/writer feature.
+    // Protocol action includes the v2Checkpoint reader/writer feature.
     write_commit_to_store(
         &store,
         vec![
@@ -66,34 +70,37 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
+    // Use V2 schema for the checkpoint metadata batch
+    let checkpoint_batch =
+        writer.create_checkpoint_metadata_batch(&engine, &CHECKPOINT_ACTIONS_SCHEMA_V2)?;
     assert!(checkpoint_batch.filtered_data.has_selected_rows());
 
-    // Verify the underlying EngineData contains the expected CheckpointMetadata action
+    // Verify the underlying EngineData contains the expected fields
     let (underlying_data, _) = checkpoint_batch.filtered_data.into_parts();
     let arrow_engine_data = ArrowEngineData::try_from_engine_data(underlying_data)?;
     let record_batch = arrow_engine_data.record_batch();
 
-    // Build the expected RecordBatch
-    // Note: The schema is a struct with a single field "checkpointMetadata" of type struct
-    // containing a single field "version" of type long
-    let expected_schema = Arc::new(Schema::new(vec![Field::new(
-        "checkpointMetadata",
-        DataType::Struct(vec![Field::new("version", DataType::Int64, false)].into()),
-        true,
-    )]));
-    let expected = RecordBatch::try_new(
-        expected_schema,
-        vec![Arc::new(StructArray::from(vec![(
-            Arc::new(Field::new("version", DataType::Int64, false)),
-            create_array!(Int64, [0]) as ArrayRef,
-        )]))],
-    )
-    .unwrap();
+    // Verify the schema has the expected fields
+    let schema = record_batch.schema();
+    assert!(
+        schema.field_with_name("checkpointMetadata").is_ok(),
+        "Schema should have checkpointMetadata field"
+    );
+    assert!(
+        schema.field_with_name("add").is_ok(),
+        "Schema should have add field"
+    );
+    assert!(
+        schema.field_with_name("remove").is_ok(),
+        "Schema should have remove field"
+    );
 
-    assert_eq!(*record_batch, expected);
+    // Verify we have one row
+    assert_eq!(record_batch.num_rows(), 1);
+
+    // Verify action counts
     assert_eq!(checkpoint_batch.actions_count, 1);
     assert_eq!(checkpoint_batch.add_actions_count, 0);
 
@@ -107,7 +114,7 @@ fn test_create_last_checkpoint_data() -> DeltaResult<()> {
     let add_actions_counter = 75;
     let size_in_bytes: i64 = 1024 * 1024; // 1MB
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Create last checkpoint metadata
     let last_checkpoint_batch = create_last_checkpoint_data(
@@ -148,7 +155,7 @@ fn test_create_last_checkpoint_data() -> DeltaResult<()> {
 
 /// TODO(#855): Merge copies and move to `test_utils`
 /// Create an in-memory store and return the store and the URL for the store's _delta_log directory.
-fn new_in_memory_store() -> (Arc<InMemory>, Url) {
+pub(super) fn new_in_memory_store() -> (Arc<InMemory>, Url) {
     (
         Arc::new(InMemory::new()),
         Url::parse("memory:///")
@@ -161,7 +168,7 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 /// TODO(#855): Merge copies and move to `test_utils`
 /// Writes all actions to a _delta_log json commit file in the store.
 /// This function formats the provided filename into the _delta_log directory.
-async fn write_commit_to_store(
+pub(super) async fn write_commit_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     version: u64,
@@ -179,37 +186,46 @@ async fn write_commit_to_store(
 /// Create a Protocol action without v2Checkpoint feature support
 fn create_basic_protocol_action() -> Action {
     Action::Protocol(
-        Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new())).unwrap(),
+        Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap(),
+    )
+}
+
+/// Create a Protocol action with catalogManaged feature support. Per the Delta protocol,
+/// catalogManaged depends on inCommitTimestamp.
+fn create_catalog_managed_protocol_action() -> Action {
+    Action::Protocol(
+        Protocol::try_new_modern(["catalogManaged"], ["catalogManaged", "inCommitTimestamp"])
+            .unwrap(),
     )
 }
 
 /// Create a Protocol action with v2Checkpoint feature support
-fn create_v2_checkpoint_protocol_action() -> Action {
-    Action::Protocol(
-        Protocol::try_new(3, 7, Some(vec!["v2Checkpoint"]), Some(vec!["v2Checkpoint"])).unwrap(),
-    )
+pub(super) fn create_v2_checkpoint_protocol_action() -> Action {
+    Action::Protocol(Protocol::try_new_modern(vec!["v2Checkpoint"], vec!["v2Checkpoint"]).unwrap())
 }
 
-/// Create a Metadata action
-fn create_metadata_action() -> Action {
+/// Create a Metadata action with the given table configuration.
+fn create_metadata_action_with_config(configuration: HashMap<String, String>) -> Action {
     Action::Metadata(
         Metadata::try_new(
             Some("test-table".into()),
             None,
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "value",
-                KernelDataType::INTEGER,
-            )])),
+            schema_ref! { nullable "value": INTEGER },
             vec![],
             0,
-            HashMap::new(),
+            configuration,
         )
         .unwrap(),
     )
 }
 
-/// Create an Add action with the specified path
-fn create_add_action(path: &str) -> Action {
+/// Create a Metadata action with no configuration.
+pub(super) fn create_metadata_action() -> Action {
+    create_metadata_action_with_config(HashMap::new())
+}
+
+/// Create a simple Add action with the specified path (no stats)
+pub(super) fn create_add_action(path: &str) -> Action {
     Action::Add(Add {
         path: path.into(),
         data_change: true,
@@ -221,13 +237,30 @@ fn create_add_action(path: &str) -> Action {
 ///
 /// The remove action has deletion_timestamp set to i64::MAX to ensure the
 /// remove action is not considered expired during testing.
-fn create_remove_action(path: &str) -> Action {
+pub(super) fn create_remove_action(path: &str) -> Action {
     Action::Remove(Remove {
         path: path.into(),
         data_change: true,
         deletion_timestamp: Some(i64::MAX), // Ensure the remove action is not expired
         ..Default::default()
     })
+}
+
+fn try_finalize_checkpoint(
+    writer: CheckpointWriter,
+    engine: &dyn crate::Engine,
+    metadata: &FileMeta,
+    data_iter: ActionReconciliationIterator,
+) -> DeltaResult<()> {
+    let state = data_iter.state();
+    drop(data_iter);
+    let state = Arc::into_inner(state).expect("no other Arc references");
+    let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
+        state,
+        metadata.size,
+        0, /* num_sidecars */
+    )?;
+    writer.finalize(engine, &last_checkpoint_stats)
 }
 
 /// Helper to verify the contents of the `_last_checkpoint` file
@@ -263,16 +296,21 @@ async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> 
 #[tokio::test]
 async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit: adds `fake_path_1`
-    write_commit_to_store(&store, vec![create_add_action("fake_path_1")], 0).await?;
+    write_commit_to_store(
+        &store,
+        vec![create_add_action_with_stats("fake_path_1", 10)],
+        0,
+    )
+    .await?;
 
     // 2nd commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
         &store,
         vec![
-            create_add_action("fake_path_2"),
+            create_add_action_with_stats("fake_path_2", 20),
             create_remove_action("fake_path_1"),
         ],
         1,
@@ -290,7 +328,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -298,7 +336,8 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000002.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
@@ -318,7 +357,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (2)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
@@ -335,7 +374,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
@@ -350,8 +389,8 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     write_commit_to_store(
         &store,
         vec![
-            create_add_action("file1.parquet"),
-            create_add_action("file2.parquet"),
+            create_add_action_with_stats("file1.parquet", 100),
+            create_add_action_with_stats("file2.parquet", 200),
         ],
         1,
     )
@@ -362,7 +401,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the specified version.
     assert_eq!(
@@ -370,7 +409,8 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
@@ -385,7 +425,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: specified version (0)
     // - size: 1 metadata + 1 protocol
@@ -399,7 +439,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
     write_commit_to_store(
@@ -413,27 +453,74 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
     let data_iter = writer.checkpoint_data(&engine)?;
 
     /* The returned data iterator has batches that we do not consume */
 
-    let size_in_bytes = 10;
-    let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
-        last_modified: 0,
-        size: size_in_bytes,
-    };
-
-    // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
-    let err = writer
-        .finalize(&engine, &metadata, &data_iter.state())
-        .expect_err("finalize should fail");
-    assert!(
-        err.to_string().contains("Error writing checkpoint: The checkpoint data iterator must be fully consumed and written to storage before calling finalize")
-    );
+    // Attempting to build LastCheckpointHintStats from a non-exhausted state should fail
+    let state = data_iter.state();
+    drop(data_iter);
+    let state = Arc::into_inner(state).expect("no other Arc references");
+    let err = LastCheckpointHintStats::from_reconciliation_state(
+        state, 0, /* size_in_bytes */
+        0, /* num_sidecars */
+    )
+    .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
+    assert!(err
+        .to_string()
+        .contains("reconciliation iterator must be fully consumed"));
 
     Ok(())
+}
+
+#[test]
+fn test_last_checkpoint_hint_stats_with_nonzero_num_sidecars() -> DeltaResult<()> {
+    let state = ActionReconciliationIteratorState::new_exhausted(5, 2);
+    let stats = LastCheckpointHintStats::from_reconciliation_state(state, 100, 3)?;
+    assert_eq!(stats.num_actions, 8); // 5 reconciled + 3 sidecar actions
+    assert_eq!(stats.size_in_bytes, 100);
+    assert_eq!(stats.num_of_add_files, 2); // sidecar actions do not bump this
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::num_sidecars_exceeds_i64(
+    0,
+    0,
+    0,
+    u64::MAX,
+    "num_sidecars 18446744073709551615 exceeds i64"
+)]
+#[case::actions_count_overflow(
+    i64::MAX,
+    0,
+    0,
+    1,
+    "checkpoint action count overflowed i64: 9223372036854775807 + 1"
+)]
+#[case::size_in_bytes_exceeds_i64(
+    0,
+    0,
+    u64::MAX,
+    0,
+    "size_in_bytes 18446744073709551615 exceeds i64"
+)]
+fn test_last_checkpoint_hint_stats_rejects_invalid_input(
+    #[case] actions_count: i64,
+    #[case] add_actions_count: i64,
+    #[case] size_in_bytes: u64,
+    #[case] num_sidecars: u64,
+    #[case] expected_err_substring: &str,
+) {
+    let state = ActionReconciliationIteratorState::new_exhausted(actions_count, add_actions_count);
+    let err =
+        LastCheckpointHintStats::from_reconciliation_state(state, size_in_bytes, num_sidecars)
+            .expect_err("invalid input must error");
+    assert!(
+        err.to_string().contains(expected_err_substring),
+        "error should mention {expected_err_substring}, got: {err}"
+    );
 }
 
 /// Tests the `checkpoint()` API with:
@@ -442,13 +529,13 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 #[tokio::test]
 async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
         &store,
         vec![
-            create_add_action("fake_path_2"),
+            create_add_action_with_stats("fake_path_2", 50),
             create_remove_action("fake_path_1"),
         ],
         0,
@@ -469,7 +556,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -477,7 +564,8 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
@@ -502,7 +590,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (1)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
@@ -516,12 +604,18 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
-    // normal commit
+    // normal commit with catalog-managed protocol
     write_commit_to_store(
         &store,
-        vec![create_metadata_action(), create_basic_protocol_action()],
+        vec![
+            create_metadata_action_with_config(HashMap::from([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            )])),
+            create_catalog_managed_protocol_action(),
+        ],
         0,
     )
     .await?;
@@ -547,24 +641,33 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     };
     let snapshot = Snapshot::builder_for(table_root.clone())
         .with_log_tail(vec![LogPath::try_new(staged_commit).unwrap()])
+        .with_max_catalog_version(1)
         .build(&engine)?;
 
     assert!(matches!(
-        snapshot.create_checkpoint_writer().unwrap_err(),
+        snapshot.create_checkpoint_writer(&engine).unwrap_err(),
         crate::Error::Generic(e) if e == "Log segment is not published"
     ));
     Ok(())
 }
 
+/// Create an Add action with JSON stats
+fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
+    let stats = format!(
+        r#"{{"numRecords":{num_records},"minValues":{{"id":1,"name":"alice"}},"maxValues":{{"id":100,"name":"zoe"}},"nullCount":{{"id":0,"name":5}}}}"#
+    );
+    Action::Add(Add {
+        path: path.into(),
+        data_change: true,
+        stats: Some(stats),
+        ..Default::default()
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_snapshot_checkpoint() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Version 0: metadata & protocol
     write_commit_to_store(
@@ -624,7 +727,7 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
 
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
     let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
@@ -648,7 +751,7 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // Second checkpoint: 1 metadata + 1 protocol + 7 add + 4 remove = 13, numOfAddFiles = 7
     let checkpoint_path = Path::from("_delta_log/00000000000000000006.checkpoint.parquet");
@@ -696,13 +799,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     .unwrap();
 
     // ===== Create Engine =====
-    let store = Arc::new(LocalFileSystem::new());
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
+    let engine = SyncEngine::new();
 
     let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -725,7 +822,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     assert_eq!(domain_value, Some("bar2".to_string()));
 
     // Trigger checkpoint
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // ===== Case 2: Verify domain metadata is preserved *after* checkpoint =====
     let snapshot = Snapshot::builder_for(table_url)
@@ -737,4 +834,501 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     Ok(())
 }
 
-// TODO: Add test that checkpoint does not contain tombstoned domain metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()> {
+    // ===== Setup =====
+    let tmp_dir = tempdir().unwrap();
+    let table_path = tmp_dir.path();
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
+
+    // ===== Create Table with domainMetadata feature =====
+    let commit0 = [
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": ["domainMetadata"]
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "test-table-id",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ]
+    .map(|j| j.to_string())
+    .join("\n");
+    std::fs::write(
+        table_path.join("_delta_log/00000000000000000000.json"),
+        commit0,
+    )
+    .unwrap();
+
+    // ===== Create Engine =====
+    // Use SyncEngine::new() (not new_with_store(LocalFileSystem::new())) so the engine builds
+    // per-URL LocalFileSystem instances rooted at the URL's drive. The bare
+    // LocalFileSystem::new() rejects absolute Windows paths via file:// URLs.
+    let engine = SyncEngine::new();
+
+    // ===== Commit domain metadata for "foo" =====
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let result = txn
+        .with_domain_metadata("foo".to_string(), "bar".to_string())
+        .commit(&engine)?;
+    assert!(result.is_committed());
+
+    // Verify domain exists before removal
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(
+        snapshot.get_domain_metadata("foo", &engine)?,
+        Some("bar".to_string())
+    );
+
+    // ===== Remove domain metadata for "foo" (tombstone) =====
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let result = txn
+        .with_domain_metadata_removed("foo".to_string())
+        .commit(&engine)?;
+    assert!(result.is_committed());
+
+    // Verify domain is gone before checkpoint
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, None);
+
+    // ===== Write checkpoint =====
+    snapshot.checkpoint(&engine, None)?;
+
+    // ===== Verify tombstoned domain is NOT present after loading from checkpoint =====
+    let snapshot = Snapshot::builder_for(table_url)
+        .at_version(snapshot.version())
+        .build(&engine)?;
+    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, None);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> DeltaResult<()>
+{
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let table_root = Url::parse("memory:///")?;
+    let _ = create_table(
+        table_root.as_str(),
+        schema_ref! { nullable "value": INTEGER },
+        "test",
+    )
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+
+    // Version 1
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Add("file1.parquet".to_string())]),
+    )
+    .await
+    .map_err(|err| crate::Error::generic(err.to_string()))?;
+
+    // Version 2
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        2,
+        actions_to_string(vec![TestAction::Add("file2.parquet".to_string())]),
+    )
+    .await
+    .map_err(|err| crate::Error::generic(err.to_string()))?;
+
+    // Checkpoint at version 2
+    let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert_eq!(snapshot_v2.version(), 2);
+    snapshot_v2.checkpoint(&engine, None)?;
+    let last_checkpoint = read_last_checkpoint_file(&store).await?;
+    let size_in_bytes = last_checkpoint
+        .get("sizeInBytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            crate::Error::generic("missing or invalid sizeInBytes in _last_checkpoint")
+        })?;
+    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
+
+    // Time-travel to version 1 and writing a checkpoint should not override _last_checkpoint
+    let snapshot_v1 = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(&engine)?;
+    snapshot_v1.checkpoint(&engine, None)?;
+    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
+}
+
+/// Helper to create metadata action with specific stats settings
+fn create_metadata_with_stats_config(
+    write_stats_as_json: bool,
+    write_stats_as_struct: bool,
+) -> Action {
+    create_metadata_with_stats_config_and_partitions(
+        write_stats_as_json,
+        write_stats_as_struct,
+        vec![],
+    )
+}
+
+/// Helper to create metadata action with stats settings and partition columns
+pub(super) fn create_metadata_with_stats_config_and_partitions(
+    write_stats_as_json: bool,
+    write_stats_as_struct: bool,
+    partition_columns: Vec<String>,
+) -> Action {
+    let config = HashMap::from([
+        (
+            "delta.checkpoint.writeStatsAsJson".to_string(),
+            write_stats_as_json.to_string(),
+        ),
+        (
+            "delta.checkpoint.writeStatsAsStruct".to_string(),
+            write_stats_as_struct.to_string(),
+        ),
+    ]);
+    Action::Metadata(
+        Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            schema_ref! {
+                nullable "id": LONG,
+                nullable "name": STRING,
+                nullable "category": STRING,
+            },
+            partition_columns,
+            0,
+            config,
+        )
+        .unwrap(),
+    )
+}
+
+/// Verifies checkpoint schema has expected fields based on stats configuration.
+/// Non-partitioned tables should never have `partitionValues_parsed`.
+fn verify_checkpoint_schema(
+    schema: &Schema,
+    expect_stats: bool,
+    expect_stats_parsed: bool,
+) -> DeltaResult<()> {
+    verify_checkpoint_schema_with_partitions(schema, expect_stats, expect_stats_parsed, false)
+}
+
+/// Verifies checkpoint schema has expected fields based on stats and partition configuration.
+fn verify_checkpoint_schema_with_partitions(
+    schema: &Schema,
+    expect_stats: bool,
+    expect_stats_parsed: bool,
+    expect_partition_values_parsed: bool,
+) -> DeltaResult<()> {
+    let add_field = schema
+        .field_with_name("add")
+        .expect("schema should have 'add' field");
+
+    if let DataType::Struct(add_fields) = add_field.data_type() {
+        let has_stats = add_fields.iter().any(|f| f.name() == "stats");
+        let has_stats_parsed = add_fields.iter().any(|f| f.name() == "stats_parsed");
+        let has_pv_parsed = add_fields
+            .iter()
+            .any(|f| f.name() == "partitionValues_parsed");
+
+        assert_eq!(
+            has_stats, expect_stats,
+            "stats field: expected={expect_stats}, actual={has_stats}"
+        );
+        assert_eq!(
+            has_stats_parsed, expect_stats_parsed,
+            "stats_parsed field: expected={expect_stats_parsed}, actual={has_stats_parsed}"
+        );
+        assert_eq!(
+            has_pv_parsed, expect_partition_values_parsed,
+            "partitionValues_parsed field: expected={expect_partition_values_parsed}, actual={has_pv_parsed}"
+        );
+    } else {
+        panic!("add field should be a struct");
+    }
+    Ok(())
+}
+
+/// Tests all 16 combinations of writeStatsAsJson and writeStatsAsStruct settings with a
+/// full round-trip through parquet.
+///
+/// For each combination (json1, struct1, json2, struct2):
+/// 1. Writes checkpoint 1 to parquet with (json1, struct1) settings
+/// 2. Changes config to (json2, struct2)
+/// 3. Reads from checkpoint 1 to produce checkpoint 2 data, exercising COALESCE paths (e.g.,
+///    recovering stats from stats_parsed via ToJson, or vice versa)
+/// 4. Verifies checkpoint 2 schema matches (json2, struct2)
+#[rstest::rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stats_config_round_trip(
+    #[values(true, false)] json1: bool,
+    #[values(true, false)] struct1: bool,
+    #[values(true, false)] json2: bool,
+    #[values(true, false)] struct2: bool,
+) -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let table_root = Url::parse("memory:///")?;
+
+    // Commit 0: protocol + metadata with initial settings
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(),
+            create_metadata_with_stats_config(json1, struct1),
+        ],
+        0,
+    )
+    .await?;
+
+    // Commit 1: add action with JSON stats
+    write_commit_to_store(
+        &store,
+        vec![create_add_action_with_stats("file1.parquet", 100)],
+        1,
+    )
+    .await?;
+
+    // Write checkpoint 1 to parquet with (json1, struct1) settings
+    let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    snapshot1.checkpoint(&engine, None)?;
+
+    // Commit 2: update metadata with new settings
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_with_stats_config(json2, struct2)],
+        2,
+    )
+    .await?;
+
+    // Build snapshot that reads from checkpoint 1 + commit 2.
+    // The add action for file1.parquet comes from checkpoint 1, so the COALESCE
+    // expressions must recover stats across format changes.
+    let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
+    let writer2 = snapshot2.create_checkpoint_writer(&engine)?;
+    let mut result2 = writer2.checkpoint_data(&engine)?;
+
+    // Verify checkpoint 2 schema matches new settings
+    let first_batch = result2.next().expect("should have at least one batch")?;
+    let data = first_batch.apply_selection_vector()?;
+    let record_batch = data.try_into_record_batch()?;
+    verify_checkpoint_schema(&record_batch.schema(), json2, struct2)?;
+
+    // Consume remaining batches (verifies COALESCE doesn't error)
+    for batch in result2 {
+        let _ = batch?;
+    }
+
+    Ok(())
+}
+
+/// Same as `test_stats_config_round_trip` but with a partitioned table.
+/// Verifies that `partitionValues_parsed` is included in the checkpoint schema when
+/// `writeStatsAsStruct` is true, and omitted when false.
+#[rstest::rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stats_config_round_trip_partitioned(
+    #[values(true, false)] json1: bool,
+    #[values(true, false)] struct1: bool,
+    #[values(true, false)] json2: bool,
+    #[values(true, false)] struct2: bool,
+) -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let table_root = Url::parse("memory:///")?;
+
+    // Commit 0: protocol + partitioned metadata with initial settings
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(),
+            create_metadata_with_stats_config_and_partitions(
+                json1,
+                struct1,
+                vec!["category".into()],
+            ),
+        ],
+        0,
+    )
+    .await?;
+
+    // Commit 1: add action with partition values and JSON stats
+    let mut add = Add {
+        path: "category=books/file1.parquet".into(),
+        data_change: true,
+        stats: Some(
+            r#"{"numRecords":100,"minValues":{"id":1,"name":"alice"},"maxValues":{"id":100,"name":"zoe"},"nullCount":{"id":0,"name":5}}"#.into(),
+        ),
+        ..Default::default()
+    };
+    add.partition_values
+        .insert("category".into(), "books".into());
+    write_commit_to_store(&store, vec![Action::Add(add)], 1).await?;
+
+    // Write checkpoint 1 with (json1, struct1) settings
+    let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    snapshot1.checkpoint(&engine, None)?;
+
+    // Commit 2: update metadata with new settings
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_with_stats_config_and_partitions(
+            json2,
+            struct2,
+            vec!["category".into()],
+        )],
+        2,
+    )
+    .await?;
+
+    // Build snapshot that reads from checkpoint 1 + commit 2
+    let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
+    let writer2 = snapshot2.create_checkpoint_writer(&engine)?;
+    let result2 = writer2.checkpoint_data(&engine)?;
+
+    // Collect all checkpoint batches
+    let mut all_batches = Vec::new();
+    for batch_result in result2 {
+        let batch = batch_result?;
+        let data = batch.apply_selection_vector()?;
+        all_batches.push(data.try_into_record_batch()?);
+    }
+
+    // Verify checkpoint schema matches new settings
+    verify_checkpoint_schema_with_partitions(
+        &all_batches[0].schema(),
+        json2,
+        struct2,
+        struct2, // partitionValues_parsed present iff writeStatsAsStruct=true
+    )?;
+
+    // When writeStatsAsStruct=true, verify partitionValues_parsed contains correct values
+    if struct2 {
+        let mut found_add = false;
+        for record_batch in &all_batches {
+            let add_col = record_batch
+                .column_by_name("add")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            for row in 0..record_batch.num_rows() {
+                if !add_col.is_valid(row) {
+                    continue;
+                }
+                found_add = true;
+                let pv_parsed = add_col
+                    .column_by_name("partitionValues_parsed")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let category_col = pv_parsed
+                    .column_by_name("category")
+                    .expect("partitionValues_parsed should have category field");
+                assert_eq!(category_col.as_string::<i32>().value(row), "books");
+            }
+        }
+        assert!(found_add, "should have found an add action");
+    }
+
+    Ok(())
+}
+
+// This tests that we can change the metadata of a schema field in between checkpoints and still
+// manage to checkpoint, with parsed stats enabled.
+// The checkpoint at version 0 is written with a schema without field metadata, so its
+// stats_parsed nullCount fields are plain Int64. Then a new metadata action at version 1
+// adds `__CHAR_VARCHAR_TYPE_STRING` to the "name" field. When checkpointing version 1,
+// the kernel builds a stats schema with that metadata on nullCount fields (via
+// NullCountStatsTransform), but the stats_parsed data from the old checkpoint lacks it,
+// causing an Arrow schema mismatch in the COALESCE expression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let config = HashMap::from([
+        ("delta.checkpoint.writeStatsAsJson".into(), "true".into()),
+        ("delta.checkpoint.writeStatsAsStruct".into(), "true".into()),
+    ]);
+
+    // Version 0: schema WITHOUT __CHAR_VARCHAR_TYPE_STRING + add with stats
+    let schema_v0 = schema_ref! {
+        nullable "id": LONG,
+        nullable "name": STRING,
+    };
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(),
+            Action::Metadata(
+                Metadata::try_new(
+                    Some("test".into()),
+                    None,
+                    schema_v0,
+                    vec![],
+                    0,
+                    config.clone(),
+                )
+                .unwrap(),
+            ),
+            Action::Add(Add {
+                path: "file1.parquet".into(),
+                data_change: true,
+                stats: Some(
+                    r#"{"numRecords":10,"minValues":{"id":1,"name":"alice"},"maxValues":{"id":100,"name":"zoe"},"nullCount":{"id":0,"name":2}}"#.into(),
+                ),
+                ..Default::default()
+            }),
+        ],
+        0,
+    )
+    .await?;
+
+    // Checkpoint version 0: stats_parsed nullCount fields are plain Int64 (no metadata)
+    let table_root = Url::parse("memory:///")?;
+    Snapshot::builder_for(table_root.clone())
+        .build(&engine)?
+        .checkpoint(&engine, None)?;
+
+    // Version 1: new metadata WITH __CHAR_VARCHAR_TYPE_STRING on the "name" field
+    let schema_v1 = schema_ref! {
+        nullable "id": LONG,
+        (StructField::nullable("name", KernelDataType::STRING).with_metadata([(
+                "__CHAR_VARCHAR_TYPE_STRING",
+                crate::schema::MetadataValue::String("varchar(255)".to_string()),
+            )])),
+    };
+    write_commit_to_store(
+        &store,
+        vec![Action::Metadata(
+            Metadata::try_new(Some("test".into()), None, schema_v1, vec![], 0, config).unwrap(),
+        )],
+        1,
+    )
+    .await?;
+
+    // Checkpoint version 1: the add from checkpoint 0 has stats_parsed with nullCount fields
+    // lacking metadata. Ensure our checkpointing drops the new metadata for the stats fields and
+    // doesn't see a mismatch
+    Snapshot::builder_for(table_root)
+        .build(&engine)?
+        .checkpoint(&engine, None)?;
+
+    Ok(())
+}

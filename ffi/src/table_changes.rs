@@ -1,22 +1,18 @@
 //! TableChanges related ffi code
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use delta_kernel::arrow::array::{Array, ArrayData, StructArray};
 use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::EngineData;
-use delta_kernel::Error;
-use delta_kernel::{DeltaResult, Version};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, EngineData, Error, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
-
-use super::handle::Handle;
 use url::Url;
 
+use super::handle::Handle;
 use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::scan::EnginePredicate;
@@ -33,8 +29,8 @@ pub struct ExclusiveTableChanges;
 ///
 /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
 /// - `engine`: Implementation of `Engine` apis.
-/// - `start_version`: The start version of the change data feed
-///   End version will be the newest table version.
+/// - `start_version`: The start version of the change data feed End version will be the newest
+///   table version.
 ///
 /// # Safety
 ///
@@ -154,8 +150,8 @@ pub unsafe extern "C" fn table_changes_end_version(
 pub struct SharedTableChangesScan;
 
 /// Get a [`TableChangesScan`] over the table specified by the passed table changes.
-/// It is the responsibility of the _engine_ to free this scan when complete by calling [`free_table_changes_scan`].
-/// Consumes TableChanges.
+/// It is the responsibility of the _engine_ to free this scan when complete by calling
+/// [`free_table_changes_scan`]. Consumes TableChanges.
 ///
 /// # Safety
 ///
@@ -237,7 +233,7 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
-type TableChangesData = Mutex<Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>>;
+type TableChangesData = Mutex<DeltaResultIteratorStatic<Box<dyn EngineData>>>;
 
 pub struct ScanTableChangesIterator {
     data: TableChangesData,
@@ -297,26 +293,30 @@ pub unsafe extern "C" fn free_scan_table_changes_iter(
 
 /// Get next batch of data from the table changes iterator.
 ///
+/// Returns `Ok(non-null)` with a heap-allocated [`ArrowFFIData`] containing the next batch,
+/// `Ok(null)` when the iterator is exhausted, or `Err` on failure. A non-null pointer must
+/// be freed by the engine via [`crate::engine_data::free_arrow_ffi_data`] exactly once.
+///
 /// # Safety
 ///
-/// The iterator must be valid (returned by [table_changes_scan_execute]) and not yet freed by
-/// [`free_scan_table_changes_iter`].
+/// The iterator must be valid (returned by [`table_changes_scan_execute`]) and not yet freed
+/// by [`free_scan_table_changes_iter`].
 #[no_mangle]
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
-) -> ExternResult<ArrowFFIData> {
+) -> ExternResult<*mut ArrowFFIData> {
     let data = unsafe { data.as_ref() };
     scan_table_changes_next_impl(data).into_extern_result(&data.engine.as_ref())
 }
 
-fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<ArrowFFIData> {
+fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<*mut ArrowFFIData> {
     let mut data = data
         .data
         .lock()
         .map_err(|_| Error::generic("poisoned scan table changes iterator mutex"))?;
 
     let Some(data) = data.next().transpose()? else {
-        return Ok(ArrowFFIData::empty());
+        return Ok(std::ptr::null_mut());
     };
 
     let record_batch = data.try_into_record_batch()?;
@@ -324,17 +324,15 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
     let batch_struct_array: StructArray = record_batch.into();
     let array_data: ArrayData = batch_struct_array.into_data();
     let (out_array, out_schema) = to_ffi(&array_data)?;
-    Ok(ArrowFFIData {
+    Ok(Box::into_raw(Box::new(ArrowFFIData {
         array: out_array,
         schema: out_schema,
-    })
+    })))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
-    use crate::{engine_to_handle, free_engine, free_schema, kernel_string_slice};
+    use std::sync::Arc;
 
     use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
     use delta_kernel::arrow::datatypes::{Field, Schema};
@@ -343,17 +341,22 @@ mod tests {
     use delta_kernel::arrow::util::pretty::pretty_format_batches;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
+    use delta_kernel::schema::{schema_ref, StructType};
     use delta_kernel::Engine;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
-    use object_store::{memory::InMemory, path::Path, ObjectStore};
-    use std::sync::Arc;
     use test_utils::{
         actions_to_string_with_metadata, add_commit, generate_batch, record_batch_to_bytes,
         IntoArray as _, TestAction,
     };
+
+    use super::*;
+    use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
+    use crate::{engine_to_handle, free_engine, free_schema, kernel_string_slice};
 
     const PARQUET_FILE1: &str =
         "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
@@ -406,15 +409,21 @@ mod tests {
     "#;
 
     async fn commit_add_file(
-        storage: &dyn ObjectStore,
+        table_root: &str,
+        storage: &DynObjectStore,
         version: u64,
         file: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let metadata = storage.head(&Path::from(file.as_ref())).await?;
         add_commit(
+            table_root,
             storage,
             version,
             actions_to_string_with_metadata(
-                vec![TestAction::Metadata, TestAction::Add(file)],
+                vec![
+                    TestAction::Metadata,
+                    TestAction::AddWithSize(file, metadata.size),
+                ],
                 METADATA,
             ),
         )
@@ -422,15 +431,21 @@ mod tests {
     }
 
     async fn commit_remove_file(
-        storage: &dyn ObjectStore,
+        table_root: &str,
+        storage: &DynObjectStore,
         version: u64,
         file: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let metadata = storage.head(&Path::from(file.as_ref())).await?;
         add_commit(
+            table_root,
             storage,
             version,
             actions_to_string_with_metadata(
-                vec![TestAction::Metadata, TestAction::Remove(file)],
+                vec![
+                    TestAction::Metadata,
+                    TestAction::RemoveWithSize(file, metadata.size),
+                ],
                 METADATA,
             ),
         )
@@ -438,7 +453,7 @@ mod tests {
     }
 
     async fn put_file(
-        storage: &dyn ObjectStore,
+        storage: &DynObjectStore,
         file: String,
         batch: &RecordBatch,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -450,21 +465,21 @@ mod tests {
 
     pub fn generate_batch_with_id(start_i: i32) -> Result<RecordBatch, ArrowError> {
         generate_batch(vec![
-            ("id", vec![start_i, start_i + 1, start_i + 2].into_array()),
-            ("val", vec!["a", "b", "c"].into_array()),
+            (
+                "id",
+                vec![start_i, start_i + 1, start_i + 2].into_arrow_array(),
+            ),
+            ("val", vec!["a", "b", "c"].into_arrow_array()),
         ])
     }
 
     pub fn get_batch_schema() -> Arc<StructType> {
-        Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::nullable("val", DataType::STRING),
-                StructField::nullable("_change_type", DataType::STRING),
-                StructField::nullable("_commit_version", DataType::INTEGER),
-            ])
-            .unwrap(),
-        )
+        schema_ref! {
+            nullable "id": INTEGER,
+            nullable "val": STRING,
+            nullable "_change_type": STRING,
+            nullable "_commit_version": INTEGER,
+        }
     }
 
     fn check_columns_in_schema(fields: &[&str], schema: &StructType) -> bool {
@@ -518,20 +533,21 @@ mod tests {
     #[tokio::test]
     async fn test_table_changes_getters() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
-        commit_add_file(storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
-        commit_add_file(storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let batch = generate_batch_with_id(1)?;
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
         let batch = generate_batch_with_id(4)?;
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
-        let path = "memory:///";
+        let table_root = "memory:///";
+        commit_add_file(table_root, storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
+        commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
+
         let engine = DefaultEngineBuilder::new(storage).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
-            table_changes_from_version(kernel_string_slice!(path), engine.shallow_copy(), 0)
+            table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
         });
 
         assert_eq!(
@@ -543,9 +559,9 @@ mod tests {
             1
         );
 
-        let table_root =
+        let table_root_str =
             unsafe { table_changes_table_root(table_changes.shallow_copy(), allocate_str) };
-        assert_eq!(recover_string(table_root.unwrap()), path);
+        assert_eq!(recover_string(table_root_str.unwrap()), table_root);
 
         let schema = unsafe { table_changes_schema(table_changes.shallow_copy()).shallow_copy() };
         let schema_ref = unsafe { schema.as_ref() };
@@ -564,10 +580,10 @@ mod tests {
         let table_changes_scan =
             ok_or_panic(unsafe { table_changes_scan(table_changes, engine.shallow_copy(), None) });
 
-        let table_root = unsafe {
+        let scan_table_root = unsafe {
             table_changes_scan_table_root(table_changes_scan.shallow_copy(), allocate_str)
         };
-        assert_eq!(recover_string(table_root.unwrap()), path);
+        assert_eq!(recover_string(scan_table_root.unwrap()), table_root);
 
         let logical_schema = unsafe {
             table_changes_scan_logical_schema(table_changes_scan.shallow_copy()).shallow_copy()
@@ -605,20 +621,21 @@ mod tests {
     #[tokio::test]
     async fn test_table_changes_scan() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
-        commit_add_file(storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
-        commit_add_file(storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let batch = generate_batch_with_id(1)?;
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
         let batch = generate_batch_with_id(4)?;
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
-        let path = "memory:///";
+        let table_root = "memory:///";
+        commit_add_file(table_root, storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
+        commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
+
         let engine = DefaultEngineBuilder::new(storage).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
-            table_changes_from_version(kernel_string_slice!(path), engine.shallow_copy(), 0)
+            table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
         });
         let table_changes_scan =
             ok_or_panic(unsafe { table_changes_scan(table_changes, engine.shallow_copy(), None) });
@@ -661,20 +678,21 @@ mod tests {
     #[tokio::test]
     async fn test_table_changes_scan_iterator() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
-        commit_add_file(storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
-        commit_add_file(storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let batch = generate_batch_with_id(1)?;
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
         let batch = generate_batch_with_id(4)?;
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
-        let path = "memory:///";
+        let table_root = "memory:///";
+        commit_add_file(table_root, storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
+        commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
+
         let engine = DefaultEngineBuilder::new(storage).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
-            table_changes_from_version(kernel_string_slice!(path), engine.shallow_copy(), 0)
+            table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
         });
 
         let table_changes_scan =
@@ -688,14 +706,16 @@ mod tests {
         let mut i: i32 = 0;
         loop {
             i += 1;
-            let data = ok_or_panic(unsafe {
+            let data_ptr = ok_or_panic(unsafe {
                 scan_table_changes_next(table_changes_scan_iter_result.shallow_copy())
             });
-            if data.array.is_empty() {
+            if data_ptr.is_null() {
                 break;
             }
-            let engine_data =
-                ok_or_panic(unsafe { get_engine_data(data.array, &data.schema, allocate_err) });
+            // Take ownership of the boxed ArrowFFIData; the inner array/schema are moved
+            // into get_engine_data which takes ownership of the FFI_ArrowArray.
+            let ArrowFFIData { array, schema } = *unsafe { Box::from_raw(data_ptr) };
+            let engine_data = ok_or_panic(unsafe { get_engine_data(array, &schema, allocate_err) });
             let record_batch = unsafe { engine_data.into_inner().try_into_record_batch() }?;
 
             println!("Batch ({i}) num rows {:?}", record_batch.num_rows());
@@ -739,22 +759,28 @@ mod tests {
     #[tokio::test]
     async fn test_table_changes_between_commits() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
-        commit_add_file(storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
-        commit_add_file(storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
-        commit_remove_file(storage.as_ref(), 2, PARQUET_FILE1.to_string()).await?;
-        commit_remove_file(storage.as_ref(), 3, PARQUET_FILE2.to_string()).await?;
 
         let batch = generate_batch_with_id(1)?;
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
         let batch = generate_batch_with_id(4)?;
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
-        let path = "memory:///";
+        let table_root = "memory:///";
+        commit_add_file(table_root, storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
+        commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
+        commit_remove_file(table_root, storage.as_ref(), 2, PARQUET_FILE1.to_string()).await?;
+        commit_remove_file(table_root, storage.as_ref(), 3, PARQUET_FILE2.to_string()).await?;
+
         let engine = DefaultEngineBuilder::new(storage).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
-            table_changes_between_versions(kernel_string_slice!(path), engine.shallow_copy(), 1, 2)
+            table_changes_between_versions(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+                1,
+                2,
+            )
         });
         let table_changes_scan =
             ok_or_panic(unsafe { table_changes_scan(table_changes, engine.shallow_copy(), None) });
@@ -767,12 +793,12 @@ mod tests {
         let batches: Vec<RecordBatch> = batches.into_iter().flatten().collect();
         let filtered_batches: Vec<RecordBatch> = filter_batches(batches);
 
-        let table_schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("val", DataType::STRING),
-            StructField::nullable("_change_type", DataType::STRING),
-            StructField::nullable("_commit_version", DataType::INTEGER),
-        ])?);
+        let table_schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "val": STRING,
+            nullable "_change_type": STRING,
+            nullable "_commit_version": INTEGER,
+        };
         let expected = &ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(table_schema.as_ref().try_into_arrow()?),
             vec![

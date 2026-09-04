@@ -1,0 +1,1960 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+use rstest::rstest;
+use url::Url;
+
+use super::*;
+use crate::engine::sync::SyncEngine;
+use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path as ObjectPath;
+use crate::object_store::ObjectStoreExt as _;
+use crate::path::tests::multipart_checkpoint_name;
+use crate::unit_test_utils::TestCancellationToken;
+use crate::{DeltaResultIteratorStatic, Engine as _, FileMeta, StorageHandler};
+
+// size markers used to identify commit sources in tests
+const FILESYSTEM_SIZE_MARKER: u64 = 10;
+const CATALOG_SIZE_MARKER: u64 = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitSource {
+    Filesystem,
+    Catalog,
+}
+
+fn log_path_for_file_type(version: Version, file_type: &LogPathFileType) -> String {
+    match file_type {
+        LogPathFileType::Commit => {
+            format!("_delta_log/{version:020}.json")
+        }
+        LogPathFileType::StagedCommit => {
+            let uuid = uuid::Uuid::new_v4();
+            format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
+        }
+        LogPathFileType::ClassicCheckpoint => {
+            format!("_delta_log/{version:020}.checkpoint.parquet")
+        }
+        LogPathFileType::MultiPartCheckpoint {
+            part_num,
+            num_parts,
+        } => {
+            let name = multipart_checkpoint_name(version, *part_num, *num_parts);
+            format!("_delta_log/{name}")
+        }
+        LogPathFileType::Crc => {
+            format!("_delta_log/{version:020}.crc")
+        }
+        LogPathFileType::CompactedCommit { hi } => {
+            format!("_delta_log/{version:020}.{hi:020}.compacted.json")
+        }
+        LogPathFileType::UuidCheckpoint | LogPathFileType::Unknown => {
+            panic!("Unsupported file type in test: {file_type:?}")
+        }
+    }
+}
+
+async fn create_storage(
+    log_files: Vec<(Version, LogPathFileType, CommitSource)>,
+) -> (Arc<dyn StorageHandler>, Url) {
+    create_storage_with_raw_paths(log_files, &[]).await
+}
+
+/// Like [`create_storage`] but also writes `raw_paths` verbatim, for log entries that
+/// [`log_path_for_file_type`] cannot produce (e.g. `_last_checkpoint`).
+async fn create_storage_with_raw_paths(
+    log_files: Vec<(Version, LogPathFileType, CommitSource)>,
+    raw_paths: &[&str],
+) -> (Arc<dyn StorageHandler>, Url) {
+    let store = Arc::new(InMemory::new());
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+
+    for path in raw_paths {
+        store
+            .put(&ObjectPath::from(*path), bytes::Bytes::from("raw").into())
+            .await
+            .expect("Failed to put raw test file");
+    }
+
+    for (version, file_type, source) in log_files {
+        let path = log_path_for_file_type(version, &file_type);
+        let data = match source {
+            CommitSource::Filesystem => bytes::Bytes::from("filesystem"),
+            CommitSource::Catalog => bytes::Bytes::from("catalog"),
+        };
+        store
+            .put(&ObjectPath::from(path.as_str()), data.into())
+            .await
+            .expect("Failed to put test file");
+    }
+
+    let engine = SyncEngine::new_with_store(store);
+    (engine.storage_handler(), log_root)
+}
+
+// helper to create a ParsedLogPath with specific source marker
+fn make_parsed_log_path_with_source(
+    version: Version,
+    file_type: LogPathFileType,
+    source: CommitSource,
+) -> ParsedLogPath {
+    let url = Url::parse(&format!("memory:///_delta_log/{version:020}.json")).unwrap();
+    let mut filename_path_segments = url.path_segments().unwrap();
+    let filename = filename_path_segments.next_back().unwrap().to_string();
+    let extension = filename.split('.').next_back().unwrap().to_string();
+
+    let size = match source {
+        CommitSource::Filesystem => FILESYSTEM_SIZE_MARKER,
+        CommitSource::Catalog => CATALOG_SIZE_MARKER,
+    };
+
+    let location = FileMeta {
+        location: url,
+        last_modified: 0,
+        size,
+    };
+
+    ParsedLogPath {
+        location,
+        filename,
+        extension,
+        version,
+        file_type,
+    }
+}
+
+fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
+    let expected_size = match expected_source {
+        CommitSource::Filesystem => FILESYSTEM_SIZE_MARKER,
+        CommitSource::Catalog => CATALOG_SIZE_MARKER,
+    };
+    assert_eq!(
+        commit.location.size, expected_size,
+        "Commit version {} should be from {:?}, but size was {}",
+        commit.version, expected_source, commit.location.size
+    );
+}
+
+/// A [`StorageHandler`] wrapper that counts the number of `list_from` calls and the number of
+/// items consumed from the returned iterators. Used to verify that
+/// `list_with_backward_checkpoint_scan` issues the expected number of storage listing requests,
+/// and that listing terminates without consuming files past the version-named region.
+struct CountingStorageHandler {
+    inner: Arc<dyn StorageHandler>,
+    list_from_count: AtomicU32,
+    items_listed: Arc<AtomicU32>,
+}
+
+impl CountingStorageHandler {
+    fn new(inner: Arc<dyn StorageHandler>) -> Self {
+        Self {
+            inner,
+            list_from_count: AtomicU32::new(0),
+            items_listed: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn call_count(&self) -> u32 {
+        self.list_from_count.load(Ordering::Relaxed)
+    }
+
+    fn items_listed(&self) -> u32 {
+        self.items_listed.load(Ordering::Relaxed)
+    }
+}
+
+impl StorageHandler for CountingStorageHandler {
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        self.list_from_count.fetch_add(1, Ordering::Relaxed);
+        let items_listed = self.items_listed.clone();
+        let iter = self.inner.list_from(path)?;
+        Ok(Box::new(iter.inspect(move |_| {
+            items_listed.fetch_add(1, Ordering::Relaxed);
+        })))
+    }
+
+    fn read_files(
+        &self,
+        _files: Vec<crate::FileSlice>,
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+        panic!("read_files should not be called during listing");
+    }
+
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        panic!("put should not be called during listing");
+    }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        panic!("copy_atomic should not be called during listing");
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+        panic!("head should not be called during listing");
+    }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during listing");
+    }
+}
+
+/// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
+/// Returns (ascending_commit_files, ascending_compaction_files, checkpoint_parts,
+///          latest_crc_file, latest_commit_file, max_published_version).
+#[allow(clippy::type_complexity)]
+fn list_and_destructure(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
+    start_version: Option<Version>,
+    end_version: Option<Version>,
+) -> (
+    Vec<ParsedLogPath>,
+    Vec<ParsedLogPath>,
+    Vec<ParsedLogPath>,
+    Option<ParsedLogPath>,
+    Option<ParsedLogPath>,
+    Option<Version>,
+) {
+    let r = LogSegmentFiles::list(
+        storage,
+        log_root,
+        log_tail,
+        start_version,
+        end_version,
+        None,
+    )
+    .unwrap();
+    (
+        r.ascending_commit_files,
+        r.ascending_compaction_files,
+        r.checkpoint_parts,
+        r.latest_crc_file,
+        r.latest_commit_file,
+        r.max_published_version,
+    )
+}
+
+// ===== list() tests =====
+
+#[tokio::test]
+async fn test_empty_log_tail() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+    ];
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], Some(1), Some(2));
+
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].version, 1);
+    assert_eq!(commits[1].version, 2);
+    assert_source(&commits[0], CommitSource::Filesystem);
+    assert_source(&commits[1], CommitSource::Filesystem);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    assert_eq!(max_pub, Some(2));
+}
+
+#[tokio::test]
+async fn test_log_tail_has_latest_commit_files() {
+    // Filesystem has commits 0-2, log_tail has commits 3-5 (the latest)
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+    ];
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let log_tail = vec![
+        make_parsed_log_path_with_source(3, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(4, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(5, LogPathFileType::Commit, CommitSource::Catalog),
+    ];
+
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), Some(5));
+
+    assert_eq!(commits.len(), 6);
+    // filesystem commits 0-2
+    for (i, commit) in commits.iter().enumerate().take(3) {
+        assert_eq!(commit.version, i as u64);
+        assert_source(commit, CommitSource::Filesystem);
+    }
+    // catalog commits 3-5
+    for (i, commit) in commits.iter().enumerate().skip(3) {
+        assert_eq!(commit.version, i as u64);
+        assert_source(commit, CommitSource::Catalog);
+    }
+    assert_eq!(latest_commit.unwrap().version, 5);
+    assert_eq!(max_pub, Some(5));
+}
+
+#[tokio::test]
+async fn test_request_subset_with_log_tail() {
+    // Test requesting a subset when log_tail is the latest commits
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+    ];
+    let (storage, log_root) = create_storage(log_files).await;
+
+    // log_tail represents versions 2-4 (latest commits)
+    let log_tail = vec![
+        make_parsed_log_path_with_source(2, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(3, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(4, LogPathFileType::Commit, CommitSource::Catalog),
+    ];
+
+    // list for only versions 1-3
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(1), Some(3));
+
+    assert_eq!(commits.len(), 3);
+    assert_eq!(commits[0].version, 1);
+    assert_eq!(commits[1].version, 2);
+    assert_eq!(commits[2].version, 3);
+    assert_source(&commits[0], CommitSource::Filesystem);
+    assert_source(&commits[1], CommitSource::Catalog);
+    assert_source(&commits[2], CommitSource::Catalog);
+    assert_eq!(latest_commit.unwrap().version, 3);
+    assert_eq!(max_pub, Some(3));
+}
+
+#[tokio::test]
+async fn test_log_tail_defines_latest_version() {
+    // log_tail defines the latest version of the table: if there is file system files after log
+    // tail, they are ignored. But we still list all filesystem files to track
+    // max_published_version.
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
+    ];
+    let (storage, log_root) = create_storage(log_files).await;
+
+    // log_tail is just [1], indicating version 1 is the latest
+    let log_tail = vec![make_parsed_log_path_with_source(
+        1,
+        LogPathFileType::Commit,
+        CommitSource::Catalog,
+    )];
+
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), None);
+
+    // expect only 0 from file system and 1 from log tail
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].version, 0);
+    assert_eq!(commits[1].version, 1);
+    assert_source(&commits[0], CommitSource::Filesystem);
+    assert_source(&commits[1], CommitSource::Catalog);
+    assert_eq!(latest_commit.unwrap().version, 1);
+    // max_published_version should reflect the highest published commit on filesystem
+    assert_eq!(max_pub, Some(2));
+}
+
+#[test]
+fn test_log_tail_covers_entire_range_empty_filesystem() {
+    // Test-only storage handler that returns an empty listing.
+    // When the log_tail covers the entire commit range, we still call list_from
+    // (to pick up non-commit files like CRC/checkpoints), but the filesystem may
+    // have nothing — e.g. a purely catalog-managed table.
+    struct EmptyStorageHandler;
+    impl StorageHandler for EmptyStorageHandler {
+        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn read_files(
+            &self,
+            _files: Vec<crate::FileSlice>,
+        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+            panic!("read_files should not be called during listing");
+        }
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+            panic!("put should not be called during listing");
+        }
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+            panic!("copy_atomic should not be called during listing");
+        }
+        fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+            panic!("head should not be called during listing");
+        }
+        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+            panic!("delete should not be called during listing");
+        }
+    }
+
+    // log_tail covers versions 0-2, the entire range
+    let log_tail = vec![
+        make_parsed_log_path_with_source(0, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(1, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(2, LogPathFileType::StagedCommit, CommitSource::Catalog),
+    ];
+
+    let storage = EmptyStorageHandler;
+    let url = Url::parse("memory:///anything/_delta_log/").unwrap();
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(&storage, &url, log_tail, Some(0), Some(2));
+
+    // Only log_tail commits should appear (filesystem is empty)
+    assert_eq!(commits.len(), 3);
+    assert_eq!(commits[0].version, 0);
+    assert_eq!(commits[1].version, 1);
+    assert_eq!(commits[2].version, 2);
+    assert_source(&commits[0], CommitSource::Catalog);
+    assert_source(&commits[1], CommitSource::Catalog);
+    assert_source(&commits[2], CommitSource::Catalog);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    // Only published (non-staged) commits from log_tail count for max_published_version
+    assert_eq!(max_pub, Some(1));
+}
+
+#[tokio::test]
+async fn test_log_tail_covers_entire_range_with_crc() {
+    // When log_tail covers the entire requested range (starts at version 0), commit files
+    // from the filesystem should be excluded (log_tail is authoritative for commits), but
+    // non-commit files (CRC, checkpoints) should still be picked up from the filesystem.
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Crc, CommitSource::Filesystem),
+    ];
+    let (storage, log_root) = create_storage(log_files).await;
+
+    // log_tail covers versions 0-2, which includes the entire range we'll request
+    let log_tail = vec![
+        make_parsed_log_path_with_source(0, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(1, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(2, LogPathFileType::StagedCommit, CommitSource::Catalog),
+    ];
+
+    let (commits, _, _, latest_crc, latest_commit, max_pub) =
+        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), Some(2));
+
+    // 3 commits from log_tail: 0, 1, 2
+    assert_eq!(commits.len(), 3);
+    assert_source(&commits[0], CommitSource::Catalog);
+    assert_source(&commits[1], CommitSource::Catalog);
+    assert_source(&commits[2], CommitSource::Catalog);
+
+    // CRC at version 2 from filesystem is preserved
+    let crc = latest_crc.unwrap();
+    assert_eq!(crc.version, 2);
+    assert!(matches!(crc.file_type, LogPathFileType::Crc));
+
+    assert_eq!(latest_commit.unwrap().version, 2);
+    // Only published commits count: filesystem 0,1 (skipped but tracked) + log_tail 0,1
+    assert_eq!(max_pub, Some(1));
+}
+
+#[tokio::test]
+async fn test_listing_omits_staged_commits() {
+    // note that in the presence of staged commits, we CANNOT trust listing to determine which
+    // to include in our listing/log segment. This is up to the catalog. (e.g. version
+    // 5.uuid1.json and 5.uuid2.json can both exist and only catalog can say which is the 'real'
+    // version 5).
+
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
+        (1, LogPathFileType::StagedCommit, CommitSource::Filesystem),
+        (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
+    ];
+
+    let (storage, log_root) = create_storage(log_files).await;
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    // we must only see two regular commits
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].version, 0);
+    assert_eq!(commits[1].version, 1);
+    assert_source(&commits[0], CommitSource::Filesystem);
+    assert_source(&commits[1], CommitSource::Filesystem);
+    assert_eq!(latest_commit.unwrap().version, 1);
+    assert_eq!(max_pub, Some(1));
+}
+
+#[tokio::test]
+async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() {
+    let mut log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+    ];
+    // Staged commits sort after every version-named file ('_' > '9'), so a sorted listing
+    // reaches them only after all relevant files. None should be consumed beyond the first.
+    log_files
+        .extend((0..100).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
+
+    let (storage, log_root) = create_storage(log_files).await;
+    let storage = CountingStorageHandler::new(storage);
+
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(&storage, &log_root, vec![], None, None);
+
+    assert_eq!(commits.len(), 3);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    assert_eq!(max_pub, Some(2));
+    // 3 commits plus the single staged commit that stops the listing
+    assert_eq!(storage.items_listed(), 4);
+}
+
+// Any path past the version-named region stops the listing, not just `_staged_commits/`:
+// checkpoint sidecars under `_sidecars/` and non-underscore names whose first byte sorts
+// past '9' (e.g. 'Z'). Both sentinels sort before `_staged_commits/`, so no staged commit
+// is ever consumed.
+#[rstest]
+#[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet")]
+#[case::non_underscore_sentinel("_delta_log/Zsentinel")]
+#[tokio::test]
+async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_path: &str) {
+    let mut log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+    ];
+    log_files.extend((0..50).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
+
+    let (storage, log_root) = create_storage_with_raw_paths(log_files, &[sentinel_path]).await;
+    let storage = CountingStorageHandler::new(storage);
+
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(&storage, &log_root, vec![], None, None);
+
+    assert_eq!(commits.len(), 3);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    assert_eq!(max_pub, Some(2));
+    // 3 commits plus the sentinel that stops the listing
+    assert_eq!(storage.items_listed(), 4);
+}
+
+#[tokio::test]
+async fn test_listing_stops_at_last_checkpoint_marker() {
+    // In a real table `_last_checkpoint` sorts before `_staged_commits/` ('_la' < '_st'), so
+    // it is the path that stops the listing.
+    let mut log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            2,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ),
+        (2, LogPathFileType::Crc, CommitSource::Filesystem),
+    ];
+    log_files.extend((0..50).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
+
+    let (storage, log_root) =
+        create_storage_with_raw_paths(log_files, &["_delta_log/_last_checkpoint"]).await;
+    let storage = CountingStorageHandler::new(storage);
+
+    let (commits, _, checkpoint_parts, latest_crc, latest_commit, max_pub) =
+        list_and_destructure(&storage, &log_root, vec![], None, None);
+
+    // The checkpoint at version 2 subsumes all commits; only latest_commit_file is retained
+    assert!(commits.is_empty());
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 2);
+    assert_eq!(latest_crc.unwrap().version, 2);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    assert_eq!(max_pub, Some(2));
+    // 5 version-named files plus the `_last_checkpoint` that stops the listing; no staged
+    // commit is ever consumed
+    assert_eq!(storage.items_listed(), 6);
+}
+
+#[tokio::test]
+async fn test_listing_with_large_end_version() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
+        (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
+    ];
+
+    let (storage, log_root) = create_storage(log_files).await;
+    // note we let you request end version past the end of log. up to consumer to interpret
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, Some(3));
+
+    // we must only see two regular commits
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].version, 0);
+    assert_eq!(commits[1].version, 1);
+    assert_eq!(latest_commit.unwrap().version, 1);
+    assert_eq!(max_pub, Some(1));
+}
+
+#[tokio::test]
+async fn test_non_commit_files_at_log_tail_versions_are_preserved() {
+    // Filesystem has commits 0-5, a checkpoint at version 7, and a CRC at version 8.
+    // Log tail provides commits 6-10. The checkpoint and CRC are on the filesystem
+    // at versions covered by the log_tail and must NOT be filtered out.
+    //
+    // After processing through ListingAccumulator, the checkpoint at version 7
+    // causes commits before it to be cleared, keeping only commits after the checkpoint.
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        (3, LogPathFileType::Commit, CommitSource::Filesystem),
+        (4, LogPathFileType::Commit, CommitSource::Filesystem),
+        (5, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            7,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ),
+        (8, LogPathFileType::Crc, CommitSource::Filesystem),
+    ];
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let log_tail = vec![
+        make_parsed_log_path_with_source(6, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(7, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(8, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(9, LogPathFileType::Commit, CommitSource::Catalog),
+        make_parsed_log_path_with_source(10, LogPathFileType::Commit, CommitSource::Catalog),
+    ];
+
+    let (commits, _, checkpoint_parts, latest_crc, latest_commit, max_pub) =
+        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), Some(10));
+
+    // Checkpoint at version 7 is preserved from filesystem
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 7);
+    assert!(checkpoint_parts[0].is_checkpoint());
+
+    // CRC at version 8 is preserved from filesystem
+    let crc = latest_crc.unwrap();
+    assert_eq!(crc.version, 8);
+    assert!(matches!(crc.file_type, LogPathFileType::Crc));
+
+    // After checkpoint processing: commits before checkpoint are cleared,
+    // only log_tail commits 6-10 remain (added after checkpoint flush)
+    assert_eq!(commits.len(), 5);
+    for (i, commit) in commits.iter().enumerate() {
+        assert_eq!(commit.version, (i + 6) as u64);
+        assert_source(commit, CommitSource::Catalog);
+    }
+    assert_eq!(latest_commit.unwrap().version, 10);
+
+    // max_published_version reflects all published commits seen (filesystem 0-5 + log_tail 6-10)
+    assert_eq!(max_pub, Some(10));
+}
+
+// ===== list_with_backward_checkpoint_scan() tests =====
+
+// Log from v0 to v1005. Each case places an optional single-part checkpoint and
+// verifies the expected commits, checkpoint version, and number of storage listings.
+//
+// Window boundaries (window size=1000, end_version=1005, exclusive upper):
+//   Window 1: [6, 1006)  covers v6..=v1005
+//   Window 2: [0, 6)     covers v0..=v5
+//
+// A checkpoint at v6+ is found in window 1 (1 listing); at v5 or lower in window 2
+// (2 listings). A checkpoint beyond end_version is never seen.
+#[rstest]
+// No checkpoint: scan exhausts both windows, all 1006 commits returned
+#[case::no_checkpoint(None, 0..=1005, None, 2)]
+// Checkpoint beyond end_version is never seen; same behavior as no checkpoint
+#[case::checkpoint_beyond_end(Some(1006), 0..=1005, None, 2)]
+// Checkpoint at end_version: found in window 1, no commits after it
+#[case::checkpoint_at_end(Some(1005), 0..0, Some(1005), 1)]
+// Checkpoint at v5: falls in window 2 -> 2 listings; commits 6..=1005 returned.
+// Tests the inclusive window boundary: window 1 covers [6, 1006) or [6, 1005] (lower = 1006 - 1000
+// = 6), so v5 falls just outside it and requires a second listing, while v6 (next case) does not.
+#[case::checkpoint_in_second_window(Some(5), 6..=1005, Some(5), 2)]
+// Checkpoint at v6: falls in window 1 -> 1 listing; commits 7..=1005 returned
+#[case::checkpoint_in_first_window(Some(6), 7..=1005, Some(6), 1)]
+#[tokio::test]
+async fn backward_scan_single_checkpoint_cases(
+    #[case] checkpoint_version: Option<u64>,
+    #[case] expected_commits: impl Iterator<Item = u64>,
+    #[case] expected_checkpoint: Option<u64>,
+    #[case] expected_listings: u32,
+) {
+    let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=1005)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+
+    if let Some(cp) = checkpoint_version {
+        log_files.push((
+            cp,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ));
+    }
+
+    let (storage, log_root) = create_storage(log_files).await;
+    let counter = CountingStorageHandler::new(storage);
+
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(counter.call_count(), expected_listings);
+
+    assert_eq!(
+        result.checkpoint_parts.len(),
+        if expected_checkpoint.is_some() { 1 } else { 0 }
+    );
+    if let Some(cp_version) = expected_checkpoint {
+        assert_eq!(result.checkpoint_parts[0].version, cp_version);
+    }
+
+    assert!(result
+        .ascending_commit_files
+        .iter()
+        .map(|f| f.version)
+        .eq(expected_commits));
+}
+
+/// end_version=3000. Window 2 contains an incomplete 2-of-2 multipart checkpoint (only
+/// part 1 present). find_complete_checkpoint_version must return None for window 2, causing
+/// the scan to continue to window 3, where a complete single-part checkpoint at v500 is
+/// found. Verifies that incomplete parts from window 2 are discarded and do not pollute
+/// the result's checkpoint_parts.
+///
+/// Window 1 [2001, 3001): commits v2001..=v3000, no checkpoint -> continue
+/// Window 2 [1001, 2001): commits v1001..=v2000, v1500 (1-of-2 parts) incomplete -> continue
+/// Window 3 [1, 1001):    commits v1..=v1000, v500 (complete) -> checkpoint found -> break
+fn files_incomplete_in_second_window_complete_in_third_window(
+) -> Vec<(Version, LogPathFileType, CommitSource)> {
+    let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=3000)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    log_files.push((
+        500,
+        LogPathFileType::ClassicCheckpoint,
+        CommitSource::Filesystem,
+    ));
+    log_files.push((
+        1500,
+        LogPathFileType::MultiPartCheckpoint {
+            part_num: 1,
+            num_parts: 2,
+        },
+        CommitSource::Filesystem,
+    ));
+    log_files
+}
+fn multipart_checkpoint_files() -> Vec<(Version, LogPathFileType, CommitSource)> {
+    // Log v0..=v52 with a complete 3-part checkpoint at v50.
+    // Single window [0, 53): checkpoint found -> stop.
+    let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=52)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    log_files.extend([
+        (
+            50,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num: 1,
+                num_parts: 3,
+            },
+            CommitSource::Filesystem,
+        ),
+        (
+            50,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num: 2,
+                num_parts: 3,
+            },
+            CommitSource::Filesystem,
+        ),
+        (
+            50,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num: 3,
+                num_parts: 3,
+            },
+            CommitSource::Filesystem,
+        ),
+    ]);
+    log_files
+}
+
+struct BackwardScanExpected {
+    listings: u32,
+    checkpoint_parts: usize,
+    checkpoint_version: Version,
+    commit_count: usize,
+    first_commit: Version,
+    last_commit: Version,
+}
+
+// Case 1: complete 3-part checkpoint at v50, single window needed
+// Case 2: incomplete 1-of-2 part at v1500 in window 2, complete checkpoint at v500 in window 3
+#[rstest]
+#[case::multipart_checkpoint(
+        multipart_checkpoint_files(),
+        52,
+        BackwardScanExpected { listings: 1, checkpoint_parts: 3, checkpoint_version: 50, commit_count: 2, first_commit: 51, last_commit: 52 }
+    )]
+#[case::incomplete_in_second_window_complete_in_third(
+        files_incomplete_in_second_window_complete_in_third_window(),
+        3000,
+        BackwardScanExpected { listings: 3, checkpoint_parts: 1, checkpoint_version: 500, commit_count: 2500, first_commit: 501, last_commit: 3000 }
+    )]
+#[tokio::test]
+async fn backward_scan_multipart_checkpoint_cases(
+    #[case] log_files: Vec<(Version, LogPathFileType, CommitSource)>,
+    #[case] end_version: Version,
+    #[case] expected: BackwardScanExpected,
+) {
+    let BackwardScanExpected {
+        listings: expected_listings,
+        checkpoint_parts: expected_checkpoint_parts,
+        checkpoint_version: expected_checkpoint_version,
+        commit_count: expected_commit_count,
+        first_commit: expected_first_commit,
+        last_commit: expected_last_commit,
+    } = expected;
+    let (storage, log_root) = create_storage(log_files).await;
+    let counter = CountingStorageHandler::new(storage);
+
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        end_version,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(counter.call_count(), expected_listings);
+    assert_eq!(result.checkpoint_parts.len(), expected_checkpoint_parts);
+    assert!(result
+        .checkpoint_parts
+        .iter()
+        .all(|p| p.version == expected_checkpoint_version));
+    assert_eq!(result.ascending_commit_files.len(), expected_commit_count);
+    assert_eq!(
+        result.ascending_commit_files.first().unwrap().version,
+        expected_first_commit
+    );
+    assert_eq!(
+        result.ascending_commit_files.last().unwrap().version,
+        expected_last_commit
+    );
+    assert_eq!(
+        result.latest_commit_file.unwrap().version,
+        expected_last_commit
+    );
+}
+
+#[tokio::test]
+async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
+    // FS: commits v0..=v7 + checkpoint at v5. log_tail: catalog commits v8..=v10.
+    // The checkpoint at v5 sets the lower bound to v6, so FS commits v6 and v7 plus all
+    // catalog entries v8..=v10 are included.
+    let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=7)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    log_files.push((
+        5,
+        LogPathFileType::ClassicCheckpoint,
+        CommitSource::Filesystem,
+    ));
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let log_tail: Vec<_> = (8u64..=10)
+        .map(|v| {
+            make_parsed_log_path_with_source(v, LogPathFileType::Commit, CommitSource::Catalog)
+        })
+        .collect();
+
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        storage.as_ref(),
+        &log_root,
+        log_tail,
+        10,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(result.checkpoint_parts.len(), 1);
+    assert_eq!(result.checkpoint_parts[0].version, 5);
+
+    // FS commits v6, v7 after the checkpoint; catalog commits v8..=v10
+    let expected = [
+        (6, CommitSource::Filesystem),
+        (7, CommitSource::Filesystem),
+        (8, CommitSource::Catalog),
+        (9, CommitSource::Catalog),
+        (10, CommitSource::Catalog),
+    ];
+    assert_eq!(result.ascending_commit_files.len(), expected.len());
+    for (file, (version, source)) in result.ascending_commit_files.iter().zip(expected) {
+        assert_eq!(file.version, version);
+        assert_source(file, source);
+    }
+    assert_eq!(result.latest_commit_file.unwrap().version, 10);
+}
+
+#[tokio::test]
+async fn backward_scan_with_log_tail_starting_before_checkpoint() {
+    // FS: commits v0..=v5 + checkpoint at v5 + CRC at v6. log_tail: catalog commits v3..=v8,
+    // starting before the checkpoint. The checkpoint at v5 sets the lower bound to v5, so
+    // log_tail v3..=v4 are excluded. The log_tail commit at v5 passes through (it is at the
+    // checkpoint version). The CRC at v6 is preserved even though v6 is within the log_tail range.
+    let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=5)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    log_files.push((
+        5,
+        LogPathFileType::ClassicCheckpoint,
+        CommitSource::Filesystem,
+    ));
+    log_files.push((6, LogPathFileType::Crc, CommitSource::Filesystem));
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let log_tail: Vec<_> = (3u64..=8)
+        .map(|v| {
+            make_parsed_log_path_with_source(v, LogPathFileType::Commit, CommitSource::Catalog)
+        })
+        .collect();
+
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        storage.as_ref(),
+        &log_root,
+        log_tail,
+        8,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(result.checkpoint_parts.len(), 1);
+    assert_eq!(result.checkpoint_parts[0].version, 5);
+
+    // CRC at v6 is preserved even though v6 is within the log_tail range
+    let crc = result.latest_crc_file.unwrap();
+    assert_eq!(crc.version, 6);
+    assert!(matches!(crc.file_type, LogPathFileType::Crc));
+
+    // v5 passes the start version filter (>= 5) and is included here
+    assert_eq!(result.ascending_commit_files.len(), 4);
+    for (i, commit) in result.ascending_commit_files.iter().enumerate() {
+        assert_eq!(commit.version, (i + 5) as u64);
+        assert_source(commit, CommitSource::Catalog);
+    }
+    assert_eq!(result.latest_commit_file.unwrap().version, 8);
+}
+
+#[tokio::test]
+async fn backward_scan_log_tail_defines_latest_version() {
+    // FS: commits v0..=v5. log_tail: catalog commit v4. end_version=5.
+    // FS v4 and v5 are filtered since log_tail_start=4. max_published_version is Some(5),
+    // the highest FS commit seen within end_version, even though v5 is not in
+    // ascending_commit_files.
+    let log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=5)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let log_tail = vec![make_parsed_log_path_with_source(
+        4,
+        LogPathFileType::Commit,
+        CommitSource::Catalog,
+    )];
+
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        storage.as_ref(),
+        &log_root,
+        log_tail,
+        5,
+        None,
+    )
+    .unwrap();
+
+    let expected = [
+        (0, CommitSource::Filesystem),
+        (1, CommitSource::Filesystem),
+        (2, CommitSource::Filesystem),
+        (3, CommitSource::Filesystem),
+        (4, CommitSource::Catalog),
+    ];
+    assert_eq!(result.ascending_commit_files.len(), expected.len());
+    for (file, (version, source)) in result.ascending_commit_files.iter().zip(expected) {
+        assert_eq!(file.version, version);
+        assert_source(file, source);
+    }
+    assert_eq!(result.latest_commit_file.unwrap().version, 4);
+    assert_eq!(result.max_published_version, Some(5));
+}
+
+// ===== empty (0-byte) log file detection tests =====
+
+/// Creates storage where some files can be empty (0 bytes). Each entry is
+/// (version, file_type, is_empty). Non-empty files get placeholder content.
+async fn create_storage_with_empty_files(
+    log_files: Vec<(Version, LogPathFileType, bool)>,
+) -> (Arc<dyn StorageHandler>, Url) {
+    let store = Arc::new(InMemory::new());
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+
+    for (version, file_type, is_empty) in log_files {
+        let path = log_path_for_file_type(version, &file_type);
+        let data = if is_empty {
+            bytes::Bytes::new()
+        } else {
+            bytes::Bytes::from("placeholder")
+        };
+        store
+            .put(&ObjectPath::from(path.as_str()), data.into())
+            .await
+            .expect("Failed to put test file");
+    }
+
+    let engine = SyncEngine::new_with_store(store);
+    (engine.storage_handler(), log_root)
+}
+
+// v2.json is 0 bytes -> kept in listing (commits are source of truth, not skipped)
+#[tokio::test]
+async fn test_zero_byte_commit_kept_in_listing() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, true), // empty but still listed
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
+    assert_eq!(result.ascending_commit_files.len(), 3);
+    assert_eq!(result.ascending_commit_files[0].version, 0);
+    assert_eq!(result.ascending_commit_files[1].version, 1);
+    assert_eq!(result.ascending_commit_files[2].version, 2);
+    assert_eq!(result.ascending_commit_files[2].location.size, 0);
+}
+
+// 0.4.compacted.json is 0 bytes -> skipped, individual commits v0-v4 used instead
+#[rstest]
+#[case::forward_list(false)]
+#[case::backward_scan(true)]
+#[tokio::test]
+async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_scan: bool) {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, false),
+        (3, LogPathFileType::Commit, false),
+        (4, LogPathFileType::Commit, false),
+        (
+            0,
+            LogPathFileType::CompactedCommit { hi: 4 },
+            true, // empty compaction
+        ),
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result = if use_backward_scan {
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            4,
+            None,
+        )
+        .unwrap()
+    } else {
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4), None).unwrap()
+    };
+
+    assert!(
+        result.ascending_compaction_files.is_empty(),
+        "0-byte compaction should have been skipped"
+    );
+    assert_eq!(result.ascending_commit_files.len(), 5);
+    for (i, commit) in result.ascending_commit_files.iter().enumerate() {
+        assert_eq!(commit.version, i as u64);
+    }
+}
+
+// v10.checkpoint.parquet is 0 bytes -> skipped, falls back to valid checkpoint at v5
+#[rstest]
+#[case::forward_list(false)]
+#[case::backward_scan(true)]
+#[tokio::test]
+async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan: bool) {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, false),
+        (3, LogPathFileType::Commit, false),
+        (4, LogPathFileType::Commit, false),
+        (5, LogPathFileType::Commit, false),
+        (6, LogPathFileType::Commit, false),
+        (7, LogPathFileType::Commit, false),
+        (8, LogPathFileType::Commit, false),
+        (9, LogPathFileType::Commit, false),
+        (10, LogPathFileType::Commit, false),
+        (5, LogPathFileType::ClassicCheckpoint, false), // valid checkpoint
+        (10, LogPathFileType::ClassicCheckpoint, true), // empty checkpoint
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result = if use_backward_scan {
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            10,
+            None,
+        )
+        .unwrap()
+    } else {
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10), None).unwrap()
+    };
+
+    // Should fall back to checkpoint at v5 (the empty v10 checkpoint is skipped)
+    assert_eq!(result.checkpoint_parts.len(), 1);
+    assert_eq!(result.checkpoint_parts[0].version, 5);
+
+    // Commits after checkpoint v5: v6 through v10
+    assert_eq!(result.ascending_commit_files.len(), 5);
+    assert_eq!(result.ascending_commit_files[0].version, 6);
+    assert_eq!(result.ascending_commit_files[4].version, 10);
+}
+
+// v2.crc is 0 bytes -> kept (CRC is optional, may report size 0 on some platforms)
+#[tokio::test]
+async fn test_zero_byte_crc_kept() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Crc, false), // valid CRC
+        (2, LogPathFileType::Crc, true),  // empty CRC, still kept
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
+
+    // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
+    let crc = result.latest_crc_file.unwrap();
+    assert_eq!(crc.version, 2);
+}
+
+// v1005.checkpoint.parquet is 0 bytes in window 1 -> scan continues to window 2,
+// finds valid checkpoint at v5. Verifies the fix in find_complete_checkpoint_version.
+#[tokio::test]
+async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
+    // Commits v0..=1005, valid checkpoint at v5, 0-byte checkpoint at v1005.
+    // Window 1 [6, 1006): sees 0-byte checkpoint at v1005, must NOT stop.
+    // Window 2 [0, 6): finds valid checkpoint at v5 -> stop.
+    let mut log_files: Vec<(Version, LogPathFileType, bool)> = (0u64..=1005)
+        .map(|v| (v, LogPathFileType::Commit, false))
+        .collect();
+    log_files.push((5, LogPathFileType::ClassicCheckpoint, false));
+    log_files.push((1005, LogPathFileType::ClassicCheckpoint, true));
+
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+    let counter = CountingStorageHandler::new(storage);
+
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        None,
+    )
+    .unwrap();
+
+    // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
+    assert_eq!(counter.call_count(), 2);
+    assert_eq!(result.checkpoint_parts.len(), 1);
+    assert_eq!(result.checkpoint_parts[0].version, 5);
+    // Commits after checkpoint v5: v6 through v1005
+    assert_eq!(result.ascending_commit_files.len(), 1000);
+    assert_eq!(result.ascending_commit_files[0].version, 6);
+    assert_eq!(result.ascending_commit_files[999].version, 1005);
+}
+
+// 0-byte commit in list_commits -> kept (commits are source of truth, not skipped)
+#[tokio::test]
+async fn test_list_commits_zero_byte_commit_kept() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, true), // empty but still listed
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result =
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None)
+            .unwrap();
+    assert_eq!(result.ascending_commit_files.len(), 3);
+    assert_eq!(result.ascending_commit_files[2].version, 2);
+    assert_eq!(result.ascending_commit_files[2].location.size, 0);
+}
+
+/// `list_commits` merges a caller-provided `log_tail` over the filesystem listing: the log_tail
+/// supersedes filesystem commits at overlapping versions and is clipped to `[start, end]`, while
+/// the published watermark counts only filesystem (published) commits.
+#[rstest]
+// log_tail supersedes filesystem at overlapping versions; filesystem commits still set the
+// watermark.
+#[case::supersedes_filesystem(
+    &[0, 1, 2],
+    &[1, 2],
+    Some(0), Some(2),
+    &[(0, CommitSource::Filesystem), (1, CommitSource::Catalog), (2, CommitSource::Catalog)],
+    Some(2),
+)]
+// staged tail extends the prefix but does not move the published watermark.
+#[case::staged_tail_keeps_watermark(
+    &[0],
+    &[1, 2],
+    Some(0), Some(2),
+    &[(0, CommitSource::Filesystem), (1, CommitSource::Catalog), (2, CommitSource::Catalog)],
+    Some(0),
+)]
+// log_tail entries below `start` are dropped (filesystem v3 superseded by the tail).
+#[case::drops_tail_below_start(
+    &[3],
+    &[2, 3, 4],
+    Some(3), Some(4),
+    &[(3, CommitSource::Catalog), (4, CommitSource::Catalog)],
+    Some(3),
+)]
+// log_tail entries above `end` are dropped.
+#[case::drops_tail_above_end(
+    &[3],
+    &[2, 3, 4],
+    Some(3), Some(3),
+    &[(3, CommitSource::Catalog)],
+    Some(3),
+)]
+#[tokio::test]
+async fn list_commits_merges_log_tail(
+    #[case] filesystem_commits: &[Version],
+    #[case] staged: &[Version],
+    #[case] start: Option<Version>,
+    #[case] end: Option<Version>,
+    #[case] expected: &[(Version, CommitSource)],
+    #[case] expected_max_published: Option<Version>,
+) {
+    let (storage, log_root) = create_storage(
+        filesystem_commits
+            .iter()
+            .map(|v| (*v, LogPathFileType::Commit, CommitSource::Filesystem))
+            .collect(),
+    )
+    .await;
+    let log_tail: Vec<ParsedLogPath> = staged
+        .iter()
+        .map(|v| {
+            make_parsed_log_path_with_source(
+                *v,
+                LogPathFileType::StagedCommit,
+                CommitSource::Catalog,
+            )
+        })
+        .collect();
+
+    let result =
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end, None)
+            .unwrap();
+
+    let commits = &result.ascending_commit_files;
+    assert_eq!(commits.len(), expected.len());
+    for (commit, (version, source)) in commits.iter().zip(expected) {
+        assert_eq!(commit.version, *version);
+        assert_source(commit, *source);
+    }
+    assert_eq!(result.max_published_version, expected_max_published);
+    if let Some((last_version, _)) = expected.last() {
+        assert_eq!(result.latest_commit_file.unwrap().version, *last_version);
+    }
+}
+
+#[tokio::test]
+async fn test_list_commits_keeps_commits_across_checkpoint() {
+    let mut files: Vec<_> = (0..=5)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    files.push((
+        3,
+        LogPathFileType::ClassicCheckpoint,
+        CommitSource::Filesystem,
+    ));
+    let (storage, log_root) = create_storage(files).await;
+
+    let result =
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5), None)
+            .unwrap();
+    let versions: Vec<_> = result
+        .ascending_commit_files
+        .iter()
+        .map(|c| c.version)
+        .collect();
+    assert_eq!(versions, vec![0, 1, 2, 3, 4, 5]);
+}
+
+// ---------------------------------------------------------------------------
+// find_complete_checkpoint_version direct unit tests
+// (other cases already covered by tests above)
+// ---------------------------------------------------------------------------
+
+fn incomplete_then_complete_files() -> Vec<ParsedLogPath> {
+    // Commits v0..=10, an incomplete checkpoint at v5 (1 of 3 parts), and a complete
+    // checkpoint at v10. find_complete_checkpoint_version must continue past the failed group
+    // and find the complete one.
+    let mut files: Vec<ParsedLogPath> = (0..=10)
+        .map(|v| {
+            make_parsed_log_path_with_source(v, LogPathFileType::Commit, CommitSource::Filesystem)
+        })
+        .collect();
+    files.push(make_parsed_log_path_with_source(
+        5,
+        LogPathFileType::MultiPartCheckpoint {
+            part_num: 1,
+            num_parts: 3,
+        },
+        CommitSource::Filesystem,
+    ));
+    files.push(make_parsed_log_path_with_source(
+        10,
+        LogPathFileType::ClassicCheckpoint,
+        CommitSource::Filesystem,
+    ));
+    files
+}
+
+fn two_complete_checkpoints_files() -> Vec<ParsedLogPath> {
+    // Commits v0..=10, complete checkpoint at v5 and complete checkpoint at v10.
+    // The function must return the latest (v10), not the first (v5).
+    let mut files: Vec<ParsedLogPath> = (0..=10)
+        .map(|v| {
+            make_parsed_log_path_with_source(v, LogPathFileType::Commit, CommitSource::Filesystem)
+        })
+        .collect();
+    files.push(make_parsed_log_path_with_source(
+        5,
+        LogPathFileType::ClassicCheckpoint,
+        CommitSource::Filesystem,
+    ));
+    files.push(make_parsed_log_path_with_source(
+        10,
+        LogPathFileType::ClassicCheckpoint,
+        CommitSource::Filesystem,
+    ));
+    files
+}
+
+#[rstest]
+// Commits v0..=5, no checkpoint files
+#[case::no_checkpoint(
+        (0u64..=5).map(|v| make_parsed_log_path_with_source(v, LogPathFileType::Commit, CommitSource::Filesystem)).collect(),
+        None
+    )]
+// Commits v0..=10, incomplete checkpoint at v5, complete checkpoint at v10
+#[case::incomplete_then_complete(incomplete_then_complete_files(), Some(10))]
+// Commits v0..=10, complete checkpoint at v5 and v10: must return v10 (latest)
+#[case::two_complete(two_complete_checkpoints_files(), Some(10))]
+fn find_complete_checkpoint_version_cases(
+    #[case] files: Vec<ParsedLogPath>,
+    #[case] expected: Option<u64>,
+) {
+    assert_eq!(find_complete_checkpoint_version(&files), expected);
+}
+
+/// [`crate::path::tests::parse_log_path`] stamped with this module's filesystem size marker. Unlike
+/// [`make_parsed_log_path_with_source`], whose url is always `<version>.json`, this works for
+/// checkpoint paths, whose file name takes part in checkpoint selection.
+fn parse_log_path(filename: &str) -> ParsedLogPath {
+    crate::path::tests::parse_log_path(filename, FILESYSTEM_SIZE_MARKER)
+}
+
+/// A v5 `_last_checkpoint` hint describing the uuid-named (V2) checkpoint `filename`.
+fn hint_naming_uuid(filename: &str) -> LastCheckpointHint {
+    LastCheckpointHint {
+        version: 5,
+        v2_checkpoint: Some(crate::last_checkpoint_hint::LastCheckpointV2 {
+            path: filename.to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn checkpoint_instance_orders_like_delta_spark() {
+    let classic = CheckpointInstance::Classic;
+    let uuid_a = CheckpointInstance::Uuid {
+        filename: "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+            .to_string(),
+    };
+    let uuid_b = CheckpointInstance::Uuid {
+        filename: "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet"
+            .to_string(),
+    };
+
+    assert!(classic < CheckpointInstance::MultiPart { num_parts: 2 });
+    assert!(
+        CheckpointInstance::MultiPart { num_parts: 2 }
+            < CheckpointInstance::MultiPart { num_parts: 11 }
+    );
+    assert!(classic < CheckpointInstance::MultiPart { num_parts: 11 });
+    assert!(uuid_a > CheckpointInstance::MultiPart { num_parts: 11 });
+    assert!(uuid_a > classic);
+    // Two uuid checkpoints at one version break the tie on file name.
+    assert!(uuid_a < uuid_b);
+}
+
+/// The reported failure: two writers checkpointed one version with different part counts.
+#[tokio::test]
+async fn two_complete_checkpoints_at_one_version_selects_more_parts() {
+    let mut log_files: Vec<_> = (0..=6)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    for part_num in 1..=2 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 2,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    for part_num in 1..=11 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 11,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (commit_files, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    let selected: Vec<_> = checkpoint_parts.iter().map(|p| &p.filename).collect();
+    let expected: Vec<_> = (1..=11)
+        .map(|p| multipart_checkpoint_name(4, p, 11))
+        .collect();
+    assert_eq!(selected, expected.iter().collect::<Vec<_>>());
+    let commit_versions: Vec<_> = commit_files.iter().map(|c| c.version).collect();
+    assert_eq!(commit_versions, vec![5, 6]);
+}
+
+/// Rank orders the candidates, but only complete checkpoints are candidates at all.
+#[tokio::test]
+async fn torn_higher_ranked_checkpoint_loses_to_complete_lower_ranked() {
+    let mut log_files: Vec<_> = (0..=6)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    for part_num in 1..=2 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 2,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    // A writer got 3 of its 11 parts out before dying: outranks the 2-part group, unusable.
+    for part_num in 1..=3 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 11,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (commit_files, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    let selected: Vec<_> = checkpoint_parts.iter().map(|p| &p.filename).collect();
+    let expected: Vec<_> = (1..=2)
+        .map(|p| multipart_checkpoint_name(4, p, 2))
+        .collect();
+    assert_eq!(selected, expected.iter().collect::<Vec<_>>());
+    let commit_versions: Vec<_> = commit_files.iter().map(|c| c.version).collect();
+    assert_eq!(commit_versions, vec![5, 6]);
+}
+
+/// Same rule as above, but the surviving candidate is a single-file checkpoint.
+#[tokio::test]
+async fn torn_multipart_checkpoint_loses_to_classic_checkpoint() {
+    let mut log_files = vec![
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            1,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ),
+    ];
+    for part_num in 1..=2 {
+        log_files.push((
+            1,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 3,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.parquet"
+    );
+}
+
+#[tokio::test]
+async fn uuid_and_multipart_checkpoints_at_one_version_selects_uuid() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        ],
+        &[
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 1, 2)),
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 2, 2)),
+            "_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet",
+        ],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+    );
+}
+
+/// Two uuid-named checkpoints at one version are distinct checkpoints, not parts of one, since each
+/// writer picked its own uuid.
+#[tokio::test]
+async fn two_uuid_checkpoints_at_one_version_select_greater_filename() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![(1, LogPathFileType::Commit, CommitSource::Filesystem)],
+        &[
+            "_delta_log/00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet",
+            "_delta_log/00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet",
+        ],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet"
+    );
+}
+
+/// v5 holds a complete 2-part checkpoint and two uuid-named ones, so listing selects uuid `bbbb`.
+/// Each case points the hint at a different candidate; only the one naming `bbbb` applies. Runs
+/// `applies_to` against listed paths rather than hand-built ones.
+#[rstest]
+#[case::hint_names_winner_uuid(
+    hint_naming_uuid(
+        "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet"
+    ),
+    true
+)]
+#[case::hint_names_loser_uuid(
+    hint_naming_uuid(
+        "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+    ),
+    false
+)]
+#[case::hint_names_losing_multipart(
+    LastCheckpointHint { version: 5, parts: Some(2), ..Default::default() },
+    false
+)]
+#[case::hint_names_phantom_classic(
+    LastCheckpointHint { version: 5, ..Default::default() },
+    false
+)]
+#[tokio::test]
+async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
+    #[case] hint: LastCheckpointHint,
+    #[case] expect_hint_applies: bool,
+) {
+    let winner = "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet";
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (5, LogPathFileType::Commit, CommitSource::Filesystem),
+            (6, LogPathFileType::Commit, CommitSource::Filesystem),
+        ],
+        &[
+            &format!("_delta_log/{}", multipart_checkpoint_name(5, 1, 2)),
+            &format!("_delta_log/{}", multipart_checkpoint_name(5, 2, 2)),
+            "_delta_log/00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet",
+            &format!("_delta_log/{winner}"),
+        ],
+    )
+    .await;
+
+    let listed = LogSegmentFiles::list_with_checkpoint_hint(
+        &hint,
+        storage.as_ref(),
+        &log_root,
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+
+    // The winner is the same no matter what the hint names.
+    assert_eq!(listed.checkpoint_parts.len(), 1);
+    assert_eq!(listed.checkpoint_parts[0].filename, winner);
+    assert_eq!(
+        hint.applies_to(&listed.checkpoint_parts),
+        expect_hint_applies
+    );
+}
+
+#[tokio::test]
+async fn uuid_checkpoint_beats_classic_checkpoint_at_one_version() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::ClassicCheckpoint, CommitSource::Filesystem),
+        ],
+        &["_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+    );
+}
+
+/// A json checkpoint has no parquet footer, so selecting it routes schema discovery through the
+/// sidecar path rather than a footer read (see `LogSegment::get_file_actions_schema_and_sidecars`).
+#[tokio::test]
+async fn json_uuid_checkpoint_beats_v1_checkpoints_at_one_version() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                1,
+                LogPathFileType::ClassicCheckpoint,
+                CommitSource::Filesystem,
+            ),
+        ],
+        &[
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 1, 2)),
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 2, 2)),
+            "_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json",
+        ],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json"
+    );
+}
+
+/// Both are complete single-file V1 checkpoints, so they replay to the same state either way.
+#[tokio::test]
+async fn one_of_one_multipart_checkpoint_beats_classic_checkpoint() {
+    let (storage, log_root) = create_storage(vec![
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            1,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ),
+        (
+            1,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num: 1,
+                num_parts: 1,
+            },
+            CommitSource::Filesystem,
+        ),
+    ])
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        multipart_checkpoint_name(1, 1, 1)
+    );
+}
+
+#[rstest]
+// A classic and a 1-of-1 multi-part checkpoint at one version each fill their own group.
+#[case::single_and_one_of_one_same_version(
+        vec![
+            parse_log_path(&multipart_checkpoint_name(5, 1, 1)),
+            parse_log_path("00000000000000000005.checkpoint.parquet"),
+        ],
+        Some(5)
+    )]
+// A complete 2-part and a complete 11-part checkpoint at one version.
+#[case::two_complete_multipart_same_version(
+        (1..=2).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
+            .chain((1..=11).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))
+            .sorted_by_key(|f| f.filename.clone())
+            .collect(),
+        Some(10)
+    )]
+// A torn 11-part group beside a complete 2-part one: still checkpointed, on the complete group.
+#[case::torn_beside_complete_same_version(
+        (1..=2).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
+            .chain((1..=3).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))
+            .sorted_by_key(|f| f.filename.clone())
+            .collect(),
+        Some(10)
+    )]
+// Every group at the version is torn, so the version is not checkpointed.
+#[case::all_torn_same_version(
+        (1..=1).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
+            .chain((1..=3).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))
+            .sorted_by_key(|f| f.filename.clone())
+            .collect(),
+        None
+    )]
+fn find_complete_checkpoint_version_same_version_cases(
+    #[case] files: Vec<ParsedLogPath>,
+    #[case] expected: Option<u64>,
+) {
+    assert_eq!(find_complete_checkpoint_version(&files), expected);
+}
+
+// ===== cancellation tests =====
+
+/// A storage handler whose listing yields `count` synthetic commit paths and records how many were
+/// pulled, so a test can tell where a cancelled listing actually stopped.
+struct FiniteListingHandler {
+    log_root: Url,
+    count: usize,
+    items_pulled: Arc<AtomicU32>,
+}
+
+impl StorageHandler for FiniteListingHandler {
+    fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        let log_root = self.log_root.clone();
+        let pulled = self.items_pulled.clone();
+        let iter = (0..self.count as u64).map(move |version| {
+            pulled.fetch_add(1, Ordering::Relaxed);
+            Ok(FileMeta::new(
+                log_root.join(&format!("{version:020}.json"))?,
+                version as i64,
+                1,
+            ))
+        });
+        Ok(Box::new(iter))
+    }
+
+    fn read_files(
+        &self,
+        _files: Vec<crate::FileSlice>,
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+        panic!("read_files should not be called during listing");
+    }
+
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        panic!("put should not be called during listing");
+    }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        panic!("copy_atomic should not be called during listing");
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        panic!("head should not be called during listing");
+    }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during listing");
+    }
+}
+
+// Builds a `FiniteListingHandler` over `memory:///_delta_log/` yielding `count` paths, returning
+// the log root and the shared pull counter alongside it.
+fn finite_listing_handler(count: usize) -> (Url, Arc<AtomicU32>, FiniteListingHandler) {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let pulled = Arc::new(AtomicU32::new(0));
+    let storage = FiniteListingHandler {
+        log_root: log_root.clone(),
+        count,
+        items_pulled: pulled.clone(),
+    };
+    (log_root, pulled, storage)
+}
+
+// An already-cancelled token fails the listing before any storage call, via the default
+// `list_from_with_cancellation` (this handler does not override it).
+#[test]
+fn precancelled_token_stops_listing_before_any_storage_call() {
+    let (log_root, pulled, storage) = finite_listing_handler(100);
+
+    let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+
+    let result = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token));
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(pulled.load(Ordering::Relaxed), 0);
+}
+
+// Cancelling partway yields the items already produced, then exactly one terminal
+// `Error::Cancelled` -- never a bare `None`, which would make a truncated listing look complete.
+// This is the regression guard for polling inside (rather than outside) the version `take_while`.
+#[test]
+fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
+    let (log_root, pulled, storage) = finite_listing_handler(100);
+
+    let token = Arc::new(TestCancellationToken::default());
+    let token_ref: CancellationTokenRef = token.clone();
+    let mut iter =
+        list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token_ref))
+            .unwrap();
+
+    assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 0));
+    assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 1));
+
+    token.cancel();
+
+    assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+    // Fused: no second error and no further items.
+    assert!(iter.next().is_none());
+    assert!(iter.next().is_none());
+    // The listing stopped early rather than draining all 100 entries.
+    assert!(pulled.load(Ordering::Relaxed) < 100);
+}
+
+// With no token the listing is unchanged, so cancellation support is strictly opt-in.
+#[test]
+fn listing_without_token_is_unchanged() {
+    let (log_root, _pulled, storage) = finite_listing_handler(5);
+
+    let listed: Vec<_> = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, None)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(listed.len(), 5);
+}
+
+/// An iterator that yields nothing but cancels `token` the instant it is polled (i.e. as the
+/// enclosing listing is exhausted), so a later poll of the token observes the cancellation.
+struct CancelOnExhaustion {
+    token: Arc<TestCancellationToken>,
+    done: bool,
+}
+
+impl Iterator for CancelOnExhaustion {
+    type Item = DeltaResult<FileMeta>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.done {
+            self.done = true;
+            self.token.cancel();
+        }
+        None
+    }
+}
+
+/// A storage handler that returns an empty listing and cancels `token` as that listing is
+/// exhausted, counting its `list_from` calls. Lets a test flip the token *between* backward-scan
+/// windows rather than before the first one.
+struct CancelAfterListingHandler {
+    token: Arc<TestCancellationToken>,
+    list_calls: Arc<AtomicU32>,
+}
+
+impl StorageHandler for CancelAfterListingHandler {
+    fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        self.list_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Box::new(CancelOnExhaustion {
+            token: self.token.clone(),
+            done: false,
+        }))
+    }
+
+    fn read_files(
+        &self,
+        _files: Vec<crate::FileSlice>,
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+        panic!("read_files should not be called during listing");
+    }
+
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        panic!("put should not be called during listing");
+    }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        panic!("copy_atomic should not be called during listing");
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        panic!("head should not be called during listing");
+    }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during listing");
+    }
+}
+
+// The backward scan collects each window eagerly and re-checks the token at the top of every
+// window. Window 1 lists an empty window and succeeds; the token flips as that listing is
+// exhausted, so it is window 2's up-front check -- not window 1's -- that surfaces the cancellation
+// (exactly one listing ran).
+#[test]
+fn backward_scan_checks_cancellation_between_windows() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let token = Arc::new(TestCancellationToken::default());
+    let list_calls = Arc::new(AtomicU32::new(0));
+    let storage = CancelAfterListingHandler {
+        token: token.clone(),
+        list_calls: list_calls.clone(),
+    };
+    let token_ref: CancellationTokenRef = token;
+
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &storage,
+        &log_root,
+        vec![],
+        5_000,
+        Some(&token_ref),
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(list_calls.load(Ordering::Relaxed), 1);
+}

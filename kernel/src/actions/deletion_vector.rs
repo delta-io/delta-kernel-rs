@@ -5,12 +5,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
-use delta_kernel_derive::ToSchema;
+use delta_kernel_derive::{internal_api, ToSchema};
 use roaring::RoaringTreemap;
 use url::Url;
-
-use crc::{Crc, CRC_32_ISO_HDLC};
 
 use crate::schema::DataType;
 use crate::utils::require;
@@ -46,8 +45,7 @@ impl FromStr for DeletionVectorStorageType {
             "i" => Ok(Self::Inline),
             "p" => Ok(Self::PersistedAbsolute),
             _ => Err(Error::internal_error(format!(
-                "Unsupported deletion vector format option: {}",
-                s
+                "Unsupported deletion vector format option: {s}"
             ))),
         }
     }
@@ -137,23 +135,23 @@ pub struct DeletionVectorDescriptor {
     pub storage_type: DeletionVectorStorageType,
 
     /// Three format options are currently proposed:
-    /// - If `storageType = 'u'` then `<random prefix - optional><base85 encoded uuid>`:
-    ///   The deletion vector is stored in a file with a path relative to the data
-    ///   directory of this Delta table, and the file name can be reconstructed from
-    ///   the UUID. See Derived Fields for how to reconstruct the file name. The random
-    ///   prefix is recovered as the extra characters before the (20 characters fixed length) uuid.
-    /// - If `storageType = 'i'` then `<base85 encoded bytes>`: The deletion vector
-    ///   is stored inline in the log. The format used is the `RoaringBitmapArray`
-    ///   format also used when the DV is stored on disk and described in [Deletion Vector Format].
+    /// - If `storageType = 'u'` then `<random prefix - optional><base85 encoded uuid>`: The
+    ///   deletion vector is stored in a file with a path relative to the data directory of this
+    ///   Delta table, and the file name can be reconstructed from the UUID. See Derived Fields for
+    ///   how to reconstruct the file name. The random prefix is recovered as the extra characters
+    ///   before the (20 characters fixed length) uuid.
+    /// - If `storageType = 'i'` then `<base85 encoded bytes>`: The deletion vector is stored
+    ///   inline in the log. The format used is the `RoaringBitmapArray` format also used when the
+    ///   DV is stored on disk and described in [Deletion Vector Format].
     /// - If `storageType = 'p'` then `<absolute path>`: The DV is stored in a file with an
-    ///   absolute path given by this path, which has the same format as the `path` field
-    ///   in the `add`/`remove` actions.
+    ///   absolute path given by this path, which has the same format as the `path` field in the
+    ///   `add`/`remove` actions.
     ///
     /// [Deletion Vector Format]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Deletion-Vector-Format
     pub path_or_inline_dv: String,
 
-    /// Start of the data for this DV in number of bytes from the beginning of the file it is stored in.
-    /// Always None (absent in JSON) when `storageType = 'i'`.
+    /// Start of the data for this DV in number of bytes from the beginning of the file it is
+    /// stored in. Always None (absent in JSON) when `storageType = 'i'`.
     pub offset: Option<i32>,
 
     /// Size of the serialized DV in bytes (raw data size, i.e. before base85 encoding, if inline).
@@ -164,6 +162,80 @@ pub struct DeletionVectorDescriptor {
 }
 
 impl DeletionVectorDescriptor {
+    /// Construct a validated [`DeletionVectorDescriptor`] from its raw fields.
+    ///
+    /// Validates the protocol-level invariants from the "Deletion Vector Descriptor Schema"
+    /// section of the Delta protocol:
+    /// - `size_in_bytes` and `cardinality` must be non-negative.
+    /// - If `offset` is present, it must be non-negative.
+    /// - `Inline` descriptors must not carry an offset.
+    /// - `PersistedRelative` paths carry an optional random prefix followed by a 20-character
+    ///   z85-encoded UUID, so they must be at least 20 characters long.
+    /// - `PersistedAbsolute` paths must parse as a URL.
+    ///
+    /// `Inline` payload bytes are accepted verbatim; the framing of the embedded RoaringBitmap
+    /// is only checked when the DV is later read via [`Self::read`].
+    pub fn try_new(
+        storage_type: DeletionVectorStorageType,
+        path_or_inline_dv: impl Into<String>,
+        offset: Option<i32>,
+        size_in_bytes: i32,
+        cardinality: i64,
+    ) -> DeltaResult<Self> {
+        require!(
+            size_in_bytes >= 0,
+            Error::deletion_vector("size_in_bytes must be non-negative")
+        );
+        require!(
+            cardinality >= 0,
+            Error::deletion_vector("cardinality must be non-negative")
+        );
+        require!(
+            offset.is_none_or(|o| o >= 0),
+            Error::deletion_vector("offset must be non-negative")
+        );
+        let path_or_inline_dv = path_or_inline_dv.into();
+        match storage_type {
+            DeletionVectorStorageType::Inline => require!(
+                offset.is_none(),
+                Error::deletion_vector("inline deletion vectors must not carry an offset")
+            ),
+            DeletionVectorStorageType::PersistedRelative => {
+                // Byte-slice rather than char-slice: z85 is ASCII-only, and string slicing
+                // would panic if a non-ASCII byte boundary fell inside the trailing 20-byte
+                // window. `z85::decode` accepts `&[u8]` and rejects non-z85 bytes.
+                let bytes = path_or_inline_dv.as_bytes();
+                require!(
+                    bytes.len() >= 20,
+                    Error::deletion_vector(format!(
+                        "persisted-relative DV path must be at least 20 bytes, got {}",
+                        bytes.len()
+                    ))
+                );
+                let suffix = &bytes[bytes.len() - 20..];
+                z85::decode(suffix).map_err(|_| {
+                    Error::deletion_vector(
+                        "persisted-relative DV path must end with a z85-encoded UUID",
+                    )
+                })?;
+            }
+            DeletionVectorStorageType::PersistedAbsolute => {
+                Url::parse(&path_or_inline_dv).map_err(|e| {
+                    Error::deletion_vector(format!(
+                        "persisted-absolute DV path must parse as a URL: {e}"
+                    ))
+                })?;
+            }
+        }
+        Ok(Self {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        })
+    }
+
     pub fn unique_id(&self) -> String {
         Self::unique_id_from_parts(
             &self.storage_type.to_string(),
@@ -182,21 +254,48 @@ impl DeletionVectorDescriptor {
         }
     }
 
+    /// Decodes a `PersistedRelative` path to its relative-path form
+    /// (`<prefix>/deletion_vector_<uuid>.bin`).
+    ///
+    /// The encoded path is an optional random prefix followed by a fixed-length 20-character z85
+    /// UUID; the prefix becomes a directory component, and is omitted entirely when absent:
+    ///
+    /// ```text
+    /// "ab^-aqEH.-t@S}K{vb[*k^" -> "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+    /// "vBn[lx{q8@P<9BNH/isA"   -> "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+    /// ```
+    ///
+    /// Errors if called on a non-`PersistedRelative` descriptor, if the encoded path is shorter
+    /// than the 20-character z85 UUID suffix, or if that suffix fails to decode into a UUID.
+    pub(crate) fn relative_path(&self) -> DeltaResult<String> {
+        require!(
+            self.storage_type == DeletionVectorStorageType::PersistedRelative,
+            Error::DeletionVector(format!(
+                "relative_path is only valid for PersistedRelative, got {:?}",
+                self.storage_type
+            ))
+        );
+        // Byte-slice rather than char-slice: z85 is ASCII-only, and string slicing would panic if
+        // a non-ASCII byte boundary fell inside the trailing 20-byte window. Mirrors `try_new`.
+        let bytes = self.path_or_inline_dv.as_bytes();
+        require!(
+            bytes.len() >= 20,
+            Error::DeletionVector(format!("Invalid length {}, must be >= 20", bytes.len()))
+        );
+        let prefix_len = bytes.len() - 20;
+        let decoded = z85::decode(&bytes[prefix_len..])
+            .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
+        let uuid = uuid::Uuid::from_slice(&decoded)
+            .map_err(|err| Error::DeletionVector(err.to_string()))?;
+        let prefix = std::str::from_utf8(&bytes[..prefix_len])
+            .map_err(|_| Error::deletion_vector("DV path prefix is not valid UTF-8"))?;
+        Ok(DeletionVectorPath::relative_path(prefix, &uuid))
+    }
+
     pub fn absolute_path(&self, parent: &Url) -> DeltaResult<Option<Url>> {
         match self.storage_type {
             DeletionVectorStorageType::PersistedRelative => {
-                let path_len = self.path_or_inline_dv.len();
-                require!(
-                    path_len >= 20,
-                    Error::DeletionVector(format!("Invalid length {path_len}, must be >= 20"))
-                );
-                let prefix_len = path_len - 20;
-                let decoded = z85::decode(&self.path_or_inline_dv[prefix_len..])
-                    .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
-                let uuid = uuid::Uuid::from_slice(&decoded)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                let dv_suffix =
-                    DeletionVectorPath::relative_path(&self.path_or_inline_dv[..prefix_len], &uuid);
+                let dv_suffix = self.relative_path()?;
                 let dv_path = parent
                     .join(&dv_suffix)
                     .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;
@@ -294,8 +393,8 @@ impl DeletionVectorDescriptor {
                 // bitmap_start = this_dv_start + 4 (dv_size field) + 4 (magic field)
                 let bitmap_start = this_dv_start + 8;
                 // crc_start = this_dv_start + 4 (dv_size field) + dv_size (magic field + bitmap)
-                // Safety: size_in_bytes is checked to fit in u32 which for all known platforms should
-                // fix in usize range.
+                // Safety: size_in_bytes is checked to fit in u32 which for all known platforms
+                // should fix in usize range.
                 let crc_start = this_dv_start + 4 + (size_in_bytes as usize);
                 require!(
                     this_dv_start < dv_data_len,
@@ -402,18 +501,21 @@ fn slice_to_u32(buf: &[u8], endian: Endian) -> DeltaResult<u32> {
 
 /// helper function to convert a treemap into a boolean vector where, for index i, if the bit is
 /// set, the vector will be false, and otherwise at index i the vector will be true
+#[internal_api]
 pub(crate) fn deletion_treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
     treemap_to_bools_with(treemap, false)
 }
 
 /// helper function to convert a treemap into a boolean vector where, for index i, if the bit is
 /// set, the vector will be true, and otherwise at index i the vector will be false
+#[internal_api]
 pub(crate) fn selection_treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
     treemap_to_bools_with(treemap, true)
 }
 
 /// helper function to generate vectors of bools from treemap. If `set_bit` is `true`, this is
 /// [`selection_treemap_to_bools`]. If `set_bit` is false, this is [`deletion_treemap_to_bools`]
+#[internal_api]
 fn treemap_to_bools_with(treemap: RoaringTreemap, set_bit: bool) -> Vec<bool> {
     fn combine(high_bits: u32, low_bits: u32) -> usize {
         ((u64::from(high_bits) << 32) | u64::from(low_bits)) as usize
@@ -475,10 +577,9 @@ mod tests {
 
     use roaring::RoaringTreemap;
 
-    use crate::{engine::sync::SyncEngine, Engine};
-
-    use super::DeletionVectorDescriptor;
-    use super::*;
+    use super::{DeletionVectorDescriptor, *};
+    use crate::engine::sync::SyncEngine;
+    use crate::Engine;
 
     fn dv_relative() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
@@ -551,6 +652,74 @@ mod tests {
         assert_eq!(dv_url, example.absolute_path(&parent).unwrap().unwrap());
     }
 
+    fn dv_with_path(
+        storage_type: DeletionVectorStorageType,
+        path_or_inline_dv: &str,
+    ) -> DeletionVectorDescriptor {
+        DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv: path_or_inline_dv.to_string(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        }
+    }
+
+    #[rstest::rstest]
+    // z85 UUID with a random prefix -> `<prefix>/deletion_vector_<uuid>.bin`.
+    #[case(
+        "ab^-aqEH.-t@S}K{vb[*k^",
+        "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+    )]
+    // Bare 20-char z85 UUID, no prefix.
+    #[case(
+        "vBn[lx{q8@P<9BNH/isA",
+        "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+    )]
+    fn test_relative_path_decodes(#[case] encoded: &str, #[case] expected: &str) {
+        let dv = dv_with_path(DeletionVectorStorageType::PersistedRelative, encoded);
+        assert_eq!(dv.relative_path().unwrap(), expected);
+    }
+
+    #[rstest::rstest]
+    // Non-relative storage types are rejected by the guard.
+    #[case(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+        "only valid for PersistedRelative"
+    )]
+    #[case(
+        DeletionVectorStorageType::Inline,
+        "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L",
+        "only valid for PersistedRelative"
+    )]
+    // Path shorter than the 20-byte z85 UUID suffix.
+    #[case(
+        DeletionVectorStorageType::PersistedRelative,
+        "short",
+        "Invalid length"
+    )]
+    // A non-ASCII byte straddling the trailing-20-byte window must error, not panic. `é` is two
+    // bytes, so this 21-byte path leaves `prefix_len == 1` inside the multi-byte `é`; byte-slicing
+    // (vs the pre-fix char-slicing) errors cleanly instead of panicking.
+    #[case(
+        DeletionVectorStorageType::PersistedRelative,
+        "éaaaaaaaaaaaaaaaaaaa",
+        "Failed to decode DV uuid"
+    )]
+    fn test_relative_path_errors(
+        #[case] storage_type: DeletionVectorStorageType,
+        #[case] path_or_inline_dv: &str,
+        #[case] expected_error: &str,
+    ) {
+        let dv = dv_with_path(storage_type, path_or_inline_dv);
+        let err = dv.relative_path().unwrap_err().to_string();
+        assert!(
+            err.contains(expected_error),
+            "error {err:?} did not contain {expected_error:?}"
+        );
+    }
+
     #[test]
     fn test_magic_number_constants() {
         assert_eq!(ROARING_BITMAP_PORTABLE_MAGIC, 1681511377);
@@ -619,8 +788,9 @@ mod tests {
         assert_eq!(found, expected)
     }
 
-    // this test is ignored by default as it's expensive to allocate such big vecs full of `true`. you can run it via:
-    // cargo test actions::deletion_vector::tests::test_dv_to_bools -- --ignored
+    // this test is ignored by default as it's expensive to allocate such big vecs full of `true`.
+    // you can run it via: cargo test actions::deletion_vector::tests::test_dv_to_bools --
+    // --ignored
     #[test]
     #[ignore]
     fn test_dv_to_bools() {
@@ -642,9 +812,9 @@ mod tests {
         assert_eq!(bools, expected);
     }
 
-    // Unlike [`test_dv_to_bools`], this test is not ignored because the large zero-initialized selection vector is fast to allocate.
-    // It just gets a bunch of empty pages from the OS. [`tet_dv_to_bools`] is slow because we must
-    // set every element to `true`.
+    // Unlike [`test_dv_to_bools`], this test is not ignored because the large zero-initialized
+    // selection vector is fast to allocate. It just gets a bunch of empty pages from the OS.
+    // [`tet_dv_to_bools`] is slow because we must set every element to `true`.
     #[test]
     fn test_sv_to_bools() {
         let mut rb = RoaringTreemap::new();
@@ -790,7 +960,8 @@ mod tests {
             "file:///tmp/test_table/dv/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin";
         assert_eq!(abs_path.as_str(), expected_path);
 
-        // Verify the encoded_relative_path is exactly as expected (prefix + z85 encoded UUID: 20 chars)
+        // Verify the encoded_relative_path is exactly as expected (prefix + z85 encoded UUID: 20
+        // chars)
         let encoded = dv_path.encoded_relative_path();
         assert_eq!(encoded, "dvrsTVZ&*Sl-RXRWjryu/!");
     }
@@ -813,5 +984,95 @@ mod tests {
         // Verify the encoded_relative_path is exactly as expected (z85 encoded UUID: 20 chars)
         let encoded = dv_path.encoded_relative_path();
         assert_eq!(encoded, "5<w-%>:JjlQ/G/]6C<1m");
+    }
+
+    #[rstest::rstest]
+    #[case::inline_with_offset(DeletionVectorStorageType::Inline, "ABC", Some(0), 4, 1, "inline")]
+    #[case::persisted_relative_short_path(
+        DeletionVectorStorageType::PersistedRelative,
+        "short",
+        Some(1),
+        4,
+        1,
+        "20 bytes"
+    )]
+    #[case::persisted_relative_invalid_z85(
+        DeletionVectorStorageType::PersistedRelative,
+        // 20 bytes but `_` is outside the z85 alphabet, so z85::decode fails.
+        "____________________",
+        Some(1),
+        4,
+        1,
+        "z85"
+    )]
+    #[case::persisted_relative_non_ascii(
+        DeletionVectorStorageType::PersistedRelative,
+        // 22 bytes (`euro` U+20AC is 3 bytes) with `len - 20 = 2` landing inside the
+        // multi-byte codepoint; byte-slicing keeps this from panicking and z85 rejects
+        // the non-ASCII payload.
+        "a\u{20ac}aaaaaaaaaaaaaaaaaa",
+        Some(1),
+        4,
+        1,
+        "z85"
+    )]
+    #[case::persisted_absolute_non_url(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "not a url",
+        Some(1),
+        4,
+        1,
+        "URL"
+    )]
+    #[case::negative_size(
+        DeletionVectorStorageType::Inline, "ABC", None, -1, 0, "size_in_bytes"
+    )]
+    #[case::negative_cardinality(
+        DeletionVectorStorageType::Inline, "ABC", None, 4, -1, "cardinality"
+    )]
+    #[case::negative_offset(
+        DeletionVectorStorageType::PersistedAbsolute, "file:///tmp/dv.bin", Some(-1), 4, 1, "offset"
+    )]
+    fn dv_descriptor_try_new_rejects_invalid(
+        #[case] storage_type: DeletionVectorStorageType,
+        #[case] path: &str,
+        #[case] offset: Option<i32>,
+        #[case] size_in_bytes: i32,
+        #[case] cardinality: i64,
+        #[case] expected_substr: &str,
+    ) {
+        let err = DeletionVectorDescriptor::try_new(
+            storage_type,
+            path,
+            offset,
+            size_in_bytes,
+            cardinality,
+        )
+        .expect_err("expected validation error");
+        assert!(
+            err.to_string().contains(expected_substr),
+            "expected error containing {expected_substr:?}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dv_descriptor_try_new_round_trips_fields() {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedAbsolute,
+            "file:///tmp/dv.bin",
+            Some(7),
+            42,
+            9,
+        )
+        .expect("valid descriptor");
+
+        assert_eq!(
+            descriptor.storage_type,
+            DeletionVectorStorageType::PersistedAbsolute
+        );
+        assert_eq!(descriptor.path_or_inline_dv, "file:///tmp/dv.bin");
+        assert_eq!(descriptor.offset, Some(7));
+        assert_eq!(descriptor.size_in_bytes, 42);
+        assert_eq!(descriptor.cardinality, 9);
     }
 }

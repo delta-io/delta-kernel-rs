@@ -1,0 +1,13 @@
+Reading change data feed from ../../../../acceptance/tests/dat/out/reader_tests/generated/cdf/delta/
+  requested start_version: 1
+  requested end_version:   <latest>
+TableChanges:
+  table_root:    file://<DAT>/out/reader_tests/generated/cdf/delta/
+  start_version: 1
+  end_version:   2
+Scan:
+  table_root: file://<DAT>/out/reader_tests/generated/cdf/delta/
+CDF batches:
+  batch 0: 5 rows
+  batch 1: 4 rows
+Total: 2 batches, 9 rows

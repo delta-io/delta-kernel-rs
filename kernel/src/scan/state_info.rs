@@ -4,16 +4,16 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::{debug, enabled, warn, Level};
 
+use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
-use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
-use crate::scan::PhysicalPredicate;
+use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
+use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::ColumnMappingMode;
-use crate::transforms::{FieldTransformSpec, TransformSpec};
+use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, TableFeature};
 use crate::{DeltaResult, Error, PredicateRef, StructField};
 
 /// All the state needed to process a scan.
@@ -32,10 +32,31 @@ pub(crate) struct StateInfo {
     /// Physical stats schema for reading/parsing stats from checkpoint files.
     /// Used to construct checkpoint read schema with stats_parsed.
     pub(crate) physical_stats_schema: Option<SchemaRef>,
-    /// Logical stats schema for the file statistics. When `stats_columns` is requested,
-    /// the engine receives stats with physical column names (for column mapping). This
-    /// logical schema maps those stats back to the table's logical column names.
-    pub(crate) logical_stats_schema: Option<SchemaRef>,
+    /// Physical partition schema with native types for `partitionValues_parsed`. Fields use
+    /// physical column names (for column mapping) and are always nullable. Present when the
+    /// table has partition columns and either a predicate is provided (narrowed to
+    /// predicate-referenced columns, for partition pruning) or the engine requested the typed
+    /// struct in scan output (all partition columns).
+    pub(crate) physical_partition_schema: Option<SchemaRef>,
+    /// Physical leaf paths eligible for data skipping.
+    ///
+    /// This combines the table's indexed columns with caller-requested columns and gates which
+    /// predicate references may use stats. It can be broader than
+    /// [`Self::requested_physical_stats_columns`], which preserves the caller's selection for
+    /// `stats_parsed` output.
+    pub(crate) eligible_physical_stats_columns: HashSet<ColumnName>,
+    /// Caller-requested physical stats columns used for data skipping and `stats_parsed` output.
+    /// `Columns` resolves names strictly; `All` resolves them best-effort.
+    pub(crate) requested_physical_stats_columns: Vec<ColumnName>,
+    /// Whether the table is catalog-managed, used to label scan metric events. Converted to a
+    /// [`TableType`](crate::metrics::TableType) at event construction.
+    pub(crate) is_catalog_managed: bool,
+    /// When set, log replay does not build per-file transform expressions:
+    /// `parse_partition_values` and `get_transform_expr` are skipped and every
+    /// `ScanMetadata::scan_file_transforms` entry is left `None`. `transform_spec` is retained
+    /// so the scan can still describe the transform structurally. Set by
+    /// [`ScanBuilder::without_row_transforms`](crate::scan::ScanBuilder::without_row_transforms).
+    pub(crate) skip_row_transforms: bool,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -45,14 +66,17 @@ pub(crate) struct StateInfo {
 struct MetadataInfo<'a> {
     /// What are the names of the requested metadata fields
     metadata_field_names: HashSet<&'a String>,
-    /// The name of the column that's selecting row indexes if that's been requested or None if they
-    /// are not requested. We remember this if it's been requested explicitly. this is so we can
-    /// reference this column and not re-add it as a requested column if we're _also_ requesting
-    /// row-ids.
+    /// The name of the column that's selecting row indexes if that's been requested or None if
+    /// they are not requested. We remember this if it's been requested explicitly. this is so
+    /// we can reference this column and not re-add it as a requested column if we're _also_
+    /// requesting row-ids.
     selected_row_index_col_name: Option<&'a String>,
-    /// the materializedRowIdColumnName extracted from the table config if row ids are requested, or
-    /// None if they are not requested
+    /// the materializedRowIdColumnName extracted from the table config if row ids are requested,
+    /// or None if they are not requested
     materialized_row_id_column_name: Option<&'a String>,
+    /// the materializedRowCommitVersionColumnName extracted from the table config if row commit
+    /// versions are requested, or None if they are not requested
+    materialized_row_commit_version_column_name: Option<&'a String>,
 }
 
 /// This validates that we have sensible metadata columns, and that the requested metadata is
@@ -65,7 +89,7 @@ fn validate_metadata_columns<'a>(
     table_configuration: &'a TableConfiguration,
 ) -> DeltaResult<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
-    let partition_columns = table_configuration.metadata().partition_columns();
+    let partition_columns = table_configuration.logical_partition_columns();
     for metadata_column in logical_schema.metadata_columns() {
         // Ensure we don't have a metadata column with same name as a partition column
         if partition_columns.contains(metadata_column.name()) {
@@ -89,7 +113,23 @@ fn validate_metadata_columns<'a>(
                     .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
                 metadata_info.materialized_row_id_column_name = Some(row_id_col);
             }
-            Some(MetadataColumnSpec::RowCommitVersion) => {}
+            Some(MetadataColumnSpec::RowCommitVersion) => {
+                if !table_configuration.is_feature_enabled(&TableFeature::RowTracking) {
+                    return Err(Error::unsupported(
+                        "Row commit versions are not enabled on this table",
+                    ));
+                }
+                let row_commit_version_col = table_configuration
+                    .table_properties()
+                    .materialized_row_commit_version_column_name
+                    .as_ref()
+                    .ok_or(Error::generic(
+                        "No delta.rowTracking.materializedRowCommitVersionColumnName key found in \
+                         metadata configuration",
+                    ))?;
+                metadata_info.materialized_row_commit_version_column_name =
+                    Some(row_commit_version_col);
+            }
             Some(MetadataColumnSpec::FilePath) => {
                 // FilePath metadata column is handled by the parquet reader
             }
@@ -102,32 +142,163 @@ fn validate_metadata_columns<'a>(
     Ok(metadata_info)
 }
 
+/// Builds the physical stats and partition schemas used by scan metadata and data skipping.
+///
+/// `requested_physical_stats_columns` bypasses the table's indexed set and seeds the scan's stats
+/// schema. Predicate references may add other indexed columns.
+fn build_data_skipping_schemas(
+    struct_stats: &StructStats,
+    physical_predicate: &PhysicalPredicate,
+    predicate_column_names_logical: &[ColumnName],
+    requested_physical_stats_columns: Option<&[ColumnName]>,
+    table_configuration: &TableConfiguration,
+) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
+    // Narrow the table's typed partition schema to the columns the predicate references. The
+    // DataSkippingFilter only needs partition columns that appear in the predicate, and the
+    // shared helper forces every field nullable (MapToStruct can yield null for a missing key).
+    let predicate_partition_schema = match physical_predicate {
+        PhysicalPredicate::Some(pred, _ref_schema) => {
+            let refs: Vec<ColumnName> = pred.references().into_iter().cloned().collect();
+            table_configuration.predicate_partition_schema(&refs)
+        }
+        _ => None,
+    };
+
+    // `DataSkippingFilter` needs stats for every column its predicate references. Refs without
+    // stats fold to NULL and pruning collapses to "keep every file", even when the caller
+    // separately requested some other set of columns. Union predicate refs into the stats schema
+    // so it serves both. Unresolvable refs (e.g. a predicate typo) are dropped here.
+    let predicate_refs_physical =
+        resolve_physical_columns(table_configuration, predicate_column_names_logical);
+
+    // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields
+    // `build_expected_stats_schemas` always emits) has nothing to prune by. Return `None`
+    // in that case so the caller skips building a `DataSkippingFilter`. `nullCount` is the
+    // per-column stats wrapper, so its presence is the signal that at least one data
+    // column survived. The Delta protocol allows `minValues` / `maxValues` without
+    // `nullCount`, but `build_expected_stats_schemas` always emits `nullCount` whenever it
+    // emits min/max; this check relies on that implementation property.
+    let with_data_cols = |stats_schema: SchemaRef| -> Option<SchemaRef> {
+        stats_schema
+            .field(NULL_COUNT)
+            .is_some()
+            .then_some(stats_schema)
+    };
+
+    let stats_schema = match (struct_stats, physical_predicate) {
+        (StructStats::AllIndexed { .. }, _) => with_data_cols(
+            table_configuration
+                .build_expected_stats_schemas(requested_physical_stats_columns, None)?
+                .physical,
+        ),
+        // Requested columns bypass the indexed set and seed the stats schema; predicate refs join
+        // the schema so kernel can still prune.
+        (StructStats::Columns { .. }, _) if requested_physical_stats_columns.is_some() => {
+            let mut filter = requested_physical_stats_columns
+                .unwrap_or_default()
+                .to_vec();
+            union_extra_into_filter(&mut filter, &predicate_refs_physical);
+            with_data_cols(
+                table_configuration
+                    .build_expected_stats_schemas(requested_physical_stats_columns, Some(&filter))?
+                    .physical,
+            )
+        }
+        // No requested columns, but a predicate is present. Use just the predicate refs so the
+        // stats schema is trimmed to what the rewritten predicate needs.
+        (_, PhysicalPredicate::Some(_, _)) => with_data_cols(
+            table_configuration
+                .build_expected_stats_schemas(None, Some(&predicate_refs_physical))?
+                .physical,
+        ),
+        // No struct stats requested and no predicate: nothing to read or emit, so no stats schema.
+        (_, _) => None,
+    };
+    Ok((stats_schema, predicate_partition_schema))
+}
+
+/// Resolves logical column names best-effort, warning and omitting names that cannot be resolved.
+/// Used for `extra_indexed` and predicate references.
+fn resolve_physical_columns(
+    table_configuration: &TableConfiguration,
+    logical: &[ColumnName],
+) -> Vec<ColumnName> {
+    let logical_schema = table_configuration.logical_schema();
+    let column_mapping_mode = table_configuration.column_mapping_mode();
+    logical
+        .iter()
+        .filter_map(|col| {
+            get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
+                .inspect_err(|e| {
+                    warn!("Failed to resolve physical name for stats column {col}: {e}")
+                })
+                .ok()
+        })
+        .collect()
+}
+
+/// Resolves every logical column name to its physical name.
+///
+/// Returns an error if any name cannot be resolved. Used for the `requested` columns in
+/// [`StructStats::Columns`].
+fn resolve_physical_columns_strict(
+    table_configuration: &TableConfiguration,
+    logical: &[ColumnName],
+) -> DeltaResult<Vec<ColumnName>> {
+    let logical_schema = table_configuration.logical_schema();
+    let column_mapping_mode = table_configuration.column_mapping_mode();
+    logical
+        .iter()
+        .map(|col| get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode))
+        .collect()
+}
+
+/// Adds to `filter` every entry of `extra` not already present.
+fn union_extra_into_filter(filter: &mut Vec<ColumnName>, extra: &[ColumnName]) {
+    let to_add: Vec<ColumnName> = extra
+        .iter()
+        .filter(|c| !filter.contains(c))
+        .cloned()
+        .collect();
+    filter.extend(to_add);
+}
+
 impl StateInfo {
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
-    /// `logical_schema` - The logical schema of the scan output, which includes partition columns
+    /// `logical_read_schema` - The logical schema of the scan output
+    /// `table_schema` - The schema against which predicate column references are resolved.
+    /// Must contain every column the predicate may legitimately reference (typically the full
+    /// table schema, or full CDF-extended schema for CDF scans). Currently, we do not carry
+    /// over any metadata columns from the `logical_read_schema` to the `table_schema` (issue
+    /// 2633).
     /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
-    /// `stats_columns` - Optional list of columns to include in parsed stats output
+    /// `stats` - Engine-facing stats options. Drives which stats columns appear in scan
+    ///   metadata output and whether the JSON synthesis fallback fires.
+    /// `partition_values` - Engine-facing partition value options. Drives whether the typed
+    ///   `partitionValues_parsed` column appears in scan metadata output.
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
-        logical_schema: SchemaRef,
+        logical_read_schema: SchemaRef,
+        table_schema: SchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
-        stats_columns: Option<Vec<ColumnName>>,
+        stats: &StatsOptions,
+        partition_values: &PartitionValuesOptions,
         classifier: C,
     ) -> DeltaResult<Self> {
-        let partition_columns = table_configuration.metadata().partition_columns();
+        let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
-        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
-        let mut transform_spec = Vec::new();
+        let mut read_fields = Vec::with_capacity(logical_read_schema.num_fields());
+        let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
         let mut last_physical_field: Option<String> = None;
 
-        let metadata_info = validate_metadata_columns(&logical_schema, table_configuration)?;
+        let metadata_info = validate_metadata_columns(&logical_read_schema, table_configuration)?;
 
         // Loop over all selected fields and build both the physical schema and transform spec
-        for (index, logical_field) in logical_schema.fields().enumerate() {
+        for (index, logical_field) in logical_read_schema.fields().enumerate() {
             if let Some(spec) =
                 classifier.classify_field(logical_field, index, &last_physical_field)
             {
@@ -152,8 +323,8 @@ impl StateInfo {
 
                                 // ensure we have a column name that isn't already in our schema
                                 let index_column_name = (0..)
-                                    .map(|i| format!("row_indexes_for_row_id_{}", i))
-                                    .find(|name| logical_schema.field(name).is_none())
+                                    .map(|i| format!("row_indexes_for_row_id_{i}"))
+                                    .find(|name| logical_read_schema.field(name).is_none())
                                     .ok_or(Error::generic(
                                         "Couldn't generate row index column name",
                                     ))?;
@@ -174,21 +345,41 @@ impl StateInfo {
                             ));
                         };
 
-                        read_fields.push(StructField::nullable(row_id_col_name, DataType::LONG));
+                        let row_id_col_name = row_id_col_name.to_string();
+                        read_fields.push(StructField::nullable(&row_id_col_name, DataType::LONG));
                         transform_spec.push(FieldTransformSpec::GenerateRowId {
-                            field_name: row_id_col_name.to_string(),
+                            field_name: row_id_col_name.clone(),
                             row_index_field_name: index_column_name,
                         });
+                        last_physical_field = Some(row_id_col_name);
                     }
                     Some(MetadataColumnSpec::RowCommitVersion) => {
-                        return Err(Error::unsupported("Row commit versions not supported"));
+                        let Some(row_commit_version_col_name) =
+                            metadata_info.materialized_row_commit_version_column_name
+                        else {
+                            return Err(Error::internal_error(
+                                "missing materialized Row Commit Version column name when row \
+                                 tracking is enabled",
+                            ));
+                        };
+
+                        let row_commit_version_col_name = row_commit_version_col_name.to_string();
+                        read_fields.push(StructField::nullable(
+                            &row_commit_version_col_name,
+                            DataType::LONG,
+                        ));
+                        transform_spec.push(FieldTransformSpec::GenerateRowCommitVersion {
+                            field_name: row_commit_version_col_name.clone(),
+                        });
+                        last_physical_field = Some(row_commit_version_col_name);
                     }
                     Some(MetadataColumnSpec::RowIndex)
                     | Some(MetadataColumnSpec::FilePath)
                     | None => {
-                        // note that RowIndex and FilePath are handled in the parquet reader so we just add them as
-                        // if they're normal physical columns
-                        let physical_field = logical_field.make_physical(column_mapping_mode);
+                        // note that RowIndex and FilePath are handled in the parquet reader so we
+                        // just add them as if they're normal physical
+                        // columns
+                        let physical_field = logical_field.make_physical(column_mapping_mode)?;
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
 
@@ -209,47 +400,114 @@ impl StateInfo {
 
         let physical_schema = Arc::new(StructType::try_new(read_fields)?);
 
+        // Logical column names referenced by the predicate. Fed into the stats schema
+        // build below and into the dropped-refs observability log.
+        let predicate_column_names: Vec<ColumnName> = predicate
+            .as_ref()
+            .map(|p| p.references().into_iter().cloned().collect())
+            .unwrap_or_default();
+
+        // We use table_schema here as predicate can reference columns outside projection.
         let physical_predicate = match predicate {
-            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema, column_mapping_mode)?,
+            Some(pred) => PhysicalPredicate::try_new(&pred, &table_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
         };
 
-        // Build stats schemas:
-        // - From stats_columns if specified (for outputting stats to the engine)
-        // - From predicate columns otherwise (for data skipping only, no logical schema needed)
-        // Returns (physical_stats_schema, logical_stats_schema) tuple
-        let (physical_stats_schema, logical_stats_schema) =
-            match (&stats_columns, &physical_predicate) {
-                // stats_columns + predicate not supported together
-                (Some(_), PhysicalPredicate::Some(..)) => {
-                    return Err(Error::generic(
-                        "Cannot use both predicate and stats_columns in the same scan",
-                    ));
+        // Resolve requested names once for both stats eligibility and schema construction.
+        // `Columns` is strict; `AllIndexed` treats extra-indexed names as best-effort hints.
+        let requested_physical_stats_columns: Vec<ColumnName> = match &stats.struct_stats {
+            StructStats::AllIndexed { extra_indexed } => {
+                resolve_physical_columns(table_configuration, extra_indexed)
+            }
+            StructStats::Columns { requested } => {
+                resolve_physical_columns_strict(table_configuration, requested)?
+            }
+            StructStats::None => Vec::new(),
+        };
+        let requested_physical_stats_columns_ref = (!requested_physical_stats_columns.is_empty())
+            .then_some(requested_physical_stats_columns.as_slice());
+
+        // Stats-eligible column set. Partition columns are excluded; they flow through
+        // `partitionValues_parsed` instead.
+        let eligible_physical_stats_columns =
+            table_configuration.physical_stats_columns_set(requested_physical_stats_columns_ref);
+        // Observability: predicate refs outside `eligible_physical_stats_columns` fold to NULL
+        // by the gate. Surface the dropped set so an engine operator can see what got folded.
+        // The filter walk is bounded by predicate width but still does a physical-name
+        // resolution per ref, so gate it on the log level to skip the work when DEBUG is off.
+        if enabled!(Level::DEBUG) && matches!(physical_predicate, PhysicalPredicate::Some(_, _)) {
+            let dropped: Vec<&ColumnName> = predicate_column_names
+                .iter()
+                .filter(|c| {
+                    get_any_level_column_physical_name(&table_schema, c, column_mapping_mode)
+                        .ok()
+                        .is_some_and(|physical| {
+                            !eligible_physical_stats_columns.contains(&physical)
+                        })
+                })
+                .collect();
+            if !dropped.is_empty() {
+                debug!(
+                    "Checkpoint pushdown: predicate refs to non-stats columns folded to NULL: {:?}",
+                    dropped
+                );
+            }
+        }
+
+        // Build partition schema with physical names, used for partition pruning in data
+        // skipping and for the engine-facing `partitionValues_parsed` output column. Needed
+        // when partition columns exist and either a predicate is present or the engine
+        // requested the typed struct in scan output.
+        // partition_columns stores logical names (per Delta protocol), so we zip the table's
+        // logical and physical schemas (same field ordering, guaranteed by `make_physical`)
+        // to match logical names and extract the corresponding physical fields without
+        // per-field metadata lookups.
+        let has_predicate = !matches!(
+            physical_predicate,
+            PhysicalPredicate::None | PhysicalPredicate::StaticSkipAll
+        );
+        let table_partition_schema =
+            if (has_predicate || partition_values.parsed_struct) && !partition_columns.is_empty() {
+                let partition_fields: Vec<StructField> = table_configuration
+                    .logical_schema()
+                    .fields()
+                    .zip(table_configuration.physical_schema().fields())
+                    .filter(|(logical_f, _)| partition_columns.contains(logical_f.name()))
+                    .map(|(_, physical_f)| physical_f.clone())
+                    .collect();
+                if partition_fields.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(StructType::new_unchecked(partition_fields)))
                 }
-                // stats_columns = Some([]) means output all stats from expected_stats_schema.
-                // Clustering columns parameter is not needed here - that's for ensuring columns
-                // are included when writing stats. For reading, we use the table properties.
-                (Some(columns), _) if columns.is_empty() => {
-                    let expected_stats_schemas =
-                        table_configuration.build_expected_stats_schemas(None)?;
-                    (
-                        Some(expected_stats_schemas.physical),
-                        Some(expected_stats_schemas.logical),
-                    )
-                }
-                // Non-empty stats_columns list not supported yet
-                (Some(_), _) => {
-                    return Err(Error::generic(
-                        "Only empty stats_columns is supported (outputs all stats). \
-                         Specifying specific columns is not yet implemented.",
-                    ));
-                }
-                // No stats_columns, but has predicate - use predicate columns for data skipping
-                // (no logical stats schema needed for internal data skipping)
-                (None, PhysicalPredicate::Some(_, schema)) => (build_stats_schema(schema), None),
-                // No stats_columns and no predicate
-                (None, _) => (None, None),
+            } else {
+                None
             };
+
+        let (physical_stats_schema, predicate_partition_schema) = build_data_skipping_schemas(
+            &stats.struct_stats,
+            &physical_predicate,
+            &predicate_column_names,
+            requested_physical_stats_columns_ref,
+            table_configuration,
+        )?;
+
+        // When the engine requested the typed struct, emit all partition columns rather than
+        // the predicate-narrowed subset. The data skipping filter only references the columns
+        // its predicate needs, so the superset is safe for pruning too. All fields are forced
+        // nullable: MapToStruct can yield null even for a non-nullable column (a missing key, or
+        // an empty string cast to a non-string/binary type), and a non-nullable field would then
+        // error.
+        let physical_partition_schema = if partition_values.parsed_struct {
+            table_partition_schema.map(|tps| {
+                let nullable_fields = tps
+                    .fields()
+                    .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
+                Arc::new(StructType::new_unchecked(nullable_fields))
+            })
+        } else {
+            predicate_partition_schema
+        };
 
         let transform_spec =
             if !transform_spec.is_empty() || column_mapping_mode != ColumnMappingMode::None {
@@ -259,42 +517,69 @@ impl StateInfo {
             };
 
         Ok(StateInfo {
-            logical_schema,
+            logical_schema: logical_read_schema,
             physical_schema,
             physical_predicate,
             transform_spec,
             column_mapping_mode,
             physical_stats_schema,
-            logical_stats_schema,
+            physical_partition_schema,
+            eligible_physical_stats_columns,
+            requested_physical_stats_columns,
+            is_catalog_managed: table_configuration.is_catalog_managed(),
+            skip_row_transforms: false,
         })
+    }
+
+    /// Returns a conservative initial capacity for the dedup `HashSet` in
+    /// [`ScanLogReplayProcessor`].
+    ///
+    /// The exact file count is not available at this point, so the hint is
+    /// derived from whether stats are enabled: stats are only computed for
+    /// non-trivial tables, so their presence is a reasonable proxy for table
+    /// size. Using 4096 vs 512 as the two tiers eliminates the first 12-14
+    /// hashbrown doubling events for medium/large tables while staying cheap
+    /// for small ones.
+    pub(crate) fn dedup_capacity_hint(&self) -> usize {
+        if self.physical_stats_schema.is_some() {
+            4096
+        } else {
+            512
+        }
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
-    use url::Url;
-
-    use crate::actions::{Metadata, Protocol};
-    use crate::expressions::{column_expr, column_name, ColumnName, Expression as Expr};
-    use crate::schema::{ColumnMetadataKey, MetadataValue};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use rstest::rstest;
 
     use super::*;
+    use crate::actions::{MAX_VALUES, MIN_VALUES};
+    use crate::expressions::{col, column_name, lit, Predicate as Pred};
+    use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
+    use crate::table_features::TableFeature;
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
+    };
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
         schema: SchemaRef,
         partition_columns: Vec<String>,
     ) -> DeltaResult<StateInfo> {
-        get_state_info(schema, partition_columns, None, HashMap::new(), vec![])
+        get_state_info(schema, partition_columns, None, &[], HashMap::new(), vec![])
     }
 
+    /// When features are non-empty, uses protocol (3,7) with explicit feature lists.
+    /// When features are empty, uses legacy protocol (2,5).
     pub(crate) fn get_state_info(
         schema: SchemaRef,
         partition_columns: Vec<String>,
         predicate: Option<PredicateRef>,
+        features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
     ) -> DeltaResult<StateInfo> {
@@ -302,9 +587,10 @@ pub(crate) mod tests {
             schema,
             partition_columns,
             predicate,
+            features,
             metadata_configuration,
             metadata_cols,
-            None,
+            StatsOptions::default(),
         )
     }
 
@@ -312,26 +598,47 @@ pub(crate) mod tests {
         schema: SchemaRef,
         partition_columns: Vec<String>,
         predicate: Option<PredicateRef>,
+        features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
-        stats_columns: Option<Vec<ColumnName>>,
+        stats: StatsOptions,
     ) -> DeltaResult<StateInfo> {
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema.clone(),
+        get_state_info_with_options(
+            schema,
             partition_columns,
-            10,
+            predicate,
+            features,
             metadata_configuration,
-        )?;
-        let no_features: Option<Vec<String>> = None; // needed for type annotation
-        let protocol = Protocol::try_new(2, 2, no_features.clone(), no_features)?;
-        let table_configuration = TableConfiguration::try_new(
-            metadata,
-            protocol,
-            Url::parse("s3://my-table").unwrap(),
-            1,
-        )?;
+            metadata_cols,
+            stats,
+            PartitionValuesOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_state_info_with_options(
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        predicate: Option<PredicateRef>,
+        features: &[TableFeature],
+        metadata_configuration: HashMap<String, String>,
+        metadata_cols: Vec<(&str, MetadataColumnSpec)>,
+        stats: StatsOptions,
+        partition_values: PartitionValuesOptions,
+    ) -> DeltaResult<StateInfo> {
+        let builder = MockTableConfigurationBuilder::new()
+            .with_schema(schema.clone())
+            .with_partition_columns(partition_columns)
+            .with_properties(metadata_configuration)
+            .with_table_root("s3://my-table")
+            .with_version(1);
+        let builder = match features.is_empty() {
+            true => builder.with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build()),
+            false => {
+                builder.with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            }
+        };
+        let table_configuration = builder.try_build()?;
 
         let mut schema = schema;
         for (name, spec) in metadata_cols.into_iter() {
@@ -344,9 +651,11 @@ pub(crate) mod tests {
 
         StateInfo::try_new(
             schema.clone(),
+            table_configuration.logical_schema(),
             &table_configuration,
             predicate,
-            stats_columns,
+            &stats,
+            &partition_values,
             (),
         )
     }
@@ -389,10 +698,10 @@ pub(crate) mod tests {
     #[test]
     fn no_partition_columns() {
         // Test case: No partition columns, no column mapping
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
 
         let state_info = get_simple_state_info(schema.clone(), vec![]).unwrap();
 
@@ -410,11 +719,11 @@ pub(crate) mod tests {
     #[test]
     fn with_partition_columns() {
         // Test case: With partition columns
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("date", DataType::DATE), // Partition column
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "date": DATE, // Partition column
+            nullable "value": LONG,
+        };
 
         let state_info = get_simple_state_info(
             schema.clone(),
@@ -447,12 +756,12 @@ pub(crate) mod tests {
     #[test]
     fn multiple_partition_columns() {
         // Test case: Multiple partition columns interspersed with regular columns
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("col1", DataType::STRING),
-            StructField::nullable("part1", DataType::STRING), // Partition
-            StructField::nullable("col2", DataType::LONG),
-            StructField::nullable("part2", DataType::INTEGER), // Partition
-        ]));
+        let schema = schema_ref! {
+            nullable "col1": STRING,
+            nullable "part1": STRING, // Partition
+            nullable "col2": LONG,
+            nullable "part2": INTEGER, // Partition
+        };
 
         let state_info = get_simple_state_info(
             schema.clone(),
@@ -496,17 +805,18 @@ pub(crate) mod tests {
     #[test]
     fn with_predicate() {
         // Test case: With a valid predicate
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
 
-        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
         let state_info = get_state_info(
             schema.clone(),
             vec![], // no partition columns
             Some(predicate),
+            &[],            // no table features
             HashMap::new(), // no extra metadata
             vec![],         // no metadata
         )
@@ -525,11 +835,11 @@ pub(crate) mod tests {
     #[test]
     fn partition_at_beginning() {
         // Test case: Partition column at the beginning
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("date", DataType::DATE), // Partition column
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+        let schema = schema_ref! {
+            nullable "date": DATE, // Partition column
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
 
         let state_info = get_simple_state_info(schema.clone(), vec!["date".to_string()]).unwrap();
 
@@ -549,6 +859,50 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) const ROW_TRACKING_FEATURES: &[TableFeature] =
+        &[TableFeature::RowTracking, TableFeature::DomainMetadata];
+
+    // TODO(#3248): Add tests for row id.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RowTrackingState {
+        Unsupported,
+        SupportedNotEnabled,
+        Enabled,
+        Suspended,
+    }
+
+    impl RowTrackingState {
+        pub(crate) fn features(self) -> &'static [TableFeature] {
+            match self {
+                Self::Unsupported => &[],
+                Self::SupportedNotEnabled | Self::Enabled | Self::Suspended => {
+                    ROW_TRACKING_FEATURES
+                }
+            }
+        }
+
+        pub(crate) fn properties(self) -> HashMap<String, String> {
+            let mut properties = get_string_map(&[
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "row_commit_version_col",
+                ),
+            ]);
+            if self == Self::Enabled {
+                properties.insert("delta.enableRowTracking".to_string(), "true".to_string());
+            }
+            if self == Self::Suspended {
+                properties.insert("delta.enableRowTracking".to_string(), "false".to_string());
+                properties.insert("delta.rowTrackingSuspended".to_string(), "true".to_string());
+            }
+            properties
+        }
+    }
+
     fn get_string_map(slice: &[(&str, &str)]) -> HashMap<String, String> {
         slice
             .iter()
@@ -556,22 +910,38 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Builds a nullable [`StructField`] carrying column-mapping id + physical name metadata.
+    fn cm_field(name: &str, id: i64, physical_name: &str, ty: impl Into<DataType>) -> StructField {
+        StructField::nullable(name, ty).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(physical_name.into()),
+            ),
+        ])
+    }
+
     #[test]
     fn request_row_ids() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! { nullable "id": STRING };
 
         let state_info = get_state_info(
             schema.clone(),
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
                     "some_row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "some_row_commit_version_col",
                 ),
             ]),
             vec![("row_id", MetadataColumnSpec::RowId)],
@@ -589,21 +959,65 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn request_row_ids_conflicting_row_index_col_name() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "row_indexes_for_row_id_0", // this will conflict with the first generated name for row indexes
-            DataType::STRING,
-        )]));
-
+    fn request_row_commit_versions() {
+        let schema = schema_ref! { nullable "id": STRING };
         let state_info = get_state_info(
-            schema.clone(),
+            schema,
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
                     "some_row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "some_row_commit_version_col",
+                ),
+            ]),
+            vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            state_info
+                .physical_schema
+                .field("some_row_commit_version_col")
+                .map(StructField::data_type),
+            Some(&DataType::LONG)
+        );
+        assert_eq!(
+            state_info.transform_spec.as_deref().map(Vec::as_slice),
+            Some(
+                [FieldTransformSpec::GenerateRowCommitVersion {
+                    field_name: "some_row_commit_version_col".to_string(),
+                }]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn request_row_ids_conflicting_row_index_col_name() {
+        // "row_indexes_for_row_id_0" conflicts with the first generated name for row indexes
+        let schema = schema_ref! { nullable "row_indexes_for_row_id_0": STRING };
+
+        let state_info = get_state_info(
+            schema.clone(),
+            vec![],
+            None,
+            ROW_TRACKING_FEATURES,
+            get_string_map(&[
+                ("delta.enableRowTracking", "true"),
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "some_row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "some_row_commit_version_col",
                 ),
             ]),
             vec![("row_id", MetadataColumnSpec::RowId)],
@@ -622,20 +1036,22 @@ pub(crate) mod tests {
 
     #[test]
     fn request_row_ids_and_indexes() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! { nullable "id": STRING };
 
         let state_info = get_state_info(
             schema.clone(),
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
                     "some_row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "some_row_commit_version_col",
                 ),
             ]),
             vec![
@@ -656,37 +1072,102 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn invalid_rowtracking_config() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+    fn invalid_row_id_config() {
+        let schema = schema_ref! { nullable "id": STRING };
 
-        for (metadata_config, metadata_cols, expected_error) in [
-            (HashMap::new(), vec![("row_id", MetadataColumnSpec::RowId)], "Unsupported: Row ids are not enabled on this table"),
-            (
-                get_string_map(&[("delta.enableRowTracking", "true")]),
-                vec![("row_id", MetadataColumnSpec::RowId)],
-                "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
-            ),
-        ] {
-            let res = get_state_info(schema.clone(), vec![], None, metadata_config, metadata_cols);
-            assert_result_error_with_message(res, expected_error);
-        }
+        // Row IDs requested but row tracking not enabled → error
+        let res = get_state_info(
+            schema.clone(),
+            vec![],
+            None,
+            &[], // no table features
+            HashMap::new(),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        );
+        assert_result_error_with_message(res, "Unsupported: Row ids are not enabled on this table");
+
+        // Row tracking enabled but missing materializedRowIdColumnName → error
+        let res = get_state_info(
+            schema,
+            vec![],
+            None,
+            ROW_TRACKING_FEATURES,
+            get_string_map(&[("delta.enableRowTracking", "true")]),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        );
+        assert_result_error_with_message(
+            res,
+            "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
+        );
+    }
+
+    #[rstest]
+    #[case::unsupported(RowTrackingState::Unsupported)]
+    #[case::supported_not_enabled(RowTrackingState::SupportedNotEnabled)]
+    #[case::suspended(RowTrackingState::Suspended)]
+    fn request_row_commit_versions_requires_enabled_row_tracking(
+        #[case] row_tracking_state: RowTrackingState,
+    ) {
+        let schema = schema_ref! { nullable "id": STRING };
+        let res = get_state_info(
+            schema,
+            vec![],
+            None,
+            row_tracking_state.features(),
+            row_tracking_state.properties(),
+            vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
+        );
+        assert_result_error_with_message(
+            res,
+            "Unsupported: Row commit versions are not enabled on this table",
+        );
+    }
+
+    #[test]
+    fn request_row_commit_versions_requires_materialized_column_name() {
+        let schema = schema_ref! { nullable "id": STRING };
+        let res = get_state_info(
+            schema,
+            vec![],
+            None,
+            ROW_TRACKING_FEATURES,
+            get_string_map(&[("delta.enableRowTracking", "true")]),
+            vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
+        );
+        assert_result_error_with_message(
+            res,
+            "No delta.rowTracking.materializedRowCommitVersionColumnName key found in metadata \
+             configuration",
+        );
     }
 
     #[test]
     fn metadata_column_matches_partition_column() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
-        let res = get_state_info(
-            schema.clone(),
-            vec!["part_col".to_string()],
+        let table_configuration = MockTableConfigurationBuilder::new()
+            .with_schema(schema! {
+                nullable "id": STRING,
+                nullable "part_col": STRING,
+            })
+            .with_partition_columns(["part_col"])
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
+            .with_table_root("s3://my-table")
+            .with_version(1)
+            .build();
+
+        let read_schema = schema_ref! { nullable "id": STRING };
+        let read_schema = Arc::new(
+            read_schema
+                .add_metadata_column("part_col", MetadataColumnSpec::RowId)
+                .expect("Couldn't add metadata col"),
+        );
+        let res = StateInfo::try_new(
+            read_schema,
+            table_configuration.logical_schema(),
+            &table_configuration,
             None,
-            HashMap::new(),
-            vec![("part_col", MetadataColumnSpec::RowId)],
+            &StatsOptions::default(),
+            &PartitionValuesOptions::default(),
+            (),
         );
         assert_result_error_with_message(
             res,
@@ -696,26 +1177,12 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_read_field() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )
-        .with_metadata(HashMap::<String, MetadataValue>::from([
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-                1.into(),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName
-                    .as_ref()
-                    .to_string(),
-                "other".into(),
-            ),
-        ]))]));
+        let schema = schema_ref! { (cm_field("id", 1, "other", DataType::STRING)) };
         let res = get_state_info(
             schema.clone(),
             vec![],
             None,
+            &[], // no table features
             get_string_map(&[("delta.columnMapping.mode", "name")]),
             vec![("other", MetadataColumnSpec::RowIndex)],
         );
@@ -726,48 +1193,776 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stats_columns_with_predicate_errors() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+    fn stats_columns_with_predicate() {
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
 
-        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
-        let res = get_state_info_with_stats(
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             Some(predicate),
+            &[], // no table features
             HashMap::new(),
             vec![],
-            Some(vec![]), // empty stats_columns = include all stats
-        );
+            StatsOptions::all(),
+        )
+        .unwrap();
 
-        assert_result_error_with_message(
-            res,
-            "Cannot use both predicate and stats_columns in the same scan",
+        // physical_stats_schema should be set (from expected_stats_schema)
+        assert!(
+            state_info.physical_stats_schema.is_some(),
+            "physical_stats_schema should be Some when AllColumns is set"
+        );
+        // physical_predicate should still be active for data skipping
+        assert!(
+            matches!(state_info.physical_predicate, PhysicalPredicate::Some(..)),
+            "physical_predicate should be PhysicalPredicate::Some for data skipping"
         );
     }
 
     #[test]
-    fn non_empty_stats_columns_errors() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("value", DataType::LONG),
-        ]));
+    fn stats_columns_with_predicate_merges_columns() {
+        // When specific stats_columns are requested alongside a predicate, the stats
+        // schema should include both the requested columns and predicate-referenced columns.
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+            nullable "extra": LONG,
+        };
 
-        let res = get_state_info_with_stats(
+        let predicate = Arc::new(col!("extra").gt(lit(5i64)));
+
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            Some(predicate),
+            &[],
+            HashMap::new(),
+            vec![],
+            StatsOptions {
+                synthesize_json: true,
+                struct_stats: StructStats::Columns {
+                    requested: vec![column_name!("value")],
+                },
+            },
+        )
+        .unwrap();
+
+        let stats_schema = state_info
+            .physical_stats_schema
+            .expect("should have physical stats schema");
+
+        let min_values = stats_schema
+            .field(MIN_VALUES)
+            .expect("should have minValues");
+        if let DataType::Struct(inner) = min_values.data_type() {
+            assert!(
+                inner.field("value").is_some(),
+                "minValues should have 'value' (requested)"
+            );
+            assert!(
+                inner.field("extra").is_some(),
+                "minValues should have 'extra' (from predicate)"
+            );
+            assert!(
+                inner.field("id").is_none(),
+                "minValues should not have 'id' (neither requested nor in predicate)"
+            );
+        } else {
+            panic!("minValues should be a struct");
+        }
+    }
+
+    #[test]
+    fn non_empty_stats_columns_filters_schema() {
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "value": LONG,
+        };
+
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             None,
+            &[], // no table features
             HashMap::new(),
             vec![],
-            Some(vec![column_name!("value")]), // non-empty stats_columns not yet supported
-        );
+            StatsOptions {
+                synthesize_json: true,
+                struct_stats: StructStats::Columns {
+                    requested: vec![column_name!("value")],
+                },
+            },
+        )
+        .unwrap();
 
-        assert_result_error_with_message(
-            res,
-            "Only empty stats_columns is supported (outputs all stats)",
+        let stats_schema = state_info
+            .physical_stats_schema
+            .expect("should have physical stats schema");
+
+        // Check that minValues/maxValues only contain 'value', not 'id'
+        let min_values = stats_schema
+            .field(MIN_VALUES)
+            .expect("should have minValues");
+        if let DataType::Struct(inner) = min_values.data_type() {
+            assert!(
+                inner.field("value").is_some(),
+                "minValues should have 'value'"
+            );
+            assert!(
+                inner.field("id").is_none(),
+                "minValues should not have 'id'"
+            );
+        } else {
+            panic!("minValues should be a struct");
+        }
+    }
+
+    #[test]
+    fn partition_schema_uses_physical_names_with_column_mapping() {
+        // Verify that physical_partition_schema uses physical column names when column
+        // mapping is enabled. The logical partition column "date" has physical name
+        // "col-date-phys", and the schema should reflect the physical name.
+        let schema = schema_ref! {
+            (cm_field("id", 1, "col-id-phys", DataType::STRING)),
+            (cm_field("date", 2, "col-date-phys", DataType::DATE)),
+            (cm_field("value", 3, "col-value-phys", DataType::LONG)),
+        };
+
+        let predicate = Arc::new(col!("date").lt(lit(100i32)));
+
+        let state_info = get_state_info(
+            schema,
+            vec!["date".to_string()],
+            Some(predicate),
+            &[TableFeature::ColumnMapping],
+            get_string_map(&[("delta.columnMapping.mode", "name")]),
+            vec![],
+        )
+        .unwrap();
+
+        // physical_partition_schema should exist and use the physical column name
+        let partition_schema = state_info
+            .physical_partition_schema
+            .as_ref()
+            .expect("should have physical_partition_schema with predicate + partition columns");
+        assert_eq!(partition_schema.num_fields(), 1);
+        let field = partition_schema.fields().next().unwrap();
+        assert_eq!(
+            field.name(),
+            "col-date-phys",
+            "partition schema should use physical column name, not logical"
         );
+        assert_eq!(field.data_type(), &DataType::DATE);
+    }
+
+    /// `with_struct` builds `physical_partition_schema` from all partition columns (independent of
+    /// predicate and `StatsOptions::none`), and omits it entirely on non-partitioned tables.
+    #[rstest]
+    #[case::all_columns_without_predicate(
+        vec![
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("region", DataType::STRING),
+            StructField::nullable("date", DataType::DATE),
+        ],
+        vec!["region".to_string(), "date".to_string()],
+        StatsOptions::default(),
+        Some(vec!["region", "date"]),
+    )]
+    #[case::survives_stats_none(
+        vec![
+            StructField::nullable("value", DataType::LONG),
+            StructField::nullable("date", DataType::DATE),
+        ],
+        vec!["date".to_string()],
+        StatsOptions::none(),
+        Some(vec!["date"]),
+    )]
+    #[case::omitted_for_non_partitioned_table(
+        vec![
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("value", DataType::STRING),
+        ],
+        vec![],
+        StatsOptions::default(),
+        None,
+    )]
+    fn partition_values_with_struct(
+        #[case] fields: Vec<StructField>,
+        #[case] partition_columns: Vec<String>,
+        #[case] stats: StatsOptions,
+        #[case] expected_names: Option<Vec<&str>>,
+    ) {
+        let schema = Arc::new(StructType::new_unchecked(fields));
+        let state_info = get_state_info_with_options(
+            schema,
+            partition_columns,
+            None,
+            &[],
+            HashMap::new(),
+            vec![],
+            stats,
+            PartitionValuesOptions::with_struct(),
+        )
+        .unwrap();
+
+        match expected_names {
+            Some(expected) => {
+                let partition_schema = state_info
+                    .physical_partition_schema
+                    .as_ref()
+                    .expect("with_struct should build a partition schema");
+                let names: Vec<&str> = partition_schema
+                    .fields()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                assert_eq!(names, expected);
+                // MapToStruct lookups can return null, so every field must be nullable.
+                assert!(partition_schema.fields().all(|f| f.is_nullable()));
+            }
+            None => assert!(state_info.physical_partition_schema.is_none()),
+        }
+    }
+
+    #[test]
+    fn stats_columns_with_column_mapping_uses_physical_names() {
+        let schema = schema_ref! {
+            (cm_field("col_a", 1, "phys_a", DataType::LONG)),
+            (cm_field("col_b", 2, "phys_b", DataType::LONG)),
+            (cm_field("col_c", 3, "phys_c", DataType::LONG)),
+        };
+        let mut props = HashMap::new();
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+
+        // Request col_a via stats_columns (logical), and reference col_b via predicate (logical).
+        // Both must be translated to physical names in the output stats schema.
+        let predicate = Arc::new(col!("col_b").gt(lit(5i64)));
+
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            Some(predicate),
+            &[],
+            props,
+            vec![],
+            StatsOptions {
+                synthesize_json: true,
+                struct_stats: StructStats::Columns {
+                    requested: vec![column_name!("col_a")],
+                },
+            },
+        )
+        .unwrap();
+
+        let stats_schema = state_info
+            .physical_stats_schema
+            .expect("should have physical stats schema");
+
+        assert_stats_leaves(
+            &stats_schema,
+            &["phys_a", "phys_b"],
+            &["col_a", "col_b", "phys_c"],
+        );
+    }
+
+    // === eligible_physical_stats_columns trims the predicate-derived stats schema ===
+
+    /// Flat schema with `n` long columns named `c0..c{n-1}`.
+    fn flat_long_schema(n: usize) -> SchemaRef {
+        Arc::new(StructType::new_unchecked(
+            (0..n)
+                .map(|i| StructField::nullable(format!("c{i}"), DataType::LONG))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Asserts each `present` top-level leaf is in, and each `absent` leaf is out of, both
+    /// `minValues` and `maxValues` of `stats_schema`.
+    fn assert_stats_leaves(stats_schema: &SchemaRef, present: &[&str], absent: &[&str]) {
+        for stats_field in [MIN_VALUES, MAX_VALUES] {
+            let DataType::Struct(inner) = stats_schema
+                .field(stats_field)
+                .unwrap_or_else(|| panic!("should have {stats_field}"))
+                .data_type()
+            else {
+                panic!("{stats_field} should be a struct");
+            };
+            for name in present {
+                assert!(
+                    inner.field(name).is_some(),
+                    "{stats_field} expected '{name}'"
+                );
+            }
+            for name in absent {
+                assert!(
+                    inner.field(name).is_none(),
+                    "{stats_field} unexpected '{name}'"
+                );
+            }
+        }
+    }
+
+    /// `delta.dataSkippingNumIndexedCols=<n>` configuration map.
+    fn num_indexed_cols_config(n: i32) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            n.to_string(),
+        );
+        m
+    }
+
+    /// `delta.dataSkippingStatsColumns=<cols joined by ",">` configuration map.
+    fn stats_columns_config(cols: &[&str]) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("delta.dataSkippingStatsColumns".to_string(), cols.join(","));
+        m
+    }
+
+    /// Both `delta.dataSkippingStatsColumns` and `delta.dataSkippingNumIndexedCols` set
+    /// simultaneously. Per the Delta protocol, the explicit list takes precedence over the
+    /// cap; this helper exists for tests that exercise that precedence.
+    fn both_configs(stats_cols: &[&str], num_indexed: i32) -> HashMap<String, String> {
+        let mut m = stats_columns_config(stats_cols);
+        m.insert(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            num_indexed.to_string(),
+        );
+        m
+    }
+
+    /// `delta.dataSkippingNumIndexedCols` caps the `eligible_physical_stats_columns` set to the
+    /// first N leaves.
+    #[test]
+    fn stats_columns_honors_num_indexed_cols() {
+        let schema = flat_long_schema(5);
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None, // no predicate; just check the cached set
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+        )
+        .unwrap();
+        let cols = HashSet::from_iter([column_name!("c0"), column_name!("c1")]);
+        assert_eq!(state_info.eligible_physical_stats_columns, cols);
+    }
+
+    /// Predicate on a past-cap column: stats schema goes to `None` (no skipping), but
+    /// the physical predicate is retained so engines can still apply it per-row.
+    #[test]
+    fn predicate_on_past_cap_column_drops_stats_schema() {
+        let schema = flat_long_schema(5);
+        let predicate = Arc::new(col!("c4").gt(lit(10i64)));
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            Some(predicate),
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+        )
+        .unwrap();
+        assert!(
+            state_info.physical_stats_schema.is_none(),
+            "Predicate on a past-cap column should produce no stats schema, got {:?}",
+            state_info.physical_stats_schema
+        );
+        assert!(
+            matches!(state_info.physical_predicate, PhysicalPredicate::Some(_, _)),
+            "User predicate must be retained even when stats schema is dropped"
+        );
+    }
+
+    /// Indexed AND past-cap: indexed leaf survives in the stats schema, past-cap leaf
+    /// is dropped.
+    #[test]
+    fn predicate_on_mixed_indexed_and_past_cap_keeps_indexed_only() {
+        let schema = flat_long_schema(5);
+        let predicate = Arc::new(Pred::and(
+            col!("c0").gt(lit(10i64)),
+            col!("c4").gt(lit(10i64)),
+        ));
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            Some(predicate),
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("should have stats schema (indexed arm survives)");
+        // c0 (indexed) survives; c4 (past cap) is dropped.
+        assert_stats_leaves(stats_schema, &["c0"], &["c4"]);
+    }
+
+    /// `numIndexedCols=2` against `{ a, b, s: { c, d } }` keeps `a, b` and drops the
+    /// entire `s` struct, so a predicate on `s.c` produces no stats schema.
+    #[test]
+    fn predicate_on_nested_past_cap_leaf_drops_parent_struct() {
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
+        // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
+        let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            Some(predicate),
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+        )
+        .unwrap();
+        assert!(state_info.physical_stats_schema.is_none());
+        assert!(!state_info.eligible_physical_stats_columns.is_empty());
+        assert!(!state_info
+            .eligible_physical_stats_columns
+            .contains(&column_name!("s.c")));
+    }
+
+    /// `delta.dataSkippingStatsColumns` selects exactly the listed leaves, regardless of
+    /// their position relative to the (default) cap.
+    #[rstest]
+    #[case::single(&["c2"], &["c2"])]
+    #[case::sparse_subset(&["c0", "c3"], &["c0", "c3"])]
+    #[case::all_listed(&["c0", "c1", "c2", "c3", "c4"], &["c0", "c1", "c2", "c3", "c4"])]
+    fn stats_columns_honors_explicit_stats_columns(
+        #[case] listed: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let schema = flat_long_schema(5);
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            &[],
+            stats_columns_config(listed),
+            vec![],
+        )
+        .unwrap();
+        let expected_cols: HashSet<ColumnName> =
+            expected.iter().map(|s| ColumnName::new([*s])).collect();
+        assert_eq!(state_info.eligible_physical_stats_columns, expected_cols);
+    }
+
+    /// `numIndexedCols=3` against `{ a, b, s: { c, d } }` keeps `a, b, s.c` and drops
+    /// `s.d`. A predicate on both `s.c` and `s.d` keeps the `s` struct under
+    /// `minValues` / `maxValues` with `c` only.
+    #[test]
+    fn predicate_on_nested_mixed_keeps_intersection_under_parent_struct() {
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
+        let predicate = Arc::new(Pred::and(
+            col!("s.c").gt(lit(10i64)),
+            col!("s.d").gt(lit(10i64)),
+        ));
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            Some(predicate),
+            &[],
+            num_indexed_cols_config(3),
+            vec![],
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("indexed arm survives");
+        for stats_field in [MIN_VALUES, MAX_VALUES] {
+            let DataType::Struct(outer) = stats_schema
+                .field(stats_field)
+                .unwrap_or_else(|| panic!("should have {stats_field}"))
+                .data_type()
+            else {
+                panic!("{stats_field} should be a struct");
+            };
+            let DataType::Struct(inner) = outer
+                .field("s")
+                .unwrap_or_else(|| panic!("{stats_field} should have s"))
+                .data_type()
+            else {
+                panic!("{stats_field}.s should be a struct");
+            };
+            assert!(
+                inner.field("c").is_some(),
+                "{stats_field}.s should keep c (indexed)"
+            );
+            assert!(
+                inner.field("d").is_none(),
+                "{stats_field}.s should drop d (past cap)"
+            );
+        }
+    }
+
+    /// `dataSkippingStatsColumns` with a parent struct path admits every leaf under that
+    /// parent (the trie matches by prefix). `{ a, s: { c, d } }` with the property set to
+    /// `"s"` should produce `{ s.c, s.d }` (and exclude `a`, which is not in the list).
+    #[test]
+    fn stats_columns_admits_all_children_of_nested_parent_in_explicit_list() {
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            &[],
+            stats_columns_config(&["s"]),
+            vec![],
+        )
+        .unwrap();
+        let expected = HashSet::from_iter([column_name!("s.c"), column_name!("s.d")]);
+        assert_eq!(state_info.eligible_physical_stats_columns, expected);
+    }
+
+    /// `dataSkippingStatsColumns` ("A") takes precedence over `dataSkippingNumIndexedCols`
+    /// ("B") whether A wants more columns than B allows or fewer.
+    #[rstest]
+    #[case::a_broader_than_b(&["c0", "c3", "c4"], 2, &["c0", "c3", "c4"])]
+    #[case::a_narrower_than_b(&["c0"], 3, &["c0"])]
+    fn stats_columns_explicit_list_overrides_num_indexed_cols(
+        #[case] listed: &[&str],
+        #[case] num_indexed: i32,
+        #[case] expected: &[&str],
+    ) {
+        let schema = flat_long_schema(5);
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            &[],
+            both_configs(listed, num_indexed),
+            vec![],
+        )
+        .unwrap();
+        let expected_cols: HashSet<ColumnName> =
+            expected.iter().map(|s| ColumnName::new([*s])).collect();
+        assert_eq!(state_info.eligible_physical_stats_columns, expected_cols);
+    }
+
+    #[rstest]
+    #[case::all_extra_past_cap(
+        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c4")]),
+        num_indexed_cols_config(2),
+        &["c0", "c1", "c4"], &["c2", "c3"], &["c0", "c1", "c4"],
+    )]
+    #[case::all_no_extra(
+        StatsOptions::all_struct(),
+        num_indexed_cols_config(2),
+        &["c0", "c1"], &["c2", "c3", "c4"], &["c0", "c1"],
+    )]
+    #[case::extra_within_cap_noop(
+        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c0")]),
+        num_indexed_cols_config(2),
+        &["c0", "c1"], &["c2", "c3", "c4"], &["c0", "c1"],
+    )]
+    #[case::columns_within_and_past_cap(
+        StatsOptions::struct_columns(vec![column_name!("c0"), column_name!("c4")]),
+        num_indexed_cols_config(2),
+        &["c0", "c4"], &["c1", "c2", "c3"], &["c0", "c1", "c4"],
+    )]
+    #[case::columns_only_past_cap(
+        StatsOptions::struct_columns(vec![column_name!("c4")]),
+        num_indexed_cols_config(2),
+        &["c4"], &["c0", "c1", "c2", "c3"], &["c0", "c1", "c4"],
+    )]
+    #[case::extra_with_stats_columns(
+        StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c4")]),
+        stats_columns_config(&["c0"]),
+        &["c0", "c4"], &["c1", "c2", "c3"], &["c0", "c4"],
+    )]
+    #[case::unresolvable_extra_dropped(
+        StatsOptions::all_struct_with_extra_indexed(vec![
+            column_name!("c4"),
+            column_name!("does_not_exist"),
+        ]),
+        num_indexed_cols_config(2),
+        &["c0", "c1", "c4"], &["c2", "c3"], &["c0", "c1", "c4"],
+    )]
+    fn extra_indexed_schema_and_gate(
+        #[case] stats: StatsOptions,
+        #[case] config: HashMap<String, String>,
+        #[case] present: &[&str],
+        #[case] absent: &[&str],
+        #[case] expected_set: &[&str],
+    ) {
+        let state_info = get_state_info_with_stats(
+            flat_long_schema(5),
+            vec![],
+            None,
+            &[],
+            config,
+            vec![],
+            stats,
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("stats schema present");
+        assert_stats_leaves(stats_schema, present, absent);
+        let expected: HashSet<ColumnName> =
+            expected_set.iter().map(|s| ColumnName::new([*s])).collect();
+        assert_eq!(state_info.eligible_physical_stats_columns, expected);
+    }
+
+    #[test]
+    fn extra_indexed_column_widens_internal_skipping_gate() {
+        let state_info = get_state_info_with_stats(
+            flat_long_schema(5),
+            vec![],
+            Some(Arc::new(col!("c4").gt(lit(10i64)))),
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+            StatsOptions::all_struct_with_extra_indexed(vec![column_name!("c4")]),
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("stats schema present because c4 is extra_indexed");
+        assert_stats_leaves(stats_schema, &["c4"], &[]);
+        assert!(state_info
+            .eligible_physical_stats_columns
+            .contains(&column_name!("c4")));
+    }
+
+    #[test]
+    fn extra_indexed_nested_subfield_past_cap_appears() {
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(3),
+            vec![],
+            StatsOptions::all_struct_with_extra_indexed(vec![column_name!("s.d")]),
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("stats schema present");
+        for stats_field in [MIN_VALUES, MAX_VALUES] {
+            let DataType::Struct(inner) = stats_schema.field(stats_field).unwrap().data_type()
+            else {
+                panic!("{stats_field} should be a struct");
+            };
+            let DataType::Struct(s) = inner.field("s").expect("s present").data_type() else {
+                panic!("s should be a struct");
+            };
+            assert!(s.field("c").is_some(), "s.c (indexed) present");
+            assert!(
+                s.field("d").is_some(),
+                "s.d (extra_indexed, past cap) present"
+            );
+        }
+        assert!(state_info
+            .eligible_physical_stats_columns
+            .contains(&column_name!("s.d")));
+    }
+
+    #[test]
+    fn extra_indexed_struct_column_widens_gate_to_leaves() {
+        // A struct named as extra_indexed must widen the skipping gate to its leaf paths, not the
+        // parent path, so a leaf predicate (matched by exact membership) can still prune.
+        let schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "c": LONG,
+                nullable "d": LONG,
+            },
+        };
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+            StatsOptions::all_struct_with_extra_indexed(vec![column_name!("s")]),
+        )
+        .unwrap();
+        assert!(state_info
+            .eligible_physical_stats_columns
+            .contains(&column_name!("s.c")));
+        assert!(state_info
+            .eligible_physical_stats_columns
+            .contains(&column_name!("s.d")));
+        assert!(
+            !state_info
+                .eligible_physical_stats_columns
+                .contains(&column_name!("s")),
+            "the parent path must not stand in for its leaves"
+        );
+    }
+
+    #[test]
+    fn extra_indexed_column_resolves_physical_name_under_column_mapping() {
+        let schema = schema_ref! {
+            (cm_field("col_a", 1, "phys_a", DataType::LONG)),
+            (cm_field("col_b", 2, "phys_b", DataType::LONG)),
+            (cm_field("col_c", 3, "phys_c", DataType::LONG)),
+        };
+        let mut props = HashMap::new();
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+        props.insert(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "1".to_string(),
+        );
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            None,
+            &[],
+            props,
+            vec![],
+            StatsOptions::all_struct_with_extra_indexed(vec![column_name!("col_c")]),
+        )
+        .unwrap();
+        let stats_schema = state_info
+            .physical_stats_schema
+            .as_ref()
+            .expect("stats schema present");
+        assert_stats_leaves(stats_schema, &["phys_a", "phys_c"], &["col_c", "phys_b"]);
+        assert!(state_info
+            .eligible_physical_stats_columns
+            .contains(&column_name!("phys_c")));
     }
 }

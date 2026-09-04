@@ -1,0 +1,8 @@
+Reading table at ../../../../kernel/tests/data/table-with-geo/
+version: 0
+
+Schema:
+├─ geom: geometry(OGC:CRS84)
+└─ geog: geography(OGC:CRS84, spherical)
+
+[No data]

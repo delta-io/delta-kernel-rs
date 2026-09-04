@@ -1,15 +1,14 @@
+use std::collections::HashMap;
+
 use super::*;
 use crate::expressions::{
-    column_expr, column_name, column_pred, ArrayData, Expression as Expr, OpaqueExpressionOp,
+    col, column_name, column_pred, lit, ArrayData, Expression as Expr, OpaqueExpressionOp,
     OpaquePredicateOp, Predicate as Pred, ScalarExpressionEvaluator, StructData,
 };
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
 use crate::schema::ArrayType;
-use crate::DataType;
-use crate::DeltaResult;
-
-use std::collections::HashMap;
+use crate::{DataType, DeltaResult};
 
 /// Helper trait to allow expect_eq! to work with both Option<Scalar> and Option<bool>
 trait LogicalEq {
@@ -50,6 +49,47 @@ impl ResolveColumnAsScalar for Scalar {
     fn resolve_column(&self, _col: &ColumnName) -> Option<Scalar> {
         Some(self.clone())
     }
+}
+
+/// Resolves the data-skipping rewrite's `is_add` guard column to a fixed boolean and every other
+/// column to the wrapped scalar. Lets opaque-rewrite tests evaluate the guarded predicate
+/// (`OR(NOT is_add, ...)`) for Add rows (`is_add = true`) and Remove rows (`is_add = false`).
+struct IsAddResolver(Scalar, bool);
+
+impl ResolveColumnAsScalar for IsAddResolver {
+    fn resolve_column(&self, col: &ColumnName) -> Option<Scalar> {
+        if *col == column_name!("is_add") {
+            Some(Scalar::from(self.1))
+        } else {
+            Some(self.0.clone())
+        }
+    }
+}
+
+#[rstest::rstest]
+#[case::string_to_integer_succeeds(
+    Scalar::String("42".to_string()),
+    DataType::INTEGER,
+    Some(Scalar::Integer(42))
+)]
+#[case::string_to_integer_failure_is_null(
+    Scalar::String("not an integer".to_string()),
+    DataType::INTEGER,
+    Some(Scalar::Null(DataType::INTEGER))
+)]
+#[case::identity_passthrough(Scalar::Long(42), DataType::LONG, Some(Scalar::Long(42)))]
+#[case::null_source_uses_target_type(
+    Scalar::Null(DataType::STRING),
+    DataType::INTEGER,
+    Some(Scalar::Null(DataType::INTEGER))
+)]
+#[case::unsupported_pair(Scalar::Long(42), DataType::INTEGER, None)]
+fn test_cast_scalar(
+    #[case] value: Scalar,
+    #[case] target: DataType,
+    #[case] expected: Option<Scalar>,
+) {
+    assert_eq!(cast_scalar(value, &target), expected);
 }
 
 #[rstest::rstest]
@@ -225,22 +265,22 @@ fn test_default_scalar_arithmetic() {
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     for ((l, r), (add, sub, mul, div)) in left.iter().zip(right).zip(expected) {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) + Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) + lit(r.clone()))),
             Some(add),
             "add({l:?}, {r:?})"
         );
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) - Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) - lit(r.clone()))),
             Some(sub),
             "sub({l:?}, {r:?})"
         );
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) * Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) * lit(r.clone()))),
             Some(mul),
             "mul({l:?}, {r:?})"
         );
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) / Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) / lit(r.clone()))),
             Some(div),
             "div({l:?}, {r:?})"
         );
@@ -248,27 +288,27 @@ fn test_default_scalar_arithmetic() {
 
     // Invalid type combinations
     expect_eq!(
-        filter.eval_expr(&(Expr::literal("hi") + Expr::literal("ho"))),
+        filter.eval_expr(&(lit("hi") + lit("ho"))),
         None,
         "add(string, string)"
     );
     expect_eq!(
-        filter.eval_expr(&(Expr::literal(1i8) + Expr::literal(1i64))),
+        filter.eval_expr(&(lit(1i8) + lit(1i64))),
         None,
         "add(byte, long)"
     );
     expect_eq!(
-        filter.eval_expr(&(Expr::literal(1i8) - Expr::literal(1i64))),
+        filter.eval_expr(&(lit(1i8) - lit(1i64))),
         None,
         "sub(byte, long)"
     );
     expect_eq!(
-        filter.eval_expr(&(Expr::literal(1i8) * Expr::literal(1i64))),
+        filter.eval_expr(&(lit(1i8) * lit(1i64))),
         None,
         "mul(byte, long)"
     );
     expect_eq!(
-        filter.eval_expr(&(Expr::literal(1i8) / Expr::literal(1i64))),
+        filter.eval_expr(&(lit(1i8) / lit(1i64))),
         None,
         "div(byte, long)"
     );
@@ -282,7 +322,7 @@ fn test_default_scalar_arithmetic() {
     ];
     for (l, r) in args {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) + Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) + lit(r.clone()))),
             None,
             "add({l:?}, {r:?})"
         );
@@ -297,7 +337,7 @@ fn test_default_scalar_arithmetic() {
     ];
     for (l, r) in args {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) - Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) - lit(r.clone()))),
             None,
             "sub({l:?}, {r:?})"
         );
@@ -312,7 +352,7 @@ fn test_default_scalar_arithmetic() {
     ];
     for arg in args {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(arg.clone()) * Expr::literal(arg.clone()))),
+            filter.eval_expr(&(lit(arg.clone()) * lit(arg.clone()))),
             None,
             "mul({arg:?}, {arg:?})"
         );
@@ -327,7 +367,7 @@ fn test_default_scalar_arithmetic() {
     ];
     for (l, r) in args {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) / Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) / lit(r.clone()))),
             None,
             "div({l:?}, {r:?})"
         );
@@ -377,7 +417,8 @@ fn test_eval_binary_scalars() {
     }
 }
 
-// NOTE: We're testing routing here -- the actual comparisons are already validated by test_eval_binary_scalars.
+// NOTE: We're testing routing here -- the actual comparisons are already validated by
+// test_eval_binary_scalars.
 #[test]
 fn test_eval_binary_columns() {
     let columns = HashMap::from_iter(vec![
@@ -385,8 +426,8 @@ fn test_eval_binary_columns() {
         (column_name!("y"), Scalar::from(10)),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(columns);
-    let x = column_expr!("x");
-    let y = column_expr!("y");
+    let x = col!("x");
+    let y = col!("y");
     for inverted in [true, false] {
         assert_eq!(
             filter.eval_pred_binary(BinaryPredicateOp::Equal, &x, &y, inverted),
@@ -429,7 +470,7 @@ fn test_eval_junction() {
             .cloned()
             .map(|v| match v {
                 Some(v) => Pred::literal(v),
-                None => Pred::null_literal(),
+                None => Pred::NULL,
             })
             .collect();
         for inverted in [true, false] {
@@ -489,7 +530,7 @@ fn test_eval_not(
 #[test]
 fn test_eval_is_null() {
     use crate::expressions::UnaryPredicateOp::IsNull;
-    let expr = column_expr!("x");
+    let expr = col!("x");
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     expect_eq!(
         filter.eval_pred_unary(IsNull, &expr, true),
@@ -502,7 +543,7 @@ fn test_eval_is_null() {
         "x IS NULL"
     );
 
-    let expr = Expr::literal(1);
+    let expr = lit(1);
     expect_eq!(
         filter.eval_pred_unary(IsNull, &expr, true),
         Some(true),
@@ -576,14 +617,34 @@ fn test_eval_distinct() {
     );
 }
 
+#[test]
+fn test_default_evaluator_resolves_column_then_casts_and_compares() {
+    let col = column_name!("x");
+    let filter = DefaultKernelPredicateEvaluator::from(HashMap::from([(
+        col.clone(),
+        Scalar::String("10".to_string()),
+    )]));
+
+    assert_eq!(
+        filter.eval_pred_cast(
+            BinaryPredicateOp::LessThan,
+            &col,
+            &DataType::INTEGER,
+            &Scalar::Integer(20),
+            false,
+        ),
+        Some(true)
+    );
+}
+
 // NOTE: We're testing routing here -- the actual comparisons are already validated by
 // test_eval_binary_scalars.
 #[test]
 fn eval_binary() {
     use crate::expressions::BinaryPredicateOp;
 
-    let col = column_expr!("x");
-    let val = Expr::literal(10);
+    let col = col!("x");
+    let val = lit(10);
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
 
     for inverted in [true, false] {
@@ -629,6 +690,24 @@ fn eval_binary() {
             "DISTINCT(10, x) (inverted: {inverted})"
         );
     }
+}
+
+#[rstest::rstest]
+#[case::less_than(BinaryPredicateOp::LessThan, false)]
+#[case::greater_than(BinaryPredicateOp::GreaterThan, true)]
+fn test_eval_binary_commutes_literal_and_cast_column(
+    #[case] op: BinaryPredicateOp,
+    #[case] expected: bool,
+    #[values(false, true)] inverted: bool,
+) {
+    let val = lit(10);
+    let cast_col = Expr::cast(col!("x"), DataType::INTEGER);
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
+
+    assert_eq!(
+        filter.eval_pred_binary(op, &val, &cast_col, inverted),
+        Some(expected != inverted)
+    );
 }
 
 #[derive(Debug, PartialEq)]
@@ -713,8 +792,8 @@ impl OpaquePredicateOp for OpaqueLessThanOp {
             _ => return None,
         };
 
-        // NOTE: `evaluator.partial_cmp_min`_stat returns `Pred::Binary`. That's fine, because we have
-        // separate testing for the `eval_pred_scalar` path.
+        // NOTE: `evaluator.partial_cmp_min`_stat returns `Pred::Binary`. That's fine, because we
+        // have separate testing for the `eval_pred_scalar` path.
         evaluator.partial_cmp_min_stat(col, val, ord, inverted)
     }
 }
@@ -734,30 +813,38 @@ impl ParquetStatsProvider for MinStatsValue {
         Some(0)
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        1
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
+        Some(1)
     }
 }
 
 #[test]
 fn test_eval_opaque_simple() {
-    let expr = Expr::opaque(OpaqueLessThanOp, vec![column_expr!("x"), Expr::literal(10)]);
-    let pred = Pred::opaque(OpaqueLessThanOp, vec![column_expr!("x"), Expr::literal(10)]);
+    let expr = Expr::opaque(OpaqueLessThanOp, vec![col!("x"), lit(10)]);
+    let pred = Pred::opaque(OpaqueLessThanOp, vec![col!("x"), lit(10)]);
     let skipping_pred = as_data_skipping_predicate(&pred).unwrap();
 
     assert_eq!(expr, expr);
     assert_eq!(pred, pred);
 
-    // Test direct expression and predicate eval, and indirect data skipping
+    // Test direct expression and predicate eval, and indirect data skipping. The rewrite wraps
+    // opaque predicates with `OR(NOT is_add, ...)`, so skipping assertions resolve `is_add`.
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     assert_eq!(filter.eval_expr(&expr), Some(Scalar::from(true)), "x < 10");
     assert_eq!(filter.eval(&pred), Some(true), "x < 10");
+    let filter = DefaultKernelPredicateEvaluator::from(IsAddResolver(Scalar::from(1), true));
     assert_eq!(filter.eval(&skipping_pred), Some(true), "x < 10");
 
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(100));
     assert_eq!(filter.eval_expr(&expr), Some(Scalar::from(false)), "x < 10");
     assert_eq!(filter.eval(&pred), Some(false), "x < 10");
+    let filter = DefaultKernelPredicateEvaluator::from(IsAddResolver(Scalar::from(100), true));
     assert_eq!(filter.eval(&skipping_pred), Some(false), "x < 10");
+
+    // Remove-row guard: even when the stats would prune, a non-Add row must be kept -- the
+    // opaque rewrite cannot drop Removes from log replay.
+    let filter = DefaultKernelPredicateEvaluator::from(IsAddResolver(Scalar::from(100), false));
+    assert_eq!(filter.eval(&skipping_pred), Some(true), "remove row kept");
 
     // Test direct data skipping
     let filter = MinStatsValue(Scalar::from(1));
@@ -770,7 +857,7 @@ fn test_eval_opaque_simple() {
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     let pred = Pred::from_expr(Expr::from(Pred::opaque(
         OpaqueLessThanOp,
-        vec![column_expr!("x"), Expr::literal(10)],
+        vec![col!("x"), lit(10)],
     )));
     assert_eq!(filter.eval(&pred), Some(true), "pred(expr(x < 10))");
 }
@@ -839,30 +926,53 @@ impl ParquetStatsProvider for OneStatsValue {
         Some(nullcount)
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        1
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
+        Some(1)
     }
 }
 
 #[test]
 fn test_eval_opaque_predicate() {
-    let pred = Pred::opaque(OpaqueAndOp, vec![column_expr!("x"), Expr::literal(true)]);
+    let pred = Pred::opaque(OpaqueAndOp, vec![col!("x"), lit(true)]);
     let skipping_pred = as_data_skipping_predicate(&pred).unwrap();
 
-    // Test direct evaluation and indirect data skipping
+    // Direct evaluation works for any column type.
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(true));
     assert_eq!(filter.eval(&pred), Some(true), "AND(x, TRUE)");
-    assert_eq!(filter.eval(&skipping_pred), Some(true), "AND(x, TRUE)");
 
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(false));
     assert_eq!(filter.eval(&pred), Some(false), "AND(x, TRUE)");
-    assert_eq!(filter.eval(&skipping_pred), Some(false), "AND(x, TRUE)");
 
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::Null(DataType::BOOLEAN));
     assert_eq!(filter.eval(&pred), None, "AND(x, TRUE)");
-    assert_eq!(filter.eval(&skipping_pred), None, "AND(x, TRUE)");
 
-    // Test direct data skipping
+    // Indirect data skipping: `x` is Boolean and Boolean columns carry no min/max stats
+    // per the Delta protocol (see `is_skipping_eligible_datatype`). The rewrite therefore
+    // drops the `x` arm, leaving `AND(NULL, TRUE)` which evaluates to NULL for every filter.
+    // The rewrite's `OR(NOT is_add, ...)` guard is transparent for Add rows (`is_add = true`).
+    for value in [
+        Scalar::from(true),
+        Scalar::from(false),
+        Scalar::Null(DataType::BOOLEAN),
+    ] {
+        assert_eq!(
+            DefaultKernelPredicateEvaluator::from(IsAddResolver(value, true)).eval(&skipping_pred),
+            None,
+            "AND(x, TRUE) -- Boolean min/max unsupported"
+        );
+    }
+
+    // Remove-row guard: non-Add rows are always kept by the rewritten predicate.
+    assert_eq!(
+        DefaultKernelPredicateEvaluator::from(IsAddResolver(Scalar::from(false), false))
+            .eval(&skipping_pred),
+        Some(true),
+        "remove row kept"
+    );
+
+    // Direct evaluation through a `ParquetStatsProvider` still works because that path
+    // doesn't go through min/max rewriting -- `OpaqueAndOp::eval_pred_scalar` evaluates
+    // each arm directly against the provider.
     let filter = OneStatsValue(Scalar::from(true));
     assert_eq!(filter.eval(&pred), Some(true), "AND(x, TRUE)");
 
@@ -877,12 +987,12 @@ fn test_eval_opaque_predicate() {
 fn test_eval_opaque_complex() {
     // A contrived example that uses an opaque predicate that references an opaque expression
     let complex_pred = Pred::and(
-        Pred::lt(column_expr!("x"), Scalar::from(true)),
+        Pred::lt(col!("x"), lit(true)),
         Pred::opaque(
             OpaqueLessThanOp,
             vec![
-                column_expr!("x"),
-                Expr::opaque(OpaqueLessThanOp, vec![Expr::literal(2), Expr::literal(5)]),
+                col!("x"),
+                Expr::opaque(OpaqueLessThanOp, vec![lit(2), lit(5)]),
             ],
         ),
     );
@@ -909,10 +1019,13 @@ fn test_eval_opaque_complex() {
         Some(false),
         "AND(x < TRUE, x < (2 < 5))"
     );
+    // Post-fold, `x < TRUE` no longer produces a stats-based skipping arm because Boolean
+    // columns carry no min/max stats per the Delta protocol. Combined with the already-NULL
+    // opaque-expression arm, `complex_skipping_pred` evaluates to NULL for every filter.
     assert_eq!(
         filter.eval(&complex_skipping_pred),
-        Some(false),
-        "AND(x < TRUE, x < (2 < 5))"
+        None,
+        "AND(x < TRUE, x < (2 < 5)) -- Boolean min/max unsupported"
     );
 }
 
@@ -933,12 +1046,8 @@ impl ResolveColumnAsScalar for NullColumnResolver {
 
 #[test]
 fn test_sql_where() {
-    let col = &column_expr!("x");
     let col_pred = &column_pred!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(1));
-    const NULL: Pred = Pred::null_literal();
-    const FALSE: Pred = Pred::literal(false);
-    const TRUE: Pred = Pred::literal(true);
     let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
     let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
 
@@ -966,7 +1075,7 @@ fn test_sql_where() {
     );
 
     // SQL eval does not modify behavior of IS NULL
-    let pred = &Pred::is_null(col.clone());
+    let pred = &col!("x").is_null();
     expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
 
     // NOT a gets skipped when NULL but not when missing
@@ -975,52 +1084,54 @@ fn test_sql_where() {
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Injected NULL checks only short circuit if inputs are NULL
-    let pred = &Pred::lt(FALSE, TRUE);
+    let pred = &Pred::lt(Pred::FALSE, Pred::TRUE);
     expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), Some(true), "{pred}");
 
     // Contrast normal vs SQL WHERE semantics - comparison
-    let pred = &Pred::lt(col.clone(), VAL);
+    let pred = &Pred::lt(col!("x"), VAL);
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     // NULL check produces NULL due to missing column
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let pred = &Pred::lt(VAL, col.clone());
+    let pred = &Pred::lt(VAL, col!("x"));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let pred = &Pred::distinct(VAL, col.clone());
+    let pred = &Pred::distinct(VAL, col!("x"));
     expect_eq!(null_filter.eval(pred), Some(true), "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let pred = &Pred::distinct(NULL, col.clone());
+    let pred = &Pred::distinct(Pred::NULL, col!("x"));
     expect_eq!(null_filter.eval(pred), Some(false), "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Contrast normal vs SQL WHERE semantics - comparison inside AND
-    let pred = &Pred::and(TRUE, Pred::lt(col.clone(), VAL));
+    let pred = &Pred::and(Pred::TRUE, Pred::lt(col!("x"), VAL));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    // NULL allows static skipping under SQL semantics
-    let pred = &Pred::and(NULL, Pred::lt(col.clone(), VAL));
+    // NULL literal is treated as unknown (not false) under eval_sql_where, so it does not
+    // force static skipping. This prevents incorrect pruning when indirect data skipping
+    // rewriters use NULL as a sentinel for unsupported predicate arms.
+    let pred = &Pred::and(Pred::NULL, Pred::lt(col!("x"), VAL));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
-    expect_eq!(empty_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Contrast normal vs. SQL WHERE semantics - comparison inside AND inside AND
-    let pred = &Pred::and(TRUE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
+    let pred = &Pred::and(Pred::TRUE, Pred::and(Pred::TRUE, Pred::lt(col!("x"), VAL)));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Ditto for comparison inside OR inside AND
-    let pred = &Pred::or(FALSE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
+    let pred = &Pred::or(Pred::FALSE, Pred::and(Pred::TRUE, Pred::lt(col!("x"), VAL)));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");

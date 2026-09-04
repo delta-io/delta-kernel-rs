@@ -1,36 +1,37 @@
 //! Utility functions for the variant type and variant-related table features.
 
-use crate::actions::Protocol;
-use crate::schema::{Schema, SchemaTransform, StructType};
+use crate::schema::{Schema, StructType};
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-use std::borrow::Cow;
 
 /// Schema visitor that checks if any column in the schema uses VARIANT type
-#[derive(Debug, Default)]
-pub(crate) struct UsesVariant(pub(crate) bool);
+pub(crate) struct UsesVariant;
 
 impl<'a> SchemaTransform<'a> for UsesVariant {
-    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
-        self.0 = true;
-        None
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_variant(&mut self, _: &'a StructType) -> Result<(), ()> {
+        Err(())
     }
 }
 
-pub(crate) fn validate_variant_type_feature_support(
-    schema: &Schema,
-    protocol: &Protocol,
-) -> DeltaResult<()> {
+/// Checks if any column in the schema (including nested columns) has VARIANT type.
+pub(crate) fn schema_contains_variant_type(schema: &Schema) -> bool {
+    UsesVariant.transform_struct(schema).is_err()
+}
+
+pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
     // Both the reader and writer need to have either the VariantType or the VariantTypePreview
     // features.
+    let protocol = tc.protocol();
     if !protocol.has_table_feature(&TableFeature::VariantType)
         && !protocol.has_table_feature(&TableFeature::VariantTypePreview)
     {
-        let mut uses_variant = UsesVariant::default();
-        let _ = uses_variant.transform_struct(schema);
         require!(
-            !uses_variant.0,
+            !schema_contains_variant_type(&tc.logical_schema()),
             Error::unsupported(
                 "Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features"
             )
@@ -41,11 +42,12 @@ pub(crate) fn validate_variant_type_feature_support(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::actions::Protocol;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema, DataType, StructField};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, assert_schema_feature_validation,
+    };
 
     #[test]
     fn test_is_unshredded_variant() {
@@ -71,98 +73,49 @@ mod tests {
 
     #[test]
     fn test_variant_feature_validation() {
-        let features = [
+        let schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "v": (DataType::unshredded_variant()),
+        };
+        let schema_without = schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
+        let nested_schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "nested": { nullable "inner_v": (DataType::unshredded_variant()) },
+        };
+        let protocol_without =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+        let err_msg = "Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features";
+
+        for (reader, writer) in [
             (TableFeature::VariantType, TableFeature::VariantType),
             (
                 TableFeature::VariantTypePreview,
                 TableFeature::VariantTypePreview,
             ),
-        ];
-        let schema_with_variant = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("v", DataType::unshredded_variant(), true),
-        ]);
+        ] {
+            let protocol_with = Protocol::try_new_modern([&reader], [&writer]).unwrap();
 
-        let schema_without_variant = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]);
+            // ReaderWriter features must be listed on both sides
+            assert_result_error_with_message(
+                Protocol::try_new_modern([&reader], TableFeature::EMPTY_LIST),
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+            );
+            assert_result_error_with_message(
+                Protocol::try_new_modern(TableFeature::EMPTY_LIST, [&writer]),
+                "Writer features must be Writer-only or also listed in reader features",
+            );
 
-        // Nested schema with VARIANT
-        let nested_schema_with_variant = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
-                    "inner_v",
-                    DataType::unshredded_variant(),
-                    true,
-                )]))),
-                true,
-            ),
-        ]);
-        features
-            .iter()
-            .for_each(|(variant_reader, variant_writer)| {
-                // Protocol with variantType features
-                let protocol_with_features =
-                    Protocol::try_new(3, 7, Some([variant_reader]), Some([variant_writer]))
-                        .unwrap();
-
-                // Protocol without variantType features
-                let protocol_without_features = Protocol::try_new(
-                    3,
-                    7,
-                    Some::<Vec<String>>(vec![]),
-                    Some::<Vec<String>>(vec![]),
-                )
-                .unwrap();
-
-                // Since variant features are ReaderWriter feature, protocol that
-                // lists a variant feature in only one of reader/writer feature = ERR
-                let protocol_without_writer_feature =
-                    Protocol::try_new(3, 7, Some([variant_reader]), Some::<Vec<String>>(vec![]));
-                assert_result_error_with_message(protocol_without_writer_feature,
-                    "Reader features must contain only ReaderWriter features that are also listed in writer features");
-
-                let protocol_without_reader_feature =
-                    Protocol::try_new(3, 7, Some::<Vec<String>>(vec![]), Some([variant_writer]));
-                assert_result_error_with_message(protocol_without_reader_feature,
-                    "Writer features must be Writer-only or also listed in reader features");
-
-                // Schema with VARIANT + Protocol with features = OK
-                validate_variant_type_feature_support(
-                    &schema_with_variant,
-                    &protocol_with_features,
-                )
-                .expect("Should succeed when features are present");
-
-                // Schema without VARIANT + Protocol without features = OK
-                validate_variant_type_feature_support(
-                    &schema_without_variant,
-                    &protocol_without_features,
-                )
-                .expect("Should succeed when no VARIANT columns are present");
-
-                // Schema without VARIANT + Protocol with features = OK
-                validate_variant_type_feature_support(
-                    &schema_without_variant,
-                    &protocol_with_features,
-                )
-                .expect("Should succeed when no VARIANT columns are present, even with features");
-
-                // Schema with VARIANT + Protocol without features = ERROR
-                let result = validate_variant_type_feature_support(
-                    &schema_with_variant,
-                    &protocol_without_features,
-                );
-                assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
-
-                let result = validate_variant_type_feature_support(
-                    &nested_schema_with_variant,
-                    &protocol_without_features,
-                );
-                assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
-            });
+            assert_schema_feature_validation(
+                &schema_with,
+                &schema_without,
+                &protocol_with,
+                &protocol_without,
+                &[&nested_schema_with],
+                err_msg,
+            );
+        }
     }
 }

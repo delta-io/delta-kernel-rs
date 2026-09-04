@@ -1,32 +1,74 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
+#[doc(hidden)]
+pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
 pub use self::column_names::{
-    column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
+    col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
     ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
-use self::transforms::{ExpressionTransform as _, GetColumnReferences};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
-use crate::{DataType, DeltaResult, DynPartialEq};
+pub use crate::struct_patch::{ExpressionFieldPatch, ExpressionStructPatch};
+use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::utils::CollectInto;
+use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
+pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
-pub mod transforms;
+mod sql;
+pub(crate) use self::sql::parse_sql;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
+
+/// Build an [`Expression::Literal`] from anything that converts into a [`Scalar`].
+///
+/// Concise alternative to [`Expression::literal`] for plan builders. Accepts the same value
+/// types [`Scalar`] does (`i32`, `i64`, `&str`, `bool`, ...).
+///
+/// ```
+/// use delta_kernel::expressions::lit;
+/// let _zero = lit(0i64);
+/// ```
+pub fn lit(value: impl Into<Scalar>) -> Expression {
+    Expression::literal(value)
+}
+
+/// Build a typed NULL [`Expression::Literal`].
+///
+/// Prefer this over `lit(Scalar::Null(...))`. Accepts anything convertible into a [`DataType`]
+/// (including container types like [`StructType`](crate::schema::StructType)), so callers can
+/// skip an explicit `DataType::from(...)` wrapper.
+///
+/// ```
+/// # use delta_kernel::expressions::{lit, null_lit, Scalar};
+/// # use delta_kernel::schema::DataType;
+/// assert_eq!(
+///     lit(Scalar::Null(DataType::LONG)),
+///     null_lit(DataType::LONG),
+/// );
+/// ```
+pub fn null_lit(data_type: impl Into<DataType>) -> Expression {
+    Expression::Literal(Scalar::null(data_type))
+}
+
+/// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are
+/// expressions, lowered into an [`ExpressionStructPatch`] that can be embedded in an
+/// [`Expression`].
+pub type ExpressionStructPatchBuilder = crate::struct_patch::StructPatchBuilder<ExpressionRef>;
 
 ////////////////////////////////////////////////////////////////////////
 // Operators
@@ -35,58 +77,127 @@ pub type PredicateRef = std::sync::Arc<Predicate>;
 /// A unary predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum UnaryPredicateOp {
-    /// Unary Is Null
+    /// SQL `expr IS NULL`: `true` when the input is null and `false` otherwise, never null itself.
+    /// A wrapping `NOT` inverts it to `IS NOT NULL`.
     IsNull,
 }
 
 /// A binary predicate operator.
+///
+/// The ordering and equality comparisons follow SQL three-valued logic, so a NULL operand yields
+/// NULL rather than `false`. [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate
+/// NULL and always answer `true` or `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryPredicateOp {
-    /// Comparison Less Than
+    /// `left < right`.
     LessThan,
-    /// Comparison Greater Than
+    /// `left > right`.
     GreaterThan,
-    /// Comparison Equal
+    /// `left = right`.
     Equal,
-    /// Distinct
+    /// SQL `left IS DISTINCT FROM right`: null-safe inequality, treating NULL as an ordinary
+    /// value. `DISTINCT(1, 1)` and `DISTINCT(NULL, NULL)` are `false`; `DISTINCT(NULL, 1)` is
+    /// `true`.
     Distinct,
-    /// IN
+    /// SQL `left IN (elements)`: returns `false` when `left` is NULL. Otherwise, it returns `true`
+    /// when `left` equals any element and `false` when none match. NULL elements never match.
+    /// `left` must be a literal, and the elements are either a list-typed column or an
+    /// [`Expression::Literal`] holding a [`Scalar::Array`], never a list of expressions or a
+    /// subquery:
+    ///
+    /// ```sql
+    /// 2 IN (1, 2, 3)         -- literal elements
+    /// 2 IN (SELECT ...)      -- unsupported: no subquery form
+    /// col IN (1, 2, 3)       -- unsupported: the left operand must be a literal
+    /// ```
+    ///
+    /// Testing a literal against a list column is the shape data skipping uses, and it is the
+    /// reason the operands sit this way around rather than the more familiar
+    /// column-on-the-left form.
     In,
 }
 
 /// A unary expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryExpressionOp {
-    /// Convert struct data to JSON-encoded strings
+    /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
+    /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
+    /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
+    /// timestamps, whose sub-millisecond precision this operator discards (see below).
+    ///
+    /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
+    /// hex rather than base64, two digits per byte in the order the bytes appear, so
+    /// `{ b: 0xABCD, l: [1, 2], n: { z: 7 } }` becomes:
+    ///
+    /// ```text
+    /// {"b":"abcd","l":[1,2],"n":{"z":7}}
+    /// ```
+    ///
+    /// Timestamps must encode with exactly three fractional digits, truncated toward negative
+    /// infinity, because kernel writes `add.stats` with this operator and [Per-file Statistics]
+    /// truncates timestamp statistics down to milliseconds. TIMESTAMP takes a literal `Z` suffix
+    /// and TIMESTAMP_NTZ takes no offset, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
+    /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
+    /// prune files that hold matching rows.
+    ///
+    /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson,
 }
 
-/// A binary expression operator.
+/// A binary arithmetic operator over two numeric operands.
+///
+/// Both operands share a numeric type and the result takes that type. Kernel inserts no implicit
+/// casts, so widening a result (decimal precision or scale, for instance) needs an explicit
+/// [`Expression::cast`] to match a declared output type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryExpressionOp {
-    /// Arithmetic Plus
+    /// `left + right`.
     Plus,
-    /// Arithmetic Minus
+    /// `left - right`.
     Minus,
-    /// Arithmetic Multiply
+    /// `left * right`.
     Multiply,
-    /// Arithmetic Divide
+    /// `left / right`. A zero divisor never yields NULL.
+    ///
+    /// Integer operands divide truncating toward zero, and a zero divisor fails. Float operands
+    /// follow IEEE 754: `+/-inf` for a non-zero numerator, `NaN` for `0.0 / 0.0`. In a dialect
+    /// whose `/` is always fractional, the integer case is the other division operator:
+    ///
+    /// ```sql
+    /// 7 DIV 2      -- 3, this operator over integers
+    /// 7 / 2        -- 3.5, NOT this operator
+    /// ```
     Divide,
 }
 
 /// A variadic expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VariadicExpressionOp {
-    /// Collapse multiple values into one by taking the first non-null value
+    /// SQL `COALESCE(exprs...)`: the first non-null value, or null when every input is null. All
+    /// inputs share one type, which is also the result type. Requires at least one input.
     Coalesce,
+    /// SQL `ARRAY(exprs...)`: an array built by evaluating each input per row, so
+    /// `ARRAY(1, 1 + 2, my_int_col)` yields `[1, 3, <my_int_col value>]`. All inputs must share
+    /// the same element type. Requires at least one element; the element type is inferred from
+    /// the inputs.
+    ///
+    /// For static array literals whose elements are all compile-time constants, use
+    /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
+    /// `Scalar::Array` is evaluated at compile time.
+    Array,
 }
 
-/// A junction (AND/OR) predicate operator.
+/// A junction (AND/OR) predicate operator over N child predicates.
+///
+/// Both use SQL three-valued (Kleene) logic, treating a NULL child as unknown rather than false: a
+/// decisive child wins over a NULL sibling, so `AND` is `false` and `OR` is `true` despite the
+/// NULL, and only an undecided junction yields NULL. [`Predicate::junction`] folds an empty
+/// junction to its operator's identity, `true` for `AND` and `false` for `OR`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum JunctionPredicateOp {
-    /// Conjunction
+    /// SQL `a AND b AND ...`: true when every child is true.
     And,
-    /// Disjunction
+    /// SQL `a OR b OR ...`: true when any child is true.
     Or,
 }
 
@@ -236,15 +347,44 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
-/// An expression that parses a JSON string into a struct with the given schema.
-/// This is the inverse of `ToJson` - it converts a JSON-encoded string column into a
-/// struct column.
+/// An expression that parses a JSON string column into a struct column of `output_schema`, the
+/// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
+/// that operator discards.
+///
+/// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
+/// `add.stats` with this operator and data skipping reads null stats as "include the file". The
+/// required part is that it does not error; whether a given row comes back as a null struct or as a
+/// struct of null fields is unspecified, since data skipping treats the two alike.
+///
+/// An empty string is not valid JSON here, so it is unparseable. This operator does not share
+/// [`MapToStructExpression`]'s empty-string-to-NULL behavior. It is SQL `from_json(json_expr,
+/// output_schema)` in a dialect whose `from_json` is permissive rather than strict.
+///
+/// # Default engine behavior
+///
+/// `arrow-json`'s typed decoders reject a whole batch when one cell fails to parse. The default
+/// engine works around that for the leaf types that fail most often (timestamp, date, decimal) by
+/// decoding them as strings and safe-casting back, so a bad value in one of those degrades to a
+/// NULL for that field alone. Anything the workaround does not cover, namely structurally invalid
+/// JSON and a type mismatch on any other leaf, falls back to nulling the entire batch rather than
+/// the offending row. A NULL input decodes as `{}`, leaving every field NULL without disturbing the
+/// rest of the batch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
     /// The expression that evaluates to a STRING column containing JSON objects.
     pub json_expr: Box<Expression>,
     /// The schema defining the structure to parse the JSON into.
     pub output_schema: SchemaRef,
+}
+
+/// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
+/// value that cannot be represented in the target type evaluates to NULL rather than erroring.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CastExpression {
+    /// The expression whose value is cast.
+    pub expr: Box<Expression>,
+    /// The type the value is cast to.
+    pub target: DataType,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -284,7 +424,10 @@ where
 }
 
 impl OpaquePredicate {
-    fn new(op: OpaquePredicateOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+    pub(crate) fn new(
+        op: OpaquePredicateOpRef,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
         let exprs = exprs.into_iter().collect();
         Self { op, exprs }
     }
@@ -303,7 +446,10 @@ pub struct OpaqueExpression {
 }
 
 impl OpaqueExpression {
-    fn new(op: OpaqueExpressionOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+    pub(crate) fn new(
+        op: OpaqueExpressionOpRef,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
         let exprs = exprs.into_iter().collect();
         Self { op, exprs }
     }
@@ -328,100 +474,6 @@ where
     Err(de::Error::custom("Cannot deserialize an Opaque Expression"))
 }
 
-/// A transformation affecting a single field (one pieces of a [`Transform`]). The transformation
-/// could insert 0+ new fields after the target, or could replace the target with 0+ a new fields).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct FieldTransform {
-    /// The list of expressions this field transform emits at the target location.
-    pub exprs: Vec<ExpressionRef>,
-    /// If true, the output expressions replace the input field instead of following after it.
-    pub is_replace: bool,
-}
-
-/// A transformation that efficiently represents sparse modifications to struct schemas.
-///
-/// `Transform` achieves `O(changes)` space complexity instead of `O(schema_width)` by only
-/// specifying those fields that actually change (inserted, replaced, or deleted). Any input field
-/// not specifically mentioned by the transform is passed through, unmodified and with the same
-/// relative field ordering. This is particularly useful for wide schemas where only a few columns
-/// need to be modified and/or dropped, or where a small number of columns need to be injected.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Transform {
-    /// The path to the nested input struct this transform operates on (if any). If no path is
-    /// given, the transform operates directly on top-level columns.
-    pub input_path: Option<ColumnName>,
-    /// A mapping from named input fields to the transform to be performed on each field.
-    pub field_transforms: HashMap<String, FieldTransform>,
-    /// A list of new fields to emit before processing the first input field.
-    pub prepended_fields: Vec<ExpressionRef>,
-}
-
-impl Transform {
-    /// Creates a new top-level identity transform. The various `with_xxx` helper methods can be
-    /// used to add specific field transforms.
-    pub fn new_top_level() -> Self {
-        Self::default()
-    }
-
-    /// Creates a new identity transform that operates on fields of a nested struct identified by
-    /// `path`. The various `with_xxx` helper methods can be used to add specific field transforms.
-    pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
-        Self {
-            input_path: Some(ColumnName::new(path)),
-            ..Default::default()
-        }
-    }
-
-    /// Specifies a field to drop.
-    pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
-        let field_transform = self.field_transform(name);
-        field_transform.is_replace = true;
-        self
-    }
-
-    /// Specifies an expression to replace a field with.
-    pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
-        let field_transform = self.field_transform(name);
-        field_transform.exprs.push(expr);
-        field_transform.is_replace = true;
-        self
-    }
-
-    /// Specifies an expression to insert after an optional predecessor (None = prepend, emit the
-    /// expression before the first input field). Multiple fields can be inserted after the same
-    /// predecessor, and they will be emitted in the same order they were registered.
-    pub fn with_inserted_field(
-        mut self,
-        after: Option<impl Into<String>>,
-        expr: ExpressionRef,
-    ) -> Self {
-        match after {
-            Some(field_name) => self.field_transform(field_name).exprs.push(expr),
-            None => self.prepended_fields.push(expr),
-        }
-        self
-    }
-
-    /// True if this is the identity transform (all input fields pass through unchanged, with no new
-    /// fields inserted).
-    pub fn is_identity(&self) -> bool {
-        self.prepended_fields.is_empty() && self.field_transforms.is_empty()
-    }
-
-    /// None, if this is a top-level transform. Otherwise, the path of this nested transform.
-    pub fn input_path(&self) -> Option<&ColumnName> {
-        self.input_path.as_ref()
-    }
-
-    // Gets or creates the field transform for a named input field
-    fn field_transform(&mut self, field_name: impl Into<String>) -> &mut FieldTransform {
-        self.field_transforms.entry(field_name.into()).or_default()
-    }
-}
-
 /// A SQL expression.
 ///
 /// These expressions do not track or validate data types, other than the type
@@ -431,15 +483,31 @@ impl Transform {
 pub enum Expression {
     /// A literal value.
     Literal(Scalar),
-    /// A column reference by name.
+    /// A column reference by name. A [`ColumnName`] is a path, so a multi-segment name like
+    /// `add.stats.numRecords` descends one nested struct field per segment, matching by name.
     Column(ColumnName),
     /// A predicate treated as a boolean expression
     Predicate(Box<Predicate>), // should this be Arc?
-    /// A struct computed from a Vec of expressions
-    Struct(Vec<ExpressionRef>),
-    /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
+    /// A struct computed from one expression per output field, in field order.
+    ///
+    /// Field names and nullability come from the surrounding output schema (the evaluator's
+    /// `result_type`, such as a [`Project`]'s target field), and each field expression's type is
+    /// validated against the schema, so building a struct takes both. The expression count must
+    /// equal the output field count.
+    ///
+    /// The optional nullability predicate says when to *keep* the struct: a row survives only
+    /// where it is true, and nulls entirely where it is false or null.
+    ///
+    /// ```sql
+    /// CASE WHEN keep_pred THEN struct(expr1, expr2, ...) END
+    /// ```
+    ///
+    /// [`Project`]: crate::plans::ir::nodes::Project
+    Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
+    /// A sparse patch of a struct. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
-    Transform(Transform),
+    #[serde(alias = "Transform")]
+    StructPatch(ExpressionStructPatch),
     /// An expression that takes one expression as input.
     Unary(UnaryExpression),
     /// An expression that takes two expressions as input.
@@ -460,8 +528,17 @@ pub enum Expression {
     /// all rows -- almost certainly NOT what the query author intended. Use `Expression::Opaque`
     /// for expressions kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
-    /// Parse a JSON string expression into a struct with the given schema.
+    /// Parse a JSON string expression into a struct with the given schema. Unparseable input,
+    /// which includes an empty string, must yield NULL rather than error; see
+    /// [`ParseJsonExpression`].
     ParseJson(ParseJsonExpression),
+    /// Parse an Add action's `partitionValues` map into a typed struct. A null map produces a null
+    /// struct, and the behavior for duplicate keys is undefined. See [`MapToStructExpression`] for
+    /// the complete Delta partition-value contract.
+    // TODO: Rename MapToStruct to ParsePartitionValues.
+    MapToStruct(MapToStructExpression),
+    /// Cast a child expression to a target type. See [`CastExpression`].
+    Cast(CastExpression),
 }
 
 /// A SQL predicate.
@@ -492,13 +569,13 @@ pub enum Predicate {
     #[serde(deserialize_with = "fail_deserialize_opaque_predicate")]
     Opaque(OpaquePredicate),
     /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). For
-    /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL values
-    /// (which may disable skipping if it "poisons" the predicate), but engines MUST NOT attempt to
-    /// interpret them as NULL when evaluating query filters because it could produce incorrect
-    /// results. For example, converting `WHERE <fancy-udf-invocation>` to `WHERE NULL` is
-    /// equivalent to `WHERE FALSE` and would filter out all rows -- almost certainly NOT what the
-    /// query author intended. Use `Predicate::Opaque` for predicates kernel doesn't understand
-    /// but which engine can still evaluate.
+    /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL
+    /// values (which may disable skipping if it "poisons" the predicate), but engines MUST NOT
+    /// attempt to interpret them as NULL when evaluating query filters because it could
+    /// produce incorrect results. For example, converting `WHERE <fancy-udf-invocation>` to
+    /// `WHERE NULL` is equivalent to `WHERE FALSE` and would filter out all rows -- almost
+    /// certainly NOT what the query author intended. Use `Predicate::Opaque` for predicates
+    /// kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
 }
 
@@ -528,21 +605,21 @@ impl JunctionPredicateOp {
 }
 
 impl UnaryExpression {
-    fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self { op, expr }
     }
 }
 
 impl UnaryPredicate {
-    fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self { op, expr }
     }
 }
 
 impl BinaryExpression {
-    fn new(
+    pub(crate) fn new(
         op: BinaryExpressionOp,
         left: impl Into<Expression>,
         right: impl Into<Expression>,
@@ -554,7 +631,7 @@ impl BinaryExpression {
 }
 
 impl BinaryPredicate {
-    fn new(
+    pub(crate) fn new(
         op: BinaryPredicateOp,
         left: impl Into<Expression>,
         right: impl Into<Expression>,
@@ -566,7 +643,7 @@ impl BinaryPredicate {
 }
 
 impl VariadicExpression {
-    fn new(
+    pub(crate) fn new(
         op: VariadicExpressionOp,
         exprs: impl IntoIterator<Item = impl Into<Expression>>,
     ) -> Self {
@@ -576,7 +653,7 @@ impl VariadicExpression {
 }
 
 impl ParseJsonExpression {
-    fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
+    pub(crate) fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self {
             json_expr: Box::new(json_expr.into()),
             output_schema,
@@ -584,8 +661,104 @@ impl ParseJsonExpression {
     }
 }
 
+/// A Delta-specific expression that parses an Add action's `partitionValues` map into a typed
+/// `partitionValues_parsed` struct.
+///
+/// This is not a generic map-to-struct conversion. The input expression must evaluate to
+/// `Map<String, String>`, and the evaluator supplies a target [`StructType`] as this expression's
+/// result type. The expression does not carry this type itself and cannot be evaluated from
+/// `map_expr` alone. Its evaluation context must provide and propagate the target output type. The
+/// target struct is semantic input: field names select partition values, field types determine how
+/// they are parsed, and field order and nullability define the result struct. Names are matched
+/// exactly and case-sensitively against the map keys. With column mapping, both the map keys and
+/// target-schema field names are physical names.
+///
+/// # Null and Missing Key behavior
+///
+/// For each input row:
+///
+/// - A null map produces a null struct, not a non-null struct whose fields are all null.
+/// - A non-null map, including an empty map, produces a non-null struct.
+/// - A key that is in the target output schema, but missing from the map, produces a null field.
+/// - A key that is in the input map, but not in the target output schema, is ignored.
+/// - A key with a null value in the input map produces a null field in the output struct.
+/// - Fields appear in target-schema order and must have primitive types.
+/// - Duplicate keys are not valid `partitionValues` input and their result is undefined. Engines
+///   may ignore, reject, or arbitrarily select one; callers must not depend on the behavior.
+///
+/// # Value parsing
+///
+/// A literal empty string has special read compatibility behavior: it stays empty for STRING,
+/// becomes empty bytes for BINARY, and becomes null for every other primitive type. Delta writers
+/// normally encode an empty partition value as JSON null, but readers must preserve this behavior
+/// for existing tables that contain a literal empty string.
+///
+/// Non-empty strings must follow the Delta [protocol] partition value serialization rules. Kernel's
+/// reference evaluator implements these rules with [`PrimitiveType::parse_scalar`] and equivalent
+/// Arrow parsers for dates and timestamps, establishing this engine-facing behavior:
+///
+/// - STRING: return the input string unchanged.
+/// - BINARY: return the input string's UTF-8 bytes after JSON string unescaping, not hex or base64.
+/// - BYTE, SHORT, INTEGER, and LONG: parse a signed base-10 integer in the target type's range.
+/// - FLOAT and DOUBLE: parse a floating-point number, including `NaN`, `Infinity`, and `-Infinity`.
+/// - DECIMAL(p, s): require an effective scale of exactly `s` and precision that fits `p`; never
+///   round or rescale.
+/// - BOOLEAN: accept case-insensitive `true` or `false`, with no numeric or yes/no aliases.
+/// - DATE: parse `{year}-{month}-{day}`.
+/// - TIMESTAMP: parse either 1) an ISO 8601 timestamp with an explicit offset, normalized to UTC;
+///   or 2) a space-separated timestamp without a zone. Currently, kernel expects case 2 to be
+///   interpreted as UTC, however the protocol specifies that it should be interpreted in the
+///   writer's time zone. TODO: MapToStruct needs to be updated to take in a timezone as a
+///   parameter.
+/// - TIMESTAMP_NTZ: parse a space-separated timestamp without an offset and preserve the local
+///   wall-clock value.
+/// - Interval types: parse an ANSI interval literal accepted by [`PrimitiveType::parse_scalar`].
+/// - VOID: reject every non-empty value.
+///
+/// Kernel's UTC interpretation of a zone-less TIMESTAMP is explicit here: the Delta protocol says
+/// that form is interpreted in the writer's time zone, but that time zone is not carried by this
+/// expression. Modern writers should use the protocol's UTC-adjusted ISO 8601 form.
+///
+/// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
+/// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
+/// returns [`Error::ParseError`] and fails evaluation; it does not silently become null.
+///
+/// # Implementing this expression
+///
+/// A connector generally cannot implement this contract as `CAST(map[key] AS target_type)`.
+/// Generic casts may accept additional boolean spellings, round or rescale decimals, use a session
+/// time zone, or turn malformed values into null. Implement a dedicated parser (or validate before
+/// casting), handle the empty-string cases before parsing, and preserve the input map's row-level
+/// nulls on the output struct.
+///
+/// [protocol]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+/// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
+/// [`StructType`]: crate::schema::StructType
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapToStructExpression {
+    /// The expression that evaluates to a `Map<String, String>` column.
+    pub map_expr: Box<Expression>,
+}
+
+impl MapToStructExpression {
+    pub(crate) fn new(map_expr: impl Into<Expression>) -> Self {
+        Self {
+            map_expr: Box::new(map_expr.into()),
+        }
+    }
+}
+
+impl CastExpression {
+    pub(crate) fn new(expr: impl Into<Expression>, target: DataType) -> Self {
+        Self {
+            expr: Box::new(expr.into()),
+            target,
+        }
+    }
+}
+
 impl JunctionPredicate {
-    fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
+    pub(crate) fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
         Self { op, preds }
     }
 }
@@ -594,26 +767,18 @@ impl Expression {
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
-        let _ = references.transform_expr(self);
-        references.into_inner()
+        references.transform_expr(self);
+        references.0
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Expression
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Expression {
         ColumnName::new(field_names).into()
     }
 
     /// Create a new expression for a literal value
     pub fn literal(value: impl Into<Scalar>) -> Self {
         Self::Literal(value.into())
-    }
-
-    /// Creates a NULL literal expression
-    pub const fn null_literal(data_type: DataType) -> Self {
-        Self::Literal(Scalar::Null(data_type))
     }
 
     /// Wraps a predicate as a boolean-valued expression
@@ -624,14 +789,45 @@ impl Expression {
         }
     }
 
-    /// Create a new struct expression
+    /// Create a new struct expression.
+    ///
+    /// The field names and types are supplied by the caller at evaluation time via the
+    /// `result_type` parameter of the expression evaluator. Use this when the schema is
+    /// always available from external context (e.g. the expression is the top-level output
+    /// of [`crate::ExpressionEvaluator`]).
     pub fn struct_from(exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>) -> Self {
-        Self::Struct(exprs.into_iter().map(Into::into).collect())
+        Self::Struct(exprs.into_iter().map(Into::into).collect(), None)
     }
 
-    /// Create a new transform expression
-    pub fn transform(transform: Transform) -> Self {
-        Self::Transform(transform)
+    /// Create a new struct expression with a nullability predicate.
+    ///
+    /// When the predicate evaluates to false or null for a row, the entire struct is null
+    /// for that row.
+    pub fn struct_with_nullability_from(
+        exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>,
+        nullability_predicate: impl Into<Arc<Self>>,
+    ) -> Self {
+        Self::Struct(
+            exprs.into_iter().map(Into::into).collect(),
+            Some(nullability_predicate.into()),
+        )
+    }
+
+    /// Creates a new struct patch expression from a raw patch or patch builder.
+    ///
+    /// Returns an expression that applies the supplied sparse patch to an input struct. Passing a
+    /// raw [`ExpressionStructPatch`] is infallible; passing an [`ExpressionStructPatchBuilder`]
+    /// validates and lowers the recorded operations before constructing the expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supplied patch builder contains conflicting operations.
+    pub fn struct_patch<P>(patch: P) -> DeltaResult<Self>
+    where
+        P: TryInto<ExpressionStructPatch>,
+        Error: From<P::Error>,
+    {
+        Ok(Self::StructPatch(patch.try_into()?))
     }
 
     /// Create a new predicate `self IS NULL`
@@ -709,6 +905,11 @@ impl Expression {
         Self::variadic(VariadicExpressionOp::Coalesce, exprs)
     }
 
+    /// Creates a new Array constructor expression. See [`VariadicExpressionOp::Array`].
+    pub fn array(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
+        Self::variadic(VariadicExpressionOp::Array, exprs)
+    }
+
     /// Creates a new opaque expression
     pub fn opaque(
         op: impl OpaqueExpressionOp,
@@ -723,36 +924,54 @@ impl Expression {
     }
 
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
-    /// This is the inverse of `ToJson` - it converts a JSON-encoded string into a struct.
+    /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
+    /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
+    /// `ToJson` truncates it.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
+    }
+
+    /// Parses an Add action's `partitionValues` map into a typed struct whose schema comes from the
+    /// evaluator's result type. A null map produces a null struct; missing and null values produce
+    /// null fields; literal empty strings stay empty only for STRING and BINARY. Duplicate-key
+    /// behavior is undefined. See [`MapToStructExpression`] for the complete contract.
+    pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
+        Self::MapToStruct(MapToStructExpression::new(map_expr))
+    }
+
+    /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
+    /// values become NULL). See [`CastExpression`].
+    pub fn cast(expr: impl Into<Expression>, target: DataType) -> Self {
+        Self::Cast(CastExpression::new(expr, target))
     }
 }
 
 impl Predicate {
+    /// Literal boolean true.
+    pub const TRUE: Self = Self::literal(true);
+    /// Literal boolean false.
+    pub const FALSE: Self = Self::literal(false);
+    /// NULL boolean literal.
+    pub const NULL: Self =
+        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)));
+
     /// Returns a set of columns referenced by this predicate.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
-        let _ = references.transform_pred(self);
-        references.into_inner()
+        references.transform_pred(self);
+        references.0
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Predicate
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Self {
         Self::from_expr(ColumnName::new(field_names))
     }
 
-    /// Create a new literal boolean value
+    /// Create a boolean literal predicate from a runtime `bool`.
+    ///
+    /// Prefer [`Self::TRUE`] / [`Self::FALSE`] when the value is statically known.
     pub const fn literal(value: bool) -> Self {
         Self::BooleanExpression(Expression::Literal(Scalar::Boolean(value)))
-    }
-
-    /// Creates a NULL literal boolean value
-    pub const fn null_literal() -> Self {
-        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
     }
 
     /// Converts a boolean-valued expression into a predicate
@@ -769,12 +988,12 @@ impl Predicate {
     }
 
     /// Create a new predicate `self IS NULL`
-    pub fn is_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_null(expr: impl Into<Expression>) -> Self {
         Self::unary(UnaryPredicateOp::IsNull, expr)
     }
 
     /// Create a new predicate `self IS NOT NULL`
-    pub fn is_not_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_not_null(expr: impl Into<Expression>) -> Self {
         Self::not(Self::is_null(expr))
     }
 
@@ -823,12 +1042,14 @@ impl Predicate {
         Self::or_from([a.into(), b.into()])
     }
 
-    /// Creates a new predicate AND(preds...)
+    /// Creates a new predicate AND(preds...). See [`Self::junction`] for normalization of
+    /// empty and single-element inputs.
     pub fn and_from(preds: impl IntoIterator<Item = Self>) -> Self {
         Self::junction(JunctionPredicateOp::And, preds)
     }
 
-    /// Creates a new predicate OR(preds...)
+    /// Creates a new predicate OR(preds...). See [`Self::junction`] for normalization of
+    /// empty and single-element inputs.
     pub fn or_from(preds: impl IntoIterator<Item = Self>) -> Self {
         Self::junction(JunctionPredicateOp::Or, preds)
     }
@@ -852,10 +1073,24 @@ impl Predicate {
         })
     }
 
-    /// Creates a new junction predicate OP(preds...)
+    /// Creates a new junction predicate OP(preds...). Normalizes degenerate cases:
+    ///
+    /// - Empty junction returns the identity element (the value that has no effect when combined
+    ///   with other predicates under the same operator):
+    ///   - `AND()` -> `true`, because `true AND p` == `p` for any predicate `p`.
+    ///   - `OR()` -> `false`, because `false OR p` == `p` for any predicate `p`.
+    /// - Single-element junction unwraps the element: `AND(p)` / `OR(p)` -> `p`.
     pub fn junction(op: JunctionPredicateOp, preds: impl IntoIterator<Item = Self>) -> Self {
-        let preds = preds.into_iter().collect();
-        Self::Junction(JunctionPredicate { op, preds })
+        let mut preds: Vec<_> = preds.into_iter().collect();
+        match preds.len() {
+            0 => match op {
+                JunctionPredicateOp::And => Self::TRUE,
+                JunctionPredicateOp::Or => Self::FALSE,
+            },
+            // A junction of one predicate is just that predicate.
+            1 => preds.remove(0),
+            _ => Self::Junction(JunctionPredicate { op, preds }),
+        }
     }
 
     /// Creates a new opaque predicate
@@ -911,6 +1146,7 @@ impl Display for VariadicExpressionOp {
         use VariadicExpressionOp::*;
         match self {
             Coalesce => write!(f, "COALESCE"),
+            Array => write!(f, "ARRAY"),
         }
     }
 }
@@ -943,32 +1179,34 @@ impl Display for Expression {
             Literal(l) => write!(f, "{l}"),
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
-            Struct(exprs) => write!(f, "Struct({})", format_child_list(exprs)),
-            Transform(transform) => {
-                write!(f, "Transform(")?;
+            Struct(exprs, _) => write!(f, "Struct({})", format_child_list(exprs)),
+            StructPatch(patch) => {
+                write!(f, "StructPatch(")?;
                 let mut sep = "";
-                if !transform.prepended_fields.is_empty() {
-                    let prepended_fields = format_child_list(&transform.prepended_fields);
+                if !patch.prepended_fields.is_empty() {
+                    let prepended_fields = format_child_list(&patch.prepended_fields);
                     write!(f, "prepend [{prepended_fields}]")?;
                     sep = ", ";
                 }
-                for (field_name, field_transform) in &transform.field_transforms {
-                    let insertions = &field_transform.exprs;
-                    if insertions.is_empty() {
-                        if field_transform.is_replace {
-                            write!(f, "{sep}drop {field_name}")?;
-                        } else {
-                            continue; // no-op; ignore it and don't change `sep` below
-                        }
-                    } else {
-                        let insertions = format_child_list(insertions);
-                        if field_transform.is_replace {
-                            write!(f, "{sep}replace {field_name} with [{insertions}]")?;
-                        } else {
-                            write!(f, "{sep}after {field_name} insert [{insertions}]")?;
-                        }
+                for (field_name, field_patch) in &patch.field_patches {
+                    if !field_patch.keep_input && field_patch.insertions.is_empty() {
+                        write!(f, "{sep}drop {field_name}")?;
+                        sep = ", ";
                     }
-                    sep = ", ";
+                    if !field_patch.insertions.is_empty() {
+                        let insertions = format_child_list(&field_patch.insertions);
+                        let action = if field_patch.keep_input {
+                            "after"
+                        } else {
+                            "replace/after"
+                        };
+                        write!(f, "{sep}{action} {field_name} insert [{insertions}]")?;
+                        sep = ", ";
+                    }
+                }
+                if !patch.appended_fields.is_empty() {
+                    let appended_fields = format_child_list(&patch.appended_fields);
+                    write!(f, "{sep}append [{appended_fields}]")?;
                 }
                 write!(f, ")")
             }
@@ -989,6 +1227,8 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
+            MapToStruct(m) => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
+            Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
         }
     }
 }
@@ -1079,6 +1319,18 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
     }
 }
 
+/// Retrieves the set of column names referenced by an expression.
+#[derive(Default)]
+struct GetColumnReferences<'a>(HashSet<&'a ColumnName>);
+
+impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
+    transform_output_type!(|'a, T| ());
+
+    fn transform_expr_column(&mut self, name: &'a ColumnName) {
+        self.0.insert(name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
@@ -1086,7 +1338,7 @@ mod tests {
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+    use super::{col, column_pred, lit, DataType, Expression as Expr, Predicate as Pred};
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1098,14 +1350,22 @@ mod tests {
     #[test]
     fn test_expression_format() {
         let cases = [
-            (column_expr!("x"), "Column(x)"),
+            (col!("x"), "Column(x)"),
             (
-                (column_expr!("x") + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
+                (col!("x") + lit(4)) / lit(10) * lit(42),
                 "Column(x) + 4 / 10 * 42",
             ),
             (
-                Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
+                Expr::struct_from([col!("x"), lit(2), lit(10)]),
                 "Struct(Column(x), 2, 10)",
+            ),
+            (
+                Expr::array([col!("x"), col!("y"), lit(0)]),
+                "ARRAY(Column(x), Column(y), 0)",
+            ),
+            (
+                Expr::cast(col!("x"), DataType::DATE),
+                "CAST(Column(x) AS date)",
             ),
         ];
 
@@ -1119,37 +1379,25 @@ mod tests {
     fn test_predicate_format() {
         let cases = [
             (column_pred!("x"), "Column(x)"),
-            (column_expr!("x").eq(Expr::literal(2)), "Column(x) = 2"),
+            (col!("x").eq(lit(2)), "Column(x) = 2"),
+            ((col!("x") - lit(4)).lt(lit(10)), "Column(x) - 4 < 10"),
             (
-                (column_expr!("x") - Expr::literal(4)).lt(Expr::literal(10)),
-                "Column(x) - 4 < 10",
-            ),
-            (
-                Pred::and(
-                    column_expr!("x").ge(Expr::literal(2)),
-                    column_expr!("x").le(Expr::literal(10)),
-                ),
+                Pred::and(col!("x").ge(lit(2)), col!("x").le(lit(10))),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10))",
             ),
             (
                 Pred::and_from([
-                    column_expr!("x").ge(Expr::literal(2)),
-                    column_expr!("x").le(Expr::literal(10)),
-                    column_expr!("x").le(Expr::literal(100)),
+                    col!("x").ge(lit(2)),
+                    col!("x").le(lit(10)),
+                    col!("x").le(lit(100)),
                 ]),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10), NOT(Column(x) > 100))",
             ),
             (
-                Pred::or(
-                    column_expr!("x").gt(Expr::literal(2)),
-                    column_expr!("x").lt(Expr::literal(10)),
-                ),
+                Pred::or(col!("x").gt(lit(2)), col!("x").lt(lit(10))),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (
-                column_expr!("x").eq(Expr::literal("foo")),
-                "Column(x) = 'foo'",
-            ),
+            (col!("x").eq(lit("foo")), "Column(x) = 'foo'"),
         ];
 
         for (pred, expected) in cases {
@@ -1163,15 +1411,14 @@ mod tests {
     mod serde_tests {
         use std::sync::Arc;
 
+        use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, Predicate, Scalar, Transform, UnaryExpressionOp,
+            col, column_name, lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
+            Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
-        use crate::utils::test_utils::assert_result_error_with_message;
-
-        use super::assert_roundtrip;
+        use crate::unit_test_utils::assert_result_error_with_message;
 
         // ==================== Expression::Literal Tests ====================
 
@@ -1180,22 +1427,22 @@ mod tests {
             // Test all primitive scalar types that have proper PartialEq
             let cases: Vec<Expression> = vec![
                 // Numeric types
-                Expression::literal(42i32),         // Integer
-                Expression::literal(9999999999i64), // Long
-                Expression::literal(123i16),        // Short
-                Expression::literal(42i8),          // Byte
-                Expression::literal(1.12345677_32), // Float
-                Expression::literal(1.12345667_64), // Double
+                lit(42i32),         // Integer
+                lit(9999999999i64), // Long
+                lit(123i16),        // Short
+                lit(42i8),          // Byte
+                lit(1.12345677_32), // Float
+                lit(1.12345667_64), // Double
                 // String and Boolean
-                Expression::literal("hello world"),
-                Expression::literal(true),
-                Expression::literal(false),
+                lit("hello world"),
+                lit(true),
+                lit(false),
                 // Temporal types
                 Expression::Literal(Scalar::Timestamp(1234567890000000)),
                 Expression::Literal(Scalar::TimestampNtz(1234567890000000)),
                 Expression::Literal(Scalar::Date(19000)),
                 // Binary
-                Expression::Literal(Scalar::Binary(vec![1, 2, 3, 4, 5])),
+                lit(vec![1u8, 2, 3, 4, 5]),
                 // Decimal
                 Expression::Literal(Scalar::Decimal(
                     DecimalData::try_new(12345i128, DecimalType::try_new(10, 2).unwrap()).unwrap(),
@@ -1212,9 +1459,9 @@ mod tests {
             // Test complex scalar types that need JSON comparison (partial_cmp returns None)
             let cases: Vec<Expression> = vec![
                 // Null with different types
-                Expression::null_literal(DataType::INTEGER),
-                Expression::null_literal(DataType::STRING),
-                Expression::null_literal(DataType::BOOLEAN),
+                null_lit(DataType::INTEGER),
+                null_lit(DataType::STRING),
+                null_lit(DataType::BOOLEAN),
                 // Array
                 Expression::Literal(Scalar::Array(
                     ArrayData::try_new(
@@ -1256,11 +1503,8 @@ mod tests {
 
         #[test]
         fn test_column_expressions_roundtrip() {
-            let cases: Vec<Expression> = vec![
-                column_expr!("my_column"),
-                Expression::column(["parent", "child"]),
-                Expression::column(["a", "b", "c", "d"]),
-            ];
+            let cases: Vec<Expression> =
+                vec![col!("my_column"), col!("parent.child"), col!("a.b.c.d")];
 
             for expr in &cases {
                 assert_roundtrip(expr);
@@ -1271,8 +1515,8 @@ mod tests {
         fn test_column_names_roundtrip() {
             let cases: Vec<ColumnName> = vec![
                 column_name!("simple"),
-                ColumnName::new(["a", "b", "c"]),
-                ColumnName::new::<&str>([]),
+                column_name!("a.b.c"),
+                ColumnName::default(),
             ];
 
             for col in &cases {
@@ -1284,7 +1528,7 @@ mod tests {
 
         #[test]
         fn test_unary_expression_roundtrip() {
-            let expr = Expression::unary(UnaryExpressionOp::ToJson, column_expr!("data"));
+            let expr = Expression::unary(UnaryExpressionOp::ToJson, col!("data"));
             assert_roundtrip(&expr);
         }
 
@@ -1298,47 +1542,57 @@ mod tests {
             ];
 
             for op in ops {
-                let expr = Expression::binary(op, column_expr!("a"), Expression::literal(10));
+                let expr = Expression::binary(op, col!("a"), lit(10));
                 assert_roundtrip(&expr);
             }
         }
 
         #[test]
         fn test_variadic_expression_roundtrip() {
-            let expr = Expression::coalesce([
-                column_expr!("a"),
-                column_expr!("b"),
-                Expression::literal("default"),
-            ]);
+            let expr = Expression::coalesce([col!("a"), col!("b"), lit("default")]);
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        #[case::column(Expression::cast(col!("part"), DataType::DATE))]
+        #[case::literal(Expression::cast(lit("2025-01-01"), DataType::DATE))]
+        #[case::nested(Expression::cast(
+            Expression::cast(col!("part"), DataType::STRING),
+            DataType::INTEGER,
+        ))]
+        fn test_cast_expression_roundtrip(#[case] expr: Expression) {
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        #[case::array_single(Expression::array([lit(7i32)]))]
+        #[case::array_mixed(Expression::array([
+            col!("a"),
+            col!("b"),
+            lit(42i64),
+        ]))]
+        fn test_array_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
         }
 
         #[test]
         fn test_nested_arithmetic_expression_roundtrip() {
             // (a + b) * (c - d) / 2
-            let left = Expression::binary(
-                BinaryExpressionOp::Plus,
-                column_expr!("a"),
-                column_expr!("b"),
-            );
-            let right = Expression::binary(
-                BinaryExpressionOp::Minus,
-                column_expr!("c"),
-                column_expr!("d"),
-            );
+            let left = Expression::binary(BinaryExpressionOp::Plus, col!("a"), col!("b"));
+            let right = Expression::binary(BinaryExpressionOp::Minus, col!("c"), col!("d"));
             let mul = Expression::binary(BinaryExpressionOp::Multiply, left, right);
-            let expr = Expression::binary(BinaryExpressionOp::Divide, mul, Expression::literal(2));
+            let expr = Expression::binary(BinaryExpressionOp::Divide, mul, lit(2));
             assert_roundtrip(&expr);
         }
 
-        // ==================== Expression::Struct/Transform/Other Tests ====================
+        // ==================== Expression::Struct/StructPatch/Other Tests ====================
 
         #[test]
         fn test_struct_expression_roundtrip() {
             let expr = Expression::struct_from([
-                Arc::new(column_expr!("x")),
-                Arc::new(Expression::literal(42)),
-                Arc::new(Expression::literal("hello")),
+                Arc::new(col!("x")),
+                Arc::new(lit(42)),
+                Arc::new(lit("hello")),
             ]);
             assert_roundtrip(&expr);
         }
@@ -1347,27 +1601,28 @@ mod tests {
         fn test_transform_expressions_roundtrip() {
             let cases: Vec<Expression> = vec![
                 // Identity transform
-                Expression::transform(Transform::new_top_level()),
+                Expression::struct_patch(ExpressionStructPatchBuilder::new()).unwrap(),
                 // Drop field
-                Expression::transform(Transform::new_top_level().with_dropped_field("old_column")),
+                Expression::struct_patch(ExpressionStructPatchBuilder::new().drop("old_column"))
+                    .unwrap(),
                 // Replace field
-                Expression::transform(
-                    Transform::new_top_level()
-                        .with_replaced_field("original", Arc::new(Expression::literal(0))),
-                ),
+                Expression::struct_patch(
+                    ExpressionStructPatchBuilder::new().replace("original", lit(0)),
+                )
+                .unwrap(),
                 // Insert fields
-                Expression::transform(
-                    Transform::new_top_level()
-                        .with_inserted_field(Some("after_col"), Arc::new(column_expr!("new_col")))
-                        .with_inserted_field(
-                            None::<String>,
-                            Arc::new(Expression::literal("prepended")),
-                        ),
-                ),
+                Expression::struct_patch(
+                    ExpressionStructPatchBuilder::new()
+                        .insert_after("after_col", col!("new_col"))
+                        .prepend(lit("prepended"))
+                        .append(lit("appended")),
+                )
+                .unwrap(),
                 // Nested transform
-                Expression::transform(
-                    Transform::new_nested(["parent", "child"]).with_dropped_field("to_drop"),
-                ),
+                Expression::struct_patch(
+                    ExpressionStructPatchBuilder::new_nested(["parent", "child"]).drop("to_drop"),
+                )
+                .unwrap(),
             ];
 
             for expr in &cases {
@@ -1377,7 +1632,7 @@ mod tests {
 
         #[test]
         fn test_expression_wrapping_predicate_roundtrip() {
-            let pred = Predicate::eq(column_expr!("x"), Expression::literal(10));
+            let pred = Predicate::eq(col!("x"), lit(10));
             let expr = Expression::from_pred(pred);
             assert_roundtrip(&expr);
         }
@@ -1388,28 +1643,37 @@ mod tests {
             assert_roundtrip(&expr);
         }
 
+        #[test]
+        fn test_map_to_struct_expression_roundtrip() {
+            let cases: Vec<Expression> = vec![
+                Expression::map_to_struct(col!("pv")),
+                Expression::map_to_struct(lit("ignored")),
+            ];
+
+            for expr in &cases {
+                assert_roundtrip(expr);
+            }
+        }
+
         // ==================== Predicate Tests ====================
 
         #[test]
         fn test_predicate_basics_roundtrip() {
             let cases: Vec<Predicate> = vec![
                 // Boolean expression
-                Predicate::from_expr(column_expr!("is_active")),
+                Predicate::from_expr(col!("is_active")),
                 // Literals
-                Predicate::literal(true),
-                Predicate::literal(false),
+                Predicate::TRUE,
+                Predicate::FALSE,
                 // NOT
-                Predicate::not(Predicate::from_expr(column_expr!("x"))),
+                Predicate::not(Predicate::from_expr(col!("x"))),
                 // Nested NOT
-                Predicate::not(Predicate::not(Predicate::gt(
-                    column_expr!("x"),
-                    Expression::literal(5),
-                ))),
+                Predicate::not(Predicate::not(Predicate::gt(col!("x"), lit(5)))),
                 // Unknown
                 Predicate::unknown("some_unknown_predicate()"),
                 // Unary predicates
-                Predicate::is_null(column_expr!("nullable_col")),
-                Predicate::is_not_null(column_expr!("nullable_col")),
+                Predicate::is_null(col!("nullable_col")),
+                Predicate::is_not_null(col!("nullable_col")),
             ];
 
             for pred in &cases {
@@ -1419,20 +1683,19 @@ mod tests {
 
         #[test]
         fn test_predicate_null_literal_roundtrip() {
-            let pred = Predicate::null_literal();
-            assert_roundtrip(&pred);
+            assert_roundtrip(&Predicate::NULL);
         }
 
         #[test]
         fn test_predicate_comparisons_roundtrip() {
             let cases: Vec<Predicate> = vec![
-                Predicate::eq(column_expr!("x"), Expression::literal(42)),
-                Predicate::ne(column_expr!("status"), Expression::literal("active")),
-                Predicate::lt(column_expr!("age"), Expression::literal(18)),
-                Predicate::le(column_expr!("price"), Expression::literal(100)),
-                Predicate::gt(column_expr!("score"), Expression::literal(90)),
-                Predicate::ge(column_expr!("quantity"), Expression::literal(1)),
-                Predicate::distinct(column_expr!("a"), column_expr!("b")),
+                Predicate::eq(col!("x"), lit(42)),
+                Predicate::ne(col!("status"), lit("active")),
+                Predicate::lt(col!("age"), lit(18)),
+                Predicate::le(col!("price"), lit(100)),
+                Predicate::gt(col!("score"), lit(90)),
+                Predicate::ge(col!("quantity"), lit(1)),
+                Predicate::distinct(col!("a"), col!("b")),
             ];
 
             for pred in &cases {
@@ -1449,7 +1712,7 @@ mod tests {
             .unwrap();
             let pred = Predicate::binary(
                 BinaryPredicateOp::In,
-                column_expr!("x"),
+                col!("x"),
                 Expression::Literal(Scalar::Array(array_data)),
             );
             assert_roundtrip(&pred);
@@ -1460,33 +1723,33 @@ mod tests {
             let cases: Vec<Predicate> = vec![
                 // Simple AND
                 Predicate::and(
-                    Predicate::gt(column_expr!("x"), Expression::literal(0)),
-                    Predicate::lt(column_expr!("x"), Expression::literal(100)),
+                    Predicate::gt(col!("x"), lit(0)),
+                    Predicate::lt(col!("x"), lit(100)),
                 ),
                 // Simple OR
                 Predicate::or(
-                    Predicate::eq(column_expr!("status"), Expression::literal("active")),
-                    Predicate::eq(column_expr!("status"), Expression::literal("pending")),
+                    Predicate::eq(col!("status"), lit("active")),
+                    Predicate::eq(col!("status"), lit("pending")),
                 ),
                 // Multiple AND
                 Predicate::and_from([
-                    Predicate::gt(column_expr!("x"), Expression::literal(0)),
-                    Predicate::lt(column_expr!("x"), Expression::literal(100)),
-                    Predicate::is_not_null(column_expr!("x")),
+                    Predicate::gt(col!("x"), lit(0)),
+                    Predicate::lt(col!("x"), lit(100)),
+                    Predicate::is_not_null(col!("x")),
                 ]),
                 // Multiple OR
                 Predicate::or_from([
-                    Predicate::eq(column_expr!("type"), Expression::literal("A")),
-                    Predicate::eq(column_expr!("type"), Expression::literal("B")),
-                    Predicate::eq(column_expr!("type"), Expression::literal("C")),
+                    Predicate::eq(col!("type"), lit("A")),
+                    Predicate::eq(col!("type"), lit("B")),
+                    Predicate::eq(col!("type"), lit("C")),
                 ]),
                 // Nested: (a > 0 AND b < 100) OR (c = 'special')
                 Predicate::or(
                     Predicate::and(
-                        Predicate::gt(column_expr!("a"), Expression::literal(0)),
-                        Predicate::lt(column_expr!("b"), Expression::literal(100)),
+                        Predicate::gt(col!("a"), lit(0)),
+                        Predicate::lt(col!("b"), lit(100)),
                     ),
-                    Predicate::eq(column_expr!("c"), Expression::literal("special")),
+                    Predicate::eq(col!("c"), lit("special")),
                 ),
             ];
 
@@ -1500,30 +1763,18 @@ mod tests {
         #[test]
         fn test_deeply_nested_structures_roundtrip() {
             // COALESCE(a + b, c * d, 0) > 100
-            let add = Expression::binary(
-                BinaryExpressionOp::Plus,
-                column_expr!("a"),
-                column_expr!("b"),
-            );
-            let mul = Expression::binary(
-                BinaryExpressionOp::Multiply,
-                column_expr!("c"),
-                column_expr!("d"),
-            );
-            let coalesce = Expression::coalesce([add, mul, Expression::literal(0)]);
-            let pred = Predicate::gt(coalesce, Expression::literal(100));
+            let add = Expression::binary(BinaryExpressionOp::Plus, col!("a"), col!("b"));
+            let mul = Expression::binary(BinaryExpressionOp::Multiply, col!("c"), col!("d"));
+            let coalesce = Expression::coalesce([add, mul, lit(0)]);
+            let pred = Predicate::gt(coalesce, lit(100));
             assert_roundtrip(&pred);
 
             // Expression wrapping a predicate that references expressions
             let inner_pred = Predicate::and(
-                Predicate::eq(column_expr!("x"), Expression::literal(1)),
+                Predicate::eq(col!("x"), lit(1)),
                 Predicate::gt(
-                    Expression::binary(
-                        BinaryExpressionOp::Plus,
-                        column_expr!("y"),
-                        column_expr!("z"),
-                    ),
-                    Expression::literal(10),
+                    Expression::binary(BinaryExpressionOp::Plus, col!("y"), col!("z")),
+                    lit(10),
                 ),
             );
             let expr = Expression::from_pred(inner_pred);
@@ -1553,7 +1804,7 @@ mod tests {
                 }
             }
 
-            let expr = Expression::opaque(TestOpaqueExprOp, [Expression::literal(1)]);
+            let expr = Expression::opaque(TestOpaqueExprOp, [lit(1)]);
             let result = serde_json::to_string(&expr);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Expression");
         }
@@ -1601,9 +1852,44 @@ mod tests {
                 }
             }
 
-            let pred = Predicate::opaque(TestOpaquePredOp, [Expression::literal(1)]);
+            let pred = Predicate::opaque(TestOpaquePredOp, [lit(1)]);
             let result = serde_json::to_string(&pred);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
         }
+    }
+
+    #[test]
+    fn single_element_and_from_returns_unwrapped_predicate() {
+        let inner = Pred::gt(col!("x"), lit(0));
+        let result = Pred::and_from([inner.clone()]);
+        assert_eq!(result, inner);
+    }
+
+    #[test]
+    fn single_element_or_from_returns_unwrapped_predicate() {
+        let inner = Pred::gt(col!("x"), lit(0));
+        let result = Pred::or_from([inner.clone()]);
+        assert_eq!(result, inner);
+    }
+
+    #[test]
+    fn multi_element_and_from_returns_junction() {
+        let p1 = Pred::gt(col!("x"), lit(0));
+        let p2 = Pred::lt(col!("x"), lit(100));
+        let result = Pred::and_from([p1.clone(), p2.clone()]);
+        assert!(matches!(result, Pred::Junction(ref j) if j.preds.len() == 2));
+        assert_eq!(result, Pred::and(p1, p2));
+    }
+
+    #[test]
+    fn empty_and_from_returns_identity_literal() {
+        let result = Pred::and_from(std::iter::empty());
+        assert_eq!(result, Pred::TRUE);
+    }
+
+    #[test]
+    fn empty_or_from_returns_identity_literal() {
+        let result = Pred::or_from(std::iter::empty());
+        assert_eq!(result, Pred::FALSE);
     }
 }

@@ -11,7 +11,6 @@ namespace = "ffi"
 cpp_compat = true
 
 [defines]
-"feature = default-engine" = "DEFINE_DEFAULT_ENGINE"
 "feature = default-engine-rustls" = "DEFINE_DEFAULT_ENGINE_RUSTLS"
 "feature = default-engine-base" = "DEFINE_DEFAULT_ENGINE_BASE"
 

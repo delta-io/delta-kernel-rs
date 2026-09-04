@@ -1,27 +1,21 @@
-//! The [`LiteralExpressionTransform`] is a [`SchemaTransform`] that transforms a [`Schema`] and an
-//! ordered list of leaf values (scalars) into an [`Expression`] with a literal value for each leaf.
+//! Transforms a [`StructType`] and an ordered list of leaf values (scalars) into an
+//! [`Expression`] with a literal value for each leaf.
 
-use std::borrow::Cow;
 use std::ops::Deref as _;
 
-use tracing::debug;
-
-use crate::expressions::{Expression, Scalar};
-use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, SchemaTransform, StructField, StructType,
-};
+use crate::expressions::{null_lit, Expression, Scalar};
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
+use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::DeltaResult;
 
 /// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values
 /// (Scalars) into an Expression with a [`Literal`] expr for each leaf.
-#[derive(Debug)]
-pub(crate) struct LiteralExpressionTransform<'a, T: Iterator<Item = &'a Scalar>> {
+struct LiteralExpressionTransform<'a, T: Iterator<Item = &'a Scalar>> {
     /// Leaf values to insert in schema order.
     scalars: T,
     /// A stack of built Expressions. After visiting children, we pop them off to
     /// build the parent container, then push the parent back on.
     stack: Vec<Expression>,
-    /// Since schema transforms are infallible we keep track of errors here
-    error: Result<(), Error>,
 }
 
 /// Any error for [`LiteralExpressionTransform`]
@@ -48,85 +42,60 @@ pub enum Error {
     Unsupported(String),
 }
 
-impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
-    pub(crate) fn new(scalars: impl IntoIterator<IntoIter = I>) -> Self {
-        Self {
-            scalars: scalars.into_iter(),
-            stack: Vec::new(),
-            error: Ok(()),
-        }
-    }
-
-    /// return the Expression we just built (or propagate Error). the top of `stack` should be our
-    /// final Expression
-    pub(crate) fn try_into_expr(mut self) -> Result<Expression, Error> {
-        self.error?;
-
-        if let Some(s) = self.scalars.next() {
-            return Err(Error::ExcessScalars(s.clone()));
-        }
-
-        self.stack.pop().ok_or(Error::EmptyStack)
-    }
-
-    fn set_error(&mut self, error: Error) {
-        // Only set when the error not yet set
-        if let Err(ref existing_error) = self.error {
-            debug!("Trying to overwrite an existing error: {existing_error:?} with {error:?}");
-        } else {
-            self.error = Err(error);
-        }
+/// Transforms the schema and leaf values into a literal row expression.
+pub(crate) fn literal_expression_transform<'a>(
+    schema: &'a StructType,
+    scalars: impl IntoIterator<Item = &'a Scalar>,
+) -> DeltaResult<Expression> {
+    let mut transform = LiteralExpressionTransform {
+        scalars: scalars.into_iter(),
+        stack: Vec::new(),
+    };
+    transform.transform_struct(schema)?;
+    match transform.scalars.next() {
+        Some(s) => Err(Error::ExcessScalars(s.clone()).into()),
+        None => transform.stack.pop().ok_or(Error::EmptyStack.into()),
     }
 }
 
 // All leaf types (primitive, array, map) share the same "shape" of transformation logic
 macro_rules! transform_leaf {
     ($self:ident, $type_variant:path, $type:ident) => {{
-        // first always check error to terminate early if possible
-        $self.error.as_ref().ok()?;
-
         let Some(scalar) = $self.scalars.next() else {
-            $self.set_error(Error::InsufficientScalars);
-            return None;
+            return Err(Error::InsufficientScalars);
         };
 
         // NOTE: Grab a reference here so code below can leverage the blanket impl<T> Deref for &T
         let $type_variant(ref scalar_type) = scalar.data_type() else {
-            $self.set_error(Error::Schema(format!(
+            return Err(Error::Schema(format!(
                 "Mismatched scalar type while creating Expression: expected {}({:?}), got {:?}",
                 stringify!($type_variant),
                 $type,
                 scalar.data_type()
             )));
-            return None;
         };
 
         // NOTE: &T and &Box<T> both deref to &T
         if scalar_type.deref() != $type {
-            $self.set_error(Error::Schema(format!(
+            return Err(Error::Schema(format!(
                 "Mismatched scalar type while creating Expression: expected {:?}, got {:?}",
                 $type, scalar_type
             )));
-            return None;
         }
 
         $self.stack.push(Expression::Literal(scalar.clone()));
-        None
+        Ok(())
     }};
 }
 
 impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressionTransform<'a, T> {
-    fn transform_primitive(
-        &mut self,
-        prim_type: &'a PrimitiveType,
-    ) -> Option<Cow<'a, PrimitiveType>> {
+    transform_output_type!(|'a, U| Result<(), Error>);
+
+    fn transform_primitive(&mut self, prim_type: &'a PrimitiveType) -> Result<(), Error> {
         transform_leaf!(self, DataType::Primitive, prim_type)
     }
 
-    fn transform_struct(&mut self, struct_type: &'a StructType) -> Option<Cow<'a, StructType>> {
-        // first always check error to terminate early if possible
-        self.error.as_ref().ok()?;
-
+    fn transform_struct(&mut self, struct_type: &'a StructType) -> Result<(), Error> {
         // Only consume newly-added entries (if any). There could be fewer than expected if
         // the recursion encountered an error.
         let mark = self.stack.len();
@@ -135,8 +104,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
         let fields = struct_type.fields();
         if field_exprs.len() != fields.len() {
-            self.set_error(Error::InsufficientScalars);
-            return None;
+            return Err(Error::InsufficientScalars);
         }
 
         let mut found_non_nullable_null = false;
@@ -154,53 +122,41 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         let struct_expr = if found_non_nullable_null {
             if !all_null {
                 // we found a non_nullable NULL, but other siblings are non-null: error
-                self.set_error(Error::Schema(
+                return Err(Error::Schema(
                     "NULL value for non-nullable struct field with non-NULL siblings".to_string(),
                 ));
-                return None;
             }
-            Expression::null_literal(struct_type.clone().into())
+            null_lit(struct_type.clone())
         } else {
             Expression::struct_from(field_exprs)
         };
 
         self.stack.push(struct_expr);
-        None
-    }
-
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        // first always check error to terminate early if possible
-        self.error.as_ref().ok()?;
-
-        self.recurse_into_struct_field(field);
-        Some(Cow::Borrowed(field))
+        Ok(())
     }
 
     // arrays treated as leaves
-    fn transform_array(&mut self, array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+    fn transform_array(&mut self, array_type: &'a ArrayType) -> Result<(), Error> {
         transform_leaf!(self, DataType::Array, array_type)
     }
 
     // maps treated as leaves
-    fn transform_map(&mut self, map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
+    fn transform_map(&mut self, map_type: &'a MapType) -> Result<(), Error> {
         transform_leaf!(self, DataType::Map, map_type)
     }
+
+    // NOTE: No support for variant scalar values yet, so nothing to transform.
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use std::sync::Arc;
-
-    use crate::expressions::{ArrayData, MapData};
-    use crate::schema::SchemaRef;
-    use crate::schema::StructType;
-    use crate::DataType as DeltaDataTypes;
-
     use paste::paste;
-
     use Expression as Expr;
+
+    use super::*;
+    use crate::expressions::{lit, ArrayData, MapData};
+    use crate::schema::{schema, schema_ref, SchemaRef, StructField};
+    use crate::DataType as DeltaDataTypes;
 
     // helper to take values/schema to pass to `create_one` and assert the result = expected
     fn assert_single_row_transform(
@@ -208,17 +164,10 @@ mod tests {
         schema: SchemaRef,
         expected: Result<Expr, ()>,
     ) {
-        let mut schema_transform = LiteralExpressionTransform::new(values);
-        let datatype = schema.into();
-        let _transformed = schema_transform.transform(&datatype);
+        let transformed = literal_expression_transform(&schema, values);
         match expected {
-            Ok(expected_expr) => {
-                let actual_expr = schema_transform.try_into_expr().unwrap();
-                assert_eq!(expected_expr, actual_expr);
-            }
-            Err(()) => {
-                assert!(schema_transform.try_into_expr().is_err());
-            }
+            Ok(expected_expr) => assert_eq!(expected_expr, transformed.unwrap()),
+            Err(()) => assert!(transformed.is_err()),
         }
     }
 
@@ -226,48 +175,41 @@ mod tests {
     fn test_create_one_top_level_null() {
         let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "col_1",
-            DeltaDataTypes::INTEGER,
-        )]));
-        let expected = Expr::null_literal(schema.clone().into());
+        let schema = schema_ref! { not_null "col_1": INTEGER };
+        let expected = null_lit(schema.clone());
         assert_single_row_transform(values, schema, Ok(expected));
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "col_1",
-            DeltaDataTypes::INTEGER,
-        )]));
-        let expected = Expr::struct_from(vec![Expr::null_literal(DeltaDataTypes::INTEGER)]);
+        let schema = schema_ref! { nullable "col_1": INTEGER };
+        let expected = Expr::struct_from(vec![null_lit(DeltaDataTypes::INTEGER)]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
 
     #[test]
     fn test_create_one_missing_values() {
         let values = &[1.into()];
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
-            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
-        ]));
+        let schema = schema_ref! {
+            nullable "col_1": INTEGER,
+            nullable "col_2": INTEGER,
+        };
         assert_single_row_transform(values, schema, Err(()));
     }
 
     #[test]
     fn test_create_one_extra_values() {
         let values = &[1.into(), 2.into(), 3.into()];
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
-            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
-        ]));
+        let schema = schema_ref! {
+            nullable "col_1": INTEGER,
+            nullable "col_2": INTEGER,
+        };
         assert_single_row_transform(values, schema, Err(()));
     }
 
     #[test]
     fn test_create_one_incorrect_schema() {
         let values = &["a".into()];
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "col_1",
-            DeltaDataTypes::INTEGER,
-        )]));
+        let schema = schema_ref! {
+            nullable "col_1": INTEGER,
+        };
         assert_single_row_transform(values, schema, Err(()));
     }
 
@@ -275,25 +217,19 @@ mod tests {
     #[test]
     fn test_many_structs() {
         let values: &[Scalar] = &[1.into(), 2.into(), 3.into(), 4.into()];
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable(
-                "x",
-                DeltaDataTypes::struct_type_unchecked([
-                    StructField::not_null("a", DeltaDataTypes::INTEGER),
-                    StructField::nullable("b", DeltaDataTypes::INTEGER),
-                ]),
-            ),
-            StructField::nullable(
-                "y",
-                DeltaDataTypes::struct_type_unchecked([
-                    StructField::not_null("c", DeltaDataTypes::INTEGER),
-                    StructField::nullable("d", DeltaDataTypes::INTEGER),
-                ]),
-            ),
-        ]));
+        let schema = schema_ref! {
+            nullable "x": {
+                not_null "a": INTEGER,
+                nullable "b": INTEGER,
+            },
+            nullable "y": {
+                not_null "c": INTEGER,
+                nullable "d": INTEGER,
+            },
+        };
         let expected = Expr::struct_from(vec![
-            Expr::struct_from(vec![Expr::literal(1), Expr::literal(2)]),
-            Expr::struct_from(vec![Expr::literal(3), Expr::literal(4)]),
+            Expr::struct_from(vec![lit(1), lit(2)]),
+            Expr::struct_from(vec![lit(3), lit(4)]),
         ]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
@@ -308,14 +244,11 @@ mod tests {
             Scalar::Map(map_data.clone()),
             Scalar::Array(array_data.clone()),
         ];
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("map", DeltaDataTypes::Map(Box::new(map_type))),
-            StructField::nullable("array", DeltaDataTypes::Array(Box::new(array_type))),
-        ]));
-        let expected = Expr::struct_from(vec![
-            Expr::literal(Scalar::Map(map_data)),
-            Expr::literal(Scalar::Array(array_data)),
-        ]);
+        let schema = schema_ref! {
+            nullable "map": (map_type),
+            nullable "array": (array_type),
+        };
+        let expected = Expr::struct_from(vec![lit(map_data), lit(array_data)]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
 
@@ -349,22 +282,25 @@ mod tests {
         let field_b = StructField::new("b", DeltaDataTypes::INTEGER, test_schema.b_nullable);
         let field_x = StructField::new(
             "x",
-            StructType::new_unchecked([field_a.clone(), field_b.clone()]),
+            schema! {
+                (field_a.clone()),
+                (field_b.clone()),
+            },
             test_schema.x_nullable,
         );
-        let schema = Arc::new(StructType::new_unchecked([field_x.clone()]));
+        let schema = schema_ref! {
+            (field_x.clone()),
+        };
 
         let expected_result = match expected {
             Expected::Noop => {
-                let nested_struct = Expr::struct_from(vec![
-                    Expr::literal(values[0].clone()),
-                    Expr::literal(values[1].clone()),
-                ]);
+                let nested_struct =
+                    Expr::struct_from(vec![lit(values[0].clone()), lit(values[1].clone())]);
                 Ok(Expr::struct_from([nested_struct]))
             }
-            Expected::Null => Ok(Expr::null_literal(schema.clone().into())),
+            Expected::Null => Ok(null_lit(schema.clone())),
             Expected::NullStruct => {
-                let nested_null = Expr::null_literal(field_x.data_type().clone());
+                let nested_null = null_lit(field_x.data_type().clone());
                 Ok(Expr::struct_from([nested_null]))
             }
             Expected::Error => Err(()),

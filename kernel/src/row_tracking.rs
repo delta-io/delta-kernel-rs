@@ -1,17 +1,20 @@
+// Allow unreachable_pub because this module is pub when test-utils is enabled,
+// making the pub items reachable from integration tests.
+#![allow(unreachable_pub)]
+
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::actions::domain_metadata::domain_metadata_configuration;
-use crate::actions::DomainMetadata;
+use crate::actions::{DomainMetadata, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Snapshot};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RowTrackingDomainMetadata {
+pub struct RowTrackingDomainMetadata {
     // NB: The Delta spec does not rule out negative high water marks
     row_id_high_water_mark: i64,
 }
@@ -20,10 +23,22 @@ pub(crate) struct RowTrackingDomainMetadata {
 pub(crate) const ROW_TRACKING_DOMAIN_NAME: &str = "delta.rowTracking";
 
 impl RowTrackingDomainMetadata {
+    /// The row ID high water mark for a table with no assigned row IDs yet. The first
+    /// file written receives `baseRowId = MISSING_ROW_ID_HIGH_WATERMARK + 1 = 0`.
+    pub(crate) const MISSING_ROW_ID_HIGH_WATERMARK: i64 = -1;
+
     pub(crate) fn new(row_id_high_water_mark: i64) -> Self {
         RowTrackingDomainMetadata {
             row_id_high_water_mark,
         }
+    }
+
+    /// Creates the initial row tracking domain metadata for a newly created table.
+    ///
+    /// Sets the high water mark to -1, meaning no rows have been assigned IDs yet.
+    /// The first file written will receive `baseRowId = 0`.
+    pub(crate) fn initial() -> Self {
+        Self::new(Self::MISSING_ROW_ID_HIGH_WATERMARK)
     }
 
     /// Retrieves the row ID high water mark from the [`Snapshot`]'s row tracking domain metadata.
@@ -42,20 +57,15 @@ impl RowTrackingDomainMetadata {
     /// This method will return an error if:
     /// - The domain metadata configuration cannot be read from the log segment
     /// - The domain metadata JSON cannot be deserialized into `RowTrackingDomainMetadata`
-    pub(crate) fn get_high_water_mark(
+    pub fn get_high_water_mark(
         snapshot: &Snapshot,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        Ok(
-            domain_metadata_configuration(
-                snapshot.log_segment(),
-                ROW_TRACKING_DOMAIN_NAME,
-                engine,
-            )?
-            .map(|domain_metadata| serde_json::from_str::<Self>(&domain_metadata))
+        Ok(snapshot
+            .get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+            .map(|config| serde_json::from_str::<Self>(&config))
             .transpose()?
-            .map(|metadata| metadata.row_id_high_water_mark),
-        )
+            .map(|metadata| metadata.row_id_high_water_mark))
     }
 }
 
@@ -88,13 +98,12 @@ pub(crate) struct RowTrackingVisitor {
 }
 
 impl RowTrackingVisitor {
-    /// Default value for an absent high water mark
-    const DEFAULT_HIGH_WATER_MARK: i64 = -1;
-
     pub(crate) fn new(row_id_high_water_mark: Option<i64>, num_batches: Option<usize>) -> Self {
-        // A table might not have a row ID high water mark yet, so we model the input as an Option<i64>
+        // A table might not have a row ID high water mark yet, so we model the input as an
+        // Option<i64>
         Self {
-            row_id_high_water_mark: row_id_high_water_mark.unwrap_or(Self::DEFAULT_HIGH_WATER_MARK),
+            row_id_high_water_mark: row_id_high_water_mark
+                .unwrap_or(RowTrackingDomainMetadata::MISSING_ROW_ID_HIGH_WATERMARK),
             base_row_id_batches: Vec::with_capacity(num_batches.unwrap_or(0)),
         }
     }
@@ -104,7 +113,7 @@ impl RowVisitor for RowTrackingVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             (
-                vec![ColumnName::new(["stats", "numRecords"])],
+                vec![column_name!("stats", NUM_RECORDS)],
                 vec![DataType::LONG],
             )
                 .into()
@@ -126,11 +135,10 @@ impl RowVisitor for RowTrackingVisitor {
 
         let mut current_hwm = self.row_id_high_water_mark;
         for i in 0..row_count {
-            let num_records: i64 = getters[0].get_opt(i, "numRecords")?.ok_or_else(|| {
-                Error::InternalError(
-                    "numRecords must be present in Add actions when row tracking is enabled."
-                        .to_string(),
-                )
+            let num_records: i64 = getters[0].get_opt(i, NUM_RECORDS)?.ok_or_else(|| {
+                Error::InternalError(format!(
+                    "{NUM_RECORDS} must be present in Add actions when row tracking is enabled."
+                ))
             })?;
             batch_base_row_ids.push(current_hwm + 1);
             current_hwm += num_records;
@@ -146,7 +154,7 @@ impl RowVisitor for RowTrackingVisitor {
 mod tests {
     use super::*;
     use crate::engine_data::GetData;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Mock GetData implementation for testing
     struct MockGetData {
@@ -161,7 +169,7 @@ mod tests {
 
     impl<'a> GetData<'a> for MockGetData {
         fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
-            if field_name == "numRecords" {
+            if field_name == NUM_RECORDS {
                 Ok(self.num_records_values.get(row_index).copied().flatten())
             } else {
                 Ok(None)
@@ -292,7 +300,7 @@ mod tests {
         let result = visitor.visit(1, &getters);
         assert_result_error_with_message(
             result,
-            "numRecords must be present in Add actions when row tracking is enabled",
+            &format!("{NUM_RECORDS} must be present in Add actions when row tracking is enabled"),
         );
 
         Ok(())
@@ -303,7 +311,7 @@ mod tests {
         let visitor = RowTrackingVisitor::new(Some(0), None);
         let (names, types) = visitor.selected_column_names_and_types();
 
-        assert_eq!(names, (vec![ColumnName::new(["stats", "numRecords"])]));
+        assert_eq!(names, (vec![column_name!("stats", NUM_RECORDS)]));
         assert_eq!(types, vec![DataType::LONG]);
     }
 

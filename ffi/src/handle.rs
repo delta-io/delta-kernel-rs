@@ -3,11 +3,11 @@
 //!
 //! Creating a [`Handle<T>`] always implies some kind of ownership transfer. A mutable handle takes
 //! ownership of the object itself (analogous to [`Box<T>`]), while a non-mutable (shared) handle
-//! takes ownership of a shared reference to the object (analogous to [`std::sync::Arc<T>`]). Thus, a created
-//! handle remains [valid][Handle#Validity], and its underlying object remains accessible, until the
-//! handle is explicitly dropped or consumed. Dropping a mutable handle always drops the underlying
-//! object as well; dropping a shared handle only drops the underlying object if the handle was the
-//! last reference to that object.
+//! takes ownership of a shared reference to the object (analogous to [`std::sync::Arc<T>`]). Thus,
+//! a created handle remains [valid][Handle#Validity], and its underlying object remains accessible,
+//! until the handle is explicitly dropped or consumed. Dropping a mutable handle always drops the
+//! underlying object as well; dropping a shared handle only drops the underlying object if the
+//! handle was the last reference to that object.
 //!
 //! Because handles carry ownership semantics, and lifetime information is not preserved across the
 //! FFI boundary, handles are always opaque types to avoid confusiong them with normal references
@@ -39,7 +39,6 @@
 ///
 /// #[handle_descriptor(target = dyn Bar, mutable = false)]
 /// pub struct SharedBar;
-///
 /// ```
 ///
 /// NOTE: For obscure rust generic type constraint reasons, a `HandleDescriptor` must specifically
@@ -194,8 +193,8 @@ mod private {
         /// * The handle is [valid][Handle#Validity].
         ///
         /// * No other references (neither shared nor mutable) can overlap with the returned
-        ///   reference. In particular, this means the caller must ensure no other thread can access this
-        ///   handle while the returned reference is still alive.
+        ///   reference. In particular, this means the caller must ensure no other thread can access
+        ///   this handle while the returned reference is still alive.
         pub unsafe fn as_mut(&mut self) -> &mut T {
             H::as_mut(self.ptr.cast().as_ptr())
         }
@@ -497,8 +496,9 @@ pub use private::{Boolean, False, Handle, True, Unconstructable};
 mod tests {
     use std::sync::Arc;
 
-    use super::*;
     use delta_kernel_ffi_macros::handle_descriptor;
+
+    use super::*;
 
     #[allow(dead_code)]
     #[derive(Debug)]

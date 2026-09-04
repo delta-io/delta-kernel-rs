@@ -1,28 +1,35 @@
-use crate::arrow::array::StringArray;
-use crate::scan::state_info::StateInfo;
-use crate::schema::StructType;
-use crate::utils::test_utils::string_array_to_engine_data;
-use itertools::Itertools;
+use std::collections::HashSet;
 use std::sync::Arc;
-
-use crate::actions::get_log_add_schema;
-use crate::log_replay::ActionsBatch;
-use crate::log_segment::CheckpointReadInfo;
-use crate::{
-    actions::get_commit_schema,
-    engine::{
-        arrow_data::ArrowEngineData,
-        sync::{json::SyncJsonHandler, SyncEngine},
-    },
-    scan::log_replay::scan_action_iter,
-    schema::SchemaRef,
-    JsonHandler,
-};
 
 use super::state::ScanCallback;
 use super::PhysicalPredicate;
+use crate::actions::get_commit_schema;
+use crate::arrow::array::StringArray;
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::sync::json::SyncJsonHandler;
+use crate::engine::sync::SyncEngine;
+use crate::log_replay::ActionsBatch;
+use crate::log_segment::CheckpointReadInfo;
+use crate::scan::log_replay::{scan_action_iter, ScanPartitionValuesOptions, ScanStatsOptions};
+use crate::scan::state_info::StateInfo;
+use crate::scan::transform_spec::TransformSpec;
+use crate::schema::{schema_ref, SchemaRef};
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::TransformSpec;
+use crate::unit_test_utils::string_array_to_engine_data;
+use crate::JsonHandler;
+
+// Preserve schema-projected null columns because batch equality checks include them.
+fn parse_batch<S: AsRef<str>>(
+    json: impl IntoIterator<Item = S>,
+    output_schema: SchemaRef,
+) -> Box<ArrowEngineData> {
+    let handler = SyncJsonHandler::new(None);
+    let json_strings = StringArray::from_iter_values(json);
+    let parsed = handler
+        .parse_json(string_array_to_engine_data(json_strings), output_schema)
+        .unwrap();
+    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+}
 
 // Generates a batch of sidecar actions with the given paths.
 // The schema is provided as null columns affect equality checks.
@@ -41,8 +48,6 @@ pub(crate) fn sidecar_batch_with_given_paths_and_sizes(
     paths_and_sizes: Vec<(&str, u64)>,
     output_schema: SchemaRef,
 ) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
-
     let mut json_strings: Vec<String> = paths_and_sizes
         .iter()
         .map(|(path, size)| {
@@ -53,80 +58,93 @@ pub(crate) fn sidecar_batch_with_given_paths_and_sizes(
         .collect();
     json_strings.push(r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#.to_string());
 
-    let json_strings_array: StringArray =
-        json_strings.iter().map(|s| s.as_str()).collect_vec().into();
-
-    let parsed = handler
-        .parse_json(
-            string_array_to_engine_data(json_strings_array),
-            output_schema,
-        )
-        .unwrap();
-
-    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    parse_batch(json_strings, output_schema)
 }
 
 // Generates a batch with an add action.
 // The schema is provided as null columns affect equality checks.
 pub(crate) fn add_batch_simple(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
-    let json_strings: StringArray = vec![
-        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
-        r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
-    ]
-        .into();
-    let parsed = handler
-        .parse_json(string_array_to_engine_data(json_strings), output_schema)
-        .unwrap();
-    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    parse_batch(
+        [
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+        ],
+        output_schema,
+    )
 }
 
 // Generates a batch with an add action.
 // The schema is provided as null columns affect equality checks.
-pub(crate) fn add_batch_for_row_id(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
-    let json_strings: StringArray = vec![
-        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","baseRowId": 42, "tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
-        r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableRowTracking": "true", "delta.rowTracking.materializedRowIdColumnName":"row_id_col"},"createdTime":1677811175819}}"#,
-    ]
-        .into();
-    let parsed = handler
-        .parse_json(string_array_to_engine_data(json_strings), output_schema)
-        .unwrap();
-    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+pub(crate) fn add_batch_for_row_tracking(output_schema: SchemaRef) -> Box<ArrowEngineData> {
+    parse_batch(
+        [
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","baseRowId":42,"defaultRowCommitVersion":5,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableRowTracking": "true", "delta.rowTracking.materializedRowIdColumnName":"row_id_col", "delta.rowTracking.materializedRowCommitVersionColumnName":"row_commit_version_col"},"createdTime":1677811175819}}"#,
+        ],
+        output_schema,
+    )
 }
 
 // An add batch with a removed file parsed with the schema provided
 pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
-    let json_strings: StringArray = vec![
-        r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{},"size":635,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
-        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
-        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
-        r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
-    ]
-        .into();
-    let parsed = handler
-        .parse_json(string_array_to_engine_data(json_strings), output_schema)
-        .unwrap();
-    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    parse_batch(
+        [
+            r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{},"size":635,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+        ],
+        output_schema,
+    )
+}
+
+pub(crate) fn remove_only_batch(output_schema: SchemaRef) -> Box<ArrowEngineData> {
+    parse_batch(
+        [
+            r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{},"size":635}}"#,
+        ],
+        output_schema,
+    )
+}
+
+pub(crate) fn adds_only_batch(output_schema: SchemaRef) -> Box<ArrowEngineData> {
+    parse_batch(
+        [
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c002.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true}}"#,
+        ],
+        output_schema,
+    )
+}
+
+// A batch with a Remove action and a partition column (`date`). The Remove has
+// `partitionValues: {"date": "2017-12-10"}` but the transform reads from `add.*` columns,
+// so the Remove's partition values are not visible to the data skipping filter.
+pub(crate) fn add_batch_with_remove_and_partition(
+    output_schema: SchemaRef,
+) -> Box<ArrowEngineData> {
+    parse_batch(
+        [
+            r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{"date":"2017-12-10"},"size":635}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues":{"date":"2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0}}"}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{"date":"2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0}}"}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["date"],"configuration":{"delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+        ],
+        output_schema,
+    )
 }
 
 // add batch with a `date` partition col
 pub(crate) fn add_batch_with_partition_col() -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
-    let json_strings: StringArray = vec![
-        r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["date"],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
-        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues": {"date": "2017-12-11"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
-        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
-    ]
-        .into();
-    let output_schema = get_commit_schema().clone();
-    let parsed = handler
-        .parse_json(string_array_to_engine_data(json_strings), output_schema)
-        .unwrap();
-    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    parse_batch(
+        [
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["date"],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues": {"date": "2017-12-11"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+        ],
+        get_commit_schema().clone(),
+    )
 }
 
 /// Create a scan action iter and validate what's called back. If you pass `None` as
@@ -140,8 +158,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
     context: T,
     validate_callback: ScanCallback<T>,
 ) {
-    let logical_schema =
-        logical_schema.unwrap_or_else(|| Arc::new(StructType::new_unchecked(vec![])));
+    let logical_schema = logical_schema.unwrap_or_else(|| schema_ref! {});
     let state_info = Arc::new(StateInfo {
         logical_schema: logical_schema.clone(),
         physical_schema: logical_schema,
@@ -149,19 +166,22 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         transform_spec,
         column_mapping_mode: ColumnMappingMode::None,
         physical_stats_schema: None,
-        logical_stats_schema: None,
+        physical_partition_schema: None,
+        eligible_physical_stats_columns: HashSet::new(),
+        requested_physical_stats_columns: Vec::new(),
+        is_catalog_managed: false,
+        skip_row_transforms: false,
     });
-    let checkpoint_info = CheckpointReadInfo {
-        has_stats_parsed: false,
-        checkpoint_read_schema: get_log_add_schema().clone(),
-    };
-    let iter = scan_action_iter(
+    let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
+    let (iter, _metrics) = scan_action_iter(
         &SyncEngine::new(),
         batch
             .into_iter()
             .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
         state_info,
         checkpoint_info,
+        ScanStatsOptions::default(),
+        ScanPartitionValuesOptions::default(),
     )
     .unwrap();
     let mut batch_count = 0;

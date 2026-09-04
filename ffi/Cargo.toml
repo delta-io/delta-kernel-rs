@@ -18,14 +18,20 @@ release = false
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+bytes = "1.10"
+prost = { version = "0.13", optional = true }
 tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
+peak_alloc = { version = "0.3.0", optional = true }
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.19.0" }
+delta_kernel_default_engine = { path = "../default-engine", default-features = false, optional = true }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.28.0" }
+delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog", optional = true }
+unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", optional = true }
 
 [build-dependencies]
 cbindgen = "0.29.2"
@@ -36,24 +42,45 @@ paste = "1.0"
 rand = "0.9.2"
 serde = "1.0.219"
 serde_json = "1.0.142"
-test_utils = { path = "../test-utils" }
+test_utils = { path = "../test-utils", default-features = false }
 tokio = { version = "1.47" }
 trybuild = "1.0"
 tempfile = "3.20.0"
 itertools = "0.14.0"
-object_store = "0.12.3"
+rstest = "0.23"
 
 [features]
-default = ["default-engine-rustls"]
-default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-engine-base"]
-default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
-catalog-managed = ["delta_kernel/catalog-managed"]
+default = ["default-engine-rustls", "arrow"]
+default-engine-native-tls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/native-tls", "default-engine-base"]
+default-engine-rustls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/rustls", "default-engine-base"]
+delta-kernel-unity-catalog = [ "dep:delta-kernel-unity-catalog", "dep:unity-catalog-delta-client-api" ]
+arrow = ["arrow-59"]
+arrow-59 = ["delta_kernel/arrow-59"]
+arrow-58 = ["delta_kernel/arrow-58"]
 
-# This is an 'internal' feature flag which has all the shared bits from default-engine-native-tls and
-# default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of
-# default-engine-native-tls or default-engine-rustls, so default-engine-base will not work by itself
-default-engine-base = ["delta_kernel/default-engine-base", "delta_kernel/arrow"]
+# Internal feature flag with the shared bits between default-engine-native-tls and
+# default-engine-rustls. Enable one of those two on the FFI crate instead to also pick a TLS backend.
+default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine"]
+
+# Declarative plan execution via PlanExecutor trait (experimental).
+#
+# Requires `arrow` because iterators returned from plan execution use Arrow to pass along data
+# batches, and requires `default-engine-base` because the `PlanBasedEngine` FFI constructor pairs
+# the plan executor with `ArrowEvaluationHandler`
+declarative-plans = ["delta_kernel/declarative-plans", "dep:prost", "arrow", "default-engine-base"]
+
+vendored-protoc = ["delta_kernel/vendored-protoc"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []
+
+# Experimental, in-development feature flag gating in-progress geospatial
+# (geometry/geography) type support. TODO(#2949): remove once full geo support ships.
+geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]
+
+# Tracking global allocator for process-wide native live/peak bytes, readable via the
+# `*_native_bytes` FFI getters. Off by default. Only enable when building the cdylib:
+# this crate is also an rlib, so `#[global_allocator]` applies to any Rust binary that
+# links it and conflicts with a binary that installs its own (jemalloc, dhat, ...).
+alloc-tracking = ["dep:peak_alloc"]

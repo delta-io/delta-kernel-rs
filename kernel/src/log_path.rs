@@ -1,10 +1,10 @@
 //! Public-facing [`LogPath`] type for representing paths to delta log files.
 
+use url::Url;
+
 use crate::path::ParsedLogPath;
 use crate::utils::require;
 use crate::{DeltaResult, Error, FileMeta, FileSize};
-
-use url::Url;
 
 /// A path to a valid delta log file. You can parse a given `FileMeta` into a `LogPath` using
 /// [`LogPath::try_new`].
@@ -70,9 +70,9 @@ impl LogPath {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
     use std::str::FromStr;
+
+    use super::*;
 
     #[test]
     fn test_staged_commit_path_creation() {

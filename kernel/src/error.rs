@@ -1,23 +1,95 @@
 //! Definitions of errors that the delta kernel can encounter
 
-use std::{
-    backtrace::{Backtrace, BacktraceStatus},
-    convert::Infallible,
-    num::ParseIntError,
-    str::Utf8Error,
-};
-
-use crate::schema::{DataType, StructType};
-use crate::table_properties::ParseIntervalError;
-use crate::Version;
+use std::backtrace::{Backtrace, BacktraceStatus};
+use std::convert::Infallible;
+use std::num::ParseIntError;
+use std::str::Utf8Error;
 
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
-use object_store;
+use crate::object_store;
+use crate::schema::{DataType, StructType};
+use crate::table_properties::ParseIntervalError;
+use crate::Version;
+
+/// Details of a failed conversion from a scalar into a Rust value.
+///
+/// Conversion code adds path elements as an error unwinds, producing a path from the outermost
+/// value to the value that failed without carrying mutable path state through successful parsing.
+#[derive(Debug)]
+pub struct ScalarConversionError {
+    expected: String,
+    actual: String,
+    // Stored innermost-first because parent context is appended as conversion errors unwind.
+    path: Vec<String>,
+}
+
+impl ScalarConversionError {
+    pub(crate) fn new(expected: impl Into<String>, actual: impl Into<String>) -> Self {
+        Self {
+            expected: expected.into(),
+            actual: actual.into(),
+            path: Vec::new(),
+        }
+    }
+
+    fn add_path_context(mut self, element: impl Into<String>) -> Self {
+        self.path.push(element.into());
+        self
+    }
+
+    fn path_string(&self) -> String {
+        let mut path = String::new();
+        for element in self.path.iter().rev() {
+            if !path.is_empty() && !element.starts_with('[') {
+                path.push('.');
+            }
+            path.push_str(element);
+        }
+        path
+    }
+}
+
+impl std::fmt::Display for ScalarConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut target = self.path_string();
+        if target.is_empty() {
+            target.push_str("scalar");
+        }
+        write!(
+            f,
+            "Cannot convert {target}: expected {}, found {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for ScalarConversionError {}
+
+/// Adds an outer path element to a scalar conversion error as nested conversion unwinds.
+///
+/// Other error variants are returned unchanged: a field's `TryFrom<Scalar>` implementation may
+/// report a failure unrelated to scalar shape, and this helper must not reclassify it.
+pub(crate) fn add_scalar_path_context(error: Error, element: impl Into<String>) -> Error {
+    match error {
+        Error::ScalarConversion(error) => Error::ScalarConversion(error.add_path_context(element)),
+        other => other,
+    }
+}
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
+
+/// A boxed, `Send` iterator of [`DeltaResult<T>`] items.
+///
+/// Convenience alias for the common pattern of returning a streaming, fallible iterator from
+/// kernel APIs.
+pub type DeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send + 'a>;
+
+/// `'static` counterpart to [`DeltaResultIterator`] for cases where the iterator does not
+/// reference borrowed data.
+pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
 
 /// All the types of errors that the kernel can run into
 #[non_exhaustive]
@@ -49,6 +121,10 @@ pub enum Error {
     #[error("Error extracting type {0}: {1}")]
     Extract(&'static str, &'static str),
 
+    /// A scalar could not be converted into the requested Rust value.
+    #[error(transparent)]
+    ScalarConversion(#[from] ScalarConversionError),
+
     /// A generic error with a message
     #[error("Generic delta kernel error: {0}")]
     Generic(String),
@@ -58,6 +134,19 @@ pub enum Error {
     GenericError {
         /// Source error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// An error involving the maximum catalog-ratified version when building a snapshot.
+    #[error("Max catalog version error: {0}")]
+    MaxCatalogVersion(String),
+
+    /// The supplied log tail contains adjacent versions that are not contiguous.
+    #[error("Log tail versions {first_version} and {second_version} are not contiguous")]
+    LogTailVersionsNotContiguous {
+        /// Earlier version in the invalid adjacent pair.
+        first_version: Version,
+        /// Later version in the invalid adjacent pair.
+        second_version: Version,
     },
 
     /// Some kind of [`std::io::Error`]
@@ -96,6 +185,11 @@ pub enum Error {
     /// A column was requested, but not found
     #[error("{0}")]
     MissingColumn(String),
+
+    /// The connector-provided partition values are invalid (missing/extra/duplicate keys,
+    /// or a value type does not match the schema column type).
+    #[error("Invalid partition values: {0}")]
+    InvalidPartitionValues(String),
 
     /// A column was specified with a specific type, but it is not of that type
     #[error("Expected column type: {0}")]
@@ -172,6 +266,10 @@ pub enum Error {
     #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
+    /// Invalid CRS or other parameter for a Geometry / Geography type
+    #[error("Invalid geo parameters: {0}")]
+    InvalidGeoParams(String),
+
     /// Inconsistent data passed to struct scalar
     #[error("Invalid struct data: {0}")]
     InvalidStructData(String),
@@ -192,12 +290,24 @@ pub enum Error {
     #[error("Unsupported: {0}")]
     Unsupported(String),
 
+    /// Cannot write a version checksum (CRC) file for this snapshot
+    #[error("Checksum write unsupported: {0}")]
+    ChecksumWriteUnsupported(String),
+
     /// Parsing error when attempting to deserialize an interval
     #[error(transparent)]
     ParseIntervalError(#[from] ParseIntervalError),
 
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
+
+    /// Row tracking (`delta.enableRowTracking`) must be enabled for the entire version range of a
+    /// row-tracking change feed, but it is not enabled at the given version.
+    #[error(
+        "Row tracking (delta.enableRowTracking) must be enabled for the entire row-tracking change \
+         feed range, but it is not enabled at version {0}"
+    )]
+    RowTrackingChangeFeedUnsupported(Version),
 
     #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
     ChangeDataFeedIncompatibleSchema(String, String),
@@ -212,13 +322,42 @@ pub enum Error {
         #[from] crate::expressions::literal_expression_transform::Error,
     ),
 
-    /// Schema mismatch has occurred or invalid schema used somewhere
+    /// Schema mismatch has occurred or invalid/not-kernel-supported schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// Validation error for file statistics (e.g., missing required clustering column stats)
+    #[error("Stats validation error: {0}")]
+    StatsValidation(String),
+
+    /// Error during log history operations (timestamp queries, version lookups)
+    #[error(transparent)]
+    LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
+
+    #[cfg(feature = "declarative-plans")]
+    #[error("Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}")]
+    PlanResultTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+
+    /// The operation was cancelled via a [`CancellationToken`](crate::CancellationToken).
+    ///
+    /// Surfaced by cancellation-aware reads as a terminal error, distinct from normal iterator
+    /// exhaustion. See [`CancellableIterator`](crate::cancellation) for the enforced contract.
+    #[error("Operation cancelled")]
+    Cancelled,
 }
 
 // Convenience constructors for Error types that take a String argument
 impl Error {
+    pub(crate) fn scalar_conversion(
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        ScalarConversionError::new(expected, actual).into()
+    }
+
     pub(crate) fn checkpoint_write(msg: impl ToString) -> Self {
         Self::CheckpointWrite(msg.to_string())
     }
@@ -240,6 +379,9 @@ impl Error {
     pub fn unexpected_column_type(name: impl ToString) -> Self {
         Self::UnexpectedColumnType(name.to_string())
     }
+    pub fn invalid_partition_values(msg: impl ToString) -> Self {
+        Self::InvalidPartitionValues(msg.to_string())
+    }
     pub fn missing_data(name: impl ToString) -> Self {
         Self::MissingData(name.to_string())
     }
@@ -260,6 +402,10 @@ impl Error {
     }
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
+    }
+    #[cfg(feature = "geo-type-in-dev")]
+    pub fn invalid_geo_params(msg: impl ToString) -> Self {
+        Self::InvalidGeoParams(msg.to_string())
     }
     pub fn invalid_struct_data(msg: impl ToString) -> Self {
         Self::InvalidStructData(msg.to_string())
@@ -289,11 +435,28 @@ impl Error {
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
     }
+    /// Creates an [`Error::RowTrackingChangeFeedUnsupported`] for the given version, used when row
+    /// tracking is not enabled at some point in a row-tracking change feed's version range.
+    pub(crate) fn row_tracking_change_feed_unsupported(version: impl Into<Version>) -> Self {
+        Self::RowTrackingChangeFeedUnsupported(version.into())
+    }
     pub(crate) fn change_data_feed_incompatible_schema(
         expected: &StructType,
         actual: &StructType,
     ) -> Self {
-        Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
+        Self::ChangeDataFeedIncompatibleSchema(expected.to_string(), actual.to_string())
+    }
+
+    /// Creates an incompatible-schema error that identifies the version of `actual`.
+    pub(crate) fn change_data_feed_incompatible_schema_at_version(
+        expected: &StructType,
+        actual: &StructType,
+        version: Version,
+    ) -> Self {
+        Self::ChangeDataFeedIncompatibleSchema(
+            expected.to_string(),
+            format!("schema at version {version}: {actual}"),
+        )
     }
 
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {
@@ -302,6 +465,15 @@ impl Error {
 
     pub fn schema(msg: impl ToString) -> Self {
         Self::Schema(msg.to_string())
+    }
+
+    pub fn stats_validation(msg: impl ToString) -> Self {
+        Self::StatsValidation(msg.to_string())
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    pub fn plan_result_type_mismatch(expected: &'static str, actual: &'static str) -> Self {
+        Self::PlanResultTypeMismatch { expected, actual }
     }
 
     // Capture a backtrace when the error is constructed.

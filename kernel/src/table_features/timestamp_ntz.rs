@@ -1,24 +1,19 @@
 //! Validation for TIMESTAMP_NTZ feature support
 
 use super::TableFeature;
-use crate::actions::Protocol;
-use crate::schema::{PrimitiveType, Schema, SchemaTransform};
+use crate::schema::{PrimitiveType, Schema};
+use crate::table_configuration::TableConfiguration;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-use std::borrow::Cow;
-
 /// Validates that if a table schema contains TIMESTAMP_NTZ columns, the table must have the
 /// TimestampWithoutTimezone feature in both reader and writer features.
-pub(crate) fn validate_timestamp_ntz_feature_support(
-    schema: &Schema,
-    protocol: &Protocol,
-) -> DeltaResult<()> {
+pub(crate) fn validate_timestamp_ntz_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
+    let protocol = tc.protocol();
     if !protocol.has_table_feature(&TableFeature::TimestampWithoutTimezone) {
-        let mut uses_timestamp_ntz = UsesTimestampNtz(false);
-        let _ = uses_timestamp_ntz.transform_struct(schema);
         require!(
-            !uses_timestamp_ntz.0,
+            !schema_contains_timestamp_ntz(&tc.logical_schema()),
             Error::unsupported(
                 "Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features"
             )
@@ -27,99 +22,63 @@ pub(crate) fn validate_timestamp_ntz_feature_support(
     Ok(())
 }
 
-/// Schema visitor that checks if any column in the schema uses TIMESTAMP_NTZ type
-struct UsesTimestampNtz(bool);
+/// Checks if any column in the schema (including nested structs, arrays, maps) uses
+/// the TIMESTAMP_NTZ primitive type.
+pub(crate) fn schema_contains_timestamp_ntz(schema: &Schema) -> bool {
+    UsesTimestampNtz.transform_struct(schema).is_err()
+}
+
+struct UsesTimestampNtz;
 
 impl<'a> SchemaTransform<'a> for UsesTimestampNtz {
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        if *ptype == PrimitiveType::TimestampNtz {
-            self.0 = true;
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
+        match ptype {
+            PrimitiveType::TimestampNtz => Err(()),
+            _ => Ok(()),
         }
-        None
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::actions::Protocol;
-    use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::schema;
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_schema_feature_validation;
 
     #[test]
     fn test_timestamp_ntz_feature_validation() {
-        let schema_with_timestamp_ntz = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("ts", DataType::Primitive(PrimitiveType::TimestampNtz), true),
-        ]);
-
-        let schema_without_timestamp_ntz = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]);
-
-        // Protocol with TimestampWithoutTimezone features
-        let protocol_with_features = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampWithoutTimezone]),
-            Some([TableFeature::TimestampWithoutTimezone]),
+        let schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "ts": TIMESTAMP_NTZ,
+        };
+        let schema_without = schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
+        let nested_schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "nested": {
+                nullable "inner_ts": TIMESTAMP_NTZ,
+            },
+        };
+        let protocol_with = Protocol::try_new_modern(
+            [TableFeature::TimestampWithoutTimezone],
+            [TableFeature::TimestampWithoutTimezone],
         )
         .unwrap();
+        let protocol_without =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
-        // Protocol without TimestampWithoutTimezone features
-        let protocol_without_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
-
-        // Schema with TIMESTAMP_NTZ + Protocol with features = OK
-        validate_timestamp_ntz_feature_support(&schema_with_timestamp_ntz, &protocol_with_features)
-            .expect("Should succeed when features are present");
-
-        // Schema without TIMESTAMP_NTZ + Protocol without features = OK
-        validate_timestamp_ntz_feature_support(
-            &schema_without_timestamp_ntz,
-            &protocol_without_features,
-        )
-        .expect("Should succeed when no TIMESTAMP_NTZ columns are present");
-
-        // Schema without TIMESTAMP_NTZ + Protocol with features = OK
-        validate_timestamp_ntz_feature_support(
-            &schema_without_timestamp_ntz,
-            &protocol_with_features,
-        )
-        .expect("Should succeed when no TIMESTAMP_NTZ columns are present, even with features");
-
-        // Schema with TIMESTAMP_NTZ + Protocol without features = ERROR
-        let result = validate_timestamp_ntz_feature_support(
-            &schema_with_timestamp_ntz,
-            &protocol_without_features,
+        assert_schema_feature_validation(
+            &schema_with,
+            &schema_without,
+            &protocol_with,
+            &protocol_without,
+            &[&nested_schema_with],
+            "Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features",
         );
-        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
-
-        // Nested schema with TIMESTAMP_NTZ
-        let nested_schema_with_timestamp_ntz = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
-                    "inner_ts",
-                    DataType::Primitive(PrimitiveType::TimestampNtz),
-                    true,
-                )]))),
-                true,
-            ),
-        ]);
-
-        let result = validate_timestamp_ntz_feature_support(
-            &nested_schema_with_timestamp_ntz,
-            &protocol_without_features,
-        );
-        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
     }
 }

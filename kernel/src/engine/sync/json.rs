@@ -1,36 +1,46 @@
-use std::{fs::File, io::BufReader, io::Write};
+use std::io::{BufReader, Cursor};
+use std::sync::Arc;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use crate::arrow::json::ReaderBuilder;
-use tempfile::NamedTempFile;
+use bytes::Bytes;
 use url::Url;
 
-use super::read_files;
+use super::{put_bytes, read_files_arrow};
+use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::parse_json as arrow_parse_json;
-use crate::engine::arrow_utils::to_json_bytes;
+use crate::engine::arrow_utils::{
+    build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
+    to_json_bytes,
+};
 use crate::engine_data::FilteredEngineData;
+use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    FileSize, JsonHandler, PredicateRef,
 };
 
-pub(crate) struct SyncJsonHandler;
+pub(crate) struct SyncJsonHandler {
+    store: Option<Arc<DynObjectStore>>,
+}
 
-/// Note: This function must match the signature expected by `read_files` helper function,
-/// which is also used by `try_create_from_parquet`. The `_file_location` parameter is unused
-/// here but required to satisfy the shared function signature.
-fn try_create_from_json(
-    file: File,
-    _schema: SchemaRef,
-    arrow_schema: ArrowSchemaRef,
+impl SyncJsonHandler {
+    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
+        Self { store }
+    }
+}
+
+pub(super) fn try_create_from_json(
+    data: Bytes,
+    schema: SchemaRef,
     _predicate: Option<PredicateRef>,
-    _file_location: String,
+    file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let json = ReaderBuilder::new(arrow_schema)
+    let json_schema = Arc::new(json_arrow_schema(&schema)?);
+    let reorder_indices = build_json_reorder_indices(&schema)?;
+    let json = ReaderBuilder::new(json_schema)
         .with_coerce_primitive(true)
-        .build(BufReader::new(file))?
-        .map(|data| Ok(ArrowEngineData::new(data?)));
+        .build(BufReader::new(Cursor::new(data)))?
+        .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
     Ok(json)
 }
 
@@ -41,7 +51,14 @@ impl JsonHandler for SyncJsonHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        read_files(files, schema, predicate, try_create_from_json)
+        let iter = read_files_arrow(
+            self.store.as_ref(),
+            files,
+            schema,
+            predicate,
+            try_create_from_json,
+        );
+        Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
     }
 
     fn parse_json(
@@ -52,63 +69,31 @@ impl JsonHandler for SyncJsonHandler {
         arrow_parse_json(json_strings, output_schema)
     }
 
-    // For sync writer we write data to a tmp file then atomically rename it to the final path.
-    // This is highly OS-dependent and for now relies on the atomicity of tempfile's
-    // `persist_noclobber`.
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
-        let path = path
-            .to_file_path()
-            .map_err(|_| crate::Error::generic("sync client can only read local files"))?;
-        let Some(parent) = path.parent() else {
-            return Err(crate::Error::generic(format!(
-                "no parent found for {path:?}"
-            )));
-        };
-
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // write data to tmp file
-        let mut tmp_file = NamedTempFile::new_in(parent)?;
+    ) -> DeltaResult<FileSize> {
         let buf = to_json_bytes(data)?;
-        tmp_file.write_all(&buf)?;
-        tmp_file.flush()?;
-
-        let persist_result = if overwrite {
-            tmp_file.persist(path.clone())
-        } else {
-            // use 'persist_noclobber' to atomically rename tmp file to final path
-            tmp_file.persist_noclobber(path.clone())
-        };
-
-        // Map errors (handling AlreadyExists only in non-overwrite mode).
-        persist_result.map_err(|e| {
-            if !overwrite && e.error.kind() == std::io::ErrorKind::AlreadyExists {
-                Error::FileAlreadyExists(path.to_string_lossy().to_string())
-            } else {
-                Error::IOError(e.into())
-            }
-        })?;
-
-        Ok(())
+        let size = buf.len() as FileSize;
+        put_bytes(self.store.as_ref(), path, buf.into(), overwrite)?;
+        Ok(size)
     }
 }
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tempfile::TempDir;
+    use url::Url;
+
     use super::*;
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use serde_json::json;
-    use std::path::Path;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-    use url::Url;
 
     // Helper function to create test data
     fn create_test_data(values: Vec<&str>) -> DeltaResult<Box<dyn EngineData>> {
@@ -145,7 +130,7 @@ mod tests {
     fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let test_dir = TempDir::new().unwrap();
         let path = test_dir.path().join("00000000000000000001.json");
-        let handler = SyncJsonHandler;
+        let handler = SyncJsonHandler::new(None);
         let url = Url::from_file_path(&path).unwrap();
 
         // First write with no existing file
@@ -154,8 +139,9 @@ mod tests {
         let result =
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
-        // Verify the first write is successful
-        assert!(result.is_ok());
+        let written_size = result.unwrap();
+        assert_eq!(written_size, 32);
+        assert_eq!(written_size, std::fs::metadata(&path).unwrap().len());
         let json = read_json_file(&path)?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
@@ -166,20 +152,40 @@ mod tests {
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
-            // Verify the second write is successful
-            assert!(result.is_ok());
+            let written_size = result.unwrap();
+            assert_eq!(written_size, 28);
+            assert_eq!(written_size, std::fs::metadata(&path).unwrap().len());
             let json = read_json_file(&path)?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error
-            match result {
-                Err(Error::FileAlreadyExists(err_path)) => {
-                    assert_eq!(err_path, path.to_string_lossy().to_string());
-                }
-                _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),
-            }
+            assert!(matches!(result, Err(Error::FileAlreadyExists(_))));
         }
 
         Ok(())
     }
+
+    #[test]
+    fn test_write_empty_json_file_reports_zero_size() -> DeltaResult<()> {
+        let test_dir = TempDir::new().unwrap();
+        let path = test_dir.path().join("empty.json");
+        let handler = SyncJsonHandler::new(None);
+        let url = Url::from_file_path(&path).unwrap();
+
+        let written_size = handler
+            .write_json_file(&url, Box::new(std::iter::empty()), false)
+            .unwrap();
+
+        assert_eq!(written_size, 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        Ok(())
+    }
+
+    // TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can
+    // call them without the kernel-cfg-test cycle issue.
+    //
+    // #[test]
+    // fn json_handler_file_path_contract() {
+    //     test_json_handler_file_path_contract(&SyncJsonHandler::new(None));
+    // }
 }

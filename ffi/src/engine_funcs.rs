@@ -11,12 +11,11 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
+use super::handle::Handle;
 use crate::{
     ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
     NullableCvoid, SharedExternEngine, SharedSchema, TryFromStringSlice,
 };
-
-use super::handle::Handle;
 
 #[repr(C)]
 pub struct FileMeta {
@@ -43,6 +42,17 @@ pub struct ExclusiveFileReadResultIterator;
 impl Drop for FileReadResultIterator {
     fn drop(&mut self) {
         debug!("dropping FileReadResultIterator");
+    }
+}
+
+impl FileReadResultIterator {
+    /// Wrap a kernel `EngineData` iterator (paired with the engine that produced it) into a handle
+    /// the engine can drain via [`read_result_next`] and release with [`free_read_result_iter`].
+    pub(crate) fn into_handle(
+        data: FileDataReadResultIterator,
+        engine: Arc<dyn ExternEngine>,
+    ) -> Handle<ExclusiveFileReadResultIterator> {
+        Box::new(FileReadResultIterator { data, engine }).into()
     }
 }
 
@@ -216,22 +226,20 @@ fn evaluate_expression_impl(
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::expressions::lit;
+    use delta_kernel::schema::schema_ref;
+
     use super::{free_expression_evaluator, new_expression_evaluator};
     use crate::ffi_test_utils::ok_or_panic;
-    use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
-    use delta_kernel::{
-        schema::{DataType, StructField, StructType},
-        Expression,
-    };
-    use std::sync::Arc;
+    use crate::handle::Handle;
+    use crate::tests::get_default_engine;
+    use crate::{free_engine, SharedSchema};
 
     #[test]
     fn test_new_expression_evaluator() {
         let engine = get_default_engine("memory:///doesntmatter/foo");
-        let in_schema = Arc::new(
-            StructType::try_new(vec![StructField::new("a", DataType::LONG, true)]).unwrap(),
-        );
-        let expr = Expression::literal(1);
+        let in_schema = schema_ref! { nullable "a": LONG };
+        let expr = lit(1);
         let output_type: Handle<SharedSchema> = in_schema.clone().into();
         let in_schema_handle: Handle<SharedSchema> = in_schema.into();
         unsafe {

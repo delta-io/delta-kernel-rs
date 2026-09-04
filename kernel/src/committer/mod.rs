@@ -29,11 +29,11 @@ mod commit_types;
 mod filesystem;
 mod publish_types;
 
-pub use commit_types::{CommitMetadata, CommitResponse};
+pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::{DeltaResult, Engine, FilteredEngineData};
+use crate::{DeltaResult, DeltaResultIterator, Engine, FilteredEngineData};
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are
 /// effectively a collection of actions performed on the table at a specific version. The kernel
@@ -56,12 +56,13 @@ pub trait Committer: Send {
     /// Commits actions to the table at the version specified in [`CommitMetadata`].
     ///
     /// Implementations must ensure that actions are committed atomically and either:
-    /// 1. Persisted directly to object storage as published deltas (for filesystem-based tables), or
+    /// 1. Persisted directly to object storage as published deltas (for filesystem-based tables),
+    ///    or
     /// 2. Persisted as per the managing catalog's semantics (for catalog-managed tables)
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
 
@@ -81,8 +82,8 @@ pub trait Committer: Send {
     /// # Benefits
     ///
     /// - Reduces the number of commits the catalog needs to store internally and serve to readers
-    /// - Enables table maintenance operations that must operate on published versions only, such
-    ///   as checkpointing and log compaction
+    /// - Enables table maintenance operations that must operate on published versions only, such as
+    ///   checkpointing and log compaction
     ///
     /// # Requirements
     ///

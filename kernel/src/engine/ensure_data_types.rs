@@ -1,50 +1,62 @@
 //! Helpers to ensure that kernel data types match arrow data types
 
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Deref,
-};
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use super::arrow_conversion::TryIntoArrow as _;
-use crate::{
-    engine::arrow_utils::make_arrow_error,
-    schema::{DataType, MetadataValue, StructField},
-    utils::require,
-    DeltaResult, Error,
-};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
+use crate::engine::arrow_utils::make_arrow_error;
+use crate::schema::{DataType, MetadataValue, StructField};
+use crate::utils::require;
+use crate::{DeltaResult, Error};
+
+/// Controls how `ensure_data_types` validates struct fields and metadata.
+#[derive(Clone, Copy)]
+#[internal_api]
+pub(crate) enum ValidationMode {
+    /// Check types only. Struct fields are matched by ordinal position, not by name.
+    /// Nullability and metadata are not checked.
+    #[allow(dead_code)]
+    TypesOnly,
+    /// Check types and match struct fields by name, but skip nullability and metadata.
+    /// Used by the parquet reader where fields are already resolved by name upstream.
+    TypesAndNames,
+    /// Check types, names, nullability, and metadata.
+    Full,
+}
 
 /// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
 /// is the same, but does so recursively into structs, and ensures lists and maps have the correct
 /// associated types as well.
 ///
-/// If `check_nullability_and_metadata` is true, this will also return an error if it finds a struct
-/// field that differs in nullability or metadata between the kernel and arrow schema. If it is
-/// false, no checks on nullability or metadata are performed.
+/// The `mode` parameter controls how struct fields are matched and whether nullability/metadata
+/// are checked. See [`ValidationMode`] for details.
 ///
 /// This returns an `Ok(DataTypeCompat)` if the types are compatible, and
 /// will indicate what kind of compatibility they have, or an error if the types do not match. If
-/// there is a `struct` type included, we only ensure that the named fields that the kernel is
-/// asking for exist, and that for those fields the types match. Un-selected fields are ignored.
+/// there is a `struct` type included and the mode uses name-based matching, we only ensure that
+/// the named fields that the kernel is asking for exist, and that for those fields the types
+/// match. Un-selected fields are ignored.
+#[internal_api]
 pub(crate) fn ensure_data_types(
     kernel_type: &DataType,
     arrow_type: &ArrowDataType,
-    check_nullability_and_metadata: bool,
+    mode: ValidationMode,
 ) -> DeltaResult<DataTypeCompat> {
-    let check = EnsureDataTypes {
-        check_nullability_and_metadata,
-    };
+    let check = EnsureDataTypes { mode };
     check.ensure_data_types(kernel_type, arrow_type)
 }
 
 struct EnsureDataTypes {
-    check_nullability_and_metadata: bool,
+    mode: ValidationMode,
 }
 
 /// Capture the compatibility between two data-types, as passed to [`ensure_data_types`]
 #[cfg_attr(test, derive(Debug, PartialEq))]
+#[internal_api]
 pub(crate) enum DataTypeCompat {
     /// The two types are the same
     Identical,
@@ -66,17 +78,53 @@ impl EnsureDataTypes {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
+            // A variant is physically a struct of binary fields, matched by name. Accept any Arrow
+            // binary representation for the fields; their nullability is irrelevant to the physical
+            // wrapper. Requiring exactly the variant's fields keeps this in sync with
+            // `validate_parquet_variant`. The rejection of shredded layouts relies on the kernel
+            // type being unshredded (the only variant kernel constructs today).
+            (DataType::Variant(variant_fields), ArrowDataType::Struct(arrow_fields)) => {
+                require!(arrow_fields.len() == variant_fields.num_fields(), {
+                    let unexpected = arrow_fields
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .filter(|name| variant_fields.field(name).is_none())
+                        .join(", ");
+                    make_arrow_error(format!(
+                        "Variant struct has {} fields, expected {} (unexpected: [{unexpected}])",
+                        arrow_fields.len(),
+                        variant_fields.num_fields(),
+                    ))
+                });
+                for kernel_field in variant_fields.fields() {
+                    let Some(arrow_field) = arrow_fields
+                        .iter()
+                        .find(|arrow_field| arrow_field.name() == &kernel_field.name)
+                    else {
+                        return Err(make_arrow_error(format!(
+                            "Variant struct is missing field `{}`",
+                            kernel_field.name
+                        )));
+                    };
+                    self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
+                }
+                Ok(DataTypeCompat::Nested)
+            }
             (&DataType::Variant(_), _) => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
-            // strings, bools, and binary  aren't primitive in arrow
+            // Arrow's `is_primitive()` covers only numeric/temporal/decimal types and
+            // excludes Boolean, the string and binary variants, and Null -- even though
+            // kernel models all of these as `PrimitiveType` variants. Match them
+            // explicitly here so they are still recognized as compatible.
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
             | (&DataType::STRING, ArrowDataType::LargeUtf8)
             | (&DataType::STRING, ArrowDataType::Utf8)
             | (&DataType::STRING, ArrowDataType::Utf8View)
             | (&DataType::BINARY, ArrowDataType::LargeBinary)
             | (&DataType::BINARY, ArrowDataType::BinaryView)
-            | (&DataType::BINARY, ArrowDataType::Binary) => Ok(DataTypeCompat::Identical),
+            | (&DataType::BINARY, ArrowDataType::Binary)
+            | (&DataType::VOID, ArrowDataType::Null) => Ok(DataTypeCompat::Identical),
             (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field))
             | (DataType::Array(inner_type), ArrowDataType::LargeList(arrow_list_field))
             | (DataType::Array(inner_type), ArrowDataType::ListView(arrow_list_field))
@@ -107,33 +155,59 @@ impl EnsureDataTypes {
                 Ok(DataTypeCompat::Nested)
             }
             (DataType::Struct(kernel_fields), ArrowDataType::Struct(arrow_fields)) => {
-                // build a list of kernel fields that matches the order of the arrow fields
-                let mapped_fields = arrow_fields
-                    .iter()
-                    .filter_map(|f| kernel_fields.field(f.name()));
+                match self.mode {
+                    ValidationMode::TypesOnly => {
+                        // Ordinal matching: check field count and types by position,
+                        // ignore names. Column mapping can cause name mismatches between
+                        // physical (arrow) and logical (kernel) field names.
+                        require!(kernel_fields.num_fields() == arrow_fields.len(), {
+                            make_arrow_error(format!(
+                                "Struct field count mismatch: expected {}, got {}",
+                                kernel_fields.num_fields(),
+                                arrow_fields.len()
+                            ))
+                        });
+                        for (kernel_field, arrow_field) in
+                            kernel_fields.fields().zip(arrow_fields.iter())
+                        {
+                            self.ensure_data_types(
+                                &kernel_field.data_type,
+                                arrow_field.data_type(),
+                            )?;
+                        }
+                    }
+                    ValidationMode::TypesAndNames | ValidationMode::Full => {
+                        // Name-based matching: look up the kernel field for each arrow field by
+                        // name. Arrow fields with no kernel counterpart are ignored. Full mode
+                        // additionally checks nullability and metadata.
+                        let mut found_fields = 0;
+                        for arrow_field in arrow_fields {
+                            let Some(kernel_field) = kernel_fields.field(arrow_field.name()) else {
+                                continue;
+                            };
+                            self.ensure_nullability_and_metadata(kernel_field, arrow_field)?;
+                            self.ensure_data_types(
+                                &kernel_field.data_type,
+                                arrow_field.data_type(),
+                            )?;
+                            found_fields += 1;
+                        }
 
-                // keep track of how many fields we matched up
-                let mut found_fields = 0;
-                // ensure that for the fields that we found, the types match
-                for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
-                    self.ensure_nullability_and_metadata(kernel_field, arrow_field)?;
-                    self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
-                    found_fields += 1;
+                        require!(kernel_fields.num_fields() == found_fields, {
+                            let arrow_field_map: HashSet<&String> =
+                                HashSet::from_iter(arrow_fields.iter().map(|f| f.name()));
+                            let missing_field_names = kernel_fields
+                                .field_names()
+                                .filter(|kernel_field| !arrow_field_map.contains(kernel_field))
+                                .take(5)
+                                .join(", ");
+                            make_arrow_error(format!(
+                                "Missing Struct fields {missing_field_names} \
+                                 (Up to five missing fields shown)"
+                            ))
+                        });
+                    }
                 }
-
-                // require that we found the number of fields that we requested.
-                require!(kernel_fields.num_fields() == found_fields, {
-                    let arrow_field_map: HashSet<&String> =
-                        HashSet::from_iter(arrow_fields.iter().map(|f| f.name()));
-                    let missing_field_names = kernel_fields
-                        .field_names()
-                        .filter(|kernel_field| !arrow_field_map.contains(kernel_field))
-                        .take(5)
-                        .join(", ");
-                    make_arrow_error(format!(
-                        "Missing Struct fields {missing_field_names} (Up to five missing fields shown)"
-                    ))
-                });
                 Ok(DataTypeCompat::Nested)
             }
             _ => Err(make_arrow_error(format!(
@@ -148,11 +222,11 @@ impl EnsureDataTypes {
         kernel_field_is_nullable: bool,
         arrow_field_is_nullable: bool,
     ) -> DeltaResult<()> {
-        if self.check_nullability_and_metadata
+        if matches!(self.mode, ValidationMode::Full)
             && kernel_field_is_nullable != arrow_field_is_nullable
         {
             Err(Error::Generic(format!(
-                "{desc} has nullablily {kernel_field_is_nullable} in kernel and {arrow_field_is_nullable} in arrow",
+                "{desc} has nullability {kernel_field_is_nullable} in kernel and {arrow_field_is_nullable} in arrow",
             )))
         } else {
             Ok(())
@@ -169,7 +243,7 @@ impl EnsureDataTypes {
             kernel_field.nullable,
             arrow_field.is_nullable(),
         )?;
-        if self.check_nullability_and_metadata
+        if matches!(self.mode, ValidationMode::Full)
             && !metadata_eq(&kernel_field.metadata, arrow_field.metadata())
         {
             Err(Error::Generic(format!(
@@ -197,7 +271,8 @@ fn check_cast_compat(
             // timestamps are able to be cast between each other
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
-        // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of precision.
+        // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of
+        // precision.
         (Int8, Int16 | Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Int16, Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Int32, Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
@@ -206,14 +281,23 @@ fn check_cast_compat(
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
         (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        // Physical type reinterpretation: some checkpoint writers store date/timestamp columns
+        // as plain integers without Parquet logical type annotations. The Delta protocol
+        // guarantees data files conform to the table schema, so a schema mismatch (e.g. Int32
+        // where Date32 is expected) would not occur in normal data files.
+        //
+        // NOTE: The kernel-type equivalent lives in `PrimitiveType::is_stats_type_compatible_with`
+        // in `schema/mod.rs`. Changes here must be mirrored there.
+        (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
             "Incorrect datatype. Expected {target_type}, got {source_type}"
         ))),
     }
 }
 
-// Returns whether the given source type can be safely cast to a decimal with the given precision and scale without
-// loss of information.
+// Returns whether the given source type can be safely cast to a decimal with the given precision
+// and scale without loss of information.
 fn can_upcast_to_decimal(
     source_type: &ArrowDataType,
     target_precision: u8,
@@ -265,19 +349,19 @@ fn metadata_eq(
 mod tests {
     use std::sync::Arc;
 
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
-
-    use crate::engine::arrow_conversion::TryFromKernel as _;
-    use crate::engine::arrow_data::unshredded_variant_arrow_type;
-    use crate::schema::{ArrayType, DataType, MapType, StructField};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use rstest::rstest;
 
     use super::*;
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
+    use crate::engine::arrow_conversion::TryFromKernel as _;
+    use crate::schema::{schema, ArrayType, DataType, MapType};
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
     fn accepts_safe_decimal_casts() {
-        use super::can_upcast_to_decimal;
         use ArrowDataType::*;
+
+        use super::can_upcast_to_decimal;
 
         assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
         assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
@@ -314,8 +398,9 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_decimal_casts() {
-        use super::can_upcast_to_decimal;
         use ArrowDataType::*;
+
+        use super::can_upcast_to_decimal;
 
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));
@@ -331,29 +416,138 @@ mod tests {
         assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
     }
 
-    #[test]
-    fn ensure_variants() {
-        fn incorrect_variant_arrow_type() -> ArrowDataType {
-            let metadata_field = ArrowField::new("field_1", ArrowDataType::Binary, true);
-            let value_field = ArrowField::new("field_2", ArrowDataType::Binary, true);
-            let fields = vec![metadata_field, value_field];
-            ArrowDataType::Struct(fields.into())
-        }
+    /// Build a variant-shaped arrow struct from `(name, type)` pairs with the given nullability.
+    fn variant_arrow_struct(
+        fields: impl IntoIterator<Item = (&'static str, ArrowDataType)>,
+        nullable: bool,
+    ) -> ArrowDataType {
+        let fields: Vec<_> = fields
+            .into_iter()
+            .map(|(name, data_type)| ArrowField::new(name, data_type, nullable))
+            .collect();
+        ArrowDataType::Struct(fields.into())
+    }
 
-        assert!(ensure_data_types(
-            &DataType::unshredded_variant(),
-            &unshredded_variant_arrow_type(),
-            true
-        )
-        .is_ok());
+    /// The `metadata`/`value` fields are accepted for any binary representation, in both name-based
+    /// validation modes, regardless of arrow field nullability.
+    #[rstest]
+    fn ensure_variant_accepts_any_binary_representation(
+        #[values(
+            ArrowDataType::Binary,
+            ArrowDataType::LargeBinary,
+            ArrowDataType::BinaryView
+        )]
+        binary_type: ArrowDataType,
+        #[values(ValidationMode::TypesAndNames, ValidationMode::Full)] mode: ValidationMode,
+        #[values(false, true)] nullable: bool,
+    ) {
+        let arrow_type = variant_arrow_struct(
+            [("metadata", binary_type.clone()), ("value", binary_type)],
+            nullable,
+        );
+        assert_eq!(
+            ensure_data_types(&DataType::unshredded_variant(), &arrow_type, mode).unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
+    #[test]
+    fn ensure_variant_accepts_mixed_binary_representations() {
+        let arrow_type = variant_arrow_struct(
+            [
+                ("metadata", ArrowDataType::Binary),
+                ("value", ArrowDataType::LargeBinary),
+            ],
+            false,
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::unshredded_variant(),
+                &arrow_type,
+                ValidationMode::Full,
+            )
+            .unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
+    #[test]
+    fn ensure_variant_accepts_reversed_field_order() {
+        let arrow_type = variant_arrow_struct(
+            [
+                ("value", ArrowDataType::Binary),
+                ("metadata", ArrowDataType::Binary),
+            ],
+            false,
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::unshredded_variant(),
+                &arrow_type,
+                ValidationMode::Full,
+            )
+            .unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
+    #[rstest]
+    #[case::wrong_field_names(
+        variant_arrow_struct(
+            [("field_1", ArrowDataType::Binary), ("field_2", ArrowDataType::Binary)],
+            false,
+        ),
+        "missing field"
+    )]
+    #[case::extra_field_last(
+        variant_arrow_struct(
+            [
+                ("metadata", ArrowDataType::Binary),
+                ("value", ArrowDataType::Binary),
+                ("typed_value", ArrowDataType::Int64),
+            ],
+            false,
+        ),
+        "expected 2"
+    )]
+    #[case::extra_field_interleaved(
+        variant_arrow_struct(
+            [
+                ("metadata", ArrowDataType::Binary),
+                ("typed_value", ArrowDataType::Int64),
+                ("value", ArrowDataType::Binary),
+            ],
+            false,
+        ),
+        "expected 2"
+    )]
+    #[case::missing_field(
+        variant_arrow_struct(
+            [
+                ("metadata", ArrowDataType::Binary),
+                ("typed_value", ArrowDataType::Int64),
+            ],
+            false,
+        ),
+        "missing field"
+    )]
+    #[case::non_binary_value(
+        variant_arrow_struct(
+            [("metadata", ArrowDataType::Binary), ("value", ArrowDataType::Utf8)],
+            false,
+        ),
+        "Incorrect datatype"
+    )]
+    #[case::not_a_struct(ArrowDataType::Binary, "Incorrect datatype")]
+    fn ensure_variant_rejects(#[case] arrow_type: ArrowDataType, #[case] expected_err: &str) {
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::unshredded_variant(),
-                &incorrect_variant_arrow_type(),
-                true,
+                &arrow_type,
+                ValidationMode::Full,
             ),
-            "Invalid argument error: Incorrect datatype",
-        )
+            expected_err,
+        );
     }
 
     #[test]
@@ -361,14 +555,14 @@ mod tests {
         assert!(ensure_data_types(
             &DataType::decimal(5, 2).unwrap(),
             &ArrowDataType::Decimal128(5, 2),
-            false
+            ValidationMode::TypesAndNames
         )
         .is_ok());
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::decimal(5, 2).unwrap(),
                 &ArrowDataType::Decimal128(5, 3),
-                false,
+                ValidationMode::TypesAndNames,
             ),
             "Invalid argument error: Incorrect datatype. Expected Decimal128(5, 2), got Decimal128(5, 3)",
         )
@@ -385,33 +579,25 @@ mod tests {
             false,
         );
         assert!(ensure_data_types(
-            &DataType::Map(Box::new(MapType::new(
-                DataType::LONG,
-                DataType::STRING,
-                true
-            ))),
+            &DataType::from(MapType::new(DataType::LONG, DataType::STRING, true)),
             arrow_field.data_type(),
-            false
+            ValidationMode::TypesAndNames
         )
         .is_ok());
 
         assert_result_error_with_message(
             ensure_data_types(
-                &DataType::Map(Box::new(MapType::new(
-                    DataType::LONG,
-                    DataType::STRING,
-                    false,
-                ))),
+                &DataType::from(MapType::new(DataType::LONG, DataType::STRING, false)),
                 arrow_field.data_type(),
-                true,
+                ValidationMode::Full,
             ),
-            "Generic delta kernel error: Map has nullablily false in kernel and true in arrow",
+            "Generic delta kernel error: Map has nullability false in kernel and true in arrow",
         );
         assert_result_error_with_message(
             ensure_data_types(
-                &DataType::Map(Box::new(MapType::new(DataType::LONG, DataType::LONG, true))),
+                &DataType::from(MapType::new(DataType::LONG, DataType::LONG, true)),
                 arrow_field.data_type(),
-                false,
+                ValidationMode::TypesAndNames,
             ),
             "Invalid argument error: Incorrect datatype. Expected long, got Utf8",
         );
@@ -420,65 +606,55 @@ mod tests {
     #[test]
     fn ensure_list() {
         assert!(ensure_data_types(
-            &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+            &DataType::from(ArrayType::new(DataType::LONG, true)),
             &ArrowDataType::new_list(ArrowDataType::Int64, true),
-            false
+            ValidationMode::TypesAndNames
         )
         .is_ok());
         assert!(ensure_data_types(
-            &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+            &DataType::from(ArrayType::new(DataType::LONG, true)),
             &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
-            false
+            ValidationMode::TypesAndNames
         )
         .is_ok());
         assert_result_error_with_message(
             ensure_data_types(
-                &DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+                &DataType::from(ArrayType::new(DataType::STRING, true)),
                 &ArrowDataType::new_list(ArrowDataType::Int64, true),
-                false,
+                ValidationMode::TypesAndNames,
             ),
             "Invalid argument error: Incorrect datatype. Expected Utf8, got Int64",
         );
         assert_result_error_with_message(
             ensure_data_types(
-                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
                 &ArrowDataType::new_list(ArrowDataType::Int64, false),
-                true,
+                ValidationMode::Full,
             ),
-            "Generic delta kernel error: List has nullablily true in kernel and false in arrow",
+            "Generic delta kernel error: List has nullability true in kernel and false in arrow",
         );
     }
 
     #[test]
     fn ensure_struct() {
-        let schema = DataType::struct_type_unchecked([StructField::nullable(
-            "a",
-            ArrayType::new(
-                DataType::struct_type_unchecked([
-                    StructField::nullable("w", DataType::LONG),
-                    StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
-                    StructField::nullable(
-                        "y",
-                        MapType::new(DataType::LONG, DataType::STRING, true),
-                    ),
-                    StructField::nullable(
-                        "z",
-                        DataType::struct_type_unchecked([
-                            StructField::nullable("n", DataType::LONG),
-                            StructField::nullable("m", DataType::STRING),
-                        ]),
-                    ),
-                ]),
-                true,
-            ),
-        )]);
+        let schema = DataType::from(schema! {
+            nullable "a": [ nullable {
+                nullable "w": LONG,
+                nullable "x": [ nullable LONG ],
+                nullable "y": { LONG => nullable STRING },
+                nullable "z": {
+                    nullable "n": LONG,
+                    nullable "m": STRING,
+                },
+            } ],
+        });
         let arrow_struct = ArrowDataType::try_from_kernel(&schema).unwrap();
-        assert!(ensure_data_types(&schema, &arrow_struct, true).is_ok());
+        assert!(ensure_data_types(&schema, &arrow_struct, ValidationMode::Full).is_ok());
 
-        let kernel_simple = DataType::struct_type_unchecked([
-            StructField::nullable("w", DataType::LONG),
-            StructField::nullable("x", DataType::LONG),
-        ]);
+        let kernel_simple = DataType::from(schema! {
+            nullable "w": LONG,
+            nullable "x": LONG,
+        });
 
         let arrow_simple_ok = ArrowField::new_struct(
             "arrow_struct",
@@ -488,7 +664,12 @@ mod tests {
             ]),
             true,
         );
-        assert!(ensure_data_types(&kernel_simple, arrow_simple_ok.data_type(), true).is_ok());
+        assert!(ensure_data_types(
+            &kernel_simple,
+            arrow_simple_ok.data_type(),
+            ValidationMode::Full
+        )
+        .is_ok());
 
         let arrow_missing_simple = ArrowField::new_struct(
             "arrow_struct",
@@ -496,7 +677,11 @@ mod tests {
             true,
         );
         assert_result_error_with_message(
-            ensure_data_types(&kernel_simple, arrow_missing_simple.data_type(), true),
+            ensure_data_types(
+                &kernel_simple,
+                arrow_missing_simple.data_type(),
+                ValidationMode::Full,
+            ),
             "Invalid argument error: Missing Struct fields x (Up to five missing fields shown)",
         );
 
@@ -512,42 +697,89 @@ mod tests {
             ensure_data_types(
                 &kernel_simple,
                 arrow_nullable_mismatch_simple.data_type(),
-                true,
+                ValidationMode::Full,
             ),
-            "Generic delta kernel error: w has nullablily true in kernel and false in arrow",
+            "Generic delta kernel error: w has nullability true in kernel and false in arrow",
+        );
+    }
+
+    #[test]
+    fn name_based_matching_pairs_fields_by_name_with_interleaved_extra() {
+        // The arrow struct has an unselected `extra` field between the matched ones. `x` must be
+        // paired with the arrow `x`, not positionally with `extra`.
+        let kernel = DataType::from(schema! {
+            nullable "w": LONG,
+            nullable "x": STRING,
+        });
+        let arrow = ArrowDataType::Struct(Fields::from(vec![
+            ArrowField::new("w", ArrowDataType::Int64, true),
+            ArrowField::new("extra", ArrowDataType::Int64, true),
+            ArrowField::new("x", ArrowDataType::Utf8, true),
+        ]));
+        assert_eq!(
+            ensure_data_types(&kernel, &arrow, ValidationMode::Full).unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
+    #[test]
+    fn name_based_matching_rejects_wrong_type_behind_interleaved_extra() {
+        // An unselected `extra` field must not mask a type mismatch on the real `x` field.
+        let kernel = DataType::from(schema! {
+            nullable "w": LONG,
+            nullable "x": LONG,
+        });
+        let arrow = ArrowDataType::Struct(Fields::from(vec![
+            ArrowField::new("w", ArrowDataType::Int64, true),
+            ArrowField::new("extra", ArrowDataType::Int64, true),
+            ArrowField::new("x", ArrowDataType::Utf8, true),
+        ]));
+        assert_result_error_with_message(
+            ensure_data_types(&kernel, &arrow, ValidationMode::Full),
+            "Incorrect datatype",
         );
     }
 
     #[test]
     fn ensure_views() {
         assert_eq!(
-            ensure_data_types(&DataType::STRING, &ArrowDataType::Utf8View, true).unwrap(),
-            DataTypeCompat::Identical
-        );
-        assert_eq!(
-            ensure_data_types(&DataType::BINARY, &ArrowDataType::BinaryView, true).unwrap(),
-            DataTypeCompat::Identical
-        );
-        assert_eq!(
             ensure_data_types(
-                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
-                &ArrowDataType::ListView(Arc::new(ArrowField::new_list_field(
-                    ArrowDataType::Int64,
-                    true
-                ))),
-                true
+                &DataType::STRING,
+                &ArrowDataType::Utf8View,
+                ValidationMode::Full
             )
             .unwrap(),
             DataTypeCompat::Identical
         );
         assert_eq!(
             ensure_data_types(
-                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &DataType::BINARY,
+                &ArrowDataType::BinaryView,
+                ValidationMode::Full
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
+                &ArrowDataType::ListView(Arc::new(ArrowField::new_list_field(
+                    ArrowDataType::Int64,
+                    true
+                ))),
+                ValidationMode::Full
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
                 &ArrowDataType::LargeListView(Arc::new(ArrowField::new_list_field(
                     ArrowDataType::Int64,
                     true
                 ))),
-                true
+                ValidationMode::Full
             )
             .unwrap(),
             DataTypeCompat::Identical
@@ -557,12 +789,202 @@ mod tests {
     #[test]
     fn ensure_large_strings_and_binary() {
         assert_eq!(
-            ensure_data_types(&DataType::STRING, &ArrowDataType::LargeUtf8, true).unwrap(),
+            ensure_data_types(
+                &DataType::STRING,
+                &ArrowDataType::LargeUtf8,
+                ValidationMode::Full
+            )
+            .unwrap(),
             DataTypeCompat::Identical
         );
         assert_eq!(
-            ensure_data_types(&DataType::BINARY, &ArrowDataType::LargeBinary, true).unwrap(),
+            ensure_data_types(
+                &DataType::BINARY,
+                &ArrowDataType::LargeBinary,
+                ValidationMode::Full
+            )
+            .unwrap(),
             DataTypeCompat::Identical
+        );
+    }
+
+    #[test]
+    fn ensure_int32_to_date_reinterpretation() {
+        // Int32 -> Date32: checkpoint writers may omit the DATE logical type annotation
+        assert_eq!(
+            ensure_data_types(
+                &DataType::DATE,
+                &ArrowDataType::Int32,
+                ValidationMode::TypesAndNames
+            )
+            .unwrap(),
+            DataTypeCompat::NeedsCast(ArrowDataType::Date32)
+        );
+        // Reverse is not supported: Date32 -> Int32
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::INTEGER,
+                &ArrowDataType::Date32,
+                ValidationMode::TypesAndNames,
+            ),
+            "Incorrect datatype",
+        );
+    }
+
+    #[test]
+    fn ensure_int64_to_timestamp_reinterpretation() {
+        // Int64 -> Timestamp (with UTC timezone, i.e. kernel `timestamp`)
+        let ts_utc = ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        assert_eq!(
+            ensure_data_types(
+                &DataType::TIMESTAMP,
+                &ArrowDataType::Int64,
+                ValidationMode::TypesAndNames
+            )
+            .unwrap(),
+            DataTypeCompat::NeedsCast(ts_utc)
+        );
+        // Int64 -> TimestampNtz (no timezone, i.e. kernel `timestamp_ntz`)
+        let ts_ntz = ArrowDataType::Timestamp(TimeUnit::Microsecond, None);
+        assert_eq!(
+            ensure_data_types(
+                &DataType::TIMESTAMP_NTZ,
+                &ArrowDataType::Int64,
+                ValidationMode::TypesAndNames
+            )
+            .unwrap(),
+            DataTypeCompat::NeedsCast(ts_ntz)
+        );
+        // Reverse is not supported
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::LONG,
+                &ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                ValidationMode::TypesAndNames,
+            ),
+            "Incorrect datatype",
+        );
+    }
+
+    #[test]
+    fn interval_maps_to_physical_integer() {
+        assert_eq!(
+            ensure_data_types(
+                &DataType::INTERVAL_YEAR_MONTH,
+                &ArrowDataType::Int32,
+                ValidationMode::TypesAndNames
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::INTERVAL_DAY_TIME,
+                &ArrowDataType::Int64,
+                ValidationMode::TypesAndNames
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+    }
+
+    #[rstest]
+    fn interval_rejects_incompatible_arrow_types(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+        #[values(
+            ArrowDataType::Utf8,
+            ArrowDataType::Boolean,
+            ArrowDataType::Date32,
+            ArrowDataType::Float64
+        )]
+        arrow_type: ArrowDataType,
+    ) {
+        assert_result_error_with_message(
+            ensure_data_types(&interval, &arrow_type, ValidationMode::TypesAndNames),
+            "Incorrect datatype",
+        );
+    }
+
+    /// Ensures that every kernel-level checkpoint reinterpretation rule in
+    /// `PrimitiveType::is_checkpoint_cast_compatible` has a corresponding Arrow cast
+    /// in `check_cast_compat`. If one side is updated without the other, this test fails.
+    #[test]
+    fn checkpoint_reinterpretation_rules_match_arrow_cast_rules() {
+        use crate::schema::PrimitiveType;
+
+        let reinterpretation_pairs: &[(PrimitiveType, PrimitiveType)] = &[
+            (PrimitiveType::Integer, PrimitiveType::Date),
+            (PrimitiveType::Long, PrimitiveType::Timestamp),
+            (PrimitiveType::Long, PrimitiveType::TimestampNtz),
+        ];
+        for (source_kernel, target_kernel) in reinterpretation_pairs {
+            // Verify the kernel-level rule holds
+            assert!(
+                source_kernel.is_checkpoint_cast_compatible(target_kernel),
+                "Kernel should allow {source_kernel:?} -> {target_kernel:?}"
+            );
+
+            // Verify the Arrow-level rule holds
+            let source_arrow =
+                ArrowDataType::try_from_kernel(&DataType::Primitive(source_kernel.clone()))
+                    .unwrap();
+            let target_arrow =
+                ArrowDataType::try_from_kernel(&DataType::Primitive(target_kernel.clone()))
+                    .unwrap();
+            assert!(
+                check_cast_compat(target_arrow.clone(), &source_arrow).is_ok(),
+                "Arrow check_cast_compat should allow {source_arrow:?} -> {target_arrow:?} \
+                 to match kernel rule {source_kernel:?} -> {target_kernel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn types_only_matches_struct_by_ordinal_ignoring_names() {
+        let kernel = DataType::from(schema! {
+            nullable "logical_a": LONG,
+            nullable "logical_b": STRING,
+        });
+        let arrow = ArrowDataType::Struct(
+            vec![
+                ArrowField::new("physical_x", ArrowDataType::Int64, true),
+                ArrowField::new("physical_y", ArrowDataType::Utf8, true),
+            ]
+            .into(),
+        );
+        assert!(ensure_data_types(&kernel, &arrow, ValidationMode::TypesOnly).is_ok());
+    }
+
+    #[test]
+    fn types_only_rejects_struct_field_count_mismatch() {
+        let kernel = DataType::from(schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+        });
+        let arrow =
+            ArrowDataType::Struct(vec![ArrowField::new("x", ArrowDataType::Int64, true)].into());
+        assert_result_error_with_message(
+            ensure_data_types(&kernel, &arrow, ValidationMode::TypesOnly),
+            "Struct field count mismatch",
+        );
+    }
+
+    #[test]
+    fn types_only_rejects_struct_type_mismatch_by_ordinal() {
+        let kernel = DataType::from(schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+        });
+        let arrow = ArrowDataType::Struct(
+            vec![
+                ArrowField::new("x", ArrowDataType::Int64, true),
+                ArrowField::new("y", ArrowDataType::Utf8, true),
+            ]
+            .into(),
+        );
+        assert_result_error_with_message(
+            ensure_data_types(&kernel, &arrow, ValidationMode::TypesOnly),
+            "Incorrect datatype",
         );
     }
 }

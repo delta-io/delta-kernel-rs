@@ -1,25 +1,35 @@
 //! Definitions and functions to create and manipulate kernel schema
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
+use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "geo-type-in-dev")]
+use strum::{Display as StrumDisplay, EnumString};
 use tracing::warn;
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
-use crate::table_features::ColumnMappingMode;
-use crate::utils::{require, CowExt as _};
+use crate::table_features::{
+    validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
+    StaleAnnotationPolicy,
+};
+use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::utils::{require, CollectInto};
 use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
 
+pub(crate) mod column_default;
+pub use column_default::ColumnDefault;
+pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
@@ -28,10 +38,155 @@ pub(crate) mod diff;
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod validation;
 pub(crate) mod variant_utils;
+pub(crate) mod void_utils;
+
+/// Prefix of the error message the schema deserializers emit for an unsupported type.
+const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
+
+/// Builds the serde custom error for a Delta type the kernel does not support. Pairs with
+/// [`is_unsupported_delta_type_error`] for detecting whether a serde error is this kind.
+fn unsupported_delta_type_error<E: serde::de::Error>(name: &str) -> E {
+    E::custom(format!("{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{name}'"))
+}
+
+/// Returns `true` if `error` is the "unsupported Delta type" failure produced by
+/// `unsupported_delta_type_error`.
+pub(crate) fn is_unsupported_delta_type_error(error: &serde_json::Error) -> bool {
+    error.is_data()
+        && error
+            .to_string()
+            .starts_with(UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX)
+}
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
+
+/// Sugar for `LazyLock::new(|| `[`schema_ref!`](schema_ref)` { ... })`, yielding a lazy
+/// [`SchemaRef`].
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::lazy_schema_ref;
+/// Builds a [`StructType`] from a JSON-shaped description that freely mixes literal structure
+/// with interpolated runtime values, in the spirit of [`serde_json::json!`].
+///
+/// # Grammar
+///
+/// ```text
+/// body  := (entry ',')* entry?                 // 0+ comma-separated entries, optional trailing comma
+/// entry := nullability name ':' type           // possibly nullable struct field
+///        | '(' EXPR ')'                        // interpolate one StructField
+///        | '..' '(' EXPR ')'                   // splice an `impl IntoIterator<Item = StructField>`
+/// nullability := 'nullable' | 'not_null'
+/// name  := STR_LITERAL
+///        | IDENT
+///        | '(' EXPR ')'                        // interpolate an `impl Into<String>`
+/// type  := '[' nullability type ']'            // array with possibly-nullable elements
+///        | '{' body '}'                        // nested struct
+///        | '{' type '=>' nullability type '}'  // map with possibly-nullable values
+///        | '(' EXPR ')'                        // interpolate an `impl Into<DataType>`
+///        | IDENT                               // interpolate `DataType::<IDENT>`
+/// ```
+///
+/// # Examples
+///
+/// ```
+/// # use delta_kernel::schema::{schema, DataType, StructField, StructType};
+/// let s = schema! {
+///     not_null "id": LONG,
+///     nullable "name": STRING,
+///     not_null "address": {
+///         nullable "city": STRING,
+///         nullable "zip": STRING,
+///     },
+///     nullable "tags": [ not_null STRING ],            // nullable array with non-null elements
+///     not_null "props": { STRING => nullable STRING }, // non-nullable map with nullable values
+/// };
+/// assert_eq!(s.field("id").unwrap().data_type(), &DataType::LONG);
+/// ```
+///
+/// Runtime values interpolate through the expression forms:
+///
+/// ```
+/// # use delta_kernel::schema::{schema, DataType, StructField};
+/// let data_type = DataType::LONG;
+/// let first = StructField::not_null("y", DataType::INTEGER);
+/// let rest = vec![StructField::nullable("z", DataType::STRING)];
+/// let i = 42;
+/// let s = schema! {
+///     not_null (format!("col_{i}")): (data_type),
+///     (first),
+///     ..(rest),
+/// };
+/// assert_eq!(s.fields().count(), 3);
+/// ```
+///
+/// Field structure is author-controlled, so this builds via [`StructType::new_unchecked`] (no
+/// runtime validation). Statically-detectable duplicate field names -- repeated string
+/// literals or repeated identifiers within the same struct -- are rejected at compile time.
+/// Literals are compared case-insensitively, matching Delta's case-insensitive column-name
+/// rule:
+///
+/// ```compile_fail
+/// # use delta_kernel::schema::schema;
+/// const NAME: &str = "foo";
+/// let s = schema! {
+///     not_null "id": LONG,
+///     nullable "ID": STRING, // duplicate of "id" (case-insensitive) -- compile error
+///     nullable NAME: LONG,
+///     not_null NAME: STRING, // NAME used twice -- compile error
+/// };
+/// ```
+///
+/// Prefer [`try_schema`] when field names are interpolated runtime values that might collide.
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::schema;
+/// Sugar for `Arc::new(`[`schema!`](schema)` { ... })`, yielding a [`SchemaRef`]. Convenient
+/// for the `LazyLock<SchemaRef>` statics that pervade the action and stats schemas.
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::schema_ref;
+/// Like [`schema`], but validates field names at every level of the schema (each struct,
+/// including nested ones, is built via [`StructType::try_new`] and yields
+/// [`DeltaResult<StructType>`]. Use when field names are runtime values that could duplicate
+/// in ways the macro cannot see.
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::try_schema;
+
+/// Converts field interpolation inputs in [`schema!`] and [`try_schema!`] to [`StructField`].
+#[internal_api]
+pub(crate) trait ToSchemaField {
+    fn to_schema_field(self) -> StructField;
+}
+
+impl ToSchemaField for StructField {
+    fn to_schema_field(self) -> StructField {
+        self
+    }
+}
+
+impl ToSchemaField for &StructField {
+    fn to_schema_field(self) -> StructField {
+        self.clone()
+    }
+}
+
+impl<T> ToSchemaField for &T
+where
+    T: Deref<Target = StructField>,
+{
+    fn to_schema_field(self) -> StructField {
+        self.deref().clone()
+    }
+}
+
+/// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are schema
+/// fields, lowered into an output [`StructType`] directly from an input schema via
+/// [`build`](crate::struct_patch::StructPatchBuilder::<StructField>::build).
+pub type SchemaStructPatchBuilder = crate::struct_patch::StructPatchBuilder<StructField>;
 
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
@@ -98,8 +253,29 @@ impl From<bool> for MetadataValue {
 pub enum ColumnMetadataKey {
     ColumnMappingId,
     ColumnMappingPhysicalName,
+    /// Parquet field IDs for the synthesized `element` / `key` / `value` fields of an Array or
+    /// Map. Stored on the *nearest ancestor* StructField as a JSON object whose keys are
+    /// dot-paths rooted at that field's name.
+    ///
+    /// # Example: list-in-map
+    ///
+    /// For `m: map<int, array<int>>` and the key/value/element fields having field ids
+    /// 100/101/102, the metadata on `m` should be:
+    ///
+    /// ```json
+    /// {
+    ///   "delta.columnMapping.nested.ids": {
+    ///     "m.key":           100,
+    ///     "m.value":         101,
+    ///     "m.value.element": 102
+    ///   }
+    /// }
+    /// ```
+    ColumnMappingNestedIds,
     ParquetFieldId,
+    ParquetFieldNestedIds,
     GenerationExpression,
+    CurrentDefault,
     IdentityStart,
     IdentityStep,
     IdentityHighWaterMark,
@@ -107,6 +283,7 @@ pub enum ColumnMetadataKey {
     InternalColumn,
     Invariants,
     MetadataSpec,
+    TypeChanges,
 }
 
 impl AsRef<str> for ColumnMetadataKey {
@@ -114,8 +291,18 @@ impl AsRef<str> for ColumnMetadataKey {
         match self {
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
+            Self::ColumnMappingNestedIds => "delta.columnMapping.nested.ids",
+            // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
+            // established by delta-spark and other Delta ecosystem implementations for storing
+            // Parquet field IDs in StructField metadata.
             Self::ParquetFieldId => "parquet.field.id",
+            // The Delta protocol defines this key for IcebergCompatV2/V3 nested field ids. It is
+            // legacy and will be replaced by `delta.columnMapping.nested.ids` (which kernel
+            // uses everywhere). Kept here for protocol compatibility only.
+            // Tracking issue: <https://github.com/delta-io/delta/issues/6688>
+            Self::ParquetFieldNestedIds => "parquet.field.nested.ids",
             Self::GenerationExpression => "delta.generationExpression",
+            Self::CurrentDefault => "CURRENT_DEFAULT",
             Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
             Self::IdentityStart => "delta.identity.start",
@@ -123,6 +310,7 @@ impl AsRef<str> for ColumnMetadataKey {
             Self::InternalColumn => "delta.isInternalColumn",
             Self::Invariants => "delta.invariants",
             Self::MetadataSpec => "delta.metadataSpec",
+            Self::TypeChanges => "delta.typeChanges",
         }
     }
 }
@@ -205,10 +393,23 @@ pub struct StructField {
     pub metadata: HashMap<String, MetadataValue>,
 }
 
+/// Parsed (and validated) pre-existing column-mapping annotations on a single field, as
+/// returned by [`StructField::validate_and_extract_existing_column_mapping_annotations`].
+/// Either, both, or neither of the two fields may be present; a field with neither set has no
+/// pre-populated column-mapping metadata.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExistingColumnMappingAnnotations<'a> {
+    /// Parsed `delta.columnMapping.id`, if present. Guaranteed non-negative.
+    pub id: Option<i64>,
+    /// Borrowed `delta.columnMapping.physicalName`, if present. Guaranteed non-empty.
+    pub physical_name: Option<&'a str>,
+}
+
 impl StructField {
     /// The name of the default row index metadata column.
     ///
-    /// Note that the dot does not indicate a nested field, it is just a separator for the metadata column name.
+    /// Note that the dot does not indicate a nested field, it is just a separator for the metadata
+    /// column name.
     const DEFAULT_ROW_INDEX_COLUMN_NAME: &'static str = "_metadata.row_index";
 
     /////////////////
@@ -328,6 +529,119 @@ impl StructField {
         self.metadata.get(key.as_ref())
     }
 
+    /// Returns this field's `delta.columnMapping.id` annotation if present and well-formed.
+    /// Returns `None` if the annotation is missing or carries a non-numeric value.
+    pub fn column_mapping_id(&self) -> Option<i64> {
+        match self.get_config_value(&ColumnMetadataKey::ColumnMappingId)? {
+            MetadataValue::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Returns this field's column default, parsed from its `CURRENT_DEFAULT`
+    /// ([`ColumnMetadataKey::CurrentDefault`]) metadata, if present.
+    ///
+    /// - `Ok(None)` -- no `CURRENT_DEFAULT` metadata.
+    /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
+    /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
+    ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
+    ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
+    pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
+        let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
+            None => return Ok(None),
+            Some(MetadataValue::String(s)) => s.clone(),
+            Some(other) => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a non-string `{}` annotation: {other}",
+                    self.name,
+                    ColumnMetadataKey::CurrentDefault.as_ref(),
+                )))
+            }
+        };
+        ColumnDefault::new(raw_sql, &self.data_type).map(Some)
+    }
+
+    /// Validates and extracts pre-existing column-mapping annotations on this field, returning
+    /// the parsed `id` and `physical_name` borrowed from the field's metadata. Returning the
+    /// parsed values lets the column-mapping assignment dispatch match on
+    /// `(Option<i64>, Option<&str>)` directly, which makes the dispatch total and obviates a
+    /// catch-all panic for malformed annotations the validator already rejects.
+    ///
+    /// Rejects:
+    /// - `delta.columnMapping.id` is present but not a `MetadataValue::Number`,
+    /// - `delta.columnMapping.id` is a `Number` but lies outside the protocol's 32-bit non-negative
+    ///   range (negative or `> i32::MAX`); see
+    ///   [`crate::table_features::validate_column_mapping_id`],
+    /// - `delta.columnMapping.physicalName` is present but not a `MetadataValue::String`,
+    /// - `delta.columnMapping.physicalName` is an empty `String`.
+    ///
+    /// Empty-name, negative-id, and over-`i32::MAX` id are stricter than delta-spark (which
+    /// accepts the first two and historically truncates the third); kernel fails fast at
+    /// write time so a connector that supplies bad metadata learns about it on the call that
+    /// produced it. Wrong-typed `id` errors take precedence over wrong-typed `physicalName`
+    /// errors (a connector that fixes the `id` and retries will then see the `physicalName`
+    /// error).
+    pub(crate) fn validate_and_extract_existing_column_mapping_annotations(
+        &self,
+    ) -> DeltaResult<ExistingColumnMappingAnnotations<'_>> {
+        let id = match self.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+            Some(MetadataValue::Number(n)) => {
+                validate_column_mapping_id(*n)
+                    .map_err(|e| Error::schema(format!("Field '{}': {e}", self.name)))?;
+                Some(*n)
+            }
+            None => None,
+            Some(_) => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a non-numeric `{}` annotation",
+                    self.name,
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                )));
+            }
+        };
+        let physical_name =
+            match self.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                Some(MetadataValue::String(s)) if s.is_empty() => {
+                    return Err(Error::schema(format!(
+                        "Field '{}' has an empty `{}` annotation",
+                        self.name,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    )));
+                }
+                Some(MetadataValue::String(s)) => Some(s.as_str()),
+                None => None,
+                Some(_) => {
+                    return Err(Error::schema(format!(
+                        "Field '{}' has a non-string `{}` annotation",
+                        self.name,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    )));
+                }
+            };
+        Ok(ExistingColumnMappingAnnotations { id, physical_name })
+    }
+
+    /// Recursively collects every `delta.columnMapping.id` reachable from this field --
+    /// the field's own ID plus any nested struct fields under Struct/Array/Map/Variant.
+    /// Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn collect_column_mapping_ids(&self) -> Vec<i64> {
+        struct CollectIds(Vec<i64>);
+        impl<'a> SchemaTransform<'a> for CollectIds {
+            transform_output_type!(|'a, T| ());
+
+            fn transform_struct_field(&mut self, field: &'a StructField) {
+                if let Some(id) = field.column_mapping_id() {
+                    self.0.push(id);
+                }
+                self.recurse_into_struct_field(field)
+            }
+        }
+        let mut visitor = CollectIds(Vec::new());
+        visitor.transform_struct_field(self);
+        visitor.0
+    }
+
     /// Get the physical name for this field as it should be read from parquet.
     ///
     /// When `column_mapping_mode` is `None`, always returns the logical name (even if physical
@@ -335,8 +649,8 @@ impl StructField {
     /// metadata if present, otherwise returns the logical name.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
+    /// [`crate::table_configuration::TableConfiguration::try_new`]. In `None` mode a stale
+    /// annotation may still be present (it is ignored, and the logical name is returned).
     #[internal_api]
     pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
         match column_mapping_mode {
@@ -351,6 +665,26 @@ impl StructField {
                 }
             }
         }
+    }
+
+    /// Returns true if this field has a physical name annotation
+    /// in its column mapping metadata.
+    pub(crate) fn has_physical_name_annotation(&self) -> bool {
+        matches!(
+            self.metadata
+                .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()),
+            Some(MetadataValue::String(_))
+        )
+    }
+
+    /// Returns true if this field has a column mapping ID annotation
+    /// in its column mapping metadata.
+    pub(crate) fn has_id_annotation(&self) -> bool {
+        matches!(
+            self.metadata
+                .get(ColumnMetadataKey::ColumnMappingId.as_ref()),
+            Some(MetadataValue::Number(_))
+        )
     }
 
     /// Change the name of a field. The field will preserve its data type and nullability. Note that
@@ -384,15 +718,6 @@ impl StructField {
         &self.metadata
     }
 
-    /// Convert our metadata into a HashMap<String, String>. Note this copies all the data so can be
-    /// expensive for large metadata
-    pub fn metadata_with_string_values(&self) -> HashMap<String, String> {
-        self.metadata
-            .iter()
-            .map(|(key, val)| (key.clone(), val.to_string()))
-            .collect()
-    }
-
     /// Applies physical name and field ID mappings to this field.
     ///
     /// This function sets the field ID for the physical [`StructField`] only if the
@@ -407,70 +732,25 @@ impl StructField {
     /// `Id` or `Name`, this is specified in [`ColumnMetadataKey::ColumnMappingPhysicalName`].
     /// Otherwise, the field's logical name is used.
     ///
-    /// If the `column_mapping_mode` is `None`, then all column mapping metadata is removed.
-    /// If the `column_mapping_mode` is `Name`, then all Id mode column mapping metadata is
-    /// removed.
-    ///
-    /// NOTE: The caller must ensure that the schema has been validated by
-    /// [`crate::table_features::validate_schema_column_mapping`] to ensure that annotations are
-    /// present only when column mapping mode is enabled.
+    /// Returns an error if a field has invalid or inconsistent column mapping annotations (e.g.
+    /// missing or wrong-typed when column mapping is enabled), or if a metadata column is
+    /// encountered (metadata columns should not participate in column mapping). When column
+    /// mapping is disabled, a stale annotation is tolerated (resolved by logical name and dropped
+    /// from the physical metadata); CREATE / ALTER reject it via a separate strict validation pass
+    /// instead.
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     #[internal_api]
-    pub(crate) fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> Self {
-        struct MakePhysical {
-            column_mapping_mode: ColumnMappingMode,
-        }
-        impl<'a> SchemaTransform<'a> for MakePhysical {
-            fn transform_struct_field(
-                &mut self,
-                field: &'a StructField,
-            ) -> Option<Cow<'a, StructField>> {
-                let field = self.recurse_into_struct_field(field)?;
-
-                let metadata = field.logical_to_physical_metadata(self.column_mapping_mode);
-                let name = match self.column_mapping_mode {
-                    ColumnMappingMode::None => field.name().to_owned(),
-                    ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                        // Assert that the physical name is present
-                        match field.is_metadata_column() {
-                            true => {
-                                debug_assert!(
-                                    false,
-                                    "Metadata column should not have a physical name"
-                                );
-                            }
-                            false => {
-                                debug_assert!(field
-                                    .metadata
-                                    .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
-                                    .is_some_and(|x| matches!(x, MetadataValue::String(_))));
-                            }
-                        }
-                        field.physical_name(self.column_mapping_mode).to_owned()
-                    }
-                };
-
-                Some(Cow::Owned(field.with_name(name).with_metadata(metadata)))
-            }
-
-            fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-                // There is no column mapping metadata inside the struct fields of a variant, so
-                // we do not recurse into the variant fields
-                Some(Cow::Borrowed(stype))
-            }
-        }
-        // NOTE: unwrap is safe because the transformer is incapable of returning None
-        #[allow(clippy::unwrap_used)]
-        MakePhysical {
-            column_mapping_mode,
-        }
-        .transform_struct_field(self)
-        .unwrap()
-        .into_owned()
+    pub(crate) fn make_physical(
+        &self,
+        column_mapping_mode: ColumnMappingMode,
+    ) -> DeltaResult<Self> {
+        MakePhysical::new(column_mapping_mode)
+            .transform_struct_field(self)
+            .map(|f| f.into_owned())
     }
 
-    fn has_invariants(&self) -> bool {
+    pub(crate) fn has_invariants(&self) -> bool {
         self.metadata
             .contains_key(ColumnMetadataKey::Invariants.as_ref())
     }
@@ -478,9 +758,11 @@ impl StructField {
     /// Converts logical schema StructField metadata to physical schema metadata
     /// based on the specified `column_mapping_mode`.
     ///
-    /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
+    /// NOTE: Must not be called on metadata columns, which are not subject to column mapping.
+    ///
+    /// NOTE: Caller affirms that `self` was already validated by
+    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`]. In `None` mode a
+    /// stale annotation may be present; this drops the column-mapping keys regardless.
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
@@ -493,7 +775,8 @@ impl StructField {
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    // `validate_schema_column_mapping` should have verified that this has a field Id
+                    // `validate_and_extract_column_mapping_annotations` should have verified that
+                    // this has a field Id
                     warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
                     debug_assert!(false);
                     return base_metadata;
@@ -511,9 +794,18 @@ impl StructField {
                 debug_assert!(base_metadata.contains_key(physical_name_key));
                 debug_assert!(base_metadata.contains_key(field_id_key));
 
-                // Remove all id mode related metadata keys
-                base_metadata.remove(field_id_key);
-                base_metadata.remove(parquet_field_id_key);
+                // Retain column mapping id and insert parquet field id so that
+                // Parquet files carry field IDs in Name mode as well (matching
+                // the Delta protocol requirement and Delta Spark behaviour).
+                let Some(MetadataValue::Number(fid)) = field_id else {
+                    warn!("StructField with name {} is missing field id in the Name column mapping mode", self.name());
+                    debug_assert!(false);
+                    return base_metadata;
+                };
+                base_metadata.insert(
+                    parquet_field_id_key.to_string(),
+                    MetadataValue::Number(*fid),
+                );
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
             ColumnMappingMode::None => {
@@ -536,7 +828,7 @@ impl Display for StructField {
                 metadata_str.push_str(", ");
             }
             first = false;
-            metadata_str.push_str(&format!("{}: {:?}", k, v));
+            metadata_str.push_str(&format!("{k}: {v:?}"));
         }
         metadata_str.push('}');
         write!(
@@ -558,8 +850,8 @@ pub struct StructType {
     // for each field by name would be potentially quite expensive for large schemas.
     fields: IndexMap<String, StructField>,
     /// The metadata columns in this struct
-    // We use a dedicated map for metadata columns to allow for fast lookup without having to iterate
-    // over all fields.
+    // We use a dedicated map for metadata columns to allow for fast lookup without having to
+    // iterate over all fields.
     metadata_columns: HashMap<MetadataColumnSpec, usize>,
 }
 
@@ -604,12 +896,14 @@ impl StructType {
     /// Creates a new [`StructType`] from the given fields.
     ///
     /// Returns an error if:
-    /// - the schema contains duplicate field names
+    /// - the schema contains duplicate field names (case-insensitive; Delta column names are
+    ///   case-insensitive per the protocol)
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
+        let mut seen_lowercase_names = HashSet::new();
 
         // Validate each field during insertion
         for (i, field) in fields.into_iter().enumerate() {
@@ -627,10 +921,17 @@ impl StructType {
                 }
             }
 
-            // Check for duplicate field names
-            if let Some(dup) = field_map.insert(field.name.clone(), field) {
-                return Err(Error::schema(format!("Duplicate field name: {}", dup.name)));
+            // Delta column names are case-insensitive; reject schemas with duplicates that differ
+            // only by case.
+            let key = field.name.to_lowercase();
+            if !seen_lowercase_names.insert(key) {
+                return Err(Error::schema(format!(
+                    "Duplicate field name (case-insensitive): '{}'",
+                    field.name
+                )));
             }
+
+            field_map.insert(field.name.clone(), field);
         }
 
         Ok(Self {
@@ -740,6 +1041,91 @@ impl StructType {
         self.fields.get(name.as_ref())
     }
 
+    /// Retrieves the nested field named by the given column path.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    pub fn field_at<'a>(&'a self, col: &ColumnName) -> DeltaResult<&'a StructField> {
+        let mut field = None;
+        self.visit_fields_of_path(col, |f| field = Some(f))?;
+        field.ok_or_else(|| Error::generic("Empty path"))
+    }
+
+    /// Checks whether this schema contains the field at the given column path.
+    pub fn contains_col(&self, col: impl CollectInto<ColumnName>) -> bool {
+        let col = col.collect_into();
+        self.field_at(&col).is_ok()
+    }
+
+    /// Visits all fields along the given column path.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    #[internal_api]
+    pub(crate) fn visit_fields_of_path<'a>(
+        &'a self,
+        col: &ColumnName,
+        visit_field: impl FnMut(&'a StructField),
+    ) -> DeltaResult<()> {
+        self.visit_fields_of_path_by(col, |s, name| s.field(name), visit_field)
+    }
+
+    /// Resolves a column path through nested structs, returning references to all
+    /// [`StructField`]s along the path. The last element is the leaf field.
+    ///
+    /// Each element of the path must resolve to a field in the current struct. All intermediate
+    /// (non-leaf) fields must be struct types.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate
+    /// field is not a struct type.
+    #[internal_api]
+    pub(crate) fn fields_of_path<'a>(
+        &'a self,
+        col: &ColumnName,
+    ) -> DeltaResult<Vec<&'a StructField>> {
+        let mut result = Vec::with_capacity(col.path().len());
+        self.visit_fields_of_path(col, |f| result.push(f))?;
+        Ok(result)
+    }
+
+    /// Visits all fields along the given column path, using a caller-provided field name resolver.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    pub(crate) fn visit_fields_of_path_by<'a, F>(
+        &'a self,
+        col: &ColumnName,
+        find_field: F,
+        mut visit_field: impl FnMut(&'a StructField),
+    ) -> DeltaResult<()>
+    where
+        F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructField>,
+    {
+        let path = col.path();
+        if path.is_empty() {
+            return Err(Error::generic("Column path cannot be empty"));
+        }
+        let mut current_struct = self;
+        for (i, field_name) in path.iter().enumerate() {
+            let field = find_field(current_struct, field_name).ok_or_else(|| {
+                Error::generic(format!(
+                    "Could not resolve column '{col}': field '{field_name}' not found in schema"
+                ))
+            })?;
+            visit_field(field);
+            if i < path.len() - 1 {
+                let DataType::Struct(inner) = field.data_type() else {
+                    return Err(Error::generic(format!(
+                        "Cannot resolve column '{col}': intermediate field '{field_name}' \
+                         is not a struct type"
+                    )));
+                };
+                current_struct = inner;
+            }
+        }
+        Ok(())
+    }
+
     /// Gets the field with the given name and its index.
     pub fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
         self.fields
@@ -766,6 +1152,56 @@ impl StructType {
         self.fields.into_values()
     }
 
+    /// Gets a mutable reference to the underlying field map.
+    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
+        &mut self.fields
+    }
+
+    /// Walk a pre-segmented column path through this schema and return the leaf field.
+    ///
+    /// `path` is the path's individual name segments (one per nesting level), already split by
+    /// the caller. Lookup at each level is case-insensitive. The Delta protocol uses `.` as the
+    /// dotted-path separator at the API surface, but `field_at_path` itself does not split --
+    /// callers typically pass [`ColumnName::path()`](crate::expressions::ColumnName::path),
+    /// which yields the segments directly.
+    ///
+    /// Panics if any segment is missing or an intermediate field is not a struct. Intended for
+    /// use in test assertions.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Schema:
+    /// //   id:      INTEGER  not null
+    /// //   address: STRUCT { city: STRING not null, zip: STRING }
+    /// let path = vec!["address".to_string(), "city".to_string()];
+    /// let city = schema.field_at_path(&path);
+    /// assert_eq!(city.name(), "city");
+    /// assert!(!city.is_nullable());
+    /// ```
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::panic, clippy::expect_used)]
+    pub fn field_at_path<'a>(&'a self, path: &[String]) -> &'a StructField {
+        fn find_ci<'a>(
+            mut fields: impl Iterator<Item = &'a StructField>,
+            name: &str,
+        ) -> &'a StructField {
+            let lowered = name.to_lowercase();
+            fields
+                .find(|f| f.name().to_lowercase() == lowered)
+                .unwrap_or_else(|| panic!("field '{name}' not found"))
+        }
+        let (first, rest) = path.split_first().expect("non-empty path");
+        let mut field = find_ci(self.fields(), first);
+        for seg in rest {
+            let DataType::Struct(s) = field.data_type() else {
+                panic!("expected struct at intermediate segment '{seg}'");
+            };
+            field = find_ci(s.fields(), seg);
+        }
+        field
+    }
+
     /// Gets all the field names in this struct type in the order they are defined.
     pub fn field_names(&self) -> impl ExactSizeIterator<Item = &String> {
         self.fields.keys()
@@ -775,6 +1211,30 @@ impl StructType {
     pub fn num_fields(&self) -> usize {
         // O(1) for indexmap
         self.fields.len()
+    }
+
+    /// Recursively counts all [`StructField`] nodes in this schema tree.
+    ///
+    /// This includes nested struct fields (inside Struct, Array, and Map types) but does not
+    /// count Array/Map containers themselves. This matches the traversal pattern used by
+    /// `assign_column_mapping_metadata` when assigning column IDs, so the result equals the
+    /// expected `delta.columnMapping.maxColumnId` for a newly created table.
+    #[allow(unused)] // Only used by integration tests (create_table/column_mapping.rs)
+    #[internal_api]
+    pub(crate) fn total_struct_fields(&self) -> usize {
+        fn count_data_type(dt: &DataType) -> usize {
+            match dt {
+                DataType::Struct(inner) => inner.total_struct_fields(),
+                DataType::Array(array) => count_data_type(array.element_type()),
+                DataType::Map(map) => {
+                    count_data_type(map.key_type()) + count_data_type(map.value_type())
+                }
+                _ => 0,
+            }
+        }
+        self.fields()
+            .map(|field| 1 + count_data_type(field.data_type()))
+            .sum()
     }
 
     /// Gets a reference to the metadata column with the given spec.
@@ -801,7 +1261,7 @@ impl StructType {
     #[internal_api]
     pub(crate) fn leaves<'s>(&self, own_name: impl Into<Option<&'s str>>) -> ColumnNamesAndTypes {
         let mut get_leaves = GetSchemaLeaves::new(own_name.into());
-        let _ = get_leaves.transform_struct(self);
+        get_leaves.transform_struct(self);
         (get_leaves.names, get_leaves.types).into()
     }
 
@@ -809,16 +1269,15 @@ impl StructType {
     /// [`ColumnMappingMode::Id`], then each StructField will have its parquet field id in the
     /// [`ColumnMetadataKey::ParquetFieldId`] metadata field.
     ///
-    /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
-    #[allow(unused)]
+    /// Uses a single transformer so duplicate column mapping IDs are detected across all
+    /// fields in this struct, not just within each field's subtree.
     #[internal_api]
-    pub(crate) fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> Self {
-        let fields = self
-            .fields()
-            .map(|field| field.make_physical(column_mapping_mode));
-        Self::new_unchecked(fields)
+    pub(crate) fn make_physical(
+        &self,
+        column_mapping_mode: ColumnMappingMode,
+    ) -> DeltaResult<Self> {
+        let mut transformer = MakePhysical::new(column_mapping_mode);
+        transformer.transform_struct(self).map(|s| s.into_owned())
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -859,11 +1318,38 @@ impl StructType {
                     Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
                 }
             }
-            // Primitive types cannot contain nested metadata columns and variant types are validated at creation
+            // Primitive types cannot contain nested metadata columns and variant types are
+            // validated at creation
             DataType::Primitive(_) | DataType::Variant(_) => {}
         };
 
         Ok(())
+    }
+
+    /// Returns a new [`StructType`] containing only the top-level fields for which `predicate`
+    /// returns `true`. This does not recurse into nested [`StructType`] fields.
+    pub fn with_fields_filtered(
+        &self,
+        predicate: impl Fn(&StructField) -> bool,
+    ) -> DeltaResult<Self> {
+        Self::try_new(self.fields().filter(|f| predicate(f)).cloned())
+    }
+
+    /// Returns an optional [`StructType`] containing only the top-level fields for which
+    /// `predicate` returns `true`.
+    ///
+    /// This is a convenience wrapper around [`StructType::with_fields_filtered`] for callers
+    /// that treat an empty top-level struct as "no schema".
+    pub fn with_fields_filtered_nonempty(
+        &self,
+        predicate: impl Fn(&StructField) -> bool,
+    ) -> DeltaResult<Option<Self>> {
+        let filtered = self.with_fields_filtered(predicate)?;
+        if filtered.num_fields() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(filtered))
+        }
     }
 }
 
@@ -896,7 +1382,7 @@ fn write_struct_type(
         levels.push(is_last);
 
         write_indent(f, levels)?;
-        writeln!(f, "{}", field)?;
+        writeln!(f, "{field}")?;
 
         field.data_type.fmt_recursive(f, levels)?;
 
@@ -948,8 +1434,8 @@ impl<'a> IntoIterator for &'a StructType {
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
-///     StructField::new("name", DataType::STRING, false),
-///     StructField::new("age", DataType::INTEGER, true),
+///     StructField::not_null("name", DataType::STRING),
+///     StructField::nullable("age", DataType::INTEGER),
 /// ];
 /// let struct_type = StructType::try_new(fields)?;
 ///
@@ -1021,8 +1507,8 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
-///     StructField::new("name", DataType::STRING, false),
-///     StructField::new("age", DataType::INTEGER, true),
+///     StructField::not_null("name", DataType::STRING),
+///     StructField::nullable("age", DataType::INTEGER),
 /// ];
 /// let struct_type = StructType::try_new(fields)?;
 ///
@@ -1074,32 +1560,102 @@ impl DoubleEndedIterator for StructFieldRefIter<'_> {
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct InvariantChecker {
-    has_invariants: bool,
-}
+struct InvariantChecker;
 
 impl<'a> SchemaTransform<'a> for InvariantChecker {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
         if field.has_invariants() {
-            self.has_invariants = true;
-        } else if !self.has_invariants {
-            let _ = self.recurse_into_struct_field(field);
+            Err(())
+        } else {
+            self.recurse_into_struct_field(field)
         }
-        Some(Cow::Borrowed(field))
     }
 }
 
-impl InvariantChecker {
-    /// Checks if any column in the schema (including nested columns) has invariants defined.
-    ///
-    /// This traverses the entire schema to check for the presence of the "delta.invariants"
-    /// metadata key.
-    pub(crate) fn has_invariants(schema: &Schema) -> bool {
-        let mut checker = InvariantChecker::default();
-        let _ = checker.transform_struct(schema);
-        checker.has_invariants
+/// Checks if any column in the schema (including nested columns) has invariants defined.
+///
+/// This traverses the entire schema to check for the presence of the `delta.invariants`
+/// metadata key.
+pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
+    InvariantChecker.transform_struct(schema).is_err()
+}
+
+/// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.
+/// Walks the full schema tree including nested struct, array element, and map value structs.
+struct NonNullFieldChecker;
+
+impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    /// Skip recursion into variant internals. The `metadata` and `value` fields inside a
+    /// `Variant` are protocol-defined, always non-null, and not user-controlled, so they
+    /// must not be treated as user-declared non-null columns.
+    fn transform_variant(&mut self, _stype: &'a StructType) -> Result<(), ()> {
+        Ok(())
     }
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
+        if !field.is_nullable() {
+            return Err(());
+        }
+
+        self.recurse_into_struct_field(field)
+    }
+}
+
+/// Checks if any user-controlled column in the schema (including nested columns) is declared
+/// non-null (`nullable: false`).
+///
+/// Skips `Variant` internal struct fields, which are protocol-defined and always non-null.
+pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
+    NonNullFieldChecker.transform_struct(schema).is_err()
+}
+
+/// Normalizes column name field names to match the casing in the schema.
+///
+/// Walks each field name through the schema's struct hierarchy, replacing user-provided
+/// casing with the schema's canonical casing. If a field name isn't found
+/// case-insensitively, keeps the original (subsequent validation catches it).
+///
+/// For example, given schema `{ Id: int, Name: string }` and user-provided columns
+/// `["id", "name"]`, returns `["Id", "Name"]` -- matching the schema's canonical casing.
+///
+/// Note: Must be called before validation (`validate_partition_columns` or
+/// `validate_clustering_columns`) so that case-normalized names match the schema.
+pub(crate) fn normalize_column_names_to_schema_casing(
+    schema: &StructType,
+    columns: &[ColumnName],
+) -> Vec<ColumnName> {
+    columns
+        .iter()
+        .map(|col| {
+            let path = col.path();
+            let mut normalized: Vec<String> = Vec::with_capacity(path.len());
+            let mut current_schema = schema;
+            for (i, field_name) in path.iter().enumerate() {
+                match current_schema
+                    .fields()
+                    .find(|f| f.name().eq_ignore_ascii_case(field_name))
+                {
+                    Some(f) => {
+                        normalized.push(f.name().to_string());
+                        if let DataType::Struct(inner) = f.data_type() {
+                            current_schema = inner;
+                        }
+                    }
+                    None => {
+                        // Field name not found at this level -- keep remaining path
+                        // unchanged so validation reports the user's original input.
+                        normalized.extend(path[i..].iter().cloned());
+                        break;
+                    }
+                }
+            }
+            ColumnName::new(normalized.iter().map(|s| s.as_str()))
+        })
+        .collect()
 }
 
 /// Helper for RowVisitor implementations
@@ -1110,11 +1666,6 @@ impl ColumnNamesAndTypes {
     #[internal_api]
     pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
         (&self.0, &self.1)
-    }
-
-    pub(crate) fn extend(&mut self, other: ColumnNamesAndTypes) {
-        self.0.extend(other.0);
-        self.1.extend(other.1);
     }
 }
 
@@ -1168,10 +1719,10 @@ pub struct ArrayType {
 }
 
 impl ArrayType {
-    pub fn new(element_type: DataType, contains_null: bool) -> Self {
+    pub fn new(element_type: impl Into<DataType>, contains_null: bool) -> Self {
         Self {
             type_name: "array".into(),
-            element_type,
+            element_type: element_type.into(),
             contains_null,
         }
     }
@@ -1230,17 +1781,150 @@ impl MapType {
         self.value_contains_null
     }
 
-    /// Create a schema assuming the map is stored as a struct with the specified key and value field names
+    /// Create a schema assuming the map is stored as a struct with the specified key and value
+    /// field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
-        StructType::new_unchecked([
-            StructField::not_null(key_name, self.key_type.clone()),
-            StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
-        ])
+        schema! {
+            not_null (key_name): (self.key_type.clone()),
+            (StructField::new(val_name, self.value_type.clone(), self.value_contains_null)),
+        }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Validates that a CRS (Coordinate Reference System) identifier is in `AUTHORITY:CODE` form,
+/// e.g. `"EPSG:4326"` or `"OGC:CRS84"`: a non-empty authority and code separated by a single
+/// colon, no comma, and no surrounding whitespace. Validating the value against the full set of
+/// recognized CRSes is future work.
+#[cfg(feature = "geo-type-in-dev")]
+fn validate_crs(crs: &str) -> DeltaResult<()> {
+    require!(
+        crs == crs.trim(),
+        Error::invalid_geo_params(format!(
+            "CRS '{crs}' must not have leading or trailing whitespace"
+        ))
+    );
+    require!(
+        !crs.contains(','),
+        Error::invalid_geo_params(format!("CRS '{crs}' must not contain a comma"))
+    );
+
+    let [authority, code] = crs.split(':').collect::<Vec<_>>()[..] else {
+        return Err(Error::invalid_geo_params(format!(
+            "CRS '{crs}' must be in 'AUTHORITY:CODE' format"
+        )));
+    };
+
+    require!(
+        !authority.is_empty(),
+        Error::invalid_geo_params(format!(
+            "CRS '{crs}' must have an authority before the colon"
+        ))
+    );
+    require!(
+        !code.is_empty(),
+        Error::invalid_geo_params(format!("CRS '{crs}' must have a code after the colon"))
+    );
+    Ok(())
+}
+
+/// Algorithm used to interpolate edges between two vertices of a geography path.
+#[cfg(feature = "geo-type-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, EnumString, StrumDisplay)]
+#[strum(ascii_case_insensitive)]
+pub enum EdgeInterpolationAlgorithm {
+    /// Edges are interpolated as geodesics on a sphere.
+    #[strum(serialize = "spherical")]
+    Spherical,
+
+    /// Vincenty's formulae for geodesics on an ellipsoid.
+    #[strum(serialize = "vincenty")]
+    Vincenty,
+
+    /// Thomas's approximation for geodesics on an ellipsoid.
+    #[strum(serialize = "thomas")]
+    Thomas,
+
+    /// Andoyer's approximation for geodesics on an ellipsoid.
+    #[strum(serialize = "andoyer")]
+    Andoyer,
+
+    /// Karney's algorithm for geodesics on an ellipsoid.
+    #[strum(serialize = "karney")]
+    Karney,
+}
+
+/// A geometry column type with an associated coordinate reference system (CRS).
+///
+/// Serializes as `geometry(<crs>)`, e.g. `geometry(EPSG:4326)`.
+#[cfg(feature = "geo-type-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GeometryType {
+    crs: String,
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl GeometryType {
+    /// Constructs a GeometryType from the given CRS, or returns an error if the CRS is
+    /// not in AUTHORITY:CODE form.
+    pub fn try_new(crs: &str) -> DeltaResult<Self> {
+        validate_crs(crs)?;
+        Ok(Self {
+            crs: crs.to_string(),
+        })
+    }
+
+    pub fn crs(&self) -> &str {
+        &self.crs
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl Display for GeometryType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "geometry({})", self.crs)
+    }
+}
+
+/// Geography column type with an associated CRS and edge interpolation algorithm.
+///
+/// Serializes as `geography(<crs>, <algorithm>)`, e.g. `geography(EPSG:4326, spherical)`.
+#[cfg(feature = "geo-type-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GeographyType {
+    crs: String,
+    algorithm: EdgeInterpolationAlgorithm,
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl GeographyType {
+    /// Constructs a GeographyType from the given CRS and edge interpolation algorithm, or
+    /// returns an error if the CRS is not in AUTHORITY:CODE form.
+    pub fn try_new(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> DeltaResult<Self> {
+        validate_crs(crs)?;
+        Ok(Self {
+            crs: crs.to_string(),
+            algorithm,
+        })
+    }
+
+    pub fn crs(&self) -> &str {
+        &self.crs
+    }
+
+    pub fn algorithm(&self) -> &EdgeInterpolationAlgorithm {
+        &self.algorithm
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl Display for GeographyType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "geography({}, {})", self.crs, self.algorithm)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -1276,7 +1960,7 @@ impl DecimalType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
@@ -1301,12 +1985,28 @@ pub enum PrimitiveType {
     Timestamp,
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
-    #[serde(
-        serialize_with = "serialize_decimal",
-        deserialize_with = "deserialize_decimal",
-        untagged
-    )]
+    Void,
+    /// Year-month interval: a signed count of months (ANSI `INTERVAL YEAR TO MONTH` and its
+    /// narrowed `YEAR` / `MONTH` spellings). The serde rename is the `schemaString` type-name
+    /// string -- spelled with spaces, unlike the single-word siblings, so the mapping is not
+    /// self-evident.
+    #[serde(rename = "interval year to month")]
+    IntervalYearMonth,
+    /// Day-time interval: a signed count of microseconds (ANSI `INTERVAL DAY TO SECOND` and
+    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings). As with the year-month
+    /// variant above, the serde rename is the multi-word `schemaString` type-name string.
+    #[serde(rename = "interval day to second")]
+    IntervalDayTime,
+    #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
+    /// Geometry column with an associated coordinate reference system (CRS).
+    #[cfg(feature = "geo-type-in-dev")]
+    #[serde(serialize_with = "serialize_geotype", untagged)]
+    Geometry(Box<GeometryType>),
+    /// Geography column with an associated CRS and edge interpolation algorithm.
+    #[cfg(feature = "geo-type-in-dev")]
+    #[serde(serialize_with = "serialize_geotype", untagged)]
+    Geography(Box<GeographyType>),
 }
 
 impl PrimitiveType {
@@ -1314,14 +2014,22 @@ impl PrimitiveType {
         Ok(DecimalType::try_new(precision, scale)?.into())
     }
 
+    /// Returns whether this is one of the ANSI interval primitive types.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn is_interval(&self) -> bool {
+        matches!(self, Self::IntervalYearMonth | Self::IntervalDayTime)
+    }
+
     /// Returns `true` if this primitive type can be widened to the `target` type.
     ///
-    /// Widening rules (based on Parquet reader behavior):
-    /// - Integer widening: byte → short → int → long
-    /// - Float widening: float → double
-    ///
-    /// Note: These widening rules assume the parquet reader supports reading narrower types
-    /// as wider types. This should be documented as a requirement in the `ParquetHandler` trait.
+    /// Widening rules:
+    /// - Integer widening: byte -> short -> int -> long (Delta protocol type widening)
+    /// - Float widening: float -> double (Delta protocol type widening)
+    /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds since
+    ///   epoch, differing only in timezone semantics; this is a physical read accommodation, not a
+    ///   Delta protocol type widening rule)
+    #[internal_api]
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
         matches!(
@@ -1339,6 +2047,38 @@ impl PrimitiveType {
                 | (TimestampNtz, Timestamp)
         )
     }
+
+    /// Returns `true` if `self` is a physical integer type that some checkpoint writers
+    /// produce when they omit Parquet logical type annotations for date or timestamp columns.
+    ///
+    /// Specifically:
+    /// - Integer -> Date (int32 stored without DATE annotation)
+    /// - Long -> Timestamp/TimestampNtz (int64 stored without TIMESTAMP annotation)
+    ///
+    /// These are **not** Delta protocol type widening rules and must not be used outside of
+    /// checkpoint compatibility checks.
+    ///
+    /// NOTE: The Arrow-level equivalent lives in `check_cast_compat` in
+    /// `engine/ensure_data_types.rs`. Changes here must be mirrored there.
+    pub(crate) fn is_checkpoint_cast_compatible(&self, target: &Self) -> bool {
+        matches!(
+            (self, target),
+            (Self::Integer, Self::Date) | (Self::Long, Self::Timestamp | Self::TimestampNtz)
+        )
+    }
+
+    /// Returns `true` if this primitive type is compatible with `target` for reading
+    /// `stats_parsed` columns from checkpoint parquet files.
+    ///
+    /// This is a superset of [`can_widen_to`]: it includes all Delta protocol type widening
+    /// rules plus physical Parquet encoding accommodations for checkpoint interop (see
+    /// [`is_checkpoint_cast_compatible`]).
+    ///
+    /// [`can_widen_to`]: PrimitiveType::can_widen_to
+    /// [`is_checkpoint_cast_compatible`]: PrimitiveType::is_checkpoint_cast_compatible
+    pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
+        self == target || self.can_widen_to(target) || self.is_checkpoint_cast_compatible(target)
+    }
 }
 
 fn serialize_decimal<S: serde::Serializer>(
@@ -1348,30 +2088,12 @@ fn serialize_decimal<S: serde::Serializer>(
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<DecimalType, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let str_value = String::deserialize(deserializer)?;
-    require!(
-        str_value.starts_with("decimal(") && str_value.ends_with(')'),
-        serde::de::Error::custom(format!("Invalid decimal: {str_value}"))
-    );
-
-    let mut parts = str_value[8..str_value.len() - 1].split(',');
-    let precision = parts
-        .next()
-        .and_then(|part| part.trim().parse::<u8>().ok())
-        .ok_or_else(|| {
-            serde::de::Error::custom(format!("Invalid precision in decimal: {str_value}"))
-        })?;
-    let scale = parts
-        .next()
-        .and_then(|part| part.trim().parse::<u8>().ok())
-        .ok_or_else(|| {
-            serde::de::Error::custom(format!("Invalid scale in decimal: {str_value}"))
-        })?;
-    DecimalType::try_new(precision, scale).map_err(serde::de::Error::custom)
+#[cfg(feature = "geo-type-in-dev")]
+fn serialize_geotype<T: std::fmt::Display, S: serde::Serializer>(
+    value: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&value.to_string())
 }
 
 fn serialize_variant<S: serde::Serializer>(
@@ -1381,21 +2103,147 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
-fn deserialize_variant<'de, D>(deserializer: D) -> Result<Box<StructType>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let str_value = String::deserialize(deserializer)?;
-    require!(
-        str_value == "variant",
-        serde::de::Error::custom(format!("Invalid variant: {str_value}"))
-    );
-    match DataType::unshredded_variant() {
-        DataType::Variant(st) => Ok(st),
-        _ => Err(serde::de::Error::custom(
-            "Issue in DataType::unshredded_variant(). Please raise an issue at ".to_string()
-                + "delta-io/delta-kernel-rs.",
-        )),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntervalField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntervalFieldRange {
+    pub(crate) start: IntervalField,
+    pub(crate) end: IntervalField,
+}
+
+impl IntervalFieldRange {
+    fn primitive_type(self) -> PrimitiveType {
+        match self.start {
+            IntervalField::Year | IntervalField::Month => PrimitiveType::IntervalYearMonth,
+            IntervalField::Day
+            | IntervalField::Hour
+            | IntervalField::Minute
+            | IntervalField::Second => PrimitiveType::IntervalDayTime,
+        }
+    }
+}
+
+pub(crate) fn parse_interval_type(s: &str) -> Option<IntervalFieldRange> {
+    use IntervalField::*;
+
+    let (start, end) = match s {
+        "interval year" => (Year, Year),
+        "interval month" => (Month, Month),
+        "interval year to month" => (Year, Month),
+        "interval day" => (Day, Day),
+        "interval hour" => (Hour, Hour),
+        "interval minute" => (Minute, Minute),
+        "interval second" => (Second, Second),
+        "interval day to hour" => (Day, Hour),
+        "interval day to minute" => (Day, Minute),
+        "interval day to second" => (Day, Second),
+        "interval hour to minute" => (Hour, Minute),
+        "interval hour to second" => (Hour, Second),
+        "interval minute to second" => (Minute, Second),
+        _ => return None,
+    };
+    Some(IntervalFieldRange { start, end })
+}
+
+fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
+    parse_interval_type(s).map(IntervalFieldRange::primitive_type)
+}
+
+// Custom Deserialize to provide clear error messages for unsupported types.
+// The derived impl would produce: "unknown variant `interval second`, expected one of ..."
+// This impl produces: "Unsupported Delta table type: 'interval second'"
+impl<'de> serde::Deserialize<'de> for PrimitiveType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let str_value = String::deserialize(deserializer)?;
+
+        match str_value.as_str() {
+            "string" => Ok(PrimitiveType::String),
+            "long" => Ok(PrimitiveType::Long),
+            "integer" => Ok(PrimitiveType::Integer),
+            "short" => Ok(PrimitiveType::Short),
+            "byte" => Ok(PrimitiveType::Byte),
+            "float" => Ok(PrimitiveType::Float),
+            "double" => Ok(PrimitiveType::Double),
+            "boolean" => Ok(PrimitiveType::Boolean),
+            "binary" => Ok(PrimitiveType::Binary),
+            "date" => Ok(PrimitiveType::Date),
+            "timestamp" => Ok(PrimitiveType::Timestamp),
+            "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
+            "void" => Ok(PrimitiveType::Void),
+            // Accept canonical and narrowed interval spellings
+            s if s.starts_with("interval ") => {
+                normalize_interval_type(s).ok_or_else(|| unsupported_delta_type_error(s))
+            }
+            decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
+                // Parse decimal type
+                let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
+                let precision = parts
+                    .next()
+                    .and_then(|part| part.trim().parse::<u8>().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!(
+                            "Invalid precision in decimal: {decimal_str}"
+                        ))
+                    })?;
+                let scale = parts
+                    .next()
+                    .and_then(|part| part.trim().parse::<u8>().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!("Invalid scale in decimal: {decimal_str}"))
+                    })?;
+                // Reject extra parts (e.g., decimal(10,2,99))
+                if parts.next().is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "Invalid decimal format (expected 2 parts): {decimal_str}"
+                    )));
+                }
+                DecimalType::try_new(precision, scale)
+                    .map(PrimitiveType::Decimal)
+                    .map_err(serde::de::Error::custom)
+            }
+            #[cfg(feature = "geo-type-in-dev")]
+            geo_str if geo_str.starts_with("geometry(") && geo_str.ends_with(')') => {
+                let crs = &geo_str["geometry(".len()..geo_str.len() - 1];
+                GeometryType::try_new(crs.trim())
+                    .map(Box::new)
+                    .map(PrimitiveType::Geometry)
+                    .map_err(serde::de::Error::custom)
+            }
+            #[cfg(feature = "geo-type-in-dev")]
+            geo_str if geo_str.starts_with("geography(") && geo_str.ends_with(')') => {
+                let inner = &geo_str["geography(".len()..geo_str.len() - 1];
+                // Kernel accepts only the canonical serialized form that every writer emits:
+                //   geography(<crs>, <algorithm>)
+                // TODO(#2949): reevaluate whether accepting padded input like
+                // geography(  EPSG:4326 ,  vincenty  ) is desired.
+                match inner.split_once(',') {
+                    Some((crs, algo_str)) => {
+                        let algorithm: EdgeInterpolationAlgorithm =
+                            algo_str.trim().parse().map_err(serde::de::Error::custom)?;
+                        GeographyType::try_new(crs.trim(), algorithm)
+                            .map(Box::new)
+                            .map(PrimitiveType::Geography)
+                            .map_err(serde::de::Error::custom)
+                    }
+                    None => Err(serde::de::Error::custom(format!(
+                        "Invalid geography type '{geo_str}': expected \
+                         'geography(<crs>, <algorithm>)'"
+                    ))),
+                }
+            }
+            unsupported => Err(unsupported_delta_type_error(unsupported)),
+        }
     }
 }
 
@@ -1414,14 +2262,21 @@ impl Display for PrimitiveType {
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
+            PrimitiveType::IntervalYearMonth => write!(f, "interval year to month"),
+            PrimitiveType::IntervalDayTime => write!(f, "interval day to second"),
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
+            PrimitiveType::Void => write!(f, "void"),
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveType::Geometry(t) => write!(f, "{t}"),
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveType::Geography(t) => write!(f, "{t}"),
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
     /// UTF-8 encoded string of characters
@@ -1436,10 +2291,7 @@ pub enum DataType {
     Map(Box<MapType>),
     /// The Variant data type. The physical representation can be flexible to support shredded
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
-    #[serde(
-        serialize_with = "serialize_variant",
-        deserialize_with = "deserialize_variant"
-    )]
+    #[serde(serialize_with = "serialize_variant")]
     Variant(Box<StructType>),
 }
 
@@ -1451,6 +2303,30 @@ impl From<DecimalType> for PrimitiveType {
 impl From<DecimalType> for DataType {
     fn from(dtype: DecimalType) -> Self {
         PrimitiveType::from(dtype).into()
+    }
+}
+#[cfg(feature = "geo-type-in-dev")]
+impl From<GeometryType> for PrimitiveType {
+    fn from(gtype: GeometryType) -> Self {
+        PrimitiveType::Geometry(Box::new(gtype))
+    }
+}
+#[cfg(feature = "geo-type-in-dev")]
+impl From<GeometryType> for DataType {
+    fn from(gtype: GeometryType) -> Self {
+        PrimitiveType::from(gtype).into()
+    }
+}
+#[cfg(feature = "geo-type-in-dev")]
+impl From<GeographyType> for PrimitiveType {
+    fn from(gtype: GeographyType) -> Self {
+        PrimitiveType::Geography(Box::new(gtype))
+    }
+}
+#[cfg(feature = "geo-type-in-dev")]
+impl From<GeographyType> for DataType {
+    fn from(gtype: GeographyType) -> Self {
+        PrimitiveType::from(gtype).into()
     }
 }
 impl From<PrimitiveType> for DataType {
@@ -1482,6 +2358,61 @@ impl From<SchemaRef> for DataType {
     }
 }
 
+// Custom Deserialize to preserve error messages from PrimitiveType.
+// Serde's untagged enum only reports the last variant's error, discarding PrimitiveType's
+// clear "Unsupported Delta table type: 'X'" message. We deserialize to Value first, then
+// dispatch based on structure (string -> Primitive/Variant, object -> Array/Struct/Map).
+impl<'de> serde::Deserialize<'de> for DataType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        use serde_json::Value;
+
+        let value = Value::deserialize(deserializer)?;
+
+        // String values are either primitive types or "variant"
+        if let Value::String(s) = &value {
+            if s == "variant" {
+                return match DataType::unshredded_variant() {
+                    DataType::Variant(st) => Ok(DataType::Variant(st)),
+                    _ => Err(Error::custom("Failed to create variant type")),
+                };
+            }
+
+            // Try PrimitiveType - this will give us good error messages for unsupported types
+            return PrimitiveType::deserialize(value.clone())
+                .map(DataType::Primitive)
+                .map_err(|e| Error::custom(e.to_string()));
+        }
+
+        // Object values are complex types - dispatch based on "type" field
+        if let Value::Object(map) = &value {
+            if let Some(Value::String(type_str)) = map.get("type") {
+                return match type_str.as_str() {
+                    "array" => ArrayType::deserialize(value)
+                        .map(DataType::from)
+                        .map_err(|e| Error::custom(e.to_string())),
+                    "struct" => StructType::deserialize(value)
+                        .map(DataType::from)
+                        .map_err(|e| Error::custom(e.to_string())),
+                    "map" => MapType::deserialize(value)
+                        .map(DataType::from)
+                        .map_err(|e| Error::custom(e.to_string())),
+                    _ => Err(unsupported_delta_type_error(type_str)),
+                };
+            }
+        }
+
+        // Fallback error with the actual value that failed
+        Err(Error::custom(format!(
+            "Invalid data type: {}",
+            serde_json::to_string(&value).unwrap_or_else(|_| format!("{value:?}"))
+        )))
+    }
+}
+
 /// cbindgen:ignore
 impl DataType {
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
@@ -1496,6 +2427,20 @@ impl DataType {
     pub const DATE: Self = DataType::Primitive(PrimitiveType::Date);
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
+    pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
+    pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
+    pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
+
+    /// Compact type name for diagnostics that must not expand nested schemas.
+    pub(crate) fn kind_name(&self) -> String {
+        match self {
+            Self::Primitive(primitive) => primitive.to_string(),
+            Self::Array(_) => "array".to_string(),
+            Self::Struct(_) => "struct".to_string(),
+            Self::Map(_) => "map".to_string(),
+            Self::Variant(_) => "variant".to_string(),
+        }
+    }
 
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
@@ -1522,10 +2467,10 @@ impl DataType {
     /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
     /// binary fields: `metadata` and `value`.
     pub fn unshredded_variant() -> Self {
-        DataType::Variant(Box::new(StructType::new_unchecked([
-            StructField::not_null("metadata", DataType::BINARY),
-            StructField::not_null("value", DataType::BINARY),
-        ])))
+        DataType::Variant(Box::new(schema! {
+            not_null "metadata": BINARY,
+            not_null "value": BINARY,
+        }))
     }
 
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
@@ -1611,172 +2556,6 @@ impl Display for DataType {
     }
 }
 
-/// Generic framework for describing recursive bottom-up schema transforms. Transformations return
-/// `Option<Cow>` with the following semantics:
-/// * `Some(Cow::Owned)` -- The schema element was transformed and should propagate to its parent.
-/// * `Some(Cow::Borrowed)` -- The schema element was not transformed.
-/// * `None` -- The schema element was filtered out and the parent should no longer reference it.
-///
-/// The transform can start from whatever schema element is available
-/// (e.g. [`Self::transform_struct`] to start with [`StructType`]), or it can start from the generic
-/// [`Self::transform`].
-///
-/// The provided `transform_xxx` methods all default to no-op, and implementations should
-/// selectively override specific `transform_xxx` methods as needed for the task at hand.
-///
-/// The provided `recurse_into_xxx` methods encapsulate the boilerplate work of recursing into the
-/// child schema elements of each schema element. Implementations can call these as needed but will
-/// generally not need to override them.
-pub trait SchemaTransform<'a> {
-    /// Called for each primitive encountered during the schema traversal.
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        Some(Cow::Borrowed(ptype))
-    }
-
-    /// Called for each struct encountered during the schema traversal. Implementations can call
-    /// [`Self::recurse_into_struct`] if they wish to recursively transform the struct's fields.
-    fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        self.recurse_into_struct(stype)
-    }
-
-    /// Called for each struct field encountered during the schema traversal. Implementations can
-    /// call [`Self::recurse_into_struct_field`] if they wish to recursively transform the field's
-    /// data type.
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        self.recurse_into_struct_field(field)
-    }
-
-    /// Called for each array encountered during the schema traversal. Implementations can call
-    /// [`Self::recurse_into_array`] if they wish to recursively transform the array's element type.
-    fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        self.recurse_into_array(atype)
-    }
-
-    /// Called for each array element encountered during the schema traversal. Implementations can
-    /// call [`Self::transform`] if they wish to recursively transform the array element type.
-    fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform(etype)
-    }
-
-    /// Called for each map encountered during the schema traversal. Implementations can call
-    /// [`Self::recurse_into_map`] if they wish to recursively transform the map's key and/or value
-    /// types.
-    fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
-        self.recurse_into_map(mtype)
-    }
-
-    /// Called for each map key encountered during the schema traversal. Implementations can call
-    /// [`Self::transform`] if they wish to recursively transform the map key type.
-    fn transform_map_key(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform(etype)
-    }
-
-    /// Called for each map value encountered during the schema traversal. Implementations can call
-    /// [`Self::transform`] if they wish to recursively transform the map value type.
-    fn transform_map_value(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform(etype)
-    }
-
-    /// Called for each variant value encountered. By default, recurses into the fields of the
-    /// variant struct type.
-    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        self.recurse_into_struct(stype)
-    }
-
-    /// General entry point for a recursive traversal over any data type. Also invoked internally to
-    /// dispatch on nested data types encountered during the traversal.
-    fn transform(&mut self, data_type: &'a DataType) -> Option<Cow<'a, DataType>> {
-        use DataType::*;
-        let result = match data_type {
-            Primitive(ptype) => self
-                .transform_primitive(ptype)?
-                .map_owned_or_else(data_type, DataType::from),
-            Array(atype) => self
-                .transform_array(atype)?
-                .map_owned_or_else(data_type, DataType::from),
-            Struct(stype) => self
-                .transform_struct(stype)?
-                .map_owned_or_else(data_type, DataType::from),
-            Map(mtype) => self
-                .transform_map(mtype)?
-                .map_owned_or_else(data_type, DataType::from),
-            Variant(stype) => self
-                .transform_variant(stype)?
-                .map_owned_or_else(data_type, |s| DataType::Variant(Box::new(s))),
-        };
-        Some(result)
-    }
-
-    /// Recursively transforms a struct field's data type. If the data type changes, update the
-    /// field to reference it. Otherwise, no-op.
-    fn recurse_into_struct_field(
-        &mut self,
-        field: &'a StructField,
-    ) -> Option<Cow<'a, StructField>> {
-        let result = self.transform(&field.data_type)?;
-        let f = |new_data_type| StructField {
-            name: field.name.clone(),
-            data_type: new_data_type,
-            nullable: field.nullable,
-            metadata: field.metadata.clone(),
-        };
-        Some(result.map_owned_or_else(field, f))
-    }
-
-    /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
-    /// update the struct to reference all surviving fields. Otherwise, no-op.
-    fn recurse_into_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        use Cow::*;
-        let mut num_borrowed = 0;
-        let fields: Vec<_> = stype
-            .fields()
-            .filter_map(|field| self.transform_struct_field(field))
-            .inspect(|field| {
-                if let Borrowed(_) = field {
-                    num_borrowed += 1;
-                }
-            })
-            .collect();
-
-        if fields.is_empty() {
-            None
-        } else if num_borrowed < stype.fields.len() {
-            // At least one field was changed or filtered out, so make a new struct
-            Some(Owned(StructType::new_unchecked(
-                fields.into_iter().map(|f| f.into_owned()),
-            )))
-        } else {
-            Some(Borrowed(stype))
-        }
-    }
-
-    /// Recursively transforms an array's element type. If the element type changes, update the
-    /// array to reference it. Otherwise, no-op.
-    fn recurse_into_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        let result = self.transform_array_element(&atype.element_type)?;
-        let f = |element_type| ArrayType {
-            type_name: atype.type_name.clone(),
-            element_type,
-            contains_null: atype.contains_null,
-        };
-        Some(result.map_owned_or_else(atype, f))
-    }
-
-    /// Recursively transforms a map's key and value types. If either one changes, update the map to
-    /// reference them. If either one is removed, remove the map as well. Otherwise, no-op.
-    fn recurse_into_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
-        let key_type = self.transform_map_key(&mtype.key_type)?;
-        let value_type = self.transform_map_value(&mtype.value_type)?;
-        let f = |(key_type, value_type)| MapType {
-            type_name: mtype.type_name.clone(),
-            key_type,
-            value_type,
-            value_contains_null: mtype.value_contains_null,
-        };
-        Some((key_type, value_type).map_owned_or_else(mtype, f))
-    }
-}
-
 struct GetSchemaLeaves {
     path: Vec<String>,
     names: Vec<ColumnName>,
@@ -1793,91 +2572,280 @@ impl GetSchemaLeaves {
 }
 
 impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
-    fn transform_struct_field(&mut self, field: &StructField) -> Option<Cow<'a, StructField>> {
+    transform_output_type!(|'a, T| ());
+
+    fn transform_struct_field(&mut self, field: &'a StructField) {
         self.path.push(field.name.clone());
         if let DataType::Struct(_) = field.data_type {
-            let _ = self.recurse_into_struct_field(field);
+            self.recurse_into_struct_field(field);
         } else {
             self.names.push(ColumnName::new(&self.path));
             self.types.push(field.data_type.clone());
         }
         self.path.pop();
-        None
     }
 }
 
-/// A schema "transform" that doesn't actually change the schema at all. Instead, it measures the
-/// maximum depth of a schema, with a depth limit to prevent stack overflow. Useful for verifying
-/// that a schema has reasonable depth before attempting to work with it.
-pub struct SchemaDepthChecker {
-    depth_limit: usize,
-    max_depth_seen: usize,
-    current_depth: usize,
-    call_count: usize,
+/// What a [`MakePhysical`] walk does with each field. The two modes bundle the physical-rewrite
+/// behavior with the matching treatment of a stale `delta.columnMapping.*` annotation left over on
+/// a mapping-disabled table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MakePhysicalMode {
+    /// Rewrite each field to its physical name + metadata (the read/build path). A stale
+    /// annotation in `None` mode is tolerated: resolved by logical name and dropped from the
+    /// physical metadata.
+    Rewrite,
+    /// Validate annotations only, without rewriting (the strict write-path check). A stale
+    /// annotation in `None` mode is rejected.
+    ValidateStrict,
 }
-impl SchemaDepthChecker {
-    /// Depth-checks the given data type against a given depth limit. The return value is the
-    /// largest depth seen, which is capped at one more than the depth limit (indicating the
-    /// recursion was terminated).
-    pub fn check(data_type: &DataType, depth_limit: usize) -> usize {
-        Self::check_with_call_count(data_type, depth_limit).0
+
+impl MakePhysicalMode {
+    fn stale_annotation_policy(self) -> StaleAnnotationPolicy {
+        match self {
+            Self::Rewrite => StaleAnnotationPolicy::Ignore,
+            Self::ValidateStrict => StaleAnnotationPolicy::Reject,
+        }
+    }
+}
+
+pub(crate) struct MakePhysical<'a> {
+    column_mapping_mode: ColumnMappingMode,
+    /// Logical path of current field's parent, used for error messages.
+    logical_path: Vec<&'a str>,
+    /// `delta.columnMapping.id` -> first claimer logical name.
+    seen_ids: HashMap<i64, &'a str>,
+    /// Stack of sibling-`physicalName` maps. The top of the stack holds the current field's
+    /// siblings: key is the sibling's physical name, value is its logical name. Frames are
+    /// pushed in `transform_struct` (root struct included) and popped after iterating its
+    /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
+    /// elements / keys / values are anonymous.
+    sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
+    /// Whether this walk rewrites fields to physical form or only validates (see
+    /// [`MakePhysicalMode`]).
+    mode: MakePhysicalMode,
+}
+impl<'a> MakePhysical<'a> {
+    fn new(column_mapping_mode: ColumnMappingMode) -> Self {
+        Self {
+            column_mapping_mode,
+            logical_path: vec![],
+            seen_ids: HashMap::new(),
+            sibling_names_stack: vec![],
+            mode: MakePhysicalMode::Rewrite,
+        }
     }
 
-    // Exposed for testing
-    fn check_with_call_count(data_type: &DataType, depth_limit: usize) -> (usize, usize) {
-        let mut checker = Self {
-            depth_limit,
-            max_depth_seen: 0,
-            current_depth: 0,
-            call_count: 0,
+    /// Walks `schema` and validates its column-mapping annotations, rejecting stale annotations
+    /// left over on a column-mapping-disabled table.
+    pub(crate) fn validate_schema_column_mapping(
+        mode: ColumnMappingMode,
+        schema: &'a StructType,
+    ) -> DeltaResult<()> {
+        let mut walker = Self {
+            mode: MakePhysicalMode::ValidateStrict,
+            ..Self::new(mode)
         };
-        checker.transform(data_type);
-        (checker.max_depth_seen, checker.call_count)
+        walker.transform_struct(schema).map(|_| ())
     }
 
-    // Triggers the requested recursion only doing so would not exceed the depth limit.
-    fn depth_limited<'a, T: Clone + std::fmt::Debug>(
+    fn transform_inner<T>(
         &mut self,
-        recurse: impl FnOnce(&mut Self, &'a T) -> Option<Cow<'a, T>>,
-        arg: &'a T,
-    ) -> Option<Cow<'a, T>> {
-        self.call_count += 1;
-        if self.max_depth_seen < self.current_depth {
-            self.max_depth_seen = self.current_depth;
-            if self.depth_limit < self.current_depth {
-                tracing::warn!("Max schema depth {} exceeded by {arg:?}", self.depth_limit);
-            }
-        }
-        if self.max_depth_seen <= self.depth_limit {
-            self.current_depth += 1;
-            let _ = recurse(self, arg);
-            self.current_depth -= 1;
-        }
-        None
+        logical_name: &'a str,
+        transform: impl FnOnce(&mut Self) -> DeltaResult<T>,
+    ) -> DeltaResult<T> {
+        self.logical_path.push(logical_name);
+        let result = transform(self);
+        self.logical_path.pop();
+        result
     }
 }
-impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
-    fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        self.depth_limited(Self::recurse_into_struct, stype)
+impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
+    transform_output_type!(|'a, T| DeltaResult<Cow<'a, T>>);
+
+    fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
+        self.sibling_names_stack.push(HashMap::new());
+        let result = self.recurse_into_struct(stype);
+        self.sibling_names_stack.pop();
+        result
     }
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        self.depth_limited(Self::recurse_into_struct_field, field)
+
+    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
+        self.transform_inner("<array element>", |this| this.transform(etype))
     }
-    fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        self.depth_limited(Self::recurse_into_array, atype)
+    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
+        self.transform_inner("<map key>", |this| this.transform(ktype))
     }
-    fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
-        self.depth_limited(Self::recurse_into_map, mtype)
+    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
+        self.transform_inner("<map value>", |this| this.transform(vtype))
+    }
+    fn transform_struct_field(
+        &mut self,
+        field: &'a StructField,
+    ) -> DeltaResult<Cow<'a, StructField>> {
+        let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
+            field,
+            self.column_mapping_mode,
+            self.mode.stale_annotation_policy(),
+            &self.logical_path,
+            Some(&mut self.seen_ids),
+            self.sibling_names_stack.last_mut(),
+        )?;
+
+        if field.is_metadata_column() {
+            return Ok(Cow::Borrowed(field));
+        }
+
+        self.transform_inner(field.name(), |this| {
+            let field = this.recurse_into_struct_field(field)?;
+            if this.mode == MakePhysicalMode::ValidateStrict {
+                return Ok(field);
+            }
+            let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
+            let name = physical_name.to_owned();
+            Ok(Cow::Owned(field.with_name(name).with_metadata(metadata)))
+        })
+    }
+
+    fn transform_variant(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
+        // There is no column mapping metadata inside the struct fields of a variant, so
+        // we do not recurse into the variant fields
+        Ok(Cow::Borrowed(stype))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use rstest::rstest;
+    use serde_json;
 
     use super::*;
-    use serde_json;
+    use crate::table_features::ColumnMappingMode;
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
+        test_deep_nested_schema_missing_leaf_cm,
+    };
+
+    #[cfg(feature = "geo-type-in-dev")]
+    fn geography(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> PrimitiveType {
+        PrimitiveType::Geography(Box::new(GeographyType::try_new(crs, algorithm).unwrap()))
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    fn geo_field_json(type_str: &str) -> String {
+        format!(r#"{{"name":"g","type":"{type_str}","nullable":true,"metadata":{{}}}}"#)
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(
+        "geometry(EPSG:4326)",
+        PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap())),
+        "geometry(EPSG:4326)"
+    )]
+    #[case(
+        "geography(EPSG:4326, spherical)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
+        "geography(EPSG:4326, spherical)"
+    )]
+    #[case(
+        "geography(EPSG:4326, vincenty)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty),
+        "geography(EPSG:4326, vincenty)"
+    )]
+    #[case(
+        "geography(EPSG:4326, thomas)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Thomas),
+        "geography(EPSG:4326, thomas)"
+    )]
+    #[case(
+        "geography(EPSG:4326, andoyer)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Andoyer),
+        "geography(EPSG:4326, andoyer)"
+    )]
+    #[case(
+        "geography(EPSG:4326, karney)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Karney),
+        "geography(EPSG:4326, karney)"
+    )]
+    #[case(
+        "geography( EPSG:4326 , karney  )",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Karney),
+        "geography(EPSG:4326, karney)"
+    )]
+    #[case(
+        "geography(EPSG:4326, SPHERICAL)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
+        "geography(EPSG:4326, spherical)"
+    )]
+    #[case(
+        "geography(EPSG:4326, Vincenty)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty),
+        "geography(EPSG:4326, vincenty)"
+    )]
+    fn test_geo_round_trip(
+        #[case] type_str: &str,
+        #[case] expected: PrimitiveType,
+        #[case] canonical: &str,
+    ) {
+        let field: StructField = serde_json::from_str(&geo_field_json(type_str)).unwrap();
+        assert_eq!(field.data_type, DataType::Primitive(expected));
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(json_str, geo_field_json(canonical));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case("geography(EPSG:4326, unknown_algo)", "Matching variant not found")]
+    #[case("geography(EPSG:4326,)", "Matching variant not found")]
+    #[case("geometry(EPSG:4326", "Unsupported Delta table type")]
+    #[case("geographyz", "Unsupported Delta table type")]
+    #[case("geometry", "Unsupported Delta table type")]
+    #[case("geography", "Unsupported Delta table type")]
+    #[case("geometry()", "must be in 'AUTHORITY:CODE' format")]
+    #[case("geography(, vincenty)", "must be in 'AUTHORITY:CODE' format")]
+    #[case("geography(EPSG:4326)", "expected 'geography(<crs>, <algorithm>)'")]
+    #[case("geography(vincenty)", "expected 'geography(<crs>, <algorithm>)'")]
+    #[case("geography(EPSG:4326, vincenty, karney)", "Matching variant not found")]
+    fn test_invalid_geo_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
+        let result: Result<StructField, _> = serde_json::from_str(&geo_field_json(invalid_type));
+        let err = result.expect_err(&format!("expected '{invalid_type}' to be rejected"));
+        assert!(
+            err.to_string().contains(expected_error),
+            "Expected error containing '{expected_error}', got: {err}"
+        );
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    fn test_geo_try_new_rejects_invalid_crs(
+        #[values(
+            "foo",
+            "authority:",
+            ":",
+            "",
+            ":CRS84",
+            " EPSG:4326",
+            "EPSG:4326 ",
+            " EPSG:4326 ",
+            "EPSG:4326:extra",
+            "a:b:c",
+            "EPSG:1,2"
+        )]
+        crs: &str,
+    ) {
+        let geometry_err =
+            GeometryType::try_new(crs).expect_err(&format!("expected '{crs}' to be rejected"));
+        let geography_err = GeographyType::try_new(crs, EdgeInterpolationAlgorithm::Spherical)
+            .expect_err(&format!("expected '{crs}' to be rejected"));
+        for err in [geometry_err, geography_err] {
+            assert!(
+                err.to_string().contains("CRS"),
+                "expected CRS error for '{crs}', got: {err}"
+            );
+        }
+    }
 
     fn example_schema_metadata() -> &'static str {
         r#"
@@ -2025,6 +2993,53 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_void() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": true,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":true,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_void_non_nullable() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+        assert!(!field.nullable);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":false,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_void_display() {
+        assert_eq!(PrimitiveType::Void.to_string(), "void");
+        assert_eq!(DataType::VOID.to_string(), "void");
+    }
+
+    #[test]
     fn test_unshredded_variant() {
         let unshredded_variant_type = DataType::unshredded_variant();
 
@@ -2045,25 +3060,187 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case("money")]
+    #[case("interval fortnight")]
+    // invalid orderings across year-month and day-time
+    #[case("interval month to day")]
+    #[case("interval year to second")]
+    // invalid orderings within year-month and day-time
+    #[case("interval month to year")]
+    #[case("interval year to year")]
+    #[case("interval second to day")]
+    #[case("interval minute to minute")]
+    // too many fields
+    #[case("interval year to month to year")]
+    fn test_unsupported_type_error_message(#[case] unsupported_type: &str) {
+        let data = format!(
+            r#"{{
+                "name": "test_field",
+                "type": "{unsupported_type}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let result: Result<StructField, _> = serde_json::from_str(&data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let expected_msg = format!("Unsupported Delta table type: '{unsupported_type}'");
+        assert!(
+            err.to_string().contains(&expected_msg),
+            "Expected error message about unsupported type '{unsupported_type}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case("string", DataType::STRING)]
+    #[case("long", DataType::LONG)]
+    #[case("integer", DataType::INTEGER)]
+    #[case("short", DataType::SHORT)]
+    #[case("byte", DataType::BYTE)]
+    #[case("float", DataType::FLOAT)]
+    #[case("double", DataType::DOUBLE)]
+    #[case("boolean", DataType::BOOLEAN)]
+    #[case("binary", DataType::BINARY)]
+    #[case("date", DataType::DATE)]
+    #[case("timestamp", DataType::TIMESTAMP)]
+    #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
+    #[case("interval year", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval month", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval day", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval minute", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day to hour", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day to minute", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour to minute", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval minute to second", DataType::INTERVAL_DAY_TIME)]
+    fn test_primitive_type_deserialization_still_works(
+        #[case] type_str: &str,
+        #[case] expected_type: DataType,
+    ) {
+        let data = format!(
+            r#"{{
+                "name": "test_field",
+                "type": "{type_str}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let field: StructField = serde_json::from_str(&data).unwrap();
+        assert_eq!(field.data_type, expected_type);
+    }
+
+    #[rstest]
+    #[case(10, 2)]
+    #[case(16, 4)]
+    #[case(38, 10)]
+    fn test_decimal_with_primitive_deserializer(#[case] precision: u8, #[case] scale: u8) {
+        let data = format!(
+            r#"{{
+                "name": "test_decimal",
+                "type": "decimal({precision},{scale})",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let field: StructField = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            field.data_type,
+            DataType::decimal(precision, scale).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case("decimal(invalid)", "Invalid precision in decimal")]
+    #[case("decimal(10)", "Invalid scale in decimal")]
+    #[case("decimal()", "Invalid precision in decimal")]
+    #[case("decimal(10,2,99)", "Invalid decimal format (expected 2 parts)")]
+    fn test_invalid_decimal_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
+        let data = format!(
+            r#"{{
+                "name": "invalid",
+                "type": "{invalid_type}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let result: Result<StructField, _> = serde_json::from_str(&data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains(expected_error),
+            "Expected error containing '{expected_error}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case(
+        r#"{"type": "array", "elementType": "integer", "containsNull": false}"#,
+        DataType::from(ArrayType::new(DataType::INTEGER, false))
+    )]
+    #[case(
+        r#"{"type": "struct", "fields": [{"name": "a", "type": "integer", "nullable": false, "metadata": {}}, {"name": "b", "type": "string", "nullable": true, "metadata": {}}]}"#,
+        DataType::from(schema! {
+            not_null "a": INTEGER,
+            nullable "b": STRING,
+        })
+    )]
+    #[case(
+        r#"{"type": "map", "keyType": "string", "valueType": "integer", "valueContainsNull": true}"#,
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true))
+    )]
+    #[case("\"string\"", DataType::STRING)]
+    #[case("\"long\"", DataType::LONG)]
+    #[case("\"integer\"", DataType::INTEGER)]
+    #[case("\"short\"", DataType::SHORT)]
+    #[case("\"byte\"", DataType::BYTE)]
+    #[case("\"float\"", DataType::FLOAT)]
+    #[case("\"double\"", DataType::DOUBLE)]
+    #[case("\"boolean\"", DataType::BOOLEAN)]
+    #[case("\"binary\"", DataType::BINARY)]
+    #[case("\"date\"", DataType::DATE)]
+    #[case("\"timestamp\"", DataType::TIMESTAMP)]
+    #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
+    #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
+    #[case("\"variant\"", DataType::unshredded_variant())]
+    fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
+        let data_type: DataType = serde_json::from_str(type_json).unwrap();
+        assert_eq!(data_type, expected);
+    }
+
+    #[rstest]
+    #[case(PrimitiveType::IntervalYearMonth, "interval year to month")]
+    #[case(PrimitiveType::IntervalDayTime, "interval day to second")]
+    fn test_interval_type_name_round_trips(#[case] ptype: PrimitiveType, #[case] name: &str) {
+        assert_eq!(ptype.to_string(), name);
+        assert_eq!(
+            serde_json::to_string(&ptype).unwrap(),
+            format!("\"{name}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<PrimitiveType>(&format!("\"{name}\"")).unwrap(),
+            ptype
+        );
+    }
+
     #[test]
     fn test_make_physical_no_column_mapping() {
-        let data = example_schema_metadata();
-        let field: StructField = serde_json::from_str(data).unwrap();
-        let physical_field = field.make_physical(ColumnMappingMode::None);
+        let field =
+            StructField::nullable("e", ArrayType::new(schema! { not_null "d": INTEGER }, true));
+        let physical_field = field.make_physical(ColumnMappingMode::None).unwrap();
 
-        let assert_field_metadata_is_wiped = |field: &StructField| {
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                .is_none());
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-                .is_none());
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                .is_none());
-        };
         assert_eq!(physical_field.name, "e");
-        assert_field_metadata_is_wiped(&physical_field);
+        assert!(physical_field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
+            .is_none());
+        assert!(physical_field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .is_none());
 
         let DataType::Array(atype) = physical_field.data_type else {
             panic!("Expected an Array");
@@ -2073,7 +3250,127 @@ mod tests {
         };
         let struct_field = stype.fields.get_index(0).unwrap().1;
         assert_eq!(struct_field.name, "d");
-        assert_field_metadata_is_wiped(struct_field);
+    }
+
+    #[test]
+    fn test_make_physical_tolerates_stale_annotations_when_column_mapping_disabled() {
+        // A table can carry `delta.columnMapping.*` annotations after mapping was enabled and then
+        // disabled. They are inert while mapping is off, so `make_physical` (the read path)
+        // tolerates them: the field keeps its logical name and the CM keys are dropped from the
+        // physical metadata, leaving a schema indistinguishable from a table that never had them.
+        let data = example_schema_metadata();
+        let field: StructField = serde_json::from_str(data).unwrap();
+        let physical = field.make_physical(ColumnMappingMode::None).unwrap();
+
+        assert_eq!(physical.name, "e");
+        assert!(!physical
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
+        assert!(!physical
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
+        // Non-column-mapping metadata is untouched.
+        assert!(physical.metadata.contains_key("delta.identity.start"));
+
+        // The nested leaf `d` is likewise tolerated: logical name kept, CM keys dropped.
+        let DataType::Array(atype) = &physical.data_type else {
+            panic!("Expected an Array");
+        };
+        let DataType::Struct(stype) = atype.element_type() else {
+            panic!("Expected a Struct");
+        };
+        let leaf = stype.fields().next().unwrap();
+        assert_eq!(leaf.name, "d");
+        assert!(!leaf
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
+        assert!(!leaf
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
+    }
+
+    #[test]
+    fn test_make_physical_rejects_unannotated_leaf_in_deep_nesting() {
+        let schema = test_deep_nested_schema_missing_leaf_cm();
+        let field = schema.fields().next().unwrap();
+        let err = field
+            .make_physical(ColumnMappingMode::Name)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("top.`<array element>`.mid_field.`<map value>`.leaf"),
+            "Expected full nested path in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_make_physical_rejects_duplicate_column_mapping_ids() {
+        use crate::schema::ColumnMetadataKey;
+
+        fn cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {
+            StructField::not_null(name, data_type).with_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(id),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String(format!("col-{name}")),
+                ),
+            ])
+        }
+
+        let inner = schema! {
+            (cm_field("x", 3, DataType::INTEGER)),
+            (cm_field("y", 4, DataType::STRING)),
+        };
+        let schema = schema! {
+            (cm_field("a", 1, DataType::INTEGER)),
+            (cm_field("b", 2, ArrayType::new(inner, true))),
+            (cm_field("c", 3, DataType::STRING)),
+        };
+        assert_result_error_with_message(
+            schema.make_physical(ColumnMappingMode::Id),
+            "Duplicate column mapping ID",
+        );
+    }
+
+    #[rstest]
+    #[case::accepted_same_phy_name_different_paths(fixtures::same_phy_name_different_paths(), /*expected_error_substring*/None)]
+    #[case::rejected_deeply_nested_repeat_physical_paths(
+        fixtures::deeply_nested_repeat_physical_paths(),
+        Some({
+            let (a, b) =
+                fixtures::deeply_nested_collider_paths();
+            format!("assigned to both '{a}' and '{b}'")
+        }),
+    )]
+    #[case::multiple_physical_name_collisions_reports_first(
+        fixtures::multiple_physical_name_collisions(),
+        Some("'p' assigned to both 'a' and 'b'".to_string()),
+    )]
+    fn test_make_physical_dup_physical_name(
+        #[case] schema: StructType,
+        #[case] expected_error_substring: Option<String>,
+    ) {
+        // The same dedup rules should apply under both CM modes.
+        for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
+            let result = schema.make_physical(mode);
+            match &expected_error_substring {
+                None => {
+                    result.expect("The input schema should be valid");
+                }
+                Some(substr) => {
+                    assert_result_error_with_message(result.as_ref().map(|_| ()), substr);
+                    if let Err(e) = &result {
+                        assert!(
+                            !e.to_string().contains("'q'"),
+                            "walker must short-circuit on first collision under {mode:?}; got: {e}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2097,7 +3394,7 @@ mod tests {
                     field.physical_name(mode),
                     "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
                 );
-                let physical_field = field.make_physical(mode);
+                let physical_field = field.make_physical(mode).unwrap();
 
                 // Parquet field id should only be present in id column mapping mode
                 match mode {
@@ -2113,12 +3410,14 @@ mod tests {
                         ));
                     }
                     ColumnMappingMode::Name => {
-                        assert!(physical_field
-                            .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                            .is_none());
-                        assert!(physical_field
-                            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                            .is_none(),);
+                        assert!(matches!(
+                            physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                            Some(MetadataValue::Number(4))
+                        ));
+                        assert!(matches!(
+                            physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                            Some(MetadataValue::Number(4))
+                        ));
                     }
                     ColumnMappingMode::None => panic!("unexpected column mapping mode"),
                 }
@@ -2153,16 +3452,51 @@ mod tests {
                         ));
                     }
                     ColumnMappingMode::Name => {
-                        assert!(struct_field
-                            .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                            .is_none());
-                        assert!(struct_field
-                            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                            .is_none());
+                        assert!(matches!(
+                            struct_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                            Some(MetadataValue::Number(5))
+                        ));
+                        assert!(matches!(
+                            struct_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                            Some(MetadataValue::Number(5))
+                        ));
                     }
                     ColumnMappingMode::None => panic!("unexpected column mapping mode"),
                 }
             });
+    }
+
+    #[test]
+    fn test_make_physical_passes_metadata_column_through() {
+        let field = StructField::create_metadata_column(
+            "_metadata.row_index",
+            MetadataColumnSpec::RowIndex,
+        );
+        for mode in [
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id,
+        ] {
+            let physical = field.make_physical(mode).unwrap();
+            assert_eq!(physical.name(), "_metadata.row_index");
+            assert!(physical.is_metadata_column());
+        }
+    }
+
+    #[test]
+    fn test_make_physical_rejects_metadata_column_with_cm_annotations() {
+        let field = StructField::create_metadata_column(
+            "_metadata.row_index",
+            MetadataColumnSpec::RowIndex,
+        )
+        .add_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            MetadataValue::String("phys".to_string()),
+        )]);
+        assert_result_error_with_message(
+            field.make_physical(ColumnMappingMode::Name),
+            "must not have column mapping annotations",
+        );
     }
 
     #[test]
@@ -2197,97 +3531,6 @@ mod tests {
         }
         "#;
         assert!(serde_json::from_str::<StructField>(data).is_err());
-    }
-
-    #[test]
-    fn test_depth_checker() {
-        let schema = DataType::try_struct_type([
-            StructField::nullable(
-                "a",
-                ArrayType::new(
-                    DataType::try_struct_type([
-                        StructField::nullable("w", DataType::LONG),
-                        StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
-                        StructField::nullable(
-                            "y",
-                            MapType::new(DataType::LONG, DataType::STRING, true),
-                        ),
-                        StructField::nullable(
-                            "z",
-                            DataType::try_struct_type([
-                                StructField::nullable("n", DataType::LONG),
-                                StructField::nullable("m", DataType::STRING),
-                            ])
-                            .unwrap(),
-                        ),
-                    ])
-                    .unwrap(),
-                    true,
-                ),
-            ),
-            StructField::nullable(
-                "b",
-                DataType::try_struct_type([
-                    StructField::nullable("o", ArrayType::new(DataType::LONG, true)),
-                    StructField::nullable(
-                        "p",
-                        MapType::new(DataType::LONG, DataType::STRING, true),
-                    ),
-                    StructField::nullable(
-                        "q",
-                        DataType::try_struct_type([
-                            StructField::nullable(
-                                "s",
-                                DataType::try_struct_type([
-                                    StructField::nullable("u", DataType::LONG),
-                                    StructField::nullable("v", DataType::LONG),
-                                ])
-                                .unwrap(),
-                            ),
-                            StructField::nullable("t", DataType::LONG),
-                        ])
-                        .unwrap(),
-                    ),
-                    StructField::nullable("r", DataType::LONG),
-                ])
-                .unwrap(),
-            ),
-            StructField::nullable(
-                "c",
-                MapType::new(
-                    DataType::LONG,
-                    DataType::try_struct_type([
-                        StructField::nullable("f", DataType::LONG),
-                        StructField::nullable("g", DataType::STRING),
-                    ])
-                    .unwrap(),
-                    true,
-                ),
-            ),
-        ])
-        .unwrap();
-
-        // Similar to SchemaDepthChecker::check, but also returns call count
-        let check_with_call_count =
-            |depth_limit| SchemaDepthChecker::check_with_call_count(&schema, depth_limit);
-
-        // Hit depth limit at "a" but still have to look at "b" "c" "d"
-        assert_eq!(check_with_call_count(1), (2, 5));
-        assert_eq!(check_with_call_count(2), (3, 6));
-
-        // Hit depth limit at "w" but still have to look at "x" "y" "z"
-        assert_eq!(check_with_call_count(3), (4, 10));
-        assert_eq!(check_with_call_count(4), (5, 11));
-
-        // Depth limit hit at "n" but still have to look at "m"
-        assert_eq!(check_with_call_count(5), (6, 15));
-
-        // Depth limit not hit until "u"
-        assert_eq!(check_with_call_count(6), (7, 28));
-
-        // Depth limit not hit (full traversal required)
-        assert_eq!(check_with_call_count(7), (7, 32));
-        assert_eq!(check_with_call_count(8), (7, 32));
     }
 
     #[test]
@@ -2334,11 +3577,11 @@ mod tests {
     #[test]
     fn test_has_invariants() {
         // Schema with no invariants
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::STRING),
-            StructField::nullable("b", DataType::INTEGER),
-        ]);
-        assert!(!InvariantChecker::has_invariants(&schema));
+        let schema = schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+        };
+        assert!(!schema_has_invariants(&schema));
 
         // Schema with top-level invariant
         let mut field = StructField::nullable("c", DataType::STRING);
@@ -2347,87 +3590,132 @@ mod tests {
             MetadataValue::String("c > 0".to_string()),
         );
 
-        let schema =
-            StructType::new_unchecked([StructField::nullable("a", DataType::STRING), field]);
-        assert!(InvariantChecker::has_invariants(&schema));
+        let schema = schema! {
+            nullable "a": STRING,
+            (field),
+        };
+        assert!(schema_has_invariants(&schema));
 
         // Schema with nested invariant in a struct
-        let nested_field = StructField::nullable(
-            "nested_c",
-            DataType::try_struct_type([{
+        let nested = schema! {
+            ({
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
                     ColumnMetadataKey::Invariants.as_ref().to_string(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field
-            }])
-            .unwrap(),
-        );
+            }),
+        };
 
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::STRING),
-            StructField::nullable("b", DataType::INTEGER),
-            nested_field,
-        ]);
-        assert!(InvariantChecker::has_invariants(&schema));
+        let schema = schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+            nullable "nested_c": (nested),
+        };
+        assert!(schema_has_invariants(&schema));
 
         // Schema with nested invariant in an array of structs
-        let array_field = StructField::nullable(
-            "array_field",
-            ArrayType::new(
-                DataType::try_struct_type([{
-                    let mut field = StructField::nullable("d", DataType::INTEGER);
-                    field.metadata.insert(
-                        ColumnMetadataKey::Invariants.as_ref().to_string(),
-                        MetadataValue::String("d > 0".to_string()),
-                    );
-                    field
-                }])
-                .unwrap(),
-                true,
-            ),
-        );
+        let array_element = schema! {
+            ({
+                let mut field = StructField::nullable("d", DataType::INTEGER);
+                field.metadata.insert(
+                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    MetadataValue::String("d > 0".to_string()),
+                );
+                field
+            }),
+        };
 
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::STRING),
-            StructField::nullable("b", DataType::INTEGER),
-            array_field,
-        ]);
-        assert!(InvariantChecker::has_invariants(&schema));
+        let schema = schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+            nullable "array_field": [ nullable (array_element) ],
+        };
+        assert!(schema_has_invariants(&schema));
 
         // Schema with nested invariant in a map value that's a struct
-        let map_field = StructField::nullable(
-            "map_field",
-            MapType::new(
-                DataType::STRING,
-                DataType::try_struct_type([{
-                    let mut field = StructField::nullable("d", DataType::INTEGER);
-                    field.metadata.insert(
-                        ColumnMetadataKey::Invariants.as_ref().to_string(),
-                        MetadataValue::String("d > 0".to_string()),
-                    );
-                    field
-                }])
-                .unwrap(),
-                true,
-            ),
-        );
+        let map_value = schema! {
+            ({
+                let mut field = StructField::nullable("d", DataType::INTEGER);
+                field.metadata.insert(
+                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    MetadataValue::String("d > 0".to_string()),
+                );
+                field
+            }),
+        };
 
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::STRING),
-            StructField::nullable("b", DataType::INTEGER),
-            map_field,
-        ]);
-        assert!(InvariantChecker::has_invariants(&schema));
+        let schema = schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+            nullable "map_field": { STRING => nullable (map_value) },
+        };
+        assert!(schema_has_invariants(&schema));
+    }
+
+    fn all_nullable_schema() -> StructType {
+        schema! {
+            nullable "a": STRING,
+            nullable "b": INTEGER,
+        }
+    }
+
+    fn top_level_non_null_schema() -> StructType {
+        schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        }
+    }
+
+    fn nested_non_null_schema() -> StructType {
+        schema! {
+            nullable "a": STRING,
+            nullable "parent": {
+                not_null "child": INTEGER,
+            },
+        }
+    }
+
+    fn array_non_null_schema() -> StructType {
+        schema! {
+            nullable "arr": [ nullable {
+                not_null "child": INTEGER,
+            } ],
+        }
+    }
+
+    fn map_non_null_schema() -> StructType {
+        schema! {
+            nullable "map": { STRING => nullable {
+                not_null "child": INTEGER,
+            } },
+        }
+    }
+
+    fn variant_only_schema() -> StructType {
+        // Variant internal fields (metadata, value) are protocol-defined non-null but
+        // must NOT be counted as user-controlled non-null fields.
+        schema! { nullable "v": unshredded_variant() }
+    }
+
+    #[rstest]
+    #[case::all_nullable(all_nullable_schema(), false)]
+    #[case::top_level(top_level_non_null_schema(), true)]
+    #[case::nested_struct(nested_non_null_schema(), true)]
+    #[case::array_element(array_non_null_schema(), true)]
+    #[case::map_value(map_non_null_schema(), true)]
+    #[case::variant_skipped(variant_only_schema(), false)]
+    fn test_schema_contains_non_null_fields(#[case] schema: StructType, #[case] expected: bool) {
+        assert_eq!(schema_contains_non_null_fields(&schema), expected);
     }
 
     #[test]
     fn test_struct_type_iterator_basic() {
         let fields = vec![
-            StructField::new("field1", DataType::STRING, true),
-            StructField::new("field2", DataType::INTEGER, false),
-            StructField::new("field3", DataType::BOOLEAN, true),
+            StructField::nullable("field1", DataType::STRING),
+            StructField::not_null("field2", DataType::INTEGER),
+            StructField::nullable("field3", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields.clone());
 
@@ -2442,8 +3730,8 @@ mod tests {
     #[test]
     fn test_struct_type_into_iterator_owned() {
         let fields = vec![
-            StructField::new("a", DataType::STRING, true),
-            StructField::new("b", DataType::INTEGER, false),
+            StructField::nullable("a", DataType::STRING),
+            StructField::not_null("b", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2458,9 +3746,9 @@ mod tests {
     #[test]
     fn test_struct_type_into_iterator_references() {
         let fields = vec![
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new("y", DataType::FLOAT, false),
-            StructField::new("z", DataType::LONG, true),
+            StructField::nullable("x", DataType::DOUBLE),
+            StructField::not_null("y", DataType::FLOAT),
+            StructField::nullable("z", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2478,10 +3766,10 @@ mod tests {
     #[test]
     fn test_iterator_exact_size() {
         let fields = vec![
-            StructField::new("field1", DataType::STRING, true),
-            StructField::new("field2", DataType::INTEGER, false),
-            StructField::new("field3", DataType::BOOLEAN, true),
-            StructField::new("field4", DataType::DATE, true),
+            StructField::nullable("field1", DataType::STRING),
+            StructField::not_null("field2", DataType::INTEGER),
+            StructField::nullable("field3", DataType::BOOLEAN),
+            StructField::nullable("field4", DataType::DATE),
         ];
 
         // Test ExactSizeIterator for reference iterator
@@ -2502,7 +3790,7 @@ mod tests {
 
     #[test]
     fn test_iterator_with_metadata() {
-        let field_with_metadata = StructField::new("test_field", DataType::STRING, true)
+        let field_with_metadata = StructField::nullable("test_field", DataType::STRING)
             .with_metadata([("key1", MetadataValue::String("value1".to_string()))]);
 
         let struct_type = StructType::new_unchecked([field_with_metadata]);
@@ -2539,9 +3827,9 @@ mod tests {
     #[test]
     fn test_iterator_order_preservation() {
         let fields = vec![
-            StructField::new("zebra", DataType::STRING, true),
-            StructField::new("apple", DataType::INTEGER, false),
-            StructField::new("banana", DataType::BOOLEAN, true),
+            StructField::nullable("zebra", DataType::STRING),
+            StructField::not_null("apple", DataType::INTEGER),
+            StructField::nullable("banana", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2561,8 +3849,8 @@ mod tests {
     #[test]
     fn test_iterator_collect() {
         let original_fields = vec![
-            StructField::new("field1", DataType::STRING, true),
-            StructField::new("field2", DataType::INTEGER, false),
+            StructField::nullable("field1", DataType::STRING),
+            StructField::not_null("field2", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(original_fields.clone());
 
@@ -2582,10 +3870,10 @@ mod tests {
     #[test]
     fn test_iterator_functional_methods() {
         let fields = vec![
-            StructField::new("nullable_string", DataType::STRING, true),
-            StructField::new("required_int", DataType::INTEGER, false),
-            StructField::new("nullable_bool", DataType::BOOLEAN, true),
-            StructField::new("required_long", DataType::LONG, false),
+            StructField::nullable("nullable_string", DataType::STRING),
+            StructField::not_null("required_int", DataType::INTEGER),
+            StructField::nullable("nullable_bool", DataType::BOOLEAN),
+            StructField::not_null("required_long", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2608,7 +3896,7 @@ mod tests {
                 1 => assert_eq!(field.name, "required_int"),
                 2 => assert_eq!(field.name, "nullable_bool"),
                 3 => assert_eq!(field.name, "required_long"),
-                _ => panic!("Unexpected field index: {}", index),
+                _ => panic!("Unexpected field index: {index}"),
             }
         }
     }
@@ -2616,10 +3904,10 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_ref() {
         let fields = vec![
-            StructField::new("first", DataType::STRING, true),
-            StructField::new("second", DataType::INTEGER, false),
-            StructField::new("third", DataType::BOOLEAN, true),
-            StructField::new("fourth", DataType::LONG, false),
+            StructField::nullable("first", DataType::STRING),
+            StructField::not_null("second", DataType::INTEGER),
+            StructField::nullable("third", DataType::BOOLEAN),
+            StructField::not_null("fourth", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2642,9 +3930,9 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_owned() {
         let fields = vec![
-            StructField::new("alpha", DataType::STRING, true),
-            StructField::new("beta", DataType::INTEGER, false),
-            StructField::new("gamma", DataType::BOOLEAN, true),
+            StructField::nullable("alpha", DataType::STRING),
+            StructField::not_null("beta", DataType::INTEGER),
+            StructField::nullable("gamma", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2668,9 +3956,9 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_collect_reverse() {
         let fields = vec![
-            StructField::new("one", DataType::STRING, true),
-            StructField::new("two", DataType::INTEGER, false),
-            StructField::new("three", DataType::BOOLEAN, true),
+            StructField::nullable("one", DataType::STRING),
+            StructField::not_null("two", DataType::INTEGER),
+            StructField::nullable("three", DataType::BOOLEAN),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2685,9 +3973,9 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_with_into_iter_ref() {
         let fields = vec![
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new("y", DataType::FLOAT, false),
-            StructField::new("z", DataType::LONG, true),
+            StructField::nullable("x", DataType::DOUBLE),
+            StructField::not_null("y", DataType::FLOAT),
+            StructField::nullable("z", DataType::LONG),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2707,8 +3995,8 @@ mod tests {
     #[test]
     fn test_fused_iterator_ref() {
         let fields = vec![
-            StructField::new("test1", DataType::STRING, true),
-            StructField::new("test2", DataType::INTEGER, false),
+            StructField::nullable("test1", DataType::STRING),
+            StructField::not_null("test2", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2729,8 +4017,8 @@ mod tests {
     #[test]
     fn test_fused_iterator_owned() {
         let fields = vec![
-            StructField::new("item1", DataType::STRING, true),
-            StructField::new("item2", DataType::INTEGER, false),
+            StructField::nullable("item1", DataType::STRING),
+            StructField::not_null("item2", DataType::INTEGER),
         ];
         let struct_type = StructType::new_unchecked(fields);
 
@@ -2750,7 +4038,7 @@ mod tests {
 
     #[test]
     fn test_fused_iterator_with_into_iter_ref() {
-        let fields = vec![StructField::new("field_a", DataType::BOOLEAN, true)];
+        let fields = vec![StructField::nullable("field_a", DataType::BOOLEAN)];
         let struct_type = StructType::new_unchecked(fields);
 
         // Verify that &StructType into_iter implements FusedIterator
@@ -2783,7 +4071,7 @@ mod tests {
 
     #[test]
     fn test_double_ended_iterator_single_element() {
-        let fields = vec![StructField::new("single", DataType::STRING, true)];
+        let fields = vec![StructField::nullable("single", DataType::STRING)];
         let struct_type = StructType::new_unchecked(fields);
 
         // Test DoubleEndedIterator with single element
@@ -2796,7 +4084,7 @@ mod tests {
 
         // Test getting single element from next_back()
         let struct_type =
-            StructType::new_unchecked([StructField::new("single2", DataType::INTEGER, false)]);
+            StructType::new_unchecked([StructField::not_null("single2", DataType::INTEGER)]);
         let mut iter = struct_type.into_iter();
 
         assert_eq!(iter.next_back().unwrap().name, "single2");
@@ -2897,7 +4185,7 @@ mod tests {
 
     #[test]
     fn test_add_column() -> DeltaResult<()> {
-        let schema = StructType::try_new([StructField::nullable("col1", DataType::STRING)])?;
+        let schema = schema! { nullable "col1": STRING };
 
         let new_field = StructField::nullable("col2", DataType::INTEGER);
         let updated_schema = schema.add([new_field])?;
@@ -2910,7 +4198,7 @@ mod tests {
 
     #[test]
     fn test_add_metadata_column() -> DeltaResult<()> {
-        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        let schema = schema! { nullable "regular_col": STRING };
 
         let schema_with_metadata =
             schema.add_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)?;
@@ -2927,7 +4215,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_metadata_columns() -> DeltaResult<()> {
-        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        let schema = schema! { nullable "regular_col": STRING };
 
         let schema_with_metadata =
             schema.add_metadata_column("row_index1", MetadataColumnSpec::RowIndex)?;
@@ -2938,6 +4226,26 @@ mod tests {
 
         assert_result_error_with_message(result, "Duplicate metadata column");
         Ok(())
+    }
+
+    #[test]
+    fn test_duplicate_field_name_case_insensitive() {
+        // Delta column names are case-insensitive per protocol; (Value, value) is invalid
+        let result = StructType::try_new([
+            StructField::nullable("Value", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ]);
+        assert_result_error_with_message(result, "Duplicate field name (case-insensitive)");
+    }
+
+    #[test]
+    fn test_duplicate_field_name_exact() {
+        // Exact duplicate (same name twice) is rejected via the case-insensitive check
+        let result = StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("id", DataType::STRING),
+        ]);
+        assert_result_error_with_message(result, "Duplicate field name (case-insensitive)");
     }
 
     #[test]
@@ -2958,7 +4266,7 @@ mod tests {
 
         let result = StructType::try_new([
             StructField::nullable("regular_col", DataType::STRING),
-            StructField::nullable("nested", DataType::Struct(Box::new(nested_struct))),
+            StructField::nullable("nested", nested_struct),
         ]);
 
         assert_result_error_with_message(result, "only allowed at the top level");
@@ -2980,11 +4288,11 @@ mod tests {
             .collect(),
             metadata_columns: HashMap::new(),
         };
-        let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct)), true);
+        let array_type = ArrayType::new(nested_struct, true);
 
         let result = StructType::try_new([
             StructField::nullable("regular_col", DataType::STRING),
-            StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
+            StructField::nullable("array_col", array_type),
         ]);
 
         assert_result_error_with_message(result, "only allowed at the top level");
@@ -3008,20 +4316,12 @@ mod tests {
         };
 
         for map_type in [
-            MapType::new(
-                DataType::Struct(Box::new(nested_struct.clone())),
-                DataType::STRING,
-                true,
-            ),
-            MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(nested_struct)),
-                true,
-            ),
+            MapType::new(nested_struct.clone(), DataType::STRING, true),
+            MapType::new(DataType::STRING, nested_struct, true),
         ] {
             let result = StructType::try_new([
                 StructField::nullable("regular_col", DataType::STRING),
-                StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
+                StructField::nullable("map_col", map_type),
             ]);
 
             assert_result_error_with_message(result, "only allowed at the top level");
@@ -3032,10 +4332,13 @@ mod tests {
 
     #[test]
     fn test_column_identifier_trait() -> DeltaResult<()> {
-        let schema = StructType::try_new([
-            StructField::nullable("regular_col", DataType::STRING),
-            StructField::create_metadata_column("row_index_col", MetadataColumnSpec::RowIndex),
-        ])?;
+        let schema = schema! {
+            nullable "regular_col": STRING,
+            (StructField::create_metadata_column(
+                "row_index_col",
+                MetadataColumnSpec::RowIndex,
+            )),
+        };
 
         // Test string identifier
         assert!(schema.contains("regular_col"));
@@ -3073,7 +4376,7 @@ mod tests {
 
     #[test]
     fn test_all_metadata_column_specs() -> DeltaResult<()> {
-        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        let schema = schema! { nullable "regular_col": STRING };
 
         let schema = schema
             .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
@@ -3187,34 +4490,23 @@ mod tests {
     fn test_display_struct_type_stable_output() -> DeltaResult<()> {
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
-        let inner_struct =
-            StructType::new_unchecked([StructField::new("q", DataType::LONG, false)]);
-        let nested_struct = StructType::new_unchecked([
-            nested_field_with_metadata,
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new(
-                "inner_struct",
-                DataType::Struct(Box::new(inner_struct)),
-                false,
-            ),
-        ]);
-        let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct.clone())), true);
-        let map_type = MapType::new(
-            DataType::Struct(Box::new(nested_struct.clone())),
-            DataType::Struct(Box::new(nested_struct.clone())), // kek
-            true,
-        );
-        let fields = vec![
-            StructField::new("x", DataType::DOUBLE, true),
-            StructField::new("y", DataType::FLOAT, false),
-            StructField::new("z", DataType::LONG, true),
-            StructField::new("s", nested_struct.clone(), false),
-            StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
-            StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
-            StructField::new("a", DataType::LONG, true),
-        ];
-
-        let struct_type = StructType::new_unchecked(fields);
+        let inner_struct = schema! { not_null "q": LONG };
+        let nested_struct = schema! {
+            (nested_field_with_metadata),
+            nullable "x": DOUBLE,
+            not_null "inner_struct": (inner_struct),
+        };
+        let struct_type = schema! {
+            nullable "x": DOUBLE,
+            not_null "y": FLOAT,
+            nullable "z": LONG,
+            not_null "s": (nested_struct.clone()),
+            nullable "array_col": [ nullable (nested_struct.clone()) ],
+            nullable "map_col": {
+                (nested_struct.clone()) => nullable (nested_struct.clone())
+            },
+            nullable "a": LONG,
+        };
         assert_eq!(
             struct_type.to_string(),
             "struct:
@@ -3247,7 +4539,7 @@ mod tests {
 "
         );
 
-        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        let schema = schema! { nullable "regular_col": STRING };
         let schema = schema
             .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
             .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
@@ -3270,8 +4562,8 @@ mod tests {
     #[test]
     fn test_builder_add_fields() {
         let schema = StructType::builder()
-            .add_field(StructField::new("id", DataType::INTEGER, false))
-            .add_field(StructField::new("name", DataType::STRING, true))
+            .add_field(StructField::not_null("id", DataType::INTEGER))
+            .add_field(StructField::nullable("name", DataType::STRING))
             .build()
             .unwrap();
 
@@ -3282,16 +4574,204 @@ mod tests {
 
     #[test]
     fn test_builder_from_schema() {
-        let base_schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+        let base_schema = schema! { not_null "id": INTEGER };
 
         let extended_schema = StructTypeBuilder::from_schema(&base_schema)
-            .add_field(StructField::new("name", DataType::STRING, true))
+            .add_field(StructField::nullable("name", DataType::STRING))
             .build()
             .unwrap();
 
         assert_eq!(extended_schema.num_fields(), 2);
         assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_parquet_field_id_key_value() {
+        // Verify the string value of ColumnMetadataKey::ParquetFieldId matches the convention
+        // used by delta-spark and other Delta ecosystem implementations. This is not part of
+        // the Delta protocol spec, so we pin the value here to catch accidental changes.
+        assert_eq!(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            "parquet.field.id"
+        );
+    }
+
+    #[test]
+    fn test_current_default_key_value() {
+        assert_eq!(
+            ColumnMetadataKey::CurrentDefault.as_ref(),
+            "CURRENT_DEFAULT"
+        );
+    }
+
+    mod column_default_method {
+        use super::*;
+        use crate::schema::column_default::field_with_default;
+
+        #[test]
+        fn returns_none_when_no_current_default() {
+            let field = StructField::nullable("c", DataType::INTEGER);
+            assert_eq!(field.column_default().unwrap(), None);
+        }
+
+        #[test]
+        fn errors_when_current_default_is_not_a_string() {
+            let field = StructField::nullable("c", DataType::INTEGER).add_metadata([(
+                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+                MetadataValue::Number(42),
+            )]);
+            let err = field
+                .column_default()
+                .expect_err("a non-string CURRENT_DEFAULT must error")
+                .to_string();
+            assert!(err.contains("non-string"), "got: {err}");
+        }
+
+        #[rstest]
+        #[case::parsable_literal(DataType::INTEGER, "42", true)]
+        #[case::null_primitive(DataType::INTEGER, "NULL", true)]
+        #[case::unparsable_function_call(DataType::TIMESTAMP, "current_timestamp()", false)]
+        #[case::unparsable_type_mismatch(DataType::TIMESTAMP, "0.18", false)]
+        fn exposes_default_for_primitive(
+            #[case] data_type: DataType,
+            #[case] raw_sql: &str,
+            #[case] parsable: bool,
+        ) {
+            let field = field_with_default("c", data_type.clone(), raw_sql);
+            let column_default = field
+                .column_default()
+                .unwrap()
+                .expect("default must be present");
+            assert_eq!(column_default.raw_sql(), raw_sql);
+            assert_eq!(column_default.data_type(), &data_type);
+            assert_eq!(column_default.to_scalar().unwrap().is_some(), parsable);
+        }
+
+        #[rstest]
+        #[case::array(DataType::from(ArrayType::new(DataType::INTEGER, true)), "ARRAY(1)")]
+        #[case::map(
+            DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+            "MAP('a', 1)"
+        )]
+        fn non_null_default_on_container_is_tolerated(
+            #[case] data_type: DataType,
+            #[case] raw_sql: &str,
+        ) {
+            let field = field_with_default("c", data_type.clone(), raw_sql);
+            let column_default = field
+                .column_default()
+                .unwrap()
+                .expect("default must be present");
+            // Kernel cannot parse a non-primitive default, so it surfaces via raw SQL.
+            assert_eq!(column_default.raw_sql(), raw_sql);
+            assert_eq!(column_default.data_type(), &data_type);
+            assert_eq!(column_default.to_scalar().unwrap(), None);
+        }
+
+        #[test]
+        fn non_null_default_on_variant_errors() {
+            let field = field_with_default("v", DataType::unshredded_variant(), "1");
+            let err = field
+                .column_default()
+                .expect_err("a non-NULL default on a Variant column must error")
+                .to_string();
+            assert!(err.contains("Variant"), "got: {err}");
+        }
+    }
+
+    /// Schema: { a: { b: { c: double } } } — supports walks at depths 1, 2, and 3.
+    fn walk_test_schema() -> StructType {
+        schema! {
+            not_null "a": {
+                not_null "b": {
+                    not_null "c": DOUBLE,
+                },
+            },
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::single_level(
+        vec!["a"],
+        vec!["a"],
+        DataType::from(schema! {
+            not_null "b": {
+                not_null "c": DOUBLE,
+            },
+        })
+    )]
+    #[case::nested_2(
+        vec!["a", "b"],
+        vec!["a", "b"],
+        DataType::from(schema! { not_null "c": DOUBLE })
+    )]
+    #[case::nested_3(vec!["a", "b", "c"], vec!["a", "b", "c"], DataType::DOUBLE)]
+    #[test]
+    fn test_walk_column_fields_happy(
+        #[case] col_path: Vec<&str>,
+        #[case] expected_names: Vec<&str>,
+        #[case] expected_leaf_type: DataType,
+    ) {
+        let schema = walk_test_schema();
+        let fields = schema
+            .fields_of_path(&ColumnName::new(col_path.iter().copied()))
+            .unwrap();
+        assert_eq!(fields.len(), expected_names.len());
+        for (field, name) in fields.iter().zip(expected_names.iter()) {
+            assert_eq!(field.name(), *name);
+        }
+        assert_eq!(fields.last().unwrap().data_type(), &expected_leaf_type);
+    }
+
+    #[rstest::rstest]
+    #[case::empty_path(vec![], "Column path cannot be empty")]
+    #[case::not_found_top(vec!["x"], "not found in schema")]
+    #[case::not_found_nested(vec!["a", "x"], "not found in schema")]
+    #[case::intermediate_not_struct(vec!["a", "b", "c", "d"], "not a struct type")]
+    #[test]
+    fn test_walk_column_fields_error(#[case] col_path: Vec<&str>, #[case] expected_error: &str) {
+        let schema = walk_test_schema();
+        let result = schema.fields_of_path(&ColumnName::new(col_path.iter().copied()));
+        assert_result_error_with_message(result, expected_error);
+    }
+
+    #[test]
+    fn test_normalize_column_names_to_schema_casing() {
+        let schema = schema! {
+            not_null "id": INTEGER,
+            not_null "EventDate": DATE,
+            not_null "Address": {
+                not_null "City": STRING,
+            },
+        };
+
+        // Mismatched casing -> normalized to schema
+        let cols = vec![column_name!("eventdate")];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["EventDate"]
+        );
+
+        // Nested path -> each field name normalized
+        let cols = vec![column_name!("address.city")];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["Address", "City"]
+        );
+
+        // Already matching -> unchanged
+        let cols = vec![column_name!("id")];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["id"]
+        );
+
+        // Unrecognized -> keeps original
+        let cols = vec![column_name!("nonexistent")];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["nonexistent"]
+        );
     }
 }

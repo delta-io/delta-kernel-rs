@@ -1,5 +1,8 @@
 //! # Log Compaction
 //!
+//! **NOTE:** Log compaction is currently disabled on both reads and writes due to
+//! insufficient integration test coverage. See issue #2337 for re-enablement tracking.
+//!
 //! This module provides an API for writing log compaction files that aggregate
 //! multiple commit JSON files into single compacted files. This improves performance
 //! by reducing the number of individual log files that need to be processed during
@@ -7,18 +10,19 @@
 //!
 //! ## Overview
 //!
-//! Log compaction creates files with the naming pattern `{start_version}.{end_version}.compacted.json`
-//! that contain the reconciled actions from all commit files in the specified version range.
-//! Only commit/compaction files that intersect with [start_version, end_version] are processed.
-//! Note that `end_version` must be greater than `start_version` (equal versions are not allowed).
-//! This is similar to checkpoints but operates on a subset of versions rather than the entire table.
+//! Log compaction creates files with the naming pattern
+//! `{start_version}.{end_version}.compacted.json` that contain the reconciled actions from all
+//! commit files in the specified version range. Only commit/compaction files that intersect with
+//! [start_version, end_version] are processed. Note that `end_version` must be greater than
+//! `start_version` (equal versions are not allowed). This is similar to checkpoints but operates on
+//! a subset of versions rather than the entire table.
 //!
 //! ## Usage
 //!
 //! The log compaction API follows a similar pattern to the checkpoint API:
 //!
-//! 1. Create a [`LogCompactionWriter`] using [`crate::Snapshot::log_compaction_writer`] to compact the log
-//!    from a given start_version to end_version (inclusive)
+//! 1. Create a [`LogCompactionWriter`] using [`crate::Snapshot::log_compaction_writer`] to compact
+//!    the log from a given start_version to end_version (inclusive)
 //! 2. Get the compaction path from [`LogCompactionWriter::compaction_path`]
 //! 3. Get the compaction data from [`LogCompactionWriter::compaction_data`]
 //! 4. Write the data to the path in cloud storage (engine-specific)
@@ -73,14 +77,13 @@
 //! - **Log Compaction**: Aggregates only a specific range of commit files
 //! - Both use similar action reconciliation logic but serve different use cases
 
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use crate::actions::{
-    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
-    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
-    SIDECAR_NAME,
+    ADD_FIELD, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD,
+    SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{lazy_schema_ref, SchemaRef};
 
 mod writer;
 
@@ -91,14 +94,12 @@ mod tests;
 
 /// Schema for extracting relevant actions from log files for compaction.
 /// CommitInfo is excluded as it's not needed in compaction files.
-static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-    ]))
-});
+static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    (&SIDECAR_FIELD),
+};

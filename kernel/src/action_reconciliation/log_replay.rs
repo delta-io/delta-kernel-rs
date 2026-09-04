@@ -8,41 +8,40 @@
 //!
 //! This processor applies several filtering and deduplication steps to each batch of log actions:
 //!
-//! 1. **Protocol and Metadata**: Retains exactly one of each - keeping only the latest protocol
-//!    and metadata actions.
-//! 2. **Txn Actions**: Keeps exactly one `txn` action for each unique app ID, always selecting
-//!    the latest one encountered.
-//! 3. **File Actions**: Resolves file actions to produce the latest state of the table, keeping
-//!    the most recent valid add actions and unexpired remove actions (tombstones) that are newer
-//!    than `minimum_file_retention_timestamp`.
+//! 1. **Protocol and Metadata**: Retains exactly one of each - keeping only the latest protocol and
+//!    metadata actions.
+//! 2. **Txn Actions**: Keeps exactly one `txn` action for each unique app ID, always selecting the
+//!    latest one encountered.
+//! 3. **File Actions**: Resolves file actions to produce the latest state of the table, keeping the
+//!    most recent valid add actions and unexpired remove actions (tombstones) that are newer than
+//!    `minimum_file_retention_timestamp`.
 //!
 //! ## Architecture
 //!
-//! - [`ActionReconciliationVisitor`]: Implements [`RowVisitor`] to examine each action in a batch and
-//!   determine if it should be included. It maintains state for deduplication across multiple actions
-//!   in a batch and efficiently handles all filtering rules.
+//! - [`ActionReconciliationVisitor`]: Implements [`RowVisitor`] to examine each action in a batch
+//!   and determine if it should be included. It maintains state for deduplication across multiple
+//!   actions in a batch and efficiently handles all filtering rules.
 //!
-//! - [`ActionReconciliationProcessor`]: Implements the [`LogReplayProcessor`] trait and orchestrates
-//!   the overall process. For each batch of log actions, it:
+//! - [`ActionReconciliationProcessor`]: Implements the [`LogReplayProcessor`] trait and
+//!   orchestrates the overall process. For each batch of log actions, it:
 //!   1. Creates a visitor with the current deduplication state
 //!   2. Applies the visitor to filter actions in the batch
 //!   3. Tracks state for deduplication across batches
-//!   4. Produces a [`ActionReconciliationBatch`] result which includes both the filtered data and counts of
-//!      actions selected
-//!
+//!   4. Produces a [`ActionReconciliationBatch`] result which includes both the filtered data and
+//!      counts of actions selected
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock};
+
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
-use crate::log_replay::deduplicator::Deduplicator as _;
+use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
 };
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
-
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Error};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -113,6 +112,16 @@ impl ActionReconciliationIteratorState {
     pub fn is_exhausted(&self) -> bool {
         self.is_exhausted.load(Ordering::Acquire)
     }
+
+    /// Test helper that produces a state with the given counts and marked exhausted.
+    #[cfg(test)]
+    pub(crate) fn new_exhausted(actions_count: i64, add_actions_count: i64) -> Self {
+        Self {
+            actions_count: AtomicI64::new(actions_count),
+            add_actions_count: AtomicI64::new(add_actions_count),
+            is_exhausted: AtomicBool::new(true),
+        }
+    }
 }
 
 /// Iterator over action reconciliation data.
@@ -120,15 +129,13 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
+    inner: DeltaResultIteratorStatic<ActionReconciliationBatch>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(
-        inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
-    ) -> Self {
+    pub(crate) fn new(inner: DeltaResultIteratorStatic<ActionReconciliationBatch>) -> Self {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
@@ -185,9 +192,9 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
     /// and returns a [`ActionReconciliationBatch`], which contains the filtered actions,
     /// along with statistics about the included actions.
     ///
-    /// This method delegates the filtering logic to the [`ActionReconciliationVisitor`], which implements
-    /// the deduplication rules described in the module documentation. The method tracks
-    /// statistics about processed actions (total count, add actions count) and maintains
+    /// This method delegates the filtering logic to the [`ActionReconciliationVisitor`], which
+    /// implements the deduplication rules described in the module documentation. The method
+    /// tracks statistics about processed actions (total count, add actions count) and maintains
     /// state for cross-batch deduplication.
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
@@ -223,7 +230,8 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
         })
     }
 
-    /// We never do data skipping for action reconciliation log replay (entire table state is always reproduced)
+    /// We never do data skipping for action reconciliation log replay (entire table state is always
+    /// reproduced)
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
         None
     }
@@ -255,9 +263,8 @@ impl ActionReconciliationProcessor {
 /// # File Action Filtering Rules:
 ///   Kept Actions:
 /// - The first (newest) add action for each unique (path, dvId) pair
-/// - The first (newest) remove action for each unique (path, dvId) pair, but only if
-///   its deletionTimestamp > minimumFileRetentionTimestamp
-///   Omitted Actions:
+/// - The first (newest) remove action for each unique (path, dvId) pair, but only if its
+///   deletionTimestamp > minimumFileRetentionTimestamp Omitted Actions:
 /// - Any file action (add/remove) with the same (path, dvId) as a previously processed action
 /// - All remove actions with deletionTimestamp ≤ minimumFileRetentionTimestamp
 /// - All remove actions with missing deletionTimestamp (defaults to 0)
@@ -272,12 +279,12 @@ impl ActionReconciliationProcessor {
 /// - Keeps only the first domainMetadata action for each unique domain name
 ///
 /// # Excluded Actions
-/// - CommitInfo, CDC, and CheckpointMetadata actions should not appear in the action
-///   batches processed by this visitor, as they are excluded by the schema used to
-///   read the log files upstream. If present, they will be ignored by the visitor.
-/// - Sidecar actions should also be excluded—when encountered in the log, the
-///   corresponding sidecar files are read to extract the referenced file actions,
-///   which are then included directly in the action stream instead of the sidecar actions themselves.
+/// - CommitInfo, CDC, and CheckpointMetadata actions should not appear in the action batches
+///   processed by this visitor, as they are excluded by the schema used to read the log files
+///   upstream. If present, they will be ignored by the visitor.
+/// - Sidecar actions should also be excluded—when encountered in the log, the corresponding sidecar
+///   files are read to extract the referenced file actions, which are then included directly in the
+///   action stream instead of the sidecar actions themselves.
 /// - The CheckpointMetadata action is included down the wire when writing a V2 spec checkpoint.
 ///
 /// # Memory Usage
@@ -290,7 +297,8 @@ impl ActionReconciliationProcessor {
 pub(crate) struct ActionReconciliationVisitor<'seen> {
     // Deduplicates file actions (applies logic to filter Adds with corresponding Removes,
     // and keep unexpired Removes). This deduplicator builds a set of seen file actions.
-    // This set has O(M) memory usage where M = number of file actions with unique (path, dvId) pairs
+    // This set has O(M) memory usage where M = number of file actions with unique (path, dvId)
+    // pairs
     deduplicator: FileActionDeduplicator<'seen>,
     // Tracks which rows to include in the final output
     selection_vector: Vec<bool>,
@@ -310,37 +318,58 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     // This set has O(N) memory usage where N = number of txn actions with unique appIds
     seen_txns: &'seen mut HashSet<String>,
     // Set of domain names to deduplicate domainMetadata by domain
-    // This set has O(D) memory usage where D = number of domainMetadata actions with unique domains
+    // This set has O(D) memory usage where D = number of domainMetadata actions with unique
+    // domains
     seen_domains: &'seen mut HashSet<String>,
     /// Transaction expiration timestamp for filtering old transactions
     txn_expiration_timestamp: Option<i64>,
 }
 
+/// A projected column used by `ActionReconciliationVisitor`.
+///
+/// `index` is the position in the `getters: &[&dyn GetData]` slice.
+/// `name` is the fully-qualified field path used when calling `get_*` (and appears in errors).
+///
+/// Invariant: these constants must match the order in
+/// `ActionReconciliationVisitor::selected_column_names_and_types()`.
+#[derive(Debug, Copy, Clone)]
+struct GetterColumn {
+    index: usize,
+    name: &'static str,
+}
+
+impl GetterColumn {
+    const fn new(index: usize, name: &'static str) -> Self {
+        GetterColumn { index, name }
+    }
+}
+
 #[allow(unused)]
 impl ActionReconciliationVisitor<'_> {
-    // TODO(#1717): Combine index and field name constants into a single struct
-    // These index positions correspond to the order of columns defined in
-    // `selected_column_names_and_types()`
-    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
-    const ADD_DV_START_INDEX: usize = 1; // Start position of add deletion vector columns
-    const REMOVE_PATH_INDEX: usize = 4; // Position of "remove.path" in getters
-    const REMOVE_DELETION_TIMESTAMP_INDEX: usize = 5; // Position of "remove.deletionTimestamp" in getters
-    const REMOVE_DV_START_INDEX: usize = 6; // Start position of remove deletion vector columns
-    const METADATA_ID_INDEX: usize = 9;
-    const PROTOCOL_MIN_READER_VERSION_INDEX: usize = 10;
-    const TXN_APP_ID_INDEX: usize = 11;
-    const TXN_LAST_UPDATED_INDEX: usize = 12;
-    const DOMAIN_METADATA_DOMAIN_INDEX: usize = 13;
-    const DOMAIN_METADATA_REMOVED_INDEX: usize = 14;
-
-    // These are the column names used to access the data in the getters
-    const REMOVE_DELETION_TIMESTAMP: &'static str = "remove.deletionTimestamp";
-    const PROTOCOL_MIN_READER_VERSION: &'static str = "protocol.minReaderVersion";
-    const METADATA_ID: &'static str = "metaData.id";
-    const TXN_APP_ID: &'static str = "txn.appId";
-    const TXN_LAST_UPDATED: &'static str = "txn.lastUpdated";
-    const DOMAIN_METADATA_DOMAIN: &'static str = "domainMetadata.domain";
-    const DOMAIN_METADATA_REMOVED: &'static str = "domainMetadata.removed";
+    // Projected columns in the same order as `selected_column_names_and_types()`.
+    // DV columns are defined individually for completeness, even when accessed via a start index.
+    const ADD_PATH: GetterColumn = GetterColumn::new(0, "add.path");
+    const ADD_SIZE: GetterColumn = GetterColumn::new(1, "add.size");
+    const ADD_DV_STORAGE_TYPE: GetterColumn =
+        GetterColumn::new(2, "add.deletionVector.storageType");
+    const ADD_DV_PATH_OR_INLINE_DV: GetterColumn =
+        GetterColumn::new(3, "add.deletionVector.pathOrInlineDv");
+    const ADD_DV_OFFSET: GetterColumn = GetterColumn::new(4, "add.deletionVector.offset");
+    const REMOVE_PATH: GetterColumn = GetterColumn::new(5, "remove.path");
+    const REMOVE_DELETION_TIMESTAMP: GetterColumn =
+        GetterColumn::new(6, "remove.deletionTimestamp");
+    const REMOVE_DV_STORAGE_TYPE: GetterColumn =
+        GetterColumn::new(7, "remove.deletionVector.storageType");
+    const REMOVE_DV_PATH_OR_INLINE_DV: GetterColumn =
+        GetterColumn::new(8, "remove.deletionVector.pathOrInlineDv");
+    const REMOVE_DV_OFFSET: GetterColumn = GetterColumn::new(9, "remove.deletionVector.offset");
+    const METADATA_ID: GetterColumn = GetterColumn::new(10, "metaData.id");
+    const PROTOCOL_MIN_READER_VERSION: GetterColumn =
+        GetterColumn::new(11, "protocol.minReaderVersion");
+    const TXN_APP_ID: GetterColumn = GetterColumn::new(12, "txn.appId");
+    const TXN_LAST_UPDATED: GetterColumn = GetterColumn::new(13, "txn.lastUpdated");
+    const DOMAIN_METADATA_DOMAIN: GetterColumn = GetterColumn::new(14, "domainMetadata.domain");
+    const DOMAIN_METADATA_REMOVED: GetterColumn = GetterColumn::new(15, "domainMetadata.removed");
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
@@ -358,10 +387,11 @@ impl ActionReconciliationVisitor<'_> {
             deduplicator: FileActionDeduplicator::new(
                 seen_file_keys,
                 is_log_batch,
-                Self::ADD_PATH_INDEX,
-                Self::REMOVE_PATH_INDEX,
-                Self::ADD_DV_START_INDEX,
-                Self::REMOVE_DV_START_INDEX,
+                Self::ADD_PATH.index,
+                Self::ADD_SIZE.index,
+                Self::REMOVE_PATH.index,
+                Self::ADD_DV_STORAGE_TYPE.index,
+                Self::REMOVE_DV_STORAGE_TYPE.index,
             ),
             selection_vector,
             actions_count: 0,
@@ -377,9 +407,9 @@ impl ActionReconciliationVisitor<'_> {
 
     /// Determines if a remove action tombstone has expired and should be excluded.
     ///
-    /// A remove action includes a deletion_timestamp indicating when the deletion occurred. Physical
-    /// files are deleted lazily after a user-defined expiration time. Remove actions are kept to allow
-    /// concurrent readers to read snapshots at older versions.
+    /// A remove action includes a deletion_timestamp indicating when the deletion occurred.
+    /// Physical files are deleted lazily after a user-defined expiration time. Remove actions
+    /// are kept to allow concurrent readers to read snapshots at older versions.
     ///
     /// Tombstone expiration rules:
     /// - If deletion_timestamp <= minimum_file_retention_timestamp: Expired (exclude)
@@ -390,7 +420,7 @@ impl ActionReconciliationVisitor<'_> {
         // Spark and the Java Kernel.
         // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
         // will be excluded as it will be treated as expired.
-        let deletion_timestamp = getter.get_opt(i, "remove.deletionTimestamp")?;
+        let deletion_timestamp = getter.get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)?;
         let deletion_timestamp = deletion_timestamp.unwrap_or(0i64);
 
         Ok(deletion_timestamp <= self.minimum_file_retention_timestamp)
@@ -399,9 +429,10 @@ impl ActionReconciliationVisitor<'_> {
     /// Processes a potential file action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid file action to be included.
-    /// Returns `Ok(Some(false))` if the row contains a file action but it's suppressed (duplicate/expired).
-    /// Returns `Ok(None)` if the row doesn't contain a file action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(Some(false))` if the row contains a file action but it's suppressed
+    /// (duplicate/expired). Returns `Ok(None)` if the row doesn't contain a file action
+    /// (continue checking other action types). Returns `Err(...)` if there was an error
+    /// processing the action.
     ///
     /// Note: This function handles both add and remove actions, applying deduplication logic and
     /// tombstone expiration rules as needed.
@@ -411,7 +442,11 @@ impl ActionReconciliationVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
         // Extract the file action and handle errors immediately
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(i, getters, false)?
+        let Some(FileActionInfo {
+            key: file_key,
+            is_add,
+            ..
+        }) = self.deduplicator.extract_file_action(i, getters, false)?
         else {
             return Ok(None); // No file action found, continue checking other types
         };
@@ -424,7 +459,7 @@ impl ActionReconciliationVisitor<'_> {
             true
         } else {
             // Expired remove actions are not valid
-            !self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP_INDEX])?
+            !self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])?
         };
         Ok(Some(is_valid))
     }
@@ -432,18 +467,20 @@ impl ActionReconciliationVisitor<'_> {
     /// Processes a potential protocol action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid protocol action.
-    /// Returns `Ok(Some(false))` if the row contains a protocol action but it's suppressed (duplicate).
-    /// Returns `Ok(None)` if the row doesn't contain a protocol action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(Some(false))` if the row contains a protocol action but it's suppressed
+    /// (duplicate). Returns `Ok(None)` if the row doesn't contain a protocol action (continue
+    /// checking other action types). Returns `Err(...)` if there was an error processing the
+    /// action.
     fn check_protocol_action<'a>(
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
     ) -> DeltaResult<Option<bool>> {
-        // minReaderVersion is a required field, so we check for its presence to determine if this is a protocol action.
-        // Only return the first (newest) protocol action we see, ignoring other types
+        // minReaderVersion is a required field, so we check for its presence to determine if this
+        // is a protocol action. Only return the first (newest) protocol action we see,
+        // ignoring other types
         let result = getter
-            .get_int(i, Self::PROTOCOL_MIN_READER_VERSION)?
+            .get_int(i, Self::PROTOCOL_MIN_READER_VERSION.name)?
             .is_some()
             .then(|| !std::mem::replace(&mut self.seen_protocol, true));
         Ok(result)
@@ -452,18 +489,20 @@ impl ActionReconciliationVisitor<'_> {
     /// Processes a potential metadata action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid metadata action.
-    /// Returns `Ok(Some(false))` if the row contains a metadata action but it's suppressed (duplicate).
-    /// Returns `Ok(None)` if the row doesn't contain a metadata action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(Some(false))` if the row contains a metadata action but it's suppressed
+    /// (duplicate). Returns `Ok(None)` if the row doesn't contain a metadata action (continue
+    /// checking other action types). Returns `Err(...)` if there was an error processing the
+    /// action.
     fn check_metadata_action<'a>(
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
     ) -> DeltaResult<Option<bool>> {
-        // id is a required field, so we check for its presence to determine if this is a metadata action.
-        // Only return the first (newest) metadata action we see, ignoring other types
+        // id is a required field, so we check for its presence to determine if this is a metadata
+        // action. Only return the first (newest) metadata action we see, ignoring other
+        // types
         let result = getter
-            .get_str(i, Self::METADATA_ID)?
+            .get_str(i, Self::METADATA_ID.name)?
             .is_some()
             .then(|| !std::mem::replace(&mut self.seen_metadata, true));
         Ok(result)
@@ -472,35 +511,41 @@ impl ActionReconciliationVisitor<'_> {
     /// Processes a potential txn action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid txn action.
-    /// Returns `Ok(Some(false))` if the row contains a txn action but it's suppressed (duplicate/expired).
-    /// Returns `Ok(None)` if the row doesn't contain a txn action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(Some(false))` if the row contains a txn action but it's suppressed
+    /// (duplicate/expired). Returns `Ok(None)` if the row doesn't contain a txn action
+    /// (continue checking other action types). Returns `Err(...)` if there was an error
+    /// processing the action.
     fn check_txn_action<'a>(
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
-        let Some(app_id) = getters[Self::TXN_APP_ID_INDEX].get_str(i, Self::TXN_APP_ID)? else {
+        let Some(app_id) = getters[Self::TXN_APP_ID.index].get_str(i, Self::TXN_APP_ID.name)?
+        else {
             return Ok(None); // Not a txn action, continue checking other types
         };
 
-        // Check retention if last_updated is present
+        // Replay is newest-to-oldest, so the first txn seen for an app_id is the winner. Record it
+        // before checking retention: an expired winner must still suppress older txns for the same
+        // app_id rather than let one of them survive.
+        if !self.seen_txns.insert(app_id.to_string()) {
+            return Ok(Some(false)); // superseded by a newer txn for this app_id
+        }
+
+        // Exclude the winner when retention has expired it. A txn without last_updated never
+        // expires (kept for backward compatibility).
         if let Some(retention_ts) = self.txn_expiration_timestamp {
             if let Some(last_updated) =
-                getters[Self::TXN_LAST_UPDATED_INDEX].get_opt(i, Self::TXN_LAST_UPDATED)?
+                getters[Self::TXN_LAST_UPDATED.index].get_opt(i, Self::TXN_LAST_UPDATED.name)?
             {
                 let last_updated: i64 = last_updated;
                 if last_updated <= retention_ts {
-                    // Transaction is old, exclude it
                     return Ok(Some(false));
                 }
             }
-            // Note: transactions without last_updated are kept for backward compatibility
         }
 
-        // If the app ID already exists in the set, the insertion will return false,
-        // indicating that this is a duplicate.
-        Ok(Some(self.seen_txns.insert(app_id.to_string())))
+        Ok(Some(true))
     }
 
     /// Processes a potential domainMetadata action to determine if it should be included.
@@ -508,30 +553,36 @@ impl ActionReconciliationVisitor<'_> {
     /// Returns `Ok(Some(true))` if the row contains a valid domainMetadata action.
     /// Returns `Ok(Some(false))` if the row contains a domainMetadata action but it's suppressed
     ///         (duplicate or tombstone with removed=true).
-    /// Returns `Ok(None)` if the row doesn't contain a domainMetadata action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(None)` if the row doesn't contain a domainMetadata action (continue checking
+    /// other action types). Returns `Err(...)` if there was an error processing the action.
     fn check_domain_metadata_action<'a>(
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
-        let Some(domain) =
-            getters[Self::DOMAIN_METADATA_DOMAIN_INDEX].get_str(i, Self::DOMAIN_METADATA_DOMAIN)?
+        let Some(domain) = getters[Self::DOMAIN_METADATA_DOMAIN.index]
+            .get_str(i, Self::DOMAIN_METADATA_DOMAIN.name)?
         else {
             return Ok(None); // Not a domainMetadata action, continue checking other types
         };
 
-        // Exclude tombstones (removed=true) from checkpoint per protocol spec
-        let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED_INDEX]
-            .get_opt(i, Self::DOMAIN_METADATA_REMOVED)?
+        // Record the domain as seen first so older versions are deduplicated
+        // even when a newer version is a tombstone. Log replay walks newest-to-oldest,
+        // so a tombstone at a later version must still mask earlier versions of the
+        // same domain in the checkpoint.
+        if !self.seen_domains.insert(domain.to_string()) {
+            return Ok(Some(false)); // duplicate - older version of a domain we've already seen
+        }
+
+        // Exclude tombstones (removed=true) from the checkpoint per protocol spec.
+        let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED.index]
+            .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)?
             .unwrap_or(false);
         if removed {
             return Ok(Some(false));
         }
 
-        // If the domain already exists in the set, the insertion will return false,
-        // indicating that this is a duplicate.
-        Ok(Some(self.seen_domains.insert(domain.to_string())))
+        Ok(Some(true))
     }
 
     /// Determines if a row in the batch should be included.
@@ -562,11 +613,11 @@ impl ActionReconciliationVisitor<'_> {
         } else if let Some(result) = self.check_domain_metadata_action(i, getters)? {
             result
         } else if let Some(result) =
-            self.check_protocol_action(i, getters[Self::PROTOCOL_MIN_READER_VERSION_INDEX])?
+            self.check_protocol_action(i, getters[Self::PROTOCOL_MIN_READER_VERSION.index])?
         {
             result
         } else {
-            self.check_metadata_action(i, getters[Self::METADATA_ID_INDEX])?
+            self.check_metadata_action(i, getters[Self::METADATA_ID.index])?
                 .unwrap_or_default()
         };
 
@@ -596,6 +647,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
             let types_and_names = vec![
                 // File action columns
                 (STRING, column_name!("add.path")),
+                (LONG, column_name!("add.size")),
                 (STRING, column_name!("add.deletionVector.storageType")),
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
@@ -620,9 +672,9 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 15,
+            getters.len() == 16,
             Error::InternalError(format!(
-                "Wrong number of visitor getters: {}",
+                "Wrong number of visitor getters for ActionReconciliationVisitor: {}",
                 getters.len()
             ))
         );
@@ -638,12 +690,12 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 mod tests {
     use std::collections::HashSet;
 
+    use itertools::Itertools;
+
     use super::*;
     use crate::arrow::array::StringArray;
-    use crate::utils::test_utils::{action_batch, parse_json_batch};
+    use crate::unit_test_utils::{action_batch, parse_json_batch};
     use crate::Error;
-
-    use itertools::Itertools;
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {
@@ -712,7 +764,8 @@ mod tests {
 
     /// Tests the boundary conditions for tombstone expiration logic.
     /// Specifically checks:
-    /// - Remove actions with deletionTimestamp == minimumFileRetentionTimestamp (should be excluded)
+    /// - Remove actions with deletionTimestamp == minimumFileRetentionTimestamp (should be
+    ///   excluded)
     /// - Remove actions with deletionTimestamp < minimumFileRetentionTimestamp (should be excluded)
     /// - Remove actions with deletionTimestamp > minimumFileRetentionTimestamp (should be included)
     /// - Remove actions with missing deletionTimestamp (defaults to 0, should be excluded)
@@ -980,7 +1033,8 @@ mod tests {
         let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
 
         // Verify results
-        assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no selected actions
+        assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no
+                                      // selected actions
         assert_eq!(results[0].selection_vector(), &vec![true]);
         assert_eq!(results[1].selection_vector(), &vec![false, true]);
         assert_eq!(actions_count, 2);
@@ -1057,14 +1111,51 @@ mod tests {
 
         visitor.visit_rows_of(batch.as_ref())?;
 
-        // app1 and app4 should be filtered out (too old)
-        // app2 and app3 should be kept
+        // app1 and app4 are excluded (expired); app2 and app3 are emitted. All four app_ids are
+        // recorded as seen, since recording precedes the retention check.
         let expected = vec![false, true, true, false];
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.actions_count, 2);
-        assert_eq!(visitor.seen_txns.len(), 2);
-        assert!(visitor.seen_txns.contains("app2"));
-        assert!(visitor.seen_txns.contains("app3"));
+        assert_eq!(visitor.seen_txns.len(), 4);
+
+        Ok(())
+    }
+
+    // Replay is newest-to-oldest. When an app_id's newest txn is expired but an older one is not,
+    // the app_id must be dropped entirely: the expired newest suppresses the older duplicate, and
+    // neither reaches the checkpoint. Guards against resurrecting the older txn (a stale winner).
+    #[test]
+    fn test_action_reconciliation_expired_newest_txn_suppresses_older_txn_for_same_app(
+    ) -> DeltaResult<()> {
+        let json_strings: StringArray = vec![
+            // Newest for "app" (visited first), expired.
+            r#"{"txn":{"appId":"app","version":2,"lastUpdated":500}}"#,
+            // Older for "app", not expired. Must NOT survive.
+            r#"{"txn":{"appId":"app","version":1,"lastUpdated":2000}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        let mut seen_file_keys = HashSet::new();
+        let mut seen_txns = HashSet::new();
+        let mut seen_domains = HashSet::new();
+        let mut visitor = ActionReconciliationVisitor::new(
+            &mut seen_file_keys,
+            true,
+            vec![true; 2],
+            0,
+            false,
+            false,
+            &mut seen_txns,
+            &mut seen_domains,
+            Some(1000),
+        );
+
+        visitor.visit_rows_of(batch.as_ref())?;
+
+        assert_eq!(visitor.selection_vector, vec![false, false]);
+        assert_eq!(visitor.actions_count, 0);
+        assert_eq!(visitor.seen_txns.len(), 1);
 
         Ok(())
     }
@@ -1222,7 +1313,7 @@ mod tests {
         error_field: &'static str,
         error_type: &'static str,
     ) -> Vec<MockErrorGetData> {
-        (0..15)
+        (0..16)
             .map(|i| {
                 if i == error_index {
                     MockErrorGetData::new(error_field, error_type)
@@ -1253,14 +1344,14 @@ mod tests {
         // Test 2: Basic type mismatch errors using parameterized approach
         let test_cases = [
             (0, "add.path", "str", "add.path is not of type str"),
-            (9, "metaData.id", "str", "metaData.id is not of type str"),
+            (10, "metaData.id", "str", "metaData.id is not of type str"),
             (
-                10,
+                11,
                 "protocol.minReaderVersion",
                 "int",
                 "protocol.minReaderVersion is not of type i32",
             ),
-            (11, "txn.appId", "str", "txn.appId is not of type str"),
+            (12, "txn.appId", "str", "txn.appId is not of type str"),
         ];
 
         for (getter_index, field_name, error_type, expected_error_text) in test_cases {
@@ -1293,7 +1384,7 @@ mod tests {
             &mut seen_domains,
             Some(1000),
         );
-        let defaults = (0..11)
+        let defaults = (0..12)
             .map(|_| MockErrorGetData::default())
             .collect::<Vec<_>>();
         let error_mock = FlexibleMock {
@@ -1309,10 +1400,8 @@ mod tests {
         getters.push(&domain_removed_default); // domainMetadata.removed
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("lastUpdated is not of type i64"));
+        let err_str = result.unwrap_err().to_string();
+        assert!(err_str.contains("lastUpdated is not of type i64"));
 
         // Test remove.deletionTimestamp
         let mut seen_file_keys = HashSet::new();
@@ -1320,7 +1409,7 @@ mod tests {
         let mut seen_domains = HashSet::new();
         let mut visitor =
             create_test_visitor(&mut seen_file_keys, &mut seen_txns, &mut seen_domains, None);
-        let defaults = (0..4)
+        let defaults = (0..5)
             .map(|_| MockErrorGetData::default())
             .collect::<Vec<_>>();
         let error_mock = FlexibleMock {
@@ -1353,8 +1442,8 @@ mod tests {
         let batch = ActionsBatch::new(actions, true);
 
         // Create a processor and try to process the batch
-        // We can't easily trigger an error in the normal flow since parse_json_batch creates valid data
-        // But this test ensures the error propagation path exists and is tested
+        // We can't easily trigger an error in the normal flow since parse_json_batch creates valid
+        // data But this test ensures the error propagation path exists and is tested
         let mut processor = ActionReconciliationProcessor::new(0, None);
         let result = processor.process_actions_batch(batch);
 

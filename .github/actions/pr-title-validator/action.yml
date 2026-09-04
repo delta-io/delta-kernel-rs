@@ -1,0 +1,43 @@
+name: 'PR Title Validator'
+description: 'Validates a pull request title against a regex pattern'
+
+inputs:
+  regex:
+    description: 'Regular expression the PR title must match'
+    required: true
+  breaking-change-regex:
+    description: 'Regex to use instead when the breaking-change label is present'
+    required: false
+    default: ''
+  labels:
+    description: 'JSON array of label names on the PR'
+    required: false
+    default: '[]'
+  title:
+    description: 'PR title to validate. Defaults to github.event.pull_request.title.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Validate PR title
+      shell: bash
+      env:
+        PR_TITLE: ${{ inputs.title || github.event.pull_request.title }}
+        INPUT_REGEX: ${{ inputs.regex }}
+        BREAKING_REGEX: ${{ inputs.breaking-change-regex }}
+        LABELS: ${{ inputs.labels }}
+      run: |
+        REGEX="$INPUT_REGEX"
+        if [[ -n "$BREAKING_REGEX" ]] && echo "$LABELS" | jq -e '.[] | select(. == "breaking-change")' > /dev/null 2>&1; then
+          REGEX="$BREAKING_REGEX"
+          echo "breaking-change label detected, using breaking change regex."
+        fi
+
+        if [[ "$PR_TITLE" =~ $REGEX ]]; then
+          echo "PR title matches pattern."
+          exit 0
+        fi
+        echo "::error::PR title \"$PR_TITLE\" does not match pattern: $REGEX"
+        exit 1

@@ -1,19 +1,45 @@
-//! FFI functions to allow engines to receive log and tracing events from kernel
+//! FFI functions to allow engines to receive log, tracing, and metrics events from kernel.
+//!
+//! We use a single global tracing subscriber, registered the first time any of
+//! [`enable_event_tracing`], [`enable_log_line_tracing`], [`enable_formatted_log_line_tracing`], or
+//! [`enable_metrics_reporting`] is called. The subscriber has two layers, one for log events, and
+//! one for metric report events:
+//!
+//! - The logging layer is a type-erased [`Layer`] that an `enable_*_tracing` call swaps in (either
+//!   event-based or formatted log-line)
+//! - The metrics slot is a [`ReportGeneratorLayer`] that is `OFF` (zero overhead) until
+//!   [`enable_metrics_reporting`] turns it on.
+//!
+//! Both are reloadable so they can be swapped.
 
-use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{fmt, io};
 
-use delta_kernel::{DeltaResult, Error};
-use tracing::{error, warn};
-use tracing::{
-    field::{Field as TracingField, Visit},
-    Event as TracingEvent, Subscriber,
+use delta_kernel::metrics::{
+    MetricEvent as KernelMetricEvent, MetricsReporter, ReportGeneratorLayer,
 };
+use delta_kernel::{DeltaResult, Error};
+use tracing::field::{Field as TracingField, Visit};
+use tracing::{error, Event as TracingEvent, Subscriber};
+use tracing_core::Dispatch;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
+use tracing_subscriber::layer::{Context, Identity, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{reload, Layer, Registry};
 
+use crate::ffi_metrics::{with_ffi_event, MetricEvent};
 use crate::{kernel_string_slice, KernelStringSlice};
+
+/// A type-erased logging layer that lives in the reloadable logging slot of the global subscriber.
+/// cbindgen:ignore
+type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
+/// Reload handle for swapping the boxed logging layer.
+/// cbindgen:ignore
+type LayerHandle = reload::Handle<BoxedLayer, Registry>;
+/// Reload handle for changing a slot's level filter.
+/// cbindgen:ignore
+type FilterHandle = reload::Handle<LevelFilter, Registry>;
 
 /// Definitions of level verbosity. Verbose Levels are "greater than" less verbose ones. So
 /// Level::ERROR is the lowest, and Level::TRACE the highest.
@@ -70,22 +96,22 @@ pub struct Event {
     target: KernelStringSlice,
     /// source file line number where the event occurred, or 0 (zero) if unknown
     line: u32,
-    /// file where the event occurred. If unknown the slice `ptr` will be null and the len will be 0
+    /// file where the event occurred. If unknown the slice `ptr` will be null and the len will be
+    /// 0
     file: KernelStringSlice,
 }
 
 pub type TracingEventFn = extern "C" fn(event: Event);
 
 /// Enable getting called back for tracing (logging) events in the kernel. `max_level` specifies
-/// that only events `<=` to the specified level should be reported.  More verbose Levels are "greater
-/// than" less verbose ones. So Level::ERROR is the lowest, and Level::TRACE the highest.
+/// that only events `<=` to the specified level should be reported.  More verbose Levels are
+/// "greater than" less verbose ones. So Level::ERROR is the lowest, and Level::TRACE the highest.
 ///
-/// Note that setting up such a call back can only be done ONCE. Calling any of
-/// `enable_event_tracing`, `enable_log_line_tracing`, or `enable_formatted_log_line_tracing` more
-/// than once is a no-op.
+/// Calling `enable_event_tracing`, `enable_log_line_tracing`, or
+/// `enable_formatted_log_line_tracing` again replaces the active logging layer and its level,
+/// including switching between event-based and log-line formats.
 ///
-/// Returns `true` if the callback was setup successfully, false on failure (i.e. if called a second
-/// time)
+/// Returns `true` if the callback was setup successfully, `false` on failure.
 ///
 /// Event-based tracing gives an engine maximal flexibility in formatting event log
 /// lines. Kernel can also format events for the engine. If this is desired call
@@ -128,7 +154,8 @@ pub enum LogLineFormat {
     /// structured logs are consumed as JSON by analysis and viewing tools. The JSON output is not
     /// optimized for human readability.
     /// Example:
-    /// `{"timestamp":"2022-02-15T18:47:10.821315Z","level":"INFO","fields":{"message":"preparing to shave yaks","number_of_yaks":3},"target":"fmt_json"}`
+    /// `{"timestamp":"2022-02-15T18:47:10.821315Z","level":"INFO","fields":{"message":"preparing
+    /// to shave yaks","number_of_yaks":3},"target":"fmt_json"}`
     JSON,
 }
 
@@ -145,12 +172,11 @@ pub enum LogLineFormat {
 ///
 /// Log lines passed to the callback will already have a newline at the end.
 ///
-/// Note that setting up such a call back can only be done ONCE. Calling any of
-/// `enable_event_tracing`, `enable_log_line_tracing`, or `enable_formatted_log_line_tracing` more
-/// than once is a no-op.
+/// Calling `enable_event_tracing`, `enable_log_line_tracing`, or
+/// `enable_formatted_log_line_tracing` again replaces the active logging layer and its level,
+/// including switching between event-based and log-line formats.
 ///
-/// Returns `true` if the callback was setup successfully, false on failure (i.e. if called a second
-/// time)
+/// Returns `true` if the callback was setup successfully, `false` on failure.
 ///
 /// Log line based tracing is simple for an engine as it can just log the passed string, but does
 /// not provide flexibility for an engine to format events. If the engine wants to use a specific
@@ -179,12 +205,11 @@ pub unsafe extern "C" fn enable_log_line_tracing(
 /// formatting options for the log lines. See [`enable_log_line_tracing`] for general info on
 /// getting called back for log lines.
 ///
-/// Note that setting up such a call back can only be done ONCE. Calling any of
-/// `enable_event_tracing`, `enable_log_line_tracing`, or `enable_formatted_log_line_tracing` more
-/// than once is a no-op.
+/// Calling `enable_event_tracing`, `enable_log_line_tracing`, or
+/// `enable_formatted_log_line_tracing` again replaces the active logging layer and its level,
+/// including switching between event-based and log-line formats.
 ///
-/// Returns `true` if the callback was setup successfully, false on failure (i.e. if called a second
-/// time)
+/// Returns `true` if the callback was setup successfully, `false` on failure.
 ///
 /// Options that can be set:
 /// - `format`: see [`LogLineFormat`]
@@ -244,7 +269,7 @@ impl Visit for MessageFieldVisitor {
 }
 
 struct EventLayer {
-    callback: Arc<Mutex<TracingEventFn>>,
+    callback: TracingEventFn,
 }
 
 impl<S> Layer<S> for EventLayer
@@ -269,149 +294,16 @@ where
                 line: metadata.line().unwrap_or(0),
                 file: kernel_string_slice!(file),
             };
-            if let Ok(cb) = self.callback.lock() {
-                (cb)(event);
-            } else {
-                error!("Failed to lock event callback (mutex poisoned).");
-            }
+            (self.callback)(event);
         }
     }
 }
-
-struct GlobalTracingState {
-    dispatch: Option<tracing_core::Dispatch>,
-    reload_handle:
-        Option<tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>>,
-    /// callback for event subscriber
-    event_callback: Option<Arc<Mutex<TracingEventFn>>>,
-    /// callback for log line subscriber
-    log_line_callback: Option<Arc<Mutex<TracingLogLineFn>>>,
-}
-
-impl GlobalTracingState {
-    fn uninitialized() -> Self {
-        GlobalTracingState {
-            dispatch: None,
-            reload_handle: None,
-            event_callback: None,
-            log_line_callback: None,
-        }
-    }
-
-    fn register_event_callback(
-        &mut self,
-        callback: TracingEventFn,
-        max_level: Level,
-    ) -> DeltaResult<()> {
-        if !max_level.is_valid() {
-            return Err(Error::generic("max_level out of range"));
-        }
-
-        if let (Some(reload), Some(event_cb)) = (&self.reload_handle, &self.event_callback) {
-            let mut event_cb = event_cb.lock().map_err(|_e| {
-                Error::generic("Failed to acquire lock for event callback (mutex poisoned).")
-            })?;
-            *event_cb = callback;
-            return reload.reload(LevelFilter::from(max_level)).map_err(|e| {
-                warn!("Failed to reload tracing level: {e}");
-                Error::generic(format!("Unable to reload subscriber: {e}"))
-            });
-        }
-
-        let (dispatch, reload_handle, event_callback) = create_event_dispatch(callback, max_level);
-        set_global_default(dispatch.clone())?;
-        self.dispatch = Some(dispatch);
-        self.reload_handle = Some(reload_handle);
-        self.event_callback = Some(event_callback);
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn register_log_line_callback(
-        &mut self,
-        callback: TracingLogLineFn,
-        max_level: Level,
-        format: LogLineFormat,
-        ansi: bool,
-        with_time: bool,
-        with_level: bool,
-        with_target: bool,
-    ) -> DeltaResult<()> {
-        if !max_level.is_valid() {
-            return Err(Error::generic("max_level out of range"));
-        }
-
-        if let (Some(reload), Some(log_cb)) = (&self.reload_handle, &self.log_line_callback) {
-            let mut log_cb = log_cb.lock().map_err(|_e| {
-                Error::generic("Failed to acquire lock for log callback (mutex poisoned).")
-            })?;
-            *log_cb = callback;
-            return reload.reload(LevelFilter::from(max_level)).map_err(|e| {
-                warn!("Failed to reload log level: {e}");
-                Error::generic(format!("Unable to reload subscriber: {e}"))
-            });
-        }
-
-        let (dispatch, reload_handle, log_line_callback) = create_log_line_dispatch(
-            callback,
-            max_level,
-            format,
-            ansi,
-            with_time,
-            with_level,
-            with_target,
-        );
-        set_global_default(dispatch.clone())?;
-        self.dispatch = Some(dispatch);
-        self.reload_handle = Some(reload_handle);
-        self.log_line_callback = Some(log_line_callback);
-        Ok(())
-    }
-}
-
-static TRACING_STATE: LazyLock<Mutex<GlobalTracingState>> =
-    LazyLock::new(|| Mutex::new(GlobalTracingState::uninitialized()));
-
-fn create_event_dispatch(
-    callback: TracingEventFn,
-    max_level: Level,
-) -> (
-    tracing_core::Dispatch,
-    tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
-    Arc<Mutex<TracingEventFn>>,
-) {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
-
-    let callback_arc = Arc::new(Mutex::new(callback));
-    let (filter_layer, reload_handle) =
-        tracing_subscriber::reload::Layer::new(LevelFilter::from(max_level));
-    let event_layer = EventLayer {
-        callback: callback_arc.clone(),
-    }
-    .with_filter(filter_layer);
-
-    let subscriber = Registry::default().with(event_layer);
-    (
-        tracing_core::Dispatch::new(subscriber),
-        reload_handle,
-        callback_arc,
-    )
-}
-
-fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaResult<()> {
-    let mut state = TRACING_STATE
-        .lock()
-        .map_err(|_e| Error::generic("Poisoned mutex while setting up event subscriber"))?;
-    state.register_event_callback(callback, max_level)
-}
-
-// utility code below for setting up the tracing subscriber for log lines
 
 type SharedBuffer = Arc<Mutex<Vec<u8>>>;
 
 struct TriggerLayer {
     buf: SharedBuffer,
-    callback: Arc<Mutex<TracingLogLineFn>>,
+    callback: TracingLogLineFn,
 }
 
 impl<S> Layer<S> for TriggerLayer
@@ -423,21 +315,13 @@ where
             Ok(mut buf) => {
                 let message = String::from_utf8_lossy(&buf);
                 let message = kernel_string_slice!(message);
-                if let Ok(cb) = self.callback.lock() {
-                    (cb)(message);
-                } else {
-                    error!("Failed to lock event callback (mutex poisoned).");
-                }
+                (self.callback)(message);
                 buf.clear();
             }
             Err(_) => {
                 let message = "INTERNAL KERNEL ERROR: Could not lock message buffer.";
                 let message = kernel_string_slice!(message);
-                if let Ok(cb) = self.callback.lock() {
-                    (cb)(message);
-                } else {
-                    error!("Failed to lock event callback (mutex poisoned).");
-                }
+                (self.callback)(message);
             }
         }
     }
@@ -472,66 +356,206 @@ impl<'a> MakeWriter<'a> for BufferedMessageWriter {
     }
 }
 
-fn create_log_line_dispatch(
+/// Callback an engine registers via [`enable_metrics_reporting`] to receive kernel
+/// [`MetricEvent`]s. This is invoked synchronously on the thread that emitted the event. Note that
+/// the `event`, and any [`KernelStringSlice`] it carries, are only valid for the duration of the
+/// call.
+pub type MetricsEventFn = extern "C" fn(event: MetricEvent);
+
+/// A [`MetricsReporter`] that forwards each kernel [`MetricEvent`] to a registered FFI callback
+#[derive(Debug)]
+struct FfiMetricsReporter {
+    callback: Arc<Mutex<Option<MetricsEventFn>>>,
+}
+
+impl MetricsReporter for FfiMetricsReporter {
+    fn report(&self, event: KernelMetricEvent) {
+        let callback = match self.callback.lock() {
+            Ok(guard) => *guard,
+            Err(_) => {
+                error!("Failed to lock metrics callback (mutex poisoned).");
+                return;
+            }
+        };
+        if let Some(callback) = callback {
+            with_ffi_event(&event, |ffi_event| callback(ffi_event));
+        }
+    }
+}
+
+fn build_event_layer(callback: TracingEventFn) -> BoxedLayer {
+    Box::new(EventLayer { callback })
+}
+
+fn build_log_line_layer(
     callback: TracingLogLineFn,
-    max_level: Level,
     format: LogLineFormat,
     ansi: bool,
     with_time: bool,
     with_level: bool,
     with_target: bool,
-) -> (
-    tracing_core::Dispatch,
-    tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
-    Arc<Mutex<TracingLogLineFn>>,
-) {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
-
-    let buffer = Arc::new(Mutex::new(vec![]));
+) -> BoxedLayer {
+    let buffer: SharedBuffer = Arc::new(Mutex::new(vec![]));
     let writer = BufferedMessageWriter {
         current_buffer: buffer.clone(),
     };
-
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(writer)
         .with_ansi(ansi)
         .with_level(with_level)
         .with_target(with_target);
-
-    let (filter_layer, reload_handle) =
-        tracing_subscriber::reload::Layer::new(LevelFilter::from(max_level));
-
-    let callback_arc = Arc::new(Mutex::new(callback));
-    let tracking_layer = TriggerLayer {
-        buf: buffer.clone(),
-        callback: callback_arc.clone(),
+    let trigger = TriggerLayer {
+        buf: buffer,
+        callback,
     };
 
-    macro_rules! setup_subscriber {
+    // The fmt layer formats the line into the shared buffer; the trigger layer then flushes it to
+    // the callback. fmt must run before trigger, so it must be the first item in the vec.
+    macro_rules! boxed_log_line {
         ($($transform:ident()).*) => {{
-            let subscriber = Registry::default()
-                .with(filter_layer)
-                .with(fmt_layer)
-                .with(tracking_layer);
-            (
-                tracing_core::Dispatch::new(subscriber),
-                reload_handle,
-                callback_arc.clone(),
-            )
+            let fmt: BoxedLayer = Box::new(fmt_layer $(.$transform())*);
+            let trigger: BoxedLayer = Box::new(trigger);
+            Box::new(vec![fmt, trigger]) as BoxedLayer
         }};
     }
 
     use LogLineFormat::*;
     match (format, with_time) {
-        (FULL, true) => setup_subscriber!(),
-        (FULL, false) => setup_subscriber!(without_time()),
-        (COMPACT, true) => setup_subscriber!(compact()),
-        (COMPACT, false) => setup_subscriber!(compact().without_time()),
-        (PRETTY, true) => setup_subscriber!(pretty()),
-        (PRETTY, false) => setup_subscriber!(pretty().without_time()),
-        (JSON, true) => setup_subscriber!(json()),
-        (JSON, false) => setup_subscriber!(json().without_time()),
+        (FULL, true) => boxed_log_line!(),
+        (FULL, false) => boxed_log_line!(without_time()),
+        (COMPACT, true) => boxed_log_line!(compact()),
+        (COMPACT, false) => boxed_log_line!(compact().without_time()),
+        (PRETTY, true) => boxed_log_line!(pretty()),
+        (PRETTY, false) => boxed_log_line!(pretty().without_time()),
+        (JSON, true) => boxed_log_line!(json()),
+        (JSON, false) => boxed_log_line!(json().without_time()),
     }
+}
+
+struct GlobalTracingState {
+    installed: bool,
+    /// Swaps the active logging layer (event-based vs log-line).
+    logging_layer: Option<LayerHandle>,
+    /// Sets the level filter gating the logging layer.
+    logging_filter: Option<FilterHandle>,
+    /// Toggles the metrics layer on (`TRACE`) or off (`OFF`).
+    metrics_filter: Option<FilterHandle>,
+    /// Shared callback the metrics layer's reporter forwards events to.
+    metrics_callback: Arc<Mutex<Option<MetricsEventFn>>>,
+}
+
+impl GlobalTracingState {
+    fn uninitialized() -> Self {
+        GlobalTracingState {
+            installed: false,
+            logging_layer: None,
+            logging_filter: None,
+            metrics_filter: None,
+            metrics_callback: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// If the global subscriber hasn't been installed yet, this installs it and sets up all the
+    /// logging layers. When called again, this is a no-op.
+    fn ensure_installed(&mut self) -> DeltaResult<()> {
+        if self.installed {
+            return Ok(());
+        }
+
+        let noop: BoxedLayer = Box::new(Identity::new());
+        let (logging_slot, logging_layer) = reload::Layer::new(noop);
+        let (logging_filter_layer, logging_filter) = reload::Layer::new(LevelFilter::OFF);
+        let logging: BoxedLayer = Box::new(logging_slot.with_filter(logging_filter_layer));
+
+        let (metrics_filter_layer, metrics_filter) = reload::Layer::new(LevelFilter::OFF);
+        let reporter = Arc::new(FfiMetricsReporter {
+            callback: self.metrics_callback.clone(),
+        });
+        let metrics: BoxedLayer =
+            Box::new(ReportGeneratorLayer::new(reporter).with_filter(metrics_filter_layer));
+
+        let subscriber = Registry::default().with(vec![logging, metrics]);
+        set_global_default(Dispatch::new(subscriber))?;
+
+        self.logging_layer = Some(logging_layer);
+        self.logging_filter = Some(logging_filter);
+        self.metrics_filter = Some(metrics_filter);
+        self.installed = true;
+        Ok(())
+    }
+
+    /// Make `layer` the active logging layer and set its level filter.
+    fn reload_logging(&self, layer: BoxedLayer, max_level: Level) -> DeltaResult<()> {
+        let reload_err = |e| Error::generic(format!("Unable to reload logging subscriber: {e}"));
+        self.logging_layer
+            .as_ref()
+            .ok_or_else(|| Error::generic("logging slot not installed"))?
+            .reload(layer)
+            .map_err(reload_err)?;
+        self.logging_filter
+            .as_ref()
+            .ok_or_else(|| Error::generic("logging filter not installed"))?
+            .reload(LevelFilter::from(max_level))
+            .map_err(reload_err)
+    }
+
+    fn register_event_callback(
+        &mut self,
+        callback: TracingEventFn,
+        max_level: Level,
+    ) -> DeltaResult<()> {
+        if !max_level.is_valid() {
+            return Err(Error::generic("max_level out of range"));
+        }
+        self.ensure_installed()?;
+        self.reload_logging(build_event_layer(callback), max_level)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_log_line_callback(
+        &mut self,
+        callback: TracingLogLineFn,
+        max_level: Level,
+        format: LogLineFormat,
+        ansi: bool,
+        with_time: bool,
+        with_level: bool,
+        with_target: bool,
+    ) -> DeltaResult<()> {
+        if !max_level.is_valid() {
+            return Err(Error::generic("max_level out of range"));
+        }
+        self.ensure_installed()?;
+        let layer =
+            build_log_line_layer(callback, format, ansi, with_time, with_level, with_target);
+        self.reload_logging(layer, max_level)
+    }
+
+    /// Set the metrics callback and turn the metrics slot's filter on. Metric spans are emitted at
+    /// `INFO`.
+    fn register_metrics_callback(&mut self, callback: MetricsEventFn) -> DeltaResult<()> {
+        self.ensure_installed()?;
+        *self
+            .metrics_callback
+            .lock()
+            .map_err(|_| Error::generic("Failed to lock metrics callback (mutex poisoned)."))? =
+            Some(callback);
+        self.metrics_filter
+            .as_ref()
+            .ok_or_else(|| Error::generic("metrics filter not installed"))?
+            .reload(LevelFilter::INFO)
+            .map_err(|e| Error::generic(format!("Unable to reload metrics subscriber: {e}")))
+    }
+}
+
+static TRACING_STATE: LazyLock<Mutex<GlobalTracingState>> =
+    LazyLock::new(|| Mutex::new(GlobalTracingState::uninitialized()));
+
+fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaResult<()> {
+    let mut state = TRACING_STATE
+        .lock()
+        .map_err(|_e| Error::generic("Poisoned mutex while setting up event subscriber"))?;
+    state.register_event_callback(callback, max_level)
 }
 
 fn setup_log_line_subscriber(
@@ -557,23 +581,72 @@ fn setup_log_line_subscriber(
     )
 }
 
+/// Enable getting called back with structured kernel metric events. `callback` receives a
+/// [`MetricEvent`] each time kernel emits a report. (See the [`delta_kernel::metrics`] module).
+///
+/// Calling this replaces any previously set callback.
+///
+/// Returns `true` if reporting was enabled successfully, `false` on failure.
+///
+/// # Safety
+/// Caller must pass a valid function pointer for the callback.
+#[no_mangle]
+pub unsafe extern "C" fn enable_metrics_reporting(callback: MetricsEventFn) -> bool {
+    setup_metrics_reporter(callback).is_ok()
+}
+
+fn setup_metrics_reporter(callback: MetricsEventFn) -> DeltaResult<()> {
+    let mut state = TRACING_STATE
+        .lock()
+        .map_err(|_e| Error::generic("Poisoned mutex while setting up metrics reporter"))?;
+    state.register_metrics_callback(callback)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
 
-    use tracing::debug;
-    use tracing::info;
-    use tracing::trace;
+    use tracing::{debug, info, trace};
     use tracing_subscriber::fmt::time::FormatTime;
 
-    use crate::TryFromStringSlice;
-
     use super::*;
+    use crate::TryFromStringSlice;
 
     // Because we have to access a global messages buffer, we have to force tests to run one at a
     // time
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     static MESSAGES: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+    // Local dispatch builders used with `with_default` so tests can exercise each layer in
+    // isolation without consuming the once-only global default subscriber.
+    fn create_event_dispatch(callback: TracingEventFn, max_level: Level) -> Dispatch {
+        let layer = build_event_layer(callback).with_filter(LevelFilter::from(max_level));
+        Dispatch::new(Registry::default().with(layer))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_log_line_dispatch(
+        callback: TracingLogLineFn,
+        max_level: Level,
+        format: LogLineFormat,
+        ansi: bool,
+        with_time: bool,
+        with_level: bool,
+        with_target: bool,
+    ) -> Dispatch {
+        let layer =
+            build_log_line_layer(callback, format, ansi, with_time, with_level, with_target)
+                .with_filter(LevelFilter::from(max_level));
+        Dispatch::new(Registry::default().with(layer))
+    }
+
+    fn create_metrics_dispatch(callback: MetricsEventFn) -> Dispatch {
+        let reporter = Arc::new(FfiMetricsReporter {
+            callback: Arc::new(Mutex::new(Some(callback))),
+        });
+        let layer = ReportGeneratorLayer::new(reporter).with_filter(LevelFilter::TRACE);
+        Dispatch::new(Registry::default().with(layer))
+    }
 
     fn record_callback_with_filter(line: KernelStringSlice, expected_log_lines: Vec<&str>) {
         let line_str: &str = unsafe { TryFromStringSlice::try_from_slice(&line).unwrap() };
@@ -590,7 +663,8 @@ mod tests {
         }
     }
 
-    // Note: record callbacks must be extern "C". Thus we cannot construct test callback closures in runtime.
+    // Note: record callbacks must be extern "C". Thus we cannot construct test callback closures in
+    // runtime.
     extern "C" fn record_callback_with_filter_1(line: KernelStringSlice) {
         record_callback_with_filter(line, vec!["Testing 1\n", "Another line\n"])
     }
@@ -603,10 +677,14 @@ mod tests {
         *MESSAGES.lock().unwrap() = Some(vec![]);
     }
 
-    // get the string that we should ensure is in log messages for the time. If current time seconds
-    // is >= 50, return None because the minute might roll over before we actually log which would
-    // invalidate this check
-    fn get_time_test_str() -> Option<String> {
+    /// Format the current time as a string using the same formatter that tracing uses, trimmed
+    /// to hours, minutes, and seconds (e.g. `"2026-03-10T14:32:45"`). This is used by tests to
+    /// verify that log output contains a reasonable timestamp.
+    ///
+    /// Must be called both before and after logging to bracket the log's timestamp -- a context
+    /// switch between capturing and logging can cross a second boundary, so the test asserts
+    /// that at least one of the two captured timestamps appears in the output.
+    fn get_time_test_str() -> String {
         #[derive(Default)]
         struct W {
             s: String,
@@ -623,21 +701,22 @@ mod tests {
         let now = tracing_subscriber::fmt::time::SystemTime;
         now.format_time(&mut writer).unwrap();
         let tstr = w.s;
-        if tstr.len() < 19 {
-            return None;
-        }
-        let secs: u32 = tstr[17..19].parse().expect("Failed to parse secs");
-        if secs >= 50 {
-            // risk of roll-over, don't check
-            return None;
-        }
-        // Trim to just hours and minutes
-        Some(tstr[..19].to_string())
+        assert!(tstr.len() >= 19, "Unexpected time format: {tstr:?}");
+        // Trim to hours, minutes, and seconds
+        tstr[..19].to_string()
     }
 
+    /// Check that logged messages match the expected lines, level, and timestamp.
+    ///
+    /// Timestamps are captured before and after logging to handle second-boundary races: a
+    /// context switch between capturing the time and emitting the log line can cause the
+    /// seconds to differ. By bracketing with a range check (`time_before <= log_time <=
+    /// time_after`), we tolerate any amount of delay between capture and log emission. This
+    /// works because ISO 8601 timestamps sort lexicographically.
     fn check_messages(
         expected_lines: Vec<&str>,
-        expected_time_str: Option<String>,
+        time_before: &str,
+        time_after: &str,
         expected_level_str: &str,
     ) {
         let lock = MESSAGES.lock().unwrap();
@@ -649,10 +728,31 @@ mod tests {
             assert!(got.ends_with(expect));
             assert!(got.contains(expected_level_str));
             assert!(got.contains("delta_kernel_ffi::ffi_tracing::tests"));
-            if let Some(ref tstr) = expected_time_str {
-                assert!(got.contains(tstr));
-            }
+            assert_timestamp_in_range(got, time_before, time_after);
         }
+    }
+
+    /// Assert that the log line contains a timestamp within [time_before, time_after].
+    ///
+    /// Log lines may contain ANSI escape codes before the timestamp, so we locate the
+    /// timestamp by searching for the `time_before` prefix (up to the seconds). Once found,
+    /// we extract the full timestamp and do a lexicographic range check. ISO 8601 timestamps
+    /// are fixed-width and sort lexicographically.
+    fn assert_timestamp_in_range(log_line: &str, time_before: &str, time_after: &str) {
+        let len = time_before.len();
+        // Search for the date+hour+minute prefix (first 16 chars, e.g. "2026-03-10T14:32")
+        // to locate the timestamp start. We use 16 chars (excluding seconds) because the
+        // seconds may differ between time_before and the log line.
+        let prefix = &time_before[..16];
+        let ts_start = log_line
+            .find(prefix)
+            .unwrap_or_else(|| panic!("No timestamp found in log line: {log_line:?}"));
+        let log_time = &log_line[ts_start..ts_start + len];
+        assert!(
+            log_time >= time_before && log_time <= time_after,
+            "Timestamp {log_time:?} not in expected range [{time_before:?}, {time_after:?}], \
+             full log line: {log_line:?}"
+        );
     }
 
     // IMPORTANT: This is the only test that should call the actual `extern "C"` function, as we can
@@ -674,13 +774,14 @@ mod tests {
         ];
         // We registered record_callback_with_filter_1, which filters only the first two lines.
         let expected_lines = vec!["Testing 1\n", "Another line\n"];
-        let test_time_str = get_time_test_str();
+        let time_before = get_time_test_str();
         for line in &lines {
             // Remove final newline which will be added back by logging
             info!("{}", &line[..(line.len() - 1)]);
         }
+        let time_after = get_time_test_str();
 
-        check_messages(expected_lines, test_time_str, "INFO");
+        check_messages(expected_lines, &time_before, &time_after, "INFO");
         setup_messages();
 
         // Ensure we can setup again with a new callback and a new tracing level
@@ -690,20 +791,21 @@ mod tests {
         // Ensure both callback and tracing level are reloaded.
         // We registered record_callback_with_filter_2, which filters the other logging lines.
         let expected_lines = vec!["Testing 2\n", "Yet another line\n"];
-        let test_time_str = get_time_test_str();
+        let time_before = get_time_test_str();
         for line in &lines {
             debug!("{}", &line[..(line.len() - 1)]);
             // Trace must not be visible in messages, because we changed level to debug
             trace!("{}", &line[..(line.len() - 1)]);
         }
-        check_messages(expected_lines, test_time_str, "DEBUG");
+        let time_after = get_time_test_str();
+        check_messages(expected_lines, &time_before, &time_after, "DEBUG");
     }
 
     #[test]
     fn info_logs_with_formatted_log_line_tracing() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_messages();
-        let (dispatch, _, _) = create_log_line_dispatch(
+        let dispatch = create_log_line_dispatch(
             record_callback_with_filter_1,
             Level::INFO,
             LogLineFormat::COMPACT,
@@ -714,11 +816,12 @@ mod tests {
         );
         tracing_core::dispatcher::with_default(&dispatch, || {
             let lines = ["Testing 1\n", "Another line\n"];
-            let test_time_str = get_time_test_str();
+            let time_before = get_time_test_str();
             for line in lines {
                 // remove final newline which will be added back by logging
                 info!("{}", &line[..(line.len() - 1)]);
             }
+            let time_after = get_time_test_str();
             let lock = MESSAGES.lock().unwrap();
             if let Some(ref msgs) = *lock {
                 assert_eq!(msgs.len(), lines.len());
@@ -726,9 +829,7 @@ mod tests {
                     assert!(got.ends_with(expect));
                     assert!(!got.contains("INFO"));
                     assert!(!got.contains("delta_kernel_ffi::ffi_tracing::tests"));
-                    if let Some(ref tstr) = test_time_str {
-                        assert!(got.contains(tstr));
-                    }
+                    assert_timestamp_in_range(got, &time_before, &time_after);
                 }
             } else {
                 panic!("Messages wasn't Some");
@@ -744,7 +845,7 @@ mod tests {
     fn events_to_string(events: Vec<(String, tracing::Level)>) -> String {
         let events_str = events
             .iter()
-            .map(|(s, lvl)| format!("{}:{}", s, lvl))
+            .map(|(s, lvl)| format!("{s}:{lvl}"))
             .collect::<Vec<_>>()
             .join(", ");
         events_str
@@ -767,7 +868,7 @@ mod tests {
 
         // file path will use \ on windows
         use std::path::MAIN_SEPARATOR;
-        let expected_file = format!("ffi{}src{}ffi_tracing.rs", MAIN_SEPARATOR, MAIN_SEPARATOR);
+        let expected_file = format!("ffi{MAIN_SEPARATOR}src{MAIN_SEPARATOR}ffi_tracing.rs");
 
         let ok = target == "delta_kernel_ffi::ffi_tracing::tests"
             && file == expected_file
@@ -813,8 +914,7 @@ mod tests {
     fn trace_event_tracking() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
-        let (dispatch, _filter, _) =
-            create_event_dispatch(event_callback_with_filter_1, Level::TRACE);
+        let dispatch = create_event_dispatch(event_callback_with_filter_1, Level::TRACE);
         tracing_core::dispatcher::with_default(&dispatch, || {
             let lines = ["Testing 1", "Another line"];
             for line in lines {
@@ -825,7 +925,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see comment there, however this test works if run individually.
+    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see
+              // comment there, however this test works if run individually.
     fn test_enable_event_tracing() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
@@ -876,5 +977,38 @@ mod tests {
         assert_eq!(warn, Level::WARN);
         let error: Level = (&tracing::Level::ERROR).into();
         assert_eq!(error, Level::ERROR);
+    }
+
+    static METRIC_EVENTS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+    extern "C" fn capture_metric_event(event: MetricEvent) {
+        let desc = match event {
+            MetricEvent::JsonReadCompleted(e) => format!("json:{}:{}", e.num_files, e.bytes_read),
+            MetricEvent::ParquetReadCompleted(e) => {
+                format!("parquet:{}:{}", e.num_files, e.bytes_read)
+            }
+            _ => "other".to_string(),
+        };
+        if let Ok(mut lock) = METRIC_EVENTS.lock() {
+            if let Some(events) = lock.as_mut() {
+                events.push(desc);
+            }
+        }
+    }
+
+    #[test]
+    fn metrics_reporting_delivers_structured_events() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        *METRIC_EVENTS.lock().unwrap() = Some(vec![]);
+        let dispatch = create_metrics_dispatch(capture_metric_event);
+        tracing_core::dispatcher::with_default(&dispatch, || {
+            delta_kernel::metrics::emit_json_read_completed(3, 100);
+            delta_kernel::metrics::emit_parquet_read_completed(2, 50);
+        });
+        let lock = METRIC_EVENTS.lock().unwrap();
+        assert_eq!(
+            lock.as_deref(),
+            Some(["json:3:100".to_string(), "parquet:2:50".to_string()].as_slice())
+        );
     }
 }

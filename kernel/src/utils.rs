@@ -4,10 +4,10 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
@@ -19,6 +19,41 @@ macro_rules! require {
 }
 
 pub(crate) use require;
+
+/// Dual of the `FromIterator` trait, similar to how `Into` is the dual of `From`. It is
+/// automatically implemented for any iterable whose items collect into `T`, and can drastically
+/// simplify type bounds. For example, `CollectInto` allows to write this:
+///
+/// ```
+/// # use delta_kernel::CollectInto;
+/// # struct Foo;
+/// fn foo(arg: impl CollectInto<Foo>) -> Foo {
+///     arg.collect_into()
+/// }
+/// ```
+///
+/// instead of the much more verbose:
+///
+/// ```
+/// # struct Foo;
+/// fn foo<T>(arg: impl IntoIterator<Item = T>) -> Foo
+/// where
+///     Foo: FromIterator<T>,
+/// {
+///     Foo::from_iter(arg)
+/// }
+/// ```
+pub trait CollectInto<T>: IntoIterator + Sized {
+    /// Collects this iterable into a `T`
+    fn collect_into(self) -> T;
+}
+
+// blanket impl
+impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
+    fn collect_into(self) -> T {
+        T::from_iter(self)
+    }
+}
 
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
 /// like `/local/paths`, and even `../relative/paths`.
@@ -99,7 +134,7 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::generic(format!("System time before Unix epoch: {}", e)))
+        .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
@@ -109,299 +144,92 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
         .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
-// Extension trait for Cow<'_, T>
-pub(crate) trait CowExt<T: ToOwned + ?Sized> {
-    /// The owned type that corresopnds to Self
-    type Owned;
+/// Extension trait for folding zero or one value from an [`Option`] into a base value.
+#[internal_api]
+pub(crate) trait FoldWithOption: Sized {
+    /// Applies an optional fold operation `f` to `self` if `opt` is [`Some`]; otherwise returns
+    /// `self` unchanged.
+    ///
+    /// Similar to `opt.iter().fold(self, |acc, value| f(acc, value))`, but accepting `FnOnce`
+    /// instead of requiring `FnMut`, and with the base value as receiver instead of the option.
+    fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self {
+        match opt {
+            Some(value) => f(self, value),
+            None => self,
+        }
+    }
 
-    /// Propagate the results of nested transforms. If the nested transform made no change (borrowed
-    /// `self`), then return a borrowed result `s` as well. Otherwise, invoke the provided mapping
-    /// function `f` to convert the owned nested result into an owned result.
-    fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(Self::Owned) -> S) -> Cow<'_, S>;
-}
-
-// Basic implementation for a single Cow value
-impl<T: ToOwned + ?Sized> CowExt<T> for Cow<'_, T> {
-    type Owned = T::Owned;
-
-    fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(T::Owned) -> S) -> Cow<'_, S> {
-        match self {
-            Cow::Owned(v) => Cow::Owned(f(v)),
-            Cow::Borrowed(_) => Cow::Borrowed(s),
+    /// Fallible [`fold_with`](Self::fold_with): applies `Result`-returning `f` to `self` if `opt`
+    /// is [`Some`], otherwise returns `self` unchanged (wrapped in `Ok`).
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    fn try_fold_with<U, E>(
+        self,
+        opt: Option<U>,
+        f: impl FnOnce(Self, U) -> Result<Self, E>,
+    ) -> Result<Self, E> {
+        match opt {
+            Some(value) => f(self, value),
+            None => Ok(self),
         }
     }
 }
 
-// Additional implementation for a pair of Cow values
-impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, Cow<'a, T>) {
-    type Owned = (T::Owned, T::Owned);
+// Blanket impl -- every type can fold_with an Option.
+impl<T: Sized> FoldWithOption for T {}
 
-    fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(Self::Owned) -> S) -> Cow<'_, S> {
-        match self {
-            (Cow::Borrowed(_), Cow::Borrowed(_)) => Cow::Borrowed(s),
-            (left, right) => Cow::Owned(f((left.into_owned(), right.into_owned()))),
+/// Extension trait for adding completion callbacks to iterators.
+pub(crate) trait IteratorExt: Iterator + Sized {
+    /// Wraps this iterator to call a closure when fully exhausted.
+    ///
+    /// The closure is called only when `next()` returns `None`. If the iterator
+    /// is dropped before exhaustion, a warning is logged but the closure is not called.
+    fn on_complete<F: FnOnce()>(self, f: F) -> OnComplete<Self, F> {
+        OnComplete {
+            inner: self,
+            on_complete: Some(f),
         }
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_utils {
-    use std::path::PathBuf;
-    use std::{path::Path, sync::Arc};
+impl<I: Iterator> IteratorExt for I {}
 
-    use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::ObjectStore;
-    use serde::Serialize;
-    use tempfile::TempDir;
-    use test_utils::{delta_path_for_version, load_test_data};
-    use url::Url;
+/// Iterator adaptor that executes a closure when fully exhausted.
+pub(crate) struct OnComplete<I, F: FnOnce()> {
+    inner: I,
+    on_complete: Option<F>,
+}
 
-    use crate::actions::{
-        get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
-    };
-    use crate::arrow::array::{RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::engine::sync::SyncEngine;
-    use crate::{DeltaResult, EngineData, Error, SnapshotRef};
-    use crate::{Engine, Snapshot};
-
-    #[derive(Serialize)]
-    pub(crate) enum Action {
-        #[serde(rename = "add")]
-        Add(Add),
-        #[serde(rename = "remove")]
-        Remove(Remove),
-        #[serde(rename = "cdc")]
-        Cdc(Cdc),
-        #[serde(rename = "metaData")]
-        Metadata(Metadata),
-        #[serde(rename = "protocol")]
-        Protocol(Protocol),
-        #[allow(unused)]
-        #[serde(rename = "commitInfo")]
-        CommitInfo(CommitInfo),
-    }
-
-    use crate::schema::{
-        DataType as KernelDataType, PrimitiveType, SchemaRef, StructField, StructType,
-    };
-
-    /// A mock table that writes commits to a local temporary delta log. This can be used to
-    /// construct a delta log used for testing.
-    pub(crate) struct LocalMockTable {
-        commit_num: u64,
-        store: Arc<LocalFileSystem>,
-        dir: TempDir,
-    }
-
-    impl LocalMockTable {
-        pub(crate) fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-            Self {
-                commit_num: 0,
-                store,
-                dir,
-            }
-        }
-        /// Writes all `actions` to a new commit in the log
-        pub(crate) async fn commit(&mut self, actions: impl IntoIterator<Item = Action>) {
-            let data = actions
-                .into_iter()
-                .map(|action| serde_json::to_string(&action).unwrap())
-                .join("\n");
-
-            let path = delta_path_for_version(self.commit_num, "json");
-            self.commit_num += 1;
-
-            self.store
-                .put(&path, data.into())
-                .await
-                .expect("put log file in store");
-        }
-
-        /// Get the path to the root of the table.
-        pub(crate) fn table_root(&self) -> &Path {
-            self.dir.path()
-        }
-    }
-
-    /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
-    /// the default module
-    fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
-        ArrowEngineData::try_from_engine_data(engine_data)
-            .unwrap()
-            .into()
-    }
-
-    /// Checks that two `EngineData` objects are equal by converting them to `RecordBatch` and comparing
-    pub(crate) fn assert_batch_matches(actual: Box<dyn EngineData>, expected: Box<dyn EngineData>) {
-        assert_eq!(into_record_batch(actual), into_record_batch(expected));
-    }
-
-    pub(crate) fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
-        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
-        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
-            .expect("Can't convert to record batch");
-        Box::new(ArrowEngineData::new(batch))
-    }
-
-    pub(crate) fn parse_json_batch(json_strings: StringArray) -> Box<dyn EngineData> {
-        let engine = SyncEngine::new();
-        let json_handler = engine.json_handler();
-        let output_schema = get_all_actions_schema().clone();
-        json_handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap()
-    }
-
-    pub(crate) fn action_batch() -> Box<dyn EngineData> {
-        let json_strings: StringArray = vec![
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
-            r#"{"remove":{"path":"part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"partitionValues":{"c1":"4","c2":"c"},"size":452}}"#,
-            r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
-            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableChangeDataFeed":"true"},"createdTime":1677811175819}}"#,
-            r#"{"cdc":{"path":"_change_data/age=21/cdc-00000-93f7fceb-281a-446a-b221-07b88132d203.c000.snappy.parquet","partitionValues":{"age":"21"},"size":1033,"dataChange":false}}"#,
-            r#"{"sidecar":{"path":"016ae953-37a9-438e-8683-9a9a4a79a395.parquet","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{"tag_foo":"tag_bar"}}}"#,
-            r#"{"txn":{"appId":"myApp","version": 3}}"#,
-            r#"{"checkpointMetadata":{"version":2, "tags":{"tag_foo":"tag_bar"}}}"#,
-        ]
-        .into();
-        parse_json_batch(json_strings)
-    }
-
-    // TODO: allow tests to pass in context (issue#1133)
-    pub(crate) fn assert_result_error_with_message<T, E: ToString>(
-        res: Result<T, E>,
-        message: &str,
-    ) {
-        match res {
-            Ok(_) => panic!("Expected error with message {message}, but got Ok result"),
-            Err(error) => {
-                let error_str = error.to_string();
-                assert!(
-                    error_str.contains(message),
-                    "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
-                );
-            }
-        }
-    }
-
-    /// Helper to get a field from a StructType by name, panicking if not found.
-    pub(crate) fn get_schema_field(struct_type: &StructType, name: &str) -> StructField {
-        struct_type
-            .fields()
-            .find(|f| f.name() == name)
-            .unwrap_or_else(|| panic!("Field '{}' not found", name))
-            .clone()
-    }
-
-    /// Validates that a schema has the expected checkpoint structure with top-level action fields
-    /// and proper nested types for add, metaData, and protocol actions.
-    pub(crate) fn validate_checkpoint_schema(schema: &SchemaRef) {
-        // Verify top-level action fields exist and are structs
-        let top_level_fields = ["txn", "add", "remove", "metaData", "protocol"];
-        for field_name in top_level_fields {
-            let field = get_schema_field(schema, field_name);
-            assert!(
-                matches!(field.data_type(), KernelDataType::Struct(_)),
-                "Field '{}' should be a struct type",
-                field_name
+impl<I, F: FnOnce()> Drop for OnComplete<I, F> {
+    fn drop(&mut self) {
+        if self.on_complete.is_some() {
+            tracing::debug!(
+                "OnComplete iterator dropped before exhaustion; completion callback not called"
             );
         }
+    }
+}
 
-        // Verify 'add' struct has expected fields with correct types
-        let add_field = get_schema_field(schema, "add");
-        let add_struct = match add_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'add' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(add_struct, "path").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::String)
-        );
-        assert_eq!(
-            get_schema_field(add_struct, "size").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Long)
-        );
-        assert!(
-            matches!(
-                get_schema_field(add_struct, "partitionValues").data_type(),
-                KernelDataType::Map(_)
-            ),
-            "'partitionValues' should be a map type"
-        );
+impl<I, F> Iterator for OnComplete<I, F>
+where
+    I: Iterator,
+    F: FnOnce(),
+{
+    type Item = I::Item;
 
-        // Verify 'metaData' struct has nested 'format' struct
-        let metadata_field = get_schema_field(schema, "metaData");
-        let metadata_struct = match metadata_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'metaData' should be a struct"),
-        };
-        let format_field = get_schema_field(metadata_struct, "format");
-        let format_struct = match format_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'format' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(format_struct, "provider").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::String)
-        );
-
-        // Verify 'protocol' struct has version fields
-        let protocol_field = get_schema_field(schema, "protocol");
-        let protocol_struct = match protocol_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'protocol' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(protocol_struct, "minReaderVersion").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Integer)
-        );
-        assert_eq!(
-            get_schema_field(protocol_struct, "minWriterVersion").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Integer)
-        );
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
     }
 
-    /// Load a test table from tests/data directory.
-    /// Tries compressed (tar.zst) first, falls back to extracted.
-    /// Returns (engine, snapshot, optional tempdir). The TempDir must be kept alive
-    /// for the duration of the test to prevent premature cleanup of extracted files.
-    pub(crate) fn load_test_table(
-        table_name: &str,
-    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
-        // Try loading compressed table first, fall back to extracted
-        let (path, tempdir) = match load_test_data("tests/data", table_name) {
-            Ok(test_dir) => {
-                let test_path = test_dir.path().join(table_name);
-                (test_path, Some(test_dir))
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(item) => Some(item),
+            None => {
+                if let Some(f) = self.on_complete.take() {
+                    f();
+                }
+                None
             }
-            Err(_) => {
-                // Fall back to already-extracted table
-                let manifest_dir = env!("CARGO_MANIFEST_DIR");
-                let mut path = PathBuf::from(manifest_dir);
-                path.push("tests/data");
-                path.push(table_name);
-                let path = std::fs::canonicalize(path)
-                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
-                (path, None)
-            }
-        };
-
-        // Create engine and snapshot from the resolved path
-        let url = Url::from_directory_path(&path)
-            .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
-
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store).build());
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
-        Ok((engine, snapshot, tempdir))
+        }
     }
 }
 
@@ -459,5 +287,55 @@ mod tests {
             url.to_string(),
             "s3://foo/__unitystorage/catalogs/cid/tables/tid/"
         );
+    }
+
+    mod on_complete_tests {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        use super::*;
+
+        #[test]
+        fn test_calls_on_exhaustion() {
+            let called = Arc::new(AtomicBool::new(false));
+            let called_clone = called.clone();
+            let mut iter = vec![1, 2].into_iter().on_complete(move || {
+                called_clone.store(true, Ordering::SeqCst);
+            });
+            assert_eq!(iter.next(), Some(1));
+            assert!(!called.load(Ordering::SeqCst));
+            assert_eq!(iter.next(), Some(2));
+            assert_eq!(iter.next(), None);
+            assert!(called.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn test_does_not_call_on_early_drop() {
+            let called = Arc::new(AtomicBool::new(false));
+            let called_clone = called.clone();
+            {
+                let mut iter = vec![1, 2].into_iter().on_complete(move || {
+                    called_clone.store(true, Ordering::SeqCst);
+                });
+                assert_eq!(iter.next(), Some(1));
+                // Drop without exhausting - callback should NOT be called
+            }
+            assert!(!called.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn test_calls_only_once() {
+            let count = Arc::new(AtomicU32::new(0));
+            let count_clone = count.clone();
+            {
+                let mut iter = vec![1].into_iter().on_complete(move || {
+                    count_clone.fetch_add(1, Ordering::SeqCst);
+                });
+                assert_eq!(iter.next(), Some(1));
+                assert_eq!(iter.next(), None); // triggers callback
+                assert_eq!(iter.next(), None); // should not trigger again
+            } // drop should not trigger again
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
     }
 }

@@ -1,0 +1,31 @@
+[book]
+language = "en"
+src = "src"
+title = "Delta Kernel Documentation"
+
+[rust]
+edition = "2021"
+
+[build]
+create-missing = false
+
+[output.html]
+additional-css = ["./theme/catppuccin.css"]
+default-theme = "latte"
+preferred-dark-theme = "macchiato"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+# Validates internal `[link](../foo.md)` references and #section anchors.
+# Uses mdbook-linkcheck2 (a maintained fork; the original mdbook-linkcheck
+# is incompatible with mdbook 0.5+).
+# Skip web URLs to keep CI hermetic and immune to network flakes.
+# optional = true: don't fail `mdbook build` if mdbook-linkcheck2 isn't
+# installed locally; CI installs it explicitly.
+[output.linkcheck2]
+follow-web-links = false
+optional = true
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

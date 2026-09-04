@@ -23,6 +23,7 @@ fn create_multi_version_snapshot() -> SnapshotRef {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_log_compaction_writer_creation() {
     let snapshot = create_mock_snapshot();
     let start_version = 0;
@@ -37,6 +38,7 @@ fn test_log_compaction_writer_creation() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_invalid_version_range() {
     let start_version = 20;
     let end_version = 10; // Invalid: start > end
@@ -51,6 +53,7 @@ fn test_invalid_version_range() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_equal_version_range_invalid() {
     let start_version = 5;
     let end_version = 5; // Invalid: start == end (must be start < end)
@@ -65,6 +68,7 @@ fn test_equal_version_range_invalid() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_should_compact() {
     assert!(should_compact(9, 10));
     assert!(!should_compact(5, 10));
@@ -74,6 +78,7 @@ fn test_should_compact() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_compaction_actions_schema_access() {
     let schema = &*COMPACTION_ACTIONS_SCHEMA;
     assert!(schema.fields().len() > 0);
@@ -87,15 +92,17 @@ fn test_compaction_actions_schema_access() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_writer_debug_impl() {
     let snapshot = create_mock_snapshot();
     let writer = LogCompactionWriter::try_new(snapshot, 1, 5).unwrap();
 
-    let debug_str = format!("{:?}", writer);
+    let debug_str = format!("{writer:?}");
     assert!(debug_str.contains("LogCompactionWriter"));
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_compaction_data() {
     let snapshot = create_mock_snapshot();
     let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
@@ -112,13 +119,14 @@ fn test_compaction_data() {
     assert_eq!(state.add_actions_count(), 0);
 
     // Test debug implementation
-    let debug_str = format!("{:?}", iterator);
+    let debug_str = format!("{iterator:?}");
     assert!(debug_str.contains("ActionReconciliationIterator"));
     assert!(debug_str.contains("actions_count"));
     assert!(debug_str.contains("add_actions_count"));
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_end_version_exceeds_snapshot_version() {
     let snapshot = create_mock_snapshot();
     let snapshot_version = snapshot.version();
@@ -136,6 +144,7 @@ fn test_end_version_exceeds_snapshot_version() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_retention_calculator() {
     let snapshot = create_mock_snapshot();
     let writer = LogCompactionWriter::try_new(snapshot.clone(), 0, 1).unwrap();
@@ -145,6 +154,7 @@ fn test_retention_calculator() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_compaction_data_with_actual_iterator() {
     let snapshot = create_multi_version_snapshot();
     let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
@@ -174,6 +184,7 @@ fn test_compaction_data_with_actual_iterator() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_compaction_paths() {
     let snapshot = create_mock_snapshot();
 
@@ -201,14 +212,13 @@ fn test_compaction_paths() {
         let path = writer.compaction_path();
         assert!(
             path.to_string().ends_with(expected_suffix),
-            "Path {} doesn't end with {}",
-            path,
-            expected_suffix
+            "Path {path} doesn't end with {expected_suffix}"
         );
     }
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_version_filtering() {
     let snapshot = create_multi_version_snapshot();
     let engine = SyncEngine::new();
@@ -232,29 +242,33 @@ fn test_version_filtering() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_no_compaction_staged_commits() {
-    use crate::actions::Add;
-    use crate::engine::default::DefaultEngineBuilder;
-    use object_store::{memory::InMemory, path::Path, ObjectStore};
     use std::sync::Arc;
+
+    use crate::actions::Add;
+    use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStoreExt as _;
+    use crate::table_features::TableFeature;
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};
-    use crate::schema::{DataType as KernelDataType, StructField, StructType};
-    use crate::utils::test_utils::Action;
+    use crate::schema::schema_ref;
+    use crate::unit_test_utils::Action;
 
     let metadata = Action::Metadata(
         Metadata::try_new(
             Some("test-table".into()),
             None,
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "value",
-                KernelDataType::INTEGER,
-            )])),
+            schema_ref! {
+                nullable "value": INTEGER,
+            },
             vec![],
             0,
             std::collections::HashMap::new(),
@@ -262,7 +276,7 @@ async fn test_no_compaction_staged_commits() {
         .unwrap(),
     );
     let protocol = Action::Protocol(
-        Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new())).unwrap(),
+        Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap(),
     );
 
     let metadata_action = serde_json::to_string(&metadata).unwrap();
@@ -273,7 +287,7 @@ async fn test_no_compaction_staged_commits() {
     store
         .put(
             &commit_0_path,
-            format!("{}\n{}", metadata_action, protocol_action).into(),
+            format!("{metadata_action}\n{protocol_action}").into(),
         )
         .await
         .unwrap();
@@ -304,4 +318,14 @@ async fn test_no_compaction_staged_commits() {
 
     // The validation in LogCompactionWriter is a safety check for edge cases
     // where staged commits might slip through the normal filtering
+}
+
+// === Tests for disabled log compaction (TODO(#2337): remove when re-enabled) ===
+
+#[test]
+fn test_should_compact_always_false() {
+    // These inputs would return true if compaction were enabled
+    assert!(!should_compact(9, 10));
+    assert!(!should_compact(19, 10));
+    assert!(!should_compact(99, 100));
 }

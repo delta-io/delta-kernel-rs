@@ -22,6 +22,8 @@ ArrowContext* init_arrow_context(void);
 void c_read_parquet_file(
   struct EngineContext* context,
   const KernelStringSlice path,
+  int64_t size,
+  int64_t mod_time,
   const KernelBoolSlice selection_vector,
   const Expression* transform);
 void print_arrow_context(ArrowContext* context);

@@ -1,0 +1,294 @@
+# IMPORTANT: this workflow posts a github-actions[bot] comment on PRs based
+# on data produced by benchmark.yml (which runs untrusted PR code). The
+# trust boundaries are non-obvious; see ../SECURITY_MODEL.md. Anyone
+# editing this file -- or reviewing changes to it -- MUST read that
+# document first. In particular, the `case "$EVENT"` resolver in each job
+# is load-bearing: trusting the wrong source per upstream event would let
+# a fork forge cross-PR comments.
+#
+# Companion to .github/workflows/benchmark.yml. The bench workflow runs under
+# `pull_request` / `push` / `merge_group` / `issue_comment` with `contents: read`
+# only -- it has no write scope on PR-triggered runs from forks (read-only
+# GITHUB_TOKEN per GitHub's default), so it cannot post a comment itself.
+# Instead, run-benchmarks.sh writes the comment body to /tmp/bench-comment.md,
+# benchmark.yml uploads that file as the `bench-comment` artifact, and this
+# workflow (running in base-branch context, which does have write scope)
+# downloads it and posts/updates the PR comment.
+#
+# Two jobs, routed by whether the `bench-comment` artifact exists:
+#
+#   bench succeeds: `bench-comment` uploaded
+#       -> post-comment posts the table; post-failure-comment skips
+#   bench fails
+#     ├─ regression gate tripped (a benchmark >=15% slower): benchmark.yml
+#     │    uploads `bench-comment` before the gate runs, so it exists despite
+#     │    the failed job
+#     │      -> post-comment posts the table; post-failure-comment skips
+#     └─ broke before writing /tmp/bench-comment.md (e.g. compile error)
+#          -> no artifact; post-failure-comment posts a static failure note
+#
+# Pattern is identical to pr-validator.yml + comment-on-title-failure.yml.
+#
+# CAVEAT: workflow_run only fires for workflow definitions that live on the
+# default branch. A PR that modifies either this workflow or benchmark.yml
+# won't trigger this post workflow until the changes are merged to main. Test
+# end-to-end on a fork/staging repo, or accept a one-PR window of no comments
+# right after merge.
+
+name: Post benchmark results
+
+on:
+  workflow_run:
+    workflows: ["Benchmarking PR performance"]
+    types: [completed]
+
+# Empty default; each job opts into the minimum scopes it needs.
+permissions: {}
+
+# Two rapid runs of workflow A (e.g., a quick push followed by a /bench
+# comment) can both complete near-simultaneously; without concurrency, both
+# instances of this workflow race on find-comment / create-or-update-comment
+# and may double-post. Key on the PR identity (head repo + head branch),
+# not workflow_run.id, since the latter is unique per upstream run and would
+# put every instance in its own group. For issue_comment upstream events
+# head_branch is the default branch, which over-serializes /bench comments
+# across different PRs through one group -- acceptable since posting is
+# fast and we don't cancel-in-progress here.
+concurrency:
+  group: bench-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  post-comment:
+    name: Post benchmark results
+    # Post when the upstream succeeded OR failed (a failure is usually the
+    # regression gate tripping, and the result table still exists), and the
+    # upstream event was a PR event with a conversation to post to.
+    # `merge_group` and `push: main` runs of workflow A have no PR to comment on.
+    if: >
+      contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion)
+      && (github.event.workflow_run.event == 'pull_request'
+          || github.event.workflow_run.event == 'issue_comment')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      # download-artifact across workflows needs actions:read.
+      actions: read
+    steps:
+      - name: Download bench-pr-number (issue_comment upstream only)
+        # See SECURITY MODEL at the top of this file -- this artifact is
+        # trusted only on the issue_comment path. continue-on-error so an
+        # absent artifact (e.g., a non-/bench issue_comment that skipped
+        # run-benchmark) flows through to the resolve step rather than
+        # failing the whole workflow.
+        id: download-num
+        if: github.event.workflow_run.event == 'issue_comment'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bench-pr-number
+          path: /tmp/
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Resolve PR number
+        id: pr
+        env:
+          EVENT:    ${{ github.event.workflow_run.event }}
+          GH_TOKEN: ${{ github.token }}
+          REPO:     ${{ github.repository }}
+          # Conditional `owner:branch` for fork PRs vs same-repo (copied from
+          # comment-on-title-failure.yml's resolver).
+          PR_BRANCH: |-
+            ${{
+              (github.event.workflow_run.head_repository.owner.login != github.event.workflow_run.repository.owner.login)
+                && format('{0}:{1}', github.event.workflow_run.head_repository.owner.login, github.event.workflow_run.head_branch)
+                || github.event.workflow_run.head_branch
+            }}
+        run: |
+          set -u
+          # Step 1: pick the trusted source for the PR number based on which
+          # upstream event fired. See ../SECURITY_MODEL.md for why each
+          # branch is safe -- they trust different things for different reasons.
+          case "$EVENT" in
+            pull_request)
+              # Look up the PR by its head branch. head_branch and
+              # head_repository come from the workflow_run payload (set by
+              # GitHub, not the fork), so this lookup is trusted.
+              NUM=$(gh pr view --repo "$REPO" "$PR_BRANCH" --json number --jq .number || true)
+              ;;
+            issue_comment)
+              # Read the PR number from the bench-pr-number artifact. The
+              # upstream YAML uploaded this before PR-controlled code ran on
+              # the runner (for issue_comment events GitHub serves
+              # benchmark.yml from the default branch -- trusted).
+              if [[ ! -f /tmp/pr-number.txt ]]; then
+                echo "bench-pr-number artifact missing (likely a non-/bench comment that skipped run-benchmark); nothing to post." >&2
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              NUM=$(tr -d '[:space:]' < /tmp/pr-number.txt)
+              ;;
+            *)
+              echo "Unexpected upstream event: $EVENT" >&2
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          # Step 2: validate before emitting -- catches gh-lookup failures
+          # (empty NUM) and any malformed artifact contents.
+          if [[ -z "$NUM" || ! "$NUM" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Could not resolve PR number ('$NUM'); skipping." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            printf 'number=%s\n' "$NUM" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download bench comment
+        # continue-on-error: a successful upstream run may still have skipped
+        # run-benchmark (e.g., a draft PR push satisfies the `pull_request`
+        # trigger but the job's `if:` excludes drafts). In that case there is
+        # no body artifact, and we should exit cleanly without touching the
+        # existing PR comment.
+        id: download-body
+        if: steps.pr.outputs.skip != 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bench-comment
+          path: /tmp/
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Find existing bench comment
+        id: find
+        if: steps.pr.outputs.skip != 'true' && steps.download-body.outcome == 'success'
+        uses: peter-evans/find-comment@3eae4d37986fb5a8592848f6a574fdf654e61f9e # v3.1.0
+        with:
+          issue-number: ${{ steps.pr.outputs.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- delta-kernel-bench-comment -->'
+      - name: Post or update PR comment
+        # When `comment-id` is empty (no prior comment) this creates one;
+        # otherwise it replaces the existing body. Either way only one bench
+        # comment exists on the PR.
+        if: steps.pr.outputs.skip != 'true' && steps.download-body.outcome == 'success'
+        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043 # v4.0.0
+        with:
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          issue-number: ${{ steps.pr.outputs.number }}
+          edit-mode: replace
+          body-path: /tmp/bench-comment.md
+
+  post-failure-comment:
+    name: Post benchmark failure note
+    # Replace any existing success comment with a failure note so reviewers
+    # don't see stale-green after a push that breaks the bench itself.
+    # `timed_out` counts as failure for our purposes; we skip `cancelled` (a
+    # superseding run will post its own update) and `skipped` (nothing
+    # meaningful happened, e.g., draft).
+    if: >
+      contains(fromJSON('["failure","timed_out"]'), github.event.workflow_run.conclusion)
+      && (github.event.workflow_run.event == 'pull_request'
+          || github.event.workflow_run.event == 'issue_comment')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Download bench-pr-number (issue_comment upstream only)
+        # Same security rationale as the post-comment job. Trusted only on
+        # the issue_comment path. On the pull_request path we use gh pr view
+        # against the trusted workflow_run.head_branch instead.
+        id: download-num
+        if: github.event.workflow_run.event == 'issue_comment'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bench-pr-number
+          path: /tmp/
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Resolve PR number
+        id: pr
+        env:
+          EVENT:    ${{ github.event.workflow_run.event }}
+          GH_TOKEN: ${{ github.token }}
+          REPO:     ${{ github.repository }}
+          PR_BRANCH: |-
+            ${{
+              (github.event.workflow_run.head_repository.owner.login != github.event.workflow_run.repository.owner.login)
+                && format('{0}:{1}', github.event.workflow_run.head_repository.owner.login, github.event.workflow_run.head_branch)
+                || github.event.workflow_run.head_branch
+            }}
+        run: |
+          set -u
+          # Step 1: pick the trusted source for the PR number based on which
+          # upstream event fired. See ../SECURITY_MODEL.md for why each
+          # branch is safe -- they trust different things for different reasons.
+          case "$EVENT" in
+            pull_request)
+              # Look up the PR by its head branch. head_branch and
+              # head_repository come from the workflow_run payload (set by
+              # GitHub, not the fork), so this lookup is trusted.
+              NUM=$(gh pr view --repo "$REPO" "$PR_BRANCH" --json number --jq .number || true)
+              ;;
+            issue_comment)
+              # Read the PR number from the bench-pr-number artifact. The
+              # upstream YAML uploaded this before PR-controlled code ran on
+              # the runner (for issue_comment events GitHub serves
+              # benchmark.yml from the default branch -- trusted).
+              if [[ ! -f /tmp/pr-number.txt ]]; then
+                echo "bench-pr-number artifact missing; cannot post failure note." >&2
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              NUM=$(tr -d '[:space:]' < /tmp/pr-number.txt)
+              ;;
+            *)
+              echo "Unexpected upstream event: $EVENT" >&2
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          # Step 2: validate before emitting -- catches gh-lookup failures
+          # (empty NUM) and any malformed artifact contents.
+          if [[ -z "$NUM" || ! "$NUM" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Could not resolve PR number ('$NUM'); skipping failure comment." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            printf 'number=%s\n' "$NUM" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Probe for bench comment artifact
+        # Detect whether the bench produced a comment artifact; continue-on-error
+        # so "absent" is a clean outcome rather than a job failure. The find/post
+        # steps below run only when it's absent: when present, the failure was the
+        # gate tripping and post-comment owns the comment (see the header routing).
+        id: probe-body
+        if: steps.pr.outputs.skip != 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bench-comment
+          path: /tmp/
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Find existing bench comment
+        id: find
+        if: steps.pr.outputs.skip != 'true' && steps.probe-body.outcome != 'success'
+        uses: peter-evans/find-comment@3eae4d37986fb5a8592848f6a574fdf654e61f9e # v3.1.0
+        with:
+          issue-number: ${{ steps.pr.outputs.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- delta-kernel-bench-comment -->'
+      - name: Post or update failure note
+        if: steps.pr.outputs.skip != 'true' && steps.probe-body.outcome != 'success'
+        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043 # v4.0.0
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
+        with:
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          issue-number: ${{ steps.pr.outputs.number }}
+          edit-mode: replace
+          body: |
+            <!-- delta-kernel-bench-comment -->
+            ## Benchmark results: ❌ Fail
+
+            <sub>Benchmark run failed before producing results. [See workflow run](${{ env.RUN_URL }}) for details.</sub>
