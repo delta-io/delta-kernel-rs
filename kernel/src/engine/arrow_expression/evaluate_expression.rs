@@ -942,8 +942,6 @@ pub fn coalesce_arrays(
 
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
-/// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-///
 /// Date and timestamp use arrow's `Date32Type::parse` / `string_to_datetime`, which are much
 /// faster than `parse_scalar`'s chrono path and yield the same value for valid Delta partition
 /// values. These arrow parsers accept a superset of the canonical formats (e.g. `20240115`, or a
@@ -952,8 +950,9 @@ pub fn coalesce_arrays(
 /// harmless on the read path. All other types go through `parse_scalar`.
 fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
     if raw.is_empty() {
-        return Ok(prim.empty_string_partition_cast());
+        return Ok(None);
     }
+
     match prim {
         PrimitiveType::Date => {
             let days = Date32Type::parse(raw).ok_or_else(|| {
@@ -980,8 +979,8 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 }
 
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
-/// and parses each value into its target type, producing a `StructArray`. An empty-string value
-/// casts via [`PrimitiveType::empty_string_partition_cast`].
+/// and parses each value into its target type using Delta's partition value serialization rules,
+/// producing a `StructArray`.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -2963,10 +2962,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// An empty-string map value casts via `empty_string_partition_cast`: `""` for string, empty
-    /// bytes for binary, and null for every other type.
     #[test]
-    fn test_map_to_struct_empty_string_cast_semantics() {
+    fn test_map_to_struct_empty_strings_are_null() {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("region");
         builder.values().append_value("");
@@ -2999,16 +2996,14 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert!(!regions.is_null(0));
-        assert_eq!(regions.value(0), "");
+        assert!(regions.is_null(0));
 
         let blobs = structs
             .column(1)
             .as_any()
             .downcast_ref::<crate::arrow::array::BinaryArray>()
             .unwrap();
-        assert!(!blobs.is_null(0));
-        assert_eq!(blobs.value(0), b"");
+        assert!(blobs.is_null(0));
 
         let counts = structs
             .column(2)

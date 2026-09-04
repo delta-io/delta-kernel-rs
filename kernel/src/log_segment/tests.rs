@@ -1779,6 +1779,91 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     Ok(())
 }
 
+#[tokio::test]
+async fn test_json_v2_leaf_uses_hint_schema_for_native_partition_values() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
+    let checkpoint_json = r#"{"add":{"path":"file.parquet","partitionValues":{"event_time":"invalid-timestamp"},"partitionValues_parsed":{"event_time":"1970-01-01T08:00:00Z"},"size":1,"modificationTime":2,"dataChange":true}}"#;
+    store
+        .put(
+            &Path::from(format!("_delta_log/{filename}")),
+            checkpoint_json.to_string().into(),
+        )
+        .await?;
+
+    let action_schema = schema_ref! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "partitionValues": { STRING => nullable STRING },
+            nullable "size": LONG,
+            nullable "modificationTime": LONG,
+            nullable "dataChange": BOOLEAN,
+        },
+    };
+    let hint_schema = schema_ref! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "partitionValues": { STRING => nullable STRING },
+            nullable "partitionValues_parsed": { nullable "event_time": TIMESTAMP },
+            nullable "size": LONG,
+            nullable "modificationTime": LONG,
+            nullable "dataChange": BOOLEAN,
+        },
+    };
+    let partition_schema = schema_ref! { nullable "event_time": TIMESTAMP };
+    let checkpoint_file = log_root.join(filename)?.to_string();
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path(&checkpoint_file)],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHint {
+            version: 10,
+            checkpoint_schema: Some(hint_schema),
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: filename.to_string(),
+                sidecar_files: Some(vec![]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )?;
+
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        action_schema,
+        None,
+        None,
+        Some(partition_schema.as_ref()),
+        None,
+    )?;
+    assert_eq!(
+        checkpoint_result
+            .checkpoint_info
+            .native_partition_values_schema
+            .as_ref(),
+        Some(&partition_schema)
+    );
+    let read_schema = checkpoint_result.checkpoint_info.checkpoint_read_schema;
+    let mut actions = checkpoint_result.actions;
+    let ActionsBatch {
+        actions: actual,
+        is_log_batch,
+    } = actions.next().expect("JSON checkpoint batch")?;
+    assert!(!is_log_batch);
+    let expected_json: StringArray = vec![checkpoint_json].into();
+    let expected = SyncJsonHandler::new(None)
+        .parse_json(string_array_to_engine_data(expected_json), read_schema)
+        .unwrap();
+    assert_batch_matches(actual, expected);
+    assert!(actions.next().is_none());
+
+    Ok(())
+}
+
 // Tests the end-to-end process of creating a checkpoint stream.
 // Verifies that:
 // - The checkpoint file is read and produces batches containing references to sidecar files.
@@ -4253,7 +4338,8 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
     assert!(
         checkpoint_result
             .checkpoint_info
-            .has_partition_values_parsed,
+            .native_partition_values_schema
+            .is_some(),
         "Expected has_partition_values_parsed to be true"
     );
 
@@ -4316,9 +4402,10 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
 
     // Verify it's false
     assert!(
-        !checkpoint_result
+        checkpoint_result
             .checkpoint_info
-            .has_partition_values_parsed,
+            .native_partition_values_schema
+            .is_none(),
         "Expected has_partition_values_parsed to be false"
     );
 
@@ -4364,35 +4451,37 @@ fn create_checkpoint_schema_without_partition_parsed() -> StructType {
 fn test_partition_values_parsed_compatible_basic() {
     let checkpoint_schema = create_checkpoint_schema_with_partition_parsed(vec![
         StructField::nullable("date", DataType::DATE),
-        StructField::nullable("region", DataType::STRING),
+        StructField::nullable("count", DataType::INTEGER),
     ]);
     let partition_schema = schema! {
         nullable "date": DATE,
-        nullable "region": STRING,
+        nullable "count": INTEGER,
     };
-    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+    let compatible = LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .expect("both native fields should be compatible");
+    assert_eq!(compatible.as_ref(), &partition_schema);
 }
 
 #[test]
-fn test_partition_values_parsed_missing_field() {
+fn test_partition_values_parsed_missing_field_uses_available_subset() {
     let checkpoint_schema =
         create_checkpoint_schema_with_partition_parsed(vec![StructField::nullable(
             "date",
             DataType::DATE,
         )]);
-    // Partition schema expects both date and region, but checkpoint only has date.
-    // Missing fields are OK — they just won't contribute to row group skipping.
     let partition_schema = schema! {
         nullable "date": DATE,
-        nullable "region": STRING,
+        nullable "count": INTEGER,
     };
-    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+    let compatible = LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .expect("the date field should remain usable");
+    assert_eq!(compatible.as_ref(), &schema! { nullable "date": DATE });
 }
 
 #[test]
@@ -4400,14 +4489,34 @@ fn test_partition_values_parsed_extra_field() {
     // Checkpoint has extra fields beyond what partition schema needs — fine
     let checkpoint_schema = create_checkpoint_schema_with_partition_parsed(vec![
         StructField::nullable("date", DataType::DATE),
-        StructField::nullable("region", DataType::STRING),
+        StructField::nullable("count", DataType::INTEGER),
         StructField::nullable("extra", DataType::INTEGER),
     ]);
     let partition_schema = schema! { nullable "date": DATE };
-    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+    let compatible = LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .expect("the requested native field should be compatible");
+    assert_eq!(compatible.as_ref(), &partition_schema);
+}
+
+#[rstest::rstest]
+#[case::string(DataType::STRING)]
+#[case::binary(DataType::BINARY)]
+fn test_partition_values_parsed_empty_string_types_are_incompatible(#[case] data_type: DataType) {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_partition_parsed(vec![StructField::nullable(
+            "part",
+            data_type.clone(),
+        )]);
+    let partition_schema =
+        StructType::new_unchecked(vec![StructField::nullable("part", data_type)]);
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
+        &checkpoint_schema,
+        &partition_schema,
+    )
+    .is_none());
 }
 
 #[test]
@@ -4418,20 +4527,22 @@ fn test_partition_values_parsed_type_mismatch() {
             DataType::STRING,
         )]);
     let partition_schema = schema! { nullable "date": DATE };
-    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .is_none());
 }
 
 #[test]
 fn test_partition_values_parsed_not_present() {
     let checkpoint_schema = create_checkpoint_schema_without_partition_parsed();
     let partition_schema = schema! { nullable "date": DATE };
-    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .is_none());
 }
 
 #[test]
@@ -4444,10 +4555,11 @@ fn test_partition_values_parsed_not_a_struct() {
         },
     };
     let partition_schema = schema! { nullable "date": DATE };
-    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .is_none());
 }
 
 #[test]
@@ -4457,12 +4569,34 @@ fn test_partition_values_parsed_empty_partition_schema() {
             "date",
             DataType::DATE,
         )]);
-    // Empty partition schema — any partitionValues_parsed is compatible
+    // An empty target has no native field to preserve.
     let partition_schema = schema! {};
-    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .is_none());
+}
+
+#[test]
+fn test_partition_values_parsed_mixed_schema_preserves_only_trusted_native_fields() {
+    let checkpoint_schema = create_checkpoint_schema_with_partition_parsed(vec![
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("event_time", DataType::TIMESTAMP),
+    ]);
+    let partition_schema = schema! {
+        nullable "name": STRING,
+        nullable "event_time": TIMESTAMP,
+    };
+    let compatible = LogSegment::compatible_partition_values_parsed_schema(
+        &checkpoint_schema,
+        &partition_schema,
+    )
+    .expect("timestamp should remain checkpoint-native");
+    assert_eq!(
+        compatible.as_ref(),
+        &schema! { nullable "event_time": TIMESTAMP }
+    );
 }
 
 // ============================================================================

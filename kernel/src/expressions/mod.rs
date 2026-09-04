@@ -688,10 +688,8 @@ impl ParseJsonExpression {
 ///
 /// # Value parsing
 ///
-/// A literal empty string has special read compatibility behavior: it stays empty for STRING,
-/// becomes empty bytes for BINARY, and becomes null for every other primitive type. Delta writers
-/// normally encode an empty partition value as JSON null, but readers must preserve this behavior
-/// for existing tables that contain a literal empty string.
+/// A literal empty string becomes null for every primitive type, as required by the Delta
+/// [protocol].
 ///
 /// Non-empty strings must follow the Delta [protocol] partition value serialization rules. Kernel's
 /// reference evaluator implements these rules with [`PrimitiveType::parse_scalar`] and equivalent
@@ -705,19 +703,15 @@ impl ParseJsonExpression {
 ///   round or rescale.
 /// - BOOLEAN: accept case-insensitive `true` or `false`, with no numeric or yes/no aliases.
 /// - DATE: parse `{year}-{month}-{day}`.
-/// - TIMESTAMP: parse either 1) an ISO 8601 timestamp with an explicit offset, normalized to UTC;
-///   or 2) a space-separated timestamp without a zone. Currently, kernel expects case 2 to be
-///   interpreted as UTC, however the protocol specifies that it should be interpreted in the
-///   writer's time zone. TODO: MapToStruct needs to be updated to take in a timezone as a
-///   parameter.
+/// - TIMESTAMP: parse an ISO 8601 timestamp with an explicit offset and normalize it to UTC, or
+///   interpret a space-separated timestamp without a zone as UTC. The protocol assigns the latter
+///   form the writer's time zone, but this expression does not carry that zone.
 /// - TIMESTAMP_NTZ: parse a space-separated timestamp without an offset and preserve the local
 ///   wall-clock value.
 /// - Interval types: parse an ANSI interval literal accepted by [`PrimitiveType::parse_scalar`].
 /// - VOID: reject every non-empty value.
 ///
-/// Kernel's UTC interpretation of a zone-less TIMESTAMP is explicit here: the Delta protocol says
-/// that form is interpreted in the writer's time zone, but that time zone is not carried by this
-/// expression. Modern writers should use the protocol's UTC-adjusted ISO 8601 form.
+/// Writers should use the protocol's UTC-adjusted ISO 8601 timestamp form.
 ///
 /// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
 /// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
@@ -728,7 +722,7 @@ impl ParseJsonExpression {
 /// A connector generally cannot implement this contract as `CAST(map[key] AS target_type)`.
 /// Generic casts may accept additional boolean spellings, round or rescale decimals, use a session
 /// time zone, or turn malformed values into null. Implement a dedicated parser (or validate before
-/// casting), handle the empty-string cases before parsing, and preserve the input map's row-level
+/// casting), normalize empty strings before parsing, and preserve the input map's row-level
 /// nulls on the output struct.
 ///
 /// [protocol]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
@@ -933,8 +927,8 @@ impl Expression {
 
     /// Parses an Add action's `partitionValues` map into a typed struct whose schema comes from the
     /// evaluator's result type. A null map produces a null struct; missing and null values produce
-    /// null fields; literal empty strings stay empty only for STRING and BINARY. Duplicate-key
-    /// behavior is undefined. See [`MapToStructExpression`] for the complete contract.
+    /// null fields; literal empty strings also produce null fields. Duplicate-key behavior is
+    /// undefined. See [`MapToStructExpression`] for the complete contract.
     pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
         Self::MapToStruct(MapToStructExpression::new(map_expr))
     }

@@ -10,6 +10,7 @@ use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::checkpoint::{raw_partition_values_expr, PartitionValuesSource};
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef, Predicate,
@@ -28,6 +29,7 @@ use crate::schema::{
     lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
 };
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -162,9 +164,9 @@ pub struct ScanLogReplayProcessor {
     /// StructPatch for log batches (commit files) - uses ParseJson for stats and MapToStruct
     /// for partition values
     commit_transform: Arc<dyn ExpressionEvaluator>,
-    /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
-    /// partitionValues_parsed directly when available, otherwise parses from raw columns
-    checkpoint_transform: Arc<dyn ExpressionEvaluator>,
+    /// Projections for checkpoint batches. Compatible partition fields are preserved natively,
+    /// while fields needing normalization or fallback are parsed from the raw map.
+    checkpoint_transforms: Vec<Arc<dyn ExpressionEvaluator>>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -243,7 +245,7 @@ impl ScanLogReplayProcessor {
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
-            has_partition_values_parsed,
+            native_partition_values_schema,
             checkpoint_read_schema,
         } = checkpoint_info.clone();
         let ScanStatsOptions {
@@ -327,17 +329,16 @@ impl ScanLogReplayProcessor {
                 output_schema.clone().into(),
             )?,
             // Checkpoint transform: read pre-parsed columns directly when available
-            checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
+            checkpoint_transforms: build_checkpoint_transform_evaluators(
+                engine,
                 checkpoint_read_schema,
-                get_add_transform_expr(
-                    stats_schema_for_transform,
-                    has_stats_parsed,
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform,
-                    has_partition_values_parsed,
-                ),
-                output_schema.into(),
+                stats_schema_for_transform,
+                has_stats_parsed,
+                skip_stats,
+                synthesize_json,
+                partition_schema_for_transform,
+                native_partition_values_schema,
+                output_schema,
             )?,
             seen_file_keys,
             state_info,
@@ -489,12 +490,15 @@ impl ScanLogReplayProcessor {
         actions: &dyn EngineData,
         is_log_batch: bool,
     ) -> DeltaResult<(Box<dyn EngineData>, Vec<bool>)> {
-        let transform = if is_log_batch {
-            &self.commit_transform
+        let transformed = if is_log_batch {
+            self.commit_transform.evaluate(actions)?
         } else {
-            &self.checkpoint_transform
+            let mut transformed = None;
+            for evaluator in &self.checkpoint_transforms {
+                transformed = Some(evaluator.evaluate(transformed.as_deref().unwrap_or(actions))?);
+            }
+            transformed.ok_or_else(|| Error::internal_error("missing checkpoint transform"))?
         };
-        let transformed = transform.evaluate(actions)?;
         require!(
             transformed.len() == actions.len(),
             Error::internal_error(format!(
@@ -825,6 +829,91 @@ fn scan_row_schema_with_parsed_columns(
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_checkpoint_transform_evaluators(
+    engine: &dyn Engine,
+    checkpoint_read_schema: SchemaRef,
+    physical_stats_schema: Option<SchemaRef>,
+    has_stats_parsed: bool,
+    skip_stats: bool,
+    synthesize_json: bool,
+    partition_schema: Option<SchemaRef>,
+    native_partition_schema: Option<SchemaRef>,
+    output_schema: SchemaRef,
+) -> DeltaResult<Vec<Arc<dyn ExpressionEvaluator>>> {
+    let partition_values_source = partition_schema
+        .as_ref()
+        .map(|schema| PartitionValuesSource::for_schemas(schema, native_partition_schema.as_ref()));
+    if !matches!(
+        partition_values_source,
+        Some(PartitionValuesSource::Mixed(_))
+    ) {
+        let has_native_partition_values = matches!(
+            partition_values_source,
+            Some(PartitionValuesSource::Native(_))
+        );
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            checkpoint_read_schema,
+            get_add_transform_expr(
+                physical_stats_schema,
+                has_stats_parsed,
+                skip_stats,
+                synthesize_json,
+                partition_schema,
+                has_native_partition_values,
+            ),
+            output_schema.into(),
+        )?;
+        return Ok(vec![evaluator]);
+    }
+    let Some(PartitionValuesSource::Mixed(staging)) = partition_values_source else {
+        return Err(Error::internal_error(
+            "mixed partition values source expected for staged transform",
+        ));
+    };
+
+    let base_schema = scan_row_schema_with_parsed_columns(physical_stats_schema.clone(), None)?;
+    let [(raw_field, raw_expr), (native_field, native_expr)] = staging.scan_columns();
+    let raw_field_name = raw_field.name().clone();
+    let native_field_name = native_field.name().clone();
+    let staging_schema = Arc::new(
+        SchemaStructPatchBuilder::new()
+            .append(raw_field)
+            .append(native_field)
+            .build(&base_schema)?,
+    );
+    let mut staging_fields = get_add_transform_fields(
+        physical_stats_schema,
+        has_stats_parsed,
+        skip_stats,
+        synthesize_json,
+    );
+    staging_fields.extend([raw_expr, native_expr]);
+    let staging_evaluator = engine.evaluation_handler().new_expression_evaluator(
+        checkpoint_read_schema,
+        Arc::new(Expression::struct_from(staging_fields)),
+        staging_schema.clone().into(),
+    )?;
+
+    let (_, output_expr) = ProjectionStructPatchBuilder::new(&staging_schema)
+        .drop(raw_field_name)
+        .drop(native_field_name)
+        .append(
+            StructField::nullable(
+                PARTITION_VALUES_PARSED_NAME,
+                staging.partition_schema().as_ref().clone(),
+            ),
+            staging.merge_expr(),
+        )
+        .build()?;
+    let output_evaluator = engine.evaluation_handler().new_expression_evaluator(
+        staging_schema,
+        output_expr,
+        output_schema.into(),
+    )?;
+    Ok(vec![staging_evaluator, output_evaluator])
+}
+
 /// Build the add transform expression with optional stats and partition value parsing.
 ///
 /// # Parameters
@@ -841,9 +930,9 @@ fn scan_row_schema_with_parsed_columns(
 ///   the JSON stats column; JSON-only checkpoints and commits retain `add.stats` as fallback input.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
-/// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
-///   column (checkpoint). When true it is read directly; otherwise the struct is reconstructed from
-///   the `partitionValues` string map.
+/// - `has_partition_values_parsed`: Whether the source's full native `partitionValues_parsed`
+///   column can be read directly. Otherwise this one-stage helper reconstructs the struct from the
+///   `partitionValues` string map.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -856,6 +945,31 @@ fn get_add_transform_expr(
     partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
 ) -> ExpressionRef {
+    let mut fields = get_add_transform_fields(
+        physical_stats_schema,
+        has_stats_parsed,
+        skip_stats,
+        synthesize_json,
+    );
+
+    if partition_schema.is_some() {
+        let pv_parsed_expr = if has_partition_values_parsed {
+            col!("add.partitionValues_parsed")
+        } else {
+            raw_partition_values_expr()
+        };
+        fields.push(Arc::new(pv_parsed_expr));
+    }
+
+    Arc::new(Expression::struct_from(fields))
+}
+
+fn get_add_transform_fields(
+    physical_stats_schema: Option<SchemaRef>,
+    has_stats_parsed: bool,
+    skip_stats: bool,
+    synthesize_json: bool,
+) -> Vec<ExpressionRef> {
     let stats_expr = if skip_stats {
         Arc::new(null_lit(DataType::STRING))
     } else if has_stats_parsed && synthesize_json {
@@ -898,20 +1012,7 @@ fn get_add_transform_expr(
         fields.push(Arc::new(stats_parsed_expr));
     }
 
-    // Add partitionValues_parsed when partition columns are needed for data skipping or for the
-    // engine-facing typed output column.
-    if partition_schema.is_some() {
-        let pv_parsed_expr = if has_partition_values_parsed {
-            // Checkpoint carries a native partitionValues_parsed column - read it directly.
-            col!("add.partitionValues_parsed")
-        } else {
-            // No native column (JSON commit): reconstruct from the string map.
-            Expression::map_to_struct(col!("add.partitionValues"))
-        };
-        fields.push(Arc::new(pv_parsed_expr));
-    }
-
-    Arc::new(Expression::struct_from(fields))
+    fields
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
@@ -1177,10 +1278,13 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
-        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
+        build_checkpoint_transform_evaluators, get_add_transform_expr, scan_action_iter,
+        scan_row_schema_with_parsed_columns, InternalScanState, ScanLogReplayProcessor,
+        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState, COMMIT_READ_SCHEMA,
     };
     use crate::actions::get_commit_schema;
+    use crate::arrow::array::StringArray;
+    use crate::engine::sync::json::SyncJsonHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
@@ -1203,10 +1307,14 @@ mod tests {
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
+    use crate::schema::{
+        schema_ref, DataType, MetadataColumnSpec, SchemaRef, SchemaStructPatchBuilder, StructField,
+    };
     use crate::table_features::ColumnMappingMode;
-    use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::{DeltaResult, Expression as Expr, ExpressionRef};
+    use crate::unit_test_utils::{
+        assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data,
+    };
+    use crate::{DeltaResult, Expression as Expr, ExpressionRef, JsonHandler as _};
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
@@ -2151,5 +2259,71 @@ mod tests {
             &null_lit(DataType::STRING),
             "structured-only checkpoint stats output must be a typed NULL"
         );
+    }
+
+    #[test]
+    fn checkpoint_scan_transform_preserves_native_timestamp_and_normalizes_string() {
+        let partition_schema = schema_ref! {
+            nullable "name": STRING,
+            nullable "event_time": TIMESTAMP,
+        };
+        let native_schema = schema_ref! { nullable "event_time": TIMESTAMP };
+        let add_field = COMMIT_READ_SCHEMA.field("add").unwrap();
+        let DataType::Struct(add_schema) = add_field.data_type() else {
+            panic!("add must be a struct");
+        };
+        let add_schema = SchemaStructPatchBuilder::new()
+            .append(StructField::nullable(
+                "partitionValues_parsed",
+                native_schema.as_ref().clone(),
+            ))
+            .build(add_schema)
+            .unwrap();
+        let read_schema = Arc::new(
+            SchemaStructPatchBuilder::new()
+                .replace(
+                    "add",
+                    StructField::new("add", add_schema, add_field.is_nullable()),
+                )
+                .build(&COMMIT_READ_SCHEMA)
+                .unwrap(),
+        );
+        let output_schema =
+            scan_row_schema_with_parsed_columns(None, Some(partition_schema.clone())).unwrap();
+        let engine = SyncEngine::new();
+        let evaluators = build_checkpoint_transform_evaluators(
+            &engine,
+            read_schema.clone(),
+            None,
+            false,
+            true,
+            false,
+            Some(partition_schema),
+            Some(native_schema),
+            output_schema.clone(),
+        )
+        .unwrap();
+        let handler = SyncJsonHandler::new(None);
+        let input_json: StringArray = vec![
+            r#"{"add":{"path":"file.parquet","partitionValues":{"name":"","event_time":"invalid-timestamp"},"partitionValues_parsed":{"event_time":"1970-01-01T08:00:00Z"},"size":1,"modificationTime":2,"dataChange":true}}"#,
+            r#"{}"#,
+        ]
+        .into();
+        let input = handler
+            .parse_json(string_array_to_engine_data(input_json), read_schema)
+            .unwrap();
+        let mut actual = input;
+        for evaluator in evaluators {
+            actual = evaluator.evaluate(actual.as_ref()).unwrap();
+        }
+        let expected_json: StringArray = vec![
+            r#"{"path":"file.parquet","size":1,"modificationTime":2,"fileConstantValues":{"partitionValues":{"name":"","event_time":"invalid-timestamp"}},"partitionValues_parsed":{"name":null,"event_time":"1970-01-01T08:00:00Z"}}"#,
+            r#"{"fileConstantValues":{}}"#,
+        ]
+        .into();
+        let expected = handler
+            .parse_json(string_array_to_engine_data(expected_json), output_schema)
+            .unwrap();
+        assert_batch_matches(actual, expected);
     }
 }

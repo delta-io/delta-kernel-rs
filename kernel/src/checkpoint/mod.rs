@@ -141,6 +141,7 @@ pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
     build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
 };
+pub(crate) use checkpoint_transform::{raw_partition_values_expr, PartitionValuesSource};
 use sidecar::{create_sidecar_action_batch, SidecarSplitter, SingleSidecarDataIterator};
 #[cfg(test)]
 mod tests;
@@ -367,8 +368,10 @@ pub struct CheckpointWriter {
 
     is_v2: bool,
     read_schema: SchemaRef,
+    first_output_schema: SchemaRef,
     output_schema: SchemaRef,
     transform_expr: ExpressionRef,
+    output_transform_expr: Option<ExpressionRef>,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -389,16 +392,30 @@ impl CheckpointWriter {
         snapshot.log_segment().validate_published()?;
 
         let schema_context = Self::checkpoint_schema_context(&snapshot, engine)?;
+        let native_partition_schema = schema_context
+            .partition_schema
+            .as_ref()
+            .map(|schema| {
+                snapshot
+                    .log_segment()
+                    .native_partition_values_schema(engine, schema)
+            })
+            .transpose()?
+            .flatten();
+        let partition_read_schema = native_partition_schema
+            .as_ref()
+            .or(schema_context.partition_schema.as_ref());
         let read_schema = build_checkpoint_read_schema(
             &schema_context.checkpoint_base_schema,
             &schema_context.stats_schema,
-            schema_context.partition_schema.as_deref(),
+            partition_read_schema.map(AsRef::as_ref),
         )?;
-        let (output_schema, transform_expr) = build_checkpoint_transform(
+        let transform = build_checkpoint_transform(
             &schema_context.stats_config,
             &read_schema,
             &schema_context.stats_schema,
             schema_context.partition_schema.as_ref(),
+            native_partition_schema.as_ref(),
         )?;
 
         Ok(Self {
@@ -406,8 +423,10 @@ impl CheckpointWriter {
             snapshot,
             is_v2: schema_context.is_v2,
             read_schema,
-            output_schema,
-            transform_expr,
+            first_output_schema: transform.first_output_schema,
+            output_schema: transform.output_schema,
+            transform_expr: transform.first_expr,
+            output_transform_expr: transform.output_expr,
         })
     }
 
@@ -484,14 +503,29 @@ impl CheckpointWriter {
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             self.read_schema.clone(),
             self.transform_expr.clone(),
-            self.output_schema.clone().into(),
+            self.first_output_schema.clone().into(),
         )?;
+        let output_evaluator = self
+            .output_transform_expr
+            .as_ref()
+            .map(|expr| {
+                engine.evaluation_handler().new_expression_evaluator(
+                    self.first_output_schema.clone(),
+                    expr.clone(),
+                    self.output_schema.clone().into(),
+                )
+            })
+            .transpose()?;
 
         // Apply stats transform to each reconciled batch
         let transformed = checkpoint_data.map(move |batch_result| {
             let batch = batch_result?;
             let (data, sv) = batch.filtered_data.into_parts();
             let transformed = evaluator.evaluate(data.as_ref())?;
+            let transformed = match output_evaluator.as_ref() {
+                Some(evaluator) => evaluator.evaluate(transformed.as_ref())?,
+                None => transformed,
+            };
             Ok(ActionReconciliationBatch {
                 filtered_data: FilteredEngineData::try_new(transformed, sv)?,
                 actions_count: batch.actions_count,

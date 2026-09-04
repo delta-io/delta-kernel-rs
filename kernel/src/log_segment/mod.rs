@@ -28,7 +28,9 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
-use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{
+    lazy_schema_ref, DataType, PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
+};
 use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
@@ -60,12 +62,12 @@ pub(crate) struct CheckpointReadInfo {
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
     #[allow(unused)]
     pub has_stats_parsed: bool,
-    /// Whether the checkpoint has compatible pre-parsed partition values.
-    /// When `true`, checkpoint batches can read typed partition values directly from
-    /// `partitionValues_parsed` instead of parsing strings from `partitionValues`.
+    /// Compatible checkpoint-native partition fields that can be trusted as typed values.
+    /// String and binary fields are excluded because their empty values must be normalized from
+    /// `partitionValues`. Missing or incompatible fields are likewise omitted.
     #[serde(default)]
     #[allow(unused)]
-    pub has_partition_values_parsed: bool,
+    pub native_partition_values_schema: Option<SchemaRef>,
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
@@ -78,7 +80,7 @@ impl CheckpointReadInfo {
     pub(crate) fn without_stats_parsed() -> Self {
         Self {
             has_stats_parsed: false,
-            has_partition_values_parsed: false,
+            native_partition_values_schema: None,
             checkpoint_read_schema: LOG_ADD_SCHEMA.clone(),
         }
     }
@@ -968,9 +970,14 @@ impl LogSegment {
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
-                // JSON checkpoint is always V2. No checkpoint schema is available since JSON
-                // checkpoints don't have a parquet footer to read.
-                self.read_sidecar_schema_and_files(engine, checkpoint, None, cancellation_token)
+                // JSON checkpoints are always V2 and have no parquet footer, so an applicable
+                // hint is the only schema available for inline file actions.
+                self.read_sidecar_schema_and_files(
+                    engine,
+                    checkpoint,
+                    hint_schema.as_ref(),
+                    cancellation_token,
+                )
             }
             ClassicCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
@@ -994,6 +1001,18 @@ impl LogSegment {
             }
             _ => Ok((None, vec![])),
         }
+    }
+
+    /// Returns checkpoint-native partition fields that can be preserved during checkpoint writes.
+    pub(crate) fn native_partition_values_schema(
+        &self,
+        engine: &dyn Engine,
+        partition_schema: &StructType,
+    ) -> DeltaResult<Option<SchemaRef>> {
+        let (file_actions_schema, _) = self.get_file_actions_schema_and_sidecars(engine, None)?;
+        Ok(file_actions_schema.as_ref().and_then(|schema| {
+            Self::compatible_partition_values_parsed_schema(schema, partition_schema)
+        }))
     }
 
     /// Reads a parquet footer schema, threading the cancellation token so a cancelled request can
@@ -1075,9 +1094,9 @@ impl LogSegment {
                     Self::schema_has_compatible_stats_parsed(file_schema, stats)
                 });
 
-        let has_partition_values_parsed = partition_schema
+        let native_partition_values_schema = partition_schema
             .zip(file_actions_schema.as_ref())
-            .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
+            .and_then(|(ps, fs)| Self::compatible_partition_values_parsed_schema(fs, ps));
 
         // JSON checkpoint stats are required when structured stats cannot satisfy the scan schema.
         let needs_json_stats_fallback = stats_schema.is_some()
@@ -1090,8 +1109,9 @@ impl LogSegment {
             });
 
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let needs_add_augmentation =
-            needs_json_stats_fallback || has_stats_parsed || has_partition_values_parsed;
+        let needs_add_augmentation = needs_json_stats_fallback
+            || has_stats_parsed
+            || native_partition_values_schema.is_some();
         let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
             let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
                 (needs_add_augmentation, action_schema.field("add"))
@@ -1111,8 +1131,11 @@ impl LogSegment {
                     add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
                 }
 
-                if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
+                if let Some(ps) = native_partition_values_schema.as_ref() {
+                    add_fields.push(StructField::nullable(
+                        "partitionValues_parsed",
+                        ps.as_ref().clone(),
+                    ));
                 }
 
                 // Rebuild schema with modified add field
@@ -1211,7 +1234,7 @@ impl LogSegment {
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
-            has_partition_values_parsed,
+            native_partition_values_schema,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
@@ -1486,24 +1509,24 @@ impl LogSegment {
         true
     }
 
-    /// Checks if a checkpoint schema contains a usable `add.partitionValues_parsed` field.
+    /// Returns the usable fields from a checkpoint's `add.partitionValues_parsed` struct.
     ///
-    /// Validates that:
-    /// 1. The `add.partitionValues_parsed` field exists in the checkpoint schema
-    /// 2. The types for partition columns present in both schemas are compatible
+    /// The `add.partitionValues_parsed` field must exist in the checkpoint schema.
     ///
-    /// Missing partition columns in the checkpoint are OK (they simply won't contribute
-    /// to row group skipping). Returns `false` if `partitionValues_parsed` doesn't exist
-    /// or has incompatible types for any shared column.
-    pub(crate) fn schema_has_compatible_partition_values_parsed(
+    /// String and binary fields are excluded because their empty values require normalization from
+    /// the serialized map. Missing and incompatible fields are also excluded so callers can fall
+    /// back to the raw map for those fields.
+    ///
+    /// Returns `None` when no checkpoint-native field can be used.
+    pub(crate) fn compatible_partition_values_parsed_schema(
         checkpoint_schema: &StructType,
         partition_schema: &StructType,
-    ) -> bool {
+    ) -> Option<SchemaRef> {
         let Some(partition_parsed) =
             Self::get_field_from_add(checkpoint_schema, "partitionValues_parsed")
         else {
             debug!("partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field");
-            return false;
+            return None;
         };
 
         let DataType::Struct(partition_struct) = partition_parsed.data_type() else {
@@ -1511,20 +1534,29 @@ impl LogSegment {
                 "partitionValues_parsed not compatible: add.partitionValues_parsed is not a Struct, got {:?}",
                 partition_parsed.data_type()
             );
-            return false;
+            return None;
         };
 
-        // Flat struct: reuse the recursive type checker (trivial case with no nesting)
-        if !Self::structs_have_compatible_types(
-            partition_struct,
-            partition_schema,
-            "partitionValues_parsed",
-        ) {
-            return false;
-        }
-
-        debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
-        true
+        let fields = partition_schema.fields().filter_map(|needed| {
+            if matches!(
+                needed.data_type(),
+                DataType::Primitive(PrimitiveType::String)
+                    | DataType::Primitive(PrimitiveType::Binary)
+            ) {
+                return None;
+            }
+            let available = partition_struct.field(needed.name())?;
+            let single_available = StructType::new_unchecked([available.clone()]);
+            let single_needed = StructType::new_unchecked([needed.clone()]);
+            Self::structs_have_compatible_types(
+                &single_available,
+                &single_needed,
+                "partitionValues_parsed",
+            )
+            .then(|| needed.clone())
+        });
+        let fields = fields.collect::<Vec<_>>();
+        (!fields.is_empty()).then(|| Arc::new(StructType::new_unchecked(fields)))
     }
 }
 

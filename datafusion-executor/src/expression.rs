@@ -21,8 +21,7 @@ use delta_kernel::expressions::{
     VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{
-    DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
-    StructType,
+    DataType as KernelDataType, SchemaRef as KernelSchemaRef, StructField, StructType,
 };
 use delta_kernel::{DeltaResult, EngineData, Error};
 
@@ -390,13 +389,10 @@ fn struct_columns_from_patch(
 /// types come from `output_type`, which must be a struct holding only primitive fields (matching
 /// the kernel evaluator, which supports only primitive targets).
 ///
-/// Each field extracts its value with `cast(get_field(map, name), T)`. For a numeric or temporal
-/// type the raw value is first wrapped in `nullif(.., '')`, mapping an empty string to null before
-/// the cast, so an empty string becomes null (kernel's `empty_string_partition_cast`) while an
-/// unparseable value fails the cast (kernel's hard parse error). String and Binary keep the raw
-/// value (empty is a valid empty string / empty bytes). A missing key or null value is already null
-/// via [`get_field`]. The whole struct is nulled where the input map row is null, via `<map> IS NOT
-/// NULL`.
+/// Each field extracts its value with `cast(nullif(get_field(map, name), ''), T)`. This maps an
+/// empty string to null for every primitive target before the cast. A missing key or null value is
+/// already null via [`get_field`]. The whole struct is nulled where the input map row is null, via
+/// `<map> IS NOT NULL`.
 ///
 /// KNOWN DIVERGENCES from the kernel parser, confined to malformed or non-spec-compliant values
 /// (spec-compliant writers never emit them):
@@ -420,7 +416,7 @@ fn map_to_struct_to_df_expr(
 
     let mut args = Vec::with_capacity(target.num_fields() * 2);
     for field in target.fields() {
-        let KernelDataType::Primitive(prim) = field.data_type() else {
+        let KernelDataType::Primitive(_) = field.data_type() else {
             return Err(Error::unsupported(format!(
                 "MapToStruct only supports primitive target types, but field '{}' is {:?}",
                 field.name(),
@@ -428,12 +424,7 @@ fn map_to_struct_to_df_expr(
             )));
         };
         let raw = get_field(map.clone(), field.name().to_string());
-        let value = match prim {
-            // An empty string is a value for these two (the empty string / empty bytes) and null
-            // for every other type based on kernel.
-            PrimitiveType::String | PrimitiveType::Binary => raw,
-            _ => nullif(raw, lit("")),
-        };
+        let value = nullif(raw, lit(""));
         let arrow_type = field
             .data_type()
             .try_into_arrow()
@@ -1023,18 +1014,22 @@ mod tests {
             rendered,
             concat!(
                 r#"CASE WHEN pv IS NOT NULL THEN named_struct("#,
-                r#"Utf8("region"), CAST(get_field(pv, Utf8("region")) AS Utf8), "#,
+                r#"Utf8("region"), CAST(nullif(get_field(pv, Utf8("region")), Utf8("")) AS Utf8), "#,
                 r#"Utf8("id"), CAST(nullif(get_field(pv, Utf8("id")), Utf8("")) AS Int32)) "#,
                 r#"ELSE NULL END"#,
             )
         );
     }
 
-    /// String and Binary targets keep the raw value (empty string is a valid value), so they lower
-    /// to a bare `cast`; every other primitive first maps an empty string to null via `nullif`.
     #[rstest]
-    #[case::string_bare_cast(DataType::STRING, "CAST(get_field(pv, Utf8(\"f\")) AS Utf8)")]
-    #[case::binary_bare_cast(DataType::BINARY, "CAST(get_field(pv, Utf8(\"f\")) AS Binary)")]
+    #[case::string(
+        DataType::STRING,
+        "CAST(nullif(get_field(pv, Utf8(\"f\")), Utf8(\"\")) AS Utf8)"
+    )]
+    #[case::binary(
+        DataType::BINARY,
+        "CAST(nullif(get_field(pv, Utf8(\"f\")), Utf8(\"\")) AS Binary)"
+    )]
     #[case::integer_wraps_nullif(
         DataType::INTEGER,
         "CAST(nullif(get_field(pv, Utf8(\"f\")), Utf8(\"\")) AS Int32)"
