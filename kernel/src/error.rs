@@ -282,6 +282,10 @@ pub enum Error {
     #[error("Invalid log path: {0}")]
     InvalidLogPath(String),
 
+    /// Caller-supplied snapshot hint state is inconsistent or conflicts with the builder.
+    #[error("Invalid snapshot hint: {0}")]
+    InvalidSnapshotHint(String),
+
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]
     FileAlreadyExists(String),

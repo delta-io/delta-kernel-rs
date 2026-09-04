@@ -90,22 +90,25 @@ impl From<kernel::TableType> for TableType {
     }
 }
 
-/// The kind of log-segment load: a full listing from the base up to the target, or an incremental
-/// listing of the commits above an existing segment.
+/// How the snapshot was constructed.
 ///
 /// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-pub enum LogSegmentLoadType {
+pub enum SnapshotLoadType {
     Full,
     Incremental,
     Unknown,
+    /// Snapshot construction used complete caller-supplied state without engine log I/O.
+    SnapshotHint,
 }
 
-impl From<kernel::LogSegmentLoadType> for LogSegmentLoadType {
-    fn from(t: kernel::LogSegmentLoadType) -> Self {
+impl From<kernel::SnapshotLoadType> for SnapshotLoadType {
+    fn from(t: kernel::SnapshotLoadType) -> Self {
         match t {
-            kernel::LogSegmentLoadType::Full => Self::Full,
-            kernel::LogSegmentLoadType::Incremental => Self::Incremental,
+            kernel::SnapshotLoadType::Full => Self::Full,
+            kernel::SnapshotLoadType::Incremental => Self::Incremental,
+            kernel::SnapshotLoadType::SnapshotHint => Self::SnapshotHint,
             _ => Self::Unknown,
         }
     }
@@ -117,7 +120,7 @@ pub struct LogSegmentLoadSuccess {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
     pub duration_ns: u64,
     pub num_commit_files: u64,
     pub num_checkpoint_files: u64,
@@ -135,7 +138,7 @@ pub struct LogSegmentLoadFailure {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 }
 
 /// How a snapshot load resolved Protocol and Metadata.
@@ -168,7 +171,7 @@ pub struct ProtocolMetadataLoadSuccess {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
     pub source: ProtocolMetadataSource,
     pub duration_ns: u64,
 }
@@ -179,7 +182,7 @@ pub struct ProtocolMetadataLoadFailure {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 }
 
 /// A snapshot was built successfully.
@@ -188,7 +191,7 @@ pub struct SnapshotBuildSuccess {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
     pub version: u64,
     pub duration_ns: u64,
 }
@@ -199,7 +202,7 @@ pub struct SnapshotBuildFailure {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 }
 
 /// A transaction was committed successfully. `operation` and `correlation_id` are slices into
@@ -764,7 +767,7 @@ mod tests {
                 operation_id: id,
                 correlation_id: Some("pm-req".into()),
                 table_type: kernel::TableType::CatalogManaged,
-                load_type: kernel::LogSegmentLoadType::Incremental,
+                load_type: kernel::SnapshotLoadType::Incremental,
                 source: kernel::ProtocolMetadataSource::CrcAdvancedByReplay,
                 duration: Duration::from_nanos(53),
             });
@@ -774,7 +777,7 @@ mod tests {
             };
             assert_eq!(e.operation_id.bytes, id.as_bytes());
             assert!(matches!(e.table_type, TableType::CatalogManaged));
-            assert!(matches!(e.load_type, LogSegmentLoadType::Incremental));
+            assert!(matches!(e.load_type, SnapshotLoadType::Incremental));
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "pm-req");
@@ -793,7 +796,7 @@ mod tests {
             operation_id: id,
             correlation_id: Some("req-42".into()),
             table_type: kernel::TableType::CatalogManaged,
-            load_type: kernel::LogSegmentLoadType::Full,
+            load_type: kernel::SnapshotLoadType::Full,
             num_commit_files: 3,
             num_checkpoint_files: 1,
             num_compaction_files: 2,
@@ -807,7 +810,7 @@ mod tests {
             assert_eq!(e.operation_id.bytes, id.as_bytes());
             assert!(matches!(e.table_type, TableType::CatalogManaged));
             assert_eq!(e.duration_ns, 61);
-            assert!(matches!(e.load_type, LogSegmentLoadType::Full));
+            assert!(matches!(e.load_type, SnapshotLoadType::Full));
             assert_eq!(e.num_commit_files, 3);
             assert_eq!(e.num_checkpoint_files, 1);
             assert_eq!(e.num_compaction_files, 2);
@@ -820,12 +823,39 @@ mod tests {
     }
 
     #[test]
+    fn from_kernel_snapshot_hint_load_type_maps_to_appended_ffi_variant() {
+        let event = kernel::MetricEvent::SnapshotBuildSuccess(kernel::SnapshotBuildSuccess {
+            operation_id: kernel::MetricId::new(),
+            correlation_id: None,
+            table_type: kernel::TableType::PathBased,
+            load_type: kernel::SnapshotLoadType::SnapshotHint,
+            version: 7,
+            duration: Duration::from_nanos(11),
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::SnapshotBuildSuccess(e) = ffi else {
+                panic!("expected SnapshotBuildSuccess");
+            };
+            assert_eq!(e.load_type, SnapshotLoadType::SnapshotHint);
+            assert_eq!(e.version, 7);
+        });
+    }
+
+    #[test]
+    fn snapshot_load_type_discriminants_are_stable() {
+        assert_eq!(SnapshotLoadType::Full as i32, 0);
+        assert_eq!(SnapshotLoadType::Incremental as i32, 1);
+        assert_eq!(SnapshotLoadType::Unknown as i32, 2);
+        assert_eq!(SnapshotLoadType::SnapshotHint as i32, 3);
+    }
+
+    #[test]
     fn from_kernel_log_segment_load_success_unset_correlation_id_is_empty_slice() {
         let event = kernel::MetricEvent::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
             operation_id: kernel::MetricId::new(),
             correlation_id: None,
             table_type: kernel::TableType::PathBased,
-            load_type: kernel::LogSegmentLoadType::Full,
+            load_type: kernel::SnapshotLoadType::Full,
             num_commit_files: 0,
             num_checkpoint_files: 0,
             num_compaction_files: 0,

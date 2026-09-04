@@ -73,6 +73,8 @@ pub enum KernelError {
     RowTrackingChangeFeedUnsupported = 44,
     CancelledError = 45,
     InvalidTransactionStateError = 46,
+    /// Caller-supplied snapshot hint state is inconsistent or conflicts with builder options.
+    InvalidSnapshotHint = 47,
 }
 
 impl From<Error> for KernelError {
@@ -124,6 +126,7 @@ impl From<Error> for KernelError {
             } => Self::from(*source),
             Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
             Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
+            Error::InvalidSnapshotHint(_) => KernelError::InvalidSnapshotHint,
             Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
@@ -315,6 +318,7 @@ impl From<EngineExecError> for Error {
             KernelError::InvalidStructDataError => Error::InvalidStructData(message),
             KernelError::InvalidExpression => Error::InvalidExpressionEvaluation(message),
             KernelError::InvalidLogPath => Error::InvalidLogPath(message),
+            KernelError::InvalidSnapshotHint => Error::InvalidSnapshotHint(message),
             KernelError::FileAlreadyExists => Error::FileAlreadyExists(message),
             KernelError::UnsupportedError => Error::Unsupported(message),
             KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
@@ -380,6 +384,15 @@ mod error_code_tests {
         );
         assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
     }
+
+    #[test]
+    fn invalid_snapshot_hint_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            KernelError::from(Error::InvalidSnapshotHint("invalid".to_string())),
+            KernelError::InvalidSnapshotHint
+        );
+        assert_eq!(KernelError::InvalidSnapshotHint as i32, 47);
+    }
 }
 
 #[cfg(all(test, feature = "declarative-plans"))]
@@ -402,6 +415,7 @@ mod tests {
     #[case::unsupported(KernelError::UnsupportedError, "Unsupported: boom")]
     #[case::generic(KernelError::GenericError, "Generic delta kernel error: boom")]
     #[case::invalid_expr(KernelError::InvalidExpression, "Invalid expression evaluation: boom")]
+    #[case::invalid_snapshot_hint(KernelError::InvalidSnapshotHint, "Invalid snapshot hint: boom")]
     #[case::unit_missing_version(KernelError::MissingVersionError, "No table version found.")]
     #[case::fallback_io(
         KernelError::IOErrorError,

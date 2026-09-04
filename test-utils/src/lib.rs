@@ -166,7 +166,7 @@ use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
-    CapturingReporter, CountingReporter, RelaxedCounter,
+    CapturingReporter, CountingReporter, LabeledCounter, RelaxedCounter, SnapshotCompletionStatus,
 };
 use delta_kernel::actions::{
     LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,

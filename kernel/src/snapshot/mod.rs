@@ -42,6 +42,9 @@ mod builder;
 mod incremental;
 mod snapshot_crc;
 pub use builder::{IncrementalReplay, SnapshotBuilder};
+#[allow(unused_imports)]
+#[internal_api]
+pub(crate) use builder::{SnapshotHint, SnapshotHintVersionStatus};
 use snapshot_crc::SnapshotCrc;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
@@ -324,11 +327,11 @@ impl Snapshot {
 
     /// Whether this snapshot was at the latest table version when it was built.
     ///
-    /// This is best-effort: `true` when the build knows this was the newest version. That holds for
-    /// a build (fresh or incremental) with no time-travel version, a build (fresh or incremental)
-    /// at the catalog's ratified latest version, and a post-commit snapshot. It is not a
-    /// liveness guarantee: another writer may commit a newer version afterward, so a `true`
-    /// snapshot can already be stale.
+    /// This is best-effort: `true` for an ordinary latest-version build, the catalog's ratified
+    /// latest version, a post-commit snapshot, or a snapshot hint marked `Latest` by its connector.
+    /// Kernel does not independently verify hint freshness. This is not a liveness guarantee:
+    /// another writer may commit a newer version afterward, so a `true` snapshot can already be
+    /// stale.
     ///
     /// Version-preserving derivations ([`Self::checkpoint`], [`Self::write_checksum`],
     /// [`Self::publish`]) do not change this flag: they carry it over from the source snapshot.

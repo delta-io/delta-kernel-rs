@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 #[allow(unused)]
 pub(crate) use delta::{merge_domain_metadata, CrcDelta};
+use delta_kernel_derive::internal_api;
 pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
@@ -168,7 +169,12 @@ struct CrcRaw {
 }
 
 impl Crc {
-    /// Parse a `.crc` file body. `version` comes from the filename (the body does not carry it).
+    /// Parses a `.crc` file body for `version`, which comes from the filename because the body does
+    /// not carry it.
+    ///
+    /// Returns the validated in-memory CRC state. Returns an error if the body is not valid CRC
+    /// JSON or violates CRC invariants.
+    #[internal_api]
     pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> DeltaResult<Self> {
         let raw: CrcRaw = serde_json::from_slice(bytes)?;
         // Per the Delta protocol spec, numMetadata and numProtocol MUST be 1 in any CRC file.
@@ -180,6 +186,16 @@ impl Crc {
             if value != 1 {
                 return Err(Error::generic(format!(
                     "CRC file has invalid {name}: expected 1, got {value}"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("numFiles", raw.num_files),
+            ("tableSizeBytes", raw.table_size_bytes),
+        ] {
+            if value < 0 {
+                return Err(Error::generic(format!(
+                    "CRC file has invalid {name}: expected a non-negative value, got {value}"
                 )));
             }
         }
@@ -656,11 +672,16 @@ mod tests {
 
     /// Minimal CRC JSON with the supplied numMetadata / numProtocol values; used to construct
     /// invalid CRCs and verify rejection.
-    fn crc_json_with_counts(num_metadata: i64, num_protocol: i64) -> String {
+    fn crc_json_with_counts(
+        table_size_bytes: i64,
+        num_files: i64,
+        num_metadata: i64,
+        num_protocol: i64,
+    ) -> String {
         format!(
             r#"{{
-                "tableSizeBytes": 0,
-                "numFiles": 0,
+                "tableSizeBytes": {table_size_bytes},
+                "numFiles": {num_files},
                 "numMetadata": {num_metadata},
                 "numProtocol": {num_protocol},
                 "metadata": {{
@@ -687,13 +708,31 @@ mod tests {
         #[values(0i64, 2, 3, -1)] bad: i64,
     ) {
         let (m, p) = counts(bad);
-        let json = crc_json_with_counts(m, p);
+        let json = crc_json_with_counts(0, 0, m, p);
         let err = Crc::try_from_json_bytes(json.as_bytes(), 0)
             .unwrap_err()
             .to_string();
         assert!(
             err.contains(field),
             "expected error to mention {field} for value {bad}, got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::num_files("numFiles", 0, -1)]
+    #[case::table_size_bytes("tableSizeBytes", -1, 0)]
+    fn de_negative_file_stat_is_rejected(
+        #[case] field: &str,
+        #[case] table_size_bytes: i64,
+        #[case] num_files: i64,
+    ) {
+        let json = crc_json_with_counts(table_size_bytes, num_files, 1, 1);
+        let err = Crc::try_from_json_bytes(json.as_bytes(), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(field),
+            "expected error to mention {field}: {err}"
         );
     }
 

@@ -95,13 +95,14 @@ void print_table_type(TableType tt) {
   }
 }
 
-// utility to print out a log-segment load type
-void print_load_type(LogSegmentLoadType lt) {
+// utility to print out a snapshot load type
+void print_load_type(SnapshotLoadType lt) {
   printf("  load_type:");
   switch (lt) {
-  case LogSegmentLoadTypeFull: printf(" Full,\n"); break;
-  case LogSegmentLoadTypeIncremental: printf(" Incremental,\n"); break;
-  case LogSegmentLoadTypeUnknown: printf(" Unknown,\n"); break;
+  case SnapshotLoadTypeFull: printf(" Full,\n"); break;
+  case SnapshotLoadTypeIncremental: printf(" Incremental,\n"); break;
+  case SnapshotLoadTypeSnapshotHint: printf(" SnapshotHint,\n"); break;
+  case SnapshotLoadTypeUnknown: printf(" Unknown,\n"); break;
   }
 }
 

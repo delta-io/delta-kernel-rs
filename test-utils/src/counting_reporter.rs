@@ -1,14 +1,17 @@
-//! A [`MetricsReporter`] implementation that accumulates operation counts via atomic counters.
+//! A [`MetricsReporter`] implementation that accumulates operation counts via thread-safe counters.
 //!
 //! Useful in tests to assert exact IO costs and in benchmarks to print per-call IO profiles.
 //! Attach it to a `DefaultEngine` via `DefaultEngineBuilder::with_metrics_reporter`, then
 //! inspect the counters or call [`CountingReporter::print_summary`].
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use delta_kernel::metrics::{
-    CommitFailureReason, MetricEvent, MetricsReporter, WithMetricsReporterLayer as _,
+    CommitFailureReason, MetricEvent, MetricsReporter, SnapshotLoadType,
+    WithMetricsReporterLayer as _,
 };
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -114,6 +117,56 @@ impl RelaxedCounter {
     }
 }
 
+/// Status label for a snapshot completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SnapshotCompletionStatus {
+    /// The snapshot was constructed successfully.
+    Success,
+    /// Snapshot construction failed.
+    Failure,
+}
+
+/// Counts occurrences grouped by a caller-defined set of labels.
+#[derive(Debug)]
+pub struct LabeledCounter<L>(Mutex<HashMap<L, u64>>);
+
+impl<L> Default for LabeledCounter<L> {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+}
+
+impl<L: Eq + Hash> LabeledCounter<L> {
+    /// Returns the count for the supplied labels.
+    ///
+    /// Returns zero when no occurrence with those labels has been reported.
+    pub fn get(&self, labels: &L) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(labels)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Reset every labeled count to zero.
+    pub fn reset(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Increments the count for the supplied labels by one.
+    pub fn inc(&self, labels: L) {
+        let mut counts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *counts.entry(labels).or_default() += 1;
+    }
+}
+
 /// Accumulates storage and operation metrics via the [`MetricsReporter`] interface.
 ///
 /// # Note: update [`reset`] and the `MetricsReporter` impl when adding fields.
@@ -153,8 +206,8 @@ pub struct CountingReporter {
     pub parquet_bytes_read: RelaxedCounter,
 
     // Operation-level counters
-    /// Number of completed snapshot constructions.
-    pub snapshot_completions: RelaxedCounter,
+    /// Number of snapshot completions, labeled by status and load type.
+    pub snapshot_completions: LabeledCounter<(SnapshotCompletionStatus, SnapshotLoadType)>,
     /// Number of full (non-incremental) log segment loads. Each fresh snapshot construction
     /// from a table root contributes one load; incremental snapshot updates do not.
     pub log_segment_loads: RelaxedCounter,
@@ -310,8 +363,9 @@ impl MetricsReporter for CountingReporter {
                 self.parquet_files_read.add(e.num_files);
                 self.parquet_bytes_read.add(e.bytes_read);
             }
-            MetricEvent::SnapshotBuildSuccess(_) => {
-                self.snapshot_completions.inc();
+            MetricEvent::SnapshotBuildSuccess(e) => {
+                self.snapshot_completions
+                    .inc((SnapshotCompletionStatus::Success, e.load_type));
             }
             MetricEvent::LogSegmentLoadSuccess(e) => {
                 self.log_segment_loads.inc();
@@ -348,6 +402,10 @@ impl MetricsReporter for CountingReporter {
             MetricEvent::SetTransactionLoadFailure => {
                 self.set_transaction_load_failures.inc();
             }
+            MetricEvent::SnapshotBuildFailure(e) => {
+                self.snapshot_completions
+                    .inc((SnapshotCompletionStatus::Failure, e.load_type));
+            }
             MetricEvent::TransactionCommitSuccess(e) => {
                 self.transaction_commits.inc();
                 self.commit_add_files.add(e.num_add_files);
@@ -364,7 +422,6 @@ impl MetricsReporter for CountingReporter {
             MetricEvent::ProtocolMetadataLoadSuccess(_)
             | MetricEvent::ProtocolMetadataLoadFailure(_)
             | MetricEvent::LogSegmentLoadFailure(_)
-            | MetricEvent::SnapshotBuildFailure(_)
             | MetricEvent::CrcReadFailure
             | MetricEvent::ScanMetadataCompleted(_) => {}
         }
@@ -397,10 +454,11 @@ mod tests {
     use std::time::Duration;
 
     use delta_kernel::metrics::{
-        CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadSuccess, LogSegmentLoadType,
-        MetricId, ProtocolMetadataLoadSuccess, ProtocolMetadataSource, SetTransactionLoadSuccess,
-        SnapshotBuildFailure, SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted,
-        StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,
+        CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadSuccess, MetricId,
+        ProtocolMetadataLoadSuccess, ProtocolMetadataSource, SetTransactionLoadSuccess,
+        SnapshotBuildFailure, SnapshotBuildSuccess, SnapshotLoadType, StorageCopyCompleted,
+        StorageListCompleted, StorageReadCompleted, TableType, TransactionCommitFailure,
+        TransactionCommitSuccess,
     };
 
     use super::*;
@@ -447,17 +505,63 @@ mod tests {
     }
 
     #[test]
-    fn report_snapshot_completed_increments_snapshot_counter() {
+    fn report_snapshot_successes_share_one_counter_across_load_types() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
-            operation_id: MetricId::new(),
-            table_type: TableType::PathBased,
-            correlation_id: None,
-            load_type: LogSegmentLoadType::Full,
-            version: 0,
-            duration: dur(),
-        }));
-        assert_eq!(reporter.snapshot_completions.get(), 1);
+        for load_type in [
+            SnapshotLoadType::Full,
+            SnapshotLoadType::Incremental,
+            SnapshotLoadType::SnapshotHint,
+        ] {
+            reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
+                operation_id: MetricId::new(),
+                table_type: TableType::PathBased,
+                correlation_id: None,
+                load_type,
+                version: 7,
+                duration: dur(),
+            }));
+            assert_eq!(
+                reporter
+                    .snapshot_completions
+                    .get(&(SnapshotCompletionStatus::Success, load_type)),
+                1
+            );
+            assert_eq!(
+                reporter
+                    .snapshot_completions
+                    .get(&(SnapshotCompletionStatus::Failure, load_type)),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn report_snapshot_failures_share_one_counter_across_load_types() {
+        let reporter = CountingReporter::new();
+        for load_type in [
+            SnapshotLoadType::Full,
+            SnapshotLoadType::Incremental,
+            SnapshotLoadType::SnapshotHint,
+        ] {
+            reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
+                operation_id: MetricId::new(),
+                table_type: TableType::PathBased,
+                correlation_id: None,
+                load_type,
+            }));
+            assert_eq!(
+                reporter
+                    .snapshot_completions
+                    .get(&(SnapshotCompletionStatus::Success, load_type)),
+                0
+            );
+            assert_eq!(
+                reporter
+                    .snapshot_completions
+                    .get(&(SnapshotCompletionStatus::Failure, load_type)),
+                1
+            );
+        }
     }
 
     #[test]
@@ -467,7 +571,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
-            load_type: LogSegmentLoadType::Full,
+            load_type: SnapshotLoadType::Full,
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,
@@ -488,7 +592,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
-            load_type: LogSegmentLoadType::Full,
+            load_type: SnapshotLoadType::Full,
             duration: dur(),
             num_commit_files: 3,
             num_checkpoint_files: 1,
@@ -618,18 +722,23 @@ mod tests {
                 operation_id: MetricId::new(),
                 table_type: TableType::PathBased,
                 correlation_id: None,
-                load_type: LogSegmentLoadType::Full,
+                load_type: SnapshotLoadType::Full,
                 source: ProtocolMetadataSource::FullReplay,
                 duration: dur(),
             },
         ));
-        reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
-            operation_id: MetricId::new(),
-            table_type: TableType::PathBased,
-            correlation_id: None,
-            load_type: LogSegmentLoadType::Full,
-        }));
-        assert_eq!(reporter.snapshot_completions.get(), 0);
+        assert_eq!(
+            reporter
+                .snapshot_completions
+                .get(&(SnapshotCompletionStatus::Success, SnapshotLoadType::Full)),
+            0
+        );
+        assert_eq!(
+            reporter
+                .snapshot_completions
+                .get(&(SnapshotCompletionStatus::Failure, SnapshotLoadType::Full)),
+            0
+        );
     }
 
     #[test]
@@ -651,7 +760,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
-            load_type: LogSegmentLoadType::Full,
+            load_type: SnapshotLoadType::Full,
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,
@@ -676,6 +785,20 @@ mod tests {
                 duration: dur(),
             },
         ));
+        reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
+            operation_id: MetricId::new(),
+            table_type: TableType::PathBased,
+            correlation_id: None,
+            load_type: SnapshotLoadType::SnapshotHint,
+            version: 0,
+            duration: dur(),
+        }));
+        reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
+            operation_id: MetricId::new(),
+            table_type: TableType::PathBased,
+            correlation_id: None,
+            load_type: SnapshotLoadType::SnapshotHint,
+        }));
 
         reporter.reset();
 
@@ -691,7 +814,20 @@ mod tests {
         assert_eq!(reporter.parquet_read_calls.get(), 0);
         assert_eq!(reporter.parquet_files_read.get(), 0);
         assert_eq!(reporter.parquet_bytes_read.get(), 0);
-        assert_eq!(reporter.snapshot_completions.get(), 0);
+        assert_eq!(
+            reporter.snapshot_completions.get(&(
+                SnapshotCompletionStatus::Success,
+                SnapshotLoadType::SnapshotHint
+            )),
+            0
+        );
+        assert_eq!(
+            reporter.snapshot_completions.get(&(
+                SnapshotCompletionStatus::Failure,
+                SnapshotLoadType::SnapshotHint
+            )),
+            0
+        );
         assert_eq!(reporter.log_segment_loads.get(), 0);
         assert_eq!(reporter.commit_files.get(), 0);
         assert_eq!(reporter.checkpoint_files.get(), 0);
