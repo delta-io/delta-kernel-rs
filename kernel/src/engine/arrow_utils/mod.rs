@@ -2968,6 +2968,33 @@ mod tests {
     }
 
     #[test]
+    fn list_element_cast_propagates_invalid_nested_ids_error() {
+        let requested_schema: SchemaRef = schema! {
+            (StructField::not_null("values", ArrayType::new(DataType::LONG, false)).with_metadata(
+                [(
+                    ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
+                    MetadataValue::String("not a json object".to_string()),
+                )],
+            )),
+        }
+        .into();
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "values",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "element",
+                ArrowDataType::Int32,
+                false,
+            ))),
+            false,
+        )]));
+
+        assert_result_error_with_message(
+            get_requested_indices(&requested_schema, &parquet_schema),
+            "must be a JSON object",
+        );
+    }
+
+    #[test]
     fn list_skip_earlier_element() {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = schema! {
