@@ -14,9 +14,9 @@
 #   vars.OMNIGENT_BOT_APP_ID + secrets.OMNIGENT_BOT_APP_KEY
 #
 # Ready PRs from authors with write-or-higher permission are reviewed
-# automatically and published to the workflow summary and a non-blocking PR
-# check. Authorized actors can also trigger a review manually with a /review
-# comment or workflow dispatch.
+# automatically and published as an inline review with a non-blocking PR check.
+# Authorized actors can also trigger a review manually with a /review comment or
+# workflow dispatch.
 # =============================================================================
 name: AI PR Review
 
@@ -139,7 +139,7 @@ jobs:
               ;;
             pull_request_target)
               n="$PR_NUMBER"
-              mode=summary
+              mode=inline
               auth_subject="$PR_AUTHOR"
               ;;
             workflow_dispatch)
