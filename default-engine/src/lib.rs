@@ -199,15 +199,15 @@ pub struct DefaultEngine<E: TaskExecutor> {
 ///
 /// ```no_run
 /// # use std::sync::Arc;
-/// # use delta_kernel_default_engine::DefaultEngineBuilder;
+/// # use delta_kernel_default_engine::{storage::EngineStore, DefaultEngineBuilder};
 /// # use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 /// # use delta_kernel::object_store::local::LocalFileSystem;
 /// // Build a DefaultEngine with default executor
-/// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+/// let engine = DefaultEngineBuilder::new(EngineStore::plain(Arc::new(LocalFileSystem::new())))
 ///     .build();
 ///
 /// // Build with a custom executor
-/// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+/// let engine = DefaultEngineBuilder::new(EngineStore::plain(Arc::new(LocalFileSystem::new())))
 ///     .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
 ///     .build();
 /// ```
@@ -246,13 +246,23 @@ struct ReadIoConfig {
 pub struct DefaultTaskExecutor;
 
 impl DefaultEngineBuilder<DefaultTaskExecutor> {
-    /// Create a new [`DefaultEngineBuilder`] with the default executor.
+    /// Create a [`DefaultEngineBuilder`] with `store` and the default executor.
     ///
-    /// For cloud stores, prefer [`from_url_opts`](Self::from_url_opts): a `dyn ObjectStore` cannot
-    /// expose provider-specific paginated listing support.
-    pub fn new(store: impl Into<EngineStore>) -> Self {
+    /// Use [`EngineStore::with_paginated`] for cloud stores or [`Self::from_url_opts`] to preserve
+    /// directory and offset pushdown. [`EngineStore::plain`] explicitly opts into listing the whole
+    /// directory before applying the offset.
+    ///
+    /// Bare object stores are not accepted because they would silently lose listing capabilities:
+    ///
+    /// ```compile_fail
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::object_store::memory::InMemory;
+    /// # use delta_kernel_default_engine::{storage::EngineStore, DefaultEngineBuilder};
+    /// DefaultEngineBuilder::new(Arc::new(InMemory::new()));
+    /// ```
+    pub fn new(store: EngineStore) -> Self {
         Self {
-            store: store.into(),
+            store,
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
         }
@@ -329,9 +339,10 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     ///
     /// # Parameters
     ///
-    /// - `object_store`: The object store to use.
-    pub fn builder(object_store: Arc<DynObjectStore>) -> DefaultEngineBuilder<DefaultTaskExecutor> {
-        DefaultEngineBuilder::new(object_store)
+    /// - `store`: The backing store with explicit listing capabilities. Use
+    ///   [`EngineStore::with_paginated`] or [`EngineStore::from_url_opts`] for cloud stores.
+    pub fn builder(store: EngineStore) -> DefaultEngineBuilder<DefaultTaskExecutor> {
+        DefaultEngineBuilder::new(store)
     }
 }
 
@@ -501,7 +512,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(object_store).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(object_store)).build();
         test_arrow_engine(&engine, &url);
     }
 
@@ -510,7 +521,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(object_store).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(object_store)).build();
         test_arrow_engine(&engine, &url);
     }
 
@@ -526,7 +537,7 @@ mod tests {
         let executor = Arc::new(executor::tokio::TokioMultiThreadExecutor::new(
             rt.handle().clone(),
         ));
-        let engine = DefaultEngineBuilder::new(object_store)
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(object_store))
             .with_task_executor(executor)
             .build();
         test_arrow_engine(&engine, &url);
@@ -537,7 +548,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::builder(object_store).build();
+        let engine = DefaultEngine::builder(EngineStore::plain(object_store)).build();
         test_arrow_engine(&engine, &url);
     }
 
@@ -547,7 +558,7 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        let engine = DefaultEngineBuilder::new(object_store)
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(object_store))
             .with_task_executor(executor)
             .with_buffer_size(NonZero::new(4).unwrap())
             .with_batch_size(NonZero::new(8).unwrap())

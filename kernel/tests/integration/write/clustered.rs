@@ -16,6 +16,7 @@ use delta_kernel::Snapshot;
 use itertools::Itertools;
 use tempfile::TempDir;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     create_default_engine_mt_executor, nested_batches, nested_schema, read_actions_from_commit,
@@ -47,9 +48,11 @@ async fn test_checkpoint_non_kernel_written_table() {
         ),
     );
     let engine: Arc<test_utils::delta_kernel_default_engine::DefaultEngine<_>> = Arc::new(
-        test_utils::delta_kernel_default_engine::DefaultEngineBuilder::new(store)
-            .with_task_executor(executor)
-            .build(),
+        test_utils::delta_kernel_default_engine::DefaultEngineBuilder::new(EngineStore::plain(
+            store,
+        ))
+        .with_task_executor(executor)
+        .build(),
     );
 
     // Read data before checkpoint

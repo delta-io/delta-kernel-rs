@@ -32,6 +32,7 @@ use delta_kernel::transforms::{transform_output_type, SchemaTransform};
 use test_utils::delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     add_commit, create_add_files_metadata, into_record_batch, read_add_infos, test_table_setup_mt,
@@ -322,7 +323,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(EngineStore::plain(store.clone()))
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))
@@ -447,7 +448,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
 
 fn make_default_engine_and_store() -> (Arc<InMemory>, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     let storage = Arc::new(InMemory::new());
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     (storage, engine)
 }
 

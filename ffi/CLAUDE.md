@@ -41,6 +41,10 @@ the caller's memory space.
 get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> scan() -> scan_metadata() -> read + transform
 ```
 
+Default-engine construction preserves cloud listing capabilities through `EngineStore::from_url_opts`.
+Rust-side tests and custom stores must choose `EngineStore::with_paginated` or `EngineStore::plain`
+explicitly; the latter collects direct children before offset filtering.
+
 Snapshot builder API (`ffi/src/lib.rs`):
 - `get_snapshot_builder(path, engine)` -- fresh snapshot from a table path
 - `get_snapshot_builder_from(old_snapshot, engine)` -- incremental update reusing an existing snapshot (avoids re-reading the log)

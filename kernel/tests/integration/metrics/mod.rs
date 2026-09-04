@@ -23,6 +23,7 @@ use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{
@@ -51,7 +52,7 @@ fn measuring_engine(
     tracing::subscriber::DefaultGuard,
 ) {
     let reporter = Arc::new(CountingReporter::default());
-    let engine = DefaultEngineBuilder::new(store).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(store)).build();
     let guard = install_thread_local_metrics_reporter(reporter.clone());
     (engine, reporter, guard)
 }

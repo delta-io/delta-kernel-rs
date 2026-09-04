@@ -864,6 +864,7 @@ mod tests {
 
     use delta_kernel::expressions::{col, lit, Scalar};
     use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
+    use delta_kernel_default_engine::storage::EngineStore;
     use rstest::rstest;
 
     use super::*;
@@ -1482,7 +1483,7 @@ mod tests {
             .await
             .unwrap();
 
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         let scan = snapshot
             .scan_builder()
@@ -1615,7 +1616,7 @@ mod tests {
             .await
             .unwrap();
 
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         let scan = snapshot
             .scan_builder()

@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel_default_engine::storage::store_from_url;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::{DeltaResult, Snapshot};
 
@@ -53,7 +53,7 @@ fn main() -> DeltaResult<()> {
     let url = delta_kernel::try_parse_uri(&table_path)?;
 
     // 2. Build an object store and engine
-    let store = store_from_url(&url)?;
+    let store = EngineStore::from_url(&url)?;
     let engine = DefaultEngine::builder(store).build();
 
     // 3. Get a snapshot of the table at the latest version
@@ -89,13 +89,13 @@ let url = delta_kernel::try_parse_uri(&table_path)?;
 ### 2. Build an object store and engine
 
 ```rust,ignore
-let store = store_from_url(&url)?;
+let store = EngineStore::from_url(&url)?;
 let engine = DefaultEngine::builder(store).build();
 ```
 
-`store_from_url` creates an object store from the URL. For cloud storage with custom credentials,
-use `store_from_url_opts` instead. See [Configuring Storage](../storage/configuring_storage.md)
-for S3, Azure, and GCS options.
+`EngineStore::from_url` creates a store from the URL while preserving its listing capabilities.
+For cloud storage with custom credentials, use `EngineStore::from_url_opts` instead.
+See [Configuring Storage](../storage/configuring_storage.md) for S3, Azure, and GCS options.
 
 `DefaultEngine::builder(store).build()` constructs the default engine, which handles all I/O
 (Parquet, JSON, file listing) and expression evaluation using Arrow.

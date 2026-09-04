@@ -13,6 +13,7 @@ use delta_kernel::{
     JsonHandler, ParquetHandler, Snapshot, StorageHandler,
 };
 use rstest::rstest;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     actions_to_string, add_commit, generate_simple_batch, load_test_data, record_batch_to_bytes,
@@ -59,7 +60,7 @@ async fn precancelled_scan_yields_cancelled(
     #[case] stats: Option<StatsOptions>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, table_root) = json_only_table().await?;
-    let engine = DefaultEngineBuilder::new(storage).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
@@ -105,7 +106,7 @@ fn assert_cancelled<
 #[tokio::test]
 async fn uncancelled_json_scan_completes() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, table_root) = json_only_table().await?;
-    let engine = DefaultEngineBuilder::new(storage).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let scan = snapshot.clone().scan_builder().build()?;
@@ -132,7 +133,7 @@ async fn uncancelled_json_scan_completes() -> Result<(), Box<dyn std::error::Err
 async fn mid_stream_cancellation_yields_exactly_one_error() -> Result<(), Box<dyn std::error::Error>>
 {
     let (storage, table_root) = json_only_table().await?;
-    let engine = DefaultEngineBuilder::new(storage).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token = Arc::new(TestCancellationToken::default());
@@ -221,7 +222,9 @@ fn assert_token_recovered_by_identity(
 async fn engine_receives_the_callers_token_by_identity_json(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, table_root) = json_only_table().await?;
-    let engine = TokenCapturingEngine::new(Arc::new(DefaultEngineBuilder::new(storage).build()));
+    let engine = TokenCapturingEngine::new(Arc::new(
+        DefaultEngineBuilder::new(EngineStore::plain(storage)).build(),
+    ));
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token = Arc::new(TestCancellationToken::default());
@@ -266,7 +269,7 @@ async fn engine_receives_the_callers_token_by_identity_parquet(
 async fn parallel_scan_metadata_errors_when_token_set() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, table_root) = json_only_table().await?;
     let engine: Arc<dyn delta_kernel::Engine> =
-        Arc::new(DefaultEngineBuilder::new(storage).build());
+        Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage)).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
@@ -288,7 +291,7 @@ async fn parallel_scan_metadata_errors_when_token_set() -> Result<(), Box<dyn st
 #[tokio::test]
 async fn precancelled_snapshot_build_yields_cancelled() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, table_root) = json_only_table().await?;
-    let engine = DefaultEngineBuilder::new(storage).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
     let result = Snapshot::builder_for(table_root)
@@ -308,7 +311,7 @@ async fn precancelled_snapshot_build_yields_cancelled() -> Result<(), Box<dyn st
 async fn snapshot_build_with_uncancelled_token_succeeds() -> Result<(), Box<dyn std::error::Error>>
 {
     let (storage, table_root) = json_only_table().await?;
-    let engine = DefaultEngineBuilder::new(storage).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
     let with_token = Snapshot::builder_for(table_root)
@@ -410,9 +413,11 @@ async fn snapshot_build_cancelled_during_listing() -> Result<(), Box<dyn std::er
     let (storage, table_root) = json_only_table().await?;
     let token = Arc::new(TestCancellationToken::default());
     let engine = CancelOnListEngine {
-        inner: Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+        inner: Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build()),
         storage: Arc::new(CancelOnListHandler {
-            inner: DefaultEngineBuilder::new(storage).build().storage_handler(),
+            inner: DefaultEngineBuilder::new(EngineStore::plain(storage))
+                .build()
+                .storage_handler(),
             token: token.clone(),
         }),
     };
@@ -434,7 +439,7 @@ async fn snapshot_build_cancelled_during_listing() -> Result<(), Box<dyn std::er
 async fn precancelled_incremental_snapshot_build_yields_cancelled(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, table_root) = json_only_table().await?;
-    let engine = DefaultEngineBuilder::new(storage).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
 
     let base = Snapshot::builder_for(table_root).build(&engine)?;
 

@@ -29,6 +29,7 @@ use delta_kernel::scan::{Scan, StatsOptions};
 use delta_kernel::schema::{schema_ref, DataType, MetadataColumnSpec, Schema, StructField};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
@@ -86,7 +87,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
@@ -145,7 +146,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let engine = DefaultEngineBuilder::new(storage.clone()).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
@@ -209,7 +210,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let engine = DefaultEngineBuilder::new(storage.clone()).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected];
@@ -293,7 +294,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
@@ -1096,7 +1097,7 @@ async fn test_partition_pruning_with_column_mapping(
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     // Predicates use logical column names -- kernel must map to physical names. The
@@ -1464,7 +1465,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let predicate = Pred::eq(col!("id"), lit(2));
@@ -1522,7 +1523,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let predicate = Pred::eq(col!("val"), lit("g"));
@@ -1802,7 +1803,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
             .await?;
     }
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
 
     // Create a schema that includes a row index metadata column
     let schema = schema_ref! {
@@ -1895,7 +1896,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
             .await?;
     }
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
 
     // Create a schema that includes the file path metadata column
     let schema = schema_ref! {
@@ -1988,7 +1989,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
 
     // Test that unsupported metadata columns fail with appropriate errors
     let test_cases = [
@@ -2055,7 +2056,7 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
 
     let invalid_files = [
         "_delta_log/0.zip",
@@ -2437,7 +2438,7 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
         .put(&Path::from("file3.parquet"), file3_bytes.into())
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let row_count = |predicate_us: i64| -> Result<usize, Box<dyn std::error::Error>> {
@@ -2517,7 +2518,7 @@ async fn read_table_with_void_column() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     // The table schema has both "id" and "void_col"
@@ -2600,7 +2601,7 @@ async fn explicit_projection_with_void_column_returns_nulls(
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     // Explicitly request both columns, including the void one
@@ -2669,7 +2670,7 @@ async fn read_table_with_void_in_nested_struct() -> Result<(), Box<dyn std::erro
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     // Table schema has the void field inside nested struct
@@ -2854,7 +2855,7 @@ async fn scan_with_void_schema(
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
     Ok(read_scan(&scan, engine)?)
@@ -2974,7 +2975,7 @@ async fn read_all_void_table() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     // Schema should contain both void columns
@@ -3020,7 +3021,7 @@ async fn read_table_with_void_partition_column() -> Result<(), Box<dyn std::erro
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     let scan = snapshot.scan_builder().build()?;
@@ -3065,7 +3066,7 @@ async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     // Predicate: void_col IS NULL — always true for void, should return all rows

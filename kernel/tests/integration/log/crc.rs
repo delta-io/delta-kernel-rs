@@ -23,6 +23,7 @@ use delta_kernel::{
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     add_commit, begin_transaction, copy_directory, insert_data, test_table_setup,
@@ -40,7 +41,7 @@ async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
     let table_root = url::Url::from_directory_path(path).unwrap();
 
     let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngineBuilder::new(store).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(store)).build();
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 0);
@@ -232,7 +233,7 @@ async fn test_crc_returns_resolved_crc_at_snapshot_version() -> DeltaResult<()> 
     let table_root = url::Url::from_directory_path(path).unwrap();
 
     let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngineBuilder::new(store).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(store)).build();
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 0);

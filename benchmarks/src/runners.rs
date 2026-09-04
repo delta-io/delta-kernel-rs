@@ -16,6 +16,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, StatsOptions};
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_unity_catalog::snapshot_builder_from_load_table;
 use delta_kernel_workloads::models::{
@@ -47,10 +48,7 @@ pub fn configured_benchmark_name(
     format!("{}/{case_name}/{config_name}", table_info.name)
 }
 
-fn build_engine(
-    store: Arc<delta_kernel::object_store::DynObjectStore>,
-    runtime: Arc<tokio::runtime::Runtime>,
-) -> Arc<dyn Engine> {
+fn build_engine(store: EngineStore, runtime: Arc<tokio::runtime::Runtime>) -> Arc<dyn Engine> {
     let executor = TokioMultiThreadExecutor::new(runtime.handle().clone());
     Arc::new(
         DefaultEngine::builder(store)
@@ -145,8 +143,8 @@ fn resolve_snapshot_strategy(
     let table_url = Url::parse(&resp.metadata.location)?;
 
     let opts = object_store_options(&creds.storage_credentials);
-    let (store, _) = delta_kernel::object_store::parse_url_opts(&table_url, opts)?;
-    let engine = build_engine(store.into(), runtime);
+    let store = EngineStore::from_url_opts(&table_url, opts)?;
+    let engine = build_engine(store, runtime);
 
     Ok((
         engine,
@@ -198,10 +196,13 @@ fn resolve_engine_for_url(
                     opts.push((opt_key, v));
                 }
             }
-            let (store, _) = delta_kernel::object_store::parse_url_opts(url, opts)?;
-            Ok(build_engine(store.into(), runtime))
+            let store = EngineStore::from_url_opts(url, opts)?;
+            Ok(build_engine(store, runtime))
         }
-        "file" => Ok(build_engine(Arc::new(LocalFileSystem::new()), runtime)),
+        "file" => Ok(build_engine(
+            EngineStore::plain(Arc::new(LocalFileSystem::new())),
+            runtime,
+        )),
         scheme => Err(format!(
             "Unsupported scheme '{scheme}': only s3://, s3a://, and file:// are supported"
         )

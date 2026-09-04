@@ -18,6 +18,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{insert_data, test_table_setup, test_table_setup_mt};
 use url::Url;
@@ -159,7 +160,8 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
         .build()?;
     let store = table.store().clone();
     let table_url = Url::parse(table.table_root()).unwrap();
-    let setup_engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+    let setup_engine =
+        Arc::new(DefaultEngineBuilder::new(EngineStore::plain(store.clone())).build());
 
     // Write a compacted log file covering versions 0-2 using the public API
     let snap2 = Snapshot::builder_for(table.table_root()).build(setup_engine.as_ref())?;

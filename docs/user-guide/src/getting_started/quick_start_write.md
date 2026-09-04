@@ -37,7 +37,7 @@ use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
-use delta_kernel_default_engine::storage::store_from_url;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
@@ -52,7 +52,7 @@ async fn main() -> DeltaResult<()> {
     let url = delta_kernel::try_parse_uri(&table_path)?;
 
     // Build the engine
-    let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+    let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 
     // 1. Create the table
     let schema = Arc::new(StructType::try_new(vec![

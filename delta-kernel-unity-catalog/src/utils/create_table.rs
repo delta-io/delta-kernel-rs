@@ -198,6 +198,7 @@ mod tests {
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
+    use delta_kernel_default_engine::storage::EngineStore;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use test_utils::TestCatalogCommitter;
@@ -246,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_uc_create_table_request() {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let table_path = "memory:///test_create_req/";
         let schema = schema_ref! {
             nullable "id": INTEGER,
@@ -312,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_uc_create_table_request_forwards_row_tracking() {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let table_path = "memory:///test_row_tracking/";
         let schema = schema_ref! { nullable "id": INTEGER };
 
@@ -332,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_uc_create_table_request_silently_drops_user_domain_metadata() {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let table_path = "memory:///test_user_domain/";
         let schema = schema_ref! { nullable "id": INTEGER };
 
@@ -370,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn test_clustering_columns_forwarded(#[case] column_mapping: bool) {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let table_path = "memory:///test_clustering/";
         let schema = schema_ref! {
             nullable "id": INTEGER,
@@ -409,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_uc_create_table_request_rejects_non_zero_version() {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let table_path = "memory:///test_create_req_version/";
         let schema = schema_ref! { nullable "id": INTEGER };
 

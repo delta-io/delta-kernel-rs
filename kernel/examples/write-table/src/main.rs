@@ -18,6 +18,7 @@ use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
 use url::Url;
@@ -76,8 +77,7 @@ async fn try_main() -> DeltaResult<()> {
     println!("Using Delta table at: {url}");
 
     // Get the engine for local filesystem
-    use delta_kernel_default_engine::storage::store_from_url;
-    let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::from_url(&url)?).build();
 
     // Create or get the table
     let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;

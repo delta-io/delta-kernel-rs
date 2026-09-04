@@ -30,7 +30,7 @@ use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot};
-use delta_kernel_default_engine::storage::store_from_url_opts;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel_unity_catalog::{
     aws_object_store_options, build_uc_create_table_request, get_required_properties_for_disk,
@@ -156,7 +156,7 @@ async fn live_create_table() {
     // ===== Step 2: Build the engine over the staging storage location =====
     let table_root =
         normalize_table_root(&Url::parse(&resp.location).expect("location is not a valid URL"));
-    let store = store_from_url_opts(
+    let store = EngineStore::from_url_opts(
         &table_root,
         aws_object_store_options(&resp.storage_credentials, "us-east-1"),
     )

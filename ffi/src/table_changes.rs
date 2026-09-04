@@ -346,6 +346,7 @@ mod tests {
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::schema::{schema_ref, StructType};
     use delta_kernel::Engine;
+    use delta_kernel_default_engine::storage::EngineStore;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
@@ -543,7 +544,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
@@ -631,7 +632,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
@@ -688,7 +689,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
@@ -771,7 +772,7 @@ mod tests {
         commit_remove_file(table_root, storage.as_ref(), 2, PARQUET_FILE1.to_string()).await?;
         commit_remove_file(table_root, storage.as_ref(), 3, PARQUET_FILE2.to_string()).await?;
 
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage)).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {

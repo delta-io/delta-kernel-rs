@@ -30,6 +30,7 @@ use test_utils::delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
@@ -46,7 +47,7 @@ fn setup_test() -> (
 ) {
     let storage = Arc::new(InMemory::new());
     let table_root = Url::parse("memory:///").unwrap();
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     (storage, engine, table_root)
 }
 
@@ -807,7 +808,7 @@ impl CustomBatchSizeEngine {
                 .with_batch_size(NonZero::new(batch_size).expect("batch_size is non-zero")),
         );
         let inner = Arc::new(
-            DefaultEngineBuilder::new(storage)
+            DefaultEngineBuilder::new(EngineStore::plain(storage))
                 .with_task_executor(task_executor)
                 .build(),
         );

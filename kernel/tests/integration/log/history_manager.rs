@@ -11,6 +11,7 @@ use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot, Version};
 use rstest::rstest;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
 use test_utils::{build_snapshot, test_table_setup};
@@ -43,7 +44,7 @@ async fn test_get_earliest_commit(
         .with_log_state(LogState::with_latest_version(8).with_checkpoint_at([5]))
         .build()?;
     let store = table.store().clone();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(store.clone())).build();
     let log_root = Url::parse(table.table_root())?.join("_delta_log/")?;
 
     if let Some(versions) = cleanup {

@@ -7,6 +7,7 @@ use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_unity_catalog::{
     get_required_properties_for_disk, snapshot_builder_from_load_table, UCCommitter,
@@ -72,7 +73,7 @@ async fn setup() -> Result<TestSetup, TestError> {
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
-    let engine = delta_kernel_default_engine::DefaultEngineBuilder::new(store)
+    let engine = delta_kernel_default_engine::DefaultEngineBuilder::new(EngineStore::plain(store))
         .with_task_executor(executor)
         .build();
     let table_uri = url::Url::from_directory_path(tmp_dir.path()).map_err(|_| "invalid path")?;
@@ -248,7 +249,7 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
         tokio::runtime::Handle::current(),
     ));
     let engine = Arc::new(
-        delta_kernel_default_engine::DefaultEngineBuilder::new(store)
+        delta_kernel_default_engine::DefaultEngineBuilder::new(EngineStore::plain(store))
             .with_task_executor(executor)
             .build(),
     );

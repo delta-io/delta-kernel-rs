@@ -32,7 +32,10 @@ impl std::fmt::Debug for EngineStore {
 }
 
 impl EngineStore {
-    /// Create a store without provider-specific paginated listing support.
+    /// Create a store from `object_store` without provider-specific paginated listing support.
+    ///
+    /// Listing retrieves every direct child in the directory before applying the requested offset.
+    /// Prefer [`Self::with_paginated`] for cloud stores to avoid listing older files unnecessarily.
     pub fn plain(object_store: Arc<DynObjectStore>) -> Self {
         Self {
             object_store,
@@ -40,7 +43,10 @@ impl EngineStore {
         }
     }
 
-    /// The one `Arc` backs both reads and listing, so they cannot diverge.
+    /// Create a store from `store` that preserves provider-specific paginated listing support.
+    ///
+    /// The same store handles reads and listing. Where supported, listing pushes both the directory
+    /// delimiter and starting offset into the storage request and fetches pages on demand.
     pub fn with_paginated<S: ObjectStore + PaginatedListStore + 'static>(store: Arc<S>) -> Self {
         Self {
             object_store: store.clone(),
@@ -48,21 +54,41 @@ impl EngineStore {
         }
     }
 
-    /// Delimiter-pushdown capable for S3, GCS, and Azure, plain otherwise.
+    /// Create a store for `url` with default options, preserving its listing capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URL or storage configuration is invalid, or a custom handler fails.
+    pub fn from_url(url: &Url) -> DeltaResult<Self> {
+        Self::from_url_opts(url, std::iter::empty::<(&str, &str)>())
+    }
+
+    /// Create a store for `url` using the provider-specific `options`.
+    ///
+    /// Built-in S3, GCS, and Azure stores retain paginated listing support. Other built-in stores
+    /// use [`Self::plain`]. A registered URL handler takes precedence and selects its own listing
+    /// capabilities through the [`EngineStore`] it returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URL or storage configuration is invalid, or a custom handler fails.
     pub fn from_url_opts<I, K, V>(url: &Url, options: I) -> DeltaResult<Self>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: Into<String>,
     {
-        // A registered custom handler takes precedence and is not listing-capable. Drop the read
-        // guard before delegating, since store_from_url_opts locks URL_REGISTRY again.
-        let is_custom = URL_REGISTRY
+        let handler = URL_REGISTRY
             .read()
-            .map(|handlers| handlers.contains_key(url.scheme()))
-            .unwrap_or(false);
-        if is_custom {
-            return Ok(Self::plain(store_from_url_opts(url, options)?));
+            .ok()
+            .and_then(|handlers| handlers.get(url.scheme()).cloned());
+        if let Some(handler) = handler {
+            let options = options
+                .into_iter()
+                .map(|(key, value)| (key.as_ref().to_string(), value.into()))
+                .collect();
+            let (store, _path) = handler(url, options)?;
+            return Ok(store);
         }
 
         let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(object_store::Error::from)?;
@@ -78,28 +104,19 @@ impl EngineStore {
             ObjectStoreScheme::AmazonS3 => listing!(AmazonS3Builder::new()),
             ObjectStoreScheme::GoogleCloudStorage => listing!(GoogleCloudStorageBuilder::new()),
             ObjectStoreScheme::MicrosoftAzure => listing!(MicrosoftAzureBuilder::new()),
-            _ => Self::plain(store_from_url_opts(url, opts)?),
+            _ => {
+                let (store, _path) = object_store::parse_url_opts(url, opts)?;
+                Self::plain(Arc::from(store))
+            }
         })
     }
 }
 
-impl From<Arc<DynObjectStore>> for EngineStore {
-    fn from(object_store: Arc<DynObjectStore>) -> Self {
-        Self::plain(object_store)
-    }
-}
-
-impl<S: ObjectStore + 'static> From<Arc<S>> for EngineStore {
-    fn from(object_store: Arc<S>) -> Self {
-        Self::plain(object_store)
-    }
-}
-
 /// Alias for convenience
-type ClosureReturn = Result<(Box<dyn ObjectStore>, Path), Error>;
+type ClosureReturn = Result<(EngineStore, Path), Error>;
 /// This type alias makes it easier to reference the handler closure(s)
 ///
-/// It uses a HashMap<String, String> which _must_ be converted in [store_from_url_opts]
+/// It uses a HashMap<String, String> which _must_ be converted in [EngineStore::from_url_opts]
 /// because we cannot use generics in this scenario.
 type HandlerClosure = Arc<dyn Fn(&Url, HashMap<String, String>) -> ClosureReturn + Send + Sync>;
 /// hashmap containing scheme => handler fn mappings to allow consumers of delta-kernel-rs provide
@@ -108,10 +125,16 @@ type Handlers = HashMap<String, HandlerClosure>;
 /// The URL_REGISTRY contains the custom URL scheme handlers that will parse URL options
 static URL_REGISTRY: LazyLock<RwLock<Handlers>> = LazyLock::new(|| RwLock::new(HashMap::default()));
 
-/// Insert a new URL handler for [store_from_url_opts] with the given `scheme`. This allows
-/// users to provide their own custom URL handler to plug new
-/// [delta_kernel::object_store::ObjectStore] instances into delta-kernel, which is used by
-/// [store_from_url_opts] to parse the URL.
+/// Register `handler_closure` for `scheme` in [`EngineStore::from_url_opts`] and
+/// [`store_from_url_opts`], replacing any existing handler for that scheme.
+///
+/// The handler receives the URL and provider options and returns an [`EngineStore`] with explicit
+/// listing capabilities, together with the parsed object-store path. Use
+/// [`EngineStore::with_paginated`] to retain pagination or [`EngineStore::plain`] to opt out.
+///
+/// # Errors
+///
+/// Returns an error if the URL-handler registry cannot be locked for writing.
 pub fn insert_url_handler(
     scheme: impl AsRef<str>,
     handler_closure: HandlerClosure,
@@ -127,7 +150,8 @@ pub fn insert_url_handler(
 
 /// Create an [`ObjectStore`] from a URL.
 ///
-/// Returns an `Arc<dyn ObjectStore>` ready to use with [`crate::DefaultEngine`].
+/// Returns an `Arc<dyn ObjectStore>` for direct object-store operations.
+/// To construct an engine without losing paginated listing support, use [`EngineStore::from_url`].
 ///
 /// This function checks for custom URL handlers registered via [`insert_url_handler`]
 /// before falling back to [`object_store`]'s default behavior.
@@ -150,7 +174,9 @@ pub fn store_from_url(url: &Url) -> delta_kernel::DeltaResult<Arc<dyn ObjectStor
 
 /// Create an [`ObjectStore`] from a URL with custom options.
 ///
-/// Returns an `Arc<dyn ObjectStore>` ready to use with [`crate::DefaultEngine`].
+/// Returns an `Arc<dyn ObjectStore>` for direct object-store operations.
+/// To construct an engine without losing paginated listing support, use
+/// [`EngineStore::from_url_opts`].
 ///
 /// This function checks for custom URL handlers registered via [`insert_url_handler`]
 /// before falling back to [`object_store`]'s default behavior.
@@ -178,23 +204,7 @@ where
     K: AsRef<str>,
     V: Into<String>,
 {
-    // First attempt to use any schemes registered via insert_url_handler,
-    // falling back to the default behavior of delta_kernel::object_store::parse_url_opts
-    let (store, _path) = if let Ok(handlers) = URL_REGISTRY.read() {
-        if let Some(handler) = handlers.get(url.scheme()) {
-            let options = options
-                .into_iter()
-                .map(|(k, v)| (k.as_ref().to_string(), v.into()))
-                .collect();
-            handler(url, options)?
-        } else {
-            object_store::parse_url_opts(url, options)?
-        }
-    } else {
-        object_store::parse_url_opts(url, options)?
-    };
-
-    Ok(Arc::new(store))
+    Ok(EngineStore::from_url_opts(url, options)?.object_store)
 }
 
 /// Builds a concrete cloud store from `url` and `options`, mirroring
@@ -254,12 +264,12 @@ impl_cloud_builder!(MicrosoftAzureBuilder, AzureConfigKey, MicrosoftAzure);
 mod tests {
     use std::collections::HashMap;
 
+    use delta_kernel::object_store;
     use delta_kernel::object_store::aws::AmazonS3Builder;
     use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
     use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::{self, ObjectStore};
     use hdfs_native_object_store::HdfsObjectStoreBuilder;
 
     use super::{
@@ -269,10 +279,7 @@ mod tests {
     use crate::*;
 
     /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
-    fn parse_url_opts_hdfs_native<I, K, V>(
-        url: &Url,
-        options: I,
-    ) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error>
+    fn parse_url_opts_hdfs_native<I, K, V>(url: &Url, options: I) -> ClosureReturn
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
@@ -286,7 +293,7 @@ mod tests {
             .with_config(options_map)
             .build()?;
         let path = Path::parse(url.path())?;
-        Ok((Box::new(store), path))
+        Ok((EngineStore::plain(Arc::new(store)), path))
     }
 
     #[test]
@@ -355,23 +362,28 @@ mod tests {
         }
     }
 
-    /// A registered custom handler yields a plain store even for a cloud scheme.
-    #[test]
-    fn engine_store_is_plain_for_registered_custom_handler() {
-        fn memory_handler<I, K, V>(url: &Url, _opts: I) -> ClosureReturn
-        where
-            I: IntoIterator<Item = (K, V)>,
-            K: AsRef<str>,
-            V: Into<String>,
-        {
-            Ok((Box::new(InMemory::new()), Path::parse(url.path()).unwrap()))
-        }
-        let scheme = "custom-listing-test";
-        insert_url_handler(scheme, Arc::new(memory_handler)).unwrap();
-
+    #[rstest::rstest]
+    #[case::plain(false)]
+    #[case::paginated(true)]
+    fn engine_store_preserves_registered_handler_capabilities(#[case] paginated: bool) {
+        let scheme = format!("custom-listing-test-{paginated}");
+        insert_url_handler(
+            &scheme,
+            Arc::new(move |url, _options| {
+                let store = if paginated {
+                    EngineStore::with_paginated(Arc::new(
+                        AmazonS3Builder::new().with_bucket_name("bucket").build()?,
+                    ))
+                } else {
+                    EngineStore::plain(Arc::new(InMemory::new()))
+                };
+                Ok((store, Path::parse(url.path())?))
+            }),
+        )
+        .unwrap();
         let url = Url::parse(&format!("{scheme}://bucket/table")).unwrap();
-        let store = EngineStore::from_url_opts(&url, HashMap::<String, String>::default()).unwrap();
-        assert!(store.paginated.is_none());
+        let store = EngineStore::from_url(&url).unwrap();
+        assert_eq!(store.paginated.is_some(), paginated);
     }
 
     #[test]

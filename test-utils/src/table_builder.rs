@@ -78,6 +78,7 @@ use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
 use delta_kernel_default_engine::executor::TaskExecutor;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
 // ===========================================================================
@@ -1267,7 +1268,7 @@ impl TestTableBuilder {
             tokio::runtime::Handle::current(),
         ));
         let engine = Arc::new(
-            DefaultEngineBuilder::new(store.clone())
+            DefaultEngineBuilder::new(EngineStore::plain(store.clone()))
                 .with_task_executor(executor)
                 .build(),
         );
@@ -1647,10 +1648,11 @@ impl TestTable {
     /// Create a `DefaultEngine` backed by this table's store.
     ///
     /// Returns the engine from `test_utils`'s `delta_kernel`. For unit tests inside
-    /// `kernel/src/`, use `DefaultEngineBuilder::new(table.store().clone()).build()`
+    /// `kernel/src/`, use
+    /// `DefaultEngineBuilder::new(EngineStore::plain(table.store().clone())).build()`
     /// instead to get the correct crate-local engine type.
     pub fn engine(&self) -> DefaultEngine<TokioBackgroundExecutor> {
-        DefaultEngineBuilder::new(self.store.clone()).build()
+        DefaultEngineBuilder::new(EngineStore::plain(self.store.clone())).build()
     }
 }
 
@@ -1767,7 +1769,12 @@ macro_rules! test_context {
             $data_layout,
             $table_config,
             $version_target,
-            |store| { DefaultEngineBuilder::new(store).build() }
+            |store| {
+                DefaultEngineBuilder::new(
+                    $crate::delta_kernel_default_engine::storage::EngineStore::plain(store),
+                )
+                .build()
+            }
         )
     };
     ($log_state:expr, $feature_set:expr, $data_layout:expr, $table_config:expr, $version_target:expr, $engine_factory:expr $(,)?) => {{
@@ -2199,7 +2206,7 @@ mod tests {
             .with_data(1, 5)
             .build()?;
         let engine: Arc<dyn delta_kernel::Engine> =
-            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(table.store().clone())).build());
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
         let batches = crate::read_scan(&scan, engine)?;
@@ -2215,7 +2222,7 @@ mod tests {
             .with_data(2, 5)
             .build()?;
         let engine: Arc<dyn delta_kernel::Engine> =
-            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(table.store().clone())).build());
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
         let batches = crate::read_scan(&scan, engine)?;
@@ -2235,7 +2242,7 @@ mod tests {
             .with_data(1, rows_per_file)
             .build()?;
         let engine: Arc<dyn delta_kernel::Engine> =
-            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(table.store().clone())).build());
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
         let batches = crate::read_scan(&scan, engine)?;
@@ -2278,7 +2285,7 @@ mod tests {
             .with_data(1, rows_per_file)
             .build()?;
         let engine: Arc<dyn delta_kernel::Engine> =
-            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(table.store().clone())).build());
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
         let batches = crate::read_scan(&scan, engine)?;
@@ -2323,7 +2330,7 @@ mod tests {
         assert_eq!(snap.schema(), expected_schema);
         let scan = snap.scan_builder().build()?;
         let engine_arc: Arc<dyn delta_kernel::Engine> =
-            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(table.store().clone())).build());
         let batches = crate::read_scan(&scan, engine_arc)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
@@ -2343,7 +2350,7 @@ mod tests {
         assert_eq!(snap.version(), 3);
         let scan = snap.scan_builder().build()?;
         let engine_arc: Arc<dyn delta_kernel::Engine> =
-            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(table.store().clone())).build());
         let batches = crate::read_scan(&scan, engine_arc)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 30);

@@ -14,6 +14,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, create_add_files_metadata, insert_data,
@@ -72,7 +73,9 @@ async fn commit_append_emits_success_metrics(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_url) = setup_empty_table()?;
     let reporter = Arc::new(LastCommitSuccess::default());
-    let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build(),
+    );
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
@@ -108,7 +111,9 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
     // must report 4. A regression to add_files_metadata.len() (a batch count) would report 2.
     let (_temp_dir, table_url) = setup_empty_table()?;
     let reporter = Arc::new(LastCommitSuccess::default());
-    let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build(),
+    );
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 

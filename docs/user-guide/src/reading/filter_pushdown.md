@@ -148,12 +148,12 @@ Pass the predicate to `ScanBuilder::with_predicate`:
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::expressions::{col, lit, Predicate};
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let predicate = Arc::new(
@@ -227,12 +227,12 @@ statistics altogether. This avoids the cost of parsing statistics from checkpoin
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let scan = snapshot
@@ -263,12 +263,12 @@ scan metadata, pass `StatsOptions::all_struct()` (structured stats without JSON 
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let scan = snapshot
@@ -298,13 +298,13 @@ To receive statistics for only a subset of columns, pass `StatsOptions::struct_c
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::expressions::column_name;
 # use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let scan = snapshot

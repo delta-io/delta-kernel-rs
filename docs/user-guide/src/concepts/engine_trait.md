@@ -127,18 +127,18 @@ The `DefaultEngine` is a batteries-included implementation that works out of the
 - Runs async I/O on a **Tokio** thread pool
 - Supports multiple Arrow versions (see [Feature Flags](./feature_flags.md))
 
-To construct one, create an object store and pass it to the builder:
+To construct one, create an `EngineStore` and pass it to the builder. This preserves
+the storage provider's listing capabilities:
 
 ```rust,no_run
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # extern crate url;
-# use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::{storage::EngineStore, DefaultEngine};
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
 let url = url::Url::parse("file:///path/to/table")?;
-let store = store_from_url(&url)?;
+let store = EngineStore::from_url(&url)?;
 let engine = DefaultEngine::builder(store).build();
 # Ok(())
 # }
@@ -158,13 +158,12 @@ schema, stats columns, partition values).
 
 ## Configuring the Default Engine
 
-`DefaultEngine` uses a builder pattern that lets you customize the task executor and plug in a
-metrics reporter. The builder starts from `DefaultEngine::builder(store)` and chains optional
-configuration before calling `build()`:
+`DefaultEngine` uses a builder pattern that lets you customize the task executor and read-path
+I/O settings. Given an `EngineStore`, start with `DefaultEngine::builder(store)` and chain
+optional configuration before calling `build()`:
 
 ```rust,ignore
 let engine = DefaultEngine::builder(store)
-    .with_metrics_reporter(reporter)
     .with_task_executor(executor)
     .build();
 ```

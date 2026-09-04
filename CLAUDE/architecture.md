@@ -108,6 +108,13 @@ Metrics are emitted as tracing events and collected by tracing layers. A `Defaul
 `object_store` + Tokio) lives in `default-engine/src/`. Custom engines only need to replace
 specific handlers: they can reuse defaults for the rest.
 
+Default engine builders accept `storage::EngineStore` with explicit listing capabilities. Its URL
+factories preserve `PaginatedListStore` for S3, GCS, and Azure; preconfigured cloud stores use
+`EngineStore::with_paginated`. `EngineStore::plain` opts into collecting the shallow directory
+listing before filtering by offset. `StorageHandler::list_from` returns only direct children, not
+nested files. Ordered cloud listings push the delimiter and offset into requests and fetch pages
+lazily; S3 Express requires collecting, sorting, and offset-filtering the shallow listing locally.
+
 ## EngineData Trait
 
 Kernel never assumes data is Arrow. It uses the `EngineData` trait: an opaque columnar data

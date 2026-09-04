@@ -25,12 +25,12 @@ across the requested range.
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 // Read changes from version 0 through version 5 (inclusive)
 let table_changes = TableChanges::try_new(url, &engine, 0, Some(5))?;
@@ -45,12 +45,12 @@ table at the time of the call.
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 // Read all changes from version 0 to the latest version
 let table_changes = TableChanges::try_new(url, &engine, 0, None)?;
@@ -91,13 +91,13 @@ project columns with `with_schema` and filter rows with `with_predicate`.
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::expressions::{col, lit};
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::{DeltaResult, Predicate};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let table_changes = TableChanges::try_new(url, &engine, 0, Some(5))?;
 // 1. Project only the columns you need (including CDF metadata)
@@ -149,12 +149,12 @@ after building the scan), use `scan_builder` on an `Arc<TableChanges>` instead o
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 let table_changes = Arc::new(
     TableChanges::try_new(url, &engine, 0, Some(5))?

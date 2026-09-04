@@ -1994,6 +1994,7 @@ mod tests {
     use delta_kernel::object_store::{DynObjectStore, ObjectStore as _, ObjectStoreExt as _};
     use delta_kernel::schema::schema_ref;
     use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+    use delta_kernel_default_engine::storage::EngineStore;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use serde_json::Value;
@@ -2078,7 +2079,7 @@ mod tests {
         )
         .await?;
         let engine = engine_to_handle(
-            Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build()),
             allocate_err,
         );
         let snap = unsafe { build_snapshot(kernel_string_slice!(path), engine.shallow_copy()) };
@@ -2106,7 +2107,7 @@ mod tests {
         )
         .await?;
         let engine = engine_to_handle(
-            Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build()),
             allocate_err,
         );
         let snap = unsafe {
@@ -2320,7 +2321,7 @@ mod tests {
                     .await
                     .unwrap();
                 engine_to_handle(
-                    Arc::new(DefaultEngineBuilder::new(storage).build()),
+                    Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage)).build()),
                     allocate_err,
                 )
             }
@@ -2414,7 +2415,7 @@ mod tests {
         )
         .await?;
 
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -2463,7 +2464,7 @@ mod tests {
         )
         .await?;
 
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -2515,7 +2516,7 @@ mod tests {
         )
         .await?;
 
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -2567,7 +2568,7 @@ mod tests {
         )
         .await?;
 
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let snap =
@@ -2718,7 +2719,7 @@ mod tests {
         ));
         let engine = engine_to_handle(
             Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
+                DefaultEngineBuilder::new(EngineStore::plain(storage.clone()))
                     .with_task_executor(executor)
                     .build(),
             ),
@@ -3104,7 +3105,7 @@ mod tests {
             actions_to_string_partitioned(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let snapshot =
@@ -3142,7 +3143,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
 
         // Get a non-existent snapshot, this will call allocate_null_err
@@ -3438,7 +3439,7 @@ mod tests {
         )
         .await?;
         let engine = engine_to_handle(
-            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage)).build()),
             allocate_err,
         );
 
@@ -3615,7 +3616,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let engine = engine_to_handle(
-            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage)).build()),
             allocate_err,
         );
 

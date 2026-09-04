@@ -82,6 +82,7 @@ mod tests {
 
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::Snapshot;
+    use delta_kernel_default_engine::storage::EngineStore;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use unity_catalog_delta_client_api::{Commit, InMemoryUpdateTableClient, TableData};
@@ -121,7 +122,7 @@ mod tests {
         let log_tail = log_tail_from_commits(&resp.commits, table_url.clone()).unwrap();
 
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(store)).build();
         let max_catalog_version: u64 = resp.latest_table_version.unwrap_or(0).try_into().unwrap();
         let result = Snapshot::builder_for(table_url)
             .with_log_tail(log_tail)

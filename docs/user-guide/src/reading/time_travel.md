@@ -20,11 +20,11 @@ specific historical version, chain `.at_version()` onto the builder.
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 // Read the table at version 5
 let snapshot = Snapshot::builder_for(&url)
@@ -46,11 +46,11 @@ To read the latest version, omit `at_version`:
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 let snapshot = Snapshot::builder_for(&url)
     .build(&engine)?;
@@ -71,11 +71,11 @@ snapshot's version, avoiding a full log replay.
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 // Build an initial snapshot
 let snapshot = Snapshot::builder_for(&url)
@@ -109,11 +109,11 @@ with `at_version`:
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(&url).at_version(3).build(&engine)?;
 // Refresh from version 3 to exactly version 7
@@ -137,11 +137,11 @@ time on the commit file.
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 let snapshot = Snapshot::builder_for(&url)
     .at_version(5)
@@ -185,12 +185,12 @@ Pass `HistoryCommitType::Published` to allow any version that still has a commit
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # use delta_kernel::history_manager::{latest_version_as_of, HistoryCommitType};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 // 1. Load the latest snapshot to define the search range.
 let latest = Snapshot::builder_for(&url).build(&engine)?;
@@ -224,12 +224,12 @@ timestamp is optional. Pass `None` to indicate no upper bound.
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 use delta_kernel::history_manager::timestamp_range_to_versions;
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let latest = Snapshot::builder_for(&url).build(&engine)?;
 let start_ms = 1_704_067_200_000; // Jan 1, 2024 UTC

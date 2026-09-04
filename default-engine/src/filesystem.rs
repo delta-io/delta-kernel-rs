@@ -415,6 +415,7 @@ mod tests {
 
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::storage::EngineStore;
     use crate::DefaultEngineBuilder;
 
     fn setup_test() -> (
@@ -502,11 +503,11 @@ mod tests {
             .await
             .unwrap();
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, None, executor);
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(store)).build();
         let file_url = Url::parse("memory:///hello%2C%20world%21").unwrap();
 
-        let read_back: Vec<Bytes> = storage
+        let read_back: Vec<Bytes> = engine
+            .storage_handler()
             .read_files(vec![(file_url, None)])
             .unwrap()
             .try_collect()
@@ -526,7 +527,7 @@ mod tests {
         store.put(&name, data.clone().into()).await.unwrap();
 
         let table_root = Url::parse("memory:///").expect("valid url");
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(store)).build();
         let files: Vec<_> = engine
             .storage_handler()
             .list_from(&table_root.join("_delta_log/").unwrap().join("0").unwrap())
@@ -556,7 +557,7 @@ mod tests {
 
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(store)).build();
         let files = engine
             .storage_handler()
             .list_from(&url.join("_delta_log/").unwrap().join("0").unwrap())

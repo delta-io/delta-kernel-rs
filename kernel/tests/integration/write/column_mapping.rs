@@ -21,6 +21,7 @@ use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMap
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     add_commit, assert_partition_values, assert_schema_has_field,
@@ -57,7 +58,7 @@ async fn test_column_mapping_write(
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(EngineStore::plain(store.clone()))
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))
@@ -326,7 +327,7 @@ async fn test_column_mapping_partitioned_write(
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(EngineStore::plain(store.clone()))
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))
@@ -398,7 +399,7 @@ async fn test_same_phy_name_different_path(
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(EngineStore::plain(store.clone()))
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))
@@ -490,7 +491,7 @@ async fn test_read_and_append_tolerates_stale_column_mapping_when_disabled(
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(EngineStore::plain(store.clone()))
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))

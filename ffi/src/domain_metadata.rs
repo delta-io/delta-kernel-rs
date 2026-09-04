@@ -178,6 +178,7 @@ mod tests {
 
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::DeltaResult;
+    use delta_kernel_default_engine::storage::EngineStore;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use serde_json::json;
@@ -195,7 +196,7 @@ mod tests {
     async fn test_domain_metadata() -> DeltaResult<()> {
         let storage = Arc::new(InMemory::new());
 
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let table_root = "memory:///test_table/";
 
@@ -478,7 +479,7 @@ mod tests {
         crate::Handle<crate::SharedSnapshot>,
     ) {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let mut actions = vec![
@@ -672,7 +673,7 @@ mod tests {
     {
         const TAG_DECIMAL: u8 = 12;
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let table_root = "memory:///test_clustering_decimal/";
 
@@ -713,7 +714,7 @@ mod tests {
     #[tokio::test]
     async fn test_visit_clustering_columns_column_mapping_reports_both_names() -> DeltaResult<()> {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let table_root = "memory:///test_clustering_column_mapping/";
 

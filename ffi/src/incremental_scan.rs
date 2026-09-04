@@ -428,6 +428,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel_default_engine::storage::EngineStore;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use test_utils::{actions_to_string, add_commit, TestAction};
 
@@ -465,7 +466,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let mut builder = unsafe {
             ok_or_panic(get_snapshot_builder(
@@ -1061,7 +1062,7 @@ mod tests {
         ));
         let engine = engine_to_handle(
             Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
+                DefaultEngineBuilder::new(EngineStore::plain(storage.clone()))
                     .with_task_executor(executor)
                     .build(),
             ),

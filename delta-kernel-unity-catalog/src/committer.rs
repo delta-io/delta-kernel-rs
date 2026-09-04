@@ -319,6 +319,7 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::{EngineData, FilteredEngineData, Version};
+    use delta_kernel_default_engine::storage::EngineStore;
     use delta_kernel_default_engine::DefaultEngine;
     use unity_catalog_delta_client_api::error::Result;
 
@@ -367,7 +368,8 @@ mod tests {
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 0);
         let committer = test_committer();
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
         let action: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
                 "test",
@@ -409,7 +411,8 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let committer = test_committer();
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
 
         // Pre-create the commit file to trigger a conflict
         let delta_log = tmp_dir.path().join("_delta_log");
@@ -432,7 +435,8 @@ mod tests {
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
         let committer = test_committer();
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = committer
@@ -461,7 +465,8 @@ mod tests {
         )
         .unwrap();
         let committer = test_committer();
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = committer
@@ -490,7 +495,8 @@ mod tests {
         )
         .unwrap();
         let committer = test_committer();
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = committer
@@ -509,7 +515,8 @@ mod tests {
         // Version >= 1 but without catalogManaged feature (simulates downgrade attempt)
         let commit_metadata = CommitMetadata::new_unchecked(table_root, 1).unwrap();
         let committer = test_committer();
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
 
         let err = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -527,7 +534,8 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1);
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = test_committer()
@@ -544,7 +552,8 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_protocol_change();
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
 
         let err = test_committer()
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -560,7 +569,8 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_metadata_change();
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
 
         let err = test_committer()
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -577,7 +587,8 @@ mod tests {
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata =
             catalog_managed_commit_metadata(table_root, 1).with_domain_change("delta.clustering");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
 
         let err = test_committer()
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -599,7 +610,8 @@ mod tests {
             "different-table-id",
             TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         );
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
 
         let err = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -665,7 +677,8 @@ mod tests {
             "testUcTableId",
             TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         );
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine =
+            DefaultEngine::builder(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
         committer.publish(&engine, publish_metadata).unwrap();
 
         // ===== THEN =====

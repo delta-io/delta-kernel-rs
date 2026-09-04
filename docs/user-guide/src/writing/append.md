@@ -30,13 +30,13 @@ may differ.
 # use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::transaction::CommitResult;
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 // 1. Get a snapshot
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 

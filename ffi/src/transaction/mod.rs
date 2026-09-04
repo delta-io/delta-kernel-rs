@@ -807,6 +807,7 @@ mod tests {
     use serde_json::{json, Deserializer};
     use tempfile::tempdir;
     use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+    use test_utils::delta_kernel_default_engine::storage::EngineStore;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
@@ -3058,7 +3059,10 @@ mod tests {
         // Build the kernel engine over the seeded store: `create_default_engine` resolves a fresh
         // store from the URL, which for `memory://` would not see this table.
         let kernel_engine: Arc<dyn delta_kernel::Engine> = Arc::new(
-            delta_kernel_default_engine::DefaultEngineBuilder::new(Arc::clone(&store)).build(),
+            delta_kernel_default_engine::DefaultEngineBuilder::new(EngineStore::plain(Arc::clone(
+                &store,
+            )))
+            .build(),
         );
         let snapshot = delta_kernel::snapshot::Snapshot::builder_for(table_url.clone())
             .build(kernel_engine.as_ref())?;

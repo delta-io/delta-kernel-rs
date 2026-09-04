@@ -213,7 +213,7 @@ use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
 use delta_kernel_default_engine::executor::TaskExecutor;
-use delta_kernel_default_engine::storage::store_from_url;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
@@ -630,7 +630,7 @@ pub fn create_default_engine_with_batch(
     table_root: &url::Url,
     batch_size: Option<usize>,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
-    let store = store_from_url(table_root)?;
+    let store = EngineStore::from_url(table_root)?;
     let mut builder = DefaultEngineBuilder::new(store);
     if let Some(batch_size) = batch_size {
         builder = builder.with_batch_size(NonZero::new(batch_size).unwrap());
@@ -644,7 +644,7 @@ pub fn create_default_engine_with_batch(
 pub fn create_default_engine_mt_executor(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
-    let store = store_from_url(table_root)?;
+    let store = EngineStore::from_url(table_root)?;
     let task_executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
@@ -725,7 +725,7 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let engine = DefaultEngineBuilder::new(Arc::clone(&storage)).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(Arc::clone(&storage))).build();
 
     (storage, engine, url)
 }

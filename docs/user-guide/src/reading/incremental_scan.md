@@ -33,11 +33,11 @@ Call `incremental_scan_builder(base_version)` on a `Snapshot`, then `build(engin
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 // The cache already reflects version 5.
 let base_version = 5;
@@ -70,13 +70,13 @@ from a full scan:
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # use delta_kernel::incremental_scan::IncrementalScanStream;
 # fn consume(_: IncrementalScanStream) {}
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let base_version = 5;
 # let target = Snapshot::builder_for(url).build(&engine)?;
@@ -119,11 +119,11 @@ the live added and removed file keys:
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let base_version = 5;
 # let target = Snapshot::builder_for(url).build(&engine)?;
@@ -187,12 +187,12 @@ both `removes` and `duplicate_adds`:
 # extern crate delta_kernel_default_engine;
 # use std::collections::HashSet;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # use delta_kernel::log_replay::FileActionKey;
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let base_version = 5;
 # let target = Snapshot::builder_for(url).build(&engine)?;

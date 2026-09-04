@@ -78,6 +78,7 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine_data::FilteredEngineData;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel_default_engine::storage::EngineStore;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use url::Url;
 
@@ -111,7 +112,8 @@ mod tests {
 
         // The caller retains ownership of the fallback engine handle. `shallow_copy` mimics C
         // passing the pointer by value, so we can still free our own handle afterward.
-        let fallback = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
+        let fallback =
+            DefaultEngineBuilder::new(EngineStore::plain(Arc::new(InMemory::new()))).build();
         let fallback_handle = engine_to_handle(Arc::new(fallback), allocate_err);
 
         let engine_handle = unsafe {

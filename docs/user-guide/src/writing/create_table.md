@@ -15,13 +15,13 @@ The `create_table` function returns a builder that you configure and then commit
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
     StructField::not_null("id", DataType::INTEGER),
     StructField::nullable("name", DataType::STRING),
@@ -98,13 +98,13 @@ You can set custom application properties on the table:
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 # let schema = Arc::new(StructType::try_new([
 #     StructField::not_null("id", DataType::INTEGER),
 # ])?);
@@ -134,14 +134,14 @@ layout for queries that filter on the clustering columns:
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
     StructField::not_null("id", DataType::INTEGER),
     StructField::nullable("region", DataType::STRING),
@@ -190,14 +190,14 @@ entire directories when filtering on those columns.
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
     StructField::not_null("id", DataType::INTEGER),
     StructField::nullable("name", DataType::STRING),

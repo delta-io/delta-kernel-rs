@@ -5,6 +5,7 @@ use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
     all_features_cm_id, all_features_cm_name, checkpoint_at_end, checkpoint_at_end_crc_at_end,
@@ -43,7 +44,7 @@ fn test_cross_product_read_write(
     let (data_layout, table_config) = layout_config;
     let table = test_table(log_state.clone(), feature_set, data_layout, table_config);
     let engine: Arc<dyn Engine> =
-        Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        Arc::new(DefaultEngineBuilder::new(EngineStore::plain(table.store().clone())).build());
     let snap = build_snapshot!(version_target, table.table_root(), engine.as_ref());
 
     let expected_version = match &version_target {

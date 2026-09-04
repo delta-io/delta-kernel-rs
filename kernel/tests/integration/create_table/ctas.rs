@@ -24,6 +24,7 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     assert_schema_has_field, nested_batches, nested_schema, read_add_infos, test_table_setup,
@@ -204,7 +205,7 @@ async fn run_ctas_test(
     let src_url = Url::from_directory_path(&src_table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(EngineStore::plain(store.clone()))
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))

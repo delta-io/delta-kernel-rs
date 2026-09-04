@@ -100,14 +100,13 @@ are provider-namespaced (`s3.access-key-id`, `azure.sas-token`,
 ## Step 4: Build an Engine with vended credentials
 
 The `config` map matches the option shape `object_store` expects. Translate the
-provider-namespaced keys into the `object_store` option names, then wrap the
-resulting store in a `DefaultEngineBuilder`. Mapping the keys is connector-owned
+provider-namespaced keys into the `object_store` option names, then pass them to
+`DefaultEngineBuilder::from_url_opts`. Mapping the keys is connector-owned
 work, because only your connector knows which cloud it targets.
 
 ```rust,ignore
 use std::sync::Arc;
 use delta_kernel_default_engine::DefaultEngineBuilder;
-use delta_kernel::object_store;
 
 // Map the vended `config` keys to object_store option names.
 let mut options: Vec<(String, String)> = Vec::new();
@@ -124,12 +123,10 @@ for cred in &creds.storage_credentials {
 }
 options.push(("region".to_string(), "us-west-2".to_string()));
 
-let (store, _path) = object_store::parse_url_opts(&table_uri, options)?;
-let engine = DefaultEngineBuilder::new(store.into()).build();
+let engine = DefaultEngineBuilder::from_url_opts(&table_uri, options)?.build();
 ```
 
-The `.into()` converts the `Box<dyn ObjectStore>` returned by `parse_url_opts`
-into the `Arc<dyn ObjectStore>` that `DefaultEngineBuilder::new` expects. Set the
+URL-based construction preserves the cloud store's paginated listing capability. Set
 `region` to match the bucket's actual AWS region.
 
 ## Step 5: Build a Snapshot from the load_table response
@@ -182,7 +179,6 @@ data.
 ```rust,ignore
 use std::sync::Arc;
 
-use delta_kernel::object_store;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel_unity_catalog::snapshot_builder_from_load_table;
 use unity_catalog_delta_client_api::Operation;
@@ -219,8 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     options.push(("region".to_string(), "us-west-2".to_string()));
-    let (store, _) = object_store::parse_url_opts(&table_uri, options)?;
-    let engine = DefaultEngineBuilder::new(store.into()).build();
+    let engine = DefaultEngineBuilder::from_url_opts(&table_uri, options)?.build();
 
     // 5. Build a Snapshot from the load_table response
     let snapshot = snapshot_builder_from_load_table(&resp)?.build(&engine)?;

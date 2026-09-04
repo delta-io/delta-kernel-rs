@@ -678,6 +678,7 @@ mod tests {
     use delta_kernel::Engine;
     use tempfile::NamedTempFile;
 
+    use crate::storage::EngineStore;
     use crate::DefaultEngineBuilder;
 
     fn make_invalid_named_temp() -> (NamedTempFile, Url) {
@@ -696,7 +697,8 @@ mod tests {
         let (_temp_file1, file_url1) = make_invalid_named_temp();
         let (_temp_file2, file_url2) = make_invalid_named_temp();
         let schema = schema_ref! { nullable "name": BOOLEAN };
-        let default_engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build();
+        let default_engine =
+            DefaultEngineBuilder::new(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build();
 
         // Helper to check that we get expected number of errors then stream ends
         let check_errors = |file_urls: Vec<_>, expected_errors: usize| {

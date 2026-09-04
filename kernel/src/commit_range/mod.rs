@@ -21,10 +21,10 @@
 //! use delta_kernel::commit_range::{CommitRange, DeltaAction};
 //! use delta_kernel::{Engine, Error, Snapshot};
 //! use delta_kernel::object_store::local::LocalFileSystem;
-//! use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+//! use test_utils::delta_kernel_default_engine::{storage::EngineStore, DefaultEngineBuilder};
 //!
 //! let engine: Arc<dyn Engine> =
-//!     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+//!     Arc::new(DefaultEngineBuilder::new(EngineStore::plain(Arc::new(LocalFileSystem::new()))).build());
 //! let start_snapshot = Snapshot::builder_for("file:///data/T").at_version(0).build(engine.as_ref())?;
 //! let range = CommitRange::builder_for("file:///data/T", 0)
 //!     .with_end_version(4)

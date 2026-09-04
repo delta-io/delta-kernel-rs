@@ -127,6 +127,11 @@ Kernel assembles commit actions, enforces protocol compliance, and delegates the
 `EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing
 layers rather than an engine handler. `DefaultEngine` lives in `default-engine/src/`.
 
+**Default engine construction:** `DefaultEngineBuilder::new` and `DefaultEngine::builder` take
+`storage::EngineStore`, not a bare `Arc<dyn ObjectStore>`. Use its URL factories or
+`EngineStore::with_paginated` to retain cloud listing capabilities. `EngineStore::plain` explicitly
+selects a shallow fallback that fetches all direct children before filtering by offset.
+
 **EngineData:** opaque columnar data interface. NEVER access `EngineData` columns
 directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` accessors).
 

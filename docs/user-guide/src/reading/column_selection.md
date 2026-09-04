@@ -13,11 +13,11 @@ pass it to `ScanBuilder::with_schema()`:
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn main() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // Table has columns [id, name, email, created_at]
 // Select only id and name
@@ -56,12 +56,12 @@ information about each row's origin. Add them to your scan schema with
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::schema::MetadataColumnSpec;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn main() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // Start with a projection
 let schema = snapshot.schema().project_as_struct(&["id", "name"])?;

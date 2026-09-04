@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use delta_kernel::object_store::memory::InMemory;
 #[cfg(test)]
-use delta_kernel_default_engine::DefaultEngineBuilder;
+use delta_kernel_default_engine::{storage::EngineStore, DefaultEngineBuilder};
 #[cfg(test)]
 use test_utils::add_commit;
 
@@ -89,7 +89,7 @@ pub(crate) unsafe fn build_snapshot(
 pub(crate) fn engine_handle_for_store(
     store: Arc<delta_kernel::object_store::DynObjectStore>,
 ) -> crate::handle::Handle<SharedExternEngine> {
-    let engine = DefaultEngineBuilder::new(store).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(store)).build();
     engine_to_handle(Arc::new(engine), allocate_err)
 }
 
@@ -108,7 +108,7 @@ pub(crate) async fn setup_snapshot(
     let table_root = "memory:///";
     let storage = Arc::new(InMemory::new());
     add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
-    let engine = DefaultEngineBuilder::new(storage.clone()).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
     let engine = engine_to_handle(Arc::new(engine), allocate_err);
     let snap = unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
     Ok((engine, snap))

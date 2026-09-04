@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use delta_kernel::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
 use delta_kernel::Snapshot;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -21,7 +22,7 @@ fn main() {
         .build()
         .expect("build test table");
     let table_url = delta_kernel::try_parse_uri(table.table_root()).expect("parse table url");
-    let engine = DefaultEngineBuilder::new(table.store().clone()).build();
+    let engine = DefaultEngineBuilder::new(EngineStore::plain(table.store().clone())).build();
 
     let subscriber = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_ansi(false))

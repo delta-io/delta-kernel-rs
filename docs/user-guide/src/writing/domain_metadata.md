@@ -25,12 +25,12 @@ transactions.
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
     .transaction(Box::new(FileSystemCommitter::new()), &engine)?
@@ -72,12 +72,12 @@ exist yet.
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
     .transaction(Box::new(FileSystemCommitter::new()), &engine)?
@@ -110,12 +110,12 @@ To read domain metadata from a table, call `get_domain_metadata()` on a
 # extern crate tokio;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // Returns Ok(Some(config)) if the domain exists, Ok(None) if it does not

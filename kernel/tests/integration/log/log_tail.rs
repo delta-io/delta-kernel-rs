@@ -4,6 +4,7 @@ use delta_kernel::history_manager::{first_version_after, latest_version_as_of, H
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::Snapshot;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::storage::EngineStore;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
@@ -18,7 +19,7 @@ fn setup_test() -> (
 ) {
     let storage = Arc::new(InMemory::new());
     let table_root = Url::parse("memory:///").unwrap();
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build());
     (storage, engine, table_root)
 }
 

@@ -21,12 +21,12 @@ The easiest way to write a checkpoint is the convenience method on `Snapshot`:
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::snapshot::CheckpointWriteResult;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn main() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+# let engine = DefaultEngine::builder(EngineStore::from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let (result, new_snapshot) = snapshot.checkpoint(&engine, None)?;
 match result {

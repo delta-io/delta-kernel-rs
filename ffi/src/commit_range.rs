@@ -423,6 +423,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel_default_engine::storage::EngineStore;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use test_utils::{actions_to_string, add_commit, TestAction};
@@ -457,7 +458,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = DefaultEngineBuilder::new(EngineStore::plain(storage.clone())).build();
         (engine_to_handle(Arc::new(engine), allocate_err), table_root)
     }
 

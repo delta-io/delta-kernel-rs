@@ -10,6 +10,7 @@ use delta_kernel::parquet::arrow::AsyncArrowWriter;
 use delta_kernel::parquet::errors::Result as ParquetResult;
 use delta_kernel::{ActionReconciliationIterator, DeltaResult, Error, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use futures::future::{BoxFuture, FutureExt};
 
@@ -64,8 +65,7 @@ async fn try_main() -> DeltaResult<()> {
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Checkpointing Delta table at: {url}");
 
-    use delta_kernel_default_engine::storage::store_from_url;
-    let store = store_from_url(&url)?;
+    let store = EngineStore::from_url(&url)?;
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));

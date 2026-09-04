@@ -260,12 +260,12 @@ To have Kernel hand you the typed values directly, opt in with `with_partition_v
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
-# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel_default_engine::storage::EngineStore;
 # use delta_kernel::scan::PartitionValuesOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
-# let store = store_from_url(&url)?;
+# let store = EngineStore::from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let scan = snapshot
