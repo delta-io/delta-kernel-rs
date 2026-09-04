@@ -745,8 +745,58 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    create_table_impl(
+        store,
+        table_path,
+        schema,
+        partition_columns,
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        "name",
+    )
+    .await
+}
+
+/// Like [`create_table`], but writes `delta.columnMapping.mode` as `column_mapping_mode` instead
+/// of always `"name"`. No-op when `columnMapping` isn't in `reader_features`.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_table_with_column_mapping_mode(
+    store: Arc<DynObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+    column_mapping_mode: &str,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    create_table_impl(
+        store,
+        table_path,
+        schema,
+        partition_columns,
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        column_mapping_mode,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_table_impl(
+    store: Arc<DynObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
     mut reader_features: Vec<&str>,
     mut writer_features: Vec<&str>,
+    column_mapping_mode: &str,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
 
@@ -799,7 +849,10 @@ pub async fn create_table(
         let mut config = serde_json::Map::new();
 
         if reader_features.contains(&"columnMapping") {
-            config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+            config.insert(
+                "delta.columnMapping.mode".to_string(),
+                json!(column_mapping_mode),
+            );
             config.insert(
                 "delta.columnMapping.maxColumnId".to_string(),
                 json!(max_column_id.to_string()),

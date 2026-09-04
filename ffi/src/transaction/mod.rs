@@ -30,6 +30,8 @@ pub use partition_value::{
     partition_value_map_new, ExclusivePartitionValueMap,
 };
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::engine_funcs::FileMeta;
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::scan::EngineSchema;
@@ -273,6 +275,42 @@ fn with_domain_metadata_removed_impl(
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
+}
+
+/// Commits `file` as this transaction's root manifest.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[no_mangle]
+pub unsafe extern "C" fn with_root_manifest_file(
+    txn: Handle<ExclusiveTransaction>,
+    file: &FileMeta,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_root_manifest_file_impl(*txn, file).into_extern_result(&engine)
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn with_root_manifest_file_impl(
+    txn: Transaction,
+    file: &FileMeta,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
+    let location = Url::parse(path)?;
+    let size = file
+        .size
+        .try_into()
+        .map_err(|_| delta_kernel::Error::generic("manifest size does not fit a FileSize"))?;
+    let delta_file = delta_kernel::FileMeta {
+        location,
+        last_modified: file.last_modified,
+        size,
+    };
+    Ok(Box::new(txn.with_root_manifest_file(delta_file)?).into())
 }
 
 /// Add file metadata to the transaction for files that have been written. The metadata contains
@@ -2180,6 +2218,80 @@ mod tests {
 
         unsafe { free_schema(snap_schema) };
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn root_manifest_file_meta(manifest_path: &str) -> FileMeta {
+        FileMeta {
+            path: kernel_string_slice!(manifest_path),
+            last_modified: 0,
+            size: 1024,
+        }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::feature_enabled(true)]
+    #[case::feature_disabled(false)]
+    #[tokio::test]
+    async fn test_with_root_manifest_file_commit(
+        #[case] feature_enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_root_manifest_file", None);
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let mut reader_features = vec!["columnMapping", "deletionVectors"];
+        let mut writer_features = vec![
+            "columnMapping",
+            "deletionVectors",
+            "rowTracking",
+            "domainMetadata",
+            "inCommitTimestamp",
+        ];
+        if feature_enabled {
+            reader_features.push("adaptiveMetadata-preview");
+            writer_features.push("adaptiveMetadata-preview");
+        }
+        test_utils::create_table_with_column_mapping_mode(
+            store.clone(),
+            table_url.clone(),
+            schema,
+            &[],
+            true,
+            reader_features,
+            writer_features,
+            "id",
+        )
+        .await?;
+
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let table_path = table_url.to_string();
+        let table_path_str = table_path.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+
+        let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
+        let file = root_manifest_file_meta(&manifest_path);
+        let txn =
+            ok_or_panic(unsafe { with_root_manifest_file(txn, &file, engine.shallow_copy()) });
+
+        if feature_enabled {
+            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            assert_eq!(unsafe { version_and_free(committed) }, 1);
+        } else {
+            assert_extern_result_error_with_message(
+                unsafe { commit(txn, engine.shallow_copy()) },
+                KernelError::GenericError,
+                Some(
+                    "Generic delta kernel error: root manifest file commit requires the \
+                     adaptiveMetadata-preview feature",
+                ),
+            );
+        }
+
         unsafe { free_engine(engine) };
         Ok(())
     }
