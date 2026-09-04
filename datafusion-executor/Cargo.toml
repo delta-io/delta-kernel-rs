@@ -11,6 +11,8 @@ rust-version = "1.88"
 [workspace]
 
 [dependencies]
+async-trait = "0.1"
+bytes = "1"
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "declarative-plans",
   "vendored-protoc",
@@ -18,8 +20,12 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "default-engine-base",
 ] }
 datafusion = "54"
+futures = "0.3"
 itertools = "0.14"
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 rstest = "0.23"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
