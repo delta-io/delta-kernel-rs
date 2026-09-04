@@ -1,6 +1,12 @@
-//! Plan containers ([`Plan`], [`PlanNode`]).
+//! Validated plan containers ([`Plan`], [`PlanNode`]).
+
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub use super::nodes::Operator;
+use super::nodes::{Filter, Project, ScanFile, Values};
+use crate::schema::{SchemaRef, StructType};
+use crate::{DeltaResult, Error};
 
 // ============================================================================
 // Plan nodes
@@ -14,17 +20,32 @@ pub use super::nodes::Operator;
 /// emits the rows of all inputs regardless of input order.
 #[derive(Debug, Clone)]
 pub struct PlanNode {
-    pub op: Operator,
-    pub inputs: Vec<usize>,
+    op: Operator,
+    inputs: Vec<usize>,
 }
 
 impl PlanNode {
     /// A node applying `op` over the nodes at `inputs` (indices into [`Plan::nodes`]).
-    pub fn new(op: impl Into<Operator>, inputs: Vec<usize>) -> Self {
+    pub(crate) fn new(op: impl Into<Operator>, inputs: Vec<usize>) -> Self {
         Self {
             op: op.into(),
             inputs,
         }
+    }
+
+    /// Returns this node's relational operator.
+    pub fn operator(&self) -> &Operator {
+        &self.op
+    }
+
+    /// Returns the indices of this node's inputs, in operator-defined order.
+    pub fn inputs(&self) -> &[usize] {
+        &self.inputs
+    }
+
+    /// Consumes this node and returns its operator and input indices.
+    pub fn into_parts(self) -> (Operator, Vec<usize>) {
+        (self.op, self.inputs)
     }
 }
 
@@ -47,7 +68,7 @@ impl PlanNode {
 /// each node's inputs are guaranteed bound by the time the node is reached.
 ///
 /// A well-formed `Plan` has at least one node. The **terminal node** is always the last entry in
-/// `nodes`: no other node lists its index in `inputs`, and its rows are the value the engine
+/// [`Self::nodes`]: no other node lists its index in `inputs`, and its rows are the value the engine
 /// streams to the caller.
 ///
 /// The terminal node describes the rows produced by the plan. The calling API determines who
@@ -96,5 +117,346 @@ impl PlanNode {
 /// node to the caller.
 #[derive(Debug, Clone)]
 pub struct Plan {
-    pub nodes: Vec<PlanNode>,
+    nodes: Vec<PlanNode>,
+}
+
+impl Plan {
+    /// Constructs a plan after validating its topology, operator inputs, and propagated schemas.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty plan, a non-topological input reference, an invalid operator
+    /// arity, or an operator whose values or schema do not match its inputs.
+    pub(crate) fn try_new(nodes: Vec<PlanNode>) -> DeltaResult<Self> {
+        let plan = Self { nodes };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Returns the plan nodes in topological order, with the terminal node last.
+    pub fn nodes(&self) -> &[PlanNode] {
+        &self.nodes
+    }
+
+    /// Consumes this plan and returns its nodes in topological order.
+    pub fn into_nodes(self) -> Vec<PlanNode> {
+        self.nodes
+    }
+
+    /// Revalidates this plan's topology, operator inputs, and propagated schemas.
+    ///
+    /// Plan construction performs the same validation. Serialization calls this method again as
+    /// defense in depth at the process boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty plan, a non-topological input reference, an invalid operator
+    /// arity, or an operator whose values or schema do not match its inputs.
+    pub fn validate(&self) -> DeltaResult<()> {
+        if self.nodes.is_empty() {
+            return Err(Error::generic("plan must contain at least one node"));
+        }
+
+        let mut schemas = Vec::with_capacity(self.nodes.len());
+        for (node_index, node) in self.nodes.iter().enumerate() {
+            u32::try_from(node_index)
+                .map_err(|_| Error::generic("plan has more nodes than the wire format supports"))?;
+            for &input in &node.inputs {
+                if input >= node_index {
+                    return Err(node_error(
+                        node_index,
+                        &node.op,
+                        format!(
+                            "input {input} must reference one of the {node_index} prior node(s)"
+                        ),
+                    ));
+                }
+                u32::try_from(input).map_err(|_| {
+                    node_error(
+                        node_index,
+                        &node.op,
+                        format!("input {input} cannot be represented by the wire format"),
+                    )
+                })?;
+            }
+
+            let input_schemas = node
+                .inputs
+                .iter()
+                .map(|&input| Arc::clone(&schemas[input]))
+                .collect::<Vec<_>>();
+            let output_schema = validate_operator(node_index, &node.op, &input_schemas)?;
+            schemas.push(output_schema);
+        }
+        Ok(())
+    }
+}
+
+fn validate_operator(
+    node_index: usize,
+    op: &Operator,
+    inputs: &[SchemaRef],
+) -> DeltaResult<SchemaRef> {
+    let result = (|| -> DeltaResult<SchemaRef> {
+        Ok(match op {
+            Operator::ScanParquet(scan) => {
+                require_arity(inputs, 0)?;
+                validate_scan(&scan.schema, &scan.file_constant_columns, &scan.files)?;
+                Arc::clone(&scan.schema)
+            }
+            Operator::ScanJson(scan) => {
+                require_arity(inputs, 0)?;
+                validate_scan(&scan.schema, &scan.file_constant_columns, &scan.files)?;
+                Arc::clone(&scan.schema)
+            }
+            Operator::Values(values) => {
+                require_arity(inputs, 0)?;
+                validate_values(values)?;
+                Arc::clone(&values.schema)
+            }
+            Operator::Project(project) => {
+                require_arity(inputs, 1)?;
+                Project::try_new(
+                    inputs[0].as_ref(),
+                    Arc::clone(project.expression().source_expression()),
+                    Arc::clone(project.schema()),
+                )?;
+                Arc::clone(project.schema())
+            }
+            Operator::Filter(filter) => {
+                require_arity(inputs, 1)?;
+                Filter::try_new(
+                    inputs[0].as_ref(),
+                    Arc::clone(filter.predicate().source_predicate()),
+                )?;
+                Arc::clone(&inputs[0])
+            }
+            Operator::DataSkipping(site) => {
+                require_arity(inputs, 1)?;
+                site.validate_input(inputs[0].as_ref())?;
+                Arc::clone(&inputs[0])
+            }
+            Operator::DynamicScan(scan) => {
+                require_arity(inputs, 1)?;
+                scan.validate_input(&inputs[0])?;
+                Arc::clone(&scan.schema)
+            }
+            Operator::Aggregate(aggregate) => {
+                require_arity(inputs, 1)?;
+                aggregate.validate_input(inputs[0].as_ref())?;
+                Arc::clone(&aggregate.schema)
+            }
+            Operator::SemiJoin(join) => {
+                require_arity(inputs, 2)?;
+                if join.probe_keys.len() != join.build_keys.len() {
+                    return Err(Error::generic(format!(
+                        "join has {} probe key(s) but {} build key(s)",
+                        join.probe_keys.len(),
+                        join.build_keys.len()
+                    )));
+                }
+                for (probe, build) in join.probe_keys.iter().zip(&join.build_keys) {
+                    let probe_field = inputs[0].field_at(probe)?;
+                    let build_field = inputs[1].field_at(build)?;
+                    if probe_field.data_type() != build_field.data_type() {
+                        return Err(Error::generic(format!(
+                            "join keys `{probe}` and `{build}` have different types: {} and {}",
+                            probe_field.data_type(),
+                            build_field.data_type()
+                        )));
+                    }
+                }
+                Arc::clone(&inputs[0])
+            }
+            Operator::UnionAll(_) => {
+                if inputs.len() < 2 {
+                    return Err(Error::generic("union_all requires at least two inputs"));
+                }
+                if let Some(index) = inputs.iter().position(|schema| schema != &inputs[0]) {
+                    return Err(Error::generic(format!(
+                        "union_all input {index} has a different schema from input 0"
+                    )));
+                }
+                Arc::clone(&inputs[0])
+            }
+        })
+    })();
+    result.map_err(|error| node_error(node_index, op, error.to_string()))
+}
+
+fn require_arity(inputs: &[SchemaRef], expected: usize) -> DeltaResult<()> {
+    if inputs.len() != expected {
+        return Err(Error::generic(format!(
+            "expected {expected} input(s), found {}",
+            inputs.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_scan(
+    schema: &StructType,
+    file_constant_columns: &[String],
+    files: &[ScanFile],
+) -> DeltaResult<()> {
+    let mut seen = HashSet::new();
+    let mut fields = Vec::with_capacity(file_constant_columns.len());
+    for name in file_constant_columns {
+        if !seen.insert(name) {
+            return Err(Error::generic(format!(
+                "file-constant column `{name}` is listed more than once"
+            )));
+        }
+        let field = schema.field(name).ok_or_else(|| {
+            Error::generic(format!(
+                "file-constant column `{name}` is absent from scan schema"
+            ))
+        })?;
+        if field.is_metadata_column() {
+            return Err(Error::generic(format!(
+                "file-constant column `{name}` is a metadata column"
+            )));
+        }
+        fields.push(field);
+    }
+
+    for (file_index, file) in files.iter().enumerate() {
+        if file.file_constants.len() != fields.len() {
+            return Err(Error::generic(format!(
+                "file {file_index} has {} constant value(s), expected {}",
+                file.file_constants.len(),
+                fields.len()
+            )));
+        }
+        for (value_index, (value, field)) in file.file_constants.iter().zip(&fields).enumerate() {
+            if value.data_type() != *field.data_type() {
+                return Err(Error::generic(format!(
+                    "file {file_index} constant {value_index} for `{}` has type {}, expected {}",
+                    field.name(),
+                    value.data_type(),
+                    field.data_type()
+                )));
+            }
+            if value.is_null() && !field.is_nullable() {
+                return Err(Error::generic(format!(
+                    "file {file_index} constant {value_index} for non-nullable column `{}` is null",
+                    field.name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_values(values: &Values) -> DeltaResult<()> {
+    let fields = values.schema.fields().collect::<Vec<_>>();
+    for (row_index, row) in values.rows.iter().enumerate() {
+        if row.len() != fields.len() {
+            return Err(Error::generic(format!(
+                "values row {row_index} has {} value(s), expected {}",
+                row.len(),
+                fields.len()
+            )));
+        }
+        for (column_index, (value, field)) in row.iter().zip(&fields).enumerate() {
+            if value.data_type() != *field.data_type() {
+                return Err(Error::generic(format!(
+                    "values row {row_index} column {column_index} `{}` has type {}, expected {}",
+                    field.name(),
+                    value.data_type(),
+                    field.data_type()
+                )));
+            }
+            if value.is_null() && !field.is_nullable() {
+                return Err(Error::generic(format!(
+                    "values row {row_index} column {column_index} `{}` is null but not nullable",
+                    field.name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn node_error(node_index: usize, op: &Operator, message: impl std::fmt::Display) -> Error {
+    Error::generic(format!("plan node {node_index} ({op}): {message}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use test_utils::assert_result_error_with_message;
+
+    use super::*;
+    use crate::expressions::{col, column_name, lit, Predicate, Scalar};
+    use crate::plans::ir::nodes::{Filter, SemiJoin, UnionAll};
+    use crate::schema::{DataType, StructField, StructType};
+
+    fn schema(name: &str, data_type: DataType) -> SchemaRef {
+        Arc::new(StructType::new_unchecked([StructField::nullable(
+            name, data_type,
+        )]))
+    }
+
+    fn values(schema: SchemaRef, value: Scalar) -> PlanNode {
+        PlanNode::new(Values::new(schema, vec![vec![value]]), vec![])
+    }
+
+    #[test]
+    fn empty_plan_is_rejected() {
+        assert_result_error_with_message(Plan::try_new(vec![]), "at least one node");
+    }
+
+    #[test]
+    fn forward_input_reference_is_rejected() {
+        let node = PlanNode::new(Values::new(schema("id", DataType::LONG), vec![]), vec![0]);
+        assert_result_error_with_message(Plan::try_new(vec![node]), "must reference");
+    }
+
+    #[test]
+    fn values_must_match_their_schema() {
+        let node = values(schema("id", DataType::LONG), Scalar::String("wrong".into()));
+        assert_result_error_with_message(Plan::try_new(vec![node]), "has type string");
+    }
+
+    #[test]
+    fn filter_is_rechecked_against_its_actual_input() {
+        let string_schema = schema("id", DataType::STRING);
+        let filter = Filter::try_new(
+            &string_schema,
+            Predicate::eq(col!("id"), lit("expected-string")),
+        )
+        .unwrap();
+        let nodes = vec![
+            values(schema("id", DataType::LONG), Scalar::Long(1)),
+            PlanNode::new(filter, vec![0]),
+        ];
+        assert_result_error_with_message(Plan::try_new(nodes), "has type string, expected long");
+    }
+
+    #[test]
+    fn joins_require_pairwise_compatible_key_types() {
+        let join = SemiJoin {
+            inverted: false,
+            probe_keys: vec![column_name!("id")],
+            build_keys: vec![column_name!("id")],
+        };
+        let nodes = vec![
+            values(schema("id", DataType::LONG), Scalar::Long(1)),
+            values(schema("id", DataType::STRING), Scalar::String("1".into())),
+            PlanNode::new(join, vec![0, 1]),
+        ];
+        assert_result_error_with_message(Plan::try_new(nodes), "different types");
+    }
+
+    #[test]
+    fn union_requires_identical_input_schemas() {
+        let nodes = vec![
+            values(schema("id", DataType::LONG), Scalar::Long(1)),
+            values(schema("id", DataType::STRING), Scalar::String("1".into())),
+            PlanNode::new(UnionAll, vec![0, 1]),
+        ];
+        assert_result_error_with_message(Plan::try_new(nodes), "different schema");
+    }
 }

@@ -470,8 +470,9 @@ fn scan_declarative_metadata_plan_impl(
         .map(|plan| {
             delta_kernel::Operation::QueryPlan(plan)
                 .to_proto_bytes()
-                .into()
+                .map(Into::into)
         })
+        .transpose()?
         .into())
 }
 

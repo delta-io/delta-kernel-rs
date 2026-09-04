@@ -58,7 +58,7 @@ unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
     fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
-        let plan_proto_bytes = op.to_proto_bytes();
+        let plan_proto_bytes = op.to_proto_bytes()?;
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
         let mut out = EngineExecResult::Uninit;
