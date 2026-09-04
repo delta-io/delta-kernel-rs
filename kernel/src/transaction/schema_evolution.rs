@@ -9,7 +9,7 @@ use delta_kernel_derive::internal_api;
 use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{ColumnMetadataKey, DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     find_max_column_id_in_schema, schema_has_column_mapping_metadata,
@@ -17,6 +17,7 @@ use crate::table_features::{
     validate_column_mapping_id, ColumnMappingMode,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::FoldWithOption as _;
 use crate::DeltaResult;
 
@@ -50,79 +51,55 @@ impl SchemaOperation {
     }
 }
 
-fn add_field(parent: &mut StructType, field: StructField) -> DeltaResult<()> {
+fn add_field(parent: &mut StructType, field: StructField, parent_path: String) -> DeltaResult<()> {
     let lowered = field.name().to_lowercase();
     if parent
         .fields()
         .any(|existing| existing.name().to_lowercase() == lowered)
     {
         return Err(Error::schema(format!(
-            "Cannot add column '{}': a column with that name already exists",
-            field.name()
+            "Cannot add column '{}' under {}: a column with that name already exists",
+            field.name(),
+            parent_path,
         )));
     }
     parent.field_map_mut().insert(field.name().clone(), field);
     Ok(())
 }
 
-fn set_field_nullable(field: &mut StructType, name: &str) -> DeltaResult<()> {
-    let field = field
-        .field_map_mut()
-        .values_mut()
-        .find(|field| field.name().to_lowercase() == name.to_lowercase())
-        .ok_or_else(|| Error::schema(format!("field '{}' does not exist", name)))?;
-    field.nullable = true;
-    Ok(())
+struct AddedFieldMetadataValidator;
+
+impl<'a> SchemaTransform<'a> for AddedFieldMetadataValidator {
+    transform_output_type!(|'a, T| DeltaResult<()>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
+        if let Some(key) = field.metadata.keys().find(|key| {
+            key.as_str() == ColumnMetadataKey::GenerationExpression.as_ref()
+                || key.starts_with("delta.identity.")
+        }) {
+            return Err(Error::schema(format!(
+                "Cannot add column '{}': metadata annotation '{}' is not supported",
+                field.name(),
+                key,
+            )));
+        }
+
+        self.recurse_into_struct_field(field)
+    }
 }
 
-// Helper to modify a nested column. For each component in `path`,
-// locates the matching field (case-insensitive), array element, map key, or map value,
-// then descends into the next nested data
-// type. At the leaf, calls `modifier` to mutate the field in place.
-//
-// `modifier` is expected to mutate the field's nullability, metadata, or `data_type` -- but
-// not its name. Renames need additional handling (IndexMap re-keying + sibling-conflict check)
-// that downstream PRs will introduce alongside the rename caller.
-//
-// Returns an error if a field in the path does not exist or an intermediate field is not a struct.
-//
-// Example:
-//   fields   = [ id: int not null, address: struct { city: string not null, zip: string } ]
-//   path     = ["address", "city"]
-//   modifier = |f| { f.nullable = true; Ok(()) }
-// yields:
-//   [ id: int not null, address: struct { city: string, zip: string } ]
-fn modify_field_at_path(
-    data_type: &mut DataType,
-    path: &[String],
-    modifier: impl FnOnce(&mut StructType) -> DeltaResult<()>,
-) -> DeltaResult<()> {
-    let Some((segment, rest)) = path.split_first() else {
-        // `path` is empty, attempt to modify the current struct.
-        let DataType::Struct(parent) = data_type else {
-            return Err(Error::schema("path target is not a struct"));
-        };
-        return modifier(parent);
-    };
-    match (segment.as_str(), data_type) {
-        ("element", DataType::Array(array)) => {
-            modify_field_at_path(&mut array.element_type, rest, modifier)
-        }
-        ("key", DataType::Map(map)) => modify_field_at_path(&mut map.key_type, rest, modifier),
-        ("value", DataType::Map(map)) => modify_field_at_path(&mut map.value_type, rest, modifier),
-        (name, DataType::Struct(parent)) => {
-            let lowered = name.to_lowercase();
-            let field = parent
-                .field_map_mut()
-                .values_mut()
-                .find(|field| field.name().to_lowercase() == lowered)
-                .ok_or_else(|| Error::schema(format!("field '{name}' does not exist")))?;
-            modify_field_at_path(&mut field.data_type, rest, modifier)
-        }
-        (segment, data_type) => Err(Error::schema(format!(
-            "path segment {segment:?} does not match {data_type}"
-        ))),
-    }
+fn reject_generated_or_identity_metadata(field: &StructField) -> DeltaResult<()> {
+    AddedFieldMetadataValidator.transform_struct_field(field)
+}
+
+fn set_field_nullable(parent: &mut StructType, name: &str) -> DeltaResult<()> {
+    let parent = parent
+        .field_map_mut()
+        .values_mut()
+        .find(|parent| parent.name().to_lowercase() == name.to_lowercase())
+        .ok_or_else(|| Error::schema(format!("field '{}' does not exist", name)))?;
+    parent.nullable = true;
+    Ok(())
 }
 
 /// The result of applying schema operations.
@@ -184,6 +161,7 @@ pub(crate) fn apply_schema_operations(
             // `DELTA_FEATURES_REQUIRE_MANUAL_ENABLEMENT` and requires the user to enable the
             // feature explicitly before adding such a column.
             SchemaOperation::AddColumn { parent, field } => {
+                reject_generated_or_identity_metadata(&field)?;
                 if field.is_metadata_column() {
                     return Err(Error::schema(format!(
                         "Cannot add column '{}': metadata columns are not allowed in a table schema",
@@ -223,17 +201,20 @@ pub(crate) fn apply_schema_operations(
                     field
                 };
                 let parent_path = parent.as_ref().map_or(&[][..], ColumnName::path);
-                modify_field_at_path(&mut root, parent_path, |parent| add_field(parent, field))?;
+                add_field(
+                    root.struct_at_path(parent_path)?,
+                    field,
+                    ColumnName::new(parent_path).to_string(),
+                )?;
             }
             SchemaOperation::SetNullable { column } => {
                 let (leaf, parent) = column
                     .path()
                     .split_last()
                     .ok_or_else(|| Error::generic("empty column path"))?;
-                modify_field_at_path(&mut root, parent, |parent| set_field_nullable(parent, leaf))
-                    .map_err(|e| {
-                        Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
-                    })?;
+                set_field_nullable(root.struct_at_path(parent)?, leaf).map_err(|e| {
+                    Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
+                })?;
             }
         }
 
@@ -379,23 +360,6 @@ mod tests {
         StructType::try_new([StructField::nullable("existing", DataType::STRING)]).unwrap()
     }
 
-    fn nested_struct_at<'a>(mut data_type: &'a DataType, parent: &[String]) -> &'a StructType {
-        for segment in parent {
-            data_type = match (segment.as_str(), data_type) {
-                ("element", DataType::Array(array)) => array.element_type(),
-                ("key", DataType::Map(map)) => map.key_type(),
-                ("value", DataType::Map(map)) => map.value_type(),
-                (segment, data_type) => {
-                    panic!("parent segment {segment:?} does not match {data_type}")
-                }
-            };
-        }
-        let DataType::Struct(parent) = data_type else {
-            panic!("parent does not resolve to a struct");
-        };
-        parent
-    }
-
     fn get_cm_id(field: &StructField) -> i64 {
         field
             .column_mapping_id()
@@ -478,6 +442,69 @@ mod tests {
     }
 
     #[rstest]
+    #[case::generation_expression("delta.generationExpression")]
+    #[case::identity_start("delta.identity.start")]
+    #[case::identity_step("delta.identity.step")]
+    #[case::identity_high_water_mark("delta.identity.highWaterMark")]
+    #[case::identity_allow_explicit_insert("delta.identity.allowExplicitInsert")]
+    #[case::unknown_identity_annotation("delta.identity.futureAnnotation")]
+    fn rejects_generated_or_identity_metadata_on_added_field(#[case] key: &str) {
+        let field = StructField::nullable("added", DataType::STRING)
+            .add_metadata([(key, MetadataValue::String("value".to_string()))]);
+        let operation = SchemaOperation::add_column(None, field);
+
+        let err = apply_schema_operations(
+            simple_schema(),
+            vec![operation],
+            ColumnMappingMode::None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(key),
+            "expected error to name '{key}', got: {err}"
+        );
+    }
+
+    fn struct_with_generation_expression() -> StructType {
+        let field = StructField::nullable("nested", DataType::STRING).add_metadata([(
+            ColumnMetadataKey::GenerationExpression.as_ref(),
+            MetadataValue::String("value".to_string()),
+        )]);
+        StructType::try_new([field]).unwrap()
+    }
+
+    #[rstest]
+    #[case::struct_field(DataType::from(struct_with_generation_expression()))]
+    #[case::array_map_value(DataType::from(ArrayType::new(
+        MapType::new(DataType::INTEGER, struct_with_generation_expression(), true),
+        true,
+    )))]
+    #[case::map_key(DataType::from(MapType::new(
+        struct_with_generation_expression(),
+        DataType::INTEGER,
+        true,
+    )))]
+    #[case::variant(DataType::Variant(Box::new(struct_with_generation_expression())))]
+    fn rejects_nested_generation_expression_on_added_field(#[case] data_type: DataType) {
+        let field = StructField::nullable("added", data_type);
+        let operation = SchemaOperation::add_column(None, field);
+
+        let err = apply_schema_operations(
+            simple_schema(),
+            vec![operation],
+            ColumnMappingMode::None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(ColumnMetadataKey::GenerationExpression.as_ref()),
+            "expected nested generated-column metadata error, got: {err}"
+        );
+    }
+
+    #[rstest]
     #[case::single(vec![add_col("email", true)], &["id", "name", "email"])]
     #[case::multiple(
         vec![add_col("email", true), add_col("age", true)],
@@ -532,8 +559,13 @@ mod tests {
         let result =
             apply_schema_operations(schema, vec![operation], ColumnMappingMode::None, None)
                 .unwrap();
-        let container = result.schema.field("container").unwrap();
-        let parent = nested_struct_at(container.data_type(), parent_path.path());
+        let mut container_type = result
+            .schema
+            .field("container")
+            .unwrap()
+            .data_type()
+            .clone();
+        let parent = container_type.struct_at_path(parent_path.path()).unwrap();
 
         assert!(parent.field("existing").is_some());
         assert_eq!(

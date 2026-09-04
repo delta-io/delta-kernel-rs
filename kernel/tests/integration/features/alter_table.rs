@@ -19,9 +19,9 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
-    add_commit, column_mapping_fixtures as fixtures, create_table as create_test_table,
-    create_table_and_load_snapshot, engine_store_setup, test_table_setup, test_table_setup_mt,
-    write_batch_to_table,
+    add_commit, assert_result_error_with_message, column_mapping_fixtures as fixtures,
+    create_table as create_test_table, create_table_and_load_snapshot, engine_store_setup,
+    test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -541,32 +541,6 @@ async fn add_column_at_nested_struct_with_column_mapping(
 async fn add_column_at_containers_round_trip(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
 ) -> DeltaResult<()> {
-    fn target_struct<'a>(schema: &'a StructType, path: &ColumnName) -> &'a StructType {
-        let (first, rest) = path.path().split_first().expect("non-empty path");
-        let mut data_type = schema
-            .field(first)
-            .unwrap_or_else(|| panic!("field '{first}' not found"))
-            .data_type();
-        for segment in rest {
-            data_type = match (segment.as_str(), data_type) {
-                ("element", DataType::Array(array)) => array.element_type(),
-                ("key", DataType::Map(map)) => map.key_type(),
-                ("value", DataType::Map(map)) => map.value_type(),
-                (name, DataType::Struct(parent)) => parent
-                    .field(name)
-                    .unwrap_or_else(|| panic!("field '{name}' not found"))
-                    .data_type(),
-                (segment, data_type) => {
-                    panic!("path segment '{segment}' does not match {data_type}")
-                }
-            };
-        }
-        let DataType::Struct(target) = data_type else {
-            panic!("path '{path}' does not resolve to a struct")
-        };
-        target
-    }
-
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "items": [ nullable {
@@ -606,13 +580,15 @@ async fn add_column_at_containers_round_trip(
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    let reloaded_schema = reloaded.schema();
+    let mut reloaded_type = DataType::from(reloaded.schema().as_ref().clone());
     for path in [
         column_name!("items.element"),
         column_name!("by_key.key"),
         column_name!("by_value.value"),
     ] {
-        let target = target_struct(reloaded_schema.as_ref(), &path);
+        let target = reloaded_type
+            .struct_at_path(path.path())
+            .unwrap_or_else(|err| panic!("path '{path}' does not resolve to a struct: {err}"));
         assert!(target.field("existing").is_some());
 
         let added = target.field("added").expect("added field must exist");
@@ -626,6 +602,106 @@ async fn add_column_at_containers_round_trip(
             cm_mode.is_some()
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_at_struct_fields_named_like_container_segments() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "address": {
+            nullable "element": {
+                nullable "existing": STRING,
+            },
+            nullable "key": {
+                nullable "existing": STRING,
+            },
+            nullable "value": {
+                nullable "existing": STRING,
+            },
+        },
+    };
+    let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("address.element"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("address.key"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("address.value"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let mut reloaded_type = DataType::from(reloaded.schema().as_ref().clone());
+    for path in [
+        column_name!("address.element"),
+        column_name!("address.key"),
+        column_name!("address.value"),
+    ] {
+        let parent = reloaded_type
+            .struct_at_path(path.path())
+            .unwrap_or_else(|err| panic!("path '{path}' does not resolve to a struct: {err}"));
+        assert!(parent.field("existing").is_some());
+        assert_eq!(
+            parent.field("added"),
+            Some(&StructField::nullable("added", DataType::STRING))
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_at_rejects_duplicate_field_in_same_builder() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "address": {
+            nullable "existing": STRING,
+        },
+    };
+    let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+
+    let result = snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("address"),
+            StructField::nullable("dup", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("address"),
+            StructField::nullable("dup", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer());
+    assert_result_error_with_message(result, "already exists");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_at_rejects_non_struct_parent() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let result = snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("id"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer());
+    assert_result_error_with_message(result, "path target is not a struct");
 
     Ok(())
 }
