@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::history_manager::{first_version_after, latest_version_as_of, HistoryCommitType};
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::Snapshot;
+use delta_kernel::{Error, Snapshot};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
@@ -447,24 +447,19 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
     let actions = vec![TestAction::Add("file_4.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 4, actions_to_string(actions)).await?;
 
-    // Log tail only goes up to version 3
+    // Log tail only goes up to version 2
     let log_tail = vec![
         create_log_path(&table_url, delta_path_for_version(1, "json")),
         create_log_path(&table_url, delta_path_for_version(2, "json")),
-        create_log_path(&table_url, delta_path_for_version(3, "json")),
     ];
 
-    // User asks for version 4, but log tail only has up to version 3
-    // This should fail with an error
+    // User asks for version 4, but versions 3 and 4 are unavailable through the log tail.
     let result = Snapshot::builder_for(table_root)
         .at_version(4)
         .with_log_tail(log_tail)
         .build(engine.as_ref());
 
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("LogSegment end version 3 not the same as the specified end version 4"));
+    assert!(matches!(result, Err(Error::MissingVersion(3))));
 
     Ok(())
 }

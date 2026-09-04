@@ -199,9 +199,21 @@ pub enum Error {
     #[error("Expected is missing: {0}")]
     MissingData(String),
 
-    /// A version for the delta table could not be found in the log
+    /// No table versions were found for the requested log operation.
     #[error("No table version found.")]
-    MissingVersion,
+    EmptyLog,
+
+    /// One or more table versions required by a log operation are unavailable.
+    ///
+    /// The payload is the lowest version that the operation requires but cannot obtain.
+    #[error("Table version {0} is missing or unavailable for this log operation.")]
+    MissingVersion(Version),
+
+    /// A table version required by an operation has not been published to the Delta log.
+    ///
+    /// The payload is the first unpublished version.
+    #[error("Table version {0} has not been published to the Delta log.")]
+    UnpublishedVersion(Version),
 
     /// An error occurred while working with deletion vectors
     #[error("Deletion Vector error: {0}")]
@@ -281,6 +293,11 @@ pub enum Error {
     /// Unable to parse the name of a log path
     #[error("Invalid log path: {0}")]
     InvalidLogPath(String),
+
+    /// The assembled log segment is inconsistent with its declared file kinds, ordering, or
+    /// version bounds. Malformed checkpoint file sets use [`Error::InvalidCheckpoint`].
+    #[error("Invalid log segment: {0}")]
+    InvalidLogSegment(String),
 
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]
@@ -415,6 +432,10 @@ impl Error {
     }
     pub(crate) fn invalid_log_path(msg: impl ToString) -> Self {
         Self::InvalidLogPath(msg.to_string())
+    }
+
+    pub(crate) fn invalid_log_segment(msg: impl ToString) -> Self {
+        Self::InvalidLogSegment(msg.to_string())
     }
 
     pub fn internal_error(msg: impl ToString) -> Self {

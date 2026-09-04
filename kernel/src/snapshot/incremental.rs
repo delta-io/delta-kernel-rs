@@ -268,11 +268,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(requested_version) => Err(Error::Generic(format!(
-                    "Requested snapshot version {requested_version} is not available: \
-                     no new commits were found after existing snapshot version \
-                     {existing_snapshot_version}"
-                ))),
+                Some(_) => Err(Error::MissingVersion(existing_snapshot_version + 1)),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 None => Ok(NewSegment::Unchanged),
             };
@@ -1110,8 +1106,10 @@ mod tests {
         assert_eq!(snapshot, expected);
         // version exceeds latest version of the table = err
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
-            Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is not available: no new commits were found after existing snapshot version 0"
+            Snapshot::builder_from(base_snapshot.clone())
+                .at_version(1)
+                .build(&engine),
+            Err(Error::MissingVersion(1))
         ));
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
@@ -1176,8 +1174,10 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
-            Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
+            Snapshot::builder_from(base_snapshot.clone())
+                .at_version(4)
+                .build(&engine),
+            Err(Error::MissingVersion(2))
         ));
 
         // ii. commits have (new protocol, no metadata)
@@ -2198,19 +2198,19 @@ mod tests {
     async fn test_incremental_unavailable_version_emits_log_segment_load_failure() -> DeltaResult<()>
     {
         let ctx = setup_incremental_snapshot_test()?;
-        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?; // v0..=v3
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?; // v0..=v2
         let base = Snapshot::builder_for(ctx.url.as_str())
-            .at_version(3)
+            .at_version(2)
             .build(ctx.engine.as_ref())?;
 
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        // Request a version beyond the log: the listing above v3 is empty (case C.1).
+        // Request a version beyond the log: the listing above v2 is empty (case C.1).
         let result = Snapshot::builder_from(base)
-            .at_version(9)
+            .at_version(5)
             .build(ctx.engine.as_ref());
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::MissingVersion(3))));
 
         let events = reporter.events();
         let failure = events
