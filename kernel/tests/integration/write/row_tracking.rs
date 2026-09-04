@@ -148,6 +148,8 @@ mod row_tracking_preservation {
     }
 
     impl RemoveTestCase {
+        // Each pair is a table property name/value used to create the test table. Acknowledgment is
+        // transaction state, so acknowledged and unacknowledged cases share table properties.
         fn create_table_properties(self) -> &'static [(&'static str, &'static str)] {
             match self {
                 Self::EnabledUnacknowledged | Self::EnabledAcknowledged => {
@@ -174,7 +176,7 @@ mod row_tracking_preservation {
                 || self == Self::IcebergCompatV3EnabledAcknowledged
         }
 
-        fn expected_error(self) -> Option<&'static str> {
+        fn expects_error(self) -> Option<&'static str> {
             match self {
                 Self::EnabledUnacknowledged => Some("Transaction::ack_row_tracking_preservation()"),
                 Self::IcebergCompatV3EnabledUnacknowledged
@@ -248,7 +250,7 @@ mod row_tracking_preservation {
         }
 
         // === Commit and verify the result ===
-        if let Some(expected_error) = test_case.expected_error() {
+        if let Some(expected_error) = test_case.expects_error() {
             assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
         } else {
             let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();

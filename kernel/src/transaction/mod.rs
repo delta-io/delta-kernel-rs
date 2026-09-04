@@ -361,6 +361,8 @@ impl<S> Transaction<S> {
         let commit_start = Instant::now();
 
         #[cfg(feature = "row-tracking-preservation-in-dev")]
+        // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
+        // that accompany copied or updated rows, so both require the preservation acknowledgment.
         if !self.remove_files_metadata.is_empty() || self.num_dv_updates > 0 {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;

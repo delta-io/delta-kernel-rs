@@ -161,6 +161,9 @@ impl Transaction {
     ///
     /// See [Row Tracking] in the Delta protocol for more details.
     ///
+    /// Kernel does not validate rewritten files or materialized values. Calling this method asserts
+    /// that the connector has satisfied these requirements.
+    ///
     /// The Delta protocol specifies this preservation as a SHOULD requirement. Kernel requires it
     /// for compatibility.
     ///
