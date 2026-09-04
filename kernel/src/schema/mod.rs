@@ -2431,6 +2431,42 @@ impl DataType {
     pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
     pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
 
+    /// Resolves a path to a mutable nested struct.
+    ///
+    /// Struct fields are matched case-insensitively. The `element`, `key`, and `value` path
+    /// segments traverse array elements, map keys, and map values, respectively.
+    ///
+    /// Returns an error if a field does not exist, a path segment does not match the current data
+    /// type, or the path target is not a struct.
+    pub fn struct_at_path<'a>(&'a mut self, path: &[String]) -> DeltaResult<&'a mut StructType> {
+        let mut data_type = self;
+        for segment in path {
+            data_type = match (segment.as_str(), data_type) {
+                ("element", DataType::Array(array)) => &mut array.element_type,
+                ("key", DataType::Map(map)) => &mut map.key_type,
+                ("value", DataType::Map(map)) => &mut map.value_type,
+                (name, DataType::Struct(parent)) => {
+                    let lowered = name.to_lowercase();
+                    &mut parent
+                        .field_map_mut()
+                        .values_mut()
+                        .find(|field| field.name().to_lowercase() == lowered)
+                        .ok_or_else(|| Error::schema(format!("field '{name}' does not exist")))?
+                        .data_type
+                }
+                (segment, data_type) => {
+                    return Err(Error::schema(format!(
+                        "path segment {segment:?} does not match {data_type}"
+                    )))
+                }
+            };
+        }
+        let DataType::Struct(target) = data_type else {
+            return Err(Error::schema("path target is not a struct"));
+        };
+        Ok(target)
+    }
+
     /// Compact type name for diagnostics that must not expand nested schemas.
     pub(crate) fn kind_name(&self) -> String {
         match self {
