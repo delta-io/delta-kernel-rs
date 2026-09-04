@@ -1291,6 +1291,128 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         .unwrap();
 }
 
+#[derive(Clone, Copy, Debug)]
+enum EvaluatorKind {
+    Expression,
+    Predicate,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TopLevelSchemaMismatch {
+    ExtraField,
+    MissingField,
+    ReorderedFields,
+    RenamedField,
+    WrongType,
+}
+
+#[rstest]
+#[case::extra_field(
+    TopLevelSchemaMismatch::ExtraField,
+    "Input schema fields [\"a\", \"b\"] do not match batch schema fields [\"a\", \"b\", \"c\"]"
+)]
+#[case::missing_field(
+    TopLevelSchemaMismatch::MissingField,
+    "Input schema fields [\"a\", \"b\"] do not match batch schema fields [\"a\"]"
+)]
+#[case::reordered_fields(
+    TopLevelSchemaMismatch::ReorderedFields,
+    "Input schema field 'a' does not match batch schema field 'b'"
+)]
+#[case::renamed_field(
+    TopLevelSchemaMismatch::RenamedField,
+    "Input schema field 'b' does not match batch schema field 'c'"
+)]
+#[case::wrong_type(
+    TopLevelSchemaMismatch::WrongType,
+    "Input schema type for 'a' does not match the batch schema type"
+)]
+fn evaluator_rejects_mismatched_top_level_schema(
+    #[values(EvaluatorKind::Expression, EvaluatorKind::Predicate)] evaluator_kind: EvaluatorKind,
+    #[case] mismatch: TopLevelSchemaMismatch,
+    #[case] expected_error: &str,
+) {
+    let input_schema = schema_ref! {
+        nullable "a": INTEGER,
+        nullable "b": STRING,
+    };
+    let batch_schema = match mismatch {
+        TopLevelSchemaMismatch::ExtraField => Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Boolean, true),
+        ]),
+        TopLevelSchemaMismatch::MissingField => {
+            Schema::new(vec![Field::new("a", DataType::Int32, true)])
+        }
+        TopLevelSchemaMismatch::ReorderedFields => Schema::new(vec![
+            Field::new("b", DataType::Utf8, true),
+            Field::new("a", DataType::Int32, true),
+        ]),
+        TopLevelSchemaMismatch::RenamedField => Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("c", DataType::Utf8, true),
+        ]),
+        TopLevelSchemaMismatch::WrongType => Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]),
+    };
+    let batch = ArrowEngineData::new(RecordBatch::new_empty(Arc::new(batch_schema)));
+    let handler = ArrowEvaluationHandler;
+    let result = match evaluator_kind {
+        EvaluatorKind::Expression => handler
+            .new_expression_evaluator(input_schema, Arc::new(col!("a")), KernelDataType::INTEGER)
+            .unwrap()
+            .evaluate(&batch),
+        EvaluatorKind::Predicate => handler
+            .new_predicate_evaluator(input_schema, Arc::new(Predicate::TRUE))
+            .unwrap()
+            .evaluate(&batch),
+    };
+
+    assert_result_error_with_message(result, expected_error);
+}
+
+#[rstest]
+fn evaluator_accepts_omitted_fields_in_nullable_struct(
+    #[values(false, true)] batch_is_sparse: bool,
+) {
+    let sparse_struct = schema! {};
+    let rich_struct = schema! {
+        not_null "a": INTEGER,
+    };
+    let (input_struct, batch_struct) = if batch_is_sparse {
+        (rich_struct, sparse_struct)
+    } else {
+        (sparse_struct, rich_struct)
+    };
+    let input_schema = schema_ref! {
+        nullable "s": (input_struct),
+    };
+    let batch_schema = schema_ref! {
+        not_null "s": (batch_struct),
+    };
+    let batch_schema: Schema = batch_schema.as_ref().try_into_arrow().unwrap();
+
+    validate_input_schema(&input_schema, &batch_schema).unwrap();
+}
+
+#[test]
+fn evaluator_rejects_conflicting_field_in_nullable_struct() {
+    let input_schema = schema_ref! {
+        nullable "s": { not_null "a": INTEGER },
+    };
+    let batch_schema = schema_ref! {
+        nullable "s": { nullable "a": STRING },
+    };
+    let batch_schema: Schema = batch_schema.as_ref().try_into_arrow().unwrap();
+
+    let result = validate_input_schema(&input_schema, &batch_schema);
+
+    assert_result_error_with_message(result, "Input schema type for 's' does not match");
+}
+
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`
 fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBatch) {
     let handler = ArrowEvaluationHandler;

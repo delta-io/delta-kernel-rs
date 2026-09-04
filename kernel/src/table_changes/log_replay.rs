@@ -10,8 +10,8 @@ use tracing::info;
 
 use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
 use crate::actions::{
-    Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, LOG_ADD_SCHEMA, METADATA_FIELD,
-    PROTOCOL_FIELD, REMOVE_FIELD,
+    Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, PROTOCOL_FIELD,
+    REMOVE_FIELD,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
@@ -89,7 +89,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
                 engine.as_ref(),
                 predicate,
                 start_table_configuration,
-                LOG_ADD_SCHEMA.clone(),
+                FileActionSelectionVisitor::schema(),
             )
         })
         .map(Arc::new);
@@ -345,7 +345,7 @@ impl LogReplayScanner {
         let schema = FileActionSelectionVisitor::schema();
         let action_iter = engine.json_handler().read_json_files(
             slice::from_ref(&commit_file.location),
-            schema,
+            schema.clone(),
             None,
         )?;
         let commit_version = commit_file
@@ -353,7 +353,7 @@ impl LogReplayScanner {
             .try_into()
             .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            LOG_ADD_SCHEMA.clone(),
+            schema,
             Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
             cdf_scan_row_schema().into(),
         )?;

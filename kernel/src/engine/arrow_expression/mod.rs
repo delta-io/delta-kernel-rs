@@ -6,7 +6,7 @@ use evaluate_expression::{evaluate_expression, evaluate_predicate};
 use itertools::Itertools;
 use tracing::debug;
 
-use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
+use super::arrow_conversion::{TryFromArrow as _, TryFromKernel as _, TryIntoArrow as _};
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -15,7 +15,7 @@ use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::{DataType, PrimitiveType, SchemaRef};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructType};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
@@ -254,7 +254,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
-            _input_schema: schema,
+            input_schema: schema,
             expression,
             output_type,
         }))
@@ -266,7 +266,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
         Ok(Arc::new(DefaultPredicateEvaluator {
-            _input_schema: schema,
+            input_schema: schema,
             predicate,
         }))
     }
@@ -341,7 +341,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    _input_schema: SchemaRef,
+    input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
 }
@@ -350,14 +350,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
+        validate_input_schema(&self.input_schema, batch.schema().as_ref())?;
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::StructPatch(patch), DataType::Struct(_)) if patch.is_empty() => {
                 // Empty patch optimization: Skip expression evaluation and directly apply the
@@ -388,7 +381,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
-    _input_schema: SchemaRef,
+    input_schema: SchemaRef,
     predicate: PredicateRef,
 }
 
@@ -396,14 +389,7 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
+        validate_input_schema(&self.input_schema, batch.schema().as_ref())?;
         let array = evaluate_predicate(&self.predicate, batch, false)?;
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "output",
@@ -412,5 +398,90 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
         Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+}
+
+fn validate_input_schema(input_schema: &SchemaRef, batch_schema: &ArrowSchema) -> DeltaResult<()> {
+    let batch_schema = StructType::try_from_arrow(batch_schema)?;
+    require!(
+        input_schema.num_fields() == batch_schema.num_fields(),
+        Error::generic(format!(
+            "Input schema fields {:?} do not match batch schema fields {:?}",
+            input_schema
+                .fields()
+                .map(|field| field.name())
+                .collect_vec(),
+            batch_schema
+                .fields()
+                .map(|field| field.name())
+                .collect_vec()
+        ))
+    );
+
+    for (input_field, batch_field) in input_schema.fields().zip(batch_schema.fields()) {
+        require!(
+            input_field.name() == batch_field.name(),
+            Error::generic(format!(
+                "Input schema field '{}' does not match batch schema field '{}'",
+                input_field.name(),
+                batch_field.name()
+            ))
+        );
+        require!(
+            input_types_compatible(
+                input_field.data_type(),
+                batch_field.data_type(),
+                input_field.is_nullable() || batch_field.is_nullable(),
+            ),
+            Error::generic(format!(
+                "Input schema type for '{}' does not match the batch schema type: {:?} != {:?}",
+                input_field.name(),
+                input_field.data_type(),
+                batch_field.data_type()
+            ))
+        );
+    }
+    Ok(())
+}
+
+fn input_types_compatible(
+    input_type: &DataType,
+    batch_type: &DataType,
+    allow_omitted_struct_fields: bool,
+) -> bool {
+    match (input_type, batch_type) {
+        (DataType::Primitive(input), DataType::Primitive(batch)) => input == batch,
+        (DataType::Struct(input), DataType::Struct(batch)) => {
+            if !allow_omitted_struct_fields && input.num_fields() != batch.num_fields() {
+                return false;
+            }
+
+            input.fields().all(|input_field| {
+                batch.field(input_field.name()).is_none_or(|batch_field| {
+                    input_types_compatible(
+                        input_field.data_type(),
+                        batch_field.data_type(),
+                        input_field.is_nullable() || batch_field.is_nullable(),
+                    )
+                })
+            }) && batch.fields().all(|batch_field| {
+                input.field(batch_field.name()).is_some() || allow_omitted_struct_fields
+            })
+        }
+        (DataType::Array(input), DataType::Array(batch)) => input_types_compatible(
+            input.element_type(),
+            batch.element_type(),
+            input.contains_null() || batch.contains_null(),
+        ),
+        (DataType::Map(input), DataType::Map(batch)) => {
+            input_types_compatible(input.key_type(), batch.key_type(), false)
+                && input_types_compatible(
+                    input.value_type(),
+                    batch.value_type(),
+                    input.value_contains_null() || batch.value_contains_null(),
+                )
+        }
+        (DataType::Variant(input), DataType::Variant(batch)) => input == batch,
+        _ => false,
     }
 }
