@@ -92,7 +92,7 @@ prompt: |
   and do NOT restate the diff. "No blocking issues" is a fine review.
 
   Each finding must include:
-  - a stable ID (`B1`, `B2`, ... for blockers; `N1`, `N2`, ... for notes);
+  - a stable ID (`Blocker1`, `Blocker2`, ... for blockers; `Nit1`, `Nit2`, ... for notes);
   - the file/line or diff hunk reference;
   - the concrete failure mode or maintenance cost;
   - `Raised by: <agent names>` with all agents that flagged that issue;

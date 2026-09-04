@@ -66,13 +66,13 @@ class InlineReviewTest(unittest.TestCase):
         review, findings = self.inline_review.extract_inline_findings(
             "Summary\n"
             f"<!-- AI_REVIEW_INLINE_START_{marker} -->\n"
-            '{"findings":[{"id":"N1"}]}\n'
+            '{"findings":[{"id":"Nit1"}]}\n'
             f"<!-- AI_REVIEW_INLINE_END_{marker} -->",
             marker,
         )
 
         self.assertEqual(review, "Summary")
-        self.assertEqual(findings, [{"id": "N1"}])
+        self.assertEqual(findings, [{"id": "Nit1"}])
 
     def test_inline_prompt_uses_parser_contract(self) -> None:
         marker = "a" * 32
@@ -128,17 +128,17 @@ class InlineReviewTest(unittest.TestCase):
 
     def test_build_payload_keeps_only_locations_in_diff(self) -> None:
         payload, unmapped = self.inline_review.build_review_payload(
-            review="### N1: use the new call",
+            review="### Nit1: use the new call",
             findings=[
                 {
-                    "id": "N1",
+                    "id": "Nit1",
                     "path": "kernel/src/example.rs",
                     "line": 10,
                     "side": "RIGHT",
                     "body": "This is attached to the added line.",
                 },
                 {
-                    "id": "N2",
+                    "id": "Nit2",
                     "path": "kernel/src/example.rs",
                     "line": 100,
                     "side": "RIGHT",
@@ -159,20 +159,20 @@ class InlineReviewTest(unittest.TestCase):
                     "path": "kernel/src/example.rs",
                     "line": 10,
                     "side": "RIGHT",
-                    "body": "**N1** This is attached to the added line.",
+                    "body": "**Nit1** This is attached to the added line.",
                 }
             ],
         )
         self.assertIn("<details><summary>Show review</summary>", payload["body"])
         self.assertTrue(payload["body"].startswith("<!-- ai-review-bot -->"))
-        self.assertEqual(unmapped, ["N2"])
+        self.assertEqual(unmapped, ["Nit2"])
 
     def test_build_payload_accepts_multiline_finding_body(self) -> None:
         payload, unmapped = self.inline_review.build_review_payload(
             review="review",
             findings=[
                 {
-                    "id": "N1",
+                    "id": "Nit1",
                     "path": "kernel/src/example.rs",
                     "line": 10,
                     "side": "RIGHT",
@@ -199,7 +199,7 @@ class InlineReviewTest(unittest.TestCase):
 
     def test_build_payload_skips_duplicate_ids(self) -> None:
         finding = {
-            "id": "B1",
+            "id": "Blocker1",
             "path": "kernel/src/example.rs",
             "line": 9,
             "side": "RIGHT",
@@ -215,11 +215,11 @@ class InlineReviewTest(unittest.TestCase):
         )
 
         self.assertEqual(len(payload["comments"]), 1)
-        self.assertEqual(unmapped, ["B1"])
+        self.assertEqual(unmapped, ["Blocker1"])
 
     def test_build_payload_skips_untrusted_finding_fields(self) -> None:
         valid = {
-            "id": "N1",
+            "id": "Nit1",
             "path": "kernel/src/example.rs",
             "line": 10,
             "side": "RIGHT",
@@ -270,7 +270,7 @@ class InlineReviewTest(unittest.TestCase):
 
     def test_build_payload_rejects_untrusted_metadata(self) -> None:
         finding = {
-            "id": "N1",
+            "id": "Nit1",
             "path": "kernel/src/example.rs",
             "line": 10,
             "side": "RIGHT",

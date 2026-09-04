@@ -14,7 +14,7 @@ from review_publish import format_review_body as _format_review_body
 MAX_INLINE_FINDINGS = 12
 INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
 INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
-_FINDING_ID = re.compile(r"[BN][1-9][0-9]*")
+_FINDING_ID = re.compile(r"(?:Blocker|Nit)[1-9][0-9]*")
 _HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
 )
@@ -58,7 +58,7 @@ def inline_prompt_instructions(marker: str) -> str:
                     zip(
                         INLINE_FINDING_FIELDS,
                         (
-                            "N1",
+                            "Nit1",
                             "kernel/src/file.rs",
                             10,
                             "RIGHT",
@@ -84,10 +84,10 @@ machine-readable block:
 {example}
 {end}
 
-Include entries for up to {MAX_INLINE_FINDINGS} B/N findings, prioritizing
+Include entries for up to {MAX_INLINE_FINDINGS} Blocker/Nit findings, prioritizing
 blockers and then the most useful notes. Findings omitted from this block remain
 in the collapsed review. Use IDs matching `{_FINDING_ID.pattern}` (for example,
-`B1` or `N1`) and do not add an entry for the Summary. Use the repository-relative
+`Blocker1` or `Nit1`) and do not add an entry for the Summary. Use the repository-relative
 path with no backticks. Use {INLINE_FINDING_SIDES[1]} and the head-file line
 number for additions or context; use {INLINE_FINDING_SIDES[0]} and the base-file
 line number only for deleted lines. The location must occur in the supplied
@@ -227,7 +227,7 @@ def _validate_finding(finding: Any) -> tuple[str, str, int, str, str]:
     side = finding["side"]
     body = finding["body"]
     if not isinstance(finding_id, str) or _FINDING_ID.fullmatch(finding_id) is None:
-        raise ValueError("inline finding ID must match B1 or N1 form")
+        raise ValueError("inline finding ID must match Blocker1 or Nit1 form")
     if (
         not isinstance(path, str)
         or not path
