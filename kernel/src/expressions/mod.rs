@@ -31,6 +31,9 @@ mod scalars;
 mod sql;
 pub(crate) use self::sql::parse_sql;
 
+#[doc = include_str!("semantics.md")]
+pub mod semantics {}
+
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
 
@@ -77,43 +80,36 @@ pub type ExpressionStructPatchBuilder = crate::struct_patch::StructPatchBuilder<
 /// A unary predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum UnaryPredicateOp {
-    /// SQL `expr IS NULL`: `true` when the input is null and `false` otherwise, never null itself.
-    /// A wrapping `NOT` inverts it to `IS NOT NULL`.
+    /// SQL `expr IS NULL`.
+    ///
+    /// See the [Boolean and null semantics](semantics#boolean-predicates-and-nulls).
     IsNull,
 }
 
-/// A binary predicate operator.
-///
-/// The ordering and equality comparisons follow SQL three-valued logic, so a NULL operand yields
-/// NULL rather than `false`. [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate
-/// NULL and always answer `true` or `false`.
+/// A SQL comparison or membership operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryPredicateOp {
-    /// `left < right`.
+    /// SQL `left < right`.
+    ///
+    /// See the [comparison contract](semantics#comparisons).
     LessThan,
-    /// `left > right`.
+    /// SQL `left > right`.
+    ///
+    /// See the [comparison contract](semantics#comparisons).
     GreaterThan,
-    /// `left = right`.
+    /// SQL `left = right`.
+    ///
+    /// See the [comparison contract](semantics#comparisons).
     Equal,
-    /// SQL `left IS DISTINCT FROM right`: null-safe inequality, treating NULL as an ordinary
-    /// value. `DISTINCT(1, 1)` and `DISTINCT(NULL, NULL)` are `false`; `DISTINCT(NULL, 1)` is
-    /// `true`.
+    /// SQL `left IS DISTINCT FROM right`.
+    ///
+    /// See the [comparison contract](semantics#comparisons).
     Distinct,
-    /// SQL `left IN (elements)`: returns `false` when `left` is NULL. Otherwise, it returns `true`
-    /// when `left` equals any element and `false` when none match. NULL elements never match.
-    /// `left` must be a literal, and the elements are either a list-typed column or an
-    /// [`Expression::Literal`] holding a [`Scalar::Array`], never a list of expressions or a
-    /// subquery:
+    /// Tests whether `left` equals any element of an array-valued `right` expression, using SQL
+    /// `IN` null semantics. This IR node does not represent a parenthesized SQL value list or
+    /// subquery.
     ///
-    /// ```sql
-    /// 2 IN (1, 2, 3)         -- literal elements
-    /// 2 IN (SELECT ...)      -- unsupported: no subquery form
-    /// col IN (1, 2, 3)       -- unsupported: the left operand must be a literal
-    /// ```
-    ///
-    /// Testing a literal against a list column is the shape data skipping uses, and it is the
-    /// reason the operands sit this way around rather than the more familiar
-    /// column-on-the-left form.
+    /// See the [`IN` contract](semantics#in).
     In,
 }
 
@@ -144,60 +140,45 @@ pub enum UnaryExpressionOp {
     ToJson,
 }
 
-/// A binary arithmetic operator over two numeric operands.
+/// A binary SQL arithmetic operator.
 ///
-/// Both operands share a numeric type and the result takes that type. Kernel inserts no implicit
-/// casts, so widening a result (decimal precision or scale, for instance) needs an explicit
-/// [`Expression::cast`] to match a declared output type.
+/// See the [arithmetic contract](semantics#numeric-addition-subtraction-and-multiplication).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryExpressionOp {
-    /// `left + right`.
+    /// SQL `left + right`.
     Plus,
-    /// `left - right`.
+    /// SQL `left - right`.
     Minus,
-    /// `left * right`.
+    /// SQL `left * right`.
     Multiply,
-    /// `left / right`. A zero divisor never yields NULL.
+    /// SQL `left / right`: fractional numeric division. Integer inputs do not truncate.
     ///
-    /// Integer operands divide truncating toward zero, and a zero divisor fails. Float operands
-    /// follow IEEE 754: `+/-inf` for a non-zero numerator, `NaN` for `0.0 / 0.0`. In a dialect
-    /// whose `/` is always fractional, the integer case is the other division operator:
-    ///
-    /// ```sql
-    /// 7 DIV 2      -- 3, this operator over integers
-    /// 7 / 2        -- 3.5, NOT this operator
-    /// ```
+    /// See the [division contract](semantics#division).
     Divide,
 }
 
-/// A variadic expression operator.
+/// A variadic SQL expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VariadicExpressionOp {
-    /// SQL `COALESCE(exprs...)`: the first non-null value, or null when every input is null. All
-    /// inputs share one type, which is also the result type. Requires at least one input.
-    Coalesce,
-    /// SQL `ARRAY(exprs...)`: an array built by evaluating each input per row, so
-    /// `ARRAY(1, 1 + 2, my_int_col)` yields `[1, 3, <my_int_col value>]`. All inputs must share
-    /// the same element type. Requires at least one element; the element type is inferred from
-    /// the inputs.
+    /// SQL `COALESCE(exprs...)`.
     ///
-    /// For static array literals whose elements are all compile-time constants, use
-    /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
-    /// `Scalar::Array` is evaluated at compile time.
+    /// See the [`COALESCE` contract](semantics#coalesce).
+    Coalesce,
+    /// SQL `ARRAY(exprs...)`, producing one array per input row.
+    ///
+    /// Use [`Scalar::Array`] for an array literal that is constant across input rows. See the
+    /// [`ARRAY` contract](semantics#array).
     Array,
 }
 
 /// A junction (AND/OR) predicate operator over N child predicates.
 ///
-/// Both use SQL three-valued (Kleene) logic, treating a NULL child as unknown rather than false: a
-/// decisive child wins over a NULL sibling, so `AND` is `false` and `OR` is `true` despite the
-/// NULL, and only an undecided junction yields NULL. [`Predicate::junction`] folds an empty
-/// junction to its operator's identity, `true` for `AND` and `false` for `OR`.
+/// See the [Boolean and null semantics](semantics#boolean-predicates-and-nulls).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum JunctionPredicateOp {
-    /// SQL `a AND b AND ...`: true when every child is true.
+    /// SQL `a AND b AND ...`.
     And,
-    /// SQL `a OR b OR ...`: true when any child is true.
+    /// SQL `a OR b OR ...`.
     Or,
 }
 
@@ -474,11 +455,17 @@ where
     Err(de::Error::custom("Cannot deserialize an Opaque Expression"))
 }
 
-/// A SQL expression.
+/// An expression in Kernel's intermediate representation.
 ///
-/// These expressions do not track or validate data types, other than the type
-/// of literals. It is up to the expression evaluator to validate the
-/// expression against a schema and add appropriate casts as required.
+/// Expressions do not store resolved types other than the type of literals. Before evaluation, an
+/// expression is analyzed against its input schema using the common-type, result-type, nullability,
+/// and error rules in the [SQL expression contract](semantics). A surrounding `Project` may also
+/// supply a declared output type; that assignment happens after the expression's own type is
+/// resolved.
+///
+/// An evaluator may reject a valid expression it does not support. If it evaluates the expression,
+/// its result must follow the contract. Input outside the contract is not portable, even when a
+/// particular evaluator accepts it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expression {
     /// A literal value.
@@ -491,7 +478,7 @@ pub enum Expression {
     /// A struct computed from one expression per output field, in field order.
     ///
     /// Field names and nullability come from the surrounding output schema (the evaluator's
-    /// `result_type`, such as a [`Project`]'s target field), and each field expression's type is
+    /// `result_type`, such as a `Project`'s target field), and each field expression's type is
     /// validated against the schema, so building a struct takes both. The expression count must
     /// equal the output field count.
     ///
@@ -501,8 +488,6 @@ pub enum Expression {
     /// ```sql
     /// CASE WHEN keep_pred THEN struct(expr1, expr2, ...) END
     /// ```
-    ///
-    /// [`Project`]: crate::plans::ir::nodes::Project
     Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
     /// A sparse patch of a struct. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
@@ -541,16 +526,18 @@ pub enum Expression {
     Cast(CastExpression),
 }
 
-/// A SQL predicate.
+/// A predicate in Kernel's intermediate representation.
 ///
-/// These predicates do not track or validate data types, other than the type
-/// of literals. It is up to the predicate evaluator to validate the
-/// predicate against a schema and add appropriate casts as required.
+/// Predicates do not store resolved input types. Before evaluation, a predicate is analyzed against
+/// its input schema using the [SQL expression contract](semantics). Boolean predicates require
+/// Boolean inputs; Kernel does not define numeric or string truthiness.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
-    /// A boolean-valued expression, useful for e.g. `AND(<boolean_col1>, <boolean_col2>)`.
+    /// A Boolean-valued expression used as a predicate.
+    ///
+    /// See the [Boolean and null semantics](semantics#boolean-predicates-and-nulls).
     BooleanExpression(Expression),
-    /// Boolean inversion (true <-> false)
+    /// SQL Boolean inversion.
     ///
     /// NOTE: NOT is not a normal unary predicate, because it requires a predicate as input (not an
     /// expression), and is never directly evaluated. Instead, observing that all predicates are
@@ -561,7 +548,7 @@ pub enum Predicate {
     Unary(UnaryPredicate),
     /// A binary operation.
     Binary(BinaryPredicate),
-    /// A junction operation (AND/OR).
+    /// SQL `AND` or `OR` over Boolean predicates.
     Junction(JunctionPredicate),
     /// A predicate that the engine defines and implements. Kernel interacts with the predicate
     /// only through methods provided by the [`OpaquePredicateOp`] trait.

@@ -34,10 +34,10 @@
 //! - [`Operation::QueryPlan`] is a [`Plan`](ir::plan::Plan), returning [`PlanResult::Data`]. Either
 //!   evaluate [`Plan::nodes`](ir::plan::Plan::nodes) in slice order, which is topologically sorted
 //!   so a node's inputs are already evaluated, or compile the DAG into the engine's own plan.
+//!   Standard expressions follow the [SQL expression contract](crate::expressions::semantics).
 //!
 //! Every operator, expression, and predicate a plan contains must be handled; returning an error
-//! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
-//! `SyncPlanExecutor` is a complete reference implementation.
+//! for an unsupported one is fine, and kernel surfaces it to the caller.
 //!
 //! # Consuming terminal results
 //!
