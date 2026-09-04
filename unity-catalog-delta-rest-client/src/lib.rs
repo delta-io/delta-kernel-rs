@@ -24,7 +24,7 @@
 pub mod clients;
 pub mod config;
 pub mod error;
-pub mod http;
+pub(crate) mod http;
 
 #[cfg(test)]
 mod tests;
