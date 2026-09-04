@@ -1,26 +1,30 @@
 //! IcebergCompat invariant checks shared across versions.
 //!
-//! Each `delta.enableIcebergCompatV{N}` version owns a submodule (currently only
-//! [`v3`]), and exposes a single
+//! Each `delta.enableIcebergCompatV{N}` version owns a submodule (currently
+//! [`v2`] and [`v3`]), and exposes a single
 //! `pub(crate) const V{N}_VALIDATOR: IcebergCompatValidator`. Callers feed that
 //! constant and the validation context to [`validate_iceberg_compat_if_needed`].
 
+pub(crate) mod v2;
 pub(crate) mod v3;
 
-use crate::schema::{ColumnMetadataKey, DataType, StructField};
+use crate::schema::PrimitiveType::{Byte, Decimal, Double, Float, Integer, Long, Short};
+use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
 
 pub(crate) enum IcebergCompatVersion {
-    // TODO: Add V1, V2 when kernel supports them.
+    // TODO: Add V1 when kernel supports it
+    V2,
     V3,
 }
 
 impl IcebergCompatVersion {
     pub(super) fn as_table_feature(&self) -> TableFeature {
         match self {
+            Self::V2 => TableFeature::IcebergCompatV2,
             Self::V3 => TableFeature::IcebergCompatV3,
         }
     }
@@ -212,6 +216,105 @@ impl<'a> SchemaTransform<'a> for LegacyNestedIdsVisitor {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TypeChange {
+    from_type: DataType,
+    to_type: DataType,
+}
+
+/// The widenings legal under Iceberg V2, and therefore under `icebergCompatV1`/`V2`.
+/// `icebergCompatV3` currently also permits exactly this set; if V3 ever allows additional
+/// widenings those must be added separately, not by expanding this list.
+fn is_iceberg_allowed_type_change(from: &DataType, to: &DataType) -> bool {
+    match (from, to) {
+        (DataType::Primitive(Byte), DataType::Primitive(Short | Integer | Long)) => true,
+        (DataType::Primitive(Short), DataType::Primitive(Integer | Long)) => true,
+        (DataType::Primitive(Integer), DataType::Primitive(Long)) => true,
+        (DataType::Primitive(Float), DataType::Primitive(Double)) => true,
+        (DataType::Primitive(Decimal(from_decimal)), DataType::Primitive(Decimal(to_decimal))) => {
+            from_decimal.scale() == to_decimal.scale()
+                && to_decimal.precision() > from_decimal.precision()
+        }
+        _ => false,
+    }
+}
+
+struct TypeChangesValidator {
+    path: Vec<String>,
+    version: IcebergCompatVersion,
+}
+
+impl TypeChangesValidator {
+    fn validate_field_type_changes(&self, field: &StructField) -> DeltaResult<()> {
+        let type_changes_key = ColumnMetadataKey::TypeChanges.as_ref();
+        let Some(metadata) = field.metadata().get(type_changes_key) else {
+            return Ok(());
+        };
+        let path = self.path.join(".");
+        let MetadataValue::Other(value) = metadata else {
+            return Err(Error::schema(format!(
+                "Field '{path}' has a non-array `{type_changes_key}` annotation: \
+                 {metadata}"
+            )));
+        };
+        let type_changes: Vec<TypeChange> = serde_json::from_value(value.clone()).map_err(|e| {
+            Error::schema(format!(
+                "Field '{path}' has an invalid `{type_changes_key}` annotation: {e}"
+            ))
+        })?;
+        for type_change in type_changes {
+            if !is_iceberg_allowed_type_change(&type_change.from_type, &type_change.to_type) {
+                return Err(Error::schema(format!(
+                    "{} does not support type change on field '{path}': {} -> {}",
+                    self.version.as_table_feature(),
+                    type_change.from_type,
+                    type_change.to_type
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> SchemaTransform<'a> for TypeChangesValidator {
+    transform_output_type!(|'a, T| DeltaResult<()>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
+        self.path.push(field.name().clone());
+        let result = self
+            .validate_field_type_changes(field)
+            .and_then(|_| self.recurse_into_struct_field(field));
+        self.path.pop();
+        result
+    }
+
+    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+        self.path.push("element".to_string());
+        let result = self.transform(etype);
+        self.path.pop();
+        result
+    }
+
+    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<()> {
+        self.path.push("key".to_string());
+        let result = self.transform(ktype);
+        self.path.pop();
+        result
+    }
+
+    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<()> {
+        self.path.push("value".to_string());
+        let result = self.transform(vtype);
+        self.path.pop();
+        result
+    }
+
+    fn transform_variant(&mut self, _stype: &'a crate::schema::StructType) -> DeltaResult<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -393,5 +496,36 @@ mod tests {
         };
         v.transform_struct(&schema);
         assert_eq!(v.offender, expected);
+    }
+
+    fn decimal(precision: u8, scale: u8) -> DataType {
+        DataType::decimal(precision, scale).unwrap()
+    }
+
+    #[rstest]
+    // Allowed: integer promotions, float->double, decimal precision increase at equal scale.
+    #[case::byte_short(DataType::BYTE, DataType::SHORT, true)]
+    #[case::byte_integer(DataType::BYTE, DataType::INTEGER, true)]
+    #[case::byte_long(DataType::BYTE, DataType::LONG, true)]
+    #[case::short_integer(DataType::SHORT, DataType::INTEGER, true)]
+    #[case::short_long(DataType::SHORT, DataType::LONG, true)]
+    #[case::integer_long(DataType::INTEGER, DataType::LONG, true)]
+    #[case::float_double(DataType::FLOAT, DataType::DOUBLE, true)]
+    #[case::decimal_precision_increase(decimal(10, 2), decimal(20, 2), true)]
+    // Rejected: promotions Iceberg V2 forbids even though Type Widening permits them, plus
+    // non-widenings.
+    #[case::integer_double(DataType::INTEGER, DataType::DOUBLE, false)]
+    #[case::long_double(DataType::LONG, DataType::DOUBLE, false)]
+    #[case::date_timestamp_ntz(DataType::DATE, DataType::TIMESTAMP_NTZ, false)]
+    #[case::integer_decimal(DataType::INTEGER, decimal(11, 1), false)]
+    #[case::decimal_scale_increase(decimal(10, 2), decimal(20, 5), false)]
+    #[case::decimal_precision_decrease(decimal(20, 2), decimal(10, 2), false)]
+    #[case::no_op_string(DataType::STRING, DataType::STRING, false)]
+    fn iceberg_allowed_type_change_matches_iceberg_v2_rules(
+        #[case] from: DataType,
+        #[case] to: DataType,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_iceberg_allowed_type_change(&from, &to), expected);
     }
 }

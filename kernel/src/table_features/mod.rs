@@ -15,6 +15,7 @@ pub(crate) use column_mapping::{
 use delta_kernel_derive::internal_api;
 #[cfg(feature = "geo-type-in-dev")]
 pub(crate) use geospatial::validate_geospatial_feature_support;
+pub(crate) use iceberg_compat::v2::V2_VALIDATOR;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext,
@@ -421,14 +422,11 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-// TODO(#1125): IcebergCompatV2 requires schema type validation. Unlike V1, V2 allows Map and Array
-// types but needs validation against an allowlist of supported types.
-// This validation is not yet implemented. The feature is marked as NotSupported for writes until
-// proper validation is added.
-
-// See Delta Spark: IcebergCompat.scala CheckTypeInV2AllowList (lines 450-459)
-// See Java Kernel: IcebergCompatMetadataValidatorAndUpdater.java V2_SUPPORTED_TYPES
-// See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2 for more requirements to support.
+/// IcebergCompatV2 ensures that Delta tables can be converted to Iceberg format.
+/// Spec: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#iceberg-compatibility-v2>.
+/// See
+/// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2>
+/// for more requirements to support.
 static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -438,7 +436,7 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::DeletionVectors),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV3),
     ],
-    kernel_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v2 == Some(true)
     }),
