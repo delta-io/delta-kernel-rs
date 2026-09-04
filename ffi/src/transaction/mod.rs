@@ -394,6 +394,38 @@ fn create_table_with_engine_info_impl(
     Ok(Box::new(txn.with_engine_info(info)).into())
 }
 
+/// Add domain metadata to a create-table transaction.
+///
+/// `domain` identifies the user-controlled metadata domain, and `configuration` is its arbitrary
+/// string value. Returns the updated transaction handle. Invalid strings are returned as errors;
+/// domain and table-feature validation occurs when the transaction is committed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_with_domain_metadata(
+    txn: Handle<ExclusiveCreateTransaction>,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    create_table_with_domain_metadata_impl(*txn, domain, configuration).into_extern_result(&engine)
+}
+
+fn create_table_with_domain_metadata_impl(
+    txn: CreateTableTransaction,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
+    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
+}
+
 /// Add file metadata to a create-table transaction for files that have been written. The metadata
 /// contains information about files written during the transaction that will be added to the
 /// Delta log during commit.
@@ -2346,6 +2378,51 @@ mod tests {
 
         unsafe { free_schema(snap_schema) };
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_domain_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table_domain_metadata", None);
+        let (_table_path, engine, builder) = create_table_builder(
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let domain_feature = "delta.feature.domainMetadata";
+        let supported = "supported";
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_table_property(
+                builder,
+                kernel_string_slice!(domain_feature),
+                kernel_string_slice!(supported),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+        let domain = "test.domain";
+        let configuration = r#"{"key":"value"}"#;
+        let txn = ok_or_panic(unsafe {
+            create_table_with_domain_metadata(
+                txn,
+                kernel_string_slice!(domain),
+                kernel_string_slice!(configuration),
+                engine.shallow_copy(),
+            )
+        });
+
+        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 0);
+        let domain_metadata = read_domain_metadata_action(&store, &table_url, 0).await;
+        assert_eq!(domain_metadata["domainMetadata"]["domain"], domain);
+        assert_eq!(
+            domain_metadata["domainMetadata"]["configuration"],
+            configuration
+        );
+
         unsafe { free_engine(engine) };
         Ok(())
     }
