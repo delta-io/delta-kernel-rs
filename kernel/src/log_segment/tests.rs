@@ -2505,24 +2505,31 @@ fn test_validate_truncated_log_segment_reports_first_missing_version() {
     assert!(matches!(result, Err(Error::MissingVersion(3))));
 }
 
-#[test]
-fn test_validate_checkpoint_commit_gap_reports_first_missing_version() {
+#[rstest]
+#[case::checkpoint_gap(1, &[3], 2)]
+#[case::checkpoint_and_inter_commit_gaps(2, &[4, 6], 3)]
+fn test_validate_checkpoint_commit_gap_reports_lowest_missing_version(
+    #[case] checkpoint_version: Version,
+    #[case] commit_versions: &[Version],
+    #[case] expected: Version,
+) {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            checkpoint_parts: vec![create_log_path(
-                "file:///_delta_log/00000000000000000001.checkpoint.parquet",
-            )],
-            ascending_commit_files: vec![create_log_path(
-                "file:///_delta_log/00000000000000000003.json",
-            )],
+            checkpoint_parts: vec![create_log_path(&format!(
+                "file:///_delta_log/{checkpoint_version:020}.checkpoint.parquet"
+            ))],
+            ascending_commit_files: commit_versions
+                .iter()
+                .map(|version| create_log_path(&format!("file:///_delta_log/{version:020}.json")))
+                .collect(),
             ..Default::default()
         },
         log_root,
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::MissingVersion(2))));
+    assert!(matches!(result, Err(Error::MissingVersion(version)) if version == expected));
 }
 
 #[test]
