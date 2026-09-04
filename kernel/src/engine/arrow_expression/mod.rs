@@ -13,7 +13,7 @@ use crate::arrow::datatypes::{
 };
 use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
-use crate::error::{DeltaResult, KernelError};
+use crate::error::{DeltaResult, ErrorContext, KernelError};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
@@ -114,7 +114,7 @@ impl Scalar {
                 let builder = builder_as!(array::StructBuilder);
                 require!(
                     builder.num_fields() == data.fields().len(),
-                    KernelError::generic("Struct builder has wrong number of fields")
+                    KernelError::invalid_struct_data("Struct builder has wrong number of fields")
                 );
                 let field_builders = builder.field_builders_mut().iter_mut();
                 for (builder, value) in field_builders.zip(data.values()) {
@@ -195,7 +195,7 @@ impl Scalar {
                 let builder = builder_as!(array::StructBuilder);
                 require!(
                     builder.num_fields() == stype.num_fields(),
-                    KernelError::generic("Struct builder has wrong number of fields")
+                    KernelError::invalid_struct_data("Struct builder has wrong number of fields")
                 );
                 let field_builders = builder.field_builders_mut().iter_mut();
                 for (builder, field) in field_builders.zip(stype.fields()) {
@@ -318,7 +318,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         let num_fields = schema.fields().len();
         for (row_idx, row) in rows.iter().enumerate() {
             if row.len() != num_fields {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::invalid_struct_data(format!(
                     "Row {} has {} scalars but schema has {} fields",
                     row_idx,
                     row.len(),
@@ -334,18 +334,20 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             .map(|field| array::make_builder(field.data_type(), num_rows))
             .collect();
 
-        let fields: Vec<_> = schema.fields().collect();
-        for (col_idx, builder) in builders.iter_mut().enumerate() {
-            let field_name = fields[col_idx].name();
+        for (col_idx, (field, builder)) in schema.fields().zip(builders.iter_mut()).enumerate() {
             for (row_idx, row) in rows.iter().enumerate() {
-                row[col_idx].append_to(builder.as_mut(), 1).map_err(|e| {
-                    KernelError::generic(format!(
-                        "Row {row_idx}, field '{field_name}' \
-                            (expected type {}, got {}): {e}",
-                        fields[col_idx].data_type(),
-                        row[col_idx].data_type()
-                    ))
-                })?;
+                row[col_idx]
+                    .append_to(builder.as_mut(), 1)
+                    .map_err(|error| {
+                        error
+                            .with_context(ErrorContext::Scalar {
+                                row: row_idx,
+                                field: field.name().clone(),
+                                expected: field.data_type().to_string(),
+                                actual: row[col_idx].data_type().to_string(),
+                            })
+                            .with_context(ErrorContext::Operation("append scalar to row"))
+                    })?;
             }
         }
 
@@ -370,7 +372,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         let batch = extract_record_batch(batch)?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
-        //     return Err(KernelError::Generic(format!(
+        //     return Err(KernelError::invalid_struct_data(format!(
         //         "input schema does not match batch schema: {:?} != {:?}",
         //         input_schema,
         //         batch.schema()
@@ -418,7 +420,7 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         let batch = extract_record_batch(batch)?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
-        //     return Err(KernelError::Generic(format!(
+        //     return Err(KernelError::invalid_struct_data(format!(
         //         "input schema does not match batch schema: {:?} != {:?}",
         //         input_schema,
         //         batch.schema()

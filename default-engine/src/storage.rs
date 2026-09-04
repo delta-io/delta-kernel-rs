@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, Error, ObjectStore};
-use delta_kernel::KernelError as DeltaError;
+use delta_kernel::KernelError;
 use url::Url;
 
 /// Alias for convenience
@@ -26,11 +26,11 @@ static URL_REGISTRY: LazyLock<RwLock<Handlers>> = LazyLock::new(|| RwLock::new(H
 pub fn insert_url_handler(
     scheme: impl AsRef<str>,
     handler_closure: HandlerClosure,
-) -> Result<(), DeltaError> {
+) -> Result<(), KernelError> {
     let Ok(mut registry) = URL_REGISTRY.write() else {
-        return Err(DeltaError::generic(
-            "failed to acquire lock for adding a URL handler!",
-        ));
+        return Err(KernelError::LockPoisoned {
+            resource: "URL handler registry",
+        });
     };
     registry.insert(scheme.as_ref().into(), handler_closure);
     Ok(())

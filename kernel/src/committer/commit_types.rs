@@ -72,22 +72,16 @@ impl CommitProtocolMetadata {
         new_metadata: Option<Metadata>,
     ) -> DeltaResult<Self> {
         if read_protocol.is_some() != read_metadata.is_some() {
-            return Err(crate::KernelError::generic(
-                "read_protocol and read_metadata must both be present or both be absent",
+            return Err(crate::KernelError::InvalidTransactionState(
+                "read_protocol and read_metadata must both be present or both be absent".into(),
             )
             .into());
         }
         if read_protocol.is_none() && new_protocol.is_none() {
-            return Err(crate::KernelError::generic(
-                "CommitProtocolMetadata requires at least one protocol (read or new)",
-            )
-            .into());
+            return Err(crate::KernelError::MissingProtocol.into());
         }
         if read_metadata.is_none() && new_metadata.is_none() {
-            return Err(crate::KernelError::generic(
-                "CommitProtocolMetadata requires at least one metadata (read or new)",
-            )
-            .into());
+            return Err(crate::KernelError::MissingMetadata.into());
         }
         Ok(Self {
             read_protocol,

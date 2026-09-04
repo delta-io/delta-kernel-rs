@@ -103,8 +103,8 @@ impl WriteState {
     ) -> DeltaResult<BoundWriteContext> {
         require!(
             !self.logical_partition_columns.is_empty(),
-            KernelError::generic(
-                "table is not partitioned; use unpartitioned_write_context() instead"
+            KernelError::InvalidTransactionState(
+                "table is not partitioned; use unpartitioned_write_context() instead".into()
             )
         );
         let normalized = validate_partition_values(
@@ -148,7 +148,9 @@ impl WriteState {
     pub fn unpartitioned_write_context(self: &Arc<Self>) -> DeltaResult<BoundWriteContext> {
         require!(
             self.logical_partition_columns.is_empty(),
-            KernelError::generic("table is partitioned; use partitioned_write_context() instead")
+            KernelError::InvalidTransactionState(
+                "table is partitioned; use partitioned_write_context() instead".into()
+            )
         );
         let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
         Ok(BoundWriteContext {
@@ -184,7 +186,7 @@ impl WriteState {
             serde_json::from_slice(bytes).map_err(crate::KernelError::from)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
-            KernelError::generic(format!(
+            KernelError::Unsupported(format!(
                 "unsupported write state format version {}; expected {}",
                 wire.version, WRITE_STATE_FORMAT_VERSION
             ))

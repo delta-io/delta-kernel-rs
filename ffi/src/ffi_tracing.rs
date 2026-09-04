@@ -15,6 +15,7 @@
 use std::sync::{Arc, LazyLock, Mutex};
 use std::{fmt, io};
 
+use delta_kernel::error::ErrorContext;
 use delta_kernel::metrics::{
     MetricEvent as KernelMetricEvent, MetricsReporter, ReportGeneratorLayer,
 };
@@ -246,10 +247,9 @@ pub unsafe extern "C" fn enable_formatted_log_line_tracing(
 
 fn set_global_default(dispatch: tracing_core::Dispatch) -> DeltaResult<()> {
     tracing_core::dispatcher::set_global_default(dispatch)
-        .map_err(|_| {
-            KernelError::generic(
-                "Unable to set global default subscriber. Trying to set more than once?",
-            )
+        .map_err(|source| KernelError::TracingFailure {
+            operation: "set_global_default",
+            source: Box::new(source),
         })
         .map_err(delta_kernel::Error::from)
 }
@@ -490,16 +490,20 @@ impl GlobalTracingState {
 
     /// Make `layer` the active logging layer and set its level filter.
     fn reload_logging(&self, layer: BoxedLayer, max_level: Level) -> DeltaResult<()> {
-        let reload_err =
-            |e| KernelError::generic(format!("Unable to reload logging subscriber: {e}"));
+        let reload_err = |source| KernelError::TracingFailure {
+            operation: "reload logging subscriber",
+            source: Box::new(source),
+        };
         self.logging_layer
             .as_ref()
-            .ok_or_else(|| KernelError::generic("logging slot not installed"))?
+            .ok_or(KernelError::TracingSlotMissing { slot: "logging" })?
             .reload(layer)
             .map_err(reload_err)?;
         self.logging_filter
             .as_ref()
-            .ok_or_else(|| KernelError::generic("logging filter not installed"))?
+            .ok_or(KernelError::TracingSlotMissing {
+                slot: "logging filter",
+            })?
             .reload(LevelFilter::from(max_level))
             .map_err(reload_err)
             .map_err(delta_kernel::Error::from)
@@ -511,7 +515,11 @@ impl GlobalTracingState {
         max_level: Level,
     ) -> DeltaResult<()> {
         if !max_level.is_valid() {
-            return Err(KernelError::generic("max_level out of range").into());
+            return Err(delta_kernel::error::FfiContractError::InvalidTag {
+                field: "max_level",
+                value: max_level as i64,
+            }
+            .into());
         }
         self.ensure_installed()?;
         self.reload_logging(build_event_layer(callback), max_level)
@@ -529,7 +537,11 @@ impl GlobalTracingState {
         with_target: bool,
     ) -> DeltaResult<()> {
         if !max_level.is_valid() {
-            return Err(KernelError::generic("max_level out of range").into());
+            return Err(delta_kernel::error::FfiContractError::InvalidTag {
+                field: "max_level",
+                value: max_level as i64,
+            }
+            .into());
         }
         self.ensure_installed()?;
         let layer =
@@ -541,14 +553,22 @@ impl GlobalTracingState {
     /// `INFO`.
     fn register_metrics_callback(&mut self, callback: MetricsEventFn) -> DeltaResult<()> {
         self.ensure_installed()?;
-        *self.metrics_callback.lock().map_err(|_| {
-            KernelError::generic("Failed to lock metrics callback (mutex poisoned).")
-        })? = Some(callback);
+        *self
+            .metrics_callback
+            .lock()
+            .map_err(|_| KernelError::LockPoisoned {
+                resource: "metrics callback",
+            })? = Some(callback);
         self.metrics_filter
             .as_ref()
-            .ok_or_else(|| KernelError::generic("metrics filter not installed"))?
+            .ok_or(KernelError::TracingSlotMissing {
+                slot: "metrics filter",
+            })?
             .reload(LevelFilter::INFO)
-            .map_err(|e| KernelError::generic(format!("Unable to reload metrics subscriber: {e}")))
+            .map_err(|source| KernelError::TracingFailure {
+                operation: "reload metrics subscriber",
+                source: Box::new(source),
+            })
             .map_err(delta_kernel::Error::from)
     }
 }
@@ -557,9 +577,12 @@ static TRACING_STATE: LazyLock<Mutex<GlobalTracingState>> =
     LazyLock::new(|| Mutex::new(GlobalTracingState::uninitialized()));
 
 fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaResult<()> {
-    let mut state = TRACING_STATE
-        .lock()
-        .map_err(|_e| KernelError::generic("Poisoned mutex while setting up event subscriber"))?;
+    let mut state = TRACING_STATE.lock().map_err(|_| {
+        KernelError::LockPoisoned {
+            resource: "global tracing state",
+        }
+        .with_context(ErrorContext::Operation("set up event subscriber"))
+    })?;
     state.register_event_callback(callback, max_level)
 }
 
@@ -572,8 +595,11 @@ fn setup_log_line_subscriber(
     with_level: bool,
     with_target: bool,
 ) -> DeltaResult<()> {
-    let mut state = TRACING_STATE.lock().map_err(|_e| {
-        KernelError::generic("Poisoned mutex while setting up log_line_subscriber")
+    let mut state = TRACING_STATE.lock().map_err(|_| {
+        KernelError::LockPoisoned {
+            resource: "global tracing state",
+        }
+        .with_context(ErrorContext::Operation("set up log line subscriber"))
     })?;
     state.register_log_line_callback(
         callback,
@@ -601,9 +627,12 @@ pub unsafe extern "C" fn enable_metrics_reporting(callback: MetricsEventFn) -> b
 }
 
 fn setup_metrics_reporter(callback: MetricsEventFn) -> DeltaResult<()> {
-    let mut state = TRACING_STATE
-        .lock()
-        .map_err(|_e| KernelError::generic("Poisoned mutex while setting up metrics reporter"))?;
+    let mut state = TRACING_STATE.lock().map_err(|_| {
+        KernelError::LockPoisoned {
+            resource: "global tracing state",
+        }
+        .with_context(ErrorContext::Operation("set up metrics reporter"))
+    })?;
     state.register_metrics_callback(callback)
 }
 

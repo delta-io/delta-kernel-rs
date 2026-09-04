@@ -43,6 +43,89 @@ mod domain_metadata_replay;
 mod protocol_metadata_replay;
 mod version_probe;
 
+/// Invalid file coverage or replay state in a log segment.
+#[derive(Debug, thiserror::Error)]
+pub enum LogSegmentError {
+    /// Adjacent commits are not contiguous.
+    #[error("Expected contiguous commit files, but found gap: {previous} -> {next}")]
+    CommitGap {
+        /// Earlier commit version.
+        previous: Version,
+        /// Following commit version.
+        next: Version,
+    },
+    /// The segment contains neither commits nor a checkpoint.
+    #[error("No files in log segment")]
+    Empty,
+    /// The last retained version is not the requested version.
+    #[error(
+        "LogSegment end version {actual} not the same as the specified end version {requested}"
+    )]
+    EndVersionMismatch {
+        /// Actual segment end.
+        actual: Version,
+        /// Requested end.
+        requested: Version,
+    },
+    /// The first commit does not match the requested lower bound.
+    #[error("Expected the first commit to have version {expected}, got {actual:?}")]
+    StartVersionMismatch {
+        /// Requested lower bound.
+        expected: Version,
+        /// Actual first commit, if any.
+        actual: Option<Version>,
+    },
+    /// Sidecars were supplied without a checkpoint version.
+    #[error("Checkpoint hint sidecars require a selected checkpoint version")]
+    MissingCheckpointVersion,
+    /// Not all commits in the segment have been published.
+    #[error("Log segment is not published through version {end}; latest published: {published:?}")]
+    Unpublished {
+        /// Required published version.
+        end: Version,
+        /// Latest known published version.
+        published: Option<Version>,
+    },
+    /// A compaction file claims a reversed range.
+    #[error("compaction file has start version {start} > end version {end}")]
+    ReversedCompaction {
+        /// Start version in the file name.
+        start: Version,
+        /// End version in the file name.
+        end: Version,
+    },
+    /// Compactions were supplied out of ascending range order.
+    #[error(
+        "ascending_compaction_files is not sorted: ({previous_start}, {previous_end}) -> \
+         ({next_start}, {next_end})"
+    )]
+    UnsortedCompactions {
+        /// Previous range start.
+        previous_start: Version,
+        /// Previous range end.
+        previous_end: Version,
+        /// Following range start.
+        next_start: Version,
+        /// Following range end.
+        next_end: Version,
+    },
+    /// Sidecars cannot be extracted before the checkpoint manifest has been fully read.
+    #[error("Cannot extract sidecars from in-progress ManifestReader for file: {path}")]
+    IncompleteManifest {
+        /// Checkpoint manifest location.
+        path: String,
+    },
+    /// CRC reconstruction has neither an initial commit nor a checkpoint anchor.
+    #[error(
+        "Cannot build CRC: log has no checkpoint but its first commit is at version {first} \
+         (expected 0); the log appears truncated without a checkpoint"
+    )]
+    MissingCrcAnchor {
+        /// First retained commit version.
+        first: Version,
+    },
+}
+
 pub(crate) use domain_metadata_replay::DomainMetadataMap;
 use version_probe::{probe_snapshot_history, SnapshotHistory};
 
@@ -150,10 +233,13 @@ enum LogSegmentValidationError {
 impl LogSegmentValidationError {
     fn into_error(self) -> Error {
         match self {
-            Self::CommitGap { previous, next, .. } => KernelError::generic(format!(
-                "Expected contiguous commit files, but found gap: {previous:?} -> {next:?}"
-            ))
-            .into(),
+            Self::CommitGap { previous, next, .. } => {
+                KernelError::LogSegment(LogSegmentError::CommitGap {
+                    previous: previous.version,
+                    next: next.version,
+                })
+                .into()
+            }
             Self::CheckpointCommitGap {
                 checkpoint,
                 next_commit,
@@ -162,12 +248,11 @@ impl LogSegmentValidationError {
                 "Gap between checkpoint version {checkpoint} and next commit {next_commit}"
             ))
             .into(),
-            Self::Empty => KernelError::generic("No files in log segment").into(),
-            Self::EndVersionMismatch { actual, requested } => KernelError::generic(format!(
-                "LogSegment end version {actual} not the same as the specified end version \
-                 {requested}"
-            ))
-            .into(),
+            Self::Empty => KernelError::LogSegment(LogSegmentError::Empty).into(),
+            Self::EndVersionMismatch { actual, requested } => {
+                KernelError::LogSegment(LogSegmentError::EndVersionMismatch { actual, requested })
+                    .into()
+            }
             Self::Other(error) => error,
         }
     }
@@ -844,8 +929,11 @@ impl LogSegment {
         let end_version = end_version.into();
         if let Some(end_version) = end_version {
             if start_version > end_version {
-                return Err(KernelError::generic(
-                    "Failed to build LogSegment: start_version cannot be greater than end_version",
+                return Err(KernelError::CommitRange(
+                    crate::commit_range::CommitRangeError::Reversed {
+                        start: start_version,
+                        end: end_version,
+                    },
                 )
                 .into());
             }
@@ -871,13 +959,13 @@ impl LogSegment {
                 .ascending_commit_files()
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
-            KernelError::generic(format!(
-                "Expected the first commit to have version {start_version}, got {:?}",
-                listed_files
+            KernelError::LogSegment(LogSegmentError::StartVersionMismatch {
+                expected: start_version,
+                actual: listed_files
                     .ascending_commit_files()
                     .first()
-                    .map(|c| c.version)
-            ))
+                    .map(|commit| commit.version),
+            })
         );
         LogSegment::try_new(listed_files, log_root, end_version, None)
     }
@@ -902,9 +990,12 @@ impl LogSegment {
         let start_from = limit
             .map(|limit| match NonZero::<Version>::try_from(limit) {
                 Ok(limit) => Ok(Version::saturating_sub(end_version, limit.get() - 1)),
-                _ => Err(KernelError::generic(format!(
-                    "Invalid limit {limit} when building log segment in timestamp conversion",
-                ))),
+                Err(source) => Err(KernelError::integer_conversion(
+                    "timestamp conversion limit",
+                    limit,
+                    "u64",
+                    source,
+                )),
             })
             .transpose()?;
 
@@ -1276,9 +1367,9 @@ impl LogSegment {
         let Some(sidecars) = self.checkpoint_hint_sidecars() else {
             return Ok(None);
         };
-        let version = self.checkpoint_version.ok_or_else(|| {
-            KernelError::generic("Checkpoint hint sidecars require a selected checkpoint version")
-        })?;
+        let version = self
+            .checkpoint_version
+            .ok_or_else(|| KernelError::LogSegment(LogSegmentError::MissingCheckpointVersion))?;
         let version = crate::version_as_i64(version)?;
         sidecars
             .iter()
@@ -1540,7 +1631,7 @@ impl LogSegment {
                     cancellation_token.cloned(),
                 )?,
             Some(parsed_log_path) => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::unsupported(format!(
                     "Unsupported checkpoint file type: {}",
                     parsed_log_path.extension,
                 ))
@@ -1735,7 +1826,10 @@ impl LogSegment {
             self.listed
                 .max_published_version
                 .is_some_and(|v| v == self.end_version),
-            KernelError::generic("Log segment is not published")
+            KernelError::LogSegment(LogSegmentError::Unpublished {
+                end: self.end_version,
+                published: self.listed.max_published_version,
+            })
         );
         Ok(())
     }
@@ -1897,27 +1991,34 @@ impl LogSegment {
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
     for (i, f) in compactions.iter().enumerate() {
         let LogPathFileType::CompactedCommit { hi } = f.file_type else {
-            return Err(KernelError::generic(
+            return Err(KernelError::invalid_log_path(
                 "ascending_compaction_files contains non-compaction file",
             )
             .into());
         };
         if f.version > hi {
-            return Err(KernelError::generic(format!(
-                "compaction file has start version {} > end version {}",
-                f.version, hi
-            ))
-            .into());
+            return Err(
+                KernelError::LogSegment(LogSegmentError::ReversedCompaction {
+                    start: f.version,
+                    end: hi,
+                })
+                .into(),
+            );
         }
         if let Some(next) = compactions.get(i + 1) {
             // next's type is validated on its own iteration; skip sort check if it isn't a
             // CompactedCommit since the type error will be caught then.
             if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
                 if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
-                    return Err(KernelError::generic(format!(
-                        "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
-                    ))
-                    .into());
+                    return Err(
+                        KernelError::LogSegment(LogSegmentError::UnsortedCompactions {
+                            previous_start: f.version,
+                            previous_end: hi,
+                            next_start: next.version,
+                            next_end: next_hi,
+                        })
+                        .into(),
+                    );
                 }
             }
         }
@@ -1933,12 +2034,13 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
     let first_version = parts[0].version;
     for p in parts {
         if !p.is_checkpoint() {
-            return Err(
-                KernelError::generic("checkpoint_parts contains non-checkpoint file").into(),
-            );
+            return Err(KernelError::invalid_checkpoint(
+                "checkpoint_parts contains non-checkpoint file",
+            )
+            .into());
         }
         if p.version != first_version {
-            return Err(KernelError::generic(
+            return Err(KernelError::invalid_checkpoint(
                 "multi-part checkpoint parts have different versions",
             )
             .into());
@@ -1946,12 +2048,12 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
         match p.file_type {
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts as usize == n => {}
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::invalid_checkpoint(format!(
                     "multi-part checkpoint part count mismatch: slice has {n} parts but num_parts field says {num_parts}"
                 )).into());
             }
             _ if n > 1 => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::invalid_checkpoint(format!(
                     "multi-part checkpoint part count mismatch: expected {n} multi-part checkpoint files but got a non-multi-part checkpoint"
                 )).into());
             }
@@ -1964,9 +2066,10 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
 fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for f in commits {
         if !f.is_commit() {
-            return Err(
-                KernelError::generic("ascending_commit_files contains non-commit file").into(),
-            );
+            return Err(KernelError::invalid_log_path(
+                "ascending_commit_files contains non-commit file",
+            )
+            .into());
         }
     }
     Ok(())

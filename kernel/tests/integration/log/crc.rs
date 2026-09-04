@@ -624,7 +624,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
             Arc::new(arrow_schema),
             vec![Arc::new(Int32Array::from(vec![v as i32]))],
         )
-        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+        .map_err(delta_kernel::KernelError::from)?;
         let mut txn = snap
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_operation("WRITE".to_string())
@@ -816,7 +816,7 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
             Arc::new(arrow_schema),
             vec![Arc::new(Int32Array::from(vec![v]))],
         )
-        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+        .map_err(delta_kernel::KernelError::from)?;
         let mut txn = snap
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_operation("WRITE".to_string())
@@ -2122,7 +2122,7 @@ async fn commit_data<E: TaskExecutor>(
         Arc::new(arrow_schema),
         vec![Arc::new(Int32Array::from(vec![v as i32]))],
     )
-    .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+    .map_err(delta_kernel::KernelError::from)?;
     let txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())

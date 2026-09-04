@@ -60,10 +60,10 @@ impl LogCompactionWriter {
     ) -> DeltaResult<Self> {
         Err(KernelError::unsupported("Log compaction is not currently supported").into())
         // if start_version >= end_version {
-        //     return Err(KernelError::generic(format!(
-        //         "Invalid version range: end_version {end_version} must be greater than \
-        //          start_version {start_version}"
-        //     )));
+        //     return Err(KernelError::LogCompaction(super::LogCompactionError::InvalidRange {
+        //         start: start_version,
+        //         end: end_version,
+        //     }).into());
         // }
         //
         // // We disallow log compaction if the Snapshot is not published. If we didn't, this
@@ -100,11 +100,13 @@ impl LogCompactionWriter {
         // Validate that the requested version range is within the snapshot's range
         let snapshot_end_version = self.snapshot.version();
         if self.end_version > snapshot_end_version {
-            return Err(KernelError::generic(format!(
-                "End version {} exceeds snapshot version {}",
-                self.end_version, snapshot_end_version
-            ))
-            .into());
+            return Err(
+                KernelError::LogCompaction(super::LogCompactionError::BeyondSnapshot {
+                    end: self.end_version,
+                    snapshot: snapshot_end_version,
+                })
+                .into(),
+            );
         }
 
         // Create a log segment specifically for the compaction range

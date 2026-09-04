@@ -5,8 +5,7 @@ use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 use delta_kernel::{
-    DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData,
-    KernelError as DeltaError,
+    DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData, KernelError,
 };
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
@@ -160,7 +159,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(delta_kernel::Error::Kernel(DeltaError::FileAlreadyExists(_))) => {
+            Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(_))) => {
                 info!("version 0 commit conflict: commit file already exists");
                 Ok(CommitResponse::Conflict { version: 0 })
             }
@@ -213,11 +212,16 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             }],
             updates,
         )
-        .map_err(|e| DeltaError::generic(format!("invalid UC update_table request: {e}")))?;
+        .map_err(|source| KernelError::CatalogOperation {
+            operation: "validate UC update_table request",
+            source: Box::new(source),
+        })?;
         let target = self.table.clone();
 
-        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            DeltaError::generic("UCCommitter may only be used within a tokio runtime")
+        let handle = tokio::runtime::Handle::try_current().map_err(|source| {
+            KernelError::RuntimeUnavailable {
+                source: Box::new(source),
+            }
         })?;
         // `block_in_place` panics if the current runtime isn't multi-threaded. We can't check for
         // that up front: `runtime_flavor()` can't tell a real single-threaded runtime (where this
@@ -233,22 +237,26 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             })
         }))
         .map_err(|panic| {
-            let msg = panic
+            let message = panic
                 .downcast_ref::<&str>()
                 .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
-            DeltaError::generic(format!(
-                "UCCommitter commit panicked (requires a multi-threaded tokio runtime): {msg}"
-            ))
+                .or_else(|| panic.downcast_ref::<String>().cloned());
+            KernelError::RuntimePanic {
+                operation: "UCCommitter commit",
+                message,
+            }
         })?;
         match result {
             Ok(_) => Ok(CommitResponse::Committed {
                 file_meta: committed,
             }),
             // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
-            // transaction layer can rebase/retry, instead of collapsing every error to Generic.
-            Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}")).into()),
+            // transaction layer can rebase/retry rather than returning a catalog operation error.
+            Err(source) => Err(KernelError::CatalogOperation {
+                operation: "UC update_table",
+                source: Box::new(source),
+            }
+            .into()),
         }
     }
 }
@@ -286,7 +294,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
                 Ok(_) => (),
-                Err(delta_kernel::Error::Kernel(DeltaError::FileAlreadyExists(_))) => (),
+                Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(_))) => (),
                 Err(e) => return Err(e),
             }
         }
@@ -296,10 +304,10 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
 }
 
 /// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
-fn u64_to_wire_i64(value: u64, field: &str) -> DeltaResult<i64> {
+fn u64_to_wire_i64(value: u64, field: &'static str) -> DeltaResult<i64> {
     value
         .try_into()
-        .map_err(|_| DeltaError::generic(format!("{field} does not fit into i64 for UC commit")))
+        .map_err(|source| KernelError::integer_conversion(field, value, "i64", source))
         .map_err(delta_kernel::Error::from)
 }
 
@@ -308,7 +316,9 @@ fn staged_commit_file_name(path: &url::Url) -> DeltaResult<String> {
         .and_then(|mut segments| segments.next_back())
         .filter(|segment| !segment.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| DeltaError::generic("staged commit path has no file name"))
+        .ok_or_else(|| {
+            KernelError::InvalidLogPath(format!("staged commit path has no file name: {path}"))
+        })
         .map_err(delta_kernel::Error::from)
 }
 
@@ -536,10 +546,13 @@ mod tests {
         let err = test_committer()
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
             .unwrap_err();
-        assert!(
-            err.to_string().contains("multi-threaded"),
-            "expected a multi-threaded-runtime error, got: {err}"
-        );
+        assert!(matches!(
+            err,
+            delta_kernel::Error::Kernel(KernelError::RuntimePanic {
+                operation: "UCCommitter commit",
+                message: Some(_),
+            })
+        ));
     }
 
     #[test]

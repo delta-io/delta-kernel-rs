@@ -52,7 +52,7 @@ impl Validation for DvMatchedFileRequiredFields {
             .ok_or_else(|| KernelError::missing_data("AddFile is missing required field 'path'"))?;
         require!(
             !path.is_empty(),
-            KernelError::generic("AddFile path must not be empty")
+            KernelError::InvalidStructData("AddFile path must not be empty".into())
         );
 
         let partition_values = validate_required_field_exist(
@@ -69,7 +69,7 @@ impl Validation for DvMatchedFileRequiredFields {
         )?;
         require!(
             size >= 0,
-            KernelError::generic(format!(
+            KernelError::InvalidStructData(format!(
                 "AddFile for '{path}' has negative size {size}; size must be non-negative"
             ))
         );

@@ -46,7 +46,7 @@ pub fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineD
 pub fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| KernelError::generic(format!("System time before Unix epoch: {e}")))
+        .map_err(KernelError::ClockBeforeEpoch)
         .map_err(delta_kernel::Error::from)
 }
 
@@ -54,7 +54,14 @@ pub fn current_time_duration() -> DeltaResult<Duration> {
 pub fn current_time_ms() -> DeltaResult<i64> {
     let duration = current_time_duration()?;
     i64::try_from(duration.as_millis())
-        .map_err(|_| KernelError::generic("Current timestamp exceeds i64 millisecond range"))
+        .map_err(|source| {
+            KernelError::integer_conversion(
+                "current timestamp",
+                duration.as_millis(),
+                "i64",
+                source,
+            )
+        })
         .map_err(delta_kernel::Error::from)
 }
 

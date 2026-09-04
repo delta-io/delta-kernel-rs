@@ -396,7 +396,7 @@ mod tests {
         };
         let result = partition_value_map_insert_impl(
             &mut map,
-            Err(KernelError::generic("bad name").into()),
+            Err(KernelError::missing_column("bad name").into()),
             Ok(Scalar::from(1i32)),
         );
         assert!(result.is_err());
@@ -624,7 +624,7 @@ mod tests {
                     engine.shallow_copy(),
                 )
             });
-            assert_eq!(err, FFIKernelError::GenericError);
+            assert_eq!(err, FFIKernelError::UnsupportedError);
             let err = expect_err(unsafe {
                 partition_value_map_insert_null(
                     map.shallow_copy(),
@@ -635,7 +635,7 @@ mod tests {
                     engine.shallow_copy(),
                 )
             });
-            assert_eq!(err, FFIKernelError::GenericError);
+            assert_eq!(err, FFIKernelError::FfiContractError);
             // Failed inserts did not add the "bad" key.
             assert!(!unsafe { map.as_ref() }.inner.contains_key("bad"));
 

@@ -304,7 +304,9 @@ fn resolve_file_path_impl(
     file_url: DeltaResult<&str>,
 ) -> DeltaResult<String> {
     let url = Url::parse(file_url?).map_err(|e| {
-        KernelError::generic(format!("invalid file URL passed to resolve_file_path: {e}"))
+        KernelError::from(e).with_context(delta_kernel::error::ErrorContext::Operation(
+            "resolve_file_path",
+        ))
     })?;
     write_context.resolve_file_path(&url)
 }

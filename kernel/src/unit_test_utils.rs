@@ -1173,8 +1173,13 @@ fn resolve_test_table_path(table_name: &str) -> DeltaResult<(PathBuf, Option<Tem
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/data")
                 .join(table_name);
-            let path = std::fs::canonicalize(path)
-                .map_err(|e| KernelError::generic(format!("Failed to canonicalize path: {e}")))?;
+            let path = std::fs::canonicalize(&path).map_err(|source| {
+                KernelError::from(source)
+                    .with_context(crate::error::ErrorContext::Operation("canonicalize path"))
+                    .with_context(crate::error::ErrorContext::File {
+                        path: path.display().to_string(),
+                    })
+            })?;
             Ok((path, None))
         }
     }
@@ -1185,10 +1190,15 @@ pub(crate) fn copy_test_table(table_name: &str) -> DeltaResult<(Url, TempDir)> {
     let (source, _source_tempdir) = resolve_test_table_path(table_name)?;
     let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
     let table_path = tempdir.path().join(table_name);
-    copy_directory(&source, &table_path)
-        .map_err(|e| KernelError::generic(format!("Failed to copy test table: {e}")))?;
+    copy_directory(&source, &table_path).map_err(|error| {
+        KernelError::from(error)
+            .with_context(crate::error::ErrorContext::Operation("copy test table"))
+            .with_context(crate::error::ErrorContext::File {
+                path: source.display().to_string(),
+            })
+    })?;
     let url = Url::from_directory_path(&table_path)
-        .map_err(|_| KernelError::generic("Failed to create URL from path"))?;
+        .map_err(|_| KernelError::invalid_table_location("Failed to create URL from path"))?;
     Ok((url, tempdir))
 }
 
@@ -1202,7 +1212,7 @@ pub(crate) fn load_test_table(
     let (path, tempdir) = resolve_test_table_path(table_name)?;
 
     let url = Url::from_directory_path(&path)
-        .map_err(|_| KernelError::generic("Failed to create URL from path"))?;
+        .map_err(|_| KernelError::invalid_table_location("Failed to create URL from path"))?;
 
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;

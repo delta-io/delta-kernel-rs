@@ -89,6 +89,27 @@ mod writer;
 
 pub use writer::{should_compact, LogCompactionWriter};
 
+/// Invalid version bounds for a log compaction request.
+#[derive(Debug, thiserror::Error)]
+pub enum LogCompactionError {
+    /// The compaction range is empty or reversed.
+    #[error("Invalid version range: end_version {end} must be greater than start_version {start}")]
+    InvalidRange {
+        /// First version requested for compaction.
+        start: crate::Version,
+        /// Last version requested for compaction.
+        end: crate::Version,
+    },
+    /// A compaction range extends beyond the available snapshot.
+    #[error("End version {end} exceeds snapshot version {snapshot}")]
+    BeyondSnapshot {
+        /// Last version requested for compaction.
+        end: crate::Version,
+        /// Last version available in the snapshot.
+        snapshot: crate::Version,
+    },
+}
+
 #[cfg(test)]
 mod tests;
 

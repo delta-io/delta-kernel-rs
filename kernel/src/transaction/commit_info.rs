@@ -52,7 +52,7 @@ fn commit_info_literal_exprs(
     ];
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
-        return Err(KernelError::Generic(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
+        return Err(KernelError::InvalidStructData(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
             If CommitInfo field was added/removed, please update Expression::Literal in this function and update the with_commit_info doc comment", literal_exprs.len())).into());
     }
     Ok(literal_exprs)

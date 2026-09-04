@@ -8,7 +8,7 @@ use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::DeltaResult;
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::ExclusiveTransaction;
@@ -107,9 +107,10 @@ impl TryFrom<c_int> for KernelDvStorageType {
             0 => Ok(Self::PersistedRelative),
             1 => Ok(Self::Inline),
             2 => Ok(Self::PersistedAbsolute),
-            _ => Err(KernelError::generic(format!(
-                "invalid deletion vector storage type: {value}"
-            ))
+            _ => Err(delta_kernel::error::FfiContractError::InvalidTag {
+                field: "deletion vector storage type",
+                value: i64::from(value),
+            }
             .into()),
         }
     }
@@ -271,6 +272,8 @@ fn transaction_update_deletion_vectors_impl(
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::KernelError;
+
     use super::*;
 
     #[test]
@@ -294,14 +297,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn kernel_dv_storage_type_rejects_invalid_discriminant() {
-        let err = KernelDvStorageType::try_from(42).expect_err("expected error");
-        assert!(
-            err.to_string()
-                .contains("invalid deletion vector storage type"),
-            "unexpected: {err}"
-        );
+    #[rstest::rstest]
+    #[case(-1)]
+    #[case(42)]
+    fn kernel_dv_storage_type_rejects_invalid_discriminant(#[case] value: c_int) {
+        assert!(matches!(
+            KernelDvStorageType::try_from(value).unwrap_err(),
+            delta_kernel::Error::Kernel(KernelError::FfiContract(
+                delta_kernel::error::FfiContractError::InvalidTag {
+                    field: "deletion vector storage type",
+                    value: actual,
+                }
+            )) if actual == i64::from(value)
+        ));
     }
 
     #[test]
@@ -346,7 +354,7 @@ mod tests {
 
         let result = dv_descriptor_map_insert_impl(
             &mut map,
-            Err(KernelError::generic("bad data file path").into()),
+            Err(KernelError::invalid_table_location("bad data file path").into()),
             descriptor.shallow_copy(),
         );
 

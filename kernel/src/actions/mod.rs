@@ -1249,7 +1249,7 @@ fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> DeltaResu
     let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
         fields.iter().any(|f| f.name() == field_name),
-        KernelError::generic(format!(
+        KernelError::MissingColumn(format!(
             "checkpoint union element field {field_name:?} not found in element schema"
         ))
     );
@@ -1363,10 +1363,10 @@ impl ContentRoot {
         let path = &self.path;
         let location = if has_scheme(path) {
             // A URI scheme means the path is absolute and used as-is.
-            Url::parse(path).map_err(|e| {
-                KernelError::generic(format!(
-                    "Failed to parse absolute checkpoint contentRoot path {path:?}: {e}"
-                ))
+            Url::parse(path).map_err(|source| {
+                KernelError::from(source).with_context(crate::error::ErrorContext::File {
+                    path: path.to_string(),
+                })
             })?
         } else {
             // Otherwise the path is relative and concatenated onto `table_root` with a single `/`.
@@ -1374,11 +1374,10 @@ impl ContentRoot {
             if !base.ends_with('/') {
                 base.push('/');
             }
-            Url::parse(&format!("{base}{path}")).map_err(|e| {
-                KernelError::generic(format!(
-                    "Failed to resolve checkpoint contentRoot path {path:?} against table \
-                     root {base}: {e}"
-                ))
+            Url::parse(&format!("{base}{path}")).map_err(|source| {
+                KernelError::from(source).with_context(crate::error::ErrorContext::File {
+                    path: format!("{base}{path}"),
+                })
             })?
         };
         Ok(FileMeta {
@@ -1412,7 +1411,7 @@ impl CheckpointAction {
     fn validate(&self) -> DeltaResult<()> {
         require!(
             self.content_root.version <= self.version,
-            KernelError::generic(format!(
+            KernelError::InvalidCheckpoint(format!(
                 "checkpoint contentRoot.version {} exceeds checkpointMetadata.version {}",
                 self.content_root.version, self.version
             ))
@@ -1482,14 +1481,10 @@ pub(crate) struct Sidecar {
 
 /// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
 /// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
-fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
+fn to_file_size(bytes: i64, context: &'static str) -> DeltaResult<FileSize> {
     bytes
         .try_into()
-        .map_err(|_| {
-            KernelError::generic(format!(
-                "Failed to convert {context} size {bytes} to FileSize"
-            ))
-        })
+        .map_err(|source| KernelError::integer_conversion(context, bytes, "FileSize", source))
         .map_err(crate::Error::from)
 }
 
@@ -2853,7 +2848,7 @@ mod tests {
         "metadata/root.parquet",
         -1,
         "memory:///table/metadata/root.parquet",
-        Err("Failed to convert checkpoint contentRoot size -1")
+        Err(())
     )]
     #[case::table_root_without_trailing_slash_gets_one(
         "memory:///table",
@@ -2907,7 +2902,7 @@ mod tests {
         #[case] path: &str,
         #[case] size_in_bytes: i64,
         #[case] expected_location: &str,
-        #[case] expected: Result<FileSize, &str>,
+        #[case] expected: Result<FileSize, ()>,
     ) {
         let table_root = Url::parse(table_root).unwrap();
         let checkpoint_action = CheckpointAction {
@@ -2933,7 +2928,11 @@ mod tests {
                 assert_eq!(file_meta.size, expected_size);
                 assert_eq!(file_meta.last_modified, i64::MAX);
             }
-            Err(expected_message) => assert_result_error_with_message(result, expected_message),
+            Err(()) => assert!(matches!(result,
+                Err(crate::Error::Kernel(KernelError::IntegerConversion {
+                    field: "checkpoint contentRoot", value, target: "FileSize", ..
+                })) if value == size_in_bytes.to_string()
+            )),
         }
     }
 

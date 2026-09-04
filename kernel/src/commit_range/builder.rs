@@ -86,11 +86,13 @@ impl CommitRangeBuilder {
 
         // Snapshot-derived ranges can't extend past the snapshot version.
         if self.snapshot.is_some() && end_version > log_segment.end_version {
-            return Err(KernelError::generic(format!(
-                "end_version ({end_version}) cannot exceed snapshot version ({})",
-                log_segment.end_version
-            ))
-            .into());
+            return Err(
+                KernelError::CommitRange(super::CommitRangeError::BeyondSnapshot {
+                    end: end_version,
+                    snapshot: log_segment.end_version,
+                })
+                .into(),
+            );
         }
 
         // Snapshot's log segment may extend past [start, end]; filter to the requested range.
@@ -138,10 +140,9 @@ pub enum CommitOrdering {
 
 fn validate_version_range(start: Version, end: Version) -> DeltaResult<()> {
     if start > end {
-        return Err(KernelError::generic(format!(
-            "start_version ({start}) must be <= end_version ({end})",
-        ))
-        .into());
+        return Err(
+            KernelError::CommitRange(super::CommitRangeError::Reversed { start, end }).into(),
+        );
     }
 
     Ok(())
@@ -155,14 +156,16 @@ fn validate_start_version_available(
     if first_commit.map(|f| f.version) == Some(start_version) {
         return Ok(());
     }
-    let earliest_available_commit = first_commit.map(|f| f.version).ok_or_else(|| {
-        KernelError::generic("snapshot's log segment must have at least one commit")
-    })?;
-    Err(KernelError::generic(format!(
-        "start_version {start_version} is not available in the snapshot's log segment \
-         (earliest available commit: {earliest_available_commit})",
-    ))
-    .into())
+    let earliest_available_commit = first_commit
+        .map(|f| f.version)
+        .ok_or_else(|| KernelError::CommitRange(super::CommitRangeError::EmptySnapshot))?;
+    Err(
+        KernelError::CommitRange(super::CommitRangeError::StartUnavailable {
+            start: start_version,
+            earliest: earliest_available_commit,
+        })
+        .into(),
+    )
 }
 
 fn validate_number_of_commit_files(
@@ -173,9 +176,15 @@ fn validate_number_of_commit_files(
     let expected = end - start + 1;
     let actual = commit_file_count as u64;
     if expected != actual {
-        return Err(KernelError::generic(format!(
-            "The number of commit files: {actual} does not match the expected range (start_version: {start}, end_version: {end}): expected {expected} commit files",
-        )).into());
+        return Err(
+            KernelError::CommitRange(super::CommitRangeError::CommitCount {
+                start,
+                end,
+                expected,
+                actual,
+            })
+            .into(),
+        );
     }
     Ok(())
 }
@@ -232,7 +241,7 @@ mod tests {
 
     /// Snapshot-based ranges must reject any version that lands past the snapshot's
     /// version. Both the start-past-snapshot and end-past-snapshot cases surface as a
-    /// generic error before the iterator is constructed.
+    /// `CommitRangeError` before the iterator is constructed.
     #[rstest::rstest]
     #[case::start_past_snapshot_version(
         5,

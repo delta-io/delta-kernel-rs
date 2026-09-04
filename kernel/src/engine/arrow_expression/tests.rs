@@ -1352,20 +1352,55 @@ fn test_create_many_wrong_field_count_returns_error() {
     );
 }
 
-#[test]
-fn test_create_many_wrong_field_type_returns_error() {
+#[rstest]
+#[case::first_column(1, &[1i64.into(), "y".into()], "a", KernelDataType::INTEGER, KernelDataType::LONG)]
+#[case::second_column(0, &[1.into(), true.into()], "b", KernelDataType::STRING, KernelDataType::BOOLEAN)]
+fn test_create_many_wrong_field_type_returns_error(
+    #[case] row_index: usize,
+    #[case] bad_row: &[Scalar],
+    #[case] field_name: &str,
+    #[case] expected_type: KernelDataType,
+    #[case] actual_type: KernelDataType,
+) {
     let schema = schema_ref! {
         nullable "a": INTEGER,
         nullable "b": STRING,
     };
-    // Row 1 passes a Long where an Integer is expected for field "a"
     let good_row: &[Scalar] = &[1.into(), "x".into()];
-    let bad_row: &[Scalar] = &[1i64.into(), "y".into()];
+    let mut rows = vec![good_row; row_index + 1];
+    rows[row_index] = bad_row;
     let handler = ArrowEvaluationHandler;
-    assert_result_error_with_message(
-        handler.create_many(schema, &[good_row, bad_row]),
-        "Row 1, field 'a' (expected type integer, got long): Invalid expression evaluation: Invalid builder for long",
-    );
+    let Err(error) = handler.create_many(schema, &rows) else {
+        panic!("expected scalar append to fail");
+    };
+    let crate::Error::Kernel(KernelError::Context {
+        context: ErrorContext::Operation("append scalar to row"),
+        source,
+    }) = &error
+    else {
+        panic!("expected scalar append operation context, got {error:?}");
+    };
+    let KernelError::Context {
+        context:
+            ErrorContext::Scalar {
+                row,
+                field,
+                expected,
+                actual,
+            },
+        source,
+    } = source.as_ref()
+    else {
+        panic!("expected scalar context, got {source:?}");
+    };
+    assert_eq!(*row, row_index);
+    assert_eq!(field, field_name);
+    assert_eq!(expected, &expected_type.to_string());
+    assert_eq!(actual, &actual_type.to_string());
+    assert!(matches!(
+        source.as_ref(),
+        KernelError::InvalidExpressionEvaluation(_)
+    ));
 }
 
 #[test]

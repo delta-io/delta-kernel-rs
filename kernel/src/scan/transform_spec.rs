@@ -140,7 +140,9 @@ pub(crate) fn get_transform_expr(
                 row_index_field_name,
             } => {
                 let base_row_id = base_row_id.ok_or_else(|| {
-                    KernelError::generic("Asked to generate RowIds, but no baseRowId found.")
+                    KernelError::Scan(super::ScanError::MissingRowTrackingValue {
+                        field: "baseRowId",
+                    })
                 })?;
                 let expr = Arc::new(Expression::coalesce([
                     Expression::column([field_name]),
@@ -222,7 +224,7 @@ pub(crate) fn parse_partition_value_raw(
             .empty_string_partition_cast()
             .unwrap_or_else(|| Scalar::Null(data_type.clone()))),
         (Some(v), Some(primitive)) => primitive.parse_scalar(v).map_err(crate::Error::from),
-        (Some(_), None) => Err(KernelError::generic(format!(
+        (Some(_), None) => Err(KernelError::unexpected_column_type(format!(
             "Unexpected partition column type: {data_type:?}"
         ))
         .into()),
@@ -647,14 +649,16 @@ mod tests {
         };
         let metadata_values = HashMap::new();
 
-        assert_result_error_with_message(
+        assert!(matches!(
             get_transform_expr(
                 &transform_spec,
                 metadata_values,
                 &physical_schema,
                 None, /* base_row_id */
             ),
-            "Asked to generate RowIds, but no baseRowId found",
-        );
+            Err(crate::Error::Kernel(KernelError::Scan(
+                crate::scan::ScanError::MissingRowTrackingValue { field: "baseRowId" }
+            )))
+        ));
     }
 }

@@ -166,7 +166,7 @@ mod tests {
             _overwrite: bool,
         ) -> DeltaResult<FileSize> {
             self.write_size.ok_or_else(|| {
-                crate::Error::from(crate::KernelError::generic(
+                crate::Error::from(crate::KernelError::unsupported(
                     "StubJsonHandler does not support writes",
                 ))
             })

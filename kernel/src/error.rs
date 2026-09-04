@@ -3,21 +3,40 @@
 mod delta_error;
 mod delta_error_conditions;
 pub(crate) mod delta_errors;
+mod ffi_contract;
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::convert::Infallible;
-use std::num::ParseIntError;
+use std::num::{ParseIntError, TryFromIntError};
 use std::str::Utf8Error;
 
 pub use delta_error::{DeltaError, DeltaErrorParameter};
 pub use delta_error_conditions::DeltaErrorCondition;
+pub use ffi_contract::FfiContractError;
 
-#[cfg(feature = "default-engine-base")]
+#[cfg(feature = "need-arrow")]
 use crate::arrow::error::ArrowError;
+pub use crate::commit_range::CommitRangeError;
+pub use crate::committer::PublishError;
+pub use crate::crc::CrcError;
+#[cfg(any(
+    feature = "default-engine-base",
+    feature = "arrow-conversion",
+    feature = "declarative-plans"
+))]
+pub use crate::engine::ArrowEngineError;
+pub use crate::log_compaction::LogCompactionError;
+pub use crate::log_segment::LogSegmentError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
+#[cfg(feature = "declarative-plans")]
+pub use crate::plans::PlanError;
+pub use crate::scan::ScanError;
 use crate::schema::{DataType, StructType};
+pub use crate::snapshot::SnapshotError;
+pub use crate::table_changes::TableChangesError;
 use crate::table_properties::ParseIntervalError;
+pub use crate::table_properties::TablePropertyError;
 use crate::Version;
 
 /// Details of a failed conversion from a scalar into a Rust value.
@@ -113,14 +132,97 @@ pub enum Error {
     Kernel(#[from] KernelError),
 }
 
+/// The operation in which an already classified Kernel error occurred.
+#[derive(Debug, thiserror::Error)]
+pub enum ErrorContext {
+    /// A named operation; the name must not contain caller-provided data.
+    #[error("{0}")]
+    Operation(&'static str),
+    /// A configuration value being parsed or validated.
+    #[error("configuration {key}={value:?}")]
+    Configuration {
+        /// The configuration key.
+        key: &'static str,
+        /// The supplied value.
+        value: String,
+    },
+    /// A column being resolved or modified.
+    #[error("column {path}")]
+    Column {
+        /// The complete requested column path.
+        path: String,
+    },
+    /// A domain metadata entry being processed.
+    #[error("domain metadata {domain}")]
+    DomainMetadata {
+        /// The domain name.
+        domain: String,
+    },
+    /// A statistics section being constructed or reduced.
+    #[error("statistics section {section}")]
+    Statistics {
+        /// The protocol-defined statistics section name.
+        section: &'static str,
+    },
+    /// A scalar being appended to a row.
+    #[error("row {row}, field {field:?}: expected {expected}, got {actual}")]
+    Scalar {
+        /// The zero-based row index.
+        row: usize,
+        /// The field name.
+        field: String,
+        /// The type required by the schema.
+        expected: String,
+        /// The input scalar's type.
+        actual: String,
+    },
+    /// A SQL literal being parsed.
+    #[error("SQL literal {sql:?}")]
+    SqlLiteral {
+        /// The original SQL text, including whitespace.
+        sql: String,
+    },
+    /// A transaction log commit being processed.
+    #[error("commit v={version}")]
+    Commit {
+        /// The commit version.
+        version: Version,
+    },
+    /// A data file being processed.
+    #[error("file {path}")]
+    File {
+        /// The file path.
+        path: String,
+    },
+    /// Diagnostic text supplied with a recognized, payload-free callback error.
+    #[error("callback ({code}): {message}")]
+    ForeignCallback {
+        /// The original callback code.
+        code: i32,
+        /// The callback diagnostic.
+        message: String,
+    },
+}
+
+impl Error {
+    /// Adds operation context to a Kernel failure, leaving Delta failures unchanged.
+    ///
+    /// Returns the contextualized error without changing its underlying classification.
+    pub fn with_context(self, context: ErrorContext) -> Self {
+        match self {
+            Self::Kernel(error) => error.with_context(context).into(),
+            error => error,
+        }
+    }
+}
+
 /// All the types of errors that the kernel can run into
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum KernelError {
-    /// This is an error that includes a backtrace. To have a particular type of error include such
-    /// backtrace (when RUST_BACKTRACE=1), annotate the error with `#[error(transparent)]` and then
-    /// add the error type and enum variant to the `from_with_backtrace!` macro invocation
-    /// below. See IOError for an example.
+    /// A classified failure accompanied by a backtrace captured when `RUST_BACKTRACE` is enabled.
+    /// Native conversions listed in `from_with_backtrace!` capture backtraces while retaining
+    /// their typed source. This wrapper does not change the failure's classification.
     #[error("{source}\n{backtrace}")]
     Backtraced {
         source: Box<Self>,
@@ -128,9 +230,9 @@ pub enum KernelError {
     },
 
     /// An error performing operations on arrow data
-    #[cfg(feature = "default-engine-base")]
-    #[error(transparent)]
-    Arrow(ArrowError),
+    #[cfg(feature = "need-arrow")]
+    #[error("{0}")]
+    Arrow(#[source] ArrowError),
 
     #[error("Error writing checkpoint: {0}")]
     CheckpointWrite(String),
@@ -147,16 +249,188 @@ pub enum KernelError {
     #[error(transparent)]
     ScalarConversion(#[from] ScalarConversionError),
 
-    /// A generic error with a message
-    #[error("Generic delta kernel error: {0}")]
-    Generic(String),
-
-    /// A generic error wrapping another error
-    #[error("Generic error: {source}")]
-    GenericError {
-        /// Source error
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    /// Operation context surrounding an already classified Kernel failure.
+    #[error("{context}: {source}")]
+    Context {
+        /// The operation that failed.
+        context: ErrorContext,
+        /// The classified failure.
+        source: Box<Self>,
     },
+
+    /// An integer cannot be represented by the required type.
+    #[error("Cannot convert {field} value {value} to {target}: {source}")]
+    IntegerConversion {
+        /// The field being converted.
+        field: &'static str,
+        /// The original value.
+        value: String,
+        /// The required integer type.
+        target: &'static str,
+        /// The failed checked conversion.
+        source: TryFromIntError,
+    },
+
+    /// Arithmetic exceeded the representable range.
+    #[error("Numeric overflow in {operation}: {value}")]
+    NumericOverflow {
+        /// The arithmetic operation.
+        operation: &'static str,
+        /// The input value or operands.
+        value: String,
+    },
+
+    /// A JSON encoding operation failed.
+    #[error("JSON serialization failed during {operation}: {source}")]
+    JsonSerialization {
+        /// The encoding operation.
+        operation: &'static str,
+        /// The JSON encoder failure.
+        source: serde_json::Error,
+    },
+
+    /// A dependency failed to convert or lower an expression.
+    #[error("Expression conversion failed during {operation}: {source}")]
+    ExpressionConversion {
+        /// The expression conversion operation.
+        operation: &'static str,
+        /// The native conversion failure.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A serialized plan message could not be decoded.
+    #[cfg(feature = "declarative-plans")]
+    #[error("Cannot decode {message_type}: {source}")]
+    ProtobufDecode {
+        /// The expected message type.
+        message_type: &'static str,
+        /// The native protobuf decoder failure.
+        source: prost::DecodeError,
+    },
+
+    /// A shared resource was poisoned by an unwinding thread.
+    #[error("Poisoned lock: {resource}")]
+    LockPoisoned {
+        /// The protected resource.
+        resource: &'static str,
+    },
+
+    /// A catalog client operation failed.
+    #[error("Catalog operation {operation} failed: {source}")]
+    CatalogOperation {
+        /// The catalog operation.
+        operation: &'static str,
+        /// The native client failure.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// The system clock precedes the Unix epoch.
+    #[error("System time before Unix epoch: {0}")]
+    ClockBeforeEpoch(#[source] std::time::SystemTimeError),
+
+    /// Execution requires a runtime that is not available.
+    #[error("Required runtime is unavailable: {source}")]
+    RuntimeUnavailable {
+        /// The runtime lookup failure.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// An external runtime operation unwound instead of returning a result.
+    #[error("Runtime operation {operation} panicked: {message:?}")]
+    RuntimePanic {
+        /// The runtime operation.
+        operation: &'static str,
+        /// The panic message, or `None` for a non-string payload.
+        message: Option<String>,
+    },
+
+    /// Storage reported a different size than the writer produced.
+    #[error("Written file size mismatch: expected {expected}, got {actual}")]
+    WrittenFileSizeMismatch {
+        /// The size produced by the writer in bytes.
+        expected: u64,
+        /// The size reported by storage in bytes.
+        actual: u64,
+    },
+
+    /// A foreign callback returned a failure whose payload is only available as text.
+    #[error("Foreign callback error ({code}): {message}")]
+    ForeignCallback {
+        /// The original callback error code.
+        code: i32,
+        /// The callback-owned diagnostic copied across the boundary.
+        message: String,
+    },
+
+    /// A caller violated an FFI argument, visitor, or callback contract.
+    #[error("{0}")]
+    FfiContract(#[from] FfiContractError),
+
+    /// A tracing subscriber operation failed.
+    #[error("Tracing operation {operation} failed: {source}")]
+    TracingFailure {
+        /// The subscriber operation.
+        operation: &'static str,
+        /// The subscriber's original failure.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A tracing subscriber slot was not initialized.
+    #[error("Tracing slot not installed: {slot}")]
+    TracingSlotMissing {
+        /// The missing subscriber slot.
+        slot: &'static str,
+    },
+
+    /// Invalid log-segment coverage or replay state.
+    #[error("{0}")]
+    LogSegment(#[from] crate::log_segment::LogSegmentError),
+
+    /// Invalid scan state or missing scan metadata.
+    #[error("{0}")]
+    Scan(#[from] crate::scan::ScanError),
+
+    /// Invalid requested commit range or action projection.
+    #[error("{0}")]
+    CommitRange(#[from] crate::commit_range::CommitRangeError),
+
+    /// Invalid snapshot metadata or publishing state.
+    #[error("{0}")]
+    Snapshot(#[from] crate::snapshot::SnapshotError),
+
+    /// Invalid change-data file actions or metadata.
+    #[error("{0}")]
+    TableChanges(#[from] crate::table_changes::TableChangesError),
+
+    /// Invalid catalog publication request.
+    #[error("{0}")]
+    Publish(#[from] crate::committer::PublishError),
+
+    /// Invalid table property value or feature configuration.
+    #[error("{0}")]
+    TableProperty(#[from] crate::table_properties::TablePropertyError),
+
+    /// Invalid version-checksum contents or state.
+    #[error("{0}")]
+    Crc(#[from] crate::crc::CrcError),
+
+    /// Invalid log-compaction version range.
+    #[error("{0}")]
+    LogCompaction(#[from] crate::log_compaction::LogCompactionError),
+
+    /// Invalid Arrow input or reader state.
+    #[cfg(any(
+        feature = "default-engine-base",
+        feature = "arrow-conversion",
+        feature = "declarative-plans"
+    ))]
+    #[error("{0}")]
+    ArrowEngine(#[from] crate::engine::ArrowEngineError),
+
+    /// Invalid relational plan or executor input.
+    #[cfg(feature = "declarative-plans")]
+    #[error("{0}")]
+    Plan(#[from] crate::plans::PlanError),
 
     /// An error involving the maximum catalog-ratified version when building a snapshot.
     #[error("Max catalog version error: {0}")]
@@ -172,8 +446,8 @@ pub enum KernelError {
     },
 
     /// Some kind of [`std::io::Error`]
-    #[error(transparent)]
-    IOError(std::io::Error),
+    #[error("{0}")]
+    IOError(#[source] std::io::Error),
 
     /// An internal error that means kernel found an unexpected situation, which is likely a bug
     #[error("Internal error {0}. This is a kernel bug, please report.")]
@@ -189,7 +463,7 @@ pub enum KernelError {
     // object_store::Error::NotFound into Self::FileNotFound
     #[cfg(feature = "default-engine-base")]
     #[error("Error interacting with object store: {0}")]
-    ObjectStore(object_store::Error),
+    ObjectStore(#[source] object_store::Error),
 
     /// An error working with paths from the object_store crate
     #[cfg(feature = "default-engine-base")]
@@ -242,8 +516,8 @@ pub enum KernelError {
     InvalidUrl(#[from] url::ParseError),
 
     /// serde encountered malformed json
-    #[error(transparent)]
-    MalformedJson(serde_json::Error),
+    #[error("{0}")]
+    MalformedJson(#[source] serde_json::Error),
 
     /// There was no metadata action in the delta log
     #[error("No table metadata found in delta log.")]
@@ -371,7 +645,6 @@ pub enum KernelError {
     Cancelled,
 }
 
-// Convenience constructors for Error types that take a String argument
 impl KernelError {
     pub(crate) fn scalar_conversion(
         expected: impl Into<String>,
@@ -384,13 +657,31 @@ impl KernelError {
         Self::CheckpointWrite(msg.to_string())
     }
 
-    pub fn generic_err(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self::GenericError {
-            source: source.into(),
+    /// Wraps this classified failure with the supplied operation context.
+    ///
+    /// Returns an error retaining this error as its source.
+    pub fn with_context(self, context: ErrorContext) -> Self {
+        Self::Context {
+            context,
+            source: Box::new(self),
         }
     }
-    pub fn generic(msg: impl ToString) -> Self {
-        Self::Generic(msg.to_string())
+
+    /// Describes a checked integer conversion failure for `field` and its original `value`.
+    ///
+    /// Returns an error retaining `source` and the required `target` type.
+    pub fn integer_conversion(
+        field: &'static str,
+        value: impl ToString,
+        target: &'static str,
+        source: TryFromIntError,
+    ) -> Self {
+        Self::IntegerConversion {
+            field,
+            value: value.to_string(),
+            target,
+            source,
+        }
     }
     pub fn file_not_found(path: impl ToString) -> Self {
         Self::FileNotFound(path.to_string())
@@ -499,7 +790,8 @@ impl KernelError {
         Self::PlanResultTypeMismatch { expected, actual }
     }
 
-    // Capture a backtrace when the error is constructed.
+    /// Returns this error with a captured backtrace when backtrace capture is enabled.
+    /// Otherwise returns it unchanged.
     #[must_use]
     pub fn with_backtrace(self) -> Self {
         let backtrace = Backtrace::capture();
@@ -530,7 +822,7 @@ from_with_backtrace!(
     (std::io::Error, IOError)
 );
 
-#[cfg(feature = "default-engine-base")]
+#[cfg(feature = "need-arrow")]
 impl From<ArrowError> for KernelError {
     fn from(value: ArrowError) -> Self {
         Self::Arrow(value).with_backtrace()
@@ -558,5 +850,56 @@ impl From<Infallible> for Error {
 impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::*;
+
+    #[test]
+    fn operation_context_retains_io_source_and_classification() {
+        let error = KernelError::IOError(std::io::Error::other("disk unavailable"))
+            .with_context(ErrorContext::Commit { version: 42 });
+        let KernelError::Context { context, source } = &error else {
+            panic!("expected operation context");
+        };
+        assert!(matches!(context, ErrorContext::Commit { version: 42 }));
+        assert!(matches!(source.as_ref(), KernelError::IOError(_)));
+        let native = source
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(native.kind(), std::io::ErrorKind::Other);
+        assert_eq!(native.to_string(), "disk unavailable");
+    }
+
+    #[test]
+    fn delta_errors_are_not_reclassified_by_context() {
+        let error = delta_errors::table_not_found("memory:///missing/")
+            .with_context(ErrorContext::Operation("load snapshot"));
+        assert!(matches!(error, Error::Delta(_)));
+    }
+
+    #[test]
+    fn integer_conversion_preserves_original_value_and_native_source() {
+        let source = u64::try_from(-1i64).unwrap_err();
+        let error = KernelError::integer_conversion("size", -1, "u64", source);
+        assert!(matches!(
+            &error,
+            KernelError::IntegerConversion { field: "size", value, target: "u64", .. }
+                if value == "-1"
+        ));
+        assert!(error.source().unwrap().is::<TryFromIntError>());
+    }
+
+    #[test]
+    fn json_source_survives_top_level_error_conversion() {
+        let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let error = Error::from(KernelError::MalformedJson(source));
+        assert!(error.source().unwrap().is::<serde_json::Error>());
     }
 }

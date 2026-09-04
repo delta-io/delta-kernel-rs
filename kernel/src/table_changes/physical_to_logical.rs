@@ -6,7 +6,7 @@ use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values};
 use crate::schema::{schema_ref, SchemaRef, StructType};
-use crate::{DeltaResult, ExpressionRef, KernelError};
+use crate::{DeltaResult, ExpressionRef};
 
 /// Gets CDF metadata columns from the logical schema and scan file.
 ///
@@ -34,8 +34,10 @@ fn get_cdf_columns(
     // Handle _commit_timestamp
     let timestamp_field = logical_schema.field_with_index(COMMIT_TIMESTAMP_COL_NAME);
     let timestamp_metadata = if let Some((idx, field)) = timestamp_field {
-        let value = Scalar::timestamp_from_millis(scan_file.commit_timestamp).map_err(|e| {
-            KernelError::generic(format!("Failed to process {}: {e}", scan_file.path))
+        let value = Scalar::timestamp_from_millis(scan_file.commit_timestamp).map_err(|error| {
+            error.with_context(crate::error::ErrorContext::File {
+                path: scan_file.path.clone(),
+            })
         })?;
         Some((idx, (field.name().to_string(), value)))
     } else {

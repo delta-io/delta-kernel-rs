@@ -282,7 +282,7 @@ fn read_scan_file(
         size: match scan_file.size {
             Some(s) => s
                 .try_into()
-                .map_err(|_| KernelError::generic(format!("invalid file size: {s}")))?,
+                .map_err(|source| KernelError::integer_conversion("file size", s, "u64", source))?,
             None => 0,
         },
         location,

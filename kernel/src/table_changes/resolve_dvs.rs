@@ -46,14 +46,14 @@ pub(crate) fn resolve_scan_file_dv(
         .transpose()?;
     let (add_dv, rm_dv) = match (add_dv, rm_dv, &scan_file.scan_type) {
         (_, Some(_), CdfScanFileType::Remove) => {
-            return Err(KernelError::generic(
-                "CdfScanFile with type remove cannot have a remove deletion vector",
+            return Err(KernelError::TableChanges(
+                super::TableChangesError::RemoveFileWithRemoveVector,
             )
             .into());
         }
         (_, Some(_), CdfScanFileType::Cdc) => {
-            return Err(KernelError::generic(
-                "CdfScanFile with type cdc cannot have a remove deletion vector",
+            return Err(KernelError::TableChanges(
+                super::TableChangesError::CdcFileWithRemoveVector,
             )
             .into());
         }
@@ -359,22 +359,26 @@ mod tests {
         let remove_dv = Some(DvInfo::from(rm_dv));
         let mut scan_file = get_scan_file(CdfScanFileType::Cdc, Default::default(), remove_dv);
 
-        let expected_err =
-            KernelError::generic("CdfScanFile with type cdc cannot have a remove deletion vector");
-
         let res = resolve_scan_file_dv(&engine, &table_root, scan_file.clone())
             .err()
             .unwrap();
-        assert_eq!(res.to_string(), expected_err.to_string());
+        assert!(matches!(
+            res,
+            crate::Error::Kernel(KernelError::TableChanges(
+                crate::table_changes::TableChangesError::CdcFileWithRemoveVector
+            ))
+        ));
 
         scan_file.scan_type = CdfScanFileType::Remove;
-        let expected_err = KernelError::generic(
-            "CdfScanFile with type remove cannot have a remove deletion vector",
-        );
         let res = resolve_scan_file_dv(&engine, &table_root, scan_file)
             .err()
             .unwrap();
-        assert_eq!(res.to_string(), expected_err.to_string());
+        assert!(matches!(
+            res,
+            crate::Error::Kernel(KernelError::TableChanges(
+                crate::table_changes::TableChangesError::RemoveFileWithRemoveVector
+            ))
+        ));
     }
 
     #[test]

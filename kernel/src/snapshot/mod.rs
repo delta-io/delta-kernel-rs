@@ -47,6 +47,72 @@ use snapshot_crc::SnapshotCrc;
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
 
+/// Invalid snapshot metadata, version selection, or publishing preconditions.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotError {
+    /// An incremental update requested a version older than its snapshot hint.
+    #[error("Requested snapshot version {requested} is older than snapshot hint version {hint}")]
+    VersionBeforeHint {
+        /// Requested snapshot version.
+        requested: Version,
+        /// Supplied snapshot hint version.
+        hint: Version,
+    },
+    /// The latest log version has regressed behind an existing snapshot.
+    #[error(
+        "Unexpected state: the newest version in the log {latest} is older than the existing \
+         snapshot version {snapshot}"
+    )]
+    LogVersionRegressed {
+        /// Latest listed log version.
+        latest: Version,
+        /// Existing snapshot version.
+        snapshot: Version,
+    },
+    /// A caller tried to read a reserved system metadata domain.
+    #[error(
+        "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain: {domain}"
+    )]
+    ReservedDomain {
+        /// Requested domain.
+        domain: String,
+    },
+    /// ICT enablement lies after the snapshot being read.
+    #[error(
+        "Invalid state: snapshot at version {snapshot} has ICT enablement version {enablement} \
+         in the future"
+    )]
+    FutureTimestampEnablement {
+        /// Snapshot version.
+        snapshot: Version,
+        /// Configured ICT enablement version.
+        enablement: Version,
+    },
+    /// An enabled ICT value is absent from the snapshot checksum.
+    #[error("In-Commit Timestamp not found in CRC file at version {version}")]
+    MissingChecksumTimestamp {
+        /// Checksum version.
+        version: Version,
+    },
+    /// No latest commit file is available for reading the snapshot timestamp.
+    #[error("Last commit file not found in log segment for version {version}")]
+    MissingCommit {
+        /// Requested commit version.
+        version: Version,
+    },
+    /// Publishing requires a catalog-managed table.
+    #[error(
+        "There are catalog commits that need publishing, but the table is not catalog-managed."
+    )]
+    PublishNonCatalogTable,
+    /// Publishing requires a catalog committer.
+    #[error(
+        "There are catalog commits that need publishing, but the committer is not a catalog \
+         committer."
+    )]
+    PublishNonCatalogCommitter,
+}
+
 /// Result of attempting to write a version checksum (CRC) file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecksumWriteResult {
@@ -526,9 +592,9 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
         if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-            return Err(KernelError::generic(
-                "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
-            )
+            return Err(KernelError::Snapshot(SnapshotError::ReservedDomain {
+                domain: domain.to_string(),
+            })
             .into());
         }
 
@@ -783,11 +849,13 @@ impl Snapshot {
         } = enablement
         {
             if self.version() < enablement_version {
-                return Err(KernelError::generic(format!(
-                    "Invalid state: snapshot at version {} has ICT enablement version {} in the future",
-                    self.version(),
-                    enablement_version
-                )).into());
+                return Err(
+                    KernelError::Snapshot(SnapshotError::FutureTimestampEnablement {
+                        snapshot: self.version(),
+                        enablement: enablement_version,
+                    })
+                    .into(),
+                );
             }
         }
 
@@ -796,11 +864,12 @@ impl Snapshot {
             match crc.in_commit_timestamp_opt {
                 Some(ict) => return Ok(Some(ict)),
                 None => {
-                    return Err(KernelError::generic(format!(
-                        "In-Commit Timestamp not found in CRC file at version {}",
-                        self.version()
-                    ))
-                    .into());
+                    return Err(
+                        KernelError::Snapshot(SnapshotError::MissingChecksumTimestamp {
+                            version: self.version(),
+                        })
+                        .into(),
+                    );
                 }
             }
         }
@@ -811,7 +880,10 @@ impl Snapshot {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
                 Ok(Some(ict))
             }
-            None => Err(KernelError::generic("Last commit file not found in log segment").into()),
+            None => Err(KernelError::Snapshot(SnapshotError::MissingCommit {
+                version: self.version(),
+            })
+            .into()),
         }
     }
 
@@ -839,21 +911,18 @@ impl Snapshot {
                         let ts = commit_file_meta.location.last_modified;
                         Ok(ts)
                     }
-                    None => Err(KernelError::generic(format!(
-                        "Last commit file not found in log segment for version {} \
-                         (ICT disabled): cannot read filesystem modification timestamp",
-                        self.version()
-                    ))
+                    None => Err(KernelError::Snapshot(SnapshotError::MissingCommit {
+                        version: self.version(),
+                    })
                     .into()),
                 }
             }
             InCommitTimestampEnablement::Enabled { .. } => self
                 .get_in_commit_timestamp(engine)
-                .map_err(|e| {
-                    KernelError::generic(format!(
-                        "Unable to read in-commit timestamp for version {}: {e}",
-                        self.version()
-                    ))
+                .map_err(|error| {
+                    error.with_context(crate::error::ErrorContext::Commit {
+                        version: self.version(),
+                    })
                 })?
                 .ok_or_else(|| {
                     KernelError::internal_error(format!(
@@ -1266,28 +1335,24 @@ impl Snapshot {
             return Ok(Arc::clone(self));
         }
 
-        require!(
-            unpublished_catalog_commits
-                .windows(2)
-                .all(|commits| commits[0].version() + 1 == commits[1].version()),
-            KernelError::generic(format!(
-                "Expected ordered and contiguous unpublished catalog commits. \
-                 Got: {unpublished_catalog_commits:?}"
-            ))
-        );
+        for commits in unpublished_catalog_commits.windows(2) {
+            if commits[0].version().checked_add(1) != Some(commits[1].version()) {
+                return Err(KernelError::LogTailVersionsNotContiguous {
+                    first_version: commits[0].version(),
+                    second_version: commits[1].version(),
+                }
+                .into());
+            }
+        }
 
         require!(
             self.table_configuration().is_catalog_managed(),
-            KernelError::generic(
-                "There are catalog commits that need publishing, but the table is not catalog-managed.",
-            )
+            KernelError::Snapshot(SnapshotError::PublishNonCatalogTable)
         );
 
         require!(
             committer.is_catalog_committer(),
-            KernelError::generic(
-                "There are catalog commits that need publishing, but the committer is not a catalog committer.",
-            )
+            KernelError::Snapshot(SnapshotError::PublishNonCatalogCommitter)
         );
 
         let publish_metadata =
@@ -1765,8 +1830,8 @@ mod tests {
             .get_domain_metadata("delta.domain3", &engine)
             .unwrap_err();
         assert!(
-            matches!(err, crate::Error::Kernel(KernelError::Generic(msg)) if
-                msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain")
+            matches!(err, crate::Error::Kernel(KernelError::Snapshot(SnapshotError::ReservedDomain { domain })) if
+                domain == "delta.domain3")
         );
 
         // Test get_domain_metadata_internal
@@ -1971,7 +2036,10 @@ mod tests {
             .at_version(1)
             .build(&engine)?;
         let result = snapshot_missing.get_in_commit_timestamp(&engine);
-        assert_result_error_with_message(result, "In-Commit Timestamp not found");
+        assert!(
+            matches!(result, Err(crate::Error::Kernel(KernelError::MissingData(field)))
+            if field.contains("inCommitTimestamp"))
+        );
 
         Ok(())
     }
@@ -2205,7 +2273,13 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
         let result = snapshot.get_timestamp(&engine);
-        assert_result_error_with_message(result, "In-Commit Timestamp not found in commit file");
+        assert!(
+            matches!(result, Err(crate::Error::Kernel(KernelError::Context {
+            context: crate::error::ErrorContext::Commit { version: 0 },
+            source,
+        })) if matches!(source.as_ref(), KernelError::MissingData(field)
+            if field.contains("inCommitTimestamp")))
+        );
 
         Ok(())
     }

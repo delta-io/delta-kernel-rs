@@ -125,7 +125,7 @@ impl RowVisitor for RowTrackingVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 1,
-            KernelError::generic(format!(
+            KernelError::invalid_struct_data(format!(
                 "Wrong number of RowTrackingVisitor getters: {}",
                 getters.len()
             ))

@@ -318,7 +318,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             Self::try_from(location)?.ok_or_else(|| KernelError::invalid_log_path(&url))?;
         require!(
             parsed.is_commit(),
-            KernelError::generic(format!(
+            KernelError::invalid_log_path(format!(
                 "Expected a commit path, got {} of type {:?}",
                 url, parsed.file_type
             ))
@@ -385,7 +385,7 @@ impl ParsedLogPath<FileMeta> {
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         // Only works on commit files
         if !self.is_commit() {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::invalid_log_path(format!(
                 "read_in_commit_timestamp can only be called on commit files, got: {:?}",
                 self.file_type
             ))
@@ -407,13 +407,11 @@ impl ParsedLogPath<FileMeta> {
                 visitor.visit_rows_of(actions.as_ref())?;
                 visitor
                     .in_commit_timestamp
-                    .ok_or_else(|| {
-                        KernelError::generic("In-Commit Timestamp not found in commit file")
-                    })
+                    .ok_or_else(|| KernelError::missing_data("inCommitTimestamp in commit file"))
                     .map_err(crate::Error::from)
             }
             Some(Err(err)) => Err(err),
-            None => Err(KernelError::generic("Commit file contains no actions").into()),
+            None => Err(KernelError::missing_data("commit actions").into()),
         }
     }
 }
@@ -1285,7 +1283,11 @@ pub(crate) mod tests {
 
         // Should return error when ICT is missing
         let result = parsed_path.read_in_commit_timestamp(&engine);
-        assert_result_error_with_message(result, "In-Commit Timestamp not found");
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::Error::Kernel(KernelError::MissingData(message))
+                if message == "inCommitTimestamp in commit file"
+        ));
     }
 
     #[test]

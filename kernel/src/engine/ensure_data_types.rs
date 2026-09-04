@@ -234,7 +234,7 @@ impl EnsureDataTypes {
         if matches!(self.mode, ValidationMode::Full)
             && kernel_field_is_nullable != arrow_field_is_nullable
         {
-            Err(KernelError::Generic(format!(
+            Err(KernelError::schema(format!(
                 "{desc} has nullability {kernel_field_is_nullable} in kernel and {arrow_field_is_nullable} in arrow",
             )).into())
         } else {
@@ -255,7 +255,7 @@ impl EnsureDataTypes {
         if matches!(self.mode, ValidationMode::Full)
             && !metadata_eq(&kernel_field.metadata, arrow_field.metadata())
         {
-            Err(KernelError::Generic(format!(
+            Err(KernelError::schema(format!(
                 "Field {} has metadata {:?} in kernel and {:?} in arrow",
                 kernel_field.name,
                 kernel_field.metadata,
@@ -596,14 +596,14 @@ mod tests {
         )
         .is_ok());
 
-        assert_result_error_with_message(
+        assert!(matches!(
             ensure_data_types(
                 &DataType::from(MapType::new(DataType::LONG, DataType::STRING, false)),
                 arrow_field.data_type(),
                 ValidationMode::Full,
             ),
-            "Generic delta kernel error: Map has nullability false in kernel and true in arrow",
-        );
+            Err(crate::Error::Kernel(KernelError::Schema(_)))
+        ));
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::from(MapType::new(DataType::LONG, DataType::LONG, true)),
@@ -636,14 +636,14 @@ mod tests {
             ),
             "Invalid argument error: Incorrect datatype. Expected Utf8, got Int64",
         );
-        assert_result_error_with_message(
+        assert!(matches!(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
                 &ArrowDataType::new_list(ArrowDataType::Int64, false),
                 ValidationMode::Full,
             ),
-            "Generic delta kernel error: List has nullability true in kernel and false in arrow",
-        );
+            Err(crate::Error::Kernel(KernelError::Schema(_)))
+        ));
     }
 
     #[test]
@@ -704,14 +704,14 @@ mod tests {
             ]),
             true,
         );
-        assert_result_error_with_message(
+        assert!(matches!(
             ensure_data_types(
                 &kernel_simple,
                 arrow_nullable_mismatch_simple.data_type(),
                 ValidationMode::Full,
             ),
-            "Generic delta kernel error: w has nullability true in kernel and false in arrow",
-        );
+            Err(crate::Error::Kernel(KernelError::Schema(_)))
+        ));
     }
 
     #[test]

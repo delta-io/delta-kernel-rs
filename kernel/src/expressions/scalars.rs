@@ -418,9 +418,10 @@ impl Scalar {
     /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
     pub(crate) fn timestamp_from_millis(millis: i64) -> DeltaResult<Self> {
         let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
-            return Err(KernelError::generic(format!(
-                "Failed to create millisecond timestamp from {millis}"
-            ))
+            return Err(KernelError::NumericOverflow {
+                operation: "create millisecond timestamp",
+                value: millis.to_string(),
+            }
             .into());
         };
         Ok(Self::Timestamp(timestamp.timestamp_micros()))

@@ -1,5 +1,4 @@
 use delta_kernel::{DeltaResult, Error, KernelError};
-use tracing::warn;
 
 use crate::handle::Handle;
 use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelStringSlice};
@@ -30,6 +29,7 @@ pub enum FFIKernelError {
     ArrowError = 2,
     EngineDataTypeError = 3,
     ExtractError = 4,
+    /// Legacy inbound callback code. Kernel never emits this code.
     GenericError = 5,
     IOErrorError = 6,
     #[cfg(feature = "default-engine-base")]
@@ -77,6 +77,41 @@ pub enum FFIKernelError {
     CancelledError = 45,
     InvalidTransactionStateError = 46,
     DeltaError = 47,
+    IntegerConversionError = 48,
+    NumericOverflowError = 49,
+    JsonSerializationError = 50,
+    ExpressionConversionError = 51,
+    LockPoisonedError = 52,
+    CatalogOperationError = 53,
+    ClockBeforeEpochError = 54,
+    RuntimeUnavailableError = 55,
+    RuntimePanicError = 56,
+    WrittenFileSizeMismatchError = 57,
+    ForeignCallbackError = 58,
+    FfiContractError = 59,
+    TracingFailureError = 60,
+    TracingSlotMissingError = 61,
+    MaxCatalogVersionError = 62,
+    LogTailVersionsNotContiguousError = 63,
+    ScalarConversionError = 64,
+    InvalidPartitionValuesError = 65,
+    InvalidSelectionVectorError = 66,
+    InvalidGeoParamsError = 67,
+    StatsValidationError = 68,
+    ChecksumWriteUnsupportedError = 69,
+    PlanResultTypeMismatchError = 70,
+    ProtobufDecodeError = 71,
+    LogSegmentError = 72,
+    ScanError = 73,
+    CommitRangeError = 74,
+    SnapshotError = 75,
+    TableChangesError = 76,
+    PublishError = 77,
+    TablePropertyError = 78,
+    CrcError = 79,
+    LogCompactionError = 80,
+    ArrowEngineError = 81,
+    PlanError = 82,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -88,10 +123,6 @@ impl From<KernelError> for FFIKernelError {
             KernelError::CheckpointWrite(_) => FFIKernelError::CheckpointWriteError,
             KernelError::EngineDataType(_) => FFIKernelError::EngineDataTypeError,
             KernelError::Extract(..) => FFIKernelError::ExtractError,
-            KernelError::Generic(_) => FFIKernelError::GenericError,
-            KernelError::GenericError { .. } => FFIKernelError::GenericError,
-            KernelError::MaxCatalogVersion(_) => FFIKernelError::GenericError,
-            KernelError::LogTailVersionsNotContiguous { .. } => FFIKernelError::GenericError,
             KernelError::IOError(_) => FFIKernelError::IOErrorError,
             #[cfg(feature = "default-engine-base")]
             KernelError::Parquet(_) => FFIKernelError::ParquetError,
@@ -150,6 +181,48 @@ impl From<KernelError> for FFIKernelError {
             KernelError::InvalidTransactionState(_) => FFIKernelError::InvalidTransactionStateError,
             KernelError::LogHistory(_) => FFIKernelError::LogHistoryError,
             KernelError::Cancelled => FFIKernelError::CancelledError,
+            KernelError::Context { source, .. } => Self::from(*source),
+            KernelError::IntegerConversion { .. } => Self::IntegerConversionError,
+            KernelError::NumericOverflow { .. } => Self::NumericOverflowError,
+            KernelError::JsonSerialization { .. } => Self::JsonSerializationError,
+            KernelError::ExpressionConversion { .. } => Self::ExpressionConversionError,
+            KernelError::LockPoisoned { .. } => Self::LockPoisonedError,
+            KernelError::CatalogOperation { .. } => Self::CatalogOperationError,
+            KernelError::ClockBeforeEpoch(_) => Self::ClockBeforeEpochError,
+            KernelError::RuntimeUnavailable { .. } => Self::RuntimeUnavailableError,
+            KernelError::RuntimePanic { .. } => Self::RuntimePanicError,
+            KernelError::WrittenFileSizeMismatch { .. } => Self::WrittenFileSizeMismatchError,
+            KernelError::ForeignCallback { .. } => Self::ForeignCallbackError,
+            KernelError::FfiContract(_) => Self::FfiContractError,
+            KernelError::TracingFailure { .. } => Self::TracingFailureError,
+            KernelError::TracingSlotMissing { .. } => Self::TracingSlotMissingError,
+            KernelError::MaxCatalogVersion(_) => Self::MaxCatalogVersionError,
+            KernelError::LogTailVersionsNotContiguous { .. } => {
+                Self::LogTailVersionsNotContiguousError
+            }
+            KernelError::ScalarConversion(_) => Self::ScalarConversionError,
+            KernelError::InvalidPartitionValues(_) => Self::InvalidPartitionValuesError,
+            KernelError::InvalidSelectionVector(_) => Self::InvalidSelectionVectorError,
+            KernelError::InvalidGeoParams(_) => Self::InvalidGeoParamsError,
+            KernelError::StatsValidation(_) => Self::StatsValidationError,
+            KernelError::ChecksumWriteUnsupported(_) => Self::ChecksumWriteUnsupportedError,
+            #[cfg(feature = "declarative-plans")]
+            KernelError::PlanResultTypeMismatch { .. } => Self::PlanResultTypeMismatchError,
+            #[cfg(feature = "declarative-plans")]
+            KernelError::ProtobufDecode { .. } => Self::ProtobufDecodeError,
+            KernelError::LogSegment(_) => Self::LogSegmentError,
+            KernelError::Scan(_) => Self::ScanError,
+            KernelError::CommitRange(_) => Self::CommitRangeError,
+            KernelError::Snapshot(_) => Self::SnapshotError,
+            KernelError::TableChanges(_) => Self::TableChangesError,
+            KernelError::Publish(_) => Self::PublishError,
+            KernelError::TableProperty(_) => Self::TablePropertyError,
+            KernelError::Crc(_) => Self::CrcError,
+            KernelError::LogCompaction(_) => Self::LogCompactionError,
+            #[cfg(feature = "default-engine-base")]
+            KernelError::ArrowEngine(_) => Self::ArrowEngineError,
+            #[cfg(feature = "declarative-plans")]
+            KernelError::Plan(_) => Self::PlanError,
             _ => FFIKernelError::UnknownError,
         }
     }
@@ -298,14 +371,16 @@ pub enum EngineExecResult<T> {
     Uninit,
 }
 
-/// Maps the given FFIKernelError code to the given KernelError variant. Logs a warning if the
-/// associated error message is non-empty. Useful for mapping kernel errors to variants that don't
-/// carry a message, but for some reason the engine still provided one.
+/// Retains a recognized payload-free error and any diagnostic supplied by the callback.
 fn messageless_error(code: FFIKernelError, message: String, error: KernelError) -> KernelError {
-    if !message.is_empty() {
-        warn!("Discarding message for engine execution error ({code:?}): {message}");
+    if message.is_empty() {
+        error
+    } else {
+        error.with_context(delta_kernel::error::ErrorContext::ForeignCallback {
+            code: code as i32,
+            message,
+        })
     }
-    error
 }
 
 impl From<EngineExecError> for KernelError {
@@ -321,7 +396,7 @@ impl From<EngineExecError> for KernelError {
         match etype {
             FFIKernelError::CheckpointWriteError => KernelError::CheckpointWrite(message),
             FFIKernelError::EngineDataTypeError => KernelError::EngineDataType(message),
-            FFIKernelError::GenericError => KernelError::Generic(message),
+            FFIKernelError::GenericError => KernelError::ForeignCallback { code: 5, message },
             FFIKernelError::InternalError => KernelError::InternalError(message),
             FFIKernelError::FileNotFoundError => KernelError::FileNotFound(message),
             FFIKernelError::MissingColumnError => KernelError::MissingColumn(message),
@@ -361,10 +436,43 @@ impl From<EngineExecError> for KernelError {
                 messageless_error(code, message, KernelError::Cancelled)
             }
 
-            // These codes have no well-defined equivalent (e.g they wrap a foreign error type,
-            // carry a non-string payload, etc), so just map them to a generic error and
-            // preserve the code + message in the error string.
-            code @ (FFIKernelError::UnknownError
+            // Typed payloads cannot be reconstructed from the callback wire message.
+            code @ (FFIKernelError::LogSegmentError
+            | FFIKernelError::ScanError
+            | FFIKernelError::CommitRangeError
+            | FFIKernelError::SnapshotError
+            | FFIKernelError::TableChangesError
+            | FFIKernelError::PublishError
+            | FFIKernelError::TablePropertyError
+            | FFIKernelError::CrcError
+            | FFIKernelError::LogCompactionError
+            | FFIKernelError::ArrowEngineError
+            | FFIKernelError::PlanError
+            | FFIKernelError::IntegerConversionError
+            | FFIKernelError::NumericOverflowError
+            | FFIKernelError::JsonSerializationError
+            | FFIKernelError::ExpressionConversionError
+            | FFIKernelError::LockPoisonedError
+            | FFIKernelError::CatalogOperationError
+            | FFIKernelError::ClockBeforeEpochError
+            | FFIKernelError::RuntimeUnavailableError
+            | FFIKernelError::RuntimePanicError
+            | FFIKernelError::WrittenFileSizeMismatchError
+            | FFIKernelError::ForeignCallbackError
+            | FFIKernelError::FfiContractError
+            | FFIKernelError::TracingFailureError
+            | FFIKernelError::TracingSlotMissingError
+            | FFIKernelError::MaxCatalogVersionError
+            | FFIKernelError::LogTailVersionsNotContiguousError
+            | FFIKernelError::ScalarConversionError
+            | FFIKernelError::InvalidPartitionValuesError
+            | FFIKernelError::InvalidSelectionVectorError
+            | FFIKernelError::InvalidGeoParamsError
+            | FFIKernelError::StatsValidationError
+            | FFIKernelError::ChecksumWriteUnsupportedError
+            | FFIKernelError::PlanResultTypeMismatchError
+            | FFIKernelError::ProtobufDecodeError
+            | FFIKernelError::UnknownError
             | FFIKernelError::FFIError
             | FFIKernelError::DeltaError
             | FFIKernelError::ExtractError
@@ -379,23 +487,33 @@ impl From<EngineExecError> for KernelError {
             | FFIKernelError::ChangeDataFeedIncompatibleSchema
             | FFIKernelError::RowTrackingChangeFeedUnsupported
             | FFIKernelError::LiteralExpressionTransformError
-            | FFIKernelError::LogHistoryError) => {
-                KernelError::generic(format!("engine execution error ({code:?}): {message}"))
-            }
+            | FFIKernelError::LogHistoryError) => KernelError::ForeignCallback {
+                code: code as i32,
+                message,
+            },
             #[cfg(feature = "default-engine-base")]
             code @ (FFIKernelError::ArrowError
             | FFIKernelError::ParquetError
             | FFIKernelError::ObjectStoreError
             | FFIKernelError::ObjectStorePathError
-            | FFIKernelError::ReqwestError) => {
-                KernelError::generic(format!("engine execution error ({code:?}): {message}"))
-            }
+            | FFIKernelError::ReqwestError) => KernelError::ForeignCallback {
+                code: code as i32,
+                message,
+            },
         }
     }
 }
 
 #[cfg(test)]
 mod error_code_tests {
+    use std::backtrace::Backtrace;
+
+    use delta_kernel::error::{
+        CommitRangeError, CrcError, ErrorContext, FfiContractError, LogCompactionError,
+        LogSegmentError, PublishError, ScanError, SnapshotError, TableChangesError,
+        TablePropertyError,
+    };
+
     use super::*;
 
     #[test]
@@ -408,13 +526,105 @@ mod error_code_tests {
     }
 
     #[test]
+    fn all_ffi_discriminants_are_stable() {
+        assert_eq!(FFIKernelError::UnknownError as i32, 0);
+        assert_eq!(FFIKernelError::FFIError as i32, 1);
+        #[cfg(feature = "default-engine-base")]
+        assert_eq!(FFIKernelError::ArrowError as i32, 2);
+        assert_eq!(FFIKernelError::EngineDataTypeError as i32, 3);
+        assert_eq!(FFIKernelError::ExtractError as i32, 4);
+        assert_eq!(FFIKernelError::GenericError as i32, 5);
+        assert_eq!(FFIKernelError::IOErrorError as i32, 6);
+        #[cfg(feature = "default-engine-base")]
+        assert_eq!(FFIKernelError::ParquetError as i32, 7);
+        #[cfg(feature = "default-engine-base")]
+        assert_eq!(FFIKernelError::ObjectStoreError as i32, 8);
+        #[cfg(feature = "default-engine-base")]
+        assert_eq!(FFIKernelError::ObjectStorePathError as i32, 9);
+        #[cfg(feature = "default-engine-base")]
+        assert_eq!(FFIKernelError::ReqwestError as i32, 10);
+        assert_eq!(FFIKernelError::FileNotFoundError as i32, 11);
+        assert_eq!(FFIKernelError::MissingColumnError as i32, 12);
+        assert_eq!(FFIKernelError::UnexpectedColumnTypeError as i32, 13);
+        assert_eq!(FFIKernelError::MissingDataError as i32, 14);
+        assert_eq!(FFIKernelError::MissingVersionError as i32, 15);
+        assert_eq!(FFIKernelError::DeletionVectorError as i32, 16);
+        assert_eq!(FFIKernelError::InvalidUrlError as i32, 17);
+        assert_eq!(FFIKernelError::MalformedJsonError as i32, 18);
+        assert_eq!(FFIKernelError::MissingMetadataError as i32, 19);
+        assert_eq!(FFIKernelError::MissingProtocolError as i32, 20);
+        assert_eq!(FFIKernelError::InvalidProtocolError as i32, 21);
+        assert_eq!(FFIKernelError::MissingMetadataAndProtocolError as i32, 22);
+        assert_eq!(FFIKernelError::ParseError as i32, 23);
+        assert_eq!(FFIKernelError::JoinFailureError as i32, 24);
+        assert_eq!(FFIKernelError::Utf8Error as i32, 25);
+        assert_eq!(FFIKernelError::ParseIntError as i32, 26);
+        assert_eq!(FFIKernelError::InvalidColumnMappingModeError as i32, 27);
+        assert_eq!(FFIKernelError::InvalidTableLocationError as i32, 28);
+        assert_eq!(FFIKernelError::InvalidDecimalError as i32, 29);
+        assert_eq!(FFIKernelError::InvalidStructDataError as i32, 30);
+        assert_eq!(FFIKernelError::InternalError as i32, 31);
+        assert_eq!(FFIKernelError::InvalidExpression as i32, 32);
+        assert_eq!(FFIKernelError::InvalidLogPath as i32, 33);
+        assert_eq!(FFIKernelError::FileAlreadyExists as i32, 34);
+        assert_eq!(FFIKernelError::UnsupportedError as i32, 35);
+        assert_eq!(FFIKernelError::ParseIntervalError as i32, 36);
+        assert_eq!(FFIKernelError::ChangeDataFeedUnsupported as i32, 37);
+        assert_eq!(FFIKernelError::ChangeDataFeedIncompatibleSchema as i32, 38);
+        assert_eq!(FFIKernelError::InvalidCheckpoint as i32, 39);
+        assert_eq!(FFIKernelError::LiteralExpressionTransformError as i32, 40);
+        assert_eq!(FFIKernelError::CheckpointWriteError as i32, 41);
+        assert_eq!(FFIKernelError::SchemaError as i32, 42);
+        assert_eq!(FFIKernelError::LogHistoryError as i32, 43);
+        assert_eq!(FFIKernelError::RowTrackingChangeFeedUnsupported as i32, 44);
+        assert_eq!(FFIKernelError::CancelledError as i32, 45);
+        assert_eq!(FFIKernelError::InvalidTransactionStateError as i32, 46);
+        assert_eq!(FFIKernelError::DeltaError as i32, 47);
+        assert_eq!(FFIKernelError::IntegerConversionError as i32, 48);
+        assert_eq!(FFIKernelError::NumericOverflowError as i32, 49);
+        assert_eq!(FFIKernelError::JsonSerializationError as i32, 50);
+        assert_eq!(FFIKernelError::ExpressionConversionError as i32, 51);
+        assert_eq!(FFIKernelError::LockPoisonedError as i32, 52);
+        assert_eq!(FFIKernelError::CatalogOperationError as i32, 53);
+        assert_eq!(FFIKernelError::ClockBeforeEpochError as i32, 54);
+        assert_eq!(FFIKernelError::RuntimeUnavailableError as i32, 55);
+        assert_eq!(FFIKernelError::RuntimePanicError as i32, 56);
+        assert_eq!(FFIKernelError::WrittenFileSizeMismatchError as i32, 57);
+        assert_eq!(FFIKernelError::ForeignCallbackError as i32, 58);
+        assert_eq!(FFIKernelError::FfiContractError as i32, 59);
+        assert_eq!(FFIKernelError::TracingFailureError as i32, 60);
+        assert_eq!(FFIKernelError::TracingSlotMissingError as i32, 61);
+        assert_eq!(FFIKernelError::MaxCatalogVersionError as i32, 62);
+        assert_eq!(FFIKernelError::LogTailVersionsNotContiguousError as i32, 63);
+        assert_eq!(FFIKernelError::ScalarConversionError as i32, 64);
+        assert_eq!(FFIKernelError::InvalidPartitionValuesError as i32, 65);
+        assert_eq!(FFIKernelError::InvalidSelectionVectorError as i32, 66);
+        assert_eq!(FFIKernelError::InvalidGeoParamsError as i32, 67);
+        assert_eq!(FFIKernelError::StatsValidationError as i32, 68);
+        assert_eq!(FFIKernelError::ChecksumWriteUnsupportedError as i32, 69);
+        assert_eq!(FFIKernelError::PlanResultTypeMismatchError as i32, 70);
+        assert_eq!(FFIKernelError::ProtobufDecodeError as i32, 71);
+        assert_eq!(FFIKernelError::LogSegmentError as i32, 72);
+        assert_eq!(FFIKernelError::ScanError as i32, 73);
+        assert_eq!(FFIKernelError::CommitRangeError as i32, 74);
+        assert_eq!(FFIKernelError::SnapshotError as i32, 75);
+        assert_eq!(FFIKernelError::TableChangesError as i32, 76);
+        assert_eq!(FFIKernelError::PublishError as i32, 77);
+        assert_eq!(FFIKernelError::TablePropertyError as i32, 78);
+        assert_eq!(FFIKernelError::CrcError as i32, 79);
+        assert_eq!(FFIKernelError::LogCompactionError as i32, 80);
+        assert_eq!(FFIKernelError::ArrowEngineError as i32, 81);
+        assert_eq!(FFIKernelError::PlanError as i32, 82);
+    }
+
+    #[test]
     fn appended_error_codes_have_stable_discriminants() {
         assert_eq!(FFIKernelError::InvalidTransactionStateError as i32, 46);
         assert_eq!(FFIKernelError::DeltaError as i32, 47);
     }
 
     #[test]
-    fn inbound_delta_error_code_falls_back_to_generic_kernel_error() {
+    fn inbound_delta_error_code_preserves_foreign_callback() {
         let message: Handle<ExclusiveRustString> =
             Box::new("engine delta error".to_string()).into();
         let error: KernelError = EngineExecError {
@@ -425,8 +635,194 @@ mod error_code_tests {
 
         assert_eq!(
             error.to_string(),
-            "Generic delta kernel error: engine execution error (DeltaError): engine delta error"
+            "Foreign callback error (47): engine delta error"
         );
+        assert!(matches!(
+            error,
+            KernelError::ForeignCallback { code: 47, .. }
+        ));
+    }
+
+    #[rstest::rstest]
+    #[case(KernelError::NumericOverflow { operation: "add", value: "u64::MAX + 1".into() }, FFIKernelError::NumericOverflowError)]
+    #[case(KernelError::LockPoisoned { resource: "scan" }, FFIKernelError::LockPoisonedError)]
+    #[case(KernelError::WrittenFileSizeMismatch { expected: 5, actual: 4 }, FFIKernelError::WrittenFileSizeMismatchError)]
+    #[case(KernelError::ForeignCallback { code: 5, message: "failure".into() }, FFIKernelError::ForeignCallbackError)]
+    #[case(
+        KernelError::FfiContract(FfiContractError::StreamConsumed),
+        FFIKernelError::FfiContractError
+    )]
+    #[case(KernelError::TracingSlotMissing { slot: "logging" }, FFIKernelError::TracingSlotMissingError)]
+    #[case(KernelError::MaxCatalogVersion("missing".into()), FFIKernelError::MaxCatalogVersionError)]
+    #[case(KernelError::LogTailVersionsNotContiguous { first_version: 1, second_version: 3 }, FFIKernelError::LogTailVersionsNotContiguousError)]
+    #[case(KernelError::InvalidPartitionValues("missing column".into()), FFIKernelError::InvalidPartitionValuesError)]
+    #[case(KernelError::InvalidSelectionVector("too long".into()), FFIKernelError::InvalidSelectionVectorError)]
+    #[case(KernelError::InvalidGeoParams("CRS".into()), FFIKernelError::InvalidGeoParamsError)]
+    #[case(KernelError::StatsValidation("missing min".into()), FFIKernelError::StatsValidationError)]
+    #[case(KernelError::ChecksumWriteUnsupported("not published".into()), FFIKernelError::ChecksumWriteUnsupportedError)]
+    #[case::integer_conversion(
+        KernelError::integer_conversion("version", -1, "u64", u64::try_from(-1i64).unwrap_err()),
+        FFIKernelError::IntegerConversionError
+    )]
+    #[case::json_serialization(
+        KernelError::JsonSerialization {
+            operation: "serialize metadata",
+            source: serde_json::to_string(&std::collections::BTreeMap::from([(vec![1], true)])).unwrap_err(),
+        },
+        FFIKernelError::JsonSerializationError
+    )]
+    #[case::expression_conversion(
+        KernelError::ExpressionConversion {
+            operation: "parse integer literal",
+            source: Box::new("invalid".parse::<i64>().unwrap_err()),
+        },
+        FFIKernelError::ExpressionConversionError
+    )]
+    #[case::catalog_operation(
+        KernelError::CatalogOperation {
+            operation: "publish",
+            source: Box::new(std::io::Error::other("catalog unavailable")),
+        },
+        FFIKernelError::CatalogOperationError
+    )]
+    #[case::clock_before_epoch(
+        KernelError::ClockBeforeEpoch(std::time::UNIX_EPOCH.duration_since(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)
+        ).unwrap_err()),
+        FFIKernelError::ClockBeforeEpochError
+    )]
+    #[case::runtime_unavailable(
+        KernelError::RuntimeUnavailable { source: Box::new(tokio::runtime::Handle::try_current().unwrap_err()) },
+        FFIKernelError::RuntimeUnavailableError
+    )]
+    #[case::runtime_panic(
+        KernelError::RuntimePanic { operation: "block_on", message: Some("runtime stopped".into()) },
+        FFIKernelError::RuntimePanicError
+    )]
+    #[case::tracing_failure(
+        KernelError::TracingFailure { operation: "install subscriber", source: Box::new(std::io::Error::other("subscriber unavailable")) },
+        FFIKernelError::TracingFailureError
+    )]
+    #[case::log_segment(
+        KernelError::LogSegment(LogSegmentError::Empty),
+        FFIKernelError::LogSegmentError
+    )]
+    #[case::scan(
+        KernelError::Scan(ScanError::IncompleteReplay),
+        FFIKernelError::ScanError
+    )]
+    #[case::commit_range(KernelError::CommitRange(CommitRangeError::Reversed { start: 2, end: 1 }), FFIKernelError::CommitRangeError)]
+    #[case::snapshot(KernelError::Snapshot(SnapshotError::VersionBeforeHint { requested: 1, hint: 2 }), FFIKernelError::SnapshotError)]
+    #[case::table_changes(
+        KernelError::TableChanges(TableChangesError::RemoveFileWithRemoveVector),
+        FFIKernelError::TableChangesError
+    )]
+    #[case::publish(KernelError::Publish(PublishError::Empty { version: 3 }), FFIKernelError::PublishError)]
+    #[case::table_property(
+        KernelError::TableProperty(TablePropertyError::InvalidValue {
+            property: "delta.checkpointInterval".into(), value: "-1".into(), expected: "positive integer",
+        }),
+        FFIKernelError::TablePropertyError
+    )]
+    #[case::crc(KernelError::Crc(CrcError::InvalidActionCount { version: 3, field: "numMetadata", actual: 0 }), FFIKernelError::CrcError)]
+    #[case::log_compaction(KernelError::LogCompaction(LogCompactionError::InvalidRange { start: 2, end: 1 }), FFIKernelError::LogCompactionError)]
+    fn classified_errors_have_semantic_ffi_codes(
+        #[case] error: KernelError,
+        #[case] expected: FFIKernelError,
+    ) {
+        assert_eq!(FFIKernelError::from(error), expected);
+    }
+
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn arrow_engine_error_has_semantic_ffi_code() {
+        let error = KernelError::ArrowEngine(
+            delta_kernel::error::ArrowEngineError::DuplicateRowGroupOrdinal { ordinal: 1 },
+        );
+        assert_eq!(
+            FFIKernelError::from(error),
+            FFIKernelError::ArrowEngineError
+        );
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    #[case(
+        KernelError::Plan(delta_kernel::error::PlanError::EmptyInput { operation: "union" }),
+        FFIKernelError::PlanError
+    )]
+    #[case(
+        KernelError::ProtobufDecode { message_type: "Plan", source: prost::DecodeError::new("truncated message") },
+        FFIKernelError::ProtobufDecodeError
+    )]
+    #[case(
+        KernelError::PlanResultTypeMismatch { expected: "rows", actual: "files" },
+        FFIKernelError::PlanResultTypeMismatchError
+    )]
+    fn plan_errors_have_semantic_ffi_codes(
+        #[case] error: KernelError,
+        #[case] expected: FFIKernelError,
+    ) {
+        assert_eq!(FFIKernelError::from(error), expected);
+    }
+
+    #[test]
+    fn scalar_conversion_error_has_semantic_ffi_code() {
+        let error = i64::try_from(delta_kernel::expressions::Scalar::Boolean(true)).unwrap_err();
+        assert_eq!(
+            FFIKernelError::from(error),
+            FFIKernelError::ScalarConversionError
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn context_and_backtrace_preserve_leaf_code(#[case] context_outermost: bool) {
+        let leaf = KernelError::LockPoisoned { resource: "scan" };
+        let context = ErrorContext::Commit { version: 9 };
+        let error = if context_outermost {
+            KernelError::Backtraced {
+                source: Box::new(leaf),
+                backtrace: Box::new(Backtrace::disabled()),
+            }
+            .with_context(context)
+        } else {
+            KernelError::Backtraced {
+                source: Box::new(leaf.with_context(context)),
+                backtrace: Box::new(Backtrace::disabled()),
+            }
+        };
+        assert!(error.to_string().contains("commit v=9"));
+        assert_eq!(
+            FFIKernelError::from(error),
+            FFIKernelError::LockPoisonedError
+        );
+    }
+
+    #[test]
+    fn legacy_generic_callback_is_not_emitted_as_generic() {
+        let error = KernelError::from(EngineExecError {
+            etype: FFIKernelError::GenericError,
+            message: Box::new("native failure".to_string()).into(),
+        });
+        assert!(
+            matches!(&error, KernelError::ForeignCallback { code: 5, message } if message == "native failure")
+        );
+        assert_eq!(
+            FFIKernelError::from(error),
+            FFIKernelError::ForeignCallbackError
+        );
+    }
+
+    #[test]
+    fn recognized_callback_retains_diagnostic_and_classification() {
+        let error = KernelError::from(EngineExecError {
+            etype: FFIKernelError::CancelledError,
+            message: Box::new("shutdown requested".to_string()).into(),
+        });
+        assert!(error.to_string().contains("shutdown requested"));
+        assert_eq!(FFIKernelError::from(error), FFIKernelError::CancelledError);
     }
 }
 
@@ -448,19 +844,19 @@ mod tests {
     #[case::file_not_found(FFIKernelError::FileNotFoundError, "File not found: boom")]
     #[case::schema(FFIKernelError::SchemaError, "Schema error: boom")]
     #[case::unsupported(FFIKernelError::UnsupportedError, "Unsupported: boom")]
-    #[case::generic(FFIKernelError::GenericError, "Generic delta kernel error: boom")]
+    #[case::generic(FFIKernelError::GenericError, "Foreign callback error (5): boom")]
     #[case::invalid_expr(
         FFIKernelError::InvalidExpression,
         "Invalid expression evaluation: boom"
     )]
-    #[case::unit_missing_version(FFIKernelError::MissingVersionError, "No table version found.")]
-    #[case::fallback_io(
-        FFIKernelError::IOErrorError,
-        "Generic delta kernel error: engine execution error (IOErrorError): boom"
+    #[case::unit_missing_version(
+        FFIKernelError::MissingVersionError,
+        "callback (15): boom: No table version found."
     )]
+    #[case::fallback_io(FFIKernelError::IOErrorError, "Foreign callback error (6): boom")]
     #[case::fallback_row_tracking(
         FFIKernelError::RowTrackingChangeFeedUnsupported,
-        "Generic delta kernel error: engine execution error (RowTrackingChangeFeedUnsupported): boom"
+        "Foreign callback error (44): boom"
     )]
     fn engine_exec_error_maps_kernel_error_code(
         #[case] etype: FFIKernelError,

@@ -73,8 +73,8 @@ impl Committer for FileSystemCommitter {
     /// something has gone wrong upstream.
     fn publish(&self, _engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
         if !publish_metadata.commits_to_publish().is_empty() {
-            return Err(KernelError::generic(
-                "The FilesystemCommitter does not support publishing catalog commits.",
+            return Err(KernelError::InvalidTransactionState(
+                "The FilesystemCommitter does not support publishing catalog commits.".into(),
             )
             .into());
         }
@@ -128,8 +128,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Kernel(crate::KernelError::Generic(e))
-                if e.contains("This table is catalog-managed and requires a catalog committer.")
+            crate::Error::Kernel(crate::KernelError::InvalidTransactionState(_))
         ));
     }
 

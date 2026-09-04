@@ -283,8 +283,8 @@ impl Transaction {
         existing_data_files: impl Iterator<Item = DeltaResult<FilteredEngineData>>,
     ) -> DeltaResult<()> {
         if self.is_create_table() {
-            return Err(KernelError::generic(
-                "Deletion vector operations require an existing table",
+            return Err(KernelError::InvalidTransactionState(
+                "Deletion vector operations require an existing table".into(),
             )
             .into());
         }
@@ -330,7 +330,7 @@ impl Transaction {
         }
 
         if matched_dv_files != new_dv_descriptors.len() {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::DeletionVector(format!(
                 "Number of matched DV files does not match number of new DV descriptors: {} != {}",
                 matched_dv_files,
                 new_dv_descriptors.len()
@@ -647,18 +647,18 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 let stats: Option<String> =
                     getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
                 let stats = stats.ok_or_else(|| {
-                    KernelError::generic(format!(
+                    KernelError::StatsValidation(format!(
                         "update_deletion_vectors: file {path} has no stats; \
                          deletion vectors require an accurate {NUM_RECORDS}"
                     ))
                 })?;
-                let mut parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
-                    KernelError::generic(format!(
-                        "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
-                    ))
-                })?;
+                let mut parsed: serde_json::Value =
+                    serde_json::from_str(&stats).map_err(|source| {
+                        KernelError::from(source)
+                            .with_context(crate::error::ErrorContext::File { path: path.clone() })
+                    })?;
                 let stats_obj = parsed.as_object_mut().ok_or_else(|| {
-                    KernelError::generic(format!(
+                    KernelError::StatsValidation(format!(
                         "update_deletion_vectors: stats for {path} is not a JSON object"
                     ))
                 })?;
@@ -667,7 +667,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     .and_then(serde_json::Value::as_u64)
                     .is_none()
                 {
-                    return Err(KernelError::generic(format!(
+                    return Err(KernelError::StatsValidation(format!(
                         "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
                          or it is not a non-negative integer"
                     ))
@@ -684,10 +684,12 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     stats
                 } else {
                     stats_obj.insert(TIGHT_BOUNDS.to_string(), serde_json::Value::Bool(false));
-                    serde_json::to_string(&parsed).map_err(|e| {
-                        KernelError::generic(format!(
-                            "update_deletion_vectors: failed to re-serialize stats for {path}: {e}"
-                        ))
+                    serde_json::to_string(&parsed).map_err(|source| {
+                        KernelError::JsonSerialization {
+                            operation: "serialize deletion vector statistics",
+                            source,
+                        }
+                        .with_context(crate::error::ErrorContext::File { path: path.clone() })
                     })?
                 };
                 let deletion_vector = Scalar::Struct(StructData::try_new(
@@ -764,11 +766,16 @@ mod tests {
         HashMap::from([(path.to_string(), descriptor)])
     }
 
+    enum ExpectedStatsError {
+        Validation,
+        MalformedJson,
+    }
+
     #[rstest]
-    #[case::null_stats(None, &[], Some(NUM_RECORDS))]
-    #[case::stats_missing_num_records(Some("{}"), &[], Some(NUM_RECORDS))]
-    #[case::stats_not_json_object(Some("5"), &[], Some("not a JSON object"))]
-    #[case::stats_invalid_json(Some("{not json"), &[], Some("not valid JSON"))]
+    #[case::null_stats(None, &[], Some(ExpectedStatsError::Validation))]
+    #[case::stats_missing_num_records(Some("{}"), &[], Some(ExpectedStatsError::Validation))]
+    #[case::stats_not_json_object(Some("5"), &[], Some(ExpectedStatsError::Validation))]
+    #[case::stats_invalid_json(Some("{not json"), &[], Some(ExpectedStatsError::MalformedJson))]
     #[case::stats_with_num_records(Some(r#"{"numRecords":10}"#), &[], None)]
     #[case::extra_columns_dont_shift_indexes(
         Some(r#"{"numRecords":10}"#),
@@ -778,7 +785,7 @@ mod tests {
     fn dv_match_visitor_validates_matched_row_stats(
         #[case] stats: Option<&str>,
         #[case] extra_columns: &[&str],
-        #[case] expected_err: Option<&str>,
+        #[case] expected_err: Option<ExpectedStatsError>,
     ) {
         let dv_updates = dv_updates_for(TEST_PATH);
         let mut visitor = DvMatchVisitor::new(&dv_updates);
@@ -786,10 +793,26 @@ mod tests {
 
         let result = visitor.visit_rows_of(&data);
         match expected_err {
-            Some(sub_str) => {
-                let msg = result.expect_err("expected error").to_string();
-                assert!(msg.contains(sub_str), "message was: {msg}");
-                assert!(msg.contains(TEST_PATH), "message was: {msg}");
+            Some(ExpectedStatsError::Validation) => {
+                assert!(matches!(result,
+                    Err(crate::Error::Kernel(KernelError::StatsValidation(message)))
+                        if message.contains(TEST_PATH)
+                ));
+            }
+            Some(ExpectedStatsError::MalformedJson) => {
+                let error = result.expect_err("expected malformed JSON");
+                assert!(matches!(&error,
+                    crate::Error::Kernel(KernelError::Context {
+                        context: crate::error::ErrorContext::File { path }, ..
+                    }) if path == TEST_PATH
+                ));
+                let mut source: &(dyn std::error::Error + 'static) = &error;
+                loop {
+                    if source.is::<serde_json::Error>() {
+                        break;
+                    }
+                    source = source.source().expect("native JSON error must be retained");
+                }
             }
             None => {
                 result.expect("validation should pass");

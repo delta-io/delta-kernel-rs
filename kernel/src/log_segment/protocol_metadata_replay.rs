@@ -509,7 +509,10 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
         fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-            Err(KernelError::generic("plan executor deliberately failed").into())
+            Err(
+                KernelError::from(std::io::Error::other("plan executor deliberately failed"))
+                    .into(),
+            )
         }
     }
 

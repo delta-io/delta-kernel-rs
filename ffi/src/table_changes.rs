@@ -310,10 +310,9 @@ pub unsafe extern "C" fn scan_table_changes_next(
 }
 
 fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<*mut ArrowFFIData> {
-    let mut data = data
-        .data
-        .lock()
-        .map_err(|_| KernelError::generic("poisoned scan table changes iterator mutex"))?;
+    let mut data = data.data.lock().map_err(|_| KernelError::LockPoisoned {
+        resource: "table changes scan iterator",
+    })?;
 
     let Some(data) = data.next().transpose()? else {
         return Ok(std::ptr::null_mut());
@@ -427,7 +426,8 @@ mod tests {
                 METADATA,
             ),
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn commit_remove_file(
@@ -449,7 +449,8 @@ mod tests {
                 METADATA,
             ),
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn put_file(

@@ -266,7 +266,7 @@ impl std::str::FromStr for ColumnName {
     fn from_str(s: &str) -> DeltaResult<Self> {
         match parse_column_name(&mut s.chars().peekable())? {
             (_, FieldEnding::NextColumn) => {
-                Err(KernelError::generic("Trailing comma in column name").into())
+                Err(KernelError::invalid_expression("Trailing comma in column name").into())
             }
             (col, _) => Ok(col),
         }
@@ -317,7 +317,7 @@ fn parse_column_name(chars: &mut Chars<'_>) -> DeltaResult<(ColumnName, FieldEnd
             Some(FIELD_SEPARATOR) => FieldEnding::NextField,
             Some(COLUMN_SEPARATOR) => FieldEnding::NextColumn,
             Some(other) => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::invalid_expression(format!(
                     "Invalid character {other:?} after field {field_name:?}",
                 ))
                 .into())
@@ -334,7 +334,7 @@ fn parse_simple_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
     let mut first = true;
     while let Some(c) = chars.next_if(|c| is_simple_char(*c)) {
         if first && c.is_ascii_digit() {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::invalid_expression(format!(
                 "Unescaped field name cannot start with a digit {c:?}"
             ))
             .into());
@@ -357,7 +357,7 @@ pub(crate) fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<Str
             Some(FIELD_ESCAPE_CHAR) if chars.next_if_eq(&FIELD_ESCAPE_CHAR).is_none() => break,
             Some(c) => name.push(c),
             None => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::invalid_expression(format!(
                     "No closing {FIELD_ESCAPE_CHAR:?} after field {name:?}"
                 ))
                 .into());

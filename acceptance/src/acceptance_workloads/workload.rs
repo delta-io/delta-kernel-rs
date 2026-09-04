@@ -47,9 +47,19 @@ fn build_snapshot(
     time_travel: Option<&TimeTravel>,
 ) -> DeltaResult<Arc<Snapshot>> {
     let version = time_travel
-        .map(TimeTravel::as_version)
-        .transpose()
-        .map_err(KernelError::generic)?;
+        .map(|travel| -> DeltaResult<u64> {
+            match travel {
+                TimeTravel::Version { version } => u64::try_from(*version).map_err(|source| {
+                    KernelError::integer_conversion("snapshot version", version, "u64", source)
+                        .into()
+                }),
+                TimeTravel::Timestamp { .. } => Err(KernelError::unsupported(
+                    "Timestamp-based time travel is not yet supported",
+                )
+                .into()),
+            }
+        })
+        .transpose()?;
 
     let mut builder = Snapshot::builder_for(table_root.clone());
     if let Some(v) = version {
@@ -73,8 +83,12 @@ pub fn execute_read_workload(
 
     // Extract and parse the predicate if one is present
     let predicate = if let Some(ref predicate_string) = read_spec.predicate {
-        let predicate =
-            parse_predicate(predicate_string, &table_schema).map_err(KernelError::generic)?;
+        let predicate = parse_predicate(predicate_string, &table_schema).map_err(|source| {
+            KernelError::ExpressionConversion {
+                operation: "parse workload predicate",
+                source,
+            }
+        })?;
         let predicate = Arc::new(predicate);
         scan_builder = scan_builder.with_predicate(predicate.clone());
         Some(predicate)

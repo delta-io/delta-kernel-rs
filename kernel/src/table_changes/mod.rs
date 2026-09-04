@@ -63,6 +63,33 @@ mod physical_to_logical;
 mod resolve_dvs;
 pub mod scan;
 mod scan_file;
+
+/// Missing metadata or contradictory file actions in a change-data scan.
+#[derive(Debug, thiserror::Error)]
+pub enum TableChangesError {
+    /// A required row-tracking metadata property is missing.
+    #[error(
+        "Row tracking is enabled at version {version}, but metadata property {property} is missing"
+    )]
+    MissingRowTrackingProperty {
+        /// Version whose metadata was read.
+        version: Version,
+        /// Required table property.
+        property: &'static str,
+    },
+    /// ICT is enabled but its commit-info field is missing.
+    #[error("In-commit timestamp is enabled but not found in commit at version {version}")]
+    MissingCommitTimestamp {
+        /// Commit with a missing timestamp.
+        version: Version,
+    },
+    /// A remove file cannot supply a second, remove-side deletion vector.
+    #[error("CdfScanFile with type remove cannot have a remove deletion vector")]
+    RemoveFileWithRemoveVector,
+    /// A CDC file cannot supply a remove-side deletion vector.
+    #[error("CdfScanFile with type cdc cannot have a remove deletion vector")]
+    CdcFileWithRemoveVector,
+}
 #[cfg(test)]
 mod test_utils;
 
@@ -144,14 +171,9 @@ impl CdfMode {
         self == CdfMode::ChangeDataFeed
     }
 
-    /// Returns the mode-specific error for incompatible range-boundary schemas.
+    /// Returns an error identifying incompatible range-boundary schemas.
     pub(crate) fn boundary_schema_error(self, start: &StructType, end: &StructType) -> KernelError {
-        match self {
-            CdfMode::ChangeDataFeed => KernelError::generic(format!(
-                "Failed to build TableChanges: Start and end version schemas are different. Found start version schema {start:?} and end version schema {end:?}",
-            )),
-            CdfMode::RowTracking => KernelError::change_data_feed_incompatible_schema(end, start),
-        }
+        KernelError::change_data_feed_incompatible_schema(end, start)
     }
 
     /// Maps a reader-support failure on a protocol update to the mode-specific error.
@@ -364,21 +386,19 @@ impl TableChanges {
             let properties = end_snapshot.table_properties();
             require!(
                 properties.materialized_row_id_column_name.is_some(),
-                KernelError::generic(format!(
-                    "Row tracking is enabled at version {}, but metadata property {} is missing",
-                    end_snapshot.version(),
-                    MATERIALIZED_ROW_ID_COLUMN_NAME
-                ))
+                KernelError::TableChanges(TableChangesError::MissingRowTrackingProperty {
+                    version: end_snapshot.version(),
+                    property: MATERIALIZED_ROW_ID_COLUMN_NAME,
+                })
             );
             require!(
                 properties
                     .materialized_row_commit_version_column_name
                     .is_some(),
-                KernelError::generic(format!(
-                    "Row tracking is enabled at version {}, but metadata property {} is missing",
-                    end_snapshot.version(),
-                    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME
-                ))
+                KernelError::TableChanges(TableChangesError::MissingRowTrackingProperty {
+                    version: end_snapshot.version(),
+                    property: MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+                })
             );
         }
 
@@ -631,13 +651,14 @@ mod tests {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
-        let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }}, metadata_columns: {} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }}, metadata_columns: {} }";
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
         assert!(matches!(
             table_changes_res,
-            Err(crate::Error::Kernel(KernelError::Generic(msg))) if msg == expected_msg
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(..)
+            ))
         ));
     }
 

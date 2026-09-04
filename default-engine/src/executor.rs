@@ -53,6 +53,7 @@ pub mod tokio {
     use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
 
+    use delta_kernel::error::ErrorContext;
     use delta_kernel::{DeltaResult, KernelError};
     use futures::future::BoxFuture;
     use futures::{Future, TryFutureExt};
@@ -241,8 +242,9 @@ pub mod tokio {
                 builder.max_blocking_threads(max_blocking);
             }
 
-            let runtime = builder.build().map_err(|e| {
-                KernelError::generic(format!("Failed to create Tokio runtime: {e}"))
+            let runtime = builder.build().map_err(|source| {
+                KernelError::from(source)
+                    .with_context(ErrorContext::Operation("create Tokio runtime"))
             })?;
 
             let handle = runtime.handle().clone();

@@ -422,8 +422,9 @@ fn create_struct_data_type(
         .iter()
         .map(|&field_id| {
             unwrap_field(state, field_id)
-                .ok_or_else(|| {
-                    KernelError::generic(format!("Invalid field ID {field_id} in struct"))
+                .ok_or(delta_kernel::error::FfiContractError::InvalidId {
+                    kind: "field",
+                    id: field_id,
                 })
                 .map_err(delta_kernel::Error::from)
         })
@@ -474,11 +475,12 @@ fn visit_field_array_impl(
     nullable: bool,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
-    let element_field = unwrap_field(state, element_type_id).ok_or_else(|| {
-        KernelError::generic(format!(
-            "Invalid element type ID {element_type_id} for array"
-        ))
-    })?;
+    let element_field = unwrap_field(state, element_type_id).ok_or(
+        delta_kernel::error::FfiContractError::InvalidId {
+            kind: "element type",
+            id: element_type_id,
+        },
+    )?;
 
     let array_type = ArrayType::new(element_field.data_type, element_field.nullable);
     let field = StructField::new(name_str, array_type, nullable);
@@ -519,17 +521,23 @@ fn visit_field_map_impl(
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
 
-    let key_field = unwrap_field(state, key_type_id).ok_or_else(|| {
-        KernelError::generic(format!("Invalid key type ID {key_type_id} for map"))
-    })?;
+    let key_field = unwrap_field(state, key_type_id).ok_or(
+        delta_kernel::error::FfiContractError::InvalidId {
+            kind: "map key",
+            id: key_type_id,
+        },
+    )?;
 
     if key_field.nullable {
-        return Err(KernelError::generic("Delta Map keys may not be nullable").into());
+        return Err(KernelError::schema("Delta Map keys may not be nullable").into());
     }
 
-    let value_field = unwrap_field(state, value_type_id).ok_or_else(|| {
-        KernelError::generic(format!("Invalid value type ID {value_type_id} for map"))
-    })?;
+    let value_field = unwrap_field(state, value_type_id).ok_or(
+        delta_kernel::error::FfiContractError::InvalidId {
+            kind: "map value",
+            id: value_type_id,
+        },
+    )?;
 
     let map_type = MapType::new(
         key_field.data_type,
@@ -583,9 +591,10 @@ fn create_variant_data_type(
     let Some(DataType::Struct(variant_struct)) =
         state.elements.take(struct_type_id).map(|f| f.data_type)
     else {
-        return Err(KernelError::generic(format!(
-            "Invalid variant struct ID {struct_type_id} - must be DataType::Struct"
-        ))
+        return Err(delta_kernel::error::FfiContractError::InvalidId {
+            kind: "variant struct",
+            id: struct_type_id,
+        }
         .into());
     };
     Ok(DataType::Variant(variant_struct))
@@ -1365,10 +1374,7 @@ mod tests {
                     msg.len,
                 ))
             };
-            assert_eq!(
-                msg,
-                "Generic delta kernel error: Delta Map keys may not be nullable"
-            );
+            assert_eq!(msg, "Schema error: Delta Map keys may not be nullable");
             std::ptr::null_mut()
         }
 

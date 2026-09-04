@@ -402,8 +402,11 @@ impl ScanLogReplayProcessor {
             is_catalog_managed,
             skip_row_transforms,
         };
-        let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
-            KernelError::generic(format!("Failed to serialize internal state: {e}"))
+        let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|source| {
+            KernelError::JsonSerialization {
+                operation: "serialize scan internal state",
+                source,
+            }
         })?;
 
         Ok(SerializableScanState {
@@ -441,10 +444,7 @@ impl ScanLogReplayProcessor {
         let physical_predicate = match state.predicate {
             Some(predicate) => {
                 let Some(predicate_schema) = internal_state.predicate_schema else {
-                    return Err(KernelError::generic(
-                        "Invalid serialized internal state. Expected predicate schema.",
-                    )
-                    .into());
+                    return Err(KernelError::Scan(super::ScanError::MissingPredicateSchema).into());
                 };
                 PhysicalPredicate::Some(predicate, predicate_schema)
             }
@@ -932,9 +932,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         } = actions_batch;
         require!(
             !is_log_batch,
-            KernelError::generic(
-                "Parallel checkpoint processor may only be applied to checkpoint files"
-            )
+            KernelError::Scan(super::ScanError::ExpectedCheckpoint)
         );
 
         let mut should_retry_transform_and_data_skip = false;

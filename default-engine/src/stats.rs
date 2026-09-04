@@ -22,6 +22,7 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
+use delta_kernel::error::ErrorContext;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType as KernelDataType, StructType};
 use delta_kernel::{DeltaResult, KernelError};
@@ -148,10 +149,7 @@ where
     PrimitiveArray<T>: From<Vec<Option<T::Native>>>,
 {
     let array = column.as_primitive_opt::<T>().ok_or_else(|| {
-        KernelError::generic(format!(
-            "Failed to downcast column to PrimitiveArray<{}>",
-            std::any::type_name::<T>()
-        ))
+        KernelError::EngineDataType(format!("PrimitiveArray<{}>", std::any::type_name::<T>()))
     })?;
     let result = match agg {
         Agg::Min => min(array),
@@ -171,10 +169,7 @@ where
     PrimitiveArray<T>: From<Vec<Option<i64>>>,
 {
     let array = column.as_primitive_opt::<T>().ok_or_else(|| {
-        KernelError::generic(format!(
-            "Failed to downcast column to PrimitiveArray<{}>",
-            std::any::type_name::<T>()
-        ))
+        KernelError::EngineDataType(format!("PrimitiveArray<{}>", std::any::type_name::<T>()))
     })?;
     let result = match agg {
         Agg::Min => min(array),
@@ -194,7 +189,7 @@ fn agg_decimal(
 ) -> DeltaResult<Option<ArrayRef>> {
     let array = column
         .as_primitive_opt::<Decimal128Type>()
-        .ok_or_else(|| KernelError::generic("Failed to downcast column to Decimal128Array"))?;
+        .ok_or_else(|| KernelError::EngineDataType("Decimal128Array".into()))?;
     let result = match agg {
         Agg::Min => min(array),
         Agg::Max => max(array),
@@ -206,7 +201,11 @@ fn agg_decimal(
                 .map(|arr| Arc::new(arr) as ArrayRef)
         })
         .transpose()
-        .map_err(|e| KernelError::generic(format!("Invalid decimal precision/scale: {e}")))
+        .map_err(|source| {
+            KernelError::from(source).with_context(ErrorContext::Operation(
+                "set statistics decimal precision/scale",
+            ))
+        })
         .map_err(delta_kernel::Error::from)
 }
 
@@ -214,7 +213,7 @@ fn agg_decimal(
 fn agg_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
     let array = column
         .as_string_opt::<i32>()
-        .ok_or_else(|| KernelError::generic("Failed to downcast column to StringArray"))?;
+        .ok_or_else(|| KernelError::EngineDataType("StringArray".into()))?;
     let result = match agg {
         Agg::Min => min_string(array),
         Agg::Max => max_string(array),
@@ -230,7 +229,7 @@ fn agg_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
 fn agg_large_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
     let array = column
         .as_string_opt::<i64>()
-        .ok_or_else(|| KernelError::generic("Failed to downcast column to LargeStringArray"))?;
+        .ok_or_else(|| KernelError::EngineDataType("LargeStringArray".into()))?;
     let result = match agg {
         Agg::Min => array.iter().flatten().min(),
         Agg::Max => array.iter().flatten().max(),
@@ -245,7 +244,7 @@ fn agg_large_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>
 fn agg_string_view(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
     let array = column
         .as_string_view_opt()
-        .ok_or_else(|| KernelError::generic("Failed to downcast column to StringViewArray"))?;
+        .ok_or_else(|| KernelError::EngineDataType("StringViewArray".into()))?;
     let result: Option<&str> = match agg {
         Agg::Min => array.iter().flatten().min(),
         Agg::Max => array.iter().flatten().max(),
@@ -339,7 +338,7 @@ fn compute_column_stats(
         DataType::Struct(fields) => {
             let struct_array = column
                 .as_struct_opt()
-                .ok_or_else(|| KernelError::generic("Failed to downcast column to StructArray"))?;
+                .ok_or_else(|| KernelError::EngineDataType("StructArray".into()))?;
 
             // Propagate struct-level nulls to all descendants
             let fixed_struct = fix_nested_null_masks(struct_array.clone());
@@ -385,8 +384,13 @@ fn compute_column_stats(
                         Ok(None)
                     } else {
                         Ok(Some(Arc::new(
-                            StructArray::try_new(fields.into(), arrays, None)
-                                .map_err(|e| KernelError::generic(format!("stats struct: {e}")))?,
+                            StructArray::try_new(fields.into(), arrays, None).map_err(
+                                |source| {
+                                    KernelError::from(source).with_context(ErrorContext::Operation(
+                                        "create nested statistics struct",
+                                    ))
+                                },
+                            )?,
                         ) as ArrayRef))
                     }
                 };
@@ -479,8 +483,12 @@ impl StatsAccumulator {
         if self.fields.is_empty() {
             return Ok(None);
         }
-        let struct_arr = StructArray::try_new(self.fields.into(), self.arrays, None)
-            .map_err(|e| KernelError::generic(format!("Failed to create {}: {e}", self.name)))?;
+        let struct_arr =
+            StructArray::try_new(self.fields.into(), self.arrays, None).map_err(|source| {
+                KernelError::from(source)
+                    .with_context(ErrorContext::Statistics { section: self.name })
+                    .with_context(ErrorContext::Operation("create statistics struct"))
+            })?;
         let field = Field::new(self.name, struct_arr.data_type().clone(), true);
         Ok(Some((field, Arc::new(struct_arr) as Arc<dyn Array>)))
     }
@@ -586,7 +594,10 @@ fn collect_stats_raw(
     arrays.push(Arc::new(BooleanArray::from(vec![true])));
 
     StructArray::try_new(fields.into(), arrays, None)
-        .map_err(|e| KernelError::generic(format!("Failed to create stats struct: {e}")))
+        .map_err(|source| {
+            KernelError::from(source)
+                .with_context(ErrorContext::Operation("create statistics struct"))
+        })
         .map_err(delta_kernel::Error::from)
 }
 
@@ -750,8 +761,11 @@ impl FileStatsAccumulator {
             return Ok(None);
         }
         let rows: Vec<&dyn Array> = row_groups.iter().map(|s| s as &dyn Array).collect();
-        let combined = concat(&rows)
-            .map_err(|e| KernelError::generic(format!("concat per-row-group stats: {e}")))?;
+        let combined = concat(&rows).map_err(|source| {
+            KernelError::from(source).with_context(ErrorContext::Operation(
+                "concatenate per-row-group statistics",
+            ))
+        })?;
         let combined = combined
             .as_struct_opt()
             .ok_or_else(|| KernelError::internal_error("concatenated stats are not a struct"))?;
@@ -785,7 +799,10 @@ fn reduce_stats(stats: &StructArray) -> DeltaResult<StructArray> {
         });
     }
     StructArray::try_new(fields, cols, None)
-        .map_err(|e| KernelError::generic(format!("rebuilding reduced stats struct: {e}")))
+        .map_err(|source| {
+            KernelError::from(source)
+                .with_context(ErrorContext::Operation("rebuild reduced statistics struct"))
+        })
         .map_err(delta_kernel::Error::from)
 }
 
@@ -808,7 +825,11 @@ fn reduce_stats_children(
         })
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(Arc::new(StructArray::try_new(fields, cols, None).map_err(
-        |e| KernelError::generic(format!("rebuilding reduced stats sub-struct: {e}")),
+        |source| {
+            KernelError::from(source).with_context(ErrorContext::Operation(
+                "rebuild reduced statistics sub-struct",
+            ))
+        },
     )?))
 }
 
@@ -824,7 +845,10 @@ fn reduce_count_leaf(array: &ArrayRef) -> DeltaResult<ArrayRef> {
         return Err(KernelError::internal_error("null count leaf in stats").into());
     }
     let sum = sum_checked(arr)
-        .map_err(|e| KernelError::generic(format!("summing stats count leaf: {e}")))?
+        .map_err(|source| {
+            KernelError::from(source)
+                .with_context(ErrorContext::Operation("sum statistics count leaf"))
+        })?
         .unwrap_or(0);
     Ok(Arc::new(Int64Array::from(vec![sum])))
 }
@@ -867,9 +891,9 @@ fn truncate_stats_bound(bound: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayR
         DataType::Utf8View => bound.as_string_view_opt().and_then(|a| a.iter().next()),
         _ => return Ok(Some(bound.clone())),
     };
-    let s = s
-        .flatten()
-        .ok_or_else(|| KernelError::generic("expected a single non-null string stats bound"))?;
+    let s = s.flatten().ok_or_else(|| {
+        KernelError::StatsValidation("expected a single non-null string stats bound".into())
+    })?;
     let Some(truncated) = (match agg {
         Agg::Min => Some(Cow::Borrowed(truncate_min_string(s))),
         Agg::Max => truncate_max_string(s),
@@ -2557,6 +2581,61 @@ mod tests {
             err.to_string().contains(needle),
             "error {err} does not mention {needle}"
         );
+    }
+
+    #[test]
+    fn test_reduce_count_overflow_preserves_arrow_source() {
+        let counts = Arc::new(Int64Array::from(vec![i64::MAX, 1])) as ArrayRef;
+        let error = reduce_count_leaf(&counts).unwrap_err();
+        assert!(matches!(
+            &error,
+            delta_kernel::Error::Kernel(KernelError::Context {
+                context: ErrorContext::Operation("sum statistics count leaf"),
+                ..
+            })
+        ));
+        let mut source: &(dyn std::error::Error + 'static) = &error;
+        loop {
+            if source.is::<delta_kernel::arrow::error::ArrowError>() {
+                break;
+            }
+            source = source
+                .source()
+                .expect("native Arrow source must be retained");
+        }
+    }
+
+    #[rstest::rstest]
+    fn stats_builder_preserves_section_and_arrow_source(
+        #[values(MIN_VALUES, MAX_VALUES, NULL_COUNT)] section: &'static str,
+    ) {
+        let mut accumulator = StatsAccumulator::new(section);
+        accumulator.push("first", Arc::new(Int64Array::from(vec![1])));
+        accumulator.push("second", Arc::new(Int64Array::from(vec![1, 2])));
+        let error = accumulator.build().unwrap_err();
+        let delta_kernel::Error::Kernel(KernelError::Context {
+            context: ErrorContext::Operation("create statistics struct"),
+            source,
+        }) = &error
+        else {
+            panic!("expected statistics construction context, got {error:?}");
+        };
+        assert!(matches!(
+            source.as_ref(),
+            KernelError::Context {
+                context: ErrorContext::Statistics { section: actual },
+                ..
+            } if *actual == section
+        ));
+        let mut source: &(dyn std::error::Error + 'static) = &error;
+        loop {
+            if source.is::<delta_kernel::arrow::error::ArrowError>() {
+                break;
+            }
+            source = source
+                .source()
+                .expect("native Arrow source must be retained");
+        }
     }
 
     #[test]

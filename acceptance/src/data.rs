@@ -6,6 +6,7 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+use delta_kernel::error::ErrorContext;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::async_reader::{
@@ -58,7 +59,7 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) -> DeltaResult<(
     let schema_stripped = strip_metadata(schema);
     let golden_stripped = strip_metadata(golden);
     if schema_stripped.fields() != golden_stripped.fields() {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::schema(format!(
             "Schema mismatch:\nActual: {:?}\nExpected: {:?}",
             schema_stripped.fields(),
             golden_stripped.fields()
@@ -97,7 +98,7 @@ pub fn assert_data_matches(
     result: Vec<RecordBatch>,
     result_schema: &SchemaRef,
     expected: RecordBatch,
-) -> DeltaResult<()> {
+) -> TestResult<()> {
     let all_data =
         concat_batches(result_schema, result.iter()).map_err(delta_kernel::KernelError::from)?;
 
@@ -106,10 +107,14 @@ pub fn assert_data_matches(
 
     // Format both batches as strings for order-independent comparison
     let actual_str = pretty_format_batches(std::slice::from_ref(&all_data))
-        .map_err(|e| KernelError::generic(format!("Failed to format actual: {}", e)))?
+        .map_err(|source| {
+            KernelError::from(source).with_context(ErrorContext::Operation("format actual rows"))
+        })?
         .to_string();
     let expected_str = pretty_format_batches(std::slice::from_ref(&expected))
-        .map_err(|e| KernelError::generic(format!("Failed to format expected: {}", e)))?
+        .map_err(|source| {
+            KernelError::from(source).with_context(ErrorContext::Operation("format expected rows"))
+        })?
         .to_string();
 
     let mut actual_lines: Vec<&str> = actual_str.trim().lines().collect();
@@ -127,12 +132,10 @@ pub fn assert_data_matches(
 
     // Compare sorted lines
     if actual_lines != expected_lines {
-        return Err(KernelError::generic(format!(
-            "Data mismatch:\nExpected:\n{}\nActual:\n{}",
-            expected_lines.join("\n"),
-            actual_lines.join("\n")
-        ))
-        .into());
+        return Err(crate::meta::AssertionError::DataMismatch {
+            expected: expected_lines.join("\n"),
+            actual: actual_lines.join("\n"),
+        });
     }
 
     Ok(())

@@ -432,18 +432,32 @@ pub(crate) fn timestamp_to_version(
                 crate::Error::Kernel(DeltaError::LogHistory(inner)) => *inner,
                 _ => LogHistoryError::internal("failed to get earliest commit", e),
             })?;
-            let limit = snapshot
-                .version()
-                .checked_sub(earliest)
-                .and_then(|diff| usize::try_from(diff + 1).ok())
-                .and_then(NonZero::new)
-                .ok_or_else(|| {
+            let distance = snapshot.version().checked_sub(earliest).ok_or_else(|| {
+                LogHistoryError::RecreateVersionAfterSnapshot {
+                    earliest,
+                    snapshot: snapshot.version(),
+                }
+            })?;
+            let limit = distance.checked_add(1).ok_or_else(|| {
+                LogHistoryError::internal(
+                    "compute timestamp lookup bound",
+                    DeltaError::NumericOverflow {
+                        operation: "compute inclusive history length",
+                        value: distance.to_string(),
+                    },
+                )
+            })?;
+            let limit = usize::try_from(limit)
+                .and_then(NonZero::<usize>::try_from)
+                .map_err(|source| {
                     LogHistoryError::internal(
-                        "earliest recreatable version exceeds snapshot version",
-                        DeltaError::generic(format!(
-                            "earliest = {earliest}, snapshot version = {}",
-                            snapshot.version()
-                        )),
+                        "compute timestamp lookup bound",
+                        DeltaError::integer_conversion(
+                            "history length",
+                            limit,
+                            "NonZero<usize>",
+                            source,
+                        ),
                     )
                 })?;
             Some(limit)
@@ -708,11 +722,11 @@ pub fn timestamp_range_to_versions(
 /// # Errors
 /// - Propagates any error from listing the log directory.
 /// - [`LogHistoryError::NoCommitsFound`] when the log directory contains no commits.
-/// - [`DeltaError::Generic`] when there is no publised file-system commit and the earliest ratified
-///   CCv2 commit is v0. For a catalog-managed table, v0 must be a published file-system commit
-///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
-///   `_delta_log/` and "create" a table at the same location. An empty listing here therefore
-///   indicates a broken invariant rather than a normal missing version.
+/// - [`LogHistoryError::MissingPublishedVersionZero`] when no published commit exists and the
+///   earliest ratified CCv2 commit is v0. For a catalog-managed table, v0 must be a published
+///   file-system commit before the catalog exposes the table. Otherwise a filesystem-only client
+///   could list an empty `_delta_log/` and "create" a table at the same location. An empty listing
+///   here therefore indicates a broken invariant rather than a normal missing version.
 #[tracing::instrument(skip(engine), ret, err)]
 fn get_earliest_published_commit_version(
     engine: &dyn Engine,
@@ -733,10 +747,9 @@ fn get_earliest_published_commit_version(
     .map(|f| f.version)
     .ok_or_else(|| {
         if earliest_ratified_commit_version == Some(0) {
-            return DeltaError::generic(format!(
-                "expected a published v0 commit for catalog-managed table {log_root}, \
-                       but the log listing returned no commits"
-            ));
+            return DeltaError::from(LogHistoryError::MissingPublishedVersionZero {
+                log_root: log_root.clone(),
+            });
         }
         DeltaError::from(LogHistoryError::NoCommitsFound {
             log_root: log_root.clone(),
@@ -761,7 +774,7 @@ fn get_earliest_published_commit_version(
 /// - Propagate any error from listing the log directory.
 /// - [`LogHistoryError::NoCommitsFound`] if the log contains no commit files at all
 /// (empty directory, or only checkpoint files) -- unless `earliest_ratified_commit_version`
-/// is `Some(0)`, in which case it returns a generic [`KernelError`](crate::KernelError) flagging
+/// is `Some(0)`, in which case [`LogHistoryError::MissingPublishedVersionZero`] identifies
 /// the broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
 /// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
 /// `00...00.json` nor a complete checkpoint that anchors the smallest commit is present.
@@ -844,11 +857,12 @@ fn get_earliest_recreatable_commit(
     }
     if earliest_ratified_commit_version == Some(0) {
         // Broken CCv2 invariant: the catalog ratified commit 0, but no published commit exists.
-        return Err(DeltaError::generic(format!(
-            "expected a published v0 commit for catalog-managed table {log_root}, \
-             but the log listing returned no commits"
-        ))
-        .into());
+        return Err(
+            DeltaError::from(LogHistoryError::MissingPublishedVersionZero {
+                log_root: log_root.clone(),
+            })
+            .into(),
+        );
     }
     Err(DeltaError::from(LogHistoryError::NoCommitsFound {
         log_root: log_root.clone(),
@@ -887,7 +901,7 @@ pub enum HistoryCommitType {
 /// - [`LogHistoryError::NoRecreatableCommit`] when `commit_type` is
 ///   [`HistoryCommitType::Recreatable`], commits exist, but neither `00...00.json` nor a checkpoint
 ///   anchoring the smallest commit is present.
-/// - [`DeltaError::Generic`] when the listing yields no commits and
+/// - [`LogHistoryError::MissingPublishedVersionZero`] when the listing yields no commits and
 ///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
 ///   (ratified commit 0 with no published filesystem commit).
 #[tracing::instrument(skip(engine), err, ret)]
@@ -2218,7 +2232,7 @@ mod tests {
             ),
             Expected::CCv2MissingV0FilesystemCommit => {
                 assert!(
-                    matches!(res, Err(crate::Error::Kernel(DeltaError::Generic(_)))),
+                    matches!(res, Err(crate::Error::Kernel(DeltaError::LogHistory(ref error))) if matches!(error.as_ref(), LogHistoryError::MissingPublishedVersionZero { .. })),
                     "{res:?}"
                 )
             }
@@ -2292,7 +2306,7 @@ mod tests {
             ),
             Expected::CCv2MissingV0FilesystemCommit => {
                 assert!(
-                    matches!(res, Err(crate::Error::Kernel(DeltaError::Generic(_)))),
+                    matches!(res, Err(crate::Error::Kernel(DeltaError::LogHistory(ref error))) if matches!(error.as_ref(), LogHistoryError::MissingPublishedVersionZero { .. })),
                     "{res:?}"
                 )
             }

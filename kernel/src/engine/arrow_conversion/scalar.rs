@@ -40,10 +40,13 @@ use crate::{DeltaResult, KernelError};
 /// - The decimal precision/scale is invalid
 pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResult<Scalar> {
     if row_idx >= array.len() {
-        return Err(KernelError::generic(format!(
-            "row index {row_idx} out of bounds for array of length {}",
-            array.len()
-        ))
+        return Err(KernelError::ArrowEngine(
+            crate::engine::ArrowEngineError::RowIndexOutOfBounds {
+                field: "scalar extraction".to_string(),
+                index: row_idx,
+                length: array.len(),
+            },
+        )
         .into());
     }
     if array.is_null(row_idx) {
@@ -103,7 +106,7 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
         )),
         ArrowDataType::Decimal128(precision, scale) => {
             if *scale < 0 {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::invalid_decimal(format!(
                     "negative decimal scale ({scale}) is not supported"
                 ))
                 .into());
@@ -117,7 +120,7 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
         ArrowDataType::LargeBinary => Ok(Scalar::Binary(
             array.as_binary::<i64>().value(row_idx).to_vec(),
         )),
-        other => Err(KernelError::generic(format!(
+        other => Err(KernelError::unsupported(format!(
             "unsupported Arrow type for primitive scalar extraction: {other:?}"
         ))
         .into()),
@@ -153,7 +156,7 @@ fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<Dat
         ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => Ok(DataType::TIMESTAMP_NTZ),
         ArrowDataType::Decimal128(p, s) => {
             if *s < 0 {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::invalid_decimal(format!(
                     "negative decimal scale ({s}) is not supported"
                 ))
                 .into());
@@ -161,7 +164,7 @@ fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<Dat
             DataType::decimal(*p, *s as u8)
         }
         ArrowDataType::Binary | ArrowDataType::LargeBinary => Ok(DataType::BINARY),
-        other => Err(KernelError::generic(format!(
+        other => Err(KernelError::unsupported(format!(
             "unsupported Arrow type for primitive scalar extraction: {other:?}"
         ))
         .into()),

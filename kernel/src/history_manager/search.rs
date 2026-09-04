@@ -250,7 +250,7 @@ mod tests {
 
         let failing_key_fn = |x: &i32| -> DeltaResult<i32> {
             if *x == 5 {
-                Err(KernelError::generic("Error extracting key").into())
+                Err(KernelError::engine_data_type("Error extracting key").into())
             } else {
                 Ok(*x)
             }
@@ -261,7 +261,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(SearchError::KeyFunctionError(crate::Error::Kernel(
-                crate::KernelError::Generic(msg)
+                crate::KernelError::EngineDataType(msg)
             ))) if msg.contains("Error extracting key")
         ));
     }

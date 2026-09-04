@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 
 use indexmap::IndexMap;
 
-use crate::error::KernelError;
+use crate::error::{ErrorContext, KernelError};
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
@@ -54,21 +54,21 @@ fn modify_field_at_path(
 ) -> DeltaResult<()> {
     let (first, rest) = path
         .split_first()
-        .ok_or_else(|| KernelError::generic("empty column path"))?;
+        .ok_or_else(|| KernelError::Schema("empty column path".into()))?;
 
     // Delta column names are case-insensitive.
     let lowered = first.to_lowercase();
     let idx = fields
         .iter()
         .position(|(_, f)| f.name().to_lowercase() == lowered)
-        .ok_or_else(|| KernelError::generic(format!("field '{first}' does not exist")))?;
+        .ok_or_else(|| KernelError::MissingColumn(format!("field '{first}' does not exist")))?;
 
     if !rest.is_empty() {
         let (_, field) = fields
             .get_index_mut(idx)
             .ok_or_else(|| KernelError::internal_error("idx from position() invalid"))?;
         let DataType::Struct(inner) = &mut field.data_type else {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::UnexpectedColumnType(format!(
                 "intermediate field '{first}' is not a struct"
             ))
             .into());
@@ -196,8 +196,12 @@ pub(crate) fn apply_schema_operations(
                     f.nullable = true;
                     Ok(())
                 })
-                .map_err(|e| {
-                    KernelError::generic(format!("Cannot set nullable on column '{column}': {e}"))
+                .map_err(|error| {
+                    error
+                        .with_context(ErrorContext::Column {
+                            path: column.to_string(),
+                        })
+                        .with_context(ErrorContext::Operation("set column nullable"))
                 })?;
             }
         }
@@ -429,17 +433,53 @@ mod tests {
     }
 
     #[rstest]
-    #[case::nonexistent_column(column_name!("nonexistent"), "does not exist")]
-    #[case::through_non_struct(column_name!("name.inner"), "not a struct")]
-    #[case::empty_path(ColumnName::new(Vec::<String>::new()), "empty column path")]
-    fn set_nullable_fails(#[case] column: ColumnName, #[case] error_contains: &str) {
+    #[case::nonexistent_column(
+        column_name!("nonexistent"),
+        KernelError::MissingColumn("field 'nonexistent' does not exist".into())
+    )]
+    #[case::nested_nonexistent_column(
+        column_name!("missing.parent.child"),
+        KernelError::MissingColumn("field 'missing' does not exist".into())
+    )]
+    #[case::through_non_struct(
+        column_name!("name.inner"),
+        KernelError::UnexpectedColumnType("intermediate field 'name' is not a struct".into())
+    )]
+    #[case::empty_path(
+        ColumnName::new(Vec::<String>::new()),
+        KernelError::Schema("empty column path".into())
+    )]
+    fn set_nullable_fails(#[case] column: ColumnName, #[case] expected_error: KernelError) {
+        let expected_path = column.to_string();
         let ops = vec![SchemaOperation::SetNullable { column }];
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None)
+        let error = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None)
             .unwrap_err();
-        assert!(
-            err.to_string().contains(error_contains),
-            "expected error to contain '{error_contains}', got: {err}"
-        );
+        let crate::Error::Kernel(KernelError::Context {
+            context: ErrorContext::Operation("set column nullable"),
+            source,
+        }) = error
+        else {
+            panic!("expected nullable operation context, got {error:?}");
+        };
+        let KernelError::Context {
+            context: ErrorContext::Column { path },
+            source,
+        } = *source
+        else {
+            panic!("expected column context, got {source:?}");
+        };
+        assert_eq!(path, expected_path);
+        match (*source, expected_error) {
+            (KernelError::MissingColumn(actual), KernelError::MissingColumn(expected))
+            | (
+                KernelError::UnexpectedColumnType(actual),
+                KernelError::UnexpectedColumnType(expected),
+            )
+            | (KernelError::Schema(actual), KernelError::Schema(expected)) => {
+                assert_eq!(actual, expected);
+            }
+            (actual, expected) => panic!("expected {expected:?}, got {actual:?}"),
+        }
     }
 
     /// Setting a struct itself nullable must not mutate inner fields. Kept separate from the

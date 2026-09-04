@@ -295,7 +295,7 @@ mod tests {
 
         let domain3 = "delta.domain3";
         let res = get_domain_metadata_helper(domain3);
-        assert_extern_result_error_with_message(res, FFIKernelError::GenericError, Some("Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+        assert_extern_result_error_with_message(res, FFIKernelError::SnapshotError, None);
 
         // Secondly, we visit the entire domain metadata
 
@@ -529,14 +529,7 @@ mod tests {
                 allocate_str,
             )
         };
-        assert_extern_result_error_with_message(
-            rejected,
-            FFIKernelError::GenericError,
-            Some(
-                "Generic delta kernel error: User DomainMetadata are not allowed to use \
-                 system-controlled 'delta.*' domain",
-            ),
-        );
+        assert_extern_result_error_with_message(rejected, FFIKernelError::SnapshotError, None);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
@@ -809,7 +802,7 @@ mod tests {
                 visitor,
             )
         };
-        assert_extern_result_error_with_message(res, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(res, FFIKernelError::MissingColumnError, None);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }

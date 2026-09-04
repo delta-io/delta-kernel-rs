@@ -248,9 +248,10 @@ unsafe fn visit_expression_column_impl(
     parts_len: usize,
 ) -> DeltaResult<usize> {
     if parts_len == 0 {
-        return Err(
-            delta_kernel::KernelError::generic("column must have at least one field part").into(),
-        );
+        return Err(delta_kernel::error::FfiContractError::EmptyArgument {
+            field: "column parts",
+        }
+        .into());
     }
 
     let slices = unsafe { std::slice::from_raw_parts(parts, parts_len) };
@@ -259,9 +260,10 @@ unsafe fn visit_expression_column_impl(
         .map(|slice| unsafe { String::try_from_slice(slice) })
         .collect::<DeltaResult<Vec<String>>>()?;
     if fields.iter().any(|field| field.is_empty()) {
-        return Err(
-            delta_kernel::KernelError::generic("column field part must not be empty").into(),
-        );
+        return Err(delta_kernel::error::FfiContractError::EmptyArgument {
+            field: "column part",
+        }
+        .into());
     }
     let name = ColumnName::new(fields);
     Ok(wrap_expression(state, name))
@@ -527,9 +529,10 @@ impl TryFrom<u8> for NullTypeTag {
             13 => Ok(Self::IntervalYearMonth),
             14 => Ok(Self::IntervalDayTime),
             255 => Ok(Self::NonPrimitive),
-            other => Err(delta_kernel::KernelError::generic(format!(
-                "Unrecognized null type tag: {other}"
-            ))
+            other => Err(delta_kernel::error::FfiContractError::InvalidTag {
+                field: "null type",
+                value: i64::from(other),
+            }
             .into()),
         }
     }
@@ -603,7 +606,7 @@ impl NullTypeTag {
             Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
                 precision, scale,
             )?)),
-            Self::NonPrimitive => Err(delta_kernel::KernelError::generic(
+            Self::NonPrimitive => Err(delta_kernel::KernelError::unsupported(
                 "Non-primitive null types (struct, array, map, variant) cannot be reconstructed \
                  from a type tag. Use opaque expressions or a schema visitor instead.",
             )
@@ -719,11 +722,12 @@ fn visit_engine_expression_impl(
     let mut visitor_state = KernelExpressionVisitorState::default();
     let expr_id = (engine_expression.visitor)(engine_expression.expression, &mut visitor_state);
 
-    let expr = unwrap_kernel_expression(&mut visitor_state, expr_id).ok_or_else(|| {
-        delta_kernel::KernelError::generic(format!(
-            "Invalid expression ID {expr_id} returned from engine visitor"
-        ))
-    })?;
+    let expr = unwrap_kernel_expression(&mut visitor_state, expr_id).ok_or(
+        delta_kernel::error::FfiContractError::InvalidId {
+            kind: "expression",
+            id: expr_id,
+        },
+    )?;
 
     Ok(Arc::new(expr).into())
 }
@@ -749,11 +753,12 @@ fn visit_engine_predicate_impl(
     let mut visitor_state = KernelExpressionVisitorState::default();
     let pred_id = (engine_predicate.visitor)(engine_predicate.predicate, &mut visitor_state);
 
-    let pred = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
-        delta_kernel::KernelError::generic(format!(
-            "Invalid predicate ID {pred_id} returned from engine visitor"
-        ))
-    })?;
+    let pred = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or(
+        delta_kernel::error::FfiContractError::InvalidId {
+            kind: "predicate",
+            id: pred_id,
+        },
+    )?;
 
     Ok(Arc::new(pred).into())
 }
@@ -1014,13 +1019,15 @@ mod tests {
     #[case(42)]
     #[case(254)]
     fn try_from_u8_invalid(#[case] value: u8) {
-        let result = NullTypeTag::try_from(value);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("Unrecognized null type tag"),
-            "unexpected error: {msg}"
-        );
+        assert!(matches!(
+            NullTypeTag::try_from(value).unwrap_err(),
+            delta_kernel::Error::Kernel(delta_kernel::KernelError::FfiContract(
+                delta_kernel::error::FfiContractError::InvalidTag {
+                    field: "null type",
+                    value: actual,
+                }
+            )) if actual == i64::from(value)
+        ));
     }
 
     // ============================================================================
@@ -1129,13 +1136,13 @@ mod tests {
     #[rstest]
     #[case::no_parts(
         &[],
-        FFIKernelError::GenericError,
-        Some("Generic delta kernel error: column must have at least one field part")
+        FFIKernelError::FfiContractError,
+        None
     )]
     #[case::empty_part(
         &[&b"a"[..], &b""[..], &b"d"[..]],
-        FFIKernelError::GenericError,
-        Some("Generic delta kernel error: column field part must not be empty")
+        FFIKernelError::FfiContractError,
+        None
     )]
     #[case::invalid_utf8(&[&[0xFF, 0xFE][..]], FFIKernelError::Utf8Error, None)]
     fn invalid_column_parts_are_rejected(

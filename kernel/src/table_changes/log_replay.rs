@@ -298,10 +298,11 @@ impl LogReplayScanner {
         let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
         {
             let Some(in_commit_timestamp) = in_commit_timestamp_opt else {
-                return Err(KernelError::generic(format!(
-                    "In-commit timestamp is enabled but not found in commit at version {}",
-                    commit_file.version
-                ))
+                return Err(KernelError::TableChanges(
+                    super::TableChangesError::MissingCommitTimestamp {
+                        version: commit_file.version,
+                    },
+                )
                 .into());
             };
             in_commit_timestamp
@@ -349,10 +350,9 @@ impl LogReplayScanner {
             schema,
             None,
         )?;
-        let commit_version = commit_file
-            .version
-            .try_into()
-            .map_err(|_| KernelError::generic("Failed to convert commit version to i64"))?;
+        let commit_version = commit_file.version.try_into().map_err(|source| {
+            KernelError::integer_conversion("commit version", commit_file.version, "i64", source)
+        })?;
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             LOG_ADD_SCHEMA.clone(),
             Arc::new(cdf_scan_row_expression(timestamp, commit_version)),

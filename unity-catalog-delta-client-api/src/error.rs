@@ -23,6 +23,13 @@ pub enum Error {
     #[error("Authentication failed")]
     AuthenticationFailed,
 
+    /// A backend transport or its configuration failed before completing an API operation.
+    #[error("Catalog transport failed: {source}")]
+    Transport {
+        /// The concrete backend error, retained without depending on the backend implementation.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// A generic error with a descriptive message.
     #[error("{0}")]
     Generic(String),

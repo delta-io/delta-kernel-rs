@@ -337,7 +337,7 @@ pub(crate) fn get_column_mapping_mode_from_properties(
         Some(mode_str) => mode_str
             .parse::<ColumnMappingMode>()
             .map_err(|_| {
-                KernelError::generic(format!(
+                KernelError::InvalidColumnMappingMode(format!(
                     "Invalid column mapping mode '{mode_str}'. Must be one of: none, name, id"
                 ))
             })
@@ -458,17 +458,14 @@ type NestedFieldIds = serde_json::Map<String, serde_json::Value>;
 /// in the connector's id allocator rather than legitimate id exhaustion. The error message
 /// reflects that diagnosis.
 fn next_column_mapping_id(max_id: &mut i64) -> DeltaResult<i64> {
-    let next = max_id.checked_add(1).ok_or_else(|| {
-        KernelError::generic(format!(
-            "Cannot allocate column mapping id: `max_id + 1` overflows `i64` \
-             (max_id={current}). The Delta protocol caps `delta.columnMapping.id` at a \
-             32-bit non-negative integer; fix the upstream id allocator producing \
-             out-of-range preserved ids.",
-            current = *max_id,
-        ))
-    })?;
+    let next = max_id
+        .checked_add(1)
+        .ok_or_else(|| KernelError::NumericOverflow {
+            operation: "allocate column mapping id",
+            value: max_id.to_string(),
+        })?;
     if next > MAX_COLUMN_MAPPING_ID {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::InvalidProtocol(format!(
             "Cannot allocate column mapping id {next}: exceeds the Delta protocol's 32-bit \
              non-negative maximum ({MAX_COLUMN_MAPPING_ID}). A preserved \
              `delta.columnMapping.id` is at the protocol cap; lower the largest preserved \
@@ -509,7 +506,7 @@ pub(crate) fn try_assign_flat_column_mapping_info(
         ColumnMetadataKey::ParquetFieldNestedIds,
     ] {
         if field.get_config_value(&key).is_some() {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::Schema(format!(
                 "Field '{}' has pre-populated `{}` metadata; this annotation is \
                  kernel-managed and must not be supplied on input fields.",
                 field.name,
@@ -915,7 +912,7 @@ pub(crate) fn physical_to_logical_column_name_and_type(
     let leaf_type = fields
         .last()
         .ok_or_else(|| {
-            KernelError::generic(format!("Column path '{physical_col}' resolved no fields"))
+            KernelError::MissingColumn(format!("Column path '{physical_col}' resolved no fields"))
         })?
         .data_type()
         .clone();
@@ -1784,17 +1781,14 @@ mod tests {
         };
 
         let mut max_id = i64::MAX;
-        let err = assign_column_mapping_metadata(&schema, &mut max_id, false)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("Cannot allocate column mapping id")
-                && err.contains("overflows `i64`")
-                && err.contains("32-bit non-negative integer")
-                && err.contains(&i64::MAX.to_string()),
-            "Expected overflow error citing the i64 ceiling, the protocol's 32-bit bound, \
-             and the offending `max_id`; got: {err}",
-        );
+        let err = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::NumericOverflow {
+                operation: "allocate column mapping id",
+                value,
+            }) if value == i64::MAX.to_string()
+        ));
         // `max_id` must not be advanced past `i64::MAX` on failure.
         assert_eq!(max_id, i64::MAX);
     }

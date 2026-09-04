@@ -108,7 +108,11 @@ fn validate_metadata_columns<'a>(
                     .metadata()
                     .configuration()
                     .get("delta.rowTracking.materializedRowIdColumnName")
-                    .ok_or(KernelError::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
+                    .ok_or(KernelError::Scan(
+                        super::ScanError::MissingRowTrackingValue {
+                            field: "delta.rowTracking.materializedRowIdColumnName",
+                        },
+                    ))?;
                 metadata_info.materialized_row_id_column_name = Some(row_id_col);
             }
             Some(MetadataColumnSpec::RowCommitVersion) => {}
@@ -285,8 +289,8 @@ impl StateInfo {
                                 let index_column_name = (0..)
                                     .map(|i| format!("row_indexes_for_row_id_{i}"))
                                     .find(|name| logical_read_schema.field(name).is_none())
-                                    .ok_or(KernelError::generic(
-                                        "Couldn't generate row index column name",
+                                    .ok_or(KernelError::Scan(
+                                        super::ScanError::RowIndexNameExhausted,
                                     ))?;
                                 read_fields.push(StructField::create_metadata_column(
                                     &index_column_name,
@@ -937,10 +941,14 @@ pub(crate) mod tests {
             get_string_map(&[("delta.enableRowTracking", "true")]),
             vec![("row_id", MetadataColumnSpec::RowId)],
         );
-        assert_result_error_with_message(
+        assert!(matches!(
             res,
-            "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
-        );
+            Err(crate::Error::Kernel(KernelError::Scan(
+                crate::scan::ScanError::MissingRowTrackingValue {
+                    field: "delta.rowTracking.materializedRowIdColumnName",
+                }
+            )))
+        ));
     }
 
     #[test]

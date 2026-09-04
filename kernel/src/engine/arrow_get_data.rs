@@ -266,10 +266,14 @@ fn validate_and_get_physical_index(
     field_name: &str,
 ) -> DeltaResult<usize> {
     if row_index >= run_array.len() {
-        return Err(KernelError::generic(format!(
-            "Row index {row_index} out of bounds for field '{field_name}'"
-        ))
-        .into());
+        return Err(
+            KernelError::ArrowEngine(super::ArrowEngineError::RowIndexOutOfBounds {
+                field: field_name.to_string(),
+                index: row_index,
+                length: run_array.len(),
+            })
+            .into(),
+        );
     }
 
     let physical_idx = run_array.run_ends().get_physical_index(row_index);
@@ -289,7 +293,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
             .as_any()
             .downcast_ref::<GenericByteArray<GenericStringType<i32>>>()
             .ok_or_else(|| {
-                KernelError::generic(format!(
+                KernelError::engine_data_type(format!(
                     "Expected StringArray values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
@@ -304,7 +308,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
             .values()
             .as_primitive_opt::<Int32Type>()
             .ok_or_else(|| {
-                KernelError::generic(format!(
+                KernelError::engine_data_type(format!(
                     "Expected Int32Array values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
@@ -319,7 +323,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
             .values()
             .as_primitive_opt::<Int64Type>()
             .ok_or_else(|| {
-                KernelError::generic(format!(
+                KernelError::engine_data_type(format!(
                     "Expected Int64Array values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
@@ -331,7 +335,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
     fn get_bool(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<bool>> {
         let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self.values().as_boolean_opt().ok_or_else(|| {
-            KernelError::generic(format!(
+            KernelError::engine_data_type(format!(
                 "Expected BooleanArray values in RunArray, got {:?}",
                 self.values().data_type()
             ))
@@ -347,7 +351,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
             .as_any()
             .downcast_ref::<GenericByteArray<GenericBinaryType<i32>>>()
             .ok_or_else(|| {
-                KernelError::generic(format!(
+                KernelError::engine_data_type(format!(
                     "Expected BinaryArray values in RunArray, got {:?}",
                     self.values().data_type()
                 ))

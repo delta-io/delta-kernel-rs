@@ -15,6 +15,7 @@ use delta_kernel::engine::arrow_utils::{
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use delta_kernel::engine::{reader_options, writer_options};
+use delta_kernel::error::ErrorContext;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -110,8 +111,8 @@ impl DataFileMetadata {
             .map_err(delta_kernel::KernelError::from)?;
         let partitions = Arc::new(builder.finish());
         // this means max size we can write is i64::MAX (~8EB)
-        let size: i64 = self.file_meta.size.try_into().map_err(|_| {
-            KernelError::generic("Failed to convert parquet metadata 'size' to i64")
+        let size: i64 = self.file_meta.size.try_into().map_err(|source| {
+            KernelError::integer_conversion("parquet file size", self.file_meta.size, "i64", source)
         })?;
         let size = Arc::new(Int64Array::from(vec![size]));
         let modification_time = Arc::new(Int64Array::from(vec![self.file_meta.last_modified]));
@@ -216,14 +217,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         writer.close().map_err(delta_kernel::KernelError::from)?; // writer must be closed to write
                                                                   // footer
 
-        let size: u64 = buffer
-            .len()
-            .try_into()
-            .map_err(|_| KernelError::generic("unable to convert usize to u64"))?;
+        let size: u64 = buffer.len().try_into().map_err(|source| {
+            KernelError::integer_conversion("parquet buffer size", buffer.len(), "u64", source)
+        })?;
         let name: String = format!("{}.parquet", Uuid::new_v4());
         // fail if path does not end with a trailing slash
         if !path.path().ends_with('/') {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::InvalidTableLocation(format!(
                 "Path must end with a trailing slash: {path}"
             ))
             .into());
@@ -245,10 +245,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             .map_err(delta_kernel::KernelError::from)?;
         let modification_time = metadata.last_modified.timestamp_millis();
         if size != metadata.size {
-            return Err(KernelError::generic(format!(
-                "Size mismatch after writing parquet file: expected {}, got {}",
-                size, metadata.size
-            ))
+            return Err(KernelError::WrittenFileSizeMismatch {
+                expected: size,
+                actual: metadata.size,
+            }
             .into());
         }
 
@@ -398,7 +398,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
             // Get first batch to initialize writer with schema
             let first_batch = data.next().ok_or_else(|| {
-                KernelError::generic("Cannot write parquet file with empty data iterator")
+                KernelError::MissingData(
+                    "Cannot write parquet file with empty data iterator".into(),
+                )
             })??;
             let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
             let first_record_batch: RecordBatch = (*first_arrow).into();
@@ -451,11 +453,17 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         let footer_future = async move {
             let metadata = if location.is_presigned() {
                 let client = reqwest::Client::new();
-                let response = client.get(location.as_str()).send().await.map_err(|e| {
-                    KernelError::generic(format!("Failed to fetch presigned URL: {e}"))
-                })?;
-                let bytes = response.bytes().await.map_err(|e| {
-                    KernelError::generic(format!("Failed to read response bytes: {e}"))
+                let response = client
+                    .get(location.as_str())
+                    .send()
+                    .await
+                    .map_err(|source| {
+                        KernelError::from(source)
+                            .with_context(ErrorContext::Operation("fetch presigned URL"))
+                    })?;
+                let bytes = response.bytes().await.map_err(|source| {
+                    KernelError::from(source)
+                        .with_context(ErrorContext::Operation("read response bytes"))
                 })?;
                 ArrowReaderMetadata::load(&bytes, reader_options())
                     .map_err(delta_kernel::KernelError::from)?
@@ -667,8 +675,7 @@ mod tests {
     };
     use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
-        assert_result_error_with_message, current_time_ms,
-        try_into_record_batch as into_record_batch,
+        current_time_ms, try_into_record_batch as into_record_batch,
     };
     use itertools::Itertools;
     use test_utils::engine_contract::{
@@ -1197,7 +1204,7 @@ mod tests {
         ));
         let physical_schema = long_schema("a");
 
-        assert_result_error_with_message(
+        assert!(matches!(
             parquet_handler
                 .write_parquet(
                     &Url::parse("memory:///data").unwrap(),
@@ -1206,8 +1213,10 @@ mod tests {
                     &physical_schema,
                 )
                 .await,
-            "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
-        );
+            Err(delta_kernel::Error::Kernel(
+                KernelError::InvalidTableLocation(_)
+            ))
+        ));
     }
 
     #[tokio::test]

@@ -66,7 +66,7 @@ macro_rules! prim_array_cmp {
                         )
                 )
         }
-        .map_err(KernelError::generic_err)
+        .map_err(KernelError::from)
         .map_err(crate::Error::from);
     };
 }
@@ -158,7 +158,9 @@ impl RowIndexBuilder {
                     .map(|&i| {
                         // We verify that there are no duplicate or out of bounds ordinals
                         if !seen_ordinals.insert(i) {
-                            return Err(KernelError::generic("Found duplicate row group ordinal"));
+                            return Err(KernelError::ArrowEngine(
+                                super::ArrowEngineError::DuplicateRowGroupOrdinal { ordinal: i },
+                            ));
                         }
                         // We have to clone here to avoid modifying the original vector in each
                         // iteration
@@ -166,9 +168,12 @@ impl RowIndexBuilder {
                             .get(i)
                             .cloned()
                             .ok_or_else(|| {
-                                KernelError::generic(format!(
-                                    "Row group ordinal {i} is out of bounds"
-                                ))
+                                KernelError::ArrowEngine(
+                                    super::ArrowEngineError::RowGroupOutOfBounds {
+                                        ordinal: i,
+                                        count: self.row_group_row_index_ranges.len(),
+                                    },
+                                )
                             })
                     })
                     .try_collect()?
@@ -424,7 +429,7 @@ fn _count_cols(dt: &ArrowDataType) -> usize {
 /// not support.
 fn validate_parquet_variant(field: &ArrowField) -> DeltaResult<()> {
     fn variant_parquet_error(field_name: &String) -> KernelError {
-        KernelError::Generic(format!(
+        KernelError::unsupported(format!(
             "The field {field_name} presumed to be of Variant type might be \
             shredded in the parquet file. The default engine does not support \
             shredded reads yet."
@@ -567,8 +572,12 @@ fn get_indices(
                                 ),
                             ));
                         } else if children.len() != 1 {
-                            return Err(KernelError::generic(
-                                "List call should not have generated more than one reorder index",
+                            return Err(KernelError::ArrowEngine(
+                                super::ArrowEngineError::ProjectionChildCount {
+                                    container: "List",
+                                    expected: 1,
+                                    actual: children.len(),
+                                },
                             )
                             .into());
                         } else {
@@ -589,13 +598,17 @@ fn get_indices(
                             let mut key_val_names =
                                 inner_fields.iter().map(|f| f.name().to_string());
                             let key_name = key_val_names.next().ok_or_else(|| {
-                                KernelError::generic("map fields didn't include a key col")
+                                KernelError::invalid_struct_data(
+                                    "map fields didn't include a key col",
+                                )
                             })?;
                             let val_name = key_val_names.next().ok_or_else(|| {
-                                KernelError::generic("map fields didn't include a val col")
+                                KernelError::invalid_struct_data(
+                                    "map fields didn't include a val col",
+                                )
                             })?;
                             if key_val_names.next().is_some() {
-                                return Err(KernelError::generic(
+                                return Err(KernelError::invalid_struct_data(
                                     "map fields had more than 2 members",
                                 )
                                 .into());
@@ -625,8 +638,12 @@ fn get_indices(
                                     ),
                                 ));
                             } else if children.len() != 2 {
-                                return Err(KernelError::generic(
-                                    "Map call should have generated exactly two reorder indices",
+                                return Err(KernelError::ArrowEngine(
+                                    super::ArrowEngineError::ProjectionChildCount {
+                                        container: "Map",
+                                        expected: 2,
+                                        actual: children.len(),
+                                    },
                                 )
                                 .into());
                             } else {
@@ -712,7 +729,7 @@ fn get_indices(
                         ));
                     }
                     Some(metadata_spec) => {
-                        return Err(KernelError::Generic(format!(
+                        return Err(KernelError::unsupported(format!(
                             "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
                         )).into());
                     }
@@ -724,7 +741,7 @@ fn get_indices(
                         ));
                     }
                     None => {
-                        return Err(KernelError::Generic(format!(
+                        return Err(KernelError::missing_column(format!(
                             "Requested field not found in parquet schema, and field is not nullable: {}",
                             field.name()
                         )).into());
@@ -1004,7 +1021,7 @@ pub(crate) fn reorder_struct_array(
                 }
                 ReorderIndexTransform::RowIndex(field) => {
                     let Some(ref mut row_index_iter) = row_indexes else {
-                        return Err(KernelError::generic(
+                        return Err(KernelError::missing_data(
                             "Row index column requested but row index iterator not provided",
                         )
                         .into());
@@ -1022,7 +1039,7 @@ pub(crate) fn reorder_struct_array(
                 }
                 ReorderIndexTransform::FilePath(field) => {
                     let Some(file_path) = file_location else {
-                        return Err(KernelError::generic(
+                        return Err(KernelError::missing_data(
                             "File path column requested but file location not provided",
                         )
                         .into());
@@ -1220,7 +1237,7 @@ pub(crate) fn parse_json_impl(
         ArrowDataType::Utf8View => {
             parse_json_inner(json_strings.as_string_view().iter(), num_rows, schema)
         }
-        dt => Err(KernelError::generic(format!(
+        dt => Err(KernelError::engine_data_type(format!(
             "Expected string array for JSON parsing, got {dt}"
         ))
         .into()),
@@ -1279,35 +1296,40 @@ fn decode_with_arrow_json<'a>(
             .map_err(crate::KernelError::from)?;
         // did we fail to decode the whole line, or was the line partial
         if consumed != line.len() || decoder.has_partial_record() {
-            return Err(KernelError::Generic(format!(
-                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
-            ))
-            .into());
+            return Err(
+                KernelError::ArrowEngine(super::ArrowEngineError::InvalidJsonRow {
+                    row: row_number,
+                })
+                .into(),
+            );
         }
         // did we decode exactly one record
         if decoder.len() != row_number {
-            return Err(KernelError::Generic(format!(
-                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
-            ))
-            .into());
+            return Err(
+                KernelError::ArrowEngine(super::ArrowEngineError::InvalidJsonRow {
+                    row: row_number,
+                })
+                .into(),
+            );
         }
     }
     // Get the final batch out
     if let Some(batch) = decoder.flush().map_err(crate::KernelError::from)? {
         if batch.num_rows() != num_rows {
-            return Err(KernelError::Generic(format!(
-                "Unexpected number of rows decoded. Got {}, expected{}",
-                batch.num_rows(),
-                num_rows
-            ))
-            .into());
+            return Err(
+                KernelError::ArrowEngine(super::ArrowEngineError::JsonRowCount {
+                    actual: batch.num_rows(),
+                    expected: num_rows,
+                })
+                .into(),
+            );
         }
         return Ok(batch);
     }
-    Err(KernelError::generic(
-        "Malformed JSON: exited parse_json_impl without deserializing anything useful",
+    Err(
+        KernelError::ArrowEngine(super::ArrowEngineError::MissingJsonBatch { expected: num_rows })
+            .into(),
     )
-    .into())
 }
 
 /// Rewrites failure-prone primitives (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) to
@@ -1428,7 +1450,7 @@ fn cast_array_to_type(
     match target {
         ArrowDataType::Struct(target_fields) => {
             let s = array.as_struct_opt().ok_or_else(|| {
-                KernelError::generic(format!(
+                KernelError::invalid_expression(format!(
                     "cannot cast {} to a struct target",
                     array.data_type()
                 ))
@@ -1436,7 +1458,7 @@ fn cast_array_to_type(
             let nulls = s.nulls().cloned();
             require!(
                 s.columns().len() == target_fields.len(),
-                KernelError::generic(format!(
+                KernelError::invalid_struct_data(format!(
                     "cannot cast struct with {} children to target with {} fields",
                     s.columns().len(),
                     target_fields.len()
@@ -1731,7 +1753,6 @@ mod tests {
 
     #[test]
     fn test_json_parsing() {
-        static EXPECTED_JSON_ERR_STR: &str = "Generic delta kernel error: Malformed JSON: Multiple, partial, or 0 JSON objects on row";
         fn check_parse_fails(input: Vec<Option<&str>>, schema: SchemaRef, expected_start: &str) {
             let result = parse_json_impl(&StringArray::from(input), schema);
             let err = result.expect_err("Expected an error");
@@ -1760,7 +1781,13 @@ mod tests {
             vec![Some(r#"{} { "a": 1"#), Some("}")],
             vec![Some(r#"{ "a": 1"#), Some(r#", "b": "b"}"#)],
         ] {
-            check_parse_fails(input, requested_schema.clone(), EXPECTED_JSON_ERR_STR);
+            let result = parse_json_impl(&StringArray::from(input), requested_schema.clone());
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::ArrowEngine(
+                    crate::engine::ArrowEngineError::InvalidJsonRow { .. }
+                )))
+            ));
         }
 
         // this one is an error from within the tape decoder, so has a different format

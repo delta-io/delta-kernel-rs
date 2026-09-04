@@ -53,7 +53,7 @@ impl<S> Transaction<S> {
 
             // Check for duplicates
             if !seen_domains.insert(domain) {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::InvalidTransactionState(format!(
                     "Metadata for domain {domain} already specified in this transaction"
                 ))
                 .into());
@@ -66,15 +66,16 @@ impl<S> Transaction<S> {
 
             // Users cannot add system domains via the public API
             if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-                return Err(KernelError::generic(
-                    "Cannot modify domains that start with 'delta.' as those are system controlled",
+                return Err(KernelError::InvalidTransactionState(
+                    "Cannot modify domains that start with 'delta.' as those are system controlled"
+                        .into(),
                 )
                 .into());
             }
 
             // Check for duplicates (spans both system and user domains)
             if !seen_domains.insert(domain) {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::InvalidTransactionState(format!(
                     "Metadata for domain {domain} already specified in this transaction"
                 ))
                 .into());
@@ -95,15 +96,16 @@ impl<S> Transaction<S> {
         for domain in &self.user_domain_removals {
             // Cannot remove system domains
             if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-                return Err(KernelError::generic(
-                    "Cannot modify domains that start with 'delta.' as those are system controlled",
+                return Err(KernelError::InvalidTransactionState(
+                    "Cannot modify domains that start with 'delta.' as those are system controlled"
+                        .into(),
                 )
                 .into());
             }
 
             // Check for duplicates
             if !seen_domains.insert(domain.as_str()) {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::InvalidTransactionState(format!(
                     "Metadata for domain {domain} already specified in this transaction"
                 ))
                 .into());
@@ -127,7 +129,7 @@ impl<S> Transaction<S> {
             // Will be changed to a constant in a follow up clustering create table feature PR
             "delta.clustering" => Some(TableFeature::ClusteredTable),
             _ => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::InvalidTransactionState(format!(
                     "Unknown system domain '{domain}'. Only known system domains are allowed."
                 ))
                 .into());
@@ -137,7 +139,7 @@ impl<S> Transaction<S> {
         // If the domain requires a feature, validate it's supported
         if let Some(feature) = required_feature {
             if !table_config.is_feature_supported(&feature) {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::InvalidProtocol(format!(
                     "System domain '{domain}' requires the '{feature}' feature to be enabled"
                 ))
                 .into());

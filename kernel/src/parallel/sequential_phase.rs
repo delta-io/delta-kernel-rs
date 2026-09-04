@@ -149,9 +149,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     #[internal_api]
     pub(crate) fn finish(self) -> DeltaResult<AfterSequential<P>> {
         if !self.is_finished {
-            return Err(
-                KernelError::generic("Must exhaust iterator before calling finish()").into(),
-            );
+            return Err(KernelError::Scan(crate::scan::ScanError::IncompleteReplay).into());
         }
 
         let parallel_files = match self.checkpoint_manifest_phase {
@@ -160,10 +158,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
                 let parts = self.checkpoint_parts;
                 require!(
                     parts.len() != 1,
-                    KernelError::generic(
-                        "Invariant violation: If there is exactly one checkpoint part,
-                        there must be a manifest reader"
-                    )
+                    KernelError::Scan(crate::scan::ScanError::MissingManifestReader)
                 );
                 // If this is a multi-part checkpoint, use the checkpoint parts for parallel phase
                 parts

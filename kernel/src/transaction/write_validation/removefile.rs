@@ -44,7 +44,7 @@ impl Validation for RemoveFileRequiredFields {
         })?;
         require!(
             !path.is_empty(),
-            KernelError::generic("RemoveFile path must not be empty")
+            KernelError::InvalidStructData("RemoveFile path must not be empty".into())
         );
         let size = validate_required_field_exist::<i64>(
             getters[SIZE].get_opt(row, "size")?,
@@ -53,7 +53,7 @@ impl Validation for RemoveFileRequiredFields {
         )?;
         require!(
             size >= 0,
-            KernelError::generic(format!(
+            KernelError::InvalidStructData(format!(
                 "RemoveFile for '{path}' has negative size {size}; size must be non-negative"
             ))
         );

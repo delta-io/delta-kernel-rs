@@ -57,7 +57,7 @@ async fn list_from_impl(
     } else {
         let mut parts = offset.parts().collect_vec();
         if parts.pop().is_none() {
-            return Err(KernelError::Generic(format!(
+            return Err(KernelError::InvalidTableLocation(format!(
                 "Offset path must not be a root directory. Got: '{path}'",
             ))
             .into());

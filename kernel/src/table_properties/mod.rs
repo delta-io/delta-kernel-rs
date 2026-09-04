@@ -16,12 +16,28 @@ use std::time::Duration;
 
 use strum::{Display, EnumString, IntoStaticStr};
 
+use crate::error::ErrorContext;
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::{KernelError, Version};
 
 mod deserialize;
 pub use deserialize::ParseIntervalError;
+
+/// A table property does not satisfy its value constraints.
+#[derive(Debug, thiserror::Error)]
+pub enum TablePropertyError {
+    /// A property has a value outside the allowed set.
+    #[error("Invalid value '{value}' for '{property}'. Expected {expected}")]
+    InvalidValue {
+        /// The property key supplied by the caller.
+        property: String,
+        /// The invalid property value.
+        value: String,
+        /// A description of the allowed values.
+        expected: &'static str,
+    },
+}
 
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
 pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
@@ -306,15 +322,21 @@ impl TryFrom<&str> for DataSkippingNumIndexedCols {
     type Error = crate::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let num: i64 = value.parse().map_err(|_| {
-            KernelError::generic("couldn't parse DataSkippingNumIndexedCols to an integer")
+        let num: i64 = value.parse().map_err(|source| {
+            KernelError::from(source).with_context(ErrorContext::Configuration {
+                key: DATA_SKIPPING_NUM_INDEXED_COLS,
+                value: value.to_string(),
+            })
         })?;
         match num {
             -1 => Ok(DataSkippingNumIndexedCols::AllColumns),
             x => Ok(DataSkippingNumIndexedCols::NumColumns(
-                x.try_into().map_err(|_| {
-                    KernelError::generic(
-                        "couldn't parse DataSkippingNumIndexedCols to positive integer",
+                x.try_into().map_err(|source| {
+                    KernelError::integer_conversion(
+                        DATA_SKIPPING_NUM_INDEXED_COLS,
+                        x,
+                        "u64",
+                        source,
                     )
                 })?,
             )),
@@ -391,6 +413,38 @@ mod tests {
 
     use super::*;
     use crate::expressions::column_name;
+
+    #[rstest::rstest]
+    #[case("-2")]
+    #[case("-9223372036854775808")]
+    fn indexed_column_count_rejects_negative_values_with_conversion_details(#[case] input: &str) {
+        let result = DataSkippingNumIndexedCols::try_from(input);
+        assert!(matches!(result,
+            Err(crate::Error::Kernel(KernelError::IntegerConversion {
+                field: DATA_SKIPPING_NUM_INDEXED_COLS, value, target: "u64", ..
+            })) if value == input
+        ));
+    }
+
+    #[test]
+    fn indexed_column_count_preserves_integer_parse_error() {
+        let input = "not a number";
+        let error = DataSkippingNumIndexedCols::try_from(input).unwrap_err();
+        let crate::Error::Kernel(KernelError::Context {
+            context: ErrorContext::Configuration { key, value },
+            source,
+        }) = error
+        else {
+            panic!("expected configuration context, got {error:?}");
+        };
+        assert_eq!(key, DATA_SKIPPING_NUM_INDEXED_COLS);
+        assert_eq!(value, input);
+        assert!(matches!(
+            source.as_ref(),
+            KernelError::ParseIntError(native)
+                if *native.kind() == std::num::IntErrorKind::InvalidDigit
+        ));
+    }
 
     #[test]
     fn test_property_key_constants() {

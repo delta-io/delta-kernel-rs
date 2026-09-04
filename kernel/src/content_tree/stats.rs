@@ -226,7 +226,7 @@ fn leaf_stats_field(field: &StructField, path: &[String]) -> DeltaResult<Option<
     // stats, so a field ID outside the supported range is expected for some reserved metadata
     // columns; skip (warn) rather than error in that case.
     let field_id = get_field_id(field).ok_or_else(|| {
-        KernelError::generic(format!(
+        KernelError::Schema(format!(
             "Field '{}' has no usable (present, i32-representable) field ID. metadata: {:#?}",
             field.name(),
             field.metadata()

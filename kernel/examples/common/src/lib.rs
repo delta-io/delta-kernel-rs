@@ -130,7 +130,10 @@ pub fn get_engine(
 ) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
     if args.env_creds {
         let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(|e| {
-            delta_kernel::KernelError::Generic(format!("Object store could not parse url: {e}"))
+            delta_kernel::KernelError::from(delta_kernel::object_store::Error::from(e))
+                .with_context(delta_kernel::error::ErrorContext::Operation(
+                    "parse object store URL",
+                ))
         })?;
         use ObjectStoreScheme::*;
         let url_str = url.to_string();
@@ -154,14 +157,14 @@ pub fn get_engine(
                     .map_err(delta_kernel::KernelError::from)?,
             ),
             Local | Memory | Http => {
-                return Err(delta_kernel::KernelError::Generic(format!(
+                return Err(delta_kernel::KernelError::unsupported(format!(
                     "Scheme {scheme:?} doesn't support getting credentials from environment"
                 ))
                 .into());
             }
             _ => {
                 // scheme is non-exhaustive
-                return Err(delta_kernel::KernelError::Generic(format!(
+                return Err(delta_kernel::KernelError::unsupported(format!(
                     "Unknown schema {scheme:?} doesn't support getting credentials from environment"
                 ))
                 .into());

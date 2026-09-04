@@ -653,7 +653,9 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::Error::Kernel(KernelError::Generic(e)) if e == "Log segment is not published"
+        crate::Error::Kernel(KernelError::LogSegment(
+            crate::log_segment::LogSegmentError::Unpublished { end: 1, .. }
+        ))
     ));
     Ok(())
 }
@@ -932,8 +934,8 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> DeltaResult<()>
-{
+async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
+) -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -953,8 +955,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         1,
         actions_to_string(vec![TestAction::Add("file1.parquet".to_string())]),
     )
-    .await
-    .map_err(|err| crate::KernelError::generic(err.to_string()))?;
+    .await?;
 
     // Version 2
     add_commit(
@@ -963,8 +964,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         2,
         actions_to_string(vec![TestAction::Add("file2.parquet".to_string())]),
     )
-    .await
-    .map_err(|err| crate::KernelError::generic(err.to_string()))?;
+    .await?;
 
     // Checkpoint at version 2
     let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -975,7 +975,9 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         .get("sizeInBytes")
         .and_then(Value::as_u64)
         .ok_or_else(|| {
-            crate::KernelError::generic("missing or invalid sizeInBytes in _last_checkpoint")
+            crate::KernelError::InvalidCheckpoint(
+                "missing or invalid sizeInBytes in _last_checkpoint".into(),
+            )
         })?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
 
@@ -984,7 +986,8 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         .at_version(1)
         .build(&engine)?;
     snapshot_v1.checkpoint(&engine, None)?;
-    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
+    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
+    Ok(())
 }
 
 /// Helper to create metadata action with specific stats settings

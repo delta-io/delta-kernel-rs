@@ -498,9 +498,9 @@ fn read_u32(cursor: &mut Cursor<Bytes>, endian: Endian) -> DeltaResult<u32> {
 
 /// decode a slice into a u32
 fn slice_to_u32(buf: &[u8], endian: Endian) -> DeltaResult<u32> {
-    let array = buf
-        .try_into()
-        .map_err(|_| KernelError::generic("Must have a 4 byte slice to decode to u32"))?;
+    let array = buf.try_into().map_err(|_| {
+        KernelError::DeletionVector("Must have a 4 byte slice to decode to u32".into())
+    })?;
     match endian {
         Endian::Big => Ok(u32::from_be_bytes(array)),
         Endian::Little => Ok(u32::from_le_bytes(array)),

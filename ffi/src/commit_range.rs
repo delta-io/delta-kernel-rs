@@ -285,7 +285,9 @@ impl FfiCommitActionsIterator {
     fn lock_iter(&self) -> DeltaResult<MutexGuard<'_, CommitActionIter>> {
         self.data
             .lock()
-            .map_err(|_| KernelError::generic("poisoned commit-actions iterator mutex"))
+            .map_err(|_| KernelError::LockPoisoned {
+                resource: "commit actions iterator",
+            })
             .map_err(delta_kernel::Error::from)
     }
 }
@@ -591,7 +593,7 @@ mod tests {
             ))
         };
         let result = unsafe { commit_range_builder_build(builder) };
-        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::LogSegmentError, None);
 
         unsafe { free_engine(engine) }
         Ok(())
@@ -666,7 +668,11 @@ mod tests {
                 unsafe { free_commit_actions_iter(iter) }
             }
             None => {
-                assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
+                assert_extern_result_error_with_message(
+                    result,
+                    FFIKernelError::CommitRangeError,
+                    None,
+                );
             }
         }
 
@@ -692,7 +698,7 @@ mod tests {
                 0,
             )
         };
-        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::CommitRangeError, None);
 
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }

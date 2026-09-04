@@ -160,7 +160,7 @@ pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
 }
 
 fn unexpected(c: char, sql: &str) -> KernelError {
-    KernelError::generic(format!("unexpected character '{c}' in {sql}"))
+    KernelError::invalid_expression(format!("unexpected character '{c}' in {sql}"))
 }
 
 /// Peek the second character of the stream (the one after the next), without consuming anything.
@@ -177,7 +177,7 @@ fn peek_second(chars: &CharStream<'_>) -> Option<char> {
 /// with a `'`.
 fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<String> {
     if chars.next_if_eq(&'\'').is_none() {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::invalid_expression(format!(
             "string literal must start with a quote in {sql}"
         ))
         .into());
@@ -196,9 +196,10 @@ fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Stri
             }
             Some(c) => out.push(c),
             None => {
-                return Err(
-                    KernelError::generic(format!("unterminated string literal in {sql}")).into(),
-                )
+                return Err(KernelError::invalid_expression(format!(
+                    "unterminated string literal in {sql}"
+                ))
+                .into())
             }
         }
     }

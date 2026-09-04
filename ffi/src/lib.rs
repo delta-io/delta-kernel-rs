@@ -877,8 +877,11 @@ fn set_builder_rest_object_store_impl(
     context: NullableCvoid,
 ) -> DeltaResult<bool> {
     // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
-    let endpoint_config = unsafe { endpoint_config.as_ref() }
-        .ok_or_else(|| delta_kernel::KernelError::generic("null CRestEndpointConfig pointer"))?;
+    let endpoint_config = unsafe { endpoint_config.as_ref() }.ok_or(
+        delta_kernel::error::FfiContractError::NullArgument {
+            field: "CRestEndpointConfig",
+        },
+    )?;
     builder.object_store_backend =
         ObjectStoreBackend::Rest(Box::new(rest_engine::rest_builder_state_from_ffi(
             endpoint_config,
@@ -2206,7 +2209,7 @@ mod tests {
         // The crc-full fixture has a CRC at version 0 with complete file stats.
         let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
         let table_root = Url::from_directory_path(&table_path)
-            .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
+            .map_err(|()| delta_kernel::KernelError::invalid_table_location("invalid table path"))?
             .to_string();
 
         let engine = get_default_engine(&table_root);
@@ -2356,7 +2359,7 @@ mod tests {
         EarliestCommitTableSetupScenario::NoCommits,
         OptionalValue::Some(0),
         FfiHistoryCommitType::Published,
-        Err(FFIKernelError::GenericError)
+        Err(FFIKernelError::LogHistoryError)
     )]
     #[case::empty_log_errors(
         EarliestCommitTableSetupScenario::NoCommits,
@@ -2986,7 +2989,7 @@ mod tests {
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
-            .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?;
+            .ok_or_else(|| delta_kernel::KernelError::invalid_table_location("Invalid path"))?;
         let storage = Arc::new(LocalFileSystem::new());
 
         // Use a temporary runtime for async setup, then drop it before the FFI calls so the engine
@@ -3049,7 +3052,7 @@ mod tests {
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
-            .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?;
+            .ok_or_else(|| delta_kernel::KernelError::invalid_table_location("Invalid path"))?;
         let storage = Arc::new(LocalFileSystem::new());
 
         let protocol_and_metadata = METADATA
@@ -3215,7 +3218,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             invalid_snapshot,
-            FFIKernelError::GenericError,
+            FFIKernelError::MaxCatalogVersionError,
             Some(concat!(
                 "Max catalog version error: Max catalog version is required when providing ",
                 "staged commits in the log tail. ",
@@ -3331,11 +3334,7 @@ mod tests {
             snapshot_builder_set_version(&mut ptr, 1);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(
-            result,
-            FFIKernelError::GenericError,
-            Some("Generic delta kernel error: Requested snapshot version 1 is older than snapshot hint version 2"),
-        );
+        assert_extern_result_error_with_message(result, FFIKernelError::SnapshotError, None);
 
         unsafe { free_snapshot(snapshot_at_v2) }
         unsafe { free_snapshot(snapshot_at_v0) }

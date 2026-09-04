@@ -52,7 +52,9 @@ impl Validation for AddFileRequiredFields {
             .get_opt(row, "path")?
             .ok_or_else(|| KernelError::missing_data("AddFile is missing required field 'path'"))?;
         if path.is_empty() {
-            return Err(KernelError::generic("AddFile path must not be empty").into());
+            return Err(
+                KernelError::InvalidStructData("AddFile path must not be empty".into()).into(),
+            );
         }
 
         let partition_values = validate_required_field_exist(
@@ -67,7 +69,7 @@ impl Validation for AddFileRequiredFields {
             "size",
         )?;
         if size < 0 {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::InvalidStructData(format!(
                 "AddFile for '{path}' has negative size {size}; size must be non-negative"
             ))
             .into());

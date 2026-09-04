@@ -96,7 +96,7 @@ async fn try_main() -> DeltaResult<()> {
         // we'll use the first batch to determine the schema
         let first = batch_iter.next();
         let Some(first) = first else {
-            return Err(KernelError::generic("No batches in checkpoint data").into());
+            return Err(KernelError::missing_data("checkpoint data batches").into());
         };
         // Note that with `FilteredEngineData` it's important to `apply_selection_vector` to remove
         // any filtered out rows. It's also possible to use `into_parts` to get the

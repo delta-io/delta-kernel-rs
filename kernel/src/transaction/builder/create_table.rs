@@ -156,7 +156,7 @@ fn ensure_table_does_not_exist(
             // - Some(Err(other)) means real error -> propagate
             // - None means empty iterator -> OK for new table
             match files.next() {
-                Some(Ok(_)) => Err(KernelError::generic(format!(
+                Some(Ok(_)) => Err(KernelError::InvalidTransactionState(format!(
                     "Table already exists at path: {table_path}"
                 ))
                 .into()),
@@ -259,19 +259,20 @@ fn validate_partition_columns(
     partition_columns: &[ColumnName],
 ) -> DeltaResult<()> {
     if partition_columns.is_empty() {
-        return Err(KernelError::generic("Partitioning requires at least one column").into());
+        return Err(KernelError::Schema("Partitioning requires at least one column".into()).into());
     }
     if partition_columns.len() >= schema.fields().len() {
-        return Err(
-            KernelError::generic("Table must have at least one non-partition column").into(),
-        );
+        return Err(KernelError::Schema(
+            "Table must have at least one non-partition column".into(),
+        )
+        .into());
     }
 
     let mut seen = HashSet::new();
     for col in partition_columns {
         let path = col.path();
         if path.len() != 1 {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::Schema(format!(
                 "Partition column '{}' must be a top-level column (nested paths are not supported)",
                 col
             ))
@@ -279,19 +280,17 @@ fn validate_partition_columns(
         }
 
         if !seen.insert(col) {
-            return Err(
-                KernelError::generic(format!("Duplicate partition column: '{col}'")).into(),
-            );
+            return Err(KernelError::Schema(format!("Duplicate partition column: '{col}'")).into());
         }
 
         // Safety: path.len() == 1 is enforced by the top-level check above
         let col_name = &path[0];
         let field = schema.field(col_name).ok_or_else(|| {
-            KernelError::generic(format!("Partition column '{col}' not found in schema"))
+            KernelError::MissingColumn(format!("Partition column '{col}' not found in schema"))
         })?;
 
         let DataType::Primitive(_) = field.data_type() else {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::UnexpectedColumnType(format!(
                 "Partition column '{col}' has non-primitive type '{}'. \
                  Partition columns must have primitive types.",
                 field.data_type()
@@ -474,7 +473,7 @@ fn maybe_enable_ict_for_catalog_managed(
             .get(ENABLE_IN_COMMIT_TIMESTAMPS)
             .is_some_and(|v| v != "true")
         {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::InvalidProtocol(format!(
                 "Catalog-managed tables require '{ENABLE_IN_COMMIT_TIMESTAMPS}=true', \
                  but it was explicitly set to '{}'",
                 validated.properties[ENABLE_IN_COMMIT_TIMESTAMPS]
@@ -537,7 +536,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
         }
         Some("name") | Some("id") => {}
         Some(other) => {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::InvalidProtocol(format!(
                 "IcebergCompatV3 requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got \
                  '{other}'"
             ))
@@ -548,7 +547,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
     // Row tracking must not be suspended (suspension cannot coexist with row tracking actively
     // enabled, which V3 requires).
     if validated.is_property_true(ROW_TRACKING_SUSPENDED) {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::InvalidProtocol(format!(
             "IcebergCompatV3 cannot be enabled while '{ROW_TRACKING_SUSPENDED}' is 'true'"
         ))
         .into());
@@ -567,7 +566,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
         }
         Some("true") => {}
         Some(other) => {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::InvalidProtocol(format!(
                 "IcebergCompatV3 requires '{ENABLE_ROW_TRACKING}' to be 'true', got '{other}'"
             ))
             .into());
@@ -577,7 +576,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
     // V1/V2 must not be active.
     for key in [ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2] {
         if validated.is_property_true(key) {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::InvalidProtocol(format!(
                 "IcebergCompatV3 cannot be enabled together with '{key}'"
             ))
             .into());
@@ -683,9 +682,14 @@ fn validate_extract_table_features_and_properties(
 
         // Validate that the value is "supported"
         if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
-            return Err(KernelError::generic(format!(
-                "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
-            )).into());
+            return Err(KernelError::TableProperty(
+                crate::table_properties::TablePropertyError::InvalidValue {
+                    property: key.clone(),
+                    value: value.clone(),
+                    expected: SET_TABLE_FEATURE_SUPPORTED_VALUE,
+                },
+            )
+            .into());
         }
 
         // Parse feature name to TableFeature (unknown features become TableFeature::Unknown)
@@ -694,7 +698,7 @@ fn validate_extract_table_features_and_properties(
             .unwrap_or_else(|_| TableFeature::Unknown(feature_name.to_string()));
 
         if !ALLOWED_DELTA_FEATURES.contains(&feature) {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::Unsupported(format!(
                 "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
             ))
             .into());
@@ -726,7 +730,7 @@ fn validate_extract_table_features_and_properties(
         if key.starts_with(DELTA_PROPERTY_PREFIX)
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
         {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::Unsupported(format!(
                 "Setting delta property '{key}' is not supported during CREATE TABLE"
             ))
             .into());

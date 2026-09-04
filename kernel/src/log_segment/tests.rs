@@ -861,7 +861,7 @@ async fn unusable_checkpoint_at_target_preserves_structural_error() {
         .unwrap();
     let engine = SyncEngine::new_with_store(store);
 
-    assert_result_error_with_message(
+    assert!(matches!(
         LogSegment::for_snapshot_impl(
             engine.storage_handler().as_ref(),
             log_root,
@@ -870,9 +870,13 @@ async fn unusable_checkpoint_at_target_preserves_structural_error() {
             Some(2),
             None,
         ),
-        "Generic delta kernel error: LogSegment end version 1 not the same as the specified end \
-         version 2",
-    );
+        Err(crate::Error::Kernel(KernelError::LogSegment(
+            super::LogSegmentError::EndVersionMismatch {
+                actual: 1,
+                requested: 2,
+            }
+        )))
+    ));
 }
 
 #[tokio::test]
@@ -1778,26 +1782,38 @@ async fn test_non_contiguous_log() {
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
-    // check the error message up to the timestamp
-    let expected_error_pattern = "Generic delta kernel error: Expected contiguous commit files, \
-        but found gap: ParsedLogPath { location: FileMeta { location: Url { scheme: \"memory\", \
-        cannot_be_a_base: false, username: \"\", password: None, host: None, port: None, path: \
-        \"/_delta_log/00000000000000000000.json\", query: None, fragment: None }, last_modified:";
-    assert_result_error_with_message(log_segment_res, expected_error_pattern);
+    assert!(matches!(
+        log_segment_res,
+        Err(crate::Error::Kernel(KernelError::LogSegment(
+            super::LogSegmentError::CommitGap {
+                previous: 0,
+                next: 2
+            }
+        )))
+    ));
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
-    assert_result_error_with_message(
+    assert!(matches!(
         log_segment_res,
-        "Generic delta kernel error: Expected the first commit to have version 1",
-    );
+        Err(crate::Error::Kernel(KernelError::LogSegment(
+            super::LogSegmentError::StartVersionMismatch {
+                expected: 1,
+                actual: Some(2)
+            }
+        )))
+    ));
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
-    assert_result_error_with_message(
+    assert!(matches!(
         log_segment_res,
-        "Generic delta kernel error: LogSegment end version 0 not the same as the specified end \
-        version 1",
-    );
+        Err(crate::Error::Kernel(KernelError::LogSegment(
+            super::LogSegmentError::EndVersionMismatch {
+                actual: 0,
+                requested: 1
+            }
+        )))
+    ));
 }
 
 #[tokio::test]
@@ -1812,7 +1828,12 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
     )
     .await;
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0));
-    assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
+    assert!(matches!(
+        log_segment_res,
+        Err(crate::Error::Kernel(KernelError::CommitRange(
+            crate::commit_range::CommitRangeError::Reversed { start: 1, end: 0 }
+        )))
+    ));
 }
 
 #[test_log::test(rstest::rstest)]
@@ -3560,7 +3581,12 @@ async fn for_timestamp_conversion_no_commit_files() {
 
     let res =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
-    assert_result_error_with_message(res, "Generic delta kernel error: No files in log segment");
+    assert!(matches!(
+        res,
+        Err(crate::Error::Kernel(KernelError::LogSegment(
+            super::LogSegmentError::Empty
+        )))
+    ));
 }
 
 #[tokio::test]
@@ -3762,19 +3788,15 @@ fn test_log_segment_contiguous_commit_files() {
         None,
         None,
     );
-    assert_result_error_with_message(
+    assert!(matches!(
         log_segment,
-        "Generic delta kernel error: Expected contiguous commit files, but found gap: \
-        ParsedLogPath { location: FileMeta { location: Url { scheme: \
-        \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/_delta_log/00000000000000000001.json\", query: None, fragment: None }, last_modified: \
-        0, size: 0 }, filename: \"00000000000000000001.json\", extension: \"json\", version: 1, \
-        file_type: Commit } -> ParsedLogPath { location: FileMeta { location: Url { scheme: \
-        \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/_delta_log/00000000000000000003.json\", query: None, fragment: None }, last_modified: \
-        0, size: 0 }, filename: \"00000000000000000003.json\", extension: \"json\", version: 3, \
-        file_type: Commit }",
-    );
+        Err(crate::Error::Kernel(KernelError::LogSegment(
+            super::LogSegmentError::CommitGap {
+                previous: 1,
+                next: 3
+            }
+        )))
+    ));
 }
 
 /// `checkpoint_sidecars()` distinguishes "the matched hint lists zero sidecars" (`Some(&[])`) from

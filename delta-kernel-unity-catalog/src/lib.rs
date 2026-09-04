@@ -6,6 +6,7 @@ mod errors;
 mod utils;
 
 pub use committer::UCCommitter;
+use delta_kernel::error::ErrorContext;
 use delta_kernel::snapshot::SnapshotBuilder;
 use delta_kernel::{DeltaResult, KernelError, LogPath, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
@@ -35,11 +36,8 @@ pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> DeltaRe
     sorted
         .into_iter()
         .map(|c| {
-            let file_size = c.file_size.try_into().map_err(|_| {
-                KernelError::generic(format!(
-                    "commit file_size {} does not fit in FileSize",
-                    c.file_size
-                ))
+            let file_size = c.file_size.try_into().map_err(|source| {
+                KernelError::integer_conversion("commit file_size", c.file_size, "FileSize", source)
             })?;
             LogPath::staged_commit(
                 table_root.clone(),
@@ -63,14 +61,19 @@ pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> DeltaRe
 /// Returns an error if the response's location is not a valid URL, if [`log_tail_from_commits`]
 /// fails, or if `latest_table_version` is negative.
 pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> DeltaResult<SnapshotBuilder> {
-    let table_root = Url::parse(&resp.metadata.location)
-        .map_err(|e| KernelError::generic(format!("invalid table location: {e}")))?;
+    let table_root = Url::parse(&resp.metadata.location).map_err(|source| {
+        KernelError::from(source)
+            .with_context(ErrorContext::File {
+                path: resp.metadata.location.clone(),
+            })
+            .with_context(ErrorContext::Operation("parse UC table location"))
+    })?;
     let log_tail = log_tail_from_commits(&resp.commits, table_root.clone())?;
     let mut builder = Snapshot::builder_for(table_root).with_log_tail(log_tail);
     if let Some(version) = resp.latest_table_version {
-        let max_catalog_version: u64 = version
-            .try_into()
-            .map_err(|_| KernelError::generic("catalog reported a negative table version"))?;
+        let max_catalog_version: u64 = version.try_into().map_err(|source| {
+            KernelError::integer_conversion("catalog table version", version, "u64", source)
+        })?;
         builder = builder.with_max_catalog_version(max_catalog_version);
     }
     Ok(builder)
@@ -128,10 +131,17 @@ mod tests {
             .with_max_catalog_version(max_catalog_version)
             .build(&engine);
 
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Log tail versions 1 and 3 are not contiguous"));
+        let error = result.unwrap_err();
+        let delta_kernel::Error::Delta(delta_error) = &error else {
+            panic!("expected a non-contiguous-version Delta error, got {error:?}");
+        };
+        assert_eq!(
+            delta_error.condition(),
+            delta_kernel::error::DeltaErrorCondition::DeltaVersionsNotContiguous
+        );
+        assert_eq!(delta_error.parameter("startVersion"), Some("1"));
+        assert_eq!(delta_error.parameter("endVersion"), Some("3"));
+        assert_eq!(delta_error.parameter("versionToLoad"), Some("-1"));
     }
 
     /// Builds a `LoadTableResponse` with no commits at the given location and ratified version.
@@ -151,14 +161,34 @@ mod tests {
     fn snapshot_builder_from_load_table_rejects_negative_version() {
         let resp = load_table_response("memory:///my_table", -1);
         let err = snapshot_builder_from_load_table(&resp).unwrap_err();
-        assert!(err.to_string().contains("negative table version"));
+        assert!(
+            matches!(err, delta_kernel::Error::Kernel(KernelError::IntegerConversion { field: "catalog table version", value, target: "u64", .. }) if value == "-1")
+        );
     }
 
     #[test]
     fn snapshot_builder_from_load_table_rejects_invalid_location() {
         let resp = load_table_response("not a url", 0);
-        let err = snapshot_builder_from_load_table(&resp).unwrap_err();
-        assert!(err.to_string().contains("invalid table location"));
+        let error = snapshot_builder_from_load_table(&resp).unwrap_err();
+        let delta_kernel::Error::Kernel(KernelError::Context {
+            context: ErrorContext::Operation("parse UC table location"),
+            source,
+        }) = error
+        else {
+            panic!("expected UC location parsing context, got {error:?}");
+        };
+        let KernelError::Context {
+            context: ErrorContext::File { path },
+            source,
+        } = *source
+        else {
+            panic!("expected table location context, got {source:?}");
+        };
+        assert_eq!(path, resp.metadata.location);
+        assert!(matches!(
+            source.as_ref(),
+            KernelError::InvalidUrl(url::ParseError::RelativeUrlWithoutBase)
+        ));
     }
 
     #[rstest]
@@ -206,6 +236,14 @@ mod tests {
 
         let err = log_tail_from_commits(&commits, table_root).unwrap_err();
 
-        assert!(err.to_string().contains("does not fit in FileSize"));
+        assert!(matches!(
+            err,
+            delta_kernel::Error::Kernel(KernelError::IntegerConversion {
+                field: "commit file_size",
+                value,
+                target: "FileSize",
+                ..
+            }) if value == "-1"
+        ));
     }
 }

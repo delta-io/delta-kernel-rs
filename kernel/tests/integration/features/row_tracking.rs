@@ -55,8 +55,9 @@ async fn create_row_tracking_table_with_features(
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
     Arc<DynObjectStore>,
 )> {
-    let tmp_test_dir_url = Url::from_directory_path(tmp_dir.path())
-        .map_err(|_| KernelError::generic("Failed to convert directory path to URL"))?;
+    let tmp_test_dir_url = Url::from_directory_path(tmp_dir.path()).map_err(|_| {
+        KernelError::invalid_table_location("Failed to convert directory path to URL")
+    })?;
     let (store, engine, table_location) = engine_store_setup(table_name, Some(&tmp_test_dir_url));
 
     let reader_features = extra_reader_writer_features.to_vec();
@@ -74,7 +75,11 @@ async fn create_row_tracking_table_with_features(
         writer_features,
     )
     .await
-    .map_err(|e| KernelError::generic(format!("Failed to create table: {e}")))?;
+    .map_err(|error| {
+        error.with_context(delta_kernel::error::ErrorContext::Operation(
+            "create row-tracking table",
+        ))
+    })?;
 
     Ok((table_url, Arc::new(engine), store))
 }
@@ -842,8 +847,9 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     let schema = schema_ref! { nullable "number": INTEGER };
 
     // Create a table without row tracking
-    let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path())
-        .map_err(|_| KernelError::generic("Failed to convert directory path to URL"))?;
+    let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).map_err(|_| {
+        KernelError::invalid_table_location("Failed to convert directory path to URL")
+    })?;
     let (store, engine, table_location) =
         engine_store_setup("test_no_row_tracking", Some(&tmp_test_dir_url));
 
@@ -857,7 +863,11 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
         vec![], // no writer features
     )
     .await
-    .map_err(|e| KernelError::generic(format!("Failed to create table: {e}")))?;
+    .map_err(|error| {
+        error.with_context(delta_kernel::error::ErrorContext::Operation(
+            "create row-tracking table",
+        ))
+    })?;
 
     let engine = Arc::new(engine);
 
@@ -1352,7 +1362,7 @@ async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
             json_bytes.into(),
         )
         .await
-        .map_err(|e| KernelError::generic(e.to_string()))?;
+        .map_err(KernelError::from)?;
 
     // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the
     // compaction file.

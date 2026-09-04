@@ -54,7 +54,7 @@ pub(super) fn parse(tokens: Vec<Token>) -> DeltaResult<Comparison> {
     };
     let comparison = parser.parse_comparison()?;
     if parser.advance().is_some() {
-        return Err(KernelError::generic(
+        return Err(KernelError::invalid_expression(
             "unexpected trailing input: only a single comparison is supported",
         )
         .into());
@@ -136,7 +136,7 @@ impl Parser {
 /// Build the `expected {what}, found {found:?}` error shared by the parser's operand and operator
 /// sites.
 fn expected(what: &str, found: Option<Token>) -> KernelError {
-    KernelError::generic(format!("expected {what}, found {found:?}"))
+    KernelError::invalid_expression(format!("expected {what}, found {found:?}"))
 }
 
 #[cfg(test)]

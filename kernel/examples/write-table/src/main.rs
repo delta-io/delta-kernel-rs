@@ -65,10 +65,9 @@ async fn try_main() -> DeltaResult<()> {
     // Check if path is a directory and if not, create it
     if !Path::new(&cli.location_args.path).exists() {
         create_dir_all(&cli.location_args.path).map_err(|e| {
-            KernelError::generic(format!(
-                "Failed to create directory {}: {e}",
-                cli.location_args.path
-            ))
+            KernelError::from(e).with_context(delta_kernel::error::ErrorContext::File {
+                path: cli.location_args.path.clone(),
+            })
         })?;
     }
 
@@ -104,7 +103,7 @@ async fn try_main() -> DeltaResult<()> {
     let mut retries = 0;
     let committed = loop {
         if retries > 5 {
-            return Err(KernelError::generic(
+            return Err(KernelError::invalid_transaction_state(
                 "Exceeded maximum 5 retries for committing transaction",
             )
             .into());
@@ -114,7 +113,10 @@ async fn try_main() -> DeltaResult<()> {
             CommitResult::ConflictedTransaction(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
                 println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
-                return Err(KernelError::generic("Commit failed").into());
+                return Err(KernelError::invalid_transaction_state(format!(
+                    "Commit conflicted at version {conflicting_version}"
+                ))
+                .into());
             }
             CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
@@ -164,7 +166,7 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
         .map(|field| -> DeltaResult<_> {
             let parts: Vec<&str> = field.split(':').collect();
             if parts.len() != 2 {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::schema(format!(
                     "Invalid field specification: {field}. Expected format: field_name:data_type"
                 ))
                 .into());
@@ -179,7 +181,7 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
                 "boolean" => DataType::BOOLEAN,
                 "timestamp" => DataType::TIMESTAMP,
                 _ => {
-                    return Err(KernelError::generic(format!(
+                    return Err(KernelError::unsupported(format!(
                         "Unsupported data type: {data_type}"
                     ))
                     .into());
@@ -240,7 +242,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
                 Arc::new(TimestampMicrosecondArray::from(data))
             }
             _ => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::unsupported(format!(
                     "Unsupported data type for sample data: {:?}",
                     field.data_type()
                 ))

@@ -63,7 +63,7 @@ impl StorageHandler for SyncStorageHandler {
         let iter = metas.into_iter().map(move |meta| {
             let location = base_url
                 .join(meta.location.as_ref())
-                .map_err(|e| KernelError::generic(format!("Failed to construct URL: {e}")))?;
+                .map_err(KernelError::from)?;
             Ok(FileMeta {
                 location,
                 last_modified: meta.last_modified.timestamp_millis(),

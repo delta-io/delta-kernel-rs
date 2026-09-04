@@ -406,10 +406,17 @@ Because the engine allocates these errors, the engine is also responsible for fr
 them. Kernel returns the error pointer immediately and does not retain it.
 
 The `EngineError` struct contains an `FFIKernelError` enum that classifies the error type
-(for example, `GenericError`, `FileNotFoundError`, or `InvalidUrlError`). Existing error codes
-retain their values from 0 through 46. Code 47, `DeltaError`, identifies a user-facing Delta
-failure. The callback receives its rendered message through the existing `KernelStringSlice`
-argument.
+(for example, `FileNotFoundError`, `InvalidUrlError`, or `IntegerConversionError`). Existing
+error codes retain their numeric values. `DeltaError` identifies a user-facing Delta failure;
+new Kernel error families have distinct appended codes. `GenericError` is reserved for legacy
+inbound engine callbacks and is not emitted by Kernel. The callback receives the rendered
+message through `KernelStringSlice`.
+
+Rust callers match `KernelError` variants and inspect their structured payloads. Operation
+context and backtraces preserve the underlying FFI classification. When an engine callback
+returns only a code and message, Kernel retains that payload as `ForeignCallback` if the
+original typed error cannot be reconstructed. Sources and structured fields do not cross
+the existing FFI wire format.
 
 The message string passed to `allocate_error` is valid only for the duration of the callback, so
 you must copy it if you need to keep it.

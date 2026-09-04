@@ -214,21 +214,25 @@ impl FfiBytesIter {
         let array = arrow_array::make_array(array_data);
 
         let Some(binary) = array.as_any().downcast_ref::<BinaryArray>() else {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::engine_data_type(format!(
                 "CBytesIterator must yield BinaryArray, got {:?}",
                 array.data_type()
             ))
             .into());
         };
         if binary.len() != 1 {
-            return Err(KernelError::generic(format!(
-                "CBytesIterator array must contain exactly one row, got {}",
-                binary.len()
-            ))
+            return Err(delta_kernel::error::FfiContractError::CountMismatch {
+                field: "CBytesIterator",
+                actual: binary.len(),
+                expected: 1,
+            }
             .into());
         }
         if binary.is_null(0) {
-            return Err(KernelError::generic("CBytesIterator array row must not be null").into());
+            return Err(delta_kernel::error::FfiContractError::NullArgument {
+                field: "CBytesIterator row",
+            }
+            .into());
         }
 
         // TODO: this copies the payload bytes, but could be made zero-copy by
@@ -296,16 +300,16 @@ impl FfiFileMetaIter {
         let array = arrow_array::make_array(array_data);
 
         let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() else {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::engine_data_type(format!(
                 "CFileMetaIterator must yield StructArray, got {:?}",
                 array.data_type()
             ))
             .into());
         };
         if struct_array.is_empty() {
-            return Err(KernelError::generic(
-                "CFileMetaIterator batch must contain at least one row",
-            )
+            return Err(delta_kernel::error::FfiContractError::EmptyArgument {
+                field: "CFileMetaIterator batch",
+            }
             .into());
         }
 
@@ -318,20 +322,20 @@ impl FfiFileMetaIter {
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                KernelError::generic("CFileMetaIterator: location column is not Utf8")
+                KernelError::unexpected_column_type("CFileMetaIterator location: Utf8")
             })?;
         let last_modified_col = struct_array
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| {
-                KernelError::generic("CFileMetaIterator: last_modified column is not Int64")
+                KernelError::unexpected_column_type("CFileMetaIterator last_modified: Int64")
             })?;
         let size_col = struct_array
             .column(2)
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| KernelError::generic("CFileMetaIterator: size column is not UInt64"))?;
+            .ok_or_else(|| KernelError::unexpected_column_type("CFileMetaIterator size: UInt64"))?;
 
         // The fixed schema declares every column non-null; reject any batch that violates that
         // contract up front so the per-row decode below can safely call `value(i)`.
@@ -339,9 +343,9 @@ impl FfiFileMetaIter {
             || last_modified_col.null_count() != 0
             || size_col.null_count() != 0
         {
-            return Err(KernelError::generic(
-                "CFileMetaIterator batch must not contain null fields",
-            )
+            return Err(delta_kernel::error::FfiContractError::NullArgument {
+                field: "CFileMetaIterator batch fields",
+            }
             .into());
         }
 

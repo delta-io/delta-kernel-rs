@@ -31,7 +31,7 @@ mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
 pub use filesystem::FileSystemCommitter;
-pub use publish_types::{CatalogCommit, PublishMetadata};
+pub use publish_types::{CatalogCommit, PublishError, PublishMetadata};
 
 use crate::{DeltaResult, DeltaResultIterator, Engine, FilteredEngineData};
 

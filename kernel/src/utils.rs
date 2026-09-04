@@ -146,7 +146,7 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| KernelError::generic(format!("System time before Unix epoch: {e}")))
+        .map_err(KernelError::ClockBeforeEpoch)
         .map_err(crate::Error::from)
 }
 
@@ -154,7 +154,14 @@ pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
 pub(crate) fn current_time_ms() -> DeltaResult<i64> {
     let duration = current_time_duration()?;
     i64::try_from(duration.as_millis())
-        .map_err(|_| KernelError::generic("Current timestamp exceeds i64 millisecond range"))
+        .map_err(|source| {
+            KernelError::integer_conversion(
+                "current timestamp milliseconds",
+                duration.as_millis(),
+                "i64",
+                source,
+            )
+        })
         .map_err(crate::Error::from)
 }
 

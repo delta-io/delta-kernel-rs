@@ -43,6 +43,21 @@ pub(crate) use writer::try_write_crc_file;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::{DeltaResult, KernelError, Version};
 
+/// Invalid action counts in a version checksum file.
+#[derive(Debug, thiserror::Error)]
+pub enum CrcError {
+    /// A checksum must contain exactly one protocol and one metadata action.
+    #[error("CRC file has invalid {field}: expected 1, got {actual}")]
+    InvalidActionCount {
+        /// The checksum version from its file name.
+        version: Version,
+        /// The action count field that failed validation.
+        field: &'static str,
+        /// The count read from the checksum file.
+        actual: i64,
+    },
+}
+
 // ============================================================================
 // Crc: in-memory representation
 // ============================================================================
@@ -178,9 +193,11 @@ impl Crc {
             ("numProtocol", raw.num_protocol),
         ] {
             if value != 1 {
-                return Err(KernelError::generic(format!(
-                    "CRC file has invalid {name}: expected 1, got {value}"
-                ))
+                return Err(KernelError::Crc(CrcError::InvalidActionCount {
+                    version,
+                    field: name,
+                    actual: value,
+                })
                 .into());
             }
         }
@@ -310,9 +327,12 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{Crc, CrcRaw, DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
+    use super::{
+        Crc, CrcError, CrcRaw, DomainMetadataState, FileStats, FileStatsState, SetTransactionState,
+    };
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::table_features::TableFeature;
+    use crate::KernelError;
 
     /// A minimal valid protocol for round-trip tests. `Protocol::default()` is `(0, 0)`, which
     /// `try_new` rejects, so a default protocol can't round-trip through serde (deserialization
@@ -690,13 +710,15 @@ mod tests {
     ) {
         let (m, p) = counts(bad);
         let json = crc_json_with_counts(m, p);
-        let err = Crc::try_from_json_bytes(json.as_bytes(), 0)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(field),
-            "expected error to mention {field} for value {bad}, got: {err}"
-        );
+        let err = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::Crc(CrcError::InvalidActionCount {
+                version: 0,
+                field: actual_field,
+                actual,
+            })) if actual_field == field && actual == bad
+        ));
     }
 
     // ===== protocol validation on the CRC deserialization path =====

@@ -150,11 +150,13 @@ impl Snapshot {
             }
             // Case B: incremental path only moves forward.
             if end_version < existing_snapshot_version {
-                return Err(KernelError::Generic(format!(
-                    "Requested snapshot version {end_version} is older than snapshot \
-                     hint version {existing_snapshot_version}"
-                ))
-                .into());
+                return Err(
+                    KernelError::Snapshot(super::SnapshotError::VersionBeforeHint {
+                        requested: end_version,
+                        hint: existing_snapshot_version,
+                    })
+                    .into(),
+                );
             }
         } else {
             tracing::Span::current().record("version", existing_snapshot_version);
@@ -375,11 +377,13 @@ impl Snapshot {
         if new_end_version < existing_snapshot_version {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
-            return Err(KernelError::Generic(format!(
-                "Unexpected state: the newest version in the log {new_end_version} is \
-                 older than the existing snapshot version {existing_snapshot_version}"
-            ))
-            .into());
+            return Err(
+                KernelError::Snapshot(super::SnapshotError::LogVersionRegressed {
+                    latest: new_end_version,
+                    snapshot: existing_snapshot_version,
+                })
+                .into(),
+            );
         }
         if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version {
             if new_checkpoint_version > existing_snapshot_version {
@@ -842,7 +846,7 @@ mod tests {
             size: 100,
         };
         let parsed_path = ParsedLogPath::try_from(file_meta)?
-            .ok_or_else(|| KernelError::Generic("Failed to parse log path".to_string()))?;
+            .ok_or_else(|| KernelError::invalid_log_path("Failed to parse log path"))?;
         let log_tail = vec![parsed_path];
 
         // Create new snapshot from base to version 2 using try_new_from directly
@@ -931,8 +935,9 @@ mod tests {
         );
         assert!(matches!(
             older_version,
-            Err(crate::Error::Kernel(KernelError::Generic(msg)))
-                if msg.contains("older than snapshot hint version")
+            Err(crate::Error::Kernel(KernelError::Snapshot(
+                crate::snapshot::SnapshotError::VersionBeforeHint { requested: 0, .. }
+            )))
         ));
 
         Ok(())
@@ -1211,8 +1216,12 @@ mod tests {
             .build(&engine);
         assert!(matches!(
             snapshot_res,
-            Err(crate::Error::Kernel(KernelError::Generic(msg)))
-                if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
+            Err(crate::Error::Kernel(KernelError::Snapshot(
+                crate::snapshot::SnapshotError::VersionBeforeHint {
+                    requested: 0,
+                    hint: 1,
+                }
+            )))
         ));
 
         // 2. new version == existing version

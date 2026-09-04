@@ -39,6 +39,23 @@ impl NearestTimestamp {
 /// Represents errors that can occur when converting commit timestamps to versions.
 #[derive(Debug, thiserror::Error)]
 pub enum LogHistoryError {
+    /// The earliest recreatable version exceeds the snapshot version.
+    #[error("earliest recreatable version {earliest} exceeds snapshot version {snapshot}")]
+    RecreateVersionAfterSnapshot {
+        /// First recreatable version.
+        earliest: Version,
+        /// Snapshot upper bound.
+        snapshot: Version,
+    },
+    /// A catalog ratified version zero without the required published commit.
+    #[error(
+        "expected a published v0 commit for catalog-managed table {log_root}, but the log \
+         listing returned no commits"
+    )]
+    MissingPublishedVersionZero {
+        /// Table log location.
+        log_root: Url,
+    },
     /// No commit files were found in the log directory.
     #[error("No commits found in log directory {log_root}")]
     NoCommitsFound {

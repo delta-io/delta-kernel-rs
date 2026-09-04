@@ -25,7 +25,7 @@ pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -
     let data = storage
         .read_files(vec![(url, None)])?
         .next()
-        .ok_or_else(|| KernelError::generic("CRC file read returned no data"))??;
+        .ok_or_else(|| KernelError::MissingData("CRC file read returned no data".into()))??;
     tracing::Span::current().record("bytes_read", data.len() as u64);
     Crc::try_from_json_bytes(&data, crc_path.version)
 }

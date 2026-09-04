@@ -26,8 +26,10 @@ values, and user-facing Delta errors use the appended `DeltaError = 47` code. Th
 allocator callback signature is unchanged and receives the rendered message as a borrowed
 `KernelStringSlice`; an allocator that retains it must copy it before returning. `DeltaError` is
 an outbound classification. If an engine returns code 47 through an upcall, kernel preserves its
-message in a generic kernel error because the engine cannot author a structured Delta condition
-through `EngineExecError`.
+code and message in `KernelError::ForeignCallback` because the engine cannot author a structured
+Delta condition through `EngineExecError`. `GenericError = 5` is reserved for legacy inbound
+callbacks, never emitted by Kernel. New semantic error codes are appended without renumbering
+existing codes. `Context` and `Backtraced` wrappers preserve the underlying FFI classification.
 
 ## Key Files
 

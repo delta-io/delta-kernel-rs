@@ -58,6 +58,53 @@ pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
 
+/// Missing scan state or incompatible versions supplied to a scan operation.
+#[derive(Debug, thiserror::Error)]
+pub enum ScanError {
+    /// A sequential replay has not been exhausted before finishing.
+    #[error("Must exhaust iterator before calling finish()")]
+    IncompleteReplay,
+    /// A single-file checkpoint has no manifest reader.
+    #[error("A single checkpoint part requires a manifest reader")]
+    MissingManifestReader,
+    /// Row tracking requires a metadata property or per-file value that is absent.
+    #[error("Missing row tracking value {field}")]
+    MissingRowTrackingValue {
+        /// Protocol field or table property that must be present.
+        field: &'static str,
+    },
+    /// No unused generated name remains for the row-index column.
+    #[error("Could not generate an unused row index column name")]
+    RowIndexNameExhausted,
+    /// An incremental scan base must precede the target version.
+    #[error(
+        "IncrementalScanBuilder: base_version ({base}) must be less than target_version ({target})"
+    )]
+    InvalidIncrementalRange {
+        /// Exclusive lower version bound.
+        base: Version,
+        /// Inclusive upper version bound.
+        target: Version,
+    },
+    /// A cached scan is from a version later than the snapshot being scanned.
+    #[error("existing_version {existing} is greater than current version {current}")]
+    FutureScan {
+        /// Version of the supplied cached scan.
+        existing: Version,
+        /// Current snapshot version.
+        current: Version,
+    },
+    /// A serialized predicate has no corresponding schema.
+    #[error("Invalid serialized internal state. Expected predicate schema.")]
+    MissingPredicateSchema,
+    /// A checkpoint processor received a commit batch.
+    #[error("Parallel checkpoint processor may only be applied to checkpoint files")]
+    ExpectedCheckpoint,
+    /// A terminal stream operation was attempted after an earlier error.
+    #[error("IncrementalScanStream: cannot finish a stream that previously errored")]
+    FailedStream,
+}
+
 #[cfg(test)]
 pub(crate) mod test_utils;
 
@@ -384,7 +431,7 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(KernelError::generic(
+            return Err(KernelError::schema(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
             )
@@ -920,11 +967,10 @@ impl Scan {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
-            return Err(KernelError::Generic(format!(
-                "existing_version {} is greater than current version {}",
-                existing_version,
-                self.snapshot.version()
-            ))
+            return Err(KernelError::Scan(ScanError::FutureScan {
+                existing: existing_version,
+                current: self.snapshot.version(),
+            })
             .into());
         }
 
@@ -1328,8 +1374,8 @@ impl Scan {
                     .get_selection_vector(engine.as_ref(), &table_root)?;
                 let meta = FileMeta {
                     last_modified: 0,
-                    size: scan_file.size.try_into().map_err(|_| {
-                        KernelError::generic("Unable to convert scan file size into FileSize")
+                    size: scan_file.size.try_into().map_err(|source| {
+                        KernelError::integer_conversion("scan file size", scan_file.size, "u64", source)
                     })?,
                     location: file_path,
                 };

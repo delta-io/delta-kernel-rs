@@ -111,7 +111,7 @@ pub(crate) fn to_df_struct_columns(
         KernelExpression::StructPatch(patch) => {
             struct_columns_from_patch(patch, input_schema, output_type)
         }
-        _ => Err(KernelError::generic(format!(
+        _ => Err(KernelError::invalid_expression(format!(
             "Expression must be a Struct or StructPatch, got {expr:?}"
         ))
         .into()),
@@ -258,7 +258,7 @@ fn struct_columns_from_fields(
     target: &StructType,
 ) -> DeltaResult<StructColumns> {
     if fields.len() != target.num_fields() {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::invalid_expression(format!(
             "Struct expression field count mismatch: {} fields in expression but {} in schema",
             fields.len(),
             target.num_fields()
@@ -303,7 +303,7 @@ fn struct_columns_from_patch(
     let (mut source_struct, mut source_expr) = (input_schema, None);
     if let Some(path) = patch.input_path() {
         let KernelDataType::Struct(nested) = input_schema.field_at(path)?.data_type() else {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::invalid_expression(format!(
                 "StructPatch input_path '{path}' does not resolve to a struct"
             ))
             .into());
@@ -324,7 +324,9 @@ fn struct_columns_from_patch(
                             expr: &KernelExpression|
      -> DeltaResult<()> {
         let field = output_fields.next().ok_or_else(|| {
-            KernelError::generic("StructPatch produced more fields than the output schema has")
+            KernelError::invalid_expression(
+                "StructPatch produced more fields than the output schema has",
+            )
         })?;
         let value = to_df_expr(expr, input_schema, Some(field.data_type()))?;
         pairs.push((field.name().to_string(), value));
@@ -335,7 +337,9 @@ fn struct_columns_from_patch(
                            name: &str|
      -> DeltaResult<()> {
         let field = output_fields.next().ok_or_else(|| {
-            KernelError::generic("StructPatch produced more fields than the output schema has")
+            KernelError::invalid_expression(
+                "StructPatch produced more fields than the output schema has",
+            )
         })?;
         let value = match &source_expr {
             Some(base) => get_field(base.clone(), name.to_string()),
@@ -377,7 +381,7 @@ fn struct_columns_from_patch(
         .filter(|fp| !fp.optional)
         .count();
     if used_required_field_patches < required {
-        return Err(KernelError::generic(
+        return Err(KernelError::invalid_expression(
             "StructPatch has non-optional field patches that reference missing input fields",
         )
         .into());
@@ -388,7 +392,7 @@ fn struct_columns_from_patch(
     }
 
     if output_fields.next().is_some() {
-        return Err(KernelError::generic(
+        return Err(KernelError::invalid_expression(
             "StructPatch produced fewer fields than the output schema has",
         )
         .into());
@@ -449,7 +453,7 @@ fn map_to_struct_to_df_expr(
         let arrow_type = field
             .data_type()
             .try_into_arrow()
-            .map_err(KernelError::generic_err)?;
+            .map_err(KernelError::from)?;
         args.push(lit(field.name().to_string()));
         args.push(cast(value, arrow_type));
     }
@@ -504,7 +508,7 @@ impl ParseJsonUdf {
         let arrow_schema: ArrowSchema = output_schema
             .as_ref()
             .try_into_arrow()
-            .map_err(KernelError::generic_err)?;
+            .map_err(KernelError::from)?;
         Ok(Self {
             return_type: ArrowDataType::Struct(arrow_schema.fields().clone()),
             // Coerces Utf8 / LargeUtf8 / Utf8View, mirroring kernel's `parse_json_impl`.

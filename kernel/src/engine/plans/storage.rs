@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
@@ -54,10 +53,25 @@ impl StorageHandler for PlanBasedStorageHandler {
     }
 
     fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
-        self.execute_io(IoOperation::head_file(path.clone()))?
-            .into_file_meta()?
-            .exactly_one()
-            .map_err(|e| KernelError::generic(format!("Expected exactly one file meta: {e}")))?
+        let mut results = self
+            .execute_io(IoOperation::head_file(path.clone()))?
+            .into_file_meta()?;
+        let first = results.next().transpose()?.ok_or_else(|| {
+            KernelError::Plan(crate::plans::PlanError::OutputCount {
+                operation: "head file",
+                expected: 1,
+                actual_at_least: 0,
+            })
+        })?;
+        if results.next().transpose()?.is_some() {
+            return Err(KernelError::Plan(crate::plans::PlanError::OutputCount {
+                operation: "head file",
+                expected: 1,
+                actual_at_least: 2,
+            })
+            .into());
+        }
+        Ok(first)
     }
 
     fn delete(&self, _path: &Url) -> DeltaResult<()> {

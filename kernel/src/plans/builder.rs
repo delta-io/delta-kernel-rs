@@ -147,13 +147,12 @@ impl PlanBuilder {
         let cols = Vec::from_iter(file_constant_columns.iter().map(|&c| c.to_string()));
         for (i, file) in files.iter().enumerate() {
             if file.file_constants.len() != cols.len() {
-                return Err(KernelError::generic(format!(
-                    "scan: file {i} has {} constant value(s) {:?} for {} file-constant column(s) {:?}",
-                    file.file_constants.len(),
-                    file.file_constants,
-                    cols.len(),
-                    cols,
-                )).into());
+                return Err(KernelError::Plan(super::PlanError::FileConstantCount {
+                    file: i,
+                    expected: cols.len(),
+                    actual: file.file_constants.len(),
+                })
+                .into());
             }
         }
         check_file_constant_columns(&schema, &cols, "scan file_constant_columns")?;
@@ -195,7 +194,7 @@ impl PlanBuilder {
         let width = schema.fields().count();
         for (i, row) in rows.iter().enumerate() {
             if row.len() != width {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::schema(format!(
                     "values: row {i} has {} value(s) {row:?} but schema has {width} field(s) {:?}",
                     row.len(),
                     Vec::from_iter(schema.fields().map(|f| f.name())),
@@ -476,12 +475,10 @@ impl PlanBuilder {
         let probe_keys = Vec::from_iter(probe_keys);
         let build_keys = Vec::from_iter(build_keys);
         if probe_keys.len() != build_keys.len() {
-            return Err(KernelError::generic(format!(
-                "join: {} probe key(s) {probe_keys:?} but {} build key(s) {build_keys:?}; \
-                 they must match in length.",
-                probe_keys.len(),
-                build_keys.len(),
-            ))
+            return Err(KernelError::Plan(super::PlanError::JoinKeyCount {
+                probe: probe_keys.len(),
+                build: build_keys.len(),
+            })
             .into());
         }
         check_columns_resolve(self.schema(), &probe_keys, "join probe")?;
@@ -527,10 +524,13 @@ impl PlanBuilder {
     pub fn union_all(inputs: impl IntoIterator<Item = PlanBuilder>) -> DeltaResult<Self> {
         let inputs = Vec::from_iter(inputs);
         let Some(schema) = inputs.first().map(|b| Arc::clone(b.schema())) else {
-            return Err(KernelError::generic("union_all: requires at least one input").into());
+            return Err(KernelError::Plan(super::PlanError::EmptyInput {
+                operation: "union_all",
+            })
+            .into());
         };
         if let Some(i) = inputs.iter().position(|b| b.schema() != &schema) {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::schema(format!(
                 "union_all: input {i} has a schema differing from input 0: {:?} vs {:?}",
                 inputs[i].schema(),
                 schema,
@@ -613,15 +613,12 @@ impl From<Values> for PlanBuilder {
 fn check_columns_resolve<'a>(
     schema: &SchemaRef,
     cols: impl IntoIterator<Item = &'a ColumnName>,
-    ctx: &str,
+    ctx: &'static str,
 ) -> DeltaResult<()> {
     for col in cols {
-        schema.field_at(col).map_err(|_| {
-            KernelError::generic(format!(
-                "{ctx}: column `{col}` not found; schema has {:?}",
-                Vec::from_iter(schema.fields().map(|f| f.name())),
-            ))
-        })?;
+        schema
+            .field_at(col)
+            .map_err(|error| error.with_context(crate::error::ErrorContext::Operation(ctx)))?;
     }
     Ok(())
 }
@@ -636,14 +633,14 @@ fn check_file_constant_columns<'a>(
 ) -> DeltaResult<()> {
     for name in names {
         let Some(field) = schema.field(name.as_str()) else {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::missing_column(format!(
                 "{ctx}: column `{name}` not found; schema has {:?}",
                 Vec::from_iter(schema.fields().map(|f| f.name())),
             ))
             .into());
         };
         if field.is_metadata_column() {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::schema(format!(
                 "{ctx}: column `{name}` is a metadata column"
             ))
             .into());
@@ -1278,10 +1275,6 @@ mod tests {
     #[case::values_row_width("schema has 1 field",
         || PlanBuilder::values(id_schema(), vec![vec!["a".into(), "b".into()]]))]
     // transforms referencing an absent column
-    #[case::filter_unknown_column("`nope` not found",
-        || vals(id_schema()).filter(col!("nope").is_not_null()))]
-    #[case::project_unknown_column("`nope` not found",
-        || vals(id_schema()).project(Expression::struct_from([col!("nope")]), id_schema()))]
     #[case::project_patch_missing_field("does not exist",
         || vals(id_schema()).project_patch(|p| p.drop("nope")))]
     #[case::aggregate_unknown_value("not found in schema",
@@ -1293,10 +1286,6 @@ mod tests {
         || PlanBuilder::union_all([vals(id_schema()), vals(x_schema())]))]
     #[case::union_empty("at least one input", || PlanBuilder::union_all([]))]
     // semi-join keys
-    #[case::join_unknown_probe_key("join probe: column `nope`",
-        || vals(id_schema()).semi_join(vals(x_schema()), [column_name!("nope")], [column_name!("x")]))]
-    #[case::join_unknown_build_key("join build: column `nope`",
-        || vals(id_schema()).anti_join(vals(x_schema()), [column_name!("id")], [column_name!("nope")]))]
     #[case::join_key_arity("must match",
         || vals(id_schema()).semi_join(vals(x_schema()), [column_name!("id")], [column_name!("x"), column_name!("x")]))]
     // dynamic scan file constants
@@ -1345,6 +1334,30 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::filter("filter", "nope",
+        || vals(id_schema()).filter(col!("nope").is_not_null()))]
+    #[case::project("project", "nope",
+        || vals(id_schema()).project(Expression::struct_from([col!("nope")]), id_schema()))]
+    #[case::join_probe("join probe", "nope",
+        || vals(id_schema()).semi_join(vals(x_schema()), [column_name!("nope")], [column_name!("x")]))]
+    #[case::join_build("join build", "nope",
+        || vals(id_schema()).anti_join(vals(x_schema()), [column_name!("id")], [column_name!("nope")]))]
+    #[case::dynamic_scan_dv("validate dynamic scan deletion-vector column", "dv", || {
+        build_dynamic_scan_with_schemas(dynamic_scan_input_missing("dv"), dynamic_scan_output_schema())
+    })]
+    fn unknown_columns_preserve_classification_and_operation(
+        #[case] operation: &str,
+        #[case] column: &str,
+        #[case] make: impl Fn() -> DeltaResult<PlanBuilder>,
+    ) {
+        let error = make().unwrap_err();
+        assert!(matches!(error, crate::Error::Kernel(KernelError::Context {
+            context: crate::error::ErrorContext::Operation(actual), source,
+        }) if actual == operation && matches!(source.as_ref(), KernelError::MissingColumn(field)
+            if field.contains(column))));
+    }
+
+    #[rstest::rstest]
     #[case::missing_path("path", || construct_dynamic_scan(dynamic_scan_input_missing("path")))]
     #[case::missing_size("size", || construct_dynamic_scan(dynamic_scan_input_missing("size")))]
     #[case::missing_filemod("filemod", || construct_dynamic_scan(dynamic_scan_input_missing("filemod")))]
@@ -1354,7 +1367,6 @@ mod tests {
     #[case::wrong_path_type("must have type string", || construct_dynamic_scan(dynamic_scan_input_with(StructField::not_null("path", DataType::BOOLEAN))))]
     #[case::wrong_size_type("must have type long", || construct_dynamic_scan(dynamic_scan_input_with(StructField::not_null("size", DataType::STRING))))]
     #[case::wrong_filemod_type("must have type long", || construct_dynamic_scan(dynamic_scan_input_with(StructField::not_null("filemod", DataType::STRING))))]
-    #[case::missing_dv("`dv`", || construct_dynamic_scan(dynamic_scan_input_missing("dv")))]
     #[case::wrong_dv_type("deletion-vector column `dv` must have type", || construct_dynamic_scan(dynamic_scan_input_with(StructField::nullable("dv", DataType::STRING))))]
     #[case::non_nullable_dv("deletion-vector column `dv` must be nullable", || construct_dynamic_scan(dynamic_scan_input_with(StructField::not_null("dv", DeletionVectorDescriptor::to_schema()))))]
     #[case::opaque_base_url("must be hierarchical and end in `/`", || {

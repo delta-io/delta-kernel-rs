@@ -212,7 +212,7 @@ fn selected_scan_file_batch(
             return Ok(FilteredEngineData::with_all_rows_selected(data));
         }
     }
-    Err(KernelError::generic("expected at least one scan file").into())
+    Err(KernelError::missing_data("scan file").into())
 }
 
 #[derive(Clone, Copy)]

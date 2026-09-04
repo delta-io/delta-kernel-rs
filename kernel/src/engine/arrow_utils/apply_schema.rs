@@ -30,7 +30,7 @@ use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, Str
 // buffer since RecordBatch cannot have top-level nulls.
 pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
-        return Err(KernelError::generic(
+        return Err(KernelError::schema(
             "apply_schema at top-level must be passed a struct schema",
         )
         .into());
@@ -96,7 +96,7 @@ fn transform_struct(
                 arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
             ) {
                 if input_id != target_id {
-                    return Err(KernelError::generic(format!(
+                    return Err(KernelError::schema(format!(
                         "Field '{}': input field ID {} conflicts with target field ID {}",
                         target_field.name, input_id, target_id
                     ))

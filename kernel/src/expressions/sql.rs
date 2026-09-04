@@ -12,6 +12,7 @@
 //! Delta metadata contains today. If the supported SQL surface grows, options include moving
 //! parsing behind the [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
 
+use crate::error::ErrorContext;
 use crate::expressions::{lit, null_lit, Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, KernelError};
@@ -42,7 +43,7 @@ mod token;
 pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expression> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
-        return Err(KernelError::generic("empty SQL literal").into());
+        return Err(KernelError::invalid_expression("empty SQL literal").into());
     }
     // NULL is valid for any data type, including non-primitive ones.
     if trimmed.eq_ignore_ascii_case("null") {
@@ -61,7 +62,7 @@ pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expressi
 /// `TRUE`/`FALSE` are case-insensitive.
 fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<Expression> {
     let DataType::Primitive(primitive) = data_type else {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::invalid_expression(format!(
             "SQL literal parsing only supports primitive types, got {data_type:?}"
         ))
         .into());
@@ -161,7 +162,9 @@ fn unwrap_quoted_body(
     // Trim the inner body to match Spark's `stringToDate`/ `stringToTimestamp`.
     let body = body.trim();
     if body.is_empty() {
-        return Err(KernelError::generic(format!("empty {primitive:?} literal: {sql}")).into());
+        return Err(
+            KernelError::invalid_expression(format!("empty {primitive:?} literal: {sql}")).into(),
+        );
     }
     Ok(body.to_string())
 }
@@ -175,9 +178,10 @@ fn unwrap_quoted_body(
 /// - numeric offsets (e.g. `+05:00`, even `+00:00`), which `parse_scalar` silently drops as UTC.
 fn require_utc_z_suffix(raw: &str, sql: &str) -> DeltaResult<()> {
     if raw.contains(['t', 'z']) {
-        return Err(
-            KernelError::generic("TIMESTAMP literal must use uppercase 'T' and or 'Z'").into(),
-        );
+        return Err(KernelError::invalid_expression(
+            "TIMESTAMP literal must use uppercase 'T' and or 'Z'",
+        )
+        .into());
     }
     if raw.ends_with('Z') {
         return Ok(());
@@ -187,12 +191,12 @@ fn require_utc_z_suffix(raw: &str, sql: &str) -> DeltaResult<()> {
         .split_once(['T', ' '])
         .is_some_and(|(_, time)| time.contains(['+', '-']));
     Err(if has_offset {
-        KernelError::generic(format!(
+        KernelError::unsupported(format!(
             "TIMESTAMP literal with an explicit offset is not yet supported; use 'Z' (UTC): {sql}"
         ))
         .into()
     } else {
-        KernelError::generic(
+        KernelError::unsupported(
             "zoneless TIMESTAMP literal is not yet supported; use an explicit 'Z' (UTC) suffix",
         )
         .into()
@@ -208,7 +212,7 @@ fn require_utc_z_suffix(raw: &str, sql: &str) -> DeltaResult<()> {
 fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> DeltaResult<Scalar> {
     let has_exponent = raw.contains(['e', 'E']);
     if !has_exponent && exceeds_decimal_precision(raw) {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::invalid_decimal(format!(
             "numeric literal exceeds maximum DECIMAL precision 38: {sql}"
         ))
         .into());
@@ -216,9 +220,15 @@ fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> Del
     let scalar = if *primitive == PrimitiveType::Float && has_exponent {
         // f64 parse + `as f32` is the identical operation to Spark's Double.parseDouble + (float):
         // both correctly-rounded decimal->f64, then IEEE round-to-nearest-even f64->f32.
-        let value: f64 = raw
-            .parse()
-            .map_err(|_| KernelError::generic(format!("invalid FLOAT literal: {sql}")))?;
+        let value: f64 = raw.parse().map_err(|source: std::num::ParseFloatError| {
+            KernelError::ExpressionConversion {
+                operation: "parse FLOAT literal",
+                source: Box::new(source),
+            }
+            .with_context(ErrorContext::SqlLiteral {
+                sql: sql.to_string(),
+            })
+        })?;
         Scalar::Float(value as f32)
     } else {
         primitive.parse_scalar(raw)?
@@ -226,7 +236,8 @@ fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> Del
     // Negative zero: `+ 0.0` folds a plain `-0.0` to `+0.0` (a no-op for every other value);
     // exponent forms keep their sign, so skip them.
     let normalize_neg_zero = !has_exponent;
-    let non_finite_error = || KernelError::generic("non-finite float literals are not supported");
+    let non_finite_error =
+        || KernelError::invalid_expression("non-finite float literals are not supported");
     Ok(match scalar {
         Scalar::Float(f) if !f.is_finite() => return Err(non_finite_error().into()),
         Scalar::Double(d) if !d.is_finite() => return Err(non_finite_error().into()),
@@ -264,7 +275,9 @@ fn exceeds_decimal_precision(raw: &str) -> bool {
 /// contains a backslash (Spark's `\n`/`\\` escapes are not yet supported).
 fn unquote_string(input: &str) -> DeltaResult<String> {
     let body = input.strip_prefix('\'').ok_or_else(|| {
-        KernelError::generic(format!("expected a single-quoted SQL string, got: {input}"))
+        KernelError::invalid_expression(format!(
+            "expected a single-quoted SQL string, got: {input}"
+        ))
     })?;
 
     // Walk the body after the opening quote. A `'` either escapes a literal quote (`''`) or
@@ -273,7 +286,7 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
     let mut chars = body.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::invalid_expression(format!(
                 "backslash escapes in SQL string literals are not yet supported: {input}"
             ))
             .into());
@@ -286,14 +299,14 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
             None => return Ok(out),
             Some('\'') => out.push('\''),
             Some(_) => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::invalid_expression(format!(
                     "unexpected characters after closing quote in SQL string literal: {input}"
                 ))
                 .into())
             }
         }
     }
-    Err(KernelError::generic(format!("unterminated SQL string literal: {input}")).into())
+    Err(KernelError::invalid_expression(format!("unterminated SQL string literal: {input}")).into())
 }
 
 /// Strip an optional typed-literal keyword prefix (e.g. `DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`) and
@@ -320,7 +333,7 @@ fn strip_typed_prefix_and_unquote(input: &str, keywords: &[&str]) -> DeltaResult
 /// the body must be an even-length sequence of hex digits.
 fn decode_binary_literal(input: &str) -> DeltaResult<Vec<u8>> {
     let err = || {
-        KernelError::generic(format!(
+        KernelError::invalid_expression(format!(
             "expected a SQL binary literal like X'..', got: {input}"
         ))
     };
@@ -330,7 +343,7 @@ fn decode_binary_literal(input: &str) -> DeltaResult<Vec<u8>> {
         .and_then(|rest| rest.strip_suffix('\''))
         .ok_or_else(err)?;
     if !hex.len().is_multiple_of(2) {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::invalid_expression(format!(
             "binary literal must contain an even number of hex digits: {input}"
         ))
         .into());
@@ -339,12 +352,12 @@ fn decode_binary_literal(input: &str) -> DeltaResult<Vec<u8>> {
     pairs
         .iter()
         .map(|&[hi, lo]| {
-            let hi = (hi as char)
-                .to_digit(16)
-                .ok_or_else(|| KernelError::generic(format!("invalid hex digit in {input}")))?;
-            let lo = (lo as char)
-                .to_digit(16)
-                .ok_or_else(|| KernelError::generic(format!("invalid hex digit in {input}")))?;
+            let hi = (hi as char).to_digit(16).ok_or_else(|| {
+                KernelError::invalid_expression(format!("invalid hex digit in {input}"))
+            })?;
+            let lo = (lo as char).to_digit(16).ok_or_else(|| {
+                KernelError::invalid_expression(format!("invalid hex digit in {input}"))
+            })?;
             Ok((hi << 4 | lo) as u8)
         })
         .collect()
@@ -352,6 +365,9 @@ fn decode_binary_literal(input: &str) -> DeltaResult<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as StdError;
+    use std::num::ParseFloatError;
+
     use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
     use rstest::rstest;
 
@@ -616,6 +632,33 @@ mod tests {
             result.is_err(),
             "expected error for {sql:?} as {ty:?}, got {result:?}"
         );
+    }
+
+    #[rstest]
+    #[case::missing_exponent("1e+")]
+    #[case::original_whitespace(" \t1E-\n")]
+    fn float_literal_error_preserves_sql_operation_and_native_source(#[case] sql: &str) {
+        let error = parse_sql(sql, &DataType::FLOAT).unwrap_err();
+        let crate::Error::Kernel(KernelError::Context {
+            context: ErrorContext::SqlLiteral { sql: actual_sql },
+            source,
+        }) = &error
+        else {
+            panic!("expected SQL literal context, got {error:?}");
+        };
+        assert_eq!(actual_sql, sql);
+        assert!(matches!(
+            source.as_ref(),
+            KernelError::ExpressionConversion {
+                operation: "parse FLOAT literal",
+                ..
+            }
+        ));
+        let mut source = &error as &(dyn StdError + 'static);
+        while let Some(next_source) = source.source() {
+            source = next_source;
+        }
+        assert!(source.downcast_ref::<ParseFloatError>().is_some());
     }
 
     #[rstest]

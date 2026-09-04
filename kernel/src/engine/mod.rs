@@ -34,6 +34,65 @@ pub(crate) fn writer_options() -> ArrowWriterOptions {
 #[cfg(feature = "arrow-conversion")]
 pub mod arrow_conversion;
 
+/// Invalid Arrow input or reader state encountered while evaluating engine operations.
+#[derive(Debug, thiserror::Error)]
+pub enum ArrowEngineError {
+    /// A requested row is outside the array.
+    #[error("Row index {index} out of bounds for {field} of length {length}")]
+    RowIndexOutOfBounds {
+        /// Name of the field or operation being read.
+        field: String,
+        /// Requested logical row index.
+        index: usize,
+        /// Number of available logical rows.
+        length: usize,
+    },
+    /// A row group was requested more than once.
+    #[error("Found duplicate row group ordinal {ordinal}")]
+    DuplicateRowGroupOrdinal {
+        /// Repeated ordinal.
+        ordinal: usize,
+    },
+    /// A requested row group does not exist.
+    #[error("Row group ordinal {ordinal} is out of bounds for {count} row groups")]
+    RowGroupOutOfBounds {
+        /// Requested ordinal.
+        ordinal: usize,
+        /// Available row groups.
+        count: usize,
+    },
+    /// A nested reader projection returned an invalid number of children.
+    #[error("{container} projection expected {expected} reorder indices, got {actual}")]
+    ProjectionChildCount {
+        /// Container whose children are projected.
+        container: &'static str,
+        /// Required child count.
+        expected: usize,
+        /// Observed child count.
+        actual: usize,
+    },
+    /// A JSON input row does not contain exactly one complete JSON object.
+    #[error("Malformed JSON: Multiple, partial, or 0 JSON objects on row {row}")]
+    InvalidJsonRow {
+        /// One-based input row number.
+        row: usize,
+    },
+    /// JSON decoding produced a different number of rows than requested.
+    #[error("Unexpected number of rows decoded. Got {actual}, expected {expected}")]
+    JsonRowCount {
+        /// Number of input rows.
+        expected: usize,
+        /// Number of decoded rows.
+        actual: usize,
+    },
+    /// JSON decoding yielded no batch for nonempty input.
+    #[error("Malformed JSON: no batch decoded for {expected} input rows")]
+    MissingJsonBatch {
+        /// Number of input rows.
+        expected: usize,
+    },
+}
+
 #[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;
 #[cfg(all(feature = "arrow-expression", feature = "internal-api"))]

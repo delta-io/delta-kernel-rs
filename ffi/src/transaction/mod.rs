@@ -139,10 +139,9 @@ fn commit_result_to_committed_handle<S>(
         )
         .into()),
         CommitResult::ConflictedTransaction(conflicted) => {
-            Err(delta_kernel::KernelError::Generic(format!(
-                "commit conflict at version {}",
-                conflicted.conflict_version()
-            ))
+            Err(delta_kernel::error::FfiContractError::CommitConflict {
+                version: conflicted.conflict_version(),
+            }
             .into())
         }
     }
@@ -1646,8 +1645,8 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            FFIKernelError::GenericError,
-            Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
+            FFIKernelError::InvalidTransactionStateError,
+            None,
         );
 
         unsafe { free_engine(engine) };
@@ -1689,8 +1688,8 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            FFIKernelError::GenericError,
-            Some("Generic delta kernel error: Metadata for domain dup already specified in this transaction"),
+            FFIKernelError::InvalidTransactionStateError,
+            None,
         );
 
         unsafe { free_engine(engine) };
@@ -2308,7 +2307,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             missing_partition_value,
-            FFIKernelError::UnknownError,
+            FFIKernelError::InvalidPartitionValuesError,
             Some("Invalid partition values: missing partition column 'date'. Provided: []"),
         );
 
@@ -2437,7 +2436,7 @@ mod tests {
         );
         let builder = unsafe { *builder_handle.into_inner() };
         let layout: DeltaResult<DataLayout> =
-            Err(delta_kernel::KernelError::generic("bad column").into());
+            Err(delta_kernel::KernelError::missing_column("bad column").into());
         let result = create_table_builder_with_data_layout_impl(builder, layout);
         assert!(result.is_err());
         unsafe { free_engine(engine) };

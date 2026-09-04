@@ -90,10 +90,10 @@ impl IncrementalScanBuilder {
         let target_version = self.target_snapshot.version();
         require!(
             self.base_version < target_version,
-            KernelError::generic(format!(
-                "IncrementalScanBuilder: base_version ({}) must be less than target_version ({})",
-                self.base_version, target_version
-            ))
+            KernelError::Scan(crate::scan::ScanError::InvalidIncrementalRange {
+                base: self.base_version,
+                target: target_version,
+            })
         );
         // Resolve the predicate into an Add-side skipping strategy up front so `build` can
         // fail fast on a malformed predicate (e.g. references to unknown columns), rather
@@ -101,9 +101,13 @@ impl IncrementalScanBuilder {
         let add_skipping = self.resolve_add_skipping(engine)?;
         // `base_version < target_version` above guarantees `base_version < u64::MAX`, but use
         // `checked_add` to make the dependency explicit and panic-free.
-        let start_version = self.base_version.checked_add(1).ok_or_else(|| {
-            KernelError::generic("IncrementalScanBuilder: base_version + 1 overflowed u64")
-        })?;
+        let start_version =
+            self.base_version
+                .checked_add(1)
+                .ok_or_else(|| KernelError::NumericOverflow {
+                    operation: "increment base version",
+                    value: self.base_version.to_string(),
+                })?;
 
         // TODO(#2552): surface in-range protocol/metadata changes to the consumer.
         self.target_snapshot
@@ -280,16 +284,12 @@ impl IncrementalScanStream {
     ///   `Ok(None)` (commits unavailable); fall back to [`crate::Snapshot::scan_builder`].
     /// - [`KernelError::MalformedJson`] or [`KernelError::Arrow`] (default-engine) on commit JSON
     ///   corruption. Not retryable.
-    /// - [`KernelError::Generic`] on malformed `deletionVector` fields in a commit row, or on
-    ///   "cannot finish a stream that previously errored" when a terminal method is called after a
-    ///   prior `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
-    ///   corruption.
+    /// - [`KernelError::DeletionVector`] on malformed `deletionVector` fields in a commit row.
+    /// - [`KernelError::Scan`] when a terminal method is called after a prior `next()` returned
+    ///   `Err`. Rebuild the stream to retry.
     pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {
         if self.errored {
-            return Err(KernelError::generic(
-                "IncrementalScanStream: cannot finish a stream that previously errored",
-            )
-            .into());
+            return Err(KernelError::Scan(crate::scan::ScanError::FailedStream).into());
         }
         // Drain anything the consumer didn't pull. `self.next()` propagates errors via
         // `Some(Err(_))` and sets `errored`; the `?` below surfaces them.

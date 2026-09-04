@@ -40,7 +40,10 @@ impl ColumnResolver for StructType {
 
     fn resolve_column(&self, name: &KernelColumnName) -> DeltaResult<DFColumn> {
         let Some(root) = name.first() else {
-            return Err(KernelError::generic("cannot convert an empty column reference").into());
+            return Err(KernelError::invalid_expression(
+                "cannot convert an empty column reference",
+            )
+            .into());
         };
         let _ = self.field_at(name)?;
         Ok(DFColumn::new_unqualified(root.as_str()))

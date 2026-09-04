@@ -6,6 +6,31 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::utils::require;
 use crate::{DeltaResult, FileMeta, KernelError, Version};
 
+/// Invalid versions in a request to publish catalog commits.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PublishError {
+    /// Adjacent catalog commits are not in contiguous ascending order.
+    #[error("Catalog commits must be contiguous: got versions {versions:?}")]
+    NonContiguous {
+        /// Commit versions in the order supplied by the caller.
+        versions: Vec<Version>,
+    },
+    /// The last catalog commit does not match the requested publication version.
+    #[error("Catalog commits must end with snapshot version {expected}, but got {actual}")]
+    EndVersionMismatch {
+        /// Requested publication version.
+        expected: Version,
+        /// Last supplied commit version.
+        actual: Version,
+    },
+    /// No catalog commits were supplied for publication.
+    #[error("Catalog commits are empty, expected snapshot version {version}")]
+    Empty {
+        /// Requested publication version.
+        version: Version,
+    },
+}
+
 /// A catalog commit that has been ratified by the catalog but not yet published to the Delta log.
 ///
 /// Catalog commits are staged commits stored in `_delta_log/_staged_commits/` that have been
@@ -30,7 +55,7 @@ impl CatalogCommit {
     ) -> DeltaResult<Self> {
         require!(
             catalog_commit.file_type == LogPathFileType::StagedCommit,
-            KernelError::Generic(format!(
+            KernelError::InvalidLogPath(format!(
                 "Cannot construct CatalogCommit. Expected a StagedCommit, got {:?}",
                 catalog_commit.file_type
             ))
@@ -122,16 +147,15 @@ impl PublishMetadata {
     fn validate_contiguous(commits_to_publish: &[CatalogCommit]) -> DeltaResult<()> {
         commits_to_publish
             .windows(2)
-            .all(|c| c[0].version() + 1 == c[1].version())
+            .all(|commits| commits[0].version().checked_add(1) == Some(commits[1].version()))
             .then_some(())
             .ok_or_else(|| {
-                KernelError::Generic(format!(
-                    "Catalog commits must be contiguous: got versions {:?}",
-                    commits_to_publish
+                KernelError::Publish(PublishError::NonContiguous {
+                    versions: commits_to_publish
                         .iter()
-                        .map(|c| c.version())
-                        .collect::<Vec<_>>()
-                ))
+                        .map(|commit| commit.version())
+                        .collect(),
+                })
             })
             .map_err(crate::Error::from)
     }
@@ -142,13 +166,14 @@ impl PublishMetadata {
     ) -> DeltaResult<()> {
         match commits_to_publish.last().map(|c| c.version()) {
             Some(v) if v == publish_to_version => Ok(()),
-            Some(v) => Err(KernelError::Generic(format!(
-                "Catalog commits must end with snapshot version {publish_to_version}, but got {v}"
-            ))
+            Some(actual) => Err(KernelError::Publish(PublishError::EndVersionMismatch {
+                expected: publish_to_version,
+                actual,
+            })
             .into()),
-            None => Err(KernelError::Generic(format!(
-                "Catalog commits are empty, expected snapshot version {publish_to_version}"
-            ))
+            None => Err(KernelError::Publish(PublishError::Empty {
+                version: publish_to_version,
+            })
             .into()),
         }
     }
@@ -213,29 +238,20 @@ mod tests {
         assert_eq!(publish_metadata.commits_to_publish().len(), 3);
     }
 
-    #[test]
-    fn test_publish_metadata_construction_rejects_empty_commits() {
-        assert_result_error_with_message(
-            PublishMetadata::try_new(12, vec![]),
-            "Catalog commits are empty, expected snapshot version 12",
-        )
-    }
-
-    #[test]
-    fn test_publish_metadata_construction_rejects_non_contiguous_commits() {
-        let catalog_commits = create_catalog_commits(&[10, 12]);
-        assert_result_error_with_message(
-            PublishMetadata::try_new(12, catalog_commits),
-            "Catalog commits must be contiguous: got versions [10, 12]",
-        )
-    }
-
-    #[test]
-    fn test_publish_metadata_construction_rejects_commits_not_ending_with_publish_to_version() {
-        let catalog_commits = create_catalog_commits(&[10, 11]);
-        assert_result_error_with_message(
-            PublishMetadata::try_new(12, catalog_commits),
-            "Catalog commits must end with snapshot version 12, but got 11",
-        )
+    #[rstest::rstest]
+    #[case::empty(vec![], PublishError::Empty { version: 12 })]
+    #[case::gap(vec![10, 12], PublishError::NonContiguous { versions: vec![10, 12] })]
+    #[case::duplicate(vec![12, 12], PublishError::NonContiguous { versions: vec![12, 12] })]
+    #[case::overflow(vec![u64::MAX, 0], PublishError::NonContiguous { versions: vec![u64::MAX, 0] })]
+    #[case::wrong_end(vec![10, 11], PublishError::EndVersionMismatch { expected: 12, actual: 11 })]
+    fn test_publish_metadata_rejects_invalid_versions(
+        #[case] versions: Vec<Version>,
+        #[case] expected: PublishError,
+    ) {
+        let result = PublishMetadata::try_new(12, create_catalog_commits(&versions));
+        assert!(
+            matches!(result, Err(crate::Error::Kernel(KernelError::Publish(actual)))
+            if actual == expected)
+        );
     }
 }

@@ -11,6 +11,7 @@ use roaring::RoaringTreemap;
 use crate::actions::deletion_vector::{
     create_dv_crc32, DeletionVectorDescriptor, DeletionVectorPath, DeletionVectorStorageType,
 };
+use crate::error::ErrorContext;
 use crate::{DeltaResult, KernelError};
 
 /// A trait that allows engines to provide deletion vectors in various formats.
@@ -58,8 +59,9 @@ pub trait DeletionVector: Sized {
     fn serialize(self) -> DeltaResult<Bytes> {
         let treemap: RoaringTreemap = self.into_iter().collect();
         let mut serialized = Vec::new();
-        treemap.serialize_into(&mut serialized).map_err(|e| {
-            KernelError::generic(format!("Failed to serialize deletion vector: {e}"))
+        treemap.serialize_into(&mut serialized).map_err(|source| {
+            KernelError::from(source)
+                .with_context(ErrorContext::Operation("serialize deletion vector"))
         })?;
         Ok(Bytes::from(serialized))
     }
@@ -162,8 +164,9 @@ impl DeletionVector for KernelDeletionVector {
     /// Optimized serialization that directly serializes the internal RoaringTreemap.
     fn serialize(self) -> DeltaResult<Bytes> {
         let mut serialized = Vec::new();
-        self.dv.serialize_into(&mut serialized).map_err(|e| {
-            KernelError::generic(format!("Failed to serialize deletion vector: {e}"))
+        self.dv.serialize_into(&mut serialized).map_err(|source| {
+            KernelError::from(source)
+                .with_context(ErrorContext::Operation("serialize deletion vector"))
         })?;
         Ok(Bytes::from(serialized))
     }
@@ -266,53 +269,71 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
     ) -> DeltaResult<DeletionVectorWriteResult> {
         // Serialize first so a failure leaves the writer state and output untouched.
         let cardinality = deletion_vector.cardinality();
-        let serialized = deletion_vector.serialize()?;
+        let serialized = deletion_vector.serialize().map_err(|error| {
+            error.with_context(ErrorContext::Operation("serialize deletion vector"))
+        })?;
 
         // Write version byte on first write
         if self.current_offset == 0 {
             // Write header.
-            self.writer
-                .write_all(&[1u8])
-                .map_err(|e| KernelError::generic(format!("Failed to write version byte: {e}")))?;
+            self.writer.write_all(&[1u8]).map_err(|source| {
+                KernelError::from(source).with_context(ErrorContext::Operation(
+                    "write deletion vector version byte",
+                ))
+            })?;
             self.current_offset = 1;
         }
 
         // Calculate sizes
 
         // The size field contains the size of data + magic(4) (doesn't include CRC)
-        let dv_size = serialized.len() + 4;
+        let dv_size =
+            serialized
+                .len()
+                .checked_add(4)
+                .ok_or_else(|| KernelError::NumericOverflow {
+                    operation: "deletion vector serialized size",
+                    value: serialized.len().to_string(),
+                })?;
         // Use i32::MAX as the limit since Java implementations don't have unsigned integers.
         // This ensures compatibility with the Scala/Java implementation [1].
         //
         // [1] https://github.com/delta-io/delta/blob/b388f280d083d4cf92c6434e4f7a549fc26cd1fa/spark/src/main/scala/org/apache/spark/sql/delta/deletionvectors/RoaringBitmapArray.scala#L311
-        if dv_size > i32::MAX as usize {
-            return Err(
-                KernelError::generic("Deletion vector size exceeds maximum allowed size").into(),
-            );
-        }
+        let dv_size_i32 = i32::try_from(dv_size).map_err(|source| {
+            KernelError::integer_conversion("deletion vector size", dv_size, "i32", source)
+        })?;
 
         // Record the offset where this DV size starts.
-        let dv_offset: i32 = self
-            .current_offset
-            .try_into()
-            .map_err(|_| KernelError::generic("Deletion vector offset doesn't fit in i32"))?;
+        let dv_offset: i32 = self.current_offset.try_into().map_err(|source| {
+            KernelError::integer_conversion(
+                "deletion vector offset",
+                self.current_offset,
+                "i32",
+                source,
+            )
+        })?;
 
         // Write size (big-endian, as per Delta spec)
-        let size_bytes = (dv_size as u32).to_be_bytes();
-        self.writer
-            .write_all(&size_bytes)
-            .map_err(|e| KernelError::generic(format!("Failed to write size: {e}")))?;
+        let size_bytes = dv_size_i32.to_be_bytes();
+        self.writer.write_all(&size_bytes).map_err(|source| {
+            KernelError::from(source)
+                .with_context(ErrorContext::Operation("write deletion vector size"))
+        })?;
 
         // Write magic number (little-endian)
         // This is the RoaringBitmapArray format magic
         let magic: u32 = 1681511377;
         self.writer
             .write_all(&magic.to_le_bytes())
-            .map_err(|e| KernelError::generic(format!("Failed to write magic: {e}")))?;
+            .map_err(|source| {
+                KernelError::from(source)
+                    .with_context(ErrorContext::Operation("write deletion vector magic"))
+            })?;
 
         // Write the serialized treemap
-        self.writer.write_all(&serialized).map_err(|e| {
-            KernelError::generic(format!("Failed to write deletion vector data: {e}"))
+        self.writer.write_all(&serialized).map_err(|source| {
+            KernelError::from(source)
+                .with_context(ErrorContext::Operation("write deletion vector data"))
         })?;
 
         // Calculate and write CRC32 checksum (big-endian)
@@ -324,7 +345,11 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         let checksum = digest.finalize();
         self.writer
             .write_all(&checksum.to_be_bytes())
-            .map_err(|e| KernelError::generic(format!("Failed to write CRC32 checksum: {e}")))?;
+            .map_err(|source| {
+                KernelError::from(source).with_context(ErrorContext::Operation(
+                    "write deletion vector CRC32 checksum",
+                ))
+            })?;
 
         // Update offset for next write (size_prefix + magic + data + crc)
         let bytes_written = 4 + dv_size + 4; // size + (magic + data) + crc
@@ -363,16 +388,124 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
 
         self.writer
             .flush()
-            .map_err(|e| KernelError::generic(format!("Failed to flush writer: {e}")))
+            .map_err(|source| {
+                KernelError::from(source)
+                    .with_context(ErrorContext::Operation("flush deletion vector writer"))
+            })
             .map_err(crate::Error::from)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::error::Error as StdError;
+    use std::io::{Cursor, ErrorKind};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::version_byte(0, "write deletion vector version byte")]
+    #[case::size(1, "write deletion vector size")]
+    #[case::magic(5, "write deletion vector magic")]
+    #[case::data(9, "write deletion vector data")]
+    #[case::checksum(
+        9 + KernelDeletionVector::new().serialize().unwrap().len(),
+        "write deletion vector CRC32 checksum"
+    )]
+    fn streaming_writer_preserves_native_write_errors(
+        #[case] capacity: usize,
+        #[case] expected_operation: &str,
+    ) {
+        let mut buffer = vec![0; capacity];
+        let mut output = buffer.as_mut_slice();
+        let mut writer = StreamingDeletionVectorWriter::new(&mut output);
+        let error = writer
+            .write_deletion_vector(KernelDeletionVector::new())
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            crate::Error::Kernel(KernelError::Context {
+                context: ErrorContext::Operation(operation),
+                ..
+            }) if *operation == expected_operation
+        ));
+        assert_io_source(&error, ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn streaming_writer_preserves_serialization_error_context() {
+        let mut output = Vec::new();
+        let mut writer = StreamingDeletionVectorWriter::new(&mut output);
+        let error = writer
+            .write_deletion_vector(FailingDeletionVector)
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            crate::Error::Kernel(KernelError::Context {
+                context: ErrorContext::Operation("serialize deletion vector"),
+                ..
+            })
+        ));
+        assert_io_source(&error, ErrorKind::Other);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn streaming_writer_preserves_flush_error_context() {
+        let mut output = FlushFailingWriter;
+        let error = StreamingDeletionVectorWriter::new(&mut output)
+            .finalize()
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            crate::Error::Kernel(KernelError::Context {
+                context: ErrorContext::Operation("flush deletion vector writer"),
+                ..
+            })
+        ));
+        assert_io_source(&error, ErrorKind::Other);
+    }
+
+    struct FailingDeletionVector;
+
+    impl DeletionVector for FailingDeletionVector {
+        type IndexIterator = std::iter::Empty<u64>;
+
+        fn into_iter(self) -> Self::IndexIterator {
+            std::iter::empty()
+        }
+
+        fn cardinality(&self) -> u64 {
+            0
+        }
+
+        fn serialize(self) -> DeltaResult<Bytes> {
+            Err(KernelError::from(std::io::Error::other("serialization failed")).into())
+        }
+    }
+
+    struct FlushFailingWriter;
+
+    impl Write for FlushFailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush failed"))
+        }
+    }
+
+    fn assert_io_source(error: &crate::Error, expected_kind: ErrorKind) {
+        let mut source: &(dyn StdError + 'static) = error;
+        loop {
+            if let Some(native) = source.downcast_ref::<std::io::Error>() {
+                assert_eq!(native.kind(), expected_kind);
+                break;
+            }
+            source = source.source().expect("native I/O source must be retained");
+        }
+    }
 
     #[test]
     fn test_kernel_deletion_vector_new() {

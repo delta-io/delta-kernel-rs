@@ -132,7 +132,7 @@ fn evaluate_struct_expression(
     nullability_predicate: Option<&ExpressionRef>,
 ) -> DeltaResult<ArrayRef> {
     if fields.len() != output_schema.num_fields() {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::invalid_expression(format!(
             "Struct expression field count mismatch: {} fields in expression but {} in schema",
             fields.len(),
             output_schema.num_fields()
@@ -163,7 +163,7 @@ fn evaluate_struct_expression(
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| {
-                KernelError::generic("Nullability predicate must evaluate to boolean")
+                KernelError::invalid_expression("Nullability predicate must evaluate to boolean")
             })?;
         let values = bool_array.values();
         let combined = match bool_array.nulls() {
@@ -196,7 +196,7 @@ fn evaluate_struct_patch_expression(
         output_schema_iter
             .next()
             .map(|field| field.data_type())
-            .ok_or_else(|| KernelError::generic("Too few fields in output schema"))
+            .ok_or_else(|| KernelError::invalid_expression("Too few fields in output schema"))
     };
 
     // Handle prepends (insertions before any field)
@@ -214,7 +214,7 @@ fn evaluate_struct_patch_expression(
         Some(ref array) => array
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| KernelError::generic("Input path must point to a struct"))?,
+            .ok_or_else(|| KernelError::invalid_expression("Input path must point to a struct"))?,
         None => batch,
     };
 
@@ -244,7 +244,7 @@ fn evaluate_struct_patch_expression(
         .filter(|ft| !ft.optional)
         .count();
     if used_field_patches < required_count {
-        return Err(KernelError::generic(
+        return Err(KernelError::invalid_expression(
             "Some non-optional field patches reference invalid input field names",
         )
         .into());
@@ -257,7 +257,7 @@ fn evaluate_struct_patch_expression(
 
     // Verify we consumed all output schema fields
     if output_schema_iter.next().is_some() {
-        return Err(KernelError::generic("Too many fields in output schema").into());
+        return Err(KernelError::invalid_expression("Too many fields in output schema").into());
     }
 
     // Build the final struct, preserving null bitmap for nested patches
@@ -303,14 +303,14 @@ pub fn evaluate_expression(
         (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
         }
-        (Struct(..), dt) => Err(KernelError::Generic(format!(
+        (Struct(..), dt) => Err(KernelError::invalid_expression(format!(
             "Struct expression expects a DataType::Struct result, but got {dt:?}"
         ))
         .into()),
         (StructPatch(patch), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_patch_expression(patch, batch, output_schema)
         }
-        (StructPatch(_), _) => Err(KernelError::generic(
+        (StructPatch(_), _) => Err(KernelError::invalid_expression(
             "Data type is required to evaluate struct patch expressions",
         )
         .into()),
@@ -318,7 +318,7 @@ pub fn evaluate_expression(
             let result = evaluate_predicate(pred, batch, false)?;
             Ok(Arc::new(result))
         }
-        (Predicate(_), Some(data_type)) => Err(KernelError::generic(format!(
+        (Predicate(_), Some(data_type)) => Err(KernelError::invalid_expression(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))
         .into()),
@@ -327,7 +327,7 @@ pub fn evaluate_expression(
                 let input = evaluate_expression(expr, batch, None)?;
                 Ok(to_json(&input).map_err(crate::KernelError::from)?)
             }
-            Some(data_type) => Err(KernelError::generic(format!(
+            Some(data_type) => Err(KernelError::invalid_expression(format!(
                 "ToJson operator requires STRING output, but got {data_type:?}"
             ))
             .into()),
@@ -414,7 +414,7 @@ pub fn evaluate_expression(
             let result = evaluate_map_to_struct(&map_arr, output_schema)?;
             Ok(Arc::new(result) as ArrayRef)
         }
-        (MapToStruct(_), dt) => Err(KernelError::Generic(format!(
+        (MapToStruct(_), dt) => Err(KernelError::invalid_expression(format!(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
         ))
         .into()),
@@ -459,7 +459,7 @@ fn evaluate_array_expression(
     let array_type = match result_type {
         Some(DataType::Array(arr_ty)) => Some(arr_ty.as_ref()),
         Some(other) => {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::invalid_expression(format!(
                 "Array expression requires a DataType::Array result type, but got {other:?}"
             ))
             .into());
@@ -476,7 +476,9 @@ fn evaluate_array_expression(
 
     let element_type = element_arrays
         .first()
-        .ok_or_else(|| KernelError::generic("Array expression requires at least one element"))?
+        .ok_or_else(|| {
+            KernelError::invalid_expression("Array expression requires at least one element")
+        })?
         .data_type()
         .clone();
     // Single pass over the evaluated inputs: every input must evaluate to the shared element
@@ -484,7 +486,7 @@ fn evaluate_array_expression(
     // otherwise the output's field metadata would lie about the values it holds.
     for (i, arr) in element_arrays.iter().enumerate() {
         if arr.data_type() != &element_type {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::invalid_expression(format!(
                 "Array expression inputs must share the same element type; input 0 evaluates \
                  to {element_type:?} but input {i} evaluates to {:?}",
                 arr.data_type()
@@ -492,7 +494,7 @@ fn evaluate_array_expression(
             .into());
         }
         if !contains_null && arr.null_count() > 0 {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::invalid_expression(format!(
                 "Array expression declares non-nullable elements (result_type contains_null \
                  is false) but input {i} contains {} null value(s)",
                 arr.null_count()
@@ -506,11 +508,12 @@ fn evaluate_array_expression(
     // `MutableArrayData` is type-erased (works for any element type) and avoids the
     // (num_rows * n)-sized indices buffer that `arrow_select::interleave` would require.
     let array_data: Vec<ArrayData> = element_arrays.iter().map(|a| a.to_data()).collect();
-    let total_len = num_rows.checked_mul(n).ok_or_else(|| {
-        KernelError::generic(format!(
-            "Array expression length overflows usize: num_rows={num_rows} * inputs={n}"
-        ))
-    })?;
+    let total_len = num_rows
+        .checked_mul(n)
+        .ok_or_else(|| KernelError::NumericOverflow {
+            operation: "compute array expression length",
+            value: format!("{num_rows} * {n}"),
+        })?;
     let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, total_len);
     for row in 0..num_rows {
         for col in 0..n {
@@ -522,11 +525,8 @@ fn evaluate_array_expression(
     // Every row's list has exactly `n` elements. `from_lengths` builds `[0, n, 2n, ..., M*n]`
     // but panics on i32 overflow, so guard first (`LargeListArray` would be needed beyond
     // i32::MAX). `total_len == num_rows * n` was overflow-checked as usize above.
-    i32::try_from(total_len).map_err(|_| {
-        KernelError::generic(format!(
-            "Array expression offsets overflow i32: num_rows={num_rows} * inputs={n}; \
-             LargeListArray would be required"
-        ))
+    i32::try_from(total_len).map_err(|source| {
+        KernelError::integer_conversion("array expression offsets", total_len, "i32", source)
     })?;
     let offsets = OffsetBuffer::<i32>::from_lengths(std::iter::repeat_n(n, num_rows));
     let field = Arc::new(ArrowField::new(
@@ -601,7 +601,7 @@ fn cast_list_elements(
             ArrowDataType::LargeList(new_field)
         }
         (dt, _) => {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::invalid_expression(format!(
                 "cast_list_elements: expected a list type, got {dt:?}"
             ))
             .into())
@@ -675,7 +675,7 @@ pub fn evaluate_predicate(
                 Some(arr) => {
                     Ok(maybe_inverted(Cow::Borrowed(arr)).map_err(crate::KernelError::from)?)
                 }
-                None => Err(KernelError::generic("expected boolean array").into()),
+                None => Err(KernelError::invalid_expression("expected boolean array").into()),
             }
         }
         Not(pred) => evaluate_predicate(pred, batch, !inverted),
@@ -1043,21 +1043,24 @@ fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
 ) -> DeltaResult<StructArray> {
-    let map_array = map_arr
-        .as_any()
-        .downcast_ref::<MapArray>()
-        .ok_or_else(|| KernelError::generic("MapToStruct requires a MapArray as input"))?;
+    let map_array = map_arr.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+        KernelError::invalid_expression("MapToStruct requires a MapArray as input")
+    })?;
 
     let map_keys = map_array
         .keys()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| KernelError::generic("MapToStruct requires maps with string keys"))?;
+        .ok_or_else(|| {
+            KernelError::invalid_expression("MapToStruct requires maps with string keys")
+        })?;
     let map_values = map_array
         .values()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| KernelError::generic("MapToStruct requires maps with string values"))?;
+        .ok_or_else(|| {
+            KernelError::invalid_expression("MapToStruct requires maps with string values")
+        })?;
 
     let num_rows = map_array.len();
     let fields: Vec<&StructField> = output_schema.fields().collect();
@@ -1069,7 +1072,7 @@ fn evaluate_map_to_struct(
         let prim = match field.data_type() {
             DataType::Primitive(p) => p,
             other => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::invalid_expression(format!(
                     "MapToStruct only supports primitive target types, got {other:?}"
                 ))
                 .into());

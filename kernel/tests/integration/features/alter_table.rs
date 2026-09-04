@@ -507,7 +507,9 @@ async fn empty_create_then_add_column(
     let v2 = write_batch_to_table(&v1, engine.as_ref(), batch, HashMap::new())
         .await
         .map_err(|e| {
-            delta_kernel::KernelError::generic(format!("write_batch_to_table failed: {e}"))
+            e.with_context(delta_kernel::error::ErrorContext::Operation(
+                "write_batch_to_table",
+            ))
         })?;
     assert_eq!(v2.version(), 2);
 

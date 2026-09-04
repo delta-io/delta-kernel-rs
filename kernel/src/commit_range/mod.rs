@@ -66,6 +66,77 @@ use crate::table_features::Operation;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Engine, KernelError, Version};
 
+/// Invalid bounds or snapshot anchors supplied for a commit range.
+#[derive(Debug, thiserror::Error)]
+pub enum CommitRangeError {
+    /// The requested start is after the end.
+    #[error("start_version ({start}) must be <= end_version ({end})")]
+    Reversed {
+        /// Requested start version.
+        start: Version,
+        /// Requested end version.
+        end: Version,
+    },
+    /// A range derived from a snapshot extends beyond it.
+    #[error("end_version ({end}) cannot exceed snapshot version ({snapshot})")]
+    BeyondSnapshot {
+        /// Requested end version.
+        end: Version,
+        /// Snapshot version.
+        snapshot: Version,
+    },
+    /// A snapshot has no commits to anchor the requested range.
+    #[error("snapshot's log segment must have at least one commit")]
+    EmptySnapshot,
+    /// The requested first version is no longer available in the snapshot.
+    #[error(
+        "start_version {start} is not available in the snapshot's log segment (earliest \
+         available commit: {earliest})"
+    )]
+    StartUnavailable {
+        /// Requested start.
+        start: Version,
+        /// Earliest available commit.
+        earliest: Version,
+    },
+    /// The listed commits do not cover the requested inclusive range.
+    #[error(
+        "The number of commit files: {actual} does not match the expected range (start_version: \
+         {start}, end_version: {end}): expected {expected} commit files"
+    )]
+    CommitCount {
+        /// Range start.
+        start: Version,
+        /// Range end.
+        end: Version,
+        /// Expected count.
+        expected: u64,
+        /// Observed count.
+        actual: u64,
+    },
+    /// No action types were selected for replay.
+    #[error("at least one DeltaAction must be requested")]
+    EmptyActions,
+    /// The snapshot belongs to a different table.
+    #[error("snapshot table root ({snapshot}) does not match commit range table root ({range})")]
+    TableMismatch {
+        /// Snapshot table root.
+        snapshot: String,
+        /// Range table root.
+        range: String,
+    },
+    /// The supplied snapshot is not at the range's required anchor version.
+    #[error("snapshot version {actual} does not match {anchor} ({expected})")]
+    AnchorMismatch {
+        /// Anchor name for the replay direction.
+        anchor: &'static str,
+        /// Required version.
+        expected: Version,
+        /// Supplied snapshot version.
+        actual: Version,
+    },
+}
+
 /// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
 /// plus the materialized commit-file pointers in `commit_files`.
 ///
@@ -135,17 +206,16 @@ impl CommitRange {
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitAction>> + Send> {
         if actions.is_empty() {
-            return Err(KernelError::generic("at least one DeltaAction must be requested").into());
+            return Err(KernelError::CommitRange(CommitRangeError::EmptyActions).into());
         }
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
             Some(snapshot) => {
                 if snapshot.table_root() != &self.table_root {
-                    return Err(KernelError::generic(format!(
-                        "snapshot table root ({}) does not match commit range table root ({})",
-                        snapshot.table_root(),
-                        self.table_root,
-                    ))
+                    return Err(KernelError::CommitRange(CommitRangeError::TableMismatch {
+                        snapshot: snapshot.table_root().to_string(),
+                        range: self.table_root.to_string(),
+                    })
                     .into());
                 }
                 let (anchor_version, anchor_name) = match self.commit_ordering {
@@ -153,10 +223,11 @@ impl CommitRange {
                     CommitOrdering::DescendingOrder => (self.end_version, "end_version"),
                 };
                 if snapshot.version() != anchor_version {
-                    return Err(KernelError::generic(format!(
-                        "snapshot version {} does not match {anchor_name} ({anchor_version})",
-                        snapshot.version(),
-                    ))
+                    return Err(KernelError::CommitRange(CommitRangeError::AnchorMismatch {
+                        anchor: anchor_name,
+                        expected: anchor_version,
+                        actual: snapshot.version(),
+                    })
                     .into());
                 }
                 let table_config = snapshot.table_configuration();
@@ -234,16 +305,7 @@ impl CommitActionsIterator {
 
 /// Prepend `commit v={version}` context to kernel protocol-validation failures.
 fn with_version_context(version: Version, err: crate::Error) -> crate::Error {
-    match err {
-        crate::Error::Kernel(KernelError::Unsupported(msg)) => {
-            KernelError::Unsupported(format!("commit v={version}: {msg}")).into()
-        }
-        crate::Error::Kernel(KernelError::InvalidProtocol(msg)) => {
-            KernelError::InvalidProtocol(format!("commit v={version}: {msg}")).into()
-        }
-        error @ crate::Error::Delta(_) => error,
-        other => KernelError::generic(format!("commit v={version}: {other}")).into(),
-    }
+    err.with_context(crate::error::ErrorContext::Commit { version })
 }
 
 impl Iterator for CommitActionsIterator {
@@ -316,6 +378,7 @@ impl<'a> SchemaTransform<'a> for NullableActionTransform {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::error::Error as StdError;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -330,6 +393,34 @@ mod tests {
     use crate::engine_data::RowVisitor;
     use crate::object_store::memory::InMemory;
     use crate::{DeltaErrorCondition, Snapshot};
+
+    #[test]
+    fn commit_context_preserves_native_io_source() {
+        let error = with_version_context(
+            42,
+            KernelError::from(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "commit access denied",
+            ))
+            .into(),
+        );
+        assert!(matches!(
+            &error,
+            crate::Error::Kernel(KernelError::Context {
+                context: crate::error::ErrorContext::Commit { version: 42 },
+                ..
+            })
+        ));
+        let mut current = Some(&error as &(dyn StdError + 'static));
+        while let Some(source) = current {
+            if let Some(source) = source.downcast_ref::<std::io::Error>() {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+                return;
+            }
+            current = source.source();
+        }
+        panic!("native I/O source is missing from {error:?}");
+    }
 
     /// Open a `CommitRange` over `table-with-dv-small` with a matching anchor snapshot.
     /// `start_version` drives both the range's start version and the snapshot's version.
@@ -704,7 +795,8 @@ mod tests {
     )]
     #[case::too_low_reader_version(
         r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
-        |err: &crate::Error| matches!(err, crate::Error::Kernel(KernelError::InvalidProtocol(_))),
+        |err: &crate::Error| matches!(err, crate::Error::Kernel(KernelError::Context { source, .. })
+            if matches!(source.as_ref(), KernelError::InvalidProtocol(_))),
     )]
     #[tokio::test]
     async fn test_commits_errors_on_unsupported_reader_version(
@@ -1174,7 +1266,22 @@ mod tests {
         let actions = [DeltaAction::Add, DeltaAction::Remove];
         let err = drain_commits(&range, engine, Some(snapshot), &actions)
             .expect_err("missing in-commit timestamp must error");
-        let msg = format!("{err}");
-        assert!(msg.contains("in-commit timestamp"), "got: {msg}");
+        let crate::Error::Kernel(error) = &err else {
+            panic!("expected a Kernel failure, got {err:?}");
+        };
+        assert!(matches!(error, KernelError::Context { .. }));
+        let mut source = error;
+        while let KernelError::Context {
+            context,
+            source: inner,
+        } = source
+        {
+            assert!(matches!(
+                context,
+                crate::error::ErrorContext::Commit { version: 0 }
+            ));
+            source = inner;
+        }
+        assert!(matches!(source, KernelError::MissingData(field) if field == "inCommitTimestamp"));
     }
 }

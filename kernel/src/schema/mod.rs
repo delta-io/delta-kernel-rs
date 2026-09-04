@@ -1055,7 +1055,7 @@ impl StructType {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
         field
-            .ok_or_else(|| KernelError::generic("Empty path"))
+            .ok_or_else(|| KernelError::schema("Empty path"))
             .map_err(crate::Error::from)
     }
 
@@ -1111,19 +1111,19 @@ impl StructType {
     {
         let path = col.path();
         if path.is_empty() {
-            return Err(KernelError::generic("Column path cannot be empty").into());
+            return Err(KernelError::schema("Column path cannot be empty").into());
         }
         let mut current_struct = self;
         for (i, field_name) in path.iter().enumerate() {
             let field = find_field(current_struct, field_name).ok_or_else(|| {
-                KernelError::generic(format!(
+                KernelError::missing_column(format!(
                     "Could not resolve column '{col}': field '{field_name}' not found in schema"
                 ))
             })?;
             visit_field(field);
             if i < path.len() - 1 {
                 let DataType::Struct(inner) = field.data_type() else {
-                    return Err(KernelError::generic(format!(
+                    return Err(KernelError::schema(format!(
                         "Cannot resolve column '{col}': intermediate field '{field_name}' \
                          is not a struct type"
                     ))

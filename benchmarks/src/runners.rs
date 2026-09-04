@@ -235,7 +235,8 @@ impl ReadMetadataRunner {
             .predicate
             .as_deref()
             .map(|sql| parse_predicate(sql, &snapshot.schema()))
-            .transpose()?
+            .transpose()
+            .map_err(|source| -> Box<dyn std::error::Error> { source })?
             .map(Arc::new);
 
         let thread_pool = match &config.parallel_scan {

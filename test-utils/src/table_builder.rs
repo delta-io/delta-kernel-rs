@@ -116,7 +116,7 @@ where
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+                .map_err(delta_kernel::KernelError::from)?;
             runtime.block_on(make_fut())
         })
         .join()
@@ -1451,7 +1451,7 @@ async fn write_data_commit<E: TaskExecutor>(
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
-        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+        .map_err(delta_kernel::KernelError::from)?;
 
     let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
@@ -1484,7 +1484,7 @@ async fn write_data_commit<E: TaskExecutor>(
         }
         let data_arrow_schema = ArrowSchema::new(data_fields);
         let batch = RecordBatch::try_new(Arc::new(data_arrow_schema), columns)
-            .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+            .map_err(delta_kernel::KernelError::from)?;
 
         let write_context = if partition_columns.is_empty() {
             write_state.unpartitioned_write_context()?
@@ -2018,11 +2018,7 @@ mod tests {
     ) -> DeltaResult<std::collections::HashMap<String, String>> {
         let store = store.clone();
         block_on_sync(move || async move {
-            crate::read_metadata_configuration_from_store(store.as_ref(), version)
-                .await
-                .map_err(|e| {
-                    delta_kernel::Error::from(delta_kernel::KernelError::generic(e.to_string()))
-                })
+            crate::read_metadata_configuration_from_store(store.as_ref(), version).await
         })
     }
 
@@ -2636,9 +2632,9 @@ mod tests {
             Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
             Err(e) => return Err(delta_kernel::KernelError::from(e).into()),
         };
-        serde_json::from_slice(&bytes).map(Some).map_err(|e| {
-            delta_kernel::Error::from(delta_kernel::KernelError::generic(e.to_string()))
-        })
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| delta_kernel::Error::from(delta_kernel::KernelError::from(e)))
     }
 
     /// Read and parse the `_last_checkpoint` hint, if present.
@@ -2649,7 +2645,7 @@ mod tests {
             match try_read_json(&store, &path).await? {
                 Some(parsed) => {
                     let version = parsed["version"].as_u64().ok_or_else(|| {
-                        delta_kernel::Error::from(delta_kernel::KernelError::generic(
+                        delta_kernel::Error::from(delta_kernel::KernelError::missing_data(
                             "hint missing `version` field",
                         ))
                     })?;
@@ -2666,7 +2662,7 @@ mod tests {
         block_on_sync(move || async move {
             let path = Path::from(format!("_delta_log/{version:020}.crc"));
             try_read_json(&store, &path).await?.ok_or_else(|| {
-                delta_kernel::Error::from(delta_kernel::KernelError::generic(format!(
+                delta_kernel::Error::from(delta_kernel::KernelError::missing_data(format!(
                     "CRC at v={version} missing"
                 )))
             })

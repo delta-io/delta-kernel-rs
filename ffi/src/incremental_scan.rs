@@ -237,7 +237,7 @@ fn incremental_scan_stream_next_arrow_impl(
     let mut guard = lock_stream(stream)?;
     let Some(inner) = guard.as_mut() else {
         // The stream was already consumed by `into_summary` or dropped by a prior error.
-        return Err(KernelError::generic("incremental scan stream was already consumed").into());
+        return Err(delta_kernel::error::FfiContractError::StreamConsumed.into());
     };
     let result = next_arrow_batch(inner);
     // Kill the stream on any error so a later next_arrow / into_summary can't return a partial
@@ -293,7 +293,7 @@ fn incremental_scan_stream_into_summary_impl(
 ) -> DeltaResult<Handle<SharedIncrementalScanSummary>> {
     let inner = lock_stream(stream)?
         .take()
-        .ok_or_else(|| KernelError::generic("incremental scan stream was already consumed"))?;
+        .ok_or(delta_kernel::error::FfiContractError::StreamConsumed)?;
     let summary = inner.into_summary()?;
     Ok(Arc::new(summary).into())
 }
@@ -304,7 +304,9 @@ fn lock_stream(
     stream
         .stream
         .lock()
-        .map_err(|_| KernelError::generic("poisoned incremental scan stream mutex"))
+        .map_err(|_| KernelError::LockPoisoned {
+            resource: "incremental scan stream",
+        })
         .map_err(delta_kernel::Error::from)
 }
 
@@ -654,7 +656,7 @@ mod tests {
             snapshot_incremental_scan_builder(snapshot.shallow_copy(), 2, engine.shallow_copy())
         };
         let result = unsafe { incremental_scan_builder_build(builder) };
-        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::ScanError, None);
 
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
@@ -722,9 +724,9 @@ mod tests {
         let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
 
         let next = unsafe { incremental_scan_stream_next_arrow(surviving.shallow_copy()) };
-        assert_extern_result_error_with_message(next, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(next, FFIKernelError::FfiContractError, None);
         let again = unsafe { incremental_scan_stream_into_summary(surviving) };
-        assert_extern_result_error_with_message(again, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(again, FFIKernelError::FfiContractError, None);
 
         unsafe { free_incremental_scan_summary(summary) };
         unsafe { free_snapshot(snapshot) };
@@ -746,7 +748,7 @@ mod tests {
         let stream = build_stream(&snapshot, &engine, 0);
 
         // The first call surfaces the read error; later calls hit the taken-Option guard and report
-        // GenericError. Either way, no partial result leaks through.
+        // FfiContractError. Either way, no partial result leaks through.
         let first = unsafe { incremental_scan_stream_next_arrow(stream.shallow_copy()) };
         let ExternResult::Err(e) = first else {
             panic!("malformed DV must error");
@@ -754,9 +756,9 @@ mod tests {
         drop(unsafe { recover_error(e) });
 
         let again = unsafe { incremental_scan_stream_next_arrow(stream.shallow_copy()) };
-        assert_extern_result_error_with_message(again, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(again, FFIKernelError::FfiContractError, None);
         let summary = unsafe { incremental_scan_stream_into_summary(stream) };
-        assert_extern_result_error_with_message(summary, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(summary, FFIKernelError::FfiContractError, None);
 
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };

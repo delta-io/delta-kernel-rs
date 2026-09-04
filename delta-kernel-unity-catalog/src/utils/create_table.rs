@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
+use delta_kernel::error::ErrorContext;
 use delta_kernel::{DeltaResult, Engine, KernelError, Snapshot};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,
@@ -118,7 +119,7 @@ pub fn build_uc_create_table_request(
     table_name: impl Into<String>,
 ) -> DeltaResult<CreateTableRequest> {
     if snapshot.version() != 0 {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::InvalidTransactionState(format!(
             "build_uc_create_table_request is only valid for version 0 (table creation) \
              snapshots, but snapshot is at version {}",
             snapshot.version()
@@ -126,8 +127,12 @@ pub fn build_uc_create_table_request(
         .into());
     }
 
-    let columns = serde_json::to_value(snapshot.schema().as_ref())
-        .map_err(|e| KernelError::generic(format!("Failed to serialize table schema: {e}")))?;
+    let columns = serde_json::to_value(snapshot.schema().as_ref()).map_err(|source| {
+        KernelError::JsonSerialization {
+            operation: "serialize UC create table schema",
+            source,
+        }
+    })?;
 
     let table_config = snapshot.table_configuration();
     let metadata = table_config.metadata();
@@ -147,9 +152,7 @@ pub fn build_uc_create_table_request(
     for (domain, dm) in
         snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
     {
-        let value = serde_json::from_str(dm.configuration()).map_err(|e| {
-            KernelError::generic(format!("malformed {domain} domain metadata: {e}"))
-        })?;
+        let value = parse_domain_metadata(&domain, dm.configuration())?;
         domain_metadata.insert(domain, value);
     }
 
@@ -190,6 +193,18 @@ fn to_wire_protocol(protocol: &Protocol) -> WireProtocol {
     }
 }
 
+fn parse_domain_metadata(domain: &str, configuration: &str) -> DeltaResult<serde_json::Value> {
+    serde_json::from_str(configuration)
+        .map_err(|source| {
+            KernelError::from(source)
+                .with_context(ErrorContext::DomainMetadata {
+                    domain: domain.to_string(),
+                })
+                .with_context(ErrorContext::Operation("parse UC domain metadata"))
+        })
+        .map_err(delta_kernel::Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -205,6 +220,37 @@ mod tests {
     use test_utils::TestCatalogCommitter;
 
     use super::*;
+
+    #[rstest]
+    fn malformed_domain_metadata_preserves_domain_and_json_source(
+        #[values(CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME)] domain: &str,
+    ) {
+        let error = parse_domain_metadata(domain, "{").unwrap_err();
+        let delta_kernel::Error::Kernel(KernelError::Context {
+            context: ErrorContext::Operation("parse UC domain metadata"),
+            source,
+        }) = &error
+        else {
+            panic!("expected UC domain parsing context, got {error:?}");
+        };
+        assert!(matches!(
+            source.as_ref(),
+            KernelError::Context {
+                context: ErrorContext::DomainMetadata { domain: actual },
+                ..
+            } if actual == domain
+        ));
+        let mut source: &(dyn std::error::Error + 'static) = &error;
+        loop {
+            if let Some(native) = source.downcast_ref::<serde_json::Error>() {
+                assert!(native.is_eof());
+                break;
+            }
+            source = source
+                .source()
+                .expect("native JSON source must be retained");
+        }
+    }
 
     /// Create a table at version 0 (optionally clustered), then build the UC create request from
     /// its post-commit snapshot. Shared setup for the version-0 request tests.

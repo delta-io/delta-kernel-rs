@@ -226,8 +226,9 @@ impl ParallelState {
     pub fn into_bytes(self) -> DeltaResult<Vec<u8>> {
         let state = self.into_serializable_state()?;
         serde_json::to_vec(&state)
-            .map_err(|e| {
-                KernelError::generic(format!("Failed to serialize ParallelState to bytes: {e}"))
+            .map_err(|source| KernelError::JsonSerialization {
+                operation: "serialize ParallelState to bytes",
+                source,
             })
             .map_err(crate::Error::from)
     }

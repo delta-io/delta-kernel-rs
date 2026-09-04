@@ -221,7 +221,10 @@ impl AggUpdater for LongAccumulatorUpdater<'_> {
                     state.0 = Some(match state.0 {
                         None => candidate,
                         Some(sum) => i64::checked_add(sum, candidate).ok_or_else(|| {
-                            KernelError::generic("SyncPlanExecutor SUM aggregate overflowed i64")
+                            KernelError::NumericOverflow {
+                                operation: "SyncPlanExecutor SUM aggregate",
+                                value: format!("{sum} + {candidate}"),
+                            }
                         })?,
                     });
                 }
@@ -278,8 +281,9 @@ impl AggUpdater for CountUpdater<'_> {
     fn update(&self, state: &mut dyn Any, (_, row_idx): InputRow) -> DeltaResult<()> {
         if self.0.is_none_or(|values| values.is_valid(row_idx)) {
             let state = downcast_state_mut::<CountState>(state)?;
-            state.0 = i64::checked_add(state.0, 1).ok_or_else(|| {
-                KernelError::generic("SyncPlanExecutor COUNT aggregate overflowed i64")
+            state.0 = i64::checked_add(state.0, 1).ok_or_else(|| KernelError::NumericOverflow {
+                operation: "SyncPlanExecutor COUNT aggregate",
+                value: state.0.to_string(),
             })?;
         }
         Ok(())
@@ -384,7 +388,7 @@ fn downcast_state<T: 'static>(state: &dyn Any) -> DeltaResult<&T> {
     state
         .downcast_ref()
         .ok_or_else(|| {
-            KernelError::generic(format!(
+            KernelError::engine_data_type(format!(
                 "Aggregate state is not a {}",
                 std::any::type_name::<T>()
             ))
@@ -396,7 +400,7 @@ fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> DeltaResult<&mut T> {
     state
         .downcast_mut()
         .ok_or_else(|| {
-            KernelError::generic(format!(
+            KernelError::engine_data_type(format!(
                 "Aggregate state is not a {}",
                 std::any::type_name::<T>()
             ))

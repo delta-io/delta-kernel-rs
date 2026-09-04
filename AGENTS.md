@@ -299,6 +299,11 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Common Gotchas
 
+- **Error classification:** Use a precise `KernelError` variant, retaining dependency errors as
+  sources. Validation and state-machine failures without an existing classification belong in
+  typed module-owned error enums, not message-only catch-alls. `Error::with_context` annotates
+  Kernel failures while leaving Delta conditions unchanged. Add an explicit `FFIKernelError`
+  mapping for each new family; preserve existing discriminants and test feature-gated builds.
 - **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
   in production code (ok in tests). NEVER assume one batch per file: ALWAYS iterate.
 - **Column mapping:** Physical column names can differ from logical names. ALWAYS use

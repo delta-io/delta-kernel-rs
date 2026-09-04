@@ -374,7 +374,7 @@ impl<S> Transaction<S> {
             .iter()
             .find(|t| !app_ids.insert(&t.app_id))
         {
-            return Err(KernelError::generic(format!(
+            return Err(KernelError::InvalidTransactionState(format!(
                 "app_id {} already exists in transaction",
                 dup.app_id
             ))
@@ -405,11 +405,9 @@ impl<S> Transaction<S> {
                 .is_feature_enabled(&TableFeature::ChangeDataFeed);
             require!(
                 !cdf_enabled,
-                KernelError::generic(
-                    "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
+                KernelError::Unsupported("Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
                      This would require writing CDC files for DML operations, which is not yet supported. \
-                     Consider using separate transactions: one to add files, another to remove files or update deletion vectors."
-                )
+                     Consider using separate transactions: one to add files, another to remove files or update deletion vectors.".into())
             );
         }
 
@@ -554,11 +552,13 @@ impl<S> Transaction<S> {
             }
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
-            Err(crate::Error::Kernel(e @ KernelError::IOError(_))) => {
+            Err(crate::Error::Kernel(error)) if is_retryable_commit_error(&error) => {
                 // Flips the metric event from success -> failure.
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
-                Ok(CommitResult::RetryableTransaction(self.into_retryable(e)))
+                Ok(CommitResult::RetryableTransaction(
+                    self.into_retryable(error),
+                ))
             }
             Err(e) => Err(e),
         }
@@ -699,13 +699,15 @@ impl<S> Transaction<S> {
             commit_type.requires_catalog_committer(),
         ) {
             (true, true) | (false, false) => Ok(()),
-            (false, true) => Err(KernelError::generic(
+            (false, true) => Err(KernelError::InvalidTransactionState(
                 "This table is catalog-managed and requires a catalog committer. \
-                 Please provide a catalog committer via Snapshot::transaction().",
+                 Please provide a catalog committer via Snapshot::transaction()."
+                    .into(),
             )
             .into()),
-            (true, false) => Err(KernelError::generic(
-                "This table is path-based and cannot be committed to with a catalog committer.",
+            (true, false) => Err(KernelError::InvalidTransactionState(
+                "This table is path-based and cannot be committed to with a catalog committer."
+                    .into(),
             )
             .into()),
         }
@@ -837,10 +839,11 @@ impl<S> Transaction<S> {
             return Ok(());
         }
         if self.effective_table_config.logical_schema().num_fields() == 0 {
-            return Err(KernelError::generic(
+            return Err(KernelError::Schema(
                 "Cannot write data files to a Delta table with empty schema; \
                  use `snapshot.alter_table().add_column(...)` to add at least one \
-                 column before writing data",
+                 column before writing data"
+                    .into(),
             )
             .into());
         }
@@ -1682,8 +1685,16 @@ pub struct RetryableTransaction<S = ExistingTable> {
     pub error: KernelError,
 }
 
+fn is_retryable_commit_error(mut error: &KernelError) -> bool {
+    while let KernelError::Context { source, .. } | KernelError::Backtraced { source, .. } = error {
+        error = source;
+    }
+    matches!(error, KernelError::IOError(_))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::backtrace::Backtrace;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -1709,6 +1720,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::error::ErrorContext;
     use crate::expressions::{MapData, Scalar, StructData};
     use crate::metrics::{MetricEvent, TableType, TransactionCommitFailure};
     use crate::object_store::memory::InMemory;
@@ -1737,7 +1749,10 @@ mod tests {
     }
 
     /// A mock committer that always returns an IOError, used to test the retryable error path.
-    struct IoErrorCommitter;
+    struct IoErrorCommitter {
+        context: bool,
+        backtrace: bool,
+    }
 
     impl Committer for IoErrorCommitter {
         fn commit(
@@ -1746,7 +1761,17 @@ mod tests {
             _actions: DeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
-            Err(KernelError::IOError(std::io::Error::other("simulated IO error")).into())
+            let mut error = KernelError::IOError(std::io::Error::other("simulated IO error"));
+            if self.context {
+                error = error.with_context(ErrorContext::Operation("commit JSON"));
+            }
+            if self.backtrace {
+                error = KernelError::Backtraced {
+                    source: Box::new(error),
+                    backtrace: Box::new(Backtrace::disabled()),
+                };
+            }
+            Err(error.into())
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -1762,16 +1787,16 @@ mod tests {
 
     /// A mock committer that always returns a non-retryable (non-IO) error, used to test the
     /// terminal error path.
-    struct GenericErrorCommitter;
+    struct UnsupportedCommitter;
 
-    impl Committer for GenericErrorCommitter {
+    impl Committer for UnsupportedCommitter {
         fn commit(
             &self,
             _engine: &dyn Engine,
             _actions: DeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
-            Err(KernelError::generic("simulated commit error").into())
+            Err(KernelError::Unsupported("simulated unsupported commit operation".into()).into())
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -2563,7 +2588,7 @@ mod tests {
         let existing_path = paths
             .into_iter()
             .next()
-            .ok_or_else(|| KernelError::generic("expected at least one scan file"))?;
+            .ok_or_else(|| KernelError::MissingData("expected at least one scan file".into()))?;
 
         let mut dv_map = HashMap::new();
         dv_map.insert(existing_path, create_test_dv_descriptor("matched"));
@@ -2613,7 +2638,7 @@ mod tests {
         let existing_path = paths
             .into_iter()
             .next()
-            .ok_or_else(|| KernelError::generic("expected at least one scan file"))?;
+            .ok_or_else(|| KernelError::MissingData("expected at least one scan file".into()))?;
 
         let mut dv_map = HashMap::new();
         dv_map.insert(existing_path, create_test_dv_descriptor("matched"));
@@ -2623,8 +2648,8 @@ mod tests {
             scan_metadata
                 .into_iter()
                 .map(|metadata| Ok(metadata.scan_files))
-                .chain(std::iter::once(Err(KernelError::generic(
-                    "simulated scan metadata failure",
+                .chain(std::iter::once(Err(KernelError::from(
+                    std::io::Error::other("simulated scan metadata failure"),
                 )
                 .into()))),
         );
@@ -2978,10 +3003,18 @@ mod tests {
     // kernel/tests/features/dv.rs and kernel/tests/write/remove_dv.rs, which exercise
     // the full deletion vector write workflow including the DvMatchVisitor logic.
 
-    #[test]
-    fn test_commit_io_error_returns_retryable_transaction() -> DeltaResult<()> {
+    #[rstest]
+    fn test_commit_io_error_returns_retryable_transaction(
+        #[values(false, true)] context: bool,
+        #[values(false, true)] backtrace: bool,
+    ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let mut txn = snapshot.transaction(
+            Box::new(IoErrorCommitter { context, backtrace }),
+            engine.as_ref(),
+        )?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(
@@ -2994,7 +3027,17 @@ mod tests {
                 "Unexpected error: {}",
                 retryable.error
             );
+            assert_eq!(
+                matches!(retryable.error, KernelError::Backtraced { .. }),
+                backtrace
+            );
+            if context {
+                assert!(retryable.error.to_string().contains("commit JSON"));
+            }
         }
+        let failure = commit_failure_event(&reporter).expect("commit failure event");
+        assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
+        assert_eq!(failure.table_type, TableType::PathBased);
         Ok(())
     }
 
@@ -3349,7 +3392,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Kernel(KernelError::Generic(e))
+            crate::Error::Kernel(KernelError::InvalidTransactionState(e))
                 if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
@@ -3369,7 +3412,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Kernel(KernelError::Generic(e))
+            crate::Error::Kernel(KernelError::InvalidTransactionState(e))
                 if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
@@ -3504,26 +3547,11 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_io_error_emits_retryable_io_failure_metric() -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let reporter = Arc::new(CapturingReporter::default());
-        let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
-        add_dummy_file(&mut txn);
-        let result = txn.commit(engine.as_ref())?;
-        assert!(matches!(result, CommitResult::RetryableTransaction(_)));
-        let failure = commit_failure_event(&reporter).expect("commit failure event");
-        assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
-        assert_eq!(failure.table_type, TableType::PathBased);
-        Ok(())
-    }
-
-    #[test]
     fn test_commit_terminal_error_emits_error_failure_metric() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        let mut txn = snapshot.transaction(Box::new(GenericErrorCommitter), engine.as_ref())?;
+        let mut txn = snapshot.transaction(Box::new(UnsupportedCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
         assert!(txn.commit(engine.as_ref()).is_err());
         let failure = commit_failure_event(&reporter).expect("commit failure event");

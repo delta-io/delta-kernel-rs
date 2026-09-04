@@ -64,7 +64,10 @@ fn datatype_to_df_null_scalar(data_type: &KernelDataType) -> DeltaResult<DFScala
     let arrow_type: ArrowDataType = data_type.try_into_arrow().map_err(KernelError::from)?;
     arrow_type
         .try_into()
-        .map_err(KernelError::generic_err)
+        .map_err(|source| KernelError::ExpressionConversion {
+            operation: "convert DataFusion null scalar",
+            source: Box::new(source),
+        })
         .map_err(delta_kernel::Error::from)
 }
 
@@ -93,7 +96,10 @@ fn struct_to_df_scalar(data: &KernelStructData) -> DeltaResult<DFScalarValue> {
     }
     builder
         .build()
-        .map_err(KernelError::generic_err)
+        .map_err(|source| KernelError::ExpressionConversion {
+            operation: "build DataFusion struct scalar",
+            source: Box::new(source),
+        })
         .map_err(delta_kernel::Error::from)
 }
 
@@ -102,10 +108,10 @@ fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<DFScalarValue> {
     let map_type = data.map_type();
     let entries_field: ArrowField = map_type.try_into_arrow().map_err(KernelError::from)?;
     let ArrowDataType::Struct(kv_fields) = entries_field.data_type() else {
-        return Err(KernelError::generic("map entries type is not a struct").into());
+        return Err(KernelError::invalid_struct_data("map entries type is not a struct").into());
     };
     let [key_field, value_field] = kv_fields.as_ref() else {
-        return Err(KernelError::generic(
+        return Err(KernelError::invalid_struct_data(
             "map entries struct must have exactly a key and value field",
         )
         .into());
@@ -121,10 +127,10 @@ fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<DFScalarValue> {
     let value_array = df_scalars_to_arrow_array(values, value_field.data_type())?;
 
     let entries = StructArray::try_new(kv_fields.clone(), vec![key_array, value_array], None)
-        .map_err(KernelError::generic_err)?;
+        .map_err(KernelError::from)?;
     let offsets = OffsetBuffer::from_lengths([pairs.len()]);
     let map_array = MapArray::try_new(Arc::new(entries_field), offsets, entries, None, false)
-        .map_err(KernelError::generic_err)?;
+        .map_err(KernelError::from)?;
     Ok(DFScalarValue::Map(Arc::new(map_array)))
 }
 
@@ -138,7 +144,10 @@ fn df_scalars_to_arrow_array(
         Ok(new_empty_array(arrow_type))
     } else {
         DFScalarValue::iter_to_array(scalars)
-            .map_err(KernelError::generic_err)
+            .map_err(|source| KernelError::ExpressionConversion {
+                operation: "build DataFusion scalar array",
+                source: Box::new(source),
+            })
             .map_err(delta_kernel::Error::from)
     }
 }
@@ -148,12 +157,31 @@ mod tests {
     use datafusion::arrow::array::{Array, AsArray, Int32Array, ListArray};
     use datafusion::arrow::datatypes::Int32Type;
     use datafusion::arrow::util::pretty::pretty_format_columns;
+    use datafusion::common::DataFusionError;
     use delta_kernel::schema::{
         schema, ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
     };
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case(DFScalarValue::Utf8(Some("value".to_string())))]
+    #[case(DFScalarValue::Float64(Some(1.5)))]
+    fn mixed_scalar_array_preserves_datafusion_source(#[case] second: DFScalarValue) {
+        let error = df_scalars_to_arrow_array(
+            vec![DFScalarValue::Int32(Some(1)), second],
+            &ArrowDataType::Int32,
+        )
+        .unwrap_err();
+        let delta_kernel::Error::Kernel(KernelError::ExpressionConversion { operation, source }) =
+            error
+        else {
+            panic!("expected expression conversion error, got {error:?}");
+        };
+        assert_eq!(operation, "build DataFusion scalar array");
+        assert!(source.downcast_ref::<DataFusionError>().is_some());
+    }
 
     // === Shared helpers ===
 

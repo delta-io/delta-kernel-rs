@@ -251,10 +251,7 @@ pub fn load_test_data(
 /// This function copies ALL files and subdirectories, including any test artifacts
 /// that may have been created in the source directory. Ensure the source directory
 /// contains only the intended baseline data.
-pub fn copy_directory(
-    source: &std::path::Path,
-    dest: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn copy_directory(source: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dest)?;
 
     for entry in std::fs::read_dir(source)? {
@@ -479,10 +476,13 @@ pub async fn add_commit(
     store: &DynObjectStore,
     version: u64,
     data: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> DeltaResult<()> {
     let relative_path = delta_path_for_version(version, "json");
     let table_path = resolve_table_path(table_root, &relative_path)?;
-    store.put(&table_path, data.into()).await?;
+    store
+        .put(&table_path, data.into())
+        .await
+        .map_err(KernelError::from)?;
     Ok(())
 }
 
@@ -676,15 +676,14 @@ pub fn test_table_setup() -> DeltaResult<(
     String,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
 )> {
-    let temp_dir =
-        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+    let temp_dir = tempfile::tempdir().map_err(delta_kernel::KernelError::from)?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
+        .ok_or_else(|| delta_kernel::KernelError::invalid_table_location("Invalid path"))?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
+        .map_err(|_| delta_kernel::KernelError::invalid_table_location(&table_path))?;
     let engine = create_default_engine(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -699,15 +698,14 @@ pub fn test_table_setup_mt() -> DeltaResult<(
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
 )> {
-    let temp_dir =
-        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+    let temp_dir = tempfile::tempdir().map_err(delta_kernel::KernelError::from)?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
+        .ok_or_else(|| delta_kernel::KernelError::invalid_table_location("Invalid path"))?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
+        .map_err(|_| delta_kernel::KernelError::invalid_table_location(&table_path))?;
     let engine = create_default_engine_mt_executor(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -754,7 +752,7 @@ pub async fn create_table(
     use_37_protocol: bool,
     mut reader_features: Vec<&str>,
     mut writer_features: Vec<&str>,
-) -> Result<Url, Box<dyn std::error::Error>> {
+) -> DeltaResult<Url> {
     let table_id = "test_id";
 
     // IcebergCompatV3 requires ColumnMapping, RowTracking, and DomainMetadata. Add them so callers
@@ -782,7 +780,11 @@ pub async fn create_table(
     } else {
         (schema, 0i64)
     };
-    let schema = serde_json::to_string(&schema)?;
+    let schema =
+        serde_json::to_string(&schema).map_err(|source| KernelError::JsonSerialization {
+            operation: "serialize test schema",
+            source,
+        })?;
 
     let protocol = if use_37_protocol {
         json!({
@@ -900,11 +902,17 @@ pub async fn create_table(
     };
 
     // put 0.json with protocol + metadata
-    let path = table_path.join("_delta_log/00000000000000000000.json")?;
+    let path = table_path
+        .join("_delta_log/00000000000000000000.json")
+        .map_err(KernelError::from)?;
 
     store
-        .put(&Path::from_url_path(path.path())?, data.into())
-        .await?;
+        .put(
+            &Path::from_url_path(path.path()).map_err(KernelError::from)?,
+            data.into(),
+        )
+        .await
+        .map_err(KernelError::from)?;
     Ok(table_path)
 }
 
@@ -932,7 +940,7 @@ pub fn schema_with_column_defaults(
         })
         .collect();
     if !column_defaults.is_empty() {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::missing_column(format!(
             "column defaults reference unknown top-level columns: {:?}",
             column_defaults.into_keys().collect::<Vec<_>>()
         ))
@@ -1110,7 +1118,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())
         .map_err(delta_kernel::KernelError::from)?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
-        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+        .map_err(delta_kernel::KernelError::from)?;
     let mut txn = snapshot
         .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())
@@ -1421,7 +1429,7 @@ pub fn assert_row_ids_unique(batches: &[RecordBatch]) {
 pub fn create_add_files_metadata(
     add_files_schema: &SchemaRef,
     files: Vec<(&str, i64, i64, Option<i64>)>,
-) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
+) -> Result<Box<dyn delta_kernel::EngineData>, delta_kernel::arrow::error::ArrowError> {
     let num_files = files.len();
 
     // Build arrays for each file
@@ -1527,7 +1535,7 @@ pub async fn write_batch_to_table(
     engine: &DefaultEngine<impl delta_kernel_default_engine::executor::TaskExecutor>,
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+) -> DeltaResult<Arc<Snapshot>> {
     let mut txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
@@ -1980,17 +1988,21 @@ pub fn get_materialized_row_tracking_column_names(
 pub async fn read_metadata_configuration_from_store(
     store: &DynObjectStore,
     version: u64,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+) -> DeltaResult<HashMap<String, String>> {
     let path =
         delta_kernel::object_store::path::Path::from(format!("_delta_log/{version:020}.json"));
-    let get_result = store.get(&path).await?;
-    let bytes = get_result.bytes().await?;
+    let get_result = store.get(&path).await.map_err(KernelError::from)?;
+    let bytes = get_result.bytes().await.map_err(KernelError::from)?;
     let mut config = HashMap::new();
-    for line in std::str::from_utf8(&bytes)?.lines() {
-        let v: serde_json::Value = serde_json::from_str(line)?;
+    for line in std::str::from_utf8(&bytes)
+        .map_err(KernelError::from)?
+        .lines()
+    {
+        let v: serde_json::Value = serde_json::from_str(line).map_err(KernelError::from)?;
         if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration")) {
             if c.is_object() {
-                let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
+                let entries: HashMap<String, String> =
+                    serde_json::from_value(c.clone()).map_err(KernelError::from)?;
                 config.extend(entries);
             }
         }

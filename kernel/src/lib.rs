@@ -217,7 +217,9 @@ pub type Version = u64;
 pub(crate) fn version_as_i64(version: Version) -> DeltaResult<i64> {
     version
         .try_into()
-        .map_err(|_| KernelError::generic(format!("Delta log version {version} exceeds i64::MAX")))
+        .map_err(|source| {
+            KernelError::integer_conversion("Delta log version", version, "i64", source)
+        })
         .map_err(crate::Error::from)
 }
 
@@ -265,16 +267,16 @@ impl TryFrom<DirEntry> for FileMeta {
             .modified()
             .map_err(crate::KernelError::from)?
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|_| {
-                KernelError::generic("Failed to convert file timestamp to milliseconds")
-            })?;
+            .map_err(KernelError::ClockBeforeEpoch)?;
         let location = Url::from_file_path(ent.path())
-            .map_err(|_| KernelError::generic(format!("Invalid path: {:?}", ent.path())))?;
-        let last_modified = last_modified.as_millis().try_into().map_err(|_| {
-            KernelError::generic(format!(
-                "Failed to convert file modification time {:?} into i64",
-                last_modified.as_millis()
-            ))
+            .map_err(|_| KernelError::invalid_table_location(ent.path().display()))?;
+        let last_modified = last_modified.as_millis().try_into().map_err(|source| {
+            KernelError::integer_conversion(
+                "file modification time",
+                last_modified.as_millis(),
+                "i64",
+                source,
+            )
         })?;
         Ok(FileMeta {
             location,
@@ -297,7 +299,9 @@ impl FileMeta {
     /// Casts `size` to `i64`. Errors if `size` exceeds `i64::MAX`.
     pub(crate) fn size_as_i64(&self) -> DeltaResult<i64> {
         i64::try_from(self.size)
-            .map_err(|_| KernelError::generic(format!("file size {} exceeds i64::MAX", self.size)))
+            .map_err(|source| {
+                KernelError::integer_conversion("file size", self.size, "i64", source)
+            })
             .map_err(crate::Error::from)
     }
 }
@@ -1201,11 +1205,15 @@ mod tests {
         let meta = FileMeta::new(Url::parse("file:///x").unwrap(), 0, size);
         match expected {
             Some(v) => assert_eq!(meta.size_as_i64().unwrap(), v),
-            None => assert!(meta
-                .size_as_i64()
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds i64::MAX")),
+            None => assert!(matches!(
+                meta.size_as_i64().unwrap_err(),
+                Error::Kernel(KernelError::IntegerConversion {
+                    field: "file size",
+                    value,
+                    target: "i64",
+                    ..
+                }) if value == size.to_string()
+            )),
         }
     }
 }

@@ -58,7 +58,7 @@ impl CheckpointManifestReader {
                 None,
             )?,
             extension => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::unsupported(format!(
                     "Unsupported checkpoint extension: {extension}",
                 ))
                 .into());
@@ -81,10 +81,9 @@ impl CheckpointManifestReader {
     pub(crate) fn extract_sidecars(self) -> DeltaResult<Vec<FileMeta>> {
         require!(
             self.is_complete,
-            KernelError::generic(format!(
-                "Cannot extract sidecars from in-progress ManifestReader for file: {}",
-                self.manifest_file.location
-            ))
+            KernelError::LogSegment(crate::log_segment::LogSegmentError::IncompleteManifest {
+                path: self.manifest_file.location.to_string(),
+            })
         );
 
         let sidecars: Vec<_> = self

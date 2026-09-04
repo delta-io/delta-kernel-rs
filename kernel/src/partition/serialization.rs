@@ -14,6 +14,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
+use crate::error::ErrorContext;
 use crate::expressions::{DecimalData, Scalar};
 use crate::{DeltaResult, KernelError};
 
@@ -98,7 +99,7 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Binary(b) if b.is_empty() => Ok(None),
         Scalar::Binary(b) => Ok(Some(format_binary(b)?)),
         Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => {
-            Err(KernelError::generic(format!(
+            Err(KernelError::UnexpectedColumnType(format!(
                 "cannot serialize partition value: type {:?} is not a valid partition column type",
                 value.data_type()
             ))
@@ -164,26 +165,30 @@ fn format_f64(v: f64) -> String {
 
 /// Formats a date value (days since UNIX epoch) as "YYYY-MM-DD".
 fn format_date(days: i32) -> DeltaResult<String> {
-    let ce_days = UNIX_EPOCH_CE_DAYS.checked_add(days).ok_or_else(|| {
-        KernelError::generic(format!("date value {days} days from epoch is out of range"))
-    })?;
+    let ce_days =
+        UNIX_EPOCH_CE_DAYS
+            .checked_add(days)
+            .ok_or_else(|| KernelError::NumericOverflow {
+                operation: "convert partition date days from Unix epoch to CE",
+                value: days.to_string(),
+            })?;
     NaiveDate::from_num_days_from_ce_opt(ce_days)
         .map(|d| d.format("%Y-%m-%d").to_string())
-        .ok_or_else(|| {
-            KernelError::generic(format!("date value {days} days from epoch is out of range"))
+        .ok_or_else(|| KernelError::NumericOverflow {
+            operation: "format partition date",
+            value: days.to_string(),
         })
         .map_err(crate::Error::from)
 }
 
 /// Converts microseconds since epoch to a [`DateTime`], returning an error if out of range.
-fn micros_to_datetime(micros: i64, label: &str) -> DeltaResult<DateTime<Utc>> {
+fn micros_to_datetime(micros: i64, label: &'static str) -> DeltaResult<DateTime<Utc>> {
     let secs = micros.div_euclid(1_000_000);
     let subsec_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
     DateTime::from_timestamp(secs, subsec_nanos)
-        .ok_or_else(|| {
-            KernelError::generic(format!(
-                "{label} value {micros} microseconds from epoch is out of range"
-            ))
+        .ok_or_else(|| KernelError::NumericOverflow {
+            operation: label,
+            value: micros.to_string(),
         })
         .map_err(crate::Error::from)
 }
@@ -247,8 +252,10 @@ fn format_decimal(d: &DecimalData) -> String {
 fn format_binary(bytes: &[u8]) -> DeltaResult<String> {
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
-        .map_err(|e| {
-            KernelError::generic(format!("binary partition value is not valid UTF-8: {e}"))
+        .map_err(|source| {
+            KernelError::from(source).with_context(ErrorContext::Operation(
+                "decode binary partition value as UTF-8",
+            ))
         })
         .map_err(crate::Error::from)
 }
@@ -613,7 +620,10 @@ mod tests {
     #[case::timestamp(Scalar::Timestamp(i64::MAX))]
     #[case::timestamp_ntz(Scalar::TimestampNtz(i64::MAX))]
     fn test_temporal_out_of_range_returns_error(#[case] input: Scalar) {
-        assert!(serialize_partition_value(&input).is_err());
+        assert!(matches!(
+            serialize_partition_value(&input),
+            Err(crate::Error::Kernel(KernelError::NumericOverflow { .. }))
+        ));
     }
 
     /// Non-UTF-8 binary returns an error (rows 50, 52).
@@ -621,7 +631,19 @@ mod tests {
     #[case::row50_deadbeef(vec![0xDE, 0xAD, 0xBE, 0xEF])]
     #[case::row52_nul_and_high_byte(vec![0x00, 0xFF])]
     fn test_non_utf8_binary_returns_error(#[case] input: Vec<u8>) {
-        assert!(serialize_partition_value(&Scalar::Binary(input)).is_err());
+        let expected_source = std::str::from_utf8(&input).unwrap_err();
+        let error = serialize_partition_value(&Scalar::Binary(input)).unwrap_err();
+        let crate::Error::Kernel(KernelError::Context {
+            context: ErrorContext::Operation("decode binary partition value as UTF-8"),
+            source,
+        }) = error
+        else {
+            panic!("expected binary partition context, got {error:?}");
+        };
+        assert!(matches!(
+            source.as_ref(),
+            KernelError::Utf8Error(native) if *native == expected_source
+        ));
     }
 
     /// Non-null Struct, Array, and Map values return an error.

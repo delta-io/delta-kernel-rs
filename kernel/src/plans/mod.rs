@@ -81,6 +81,53 @@ use crate::{
     AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, FileMeta, KernelError, ParquetFooter,
 };
 
+/// Invalid relational plan shape or file metadata supplied to an executor.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanError {
+    /// An executor returned an invalid number of results for a single-result operation.
+    #[error("{operation} expected {expected} result(s), got at least {actual_at_least}")]
+    OutputCount {
+        /// Operation producing the result stream.
+        operation: &'static str,
+        /// Required result count.
+        expected: usize,
+        /// Observed count, bounded by how many results were consumed.
+        actual_at_least: usize,
+    },
+    /// A plan or operator requires at least one input.
+    #[error("{operation}: requires at least one input")]
+    EmptyInput {
+        /// Operator or execution operation being constructed.
+        operation: &'static str,
+    },
+    /// A file has a different number of constants than the scan declares.
+    #[error(
+        "scan: file {file} has {actual} constant value(s) for {expected} file-constant column(s)"
+    )]
+    FileConstantCount {
+        /// Zero-based file index.
+        file: usize,
+        /// Declared column count.
+        expected: usize,
+        /// Supplied constant count.
+        actual: usize,
+    },
+    /// A join's key lists differ in length.
+    #[error("join: {probe} probe key(s) but {build} build key(s); they must match in length.")]
+    JoinKeyCount {
+        /// Probe key count.
+        probe: usize,
+        /// Build key count.
+        build: usize,
+    },
+    /// A dynamic scan's file size is not positive.
+    #[error("DynamicScan file size must be positive, got {size}")]
+    InvalidFileSize {
+        /// Supplied file size.
+        size: i64,
+    },
+}
+
 /// Provides the ability to execute declarative plans to the Delta Kernel.
 ///
 /// This gives the kernel the ability to execute data-intensive operations by constructing a

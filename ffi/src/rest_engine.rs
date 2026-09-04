@@ -224,9 +224,11 @@ pub(crate) fn rest_builder_state_from_ffi(
 unsafe fn take_auth_pairs_from_c(headers: *mut CAuthHeaders) -> DeltaResult<Vec<(String, String)>> {
     let count = (*headers).count as usize;
     if count > AUTH_MAX_NUM_HEADERS {
-        return Err(KernelError::generic(format!(
-            "auth header count {count} exceeds max {AUTH_MAX_NUM_HEADERS}"
-        ))
+        return Err(delta_kernel::error::FfiContractError::CountExceeded {
+            field: "auth header",
+            actual: count,
+            maximum: AUTH_MAX_NUM_HEADERS,
+        }
         .into());
     }
 
@@ -279,10 +281,10 @@ fn copy_optional_string(slice: &KernelStringSlice) -> DeltaResult<String> {
     unsafe { String::try_from_slice(slice) }
 }
 
-fn copy_required_string(slice: &KernelStringSlice, field: &str) -> DeltaResult<String> {
+fn copy_required_string(slice: &KernelStringSlice, field: &'static str) -> DeltaResult<String> {
     let value = copy_optional_string(slice)?;
     if value.is_empty() {
-        return Err(KernelError::generic(format!("`{field}` must be non-empty")).into());
+        return Err(delta_kernel::error::FfiContractError::EmptyArgument { field }.into());
     }
     Ok(value)
 }
@@ -329,10 +331,12 @@ pub(crate) fn build_rest_object_store(
             .get(REST_BUILDER_OPTION_TLS_TIMEOUT_SECS)
             .map(|s| {
                 s.parse::<u64>().map_err(|e| {
-                    KernelError::generic(format!(
-                        "invalid {} `{s}`: {e}",
-                        REST_BUILDER_OPTION_TLS_TIMEOUT_SECS
-                    ))
+                    KernelError::from(e).with_context(
+                        delta_kernel::error::ErrorContext::Configuration {
+                            key: REST_BUILDER_OPTION_TLS_TIMEOUT_SECS,
+                            value: s.clone(),
+                        },
+                    )
                 })
             })
             .transpose()?,
@@ -341,10 +345,12 @@ pub(crate) fn build_rest_object_store(
         .get(REST_BUILDER_OPTION_RETRY_MAX_RETRIES)
         .map(|s| {
             s.parse::<u32>().map_err(|e| {
-                KernelError::generic(format!(
-                    "invalid {} `{s}`: {e}",
-                    REST_BUILDER_OPTION_RETRY_MAX_RETRIES
-                ))
+                KernelError::from(e).with_context(
+                    delta_kernel::error::ErrorContext::Configuration {
+                        key: REST_BUILDER_OPTION_RETRY_MAX_RETRIES,
+                        value: s.clone(),
+                    },
+                )
             })
         })
         .transpose()?
@@ -365,15 +371,17 @@ pub(crate) fn build_rest_object_store(
     ))
 }
 
-fn parse_bool_option(key: &str, value: Option<&String>) -> DeltaResult<bool> {
+fn parse_bool_option(key: &'static str, value: Option<&String>) -> DeltaResult<bool> {
     match value {
         None => Ok(false),
         Some(v) => match v.as_str() {
             "true" => Ok(true),
             "false" => Ok(false),
-            other => Err(KernelError::generic(format!(
-                "invalid {key} `{other}`: expected `true` or `false`"
-            ))
+            other => Err(delta_kernel::error::FfiContractError::InvalidOption {
+                key,
+                value: other.to_string(),
+                expected: "true or false",
+            }
             .into()),
         },
     }
@@ -600,13 +608,25 @@ mod tests {
     // rejects without paying crypto init. Partial mTLS rejects inside `build_rest_client` itself,
     // but before `builder.build()`, so no crypto stack is built either.
 
-    #[test]
-    fn build_rejects_invalid_timeout() {
+    #[rstest::rstest]
+    #[case(REST_BUILDER_OPTION_TLS_TIMEOUT_SECS)]
+    #[case(REST_BUILDER_OPTION_RETRY_MAX_RETRIES)]
+    fn build_rejects_invalid_integer_option_with_context(#[case] key: &'static str) {
         let mut options = HashMap::new();
-        options.insert(REST_BUILDER_OPTION_TLS_TIMEOUT_SECS.into(), "nope".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
-                .is_err()
+        options.insert(key.into(), "nope".into());
+        let error = build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
+            .unwrap_err();
+        let delta_kernel::Error::Kernel(KernelError::Context { context, source }) = error else {
+            panic!("expected configuration context");
+        };
+        assert!(matches!(
+            context,
+            delta_kernel::error::ErrorContext::Configuration { key: actual, value }
+                if actual == key && value == "nope"
+        ));
+        assert_eq!(
+            crate::error::FFIKernelError::from(*source),
+            crate::error::FFIKernelError::ParseIntError,
         );
     }
 
@@ -630,16 +650,6 @@ mod tests {
             REST_BUILDER_OPTION_TLS_CERT_PATH.into(),
             "/x/cert.pem".into(),
         );
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn build_rejects_invalid_max_retries() {
-        let mut options = HashMap::new();
-        options.insert(REST_BUILDER_OPTION_RETRY_MAX_RETRIES.into(), "nope".into());
         assert!(
             build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
                 .is_err()

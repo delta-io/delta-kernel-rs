@@ -109,7 +109,9 @@ Resolve the file path against the table root and read with the physical schema:
 
 ```rust,ignore
 let file_url = scan.table_root().join(&scan_file.path)?;
-let size: u64 = scan_file.size.try_into().map_err(|_| KernelError::generic("negative file size"))?;
+let size: u64 = scan_file.size.try_into().map_err(|source| {
+    KernelError::integer_conversion("scan file size", scan_file.size, "u64", source)
+})?;
 let file_meta = FileMeta::new(file_url, scan_file.modification_time, size);
 
 let read_results = engine

@@ -20,6 +20,18 @@ log replay or checkpoint writes, kernel receives opaque `EngineData` batches, in
 visitor pattern, updates a selection vector, and hands them back to the engine: it never
 deserializes the full batch into in-memory structs.
 
+## Errors
+
+`Error` separates stable `DeltaError` conditions from `KernelError` failures. Kernel failures use
+specific variants or module-owned typed errors re-exported through `error`; dependency errors retain
+their native sources. `Error::with_context` adds operation, commit, or file context only to Kernel
+failures. `Context` and `Backtraced` retain the underlying FFI error code.
+
+The FFI transports an explicit `FFIKernelError` code and rendered message, not Rust error objects.
+Its discriminants are stable and append-only. Legacy inbound generic codes and callback payloads
+that cannot reconstruct a typed error become `KernelError::ForeignCallback`; this has a distinct
+outbound code. Recognized payload-free callback errors retain any supplied diagnostic as context.
+
 ## Snapshot
 
 `Snapshot` (`kernel/src/snapshot/`) is the primary entry point for operations on an existing table.

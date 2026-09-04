@@ -130,7 +130,11 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
             vec![],
             &delta_kernel::arrow::array::RecordBatchOptions::new().with_row_count(Some(n_rows)),
         )
-        .map_err(|e| KernelError::Generic(format!("zero-arg opaque eval batch construction: {e}")))
+        .map_err(|e| {
+            KernelError::from(e).with_context(delta_kernel::error::ErrorContext::Operation(
+                "zero-arg opaque eval batch construction",
+            ))
+        })
         .map_err(delta_kernel::Error::from);
     }
 
@@ -150,7 +154,11 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
     let schema = Arc::new(Schema::new(fields));
 
     RecordBatch::try_new(schema, arrays)
-        .map_err(|e| KernelError::Generic(format!("opaque eval batch construction: {e}")))
+        .map_err(|e| {
+            KernelError::from(e).with_context(delta_kernel::error::ErrorContext::Operation(
+                "opaque eval batch construction",
+            ))
+        })
         .map_err(delta_kernel::Error::from)
 }
 
@@ -216,7 +224,11 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaRe
         .collect();
     StructArray::try_new(arrow_fields, arrays, None)
         .map(|sa| Arc::new(sa) as ArrayRef)
-        .map_err(|e| KernelError::Generic(format!("struct arg construction: {e}")))
+        .map_err(|e| {
+            KernelError::from(e).with_context(delta_kernel::error::ErrorContext::Operation(
+                "struct arg construction",
+            ))
+        })
         .map_err(delta_kernel::Error::from)
 }
 
@@ -227,9 +239,9 @@ fn import_ffi_array(ffi: ArrowFFIData) -> DeltaResult<ArrayRef> {
     // slot. This check is load-bearing: `from_ffi` asserts on the empty structs' null pointers,
     // and kernel must never panic -- so reject the unpopulated case with an error up front.
     if ffi.array.is_released() {
-        return Err(KernelError::Generic(
-            "engine callback returned success but no result array".into(),
-        )
+        return Err(delta_kernel::error::FfiContractError::NullArgument {
+            field: "engine callback result array",
+        }
         .into());
     }
 
@@ -237,24 +249,26 @@ fn import_ffi_array(ffi: ArrowFFIData) -> DeltaResult<ArrayRef> {
 
     // SAFETY: the engine promised these structs are valid Arrow C Data
     // Interface payloads it produced and handed to us.
-    let array_data = unsafe { from_ffi(array, &schema) }
-        .map_err(|e| KernelError::Generic(format!("from_ffi: {e}")))?;
+    let array_data = unsafe { from_ffi(array, &schema) }.map_err(|e| {
+        KernelError::from(e).with_context(delta_kernel::error::ErrorContext::Operation("from_ffi"))
+    })?;
     Ok(make_array(array_data))
 }
 
 fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> DeltaResult<BooleanArray> {
     if arr.len() != expected_rows {
-        return Err(KernelError::Generic(format!(
-            "opaque predicate eval_pred returned {} rows, expected {expected_rows}",
-            arr.len()
-        ))
+        return Err(delta_kernel::error::FfiContractError::CountMismatch {
+            field: "eval_pred",
+            actual: arr.len(),
+            expected: expected_rows,
+        }
         .into());
     }
     arr.as_any()
         .downcast_ref::<BooleanArray>()
         .cloned()
         .ok_or_else(|| {
-            KernelError::Generic(format!(
+            KernelError::engine_data_type(format!(
                 "opaque predicate eval_pred returned non-boolean array of type {:?}",
                 arr.data_type()
             ))
@@ -292,10 +306,12 @@ fn call_eval_pred(
         EngineExecResult::Success(result_ffi) => result_ffi,
         EngineExecResult::Failure(err) => return Err(KernelError::from(err).into()),
         EngineExecResult::Uninit => {
-            return Err(KernelError::Generic(format!(
-                "engine opaque-eval callback for `{op_name}` returned without writing a result"
-            ))
-            .into())
+            return Err(
+                delta_kernel::error::FfiContractError::CallbackResultUninitialized {
+                    callback: op_name.to_string(),
+                }
+                .into(),
+            )
         }
     };
 
@@ -407,6 +423,7 @@ mod tests {
     };
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
+    use delta_kernel::error::FfiContractError;
     use delta_kernel::expressions::{col, lit, Expression, Predicate};
 
     use super::*;
@@ -716,10 +733,16 @@ mod tests {
         );
         let batch = batch_with_col(vec![Some("x"), Some("y"), Some("z")]);
         let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
-        assert!(
-            format!("{err}").contains("returned 1 rows, expected 3"),
-            "got: {err}"
-        );
+        assert!(matches!(
+            err,
+            delta_kernel::Error::Kernel(KernelError::FfiContract(
+                FfiContractError::CountMismatch {
+                    field: "eval_pred",
+                    actual: 1,
+                    expected: 3,
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -741,7 +764,12 @@ mod tests {
         );
         let batch = batch_with_col(vec![Some("x")]);
         let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
-        assert!(format!("{err}").contains("no result array"), "got: {err}");
+        assert!(matches!(
+            err,
+            delta_kernel::Error::Kernel(KernelError::FfiContract(FfiContractError::NullArgument {
+                field: "engine callback result array",
+            }))
+        ));
     }
 
     // === Zero-arg opaque predicate ===============================================

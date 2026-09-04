@@ -94,13 +94,13 @@ fn preprocess_timestamp_ntz(input: &str) -> Cow<'_, str> {
 /// ])?;
 /// let pred = parse_predicate("id < 500 AND name = 'alice'", &schema).unwrap();
 /// ```
-pub fn parse_predicate(sql: &str, schema: &Schema) -> Result<KPred, Box<dyn std::error::Error>> {
+pub fn parse_predicate(
+    sql: &str,
+    schema: &Schema,
+) -> Result<KPred, Box<dyn std::error::Error + Send + Sync>> {
     let sql = preprocess_timestamp_ntz(sql);
     let dialect = GenericDialect {};
-    let expr = Parser::new(&dialect)
-        .try_with_sql(&sql)?
-        .parse_expr()
-        .map_err(|e| format!("Failed to parse predicate: {e}"))?;
+    let expr = Parser::new(&dialect).try_with_sql(&sql)?.parse_expr()?;
     expr_to_predicate(schema, &expr)
 }
 
@@ -168,7 +168,7 @@ fn check_expr(
     schema: &Schema,
     expected_ty: &DataType,
     expr: &PExpr,
-) -> Result<KExpr, Box<dyn std::error::Error>> {
+) -> Result<KExpr, Box<dyn std::error::Error + Send + Sync>> {
     match expr {
         PExpr::Value(v) => check_literal(expected_ty, &v.value, false),
         PExpr::UnaryOp {
@@ -212,7 +212,7 @@ fn check_literal(
     expected_ty: &DataType,
     value: &PVal,
     is_negative: bool,
-) -> Result<KExpr, Box<dyn std::error::Error>> {
+) -> Result<KExpr, Box<dyn std::error::Error + Send + Sync>> {
     // Local import to avoid conflict with Scalar::* variants (Long, Integer, etc.) used in tests
     use PrimitiveType::*;
     match (expected_ty, value) {
@@ -276,7 +276,7 @@ fn synthesize_binary_exprs(
     schema: &Schema,
     left: &PExpr,
     right: &PExpr,
-) -> Result<(KExpr, KExpr, DataType), Box<dyn std::error::Error>> {
+) -> Result<(KExpr, KExpr, DataType), Box<dyn std::error::Error + Send + Sync>> {
     let l_syn = synthesize_expr(schema, left);
     let r_syn = synthesize_expr(schema, right);
 
@@ -298,7 +298,10 @@ fn synthesize_binary_exprs(
 }
 
 /// Converts a sqlparser AST expression into a kernel [`KPred`] with type checking.
-fn expr_to_predicate(schema: &Schema, expr: &PExpr) -> Result<KPred, Box<dyn std::error::Error>> {
+fn expr_to_predicate(
+    schema: &Schema,
+    expr: &PExpr,
+) -> Result<KPred, Box<dyn std::error::Error + Send + Sync>> {
     match expr {
         PExpr::BinaryOp { left, op, right } => binary_op_to_predicate(schema, left, op, right),
         PExpr::UnaryOp {
@@ -344,7 +347,7 @@ fn binary_op_to_predicate(
     left: &PExpr,
     op: &PBinOp,
     right: &PExpr,
-) -> Result<KPred, Box<dyn std::error::Error>> {
+) -> Result<KPred, Box<dyn std::error::Error + Send + Sync>> {
     match op {
         PBinOp::Eq
         | PBinOp::NotEq
@@ -385,13 +388,13 @@ fn in_list_to_pred(
     expr: &PExpr,
     list: &[PExpr],
     negated: bool,
-) -> Result<KPred, Box<dyn std::error::Error>> {
+) -> Result<KPred, Box<dyn std::error::Error + Send + Sync>> {
     let (col_expr, col_ty) = synthesize_expr(schema, expr)
         .ok_or_else(|| format!("IN requires a column, got: {expr}"))?;
 
     let scalars: Vec<Scalar> = list
         .iter()
-        .map(|e| -> Result<_, Box<dyn std::error::Error>> {
+        .map(|e| -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
             match check_expr(schema, &col_ty, e)? {
                 KExpr::Literal(s) => Ok(s),
                 _ => Err(format!("IN list elements must be literals, got: {e}").into()),
@@ -413,7 +416,7 @@ fn between_to_pred(
     negated: bool,
     low: &PExpr,
     high: &PExpr,
-) -> Result<KPred, Box<dyn std::error::Error>> {
+) -> Result<KPred, Box<dyn std::error::Error + Send + Sync>> {
     let (expr_checked, low_checked, common_ty) = synthesize_binary_exprs(schema, expr, low)?;
     let high_checked = check_expr(schema, &common_ty, high)?;
 

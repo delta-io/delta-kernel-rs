@@ -13,11 +13,25 @@ use url::Url;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertionError {
+    /// Actual rows differ from the expected rows.
+    #[error("Data mismatch: expected {expected}, got {actual}")]
+    DataMismatch {
+        /// The expected rows.
+        expected: String,
+        /// The observed rows.
+        actual: String,
+    },
     #[error("Invalid test case data")]
     InvalidTestCase,
 
     #[error("Delta Kernel error: {0}")]
     KernelError(#[from] Error),
+}
+
+impl From<delta_kernel::KernelError> for AssertionError {
+    fn from(error: delta_kernel::KernelError) -> Self {
+        Self::KernelError(error.into())
+    }
 }
 
 pub type TestResult<T, E = AssertionError> = std::result::Result<T, E>;

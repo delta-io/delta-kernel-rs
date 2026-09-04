@@ -86,7 +86,7 @@ pub(crate) fn validate_clustering_columns(
 
     // Structural validation: at least one column required
     if columns.is_empty() {
-        return Err(KernelError::generic("Clustering requires at least one column").into());
+        return Err(KernelError::Schema("Clustering requires at least one column".into()).into());
     }
 
     // Validate each column and check for duplicates
@@ -94,7 +94,7 @@ pub(crate) fn validate_clustering_columns(
     for col in columns {
         if !seen.insert(col) {
             return Err(
-                KernelError::generic(format!("Duplicate clustering column: '{col}'")).into(),
+                KernelError::Schema(format!("Duplicate clustering column: '{col}'")).into(),
             );
         }
 
@@ -102,7 +102,7 @@ pub(crate) fn validate_clustering_columns(
         match field.data_type() {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
-                return Err(KernelError::generic(format!(
+                return Err(KernelError::Unsupported(format!(
                     "Clustering column '{col}' has unsupported type '{dt}'. \
                      Supported types: Byte, Short, Integer, Long, Float, Double, \
                      Decimal, Date, Timestamp, TimestampNtz, String"

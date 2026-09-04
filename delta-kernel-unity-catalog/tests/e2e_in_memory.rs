@@ -195,8 +195,8 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
         .unwrap_err();
     assert!(matches!(
         err,
-        delta_kernel::Error::Kernel(delta_kernel::KernelError::Generic(msg))
-            if msg.contains("Max unpublished commits")
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::CatalogOperation { source, .. })
+            if matches!(source.downcast_ref::<unity_catalog_delta_client_api::Error>(), Some(unity_catalog_delta_client_api::Error::MaxUnpublishedCommitsExceeded(_)))
     ));
     Ok(())
 }
@@ -238,8 +238,7 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
     let err = snapshot.checkpoint(&engine, None).unwrap_err();
     assert!(matches!(
         err,
-        delta_kernel::Error::Kernel(delta_kernel::KernelError::Generic(msg))
-            if msg.contains("not published")
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::LogSegment(_))
     ));
     Ok(())
 }

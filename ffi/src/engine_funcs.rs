@@ -136,10 +136,9 @@ fn read_parquet_file_impl(
     let delta_fm = delta_kernel::FileMeta {
         location,
         last_modified: file.last_modified,
-        size: file
-            .size
-            .try_into()
-            .map_err(|_| KernelError::generic_err("unable to convert to FileSize"))?,
+        size: file.size.try_into().map_err(|source| {
+            KernelError::integer_conversion("file size", file.size, "u64", source)
+        })?,
     };
     // TODO: Plumb the predicate through the FFI?
     let data = parquet_handler.read_parquet_files(&[delta_fm], physical_schema, None)?;

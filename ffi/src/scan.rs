@@ -207,11 +207,9 @@ pub(crate) fn decode_engine_predicate(
     let mut visitor_state = KernelExpressionVisitorState::default();
     let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
     unwrap_kernel_predicate(&mut visitor_state, pred_id)
-        .ok_or_else(|| {
-            delta_kernel::KernelError::generic(
-                "engine predicate visitor returned an invalid expression ID; \
-             predicate could not be decoded",
-            )
+        .ok_or(delta_kernel::error::FfiContractError::InvalidId {
+            kind: "predicate",
+            id: pred_id,
         })
         .map_err(delta_kernel::Error::from)
 }
@@ -501,7 +499,9 @@ impl ScanMetadataIterator {
     pub(crate) fn lock_iter(&self) -> DeltaResult<std::sync::MutexGuard<'_, ScanMetadataIter>> {
         self.data
             .lock()
-            .map_err(|_| KernelError::generic("poisoned scan-metadata iterator mutex"))
+            .map_err(|_| KernelError::LockPoisoned {
+                resource: "scan metadata iterator",
+            })
             .map_err(delta_kernel::Error::from)
     }
 }
@@ -1028,10 +1028,9 @@ pub unsafe extern "C" fn scan_metadata_next_arrow(
 fn scan_metadata_next_arrow_impl(
     data: &ScanMetadataIterator,
 ) -> DeltaResult<*mut ScanMetadataArrowResult> {
-    let mut iter = data
-        .data
-        .lock()
-        .map_err(|_| KernelError::generic("poisoned mutex"))?;
+    let mut iter = data.data.lock().map_err(|_| KernelError::LockPoisoned {
+        resource: "scan metadata iterator",
+    })?;
 
     match iter.next().transpose()? {
         Some(scan_metadata) => {

@@ -828,7 +828,7 @@ impl CheckpointElementVisitor {
     /// was absent or if [`CheckpointAction::validate`] rejects the assembled action.
     fn into_checkpoint_action(self) -> DeltaResult<CheckpointAction> {
         let missing = |field: &str| {
-            KernelError::generic(format!(
+            KernelError::InvalidCheckpoint(format!(
                 "checkpoint action is missing required `{field}` element"
             ))
         };
@@ -896,7 +896,7 @@ impl RowVisitor for CheckpointElementVisitor {
                     SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
                     DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
                     other => {
-                        return Err(KernelError::generic(format!(
+                        return Err(KernelError::Unsupported(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
                         ))
                         .into())
@@ -913,7 +913,7 @@ impl RowVisitor for CheckpointElementVisitor {
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
     if slot.replace(value).is_some() {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::InvalidCheckpoint(format!(
             "duplicate `{name}` element in checkpoint action"
         ))
         .into());

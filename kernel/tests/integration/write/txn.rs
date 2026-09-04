@@ -26,7 +26,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
                 .commit(&engine),
-            Err(delta_kernel::Error::Kernel(KernelError::Generic(msg)))
+            Err(delta_kernel::Error::Kernel(KernelError::InvalidTransactionState(msg)))
                 if msg == "app_id app_id1 already exists in transaction"
         ));
 

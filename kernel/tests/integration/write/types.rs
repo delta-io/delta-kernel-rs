@@ -270,13 +270,13 @@ async fn test_append_variant(
 
     let fields = match variant_arrow {
         ArrowDataType::Struct(fields) => Ok(fields),
-        _ => Err(KernelError::Generic(
+        _ => Err(KernelError::EngineDataType(
             "Variant arrow data type is not struct.".to_string(),
         )),
     }?;
     let fields_flipped = match variant_arrow_flipped {
         ArrowDataType::Struct(fields) => Ok(fields),
-        _ => Err(KernelError::Generic(
+        _ => Err(KernelError::EngineDataType(
             "Variant arrow data type is not struct.".to_string(),
         )),
     }?;
@@ -451,7 +451,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 
     let fields = match variant_arrow {
         ArrowDataType::Struct(fields) => Ok(fields),
-        _ => Err(KernelError::Generic(
+        _ => Err(KernelError::EngineDataType(
             "Variant arrow data type is not struct.".to_string(),
         )),
     }?;

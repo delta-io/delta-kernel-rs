@@ -199,11 +199,9 @@ impl LogSegment {
         // truncated without a checkpoint.
         require!(
             first.version == 0,
-            KernelError::generic(format!(
-                "Cannot build CRC: log has no checkpoint but its first commit is at version {} \
-                 (expected 0); the log appears truncated without a checkpoint",
-                first.version
-            ))
+            KernelError::LogSegment(super::LogSegmentError::MissingCrcAnchor {
+                first: first.version,
+            })
         );
         let delta = self.replay_commits_into_crc_delta(
             engine,

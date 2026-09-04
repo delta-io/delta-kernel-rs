@@ -2,6 +2,13 @@
 
 Workflow-authoring rules for GitHub Actions.
 
+## Error and FFI validation
+
+Error-classification changes require both all-feature and no-default-feature builds. Keep the
+separate Arrow-version and DataFusion workspace checks: root workspace feature unification does
+not validate those configurations. FFI error-code tests must preserve existing numeric values,
+exercise appended classifications, and check that context wrappers do not hide the leaf code.
+
 ## Triggers: restrict `push` to long-lived branches
 
 The CI trigger events:

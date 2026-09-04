@@ -106,7 +106,7 @@ pub(super) fn check_only_supported_types(
     let Some(offender) = v.offender else {
         return Ok(());
     };
-    Err(KernelError::generic(format!(
+    Err(KernelError::Unsupported(format!(
         "{feature_label} does not support type at column: {offender}",
     ))
     .into())
@@ -181,7 +181,7 @@ pub(super) fn check_no_legacy_nested_ids(tc: &TableConfiguration) -> DeltaResult
     let Some(offender) = v.offender else {
         return Ok(());
     };
-    Err(KernelError::generic(format!(
+    Err(KernelError::Schema(format!(
         "field `{offender}` carries deprecated `{}` metadata; use `{}` instead. \
          See https://github.com/delta-io/delta/issues/6688",
         ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),

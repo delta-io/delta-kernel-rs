@@ -95,8 +95,12 @@ fn decode_parquet_footer(footer: CParquetFooter) -> DeltaResult<ParquetFooter> {
     let CParquetFooter { schema_proto } = footer;
     // SAFETY: ExclusiveRustBytes should only have a single owner, so consuming here is safe.
     let bytes = *unsafe { schema_proto.into_inner() };
-    let proto =
-        proto_schema::StructType::decode(bytes.as_slice()).map_err(KernelError::generic_err)?;
+    let proto = proto_schema::StructType::decode(bytes.as_slice()).map_err(|source| {
+        KernelError::ProtobufDecode {
+            message_type: "StructType",
+            source,
+        }
+    })?;
     let schema = Arc::new(StructType::try_from(proto)?);
     Ok(ParquetFooter { schema })
 }
@@ -323,7 +327,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                delta_kernel::Error::Kernel(KernelError::GenericError { .. })
+                delta_kernel::Error::Kernel(KernelError::ProtobufDecode { .. })
             ),
             "expected a proto decode error, got {err:?}"
         );

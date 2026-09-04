@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- Remove `KernelError::Generic`, `GenericError`, `generic`, and `generic_err`. Match semantic
+  variants and their typed payloads instead of generic message strings. Context and backtraces
+  retain the classified source and retryable commit outcomes; existing Delta conditions and
+  engine trait signatures are unchanged.
+- Append semantic FFI error codes without changing existing discriminants or callback layouts.
+  Code 5 is accepted for legacy inbound callbacks but is not emitted by Kernel. Connectors should
+  handle the new classifications, including `ForeignCallbackError` for opaque callback failures.
+- Test helpers expose concrete I/O/Arrow errors or `DeltaResult` instead of boxed unclassified
+  errors; workload predicate parsing returns a `Send + Sync` source.
 
 ## [v0.27.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.27.1/) (2026-08-14)
 

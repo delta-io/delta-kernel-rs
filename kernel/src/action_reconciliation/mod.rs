@@ -123,8 +123,13 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
         .map(|duration| -> DeltaResult<i64> {
             let now_ms = crate::utils::current_time_ms()?;
 
-            let expiration_ms = i64::try_from(duration.as_millis()).map_err(|_| {
-                KernelError::generic("Retention duration exceeds i64 millisecond range")
+            let expiration_ms = i64::try_from(duration.as_millis()).map_err(|source| {
+                KernelError::integer_conversion(
+                    "retention duration",
+                    duration.as_millis(),
+                    "i64",
+                    source,
+                )
             })?;
 
             Ok(now_ms - expiration_ms)
@@ -219,16 +224,21 @@ mod tests {
     #[test]
     fn test_calculate_transaction_expiration_timestamp_edge_cases() {
         // Test with very large retention duration that would overflow
+        let retention = Duration::from_secs(u64::MAX);
         let properties = TableProperties {
-            set_transaction_retention_duration: Some(Duration::from_secs(u64::MAX)),
+            set_transaction_retention_duration: Some(retention),
             ..Default::default()
         };
         let result = calculate_transaction_expiration_timestamp(&properties);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Retention duration exceeds i64 millisecond range"));
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel(KernelError::IntegerConversion {
+                field: "retention duration",
+                value,
+                target: "i64",
+                ..
+            })) if value == retention.as_millis().to_string()
+        ));
     }
 
     // Mock implementation of RetentionCalculator for testing trait methods
