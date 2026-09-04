@@ -1646,6 +1646,17 @@ async fn array_element_type_widening_reads_older_files() -> Result<(), Box<dyn s
     let parquet_bytes = record_batch_to_bytes(&batch);
 
     let schema = |element_type: &str| {
+        let field_metadata = if element_type == "long" {
+            serde_json::json!({
+                "delta.typeChanges": [{
+                    "fromType": "integer",
+                    "toType": "long",
+                    "fieldPath": "element",
+                }],
+            })
+        } else {
+            serde_json::json!({})
+        };
         serde_json::json!({
             "type": "struct",
             "fields": [
@@ -1658,7 +1669,7 @@ async fn array_element_type_widening_reads_older_files() -> Result<(), Box<dyn s
                         "containsNull": true,
                     },
                     "nullable": true,
-                    "metadata": {},
+                    "metadata": field_metadata,
                 },
             ],
         })
@@ -1671,7 +1682,7 @@ async fn array_element_type_widening_reads_older_files() -> Result<(), Box<dyn s
                 "format": {"provider": "parquet", "options": {}},
                 "schemaString": schema_string,
                 "partitionColumns": [],
-                "configuration": {},
+                "configuration": {"delta.enableTypeWidening": "true"},
             },
         })
         .to_string()
@@ -1685,7 +1696,14 @@ async fn array_element_type_widening_reads_older_files() -> Result<(), Box<dyn s
             "dataChange": true,
         },
     });
-    let protocol = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    let protocol = serde_json::json!({
+        "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["typeWidening"],
+            "writerFeatures": ["typeWidening"],
+        },
+    });
     add_commit(
         table_root,
         storage.as_ref(),
