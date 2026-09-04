@@ -57,8 +57,8 @@ pub unsafe extern "C" fn free_dv_descriptor_map(map: Handle<ExclusiveDvDescripto
     map.drop_handle();
 }
 
-/// Free a deletion vector descriptor handle. Only call this if the descriptor has not
-/// been moved into a map via [`dv_descriptor_map_insert`].
+/// Free a deletion vector descriptor handle. Only call this if the descriptor has not been passed
+/// to [`dv_descriptor_map_insert`], which consumes it regardless of the result.
 ///
 /// # Safety
 ///
@@ -173,9 +173,8 @@ fn dv_descriptor_new_impl(
 }
 
 /// Insert a deletion vector descriptor into the map under the given data file path.
-/// Consumes the descriptor handle on success. On error (e.g. invalid `data_file_path`),
-/// the descriptor handle is left untouched and must still be released by the caller via
-/// [`free_dv_descriptor`].
+/// Consumes the descriptor handle regardless of whether the insertion succeeds. On error (e.g.
+/// invalid `data_file_path`), the descriptor is dropped.
 ///
 /// `data_file_path` must be the data-file path exactly as it appears in the scan
 /// metadata produced by the kernel (the Add file action's `path` field). The kernel
@@ -185,7 +184,8 @@ fn dv_descriptor_new_impl(
 ///
 /// # Safety
 ///
-/// Caller must pass valid handles. The descriptor handle is consumed only on success.
+/// Caller must pass valid handles. The descriptor handle is consumed and must not be used or freed
+/// after this call, regardless of the result.
 #[no_mangle]
 pub unsafe extern "C" fn dv_descriptor_map_insert(
     mut map: Handle<ExclusiveDvDescriptorMap>,
@@ -195,11 +195,9 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
 ) -> ExternResult<bool> {
     let map_ref = unsafe { map.as_mut() };
     let engine_ref = unsafe { engine.as_ref() };
-    // Parse the path BEFORE taking ownership of the descriptor: if parsing fails the
-    // descriptor must remain valid so the caller can free it (otherwise we get a UAF
-    // when they retry or clean up).
-    let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    dv_descriptor_map_insert_impl(map_ref, path_result, descriptor)
+    let descriptor = unsafe { descriptor.into_inner() };
+    let result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
+    dv_descriptor_map_insert_impl(map_ref, result, *descriptor)
         .map(|_| true)
         .into_extern_result(&engine_ref)
 }
@@ -207,12 +205,11 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
 fn dv_descriptor_map_insert_impl(
     map: &mut DvDescriptorMap,
     data_file_path: DeltaResult<&str>,
-    descriptor: Handle<ExclusiveDvDescriptor>,
+    descriptor: DeletionVectorDescriptor,
 ) -> DeltaResult<()> {
     let path = data_file_path?;
     let owned_path = path.to_string();
-    let descriptor = unsafe { descriptor.into_inner() };
-    map.inner.insert(owned_path, *descriptor);
+    map.inner.insert(owned_path, descriptor);
     Ok(())
 }
 
@@ -270,7 +267,28 @@ fn transaction_update_deletion_vectors_impl(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use delta_kernel::Engine;
+
     use super::*;
+    use crate::error::{AllocateError, AllocateErrorFn, KernelError};
+    use crate::ffi_test_utils::{allocate_err, assert_extern_result_error_with_message};
+    use crate::{free_engine, ExternEngine};
+
+    struct ErrorOnlyExternEngine {
+        allocate_error: AllocateErrorFn,
+    }
+
+    impl ExternEngine for ErrorOnlyExternEngine {
+        fn engine(&self) -> Arc<dyn Engine> {
+            panic!("error-only test engine does not expose a kernel engine")
+        }
+
+        fn error_allocator(&self) -> &dyn AllocateError {
+            &self.allocate_error
+        }
+    }
 
     #[test]
     fn kernel_dv_storage_type_maps_to_kernel_storage_type() {
@@ -335,25 +353,57 @@ mod tests {
     }
 
     #[test]
-    fn dv_descriptor_map_insert_error_leaves_descriptor_freeable() {
+    fn dv_descriptor_map_insert_invalid_path_does_not_insert() {
         let mut map = DvDescriptorMap {
             inner: HashMap::new(),
         };
-        let descriptor =
+        let descriptor = unsafe {
             dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), false, 0, 4, 1)
-                .expect("descriptor should be valid");
+                .expect("descriptor should be valid")
+                .into_inner()
+        };
 
         let result = dv_descriptor_map_insert_impl(
             &mut map,
             Err(Error::generic("bad data file path")),
-            descriptor.shallow_copy(),
+            *descriptor,
         );
 
-        assert!(
-            result.is_err(),
-            "insert should fail before consuming descriptor"
-        );
+        assert!(result.is_err(), "insert should fail for an invalid path");
         assert!(map.inner.is_empty());
-        unsafe { free_dv_descriptor(descriptor) };
+    }
+
+    #[test]
+    fn dv_descriptor_map_insert_invalid_utf8_consumes_descriptor() {
+        let engine: Arc<dyn ExternEngine> = Arc::new(ErrorOnlyExternEngine {
+            allocate_error: allocate_err,
+        });
+        let engine: Handle<SharedExternEngine> = engine.into();
+        let map = dv_descriptor_map_new();
+        let descriptor =
+            dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), false, 0, 4, 1)
+                .expect("descriptor should be valid");
+        let invalid_utf8 = [0xff];
+        let invalid_path = KernelStringSlice {
+            ptr: invalid_utf8.as_ptr().cast(),
+            len: invalid_utf8.len(),
+        };
+
+        let result = unsafe {
+            dv_descriptor_map_insert(
+                map.shallow_copy(),
+                invalid_path,
+                descriptor,
+                engine.shallow_copy(),
+            )
+        };
+
+        assert_extern_result_error_with_message(result, KernelError::Utf8Error, None);
+        unsafe {
+            free_dv_descriptor_map(map);
+            free_engine(engine);
+        }
+        // The extern call consumed the descriptor on error. Deliberately having no descriptor
+        // cleanup here lets Miri's leak check catch consume-after-parse regressions.
     }
 }
