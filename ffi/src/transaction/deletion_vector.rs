@@ -57,8 +57,8 @@ pub unsafe extern "C" fn free_dv_descriptor_map(map: Handle<ExclusiveDvDescripto
     map.drop_handle();
 }
 
-/// Free a deletion vector descriptor handle. Only call this if the descriptor has not been passed
-/// to [`dv_descriptor_map_insert`], which consumes it regardless of the result.
+/// Free a deletion vector descriptor handle. Only call this if the descriptor has not been
+/// consumed. [`dv_descriptor_map_insert`] consumes a descriptor handle regardless of its result.
 ///
 /// # Safety
 ///
@@ -196,8 +196,8 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     let map_ref = unsafe { map.as_mut() };
     let engine_ref = unsafe { engine.as_ref() };
     let descriptor = unsafe { descriptor.into_inner() };
-    let result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    dv_descriptor_map_insert_impl(map_ref, result, *descriptor)
+    let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
+    dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor)
         .map(|_| true)
         .into_extern_result(&engine_ref)
 }
