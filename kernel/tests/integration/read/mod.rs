@@ -7,10 +7,13 @@ use std::sync::Arc;
 use std::vec;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::{ArrayRef, AsArray as _, RecordBatch, TimestampMicrosecondArray};
+use delta_kernel::arrow::array::{
+    ArrayRef, AsArray as _, Int64Array, ListArray, RecordBatch, TimestampMicrosecondArray,
+};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, Int32Type, Int64Type, Schema as ArrowSchema,
+    TimeUnit,
 };
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
@@ -1627,6 +1630,85 @@ fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
     ]);
 
     read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
+}
+
+#[tokio::test]
+async fn array_element_type_widening_reads_older_files() -> Result<(), Box<dyn std::error::Error>> {
+    let table_root = "memory:///";
+    let file_name = "part-v0.parquet";
+    let storage = Arc::new(InMemory::new());
+    let values: ListArray =
+        ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(1), Some(2), Some(3)])]);
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ("vals", Arc::new(values) as ArrayRef),
+    ])?;
+    let parquet_bytes = record_batch_to_bytes(&batch);
+
+    let schema = |element_type: &str| {
+        serde_json::json!({
+            "type": "struct",
+            "fields": [
+                {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+                {
+                    "name": "vals",
+                    "type": {
+                        "type": "array",
+                        "elementType": element_type,
+                        "containsNull": true,
+                    },
+                    "nullable": true,
+                    "metadata": {},
+                },
+            ],
+        })
+        .to_string()
+    };
+    let metadata = |schema_string: String| {
+        serde_json::json!({
+            "metaData": {
+                "id": "array-widen",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema_string,
+                "partitionColumns": [],
+                "configuration": {},
+            },
+        })
+        .to_string()
+    };
+    let add = serde_json::json!({
+        "add": {
+            "path": file_name,
+            "partitionValues": {},
+            "size": parquet_bytes.len(),
+            "modificationTime": 1000,
+            "dataChange": true,
+        },
+    });
+    let protocol = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        format!("{protocol}\n{}\n{add}", metadata(schema("integer"))),
+    )
+    .await?;
+    add_commit(table_root, storage.as_ref(), 1, metadata(schema("long"))).await?;
+    storage
+        .put(&Path::from(file_name), parquet_bytes.into())
+        .await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage).build());
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine)?;
+
+    assert_eq!(batches.len(), 1);
+    let values = batches[0].column_by_name("vals").unwrap().as_list::<i32>();
+    assert_eq!(values.value_type(), ArrowDataType::Int64);
+    let elements = values.values().as_primitive::<Int64Type>();
+    assert_eq!(elements.values().as_ref(), &[1, 2, 3]);
+    Ok(())
 }
 
 #[test]
