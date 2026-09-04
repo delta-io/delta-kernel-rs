@@ -949,6 +949,10 @@ pub fn coalesce_arrays(
 /// `parse_scalar`; spec-compliant writers only emit canonical values, so the extra leniency is
 /// harmless on the read path. All other types go through `parse_scalar`.
 fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
     match prim {
         PrimitiveType::Date => {
             let days = Date32Type::parse(raw).ok_or_else(|| {
