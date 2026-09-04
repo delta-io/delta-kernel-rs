@@ -335,7 +335,7 @@ pub(crate) struct ReorderIndex {
 #[derive(Debug, PartialEq)]
 #[internal_api]
 pub(crate) enum ReorderIndexTransform {
-    /// For a non-nested type, indicates that we need to cast to the contained type
+    /// Cast the input column to the contained Arrow type.
     Cast(ArrowDataType),
     /// Used for struct/list/map. Potentially transform child fields using contained reordering
     Nested(Vec<ReorderIndex>),
@@ -560,11 +560,19 @@ fn get_indices(
                             ));
                         } else {
                             // safety, checked that we have 1 element
-                            let mut children = children.swap_remove(0);
+                            let mut child = children.swap_remove(0);
+                            if matches!(&child.transform, ReorderIndexTransform::Cast(_)) {
+                                // The recursive plan targets the element type, but this reorder
+                                // entry consumes the outer list column. Cast the complete list so
+                                // Arrow applies the element conversion recursively.
+                                let target_field: ArrowField = requested_field.try_into_arrow()?;
+                                child.transform =
+                                    ReorderIndexTransform::Cast(target_field.data_type().clone());
+                            }
                             // the index is wrong, as it's the index from the inner schema.
                             // Adjust it to be our index
-                            children.index = index;
-                            reorder_indices.push(children);
+                            child.index = index;
+                            reorder_indices.push(child);
                         }
                     } else {
                         return Err(Error::unexpected_column_type(list_field.name()));
@@ -2957,6 +2965,33 @@ mod tests {
             assert_eq!(mask_indices, expect_mask);
             assert_eq!(reorder_indices, expect_reorder);
         });
+    }
+
+    #[test]
+    fn list_element_cast_propagates_invalid_nested_ids_error() {
+        let requested_schema: SchemaRef = schema! {
+            (StructField::not_null("values", ArrayType::new(DataType::LONG, false)).with_metadata(
+                [(
+                    ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
+                    MetadataValue::String("not a json object".to_string()),
+                )],
+            )),
+        }
+        .into();
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "values",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "element",
+                ArrowDataType::Int32,
+                false,
+            ))),
+            false,
+        )]));
+
+        assert_result_error_with_message(
+            get_requested_indices(&requested_schema, &parquet_schema),
+            "must be a JSON object",
+        );
     }
 
     #[test]
