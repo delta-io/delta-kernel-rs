@@ -4364,11 +4364,11 @@ fn create_checkpoint_schema_without_partition_parsed() -> StructType {
 fn test_partition_values_parsed_compatible_basic() {
     let checkpoint_schema = create_checkpoint_schema_with_partition_parsed(vec![
         StructField::nullable("date", DataType::DATE),
-        StructField::nullable("region", DataType::STRING),
+        StructField::nullable("count", DataType::INTEGER),
     ]);
     let partition_schema = schema! {
         nullable "date": DATE,
-        nullable "region": STRING,
+        nullable "count": INTEGER,
     };
     assert!(LogSegment::schema_has_compatible_partition_values_parsed(
         &checkpoint_schema,
@@ -4383,11 +4383,11 @@ fn test_partition_values_parsed_missing_field() {
             "date",
             DataType::DATE,
         )]);
-    // Partition schema expects both date and region, but checkpoint only has date.
+    // Partition schema expects both date and count, but checkpoint only has date.
     // Missing fields are OK — they just won't contribute to row group skipping.
     let partition_schema = schema! {
         nullable "date": DATE,
-        nullable "region": STRING,
+        nullable "count": INTEGER,
     };
     assert!(LogSegment::schema_has_compatible_partition_values_parsed(
         &checkpoint_schema,
@@ -4400,11 +4400,28 @@ fn test_partition_values_parsed_extra_field() {
     // Checkpoint has extra fields beyond what partition schema needs — fine
     let checkpoint_schema = create_checkpoint_schema_with_partition_parsed(vec![
         StructField::nullable("date", DataType::DATE),
-        StructField::nullable("region", DataType::STRING),
+        StructField::nullable("count", DataType::INTEGER),
         StructField::nullable("extra", DataType::INTEGER),
     ]);
     let partition_schema = schema! { nullable "date": DATE };
     assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+        &checkpoint_schema,
+        &partition_schema,
+    ));
+}
+
+#[rstest::rstest]
+#[case::string(DataType::STRING)]
+#[case::binary(DataType::BINARY)]
+fn test_partition_values_parsed_empty_string_types_are_incompatible(#[case] data_type: DataType) {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_partition_parsed(vec![StructField::nullable(
+            "part",
+            data_type.clone(),
+        )]);
+    let partition_schema =
+        StructType::new_unchecked(vec![StructField::nullable("part", data_type)]);
+    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
         &checkpoint_schema,
         &partition_schema,
     ));

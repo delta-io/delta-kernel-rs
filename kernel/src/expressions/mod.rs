@@ -688,10 +688,8 @@ impl ParseJsonExpression {
 ///
 /// # Value parsing
 ///
-/// A literal empty string has special read compatibility behavior: it stays empty for STRING,
-/// becomes empty bytes for BINARY, and becomes null for every other primitive type. Delta writers
-/// normally encode an empty partition value as JSON null, but readers must preserve this behavior
-/// for existing tables that contain a literal empty string.
+/// A literal empty string becomes null for every primitive type, as required by the Delta
+/// [protocol].
 ///
 /// Non-empty strings must follow the Delta [protocol] partition value serialization rules. Kernel's
 /// reference evaluator implements these rules with [`PrimitiveType::parse_scalar`] and equivalent
@@ -728,7 +726,7 @@ impl ParseJsonExpression {
 /// A connector generally cannot implement this contract as `CAST(map[key] AS target_type)`.
 /// Generic casts may accept additional boolean spellings, round or rescale decimals, use a session
 /// time zone, or turn malformed values into null. Implement a dedicated parser (or validate before
-/// casting), handle the empty-string cases before parsing, and preserve the input map's row-level
+/// casting), normalize empty strings before parsing, and preserve the input map's row-level
 /// nulls on the output struct.
 ///
 /// [protocol]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
@@ -933,8 +931,8 @@ impl Expression {
 
     /// Parses an Add action's `partitionValues` map into a typed struct whose schema comes from the
     /// evaluator's result type. A null map produces a null struct; missing and null values produce
-    /// null fields; literal empty strings stay empty only for STRING and BINARY. Duplicate-key
-    /// behavior is undefined. See [`MapToStructExpression`] for the complete contract.
+    /// null fields; literal empty strings also produce null fields. Duplicate-key behavior is
+    /// undefined. See [`MapToStructExpression`] for the complete contract.
     pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
         Self::MapToStruct(MapToStructExpression::new(map_expr))
     }

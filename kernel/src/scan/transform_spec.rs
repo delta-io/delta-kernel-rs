@@ -237,18 +237,11 @@ fn apply_insert_after(
 }
 
 /// Parse a partition value from the raw string representation.
-///
-/// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-///
-/// [`PrimitiveType::empty_string_partition_cast`]: crate::schema::PrimitiveType::empty_string_partition_cast
 pub(crate) fn parse_partition_value_raw(
     raw: Option<&String>,
     data_type: &DataType,
 ) -> DeltaResult<Scalar> {
     match (raw, data_type.as_primitive_opt()) {
-        (Some(v), Some(primitive)) if v.is_empty() => Ok(primitive
-            .empty_string_partition_cast()
-            .unwrap_or_else(|| Scalar::Null(data_type.clone()))),
         (Some(v), Some(primitive)) => primitive.parse_scalar(v),
         (Some(_), None) => Err(Error::generic(format!(
             "Unexpected partition column type: {data_type:?}"
@@ -370,17 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_partition_value_raw_empty_string_cast_semantics() {
-        // An empty string casts to itself for string and to empty bytes for binary, and to null
-        // for every other type. A literal empty string only reaches this path from a foreign
-        // writer, since kernel serializes its own empty and null partition values to JSON null.
+    fn test_parse_partition_value_raw_empty_strings_are_null() {
         let empty = String::new();
 
         let string_value = parse_partition_value_raw(Some(&empty), &DataType::STRING).unwrap();
-        assert_eq!(string_value, Scalar::String(String::new()));
+        assert!(string_value.is_null());
 
         let binary_value = parse_partition_value_raw(Some(&empty), &DataType::BINARY).unwrap();
-        assert_eq!(binary_value, Scalar::Binary(Vec::new()));
+        assert!(binary_value.is_null());
 
         let int_value =
             parse_partition_value_raw(Some(&empty), &DataType::Primitive(PrimitiveType::Integer))

@@ -28,7 +28,9 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
-use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{
+    lazy_schema_ref, DataType, PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
+};
 use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
@@ -1490,7 +1492,9 @@ impl LogSegment {
     ///
     /// Validates that:
     /// 1. The `add.partitionValues_parsed` field exists in the checkpoint schema
-    /// 2. The types for partition columns present in both schemas are compatible
+    /// 2. The partition schema has no string or binary columns, whose empty values require
+    ///    normalization from the serialized map
+    /// 3. The types for partition columns present in both schemas are compatible
     ///
     /// Missing partition columns in the checkpoint are OK (they simply won't contribute
     /// to row group skipping). Returns `false` if `partitionValues_parsed` doesn't exist
@@ -1499,6 +1503,20 @@ impl LogSegment {
         checkpoint_schema: &StructType,
         partition_schema: &StructType,
     ) -> bool {
+        if partition_schema.fields().any(|field| {
+            matches!(
+                field.data_type(),
+                DataType::Primitive(PrimitiveType::String)
+                    | DataType::Primitive(PrimitiveType::Binary)
+            )
+        }) {
+            debug!(
+                "partitionValues_parsed not compatible: string and binary partition values must \
+                 be normalized from add.partitionValues"
+            );
+            return false;
+        }
+
         let Some(partition_parsed) =
             Self::get_field_from_add(checkpoint_schema, "partitionValues_parsed")
         else {
