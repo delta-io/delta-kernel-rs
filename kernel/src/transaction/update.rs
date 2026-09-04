@@ -105,6 +105,8 @@ impl Transaction {
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
+            #[cfg(feature = "row-tracking-preservation-in-dev")]
+            row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
@@ -146,6 +148,32 @@ impl Transaction {
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
+    }
+
+    /// Acknowledges that the connector correctly preserves Stable Row IDs and Stable Row Commit
+    /// Versions. That is:
+    ///
+    /// - Copied or updated rows retain their Stable Row IDs.
+    /// - Copied rows retain their Stable Row Commit Versions.
+    /// - The connector preserves these values in the materialized Row ID and Row Commit Version
+    ///   columns.
+    /// - The connector also satisfies all protocol MUST requirements for those columns.
+    ///
+    /// See [Row Tracking] in the Delta protocol for more details.
+    ///
+    /// Kernel does not validate rewritten files or materialized values. Calling this method asserts
+    /// that the connector has satisfied these requirements.
+    ///
+    /// The Delta protocol specifies this preservation as a SHOULD requirement. Kernel requires it
+    /// for compatibility.
+    ///
+    /// This acknowledgment is required before committing Remove actions or deletion-vector updates
+    /// on tables with Row Tracking enabled.
+    ///
+    /// [Row Tracking]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#row-tracking
+    #[cfg(feature = "row-tracking-preservation-in-dev")]
+    pub fn ack_row_tracking_preservation(&mut self) {
+        self.row_tracking_preservation_acknowledged = true;
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to
