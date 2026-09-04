@@ -67,7 +67,7 @@ file listing without re-scanning the table.
 
 ## Write Path
 
-`Snapshot` -> `Transaction` -> (`WriteState` -> `WriteContextBuilder` ->
+`Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContextBuilder` ->
 `BoundWriteContext`) -> commit
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds

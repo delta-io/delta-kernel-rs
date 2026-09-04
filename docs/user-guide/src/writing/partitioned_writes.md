@@ -137,7 +137,8 @@ which you can collect into a `Vec<Option<String>>` group key for use in a `HashM
 
 ## Partition value validation
 
-`WriteContextBuilder::build` validates the provided values before creating the `BoundWriteContext`:
+`BoundWriteContextBuilder::build` validates the provided values before creating the
+`BoundWriteContext`:
 
 | Check | Example |
 |-------|---------|

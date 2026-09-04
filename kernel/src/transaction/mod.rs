@@ -82,7 +82,7 @@ mod write_validation;
 
 pub use bound_write_context::BoundWriteContext;
 use stats_verifier::StatsColumnVerifier;
-pub use write_state::{RowTrackingMetadataColumns, WriteContextBuilder, WriteState};
+pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -3131,6 +3131,7 @@ mod tests {
         )]
         row_tracking_state: RowTrackingState,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // === Given every column-mapping mode and Row Tracking state ===
         let column_mapping_mode = match mode {
             ColumnMappingMode::None => "none",
             ColumnMappingMode::Name => "name",
@@ -3182,6 +3183,8 @@ mod tests {
             .ok_or_else(|| {
                 Error::internal_error("materialized Row Commit Version column name is missing")
             })?;
+
+        // === When the connector specifies its row-tracking input columns ===
         let write_context = write_state
             .write_context_builder()
             .with_row_tracking_columns(RowTrackingMetadataColumns {
@@ -3189,6 +3192,11 @@ mod tests {
                 row_commit_version_col_name: Some("connector_row_commit_version"),
             })
             .build();
+
+        // === Then ===
+        // Supplying materialized row-tracking columns requires Row Tracking to be enabled.
+        // Logical data schema, physical data schema, and logical_to_physical expression must be
+        // generated correctly.
         if row_tracking_state != RowTrackingState::Enabled {
             assert_result_error_with_message(
                 write_context,
@@ -3198,7 +3206,6 @@ mod tests {
             return Ok(());
         }
         let write_context = write_context?;
-
         assert_eq!(
             write_context.logical_data_schema(),
             &schema_ref! {

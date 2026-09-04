@@ -14,10 +14,10 @@ use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
 /// A write context for a specific partition or an unpartitioned table. Created by a
-/// [`WriteContextBuilder`](super::WriteContextBuilder).
+/// [`BoundWriteContextBuilder`](super::BoundWriteContextBuilder).
 ///
-/// Note: clustered tables are unpartitioned and use [`WriteContextBuilder::build`] without calling
-/// [`with_partition_values`].
+/// Note: clustered tables are unpartitioned and use [`BoundWriteContextBuilder::build`] without
+/// calling [`with_partition_values`].
 ///
 /// Contains both table-wide state and per-partition state (serialized partition values with
 /// physical column names as keys). How you use a `BoundWriteContext` depends on your engine:
@@ -32,8 +32,8 @@ use crate::{DeltaResult, Error};
 ///
 /// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
-/// [`WriteContextBuilder::build`]: super::WriteContextBuilder::build
-/// [`with_partition_values`]: super::WriteContextBuilder::with_partition_values
+/// [`BoundWriteContextBuilder::build`]: super::BoundWriteContextBuilder::build
+/// [`with_partition_values`]: super::BoundWriteContextBuilder::with_partition_values
 #[derive(Debug)]
 pub struct BoundWriteContext {
     pub(super) write_state: Arc<WriteState>,

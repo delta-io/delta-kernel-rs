@@ -139,7 +139,8 @@ let write_context = write_state
     .build()?;
 ```
 
-Kernel maps the provided logical column to the corresponding physical materialized column configured on the table.
+Kernel maps each provided logical row-tracking metadata column to the corresponding physical
+column configured on the table. Row Tracking must be enabled when these options are provided.
 
 For partitioned tables, see
 [Writing to Partitioned Tables](./partitioned_writes.md).

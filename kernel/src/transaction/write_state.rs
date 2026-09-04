@@ -13,6 +13,9 @@ use crate::schema::void_utils::add_void_stripping;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_properties::{
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+};
 use crate::utils::require;
 use crate::{DataType, DeltaResult, Error, Expression};
 
@@ -32,15 +35,16 @@ pub struct WriteState {
     /// Partition binding needs this schema to validate values, preserve metadata-defined field
     /// order, and translate logical partition names to their physical names.
     pub(super) full_logical_schema: SchemaRef,
-    /// Base logical data schema: delta schema with partition columns removed.
+    /// Base logical data schema: the Delta schema excluding partition columns.
     ///
-    /// Connectors write one partition at a time, so partition values are bound separately rather
-    /// than appearing in each input data batch.
+    /// [`BoundWriteContextBuilder`] appends any connector-specified Row ID and Row Commit Version
+    /// columns to construct the final [`BoundWriteContext::logical_data_schema`].
     pub(super) base_logical_data_schema: SchemaRef,
-    /// Base physical schema expected in the written Parquet file.
+    /// Base physical data schema used by [`BoundWriteContextBuilder`] to construct the final
+    /// [`BoundWriteContext::physical_data_schema`].
     ///
-    /// This differs from the logical schemas when column mapping, void stripping, partition
-    /// materialization, or row tracking changes the data passed to the Parquet writer.
+    /// The builder appends the table's physical materialized Row ID and Row Commit Version columns
+    /// when the connector supplies their logical counterparts.
     pub(super) base_physical_data_schema: SchemaRef,
     /// Physical name of the materialized Row ID column, when configured on the table.
     pub(super) materialized_row_id_column_name: Option<String>,
@@ -73,24 +77,24 @@ pub struct WriteState {
 /// [Row Tracking]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#row-tracking
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RowTrackingMetadataColumns<'a> {
-    /// Name of the column containing materialized Row IDs, if present in the to-be-written logical
+    /// Logical name of the column containing materialized Row IDs, if present in the to-be-written
     /// data.
     pub row_id_col_name: Option<&'a str>,
-    /// Name of the column containing materialized Row Commit Versions, if present in the
-    /// to-be-written logical data.
+    /// Logical name of the column containing materialized Row Commit Versions, if present in the
+    /// to-be-written data.
     pub row_commit_version_col_name: Option<&'a str>,
 }
 
 /// Builds a [`BoundWriteContext`].
 #[derive(Debug)]
-pub struct WriteContextBuilder {
+pub struct BoundWriteContextBuilder {
     write_state: Arc<WriteState>,
     partition_values: Option<HashMap<String, Scalar>>,
     logical_row_id_col_name: Option<String>,
     logical_row_commit_version_col_name: Option<String>,
 }
 
-impl WriteContextBuilder {
+impl BoundWriteContextBuilder {
     /// Binds one typed value for each logical partition column.
     ///
     /// Values are validated and serialized according to the Delta protocol when
@@ -160,6 +164,8 @@ impl WriteContextBuilder {
                  IcebergCompatV3 tables"
             )
         );
+        let logical_data_schema = self.build_logical_data_schema()?;
+        let physical_data_schema = self.build_physical_data_schema()?;
 
         let normalized = self
             .partition_values
@@ -195,69 +201,6 @@ impl WriteContextBuilder {
                 serialized.insert(physical_name, value);
             }
         }
-        let mut physical_row_tracking_columns = Vec::with_capacity(2);
-        if let Some(logical_name) = self.logical_row_id_col_name {
-            let physical_name = self
-                .write_state
-                .materialized_row_id_column_name
-                .clone()
-                .ok_or_else(|| {
-                    Error::generic(
-                        "No delta.rowTracking.materializedRowIdColumnName key found in metadata \
-                         configuration",
-                    )
-                })?;
-            physical_row_tracking_columns.push((logical_name, physical_name));
-        }
-        if let Some(logical_name) = self.logical_row_commit_version_col_name {
-            let physical_name = self
-                .write_state
-                .materialized_row_commit_version_column_name
-                .clone()
-                .ok_or_else(|| {
-                    Error::generic(
-                        "No delta.rowTracking.materializedRowCommitVersionColumnName key found in \
-                         metadata configuration",
-                    )
-                })?;
-            physical_row_tracking_columns.push((logical_name, physical_name));
-        }
-        let (logical_data_schema, physical_data_schema) =
-            if physical_row_tracking_columns.is_empty() {
-                (
-                    self.write_state.base_logical_data_schema.clone(),
-                    self.write_state.base_physical_data_schema.clone(),
-                )
-            } else {
-                let logical_fields = self
-                    .write_state
-                    .base_logical_data_schema
-                    .fields()
-                    .cloned()
-                    .chain(
-                        physical_row_tracking_columns
-                            .iter()
-                            .map(|(logical_name, _)| {
-                                StructField::nullable(logical_name, DataType::LONG)
-                            }),
-                    );
-                let physical_fields = self
-                    .write_state
-                    .base_physical_data_schema
-                    .fields()
-                    .cloned()
-                    .chain(
-                        physical_row_tracking_columns
-                            .iter()
-                            .map(|(_, physical_name)| {
-                                StructField::nullable(physical_name, DataType::LONG)
-                            }),
-                    );
-                (
-                    Arc::new(StructType::try_new(logical_fields)?),
-                    Arc::new(StructType::try_new(physical_fields)?),
-                )
-            };
         let logical_to_physical = Arc::new(
             self.write_state
                 .generate_logical_to_physical(normalized.as_ref())?,
@@ -270,6 +213,71 @@ impl WriteContextBuilder {
             logical_to_physical,
             physical_partition_values: serialized,
         })
+    }
+
+    fn build_logical_data_schema(&self) -> DeltaResult<SchemaRef> {
+        if self.logical_row_id_col_name.is_none()
+            && self.logical_row_commit_version_col_name.is_none()
+        {
+            return Ok(self.write_state.base_logical_data_schema.clone());
+        }
+        let mut fields: Vec<_> = self
+            .write_state
+            .base_logical_data_schema
+            .fields()
+            .cloned()
+            .collect();
+        if let Some(logical_name) = self.logical_row_id_col_name.as_deref() {
+            fields.push(StructField::nullable(logical_name, DataType::LONG));
+        }
+        if let Some(logical_name) = self.logical_row_commit_version_col_name.as_deref() {
+            fields.push(StructField::nullable(logical_name, DataType::LONG));
+        }
+        Ok(Arc::new(StructType::try_new(fields)?))
+    }
+
+    fn build_physical_data_schema(&self) -> DeltaResult<SchemaRef> {
+        if self.logical_row_id_col_name.is_none()
+            && self.logical_row_commit_version_col_name.is_none()
+        {
+            return Ok(self.write_state.base_physical_data_schema.clone());
+        }
+        let mut fields: Vec<_> = self
+            .write_state
+            .base_physical_data_schema
+            .fields()
+            .cloned()
+            .collect();
+        fields.extend(Self::build_physical_row_tracking_field(
+            self.logical_row_id_col_name.as_deref(),
+            self.write_state.materialized_row_id_column_name.as_deref(),
+            MATERIALIZED_ROW_ID_COLUMN_NAME,
+        )?);
+        fields.extend(Self::build_physical_row_tracking_field(
+            self.logical_row_commit_version_col_name.as_deref(),
+            self.write_state
+                .materialized_row_commit_version_column_name
+                .as_deref(),
+            MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+        )?);
+        Ok(Arc::new(StructType::try_new(fields)?))
+    }
+
+    fn build_physical_row_tracking_field(
+        logical_name: Option<&str>,
+        physical_name: Option<&str>,
+        configuration_key: &str,
+    ) -> DeltaResult<Option<StructField>> {
+        if logical_name.is_none() {
+            return Ok(None);
+        }
+        let physical_name = physical_name.ok_or_else(|| {
+            Error::invalid_protocol(format!(
+                "The table has Row Tracking enabled, but {configuration_key} is missing from its \
+                 metadata configuration"
+            ))
+        })?;
+        Ok(Some(StructField::nullable(physical_name, DataType::LONG)))
     }
 }
 
@@ -288,10 +296,10 @@ struct DecodedWriteStateWire {
 impl WriteState {
     /// Creates a builder for a write context.
     ///
-    /// For an unpartitioned table, call [`WriteContextBuilder::build`] directly. For a partitioned
-    /// table, call [`WriteContextBuilder::with_partition_values`] first.
-    pub fn write_context_builder(self: &Arc<Self>) -> WriteContextBuilder {
-        WriteContextBuilder {
+    /// For an unpartitioned table, call [`BoundWriteContextBuilder::build`] directly. For a
+    /// partitioned table, call [`BoundWriteContextBuilder::with_partition_values`] first.
+    pub fn write_context_builder(self: &Arc<Self>) -> BoundWriteContextBuilder {
+        BoundWriteContextBuilder {
             write_state: Arc::clone(self),
             partition_values: None,
             logical_row_id_col_name: None,
@@ -413,6 +421,7 @@ mod tests {
         materialize_partition_columns: bool,
         randomize_file_prefixes: bool,
         random_prefix_length: usize,
+        row_tracking_enabled: bool,
     ) -> Arc<WriteState> {
         let mut properties = HashMap::new();
         if column_mapping_mode != ColumnMappingMode::None {
@@ -452,27 +461,43 @@ mod tests {
         let state = Arc::get_mut(&mut write_state).unwrap();
         state.randomize_file_prefixes = randomize_file_prefixes;
         state.random_prefix_length = NonZero::new(random_prefix_length).unwrap();
+        state.row_tracking_enabled = row_tracking_enabled;
         write_state
     }
 
     #[rstest]
-    #[case::default(ColumnMappingMode::None, false, false, 2, false)]
-    #[case::column_mapping(ColumnMappingMode::Name, false, false, 7, true)]
-    #[case::materialized_partition(ColumnMappingMode::None, true, false, 2, false)]
-    #[case::randomized_prefix(ColumnMappingMode::None, false, true, 7, true)]
+    #[case::default(ColumnMappingMode::None, false, false, 2, false, false, false)]
+    #[case::column_mapping(ColumnMappingMode::Name, false, false, 7, false, false, true)]
+    #[case::materialized_partition(ColumnMappingMode::None, true, false, 2, false, false, false)]
+    #[case::randomized_prefix(ColumnMappingMode::None, false, true, 7, false, false, true)]
+    #[case::row_tracking(ColumnMappingMode::None, false, false, 2, true, false, false)]
+    #[case::row_tracking_and_iceberg_compat_v3(
+        ColumnMappingMode::Name,
+        false,
+        false,
+        2,
+        true,
+        true,
+        true
+    )]
     fn write_state_json_round_trip_preserves_worker_behavior(
         #[case] column_mapping_mode: ColumnMappingMode,
         #[case] materialize_partition_columns: bool,
         #[case] randomize_file_prefixes: bool,
         #[case] random_prefix_length: usize,
+        #[case] row_tracking_enabled: bool,
+        #[case] iceberg_compat_v3_enabled: bool,
         #[case] expect_random_prefix: bool,
     ) {
-        let original = partitioned_write_state(
+        let mut original = partitioned_write_state(
             column_mapping_mode,
             materialize_partition_columns,
             randomize_file_prefixes,
             random_prefix_length,
+            row_tracking_enabled,
         );
+        let state = Arc::get_mut(&mut original).unwrap();
+        state.iceberg_compat_v3_enabled = iceberg_compat_v3_enabled;
         let encoded = original.encode().unwrap();
         let decoded = WriteState::decode(&encoded).unwrap();
         assert_eq!(decoded.full_logical_schema, original.full_logical_schema);
@@ -487,6 +512,11 @@ mod tests {
         assert_eq!(
             decoded.materialized_row_commit_version_column_name,
             original.materialized_row_commit_version_column_name
+        );
+        assert_eq!(decoded.row_tracking_enabled, original.row_tracking_enabled);
+        assert_eq!(
+            decoded.iceberg_compat_v3_enabled,
+            original.iceberg_compat_v3_enabled
         );
 
         let values = || HashMap::from([("year".to_string(), Scalar::Integer(2024))]);
@@ -581,12 +611,12 @@ mod tests {
             false, /* materialize_partition_columns */
             false, /* randomize_file_prefixes */
             2,     /* random_prefix_length */
+            true,  /* row_tracking_enabled */
         );
         let state = Arc::get_mut(&mut write_state).unwrap();
         state.materialized_row_id_column_name = Some("_metadata_row_id".into());
         state.materialized_row_commit_version_column_name =
             Some("_metadata_row_commit_version".into());
-        state.row_tracking_enabled = true;
 
         let write_state = WriteState::decode(&write_state.encode()?)?;
         let base_logical_field = write_state
@@ -655,13 +685,13 @@ mod tests {
         #[case] row_tracking_columns: RowTrackingMetadataColumns<'_>,
         #[case] expected_error: &str,
     ) {
-        let mut write_state = partitioned_write_state(
+        let write_state = partitioned_write_state(
             ColumnMappingMode::None,
             false, /* materialize_partition_columns */
             false, /* randomize_file_prefixes */
             2,     /* random_prefix_length */
+            true,  /* row_tracking_enabled */
         );
-        Arc::get_mut(&mut write_state).unwrap().row_tracking_enabled = true;
 
         let error = write_state
             .write_context_builder()
@@ -684,12 +714,12 @@ mod tests {
             false, /* materialize_partition_columns */
             false, /* randomize_file_prefixes */
             2,     /* random_prefix_length */
+            true,  /* row_tracking_enabled */
         );
         let state = Arc::get_mut(&mut write_state).unwrap();
         state.materialized_row_id_column_name = Some("_metadata_row_id".into());
         state.materialized_row_commit_version_column_name =
             Some("_metadata_row_commit_version".into());
-        state.row_tracking_enabled = true;
 
         let error = write_state
             .write_context_builder()
@@ -711,7 +741,13 @@ mod tests {
 
     #[test]
     fn write_state_encoding_uses_current_format_version() {
-        let state = partitioned_write_state(ColumnMappingMode::None, false, false, 2);
+        let state = partitioned_write_state(
+            ColumnMappingMode::None,
+            false, /* materialize_partition_columns */
+            false, /* randomize_file_prefixes */
+            2,     /* random_prefix_length */
+            false, /* row_tracking_enabled */
+        );
         let encoded: serde_json::Value = serde_json::from_slice(&state.encode().unwrap()).unwrap();
         assert_eq!(encoded["version"], 1);
         assert!(encoded.get("write_state").is_some());
@@ -719,7 +755,13 @@ mod tests {
 
     #[test]
     fn write_state_decode_rejects_unsupported_format_version() {
-        let state = partitioned_write_state(ColumnMappingMode::None, false, false, 2);
+        let state = partitioned_write_state(
+            ColumnMappingMode::None,
+            false, /* materialize_partition_columns */
+            false, /* randomize_file_prefixes */
+            2,     /* random_prefix_length */
+            false, /* row_tracking_enabled */
+        );
         let mut encoded: serde_json::Value =
             serde_json::from_slice(&state.encode().unwrap()).unwrap();
         encoded["version"] = 2.into();
