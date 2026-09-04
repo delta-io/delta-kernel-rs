@@ -53,7 +53,8 @@ impl JsonHandler for PlanBasedJsonHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
-        let query = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)?.build()?;
+        let query =
+            PlanBuilder::scan_json_ordered(files.to_vec(), &[], physical_schema)?.build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
@@ -87,8 +88,9 @@ mod tests {
     use tempfile::{tempdir, NamedTempFile};
     use url::Url;
 
+    use super::super::assert_ordered_file_batches;
     use super::PlanBasedJsonHandler;
-    use crate::arrow::array::{Array, Int32Array, RecordBatch, StringArray};
+    use crate::arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::plans::parquet::PlanBasedParquetHandler;
     use crate::engine::sync::plan::SyncPlanExecutor;
@@ -181,8 +183,41 @@ mod tests {
         assert!(iter.next().is_none(), "expected exactly one batch");
     }
 
+    #[test]
+    fn test_read_json_files_preserves_input_file_order() {
+        let (_first, first) = temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#]);
+        let (_second, second) = temp_json_file(&[r#"{"x": 3}"#, r#"{"x": 4}"#]);
+        let schema = ordered_test_schema();
+        let batches: Vec<RecordBatch> = make_handler()
+            .read_json_files(&[second, first], schema, None)
+            .unwrap()
+            .map(|result| {
+                ArrowEngineData::try_from_engine_data(result.unwrap())
+                    .unwrap()
+                    .into()
+            })
+            .collect();
+        let batch_values: Vec<Vec<i64>> = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_ordered_file_batches(batch_values);
+    }
+
     fn test_schema() -> SchemaRef {
         schema_ref! { not_null "x": INTEGER }
+    }
+
+    fn ordered_test_schema() -> SchemaRef {
+        Arc::new(StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap())
     }
 
     /// No files -> an absent plan -> a zero-row result (no rows, no error), for either handler.
