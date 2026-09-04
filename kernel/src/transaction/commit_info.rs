@@ -1,10 +1,13 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use super::Transaction;
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
+use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, null_lit, MapData, Scalar};
-use crate::schema::{schema_ref, MapType, ToSchema};
+use crate::schema::{column_name, schema_ref, ColumnName, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::utils::require;
 use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
@@ -36,16 +39,26 @@ fn commit_info_literal_exprs(
             "operationMetrics",
             Arc::new(match commit_info.operation_metrics {
                 Some(map) => lit(MapData::try_new(
-                    string_map_type,
+                    string_map_type.clone(),
                     map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
                 )?),
-                None => null_lit(string_map_type),
+                None => null_lit(string_map_type.clone()),
             }),
         ),
         ("kernelVersion", Arc::new(lit(commit_info.kernel_version))),
         ("isBlindAppend", Arc::new(lit(commit_info.is_blind_append))),
         ("engineInfo", Arc::new(lit(commit_info.engine_info))),
         ("txnId", Arc::new(lit(commit_info.txn_id))),
+        (
+            "tags",
+            Arc::new(match commit_info.tags {
+                Some(map) => lit(MapData::try_new(
+                    string_map_type,
+                    map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
+                )?),
+                None => null_lit(string_map_type),
+            }),
+        ),
     ];
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
@@ -64,9 +77,15 @@ impl<S> Transaction<S> {
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();
+                let mut commit_info = kernel_commit_info;
+                if engine_commit_info_schema.contains("tags") {
+                    let mut visitor = CommitInfoTagsVisitor::default();
+                    visitor.visit_rows_of(engine_commit_info.as_ref())?;
+                    commit_info.merge_tags(visitor.tags);
+                }
 
                 // Step 1: Build literal expressions for each CommitInfo field.
-                let literal_exprs = commit_info_literal_exprs(kernel_commit_info)?;
+                let literal_exprs = commit_info_literal_exprs(commit_info)?;
 
                 // Step 2: Build the output schema and expression patch together. Engine fields
                 // pass through first, overlapping kernel fields are replaced in place, and
@@ -111,13 +130,56 @@ impl<S> Transaction<S> {
     }
 }
 
+#[derive(Default)]
+struct CommitInfoTagsVisitor {
+    tags: Option<HashMap<String, Option<String>>>,
+}
+
+impl RowVisitor for CommitInfoTagsVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES: LazyLock<[ColumnName; 1]> = LazyLock::new(|| [column_name!("tags")]);
+        static TYPES: LazyLock<[DataType; 1]> = LazyLock::new(|| {
+            [DataType::from(MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                true,
+            ))]
+        });
+        (NAMES.as_slice(), TYPES.as_slice())
+    }
+
+    fn visit<'a>(
+        &mut self,
+        row_count: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> Result<(), Error> {
+        require!(
+            row_count == 1,
+            Error::generic("Connector commit info must contain exactly one row")
+        );
+        let [tags_getter] = getters else {
+            return Err(Error::internal_error(format!(
+                "CommitInfoTagsVisitor received {} getters instead of one",
+                getters.len()
+            )));
+        };
+        let tags: Option<MapItem<'_>> = tags_getter.get_opt(0, "tags")?;
+        self.tags = tags.map(|tags| {
+            tags.keys()
+                .map(|key| (key.to_string(), tags.get(key).map(str::to_string)))
+                .collect()
+        });
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use crate::actions::CommitInfo;
     use crate::arrow::array::{
-        Array, ArrayRef, BooleanArray, Int64Array, MapArray, MapBuilder, StringArray,
+        Array, ArrayRef, AsArray, BooleanArray, Int64Array, MapArray, MapBuilder, StringArray,
         StringBuilder, StructArray,
     };
     use crate::arrow::datatypes::{
@@ -306,6 +368,7 @@ mod tests {
         map_builder.values().append_value("stale_value");
         map_builder.append(true).unwrap();
         let stale_op_params = Arc::new(map_builder.finish()) as ArrayRef;
+        let connector_tags = stale_op_params.clone();
         let mut metrics_map_builder =
             MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         metrics_map_builder.keys().append_value("stale_metric");
@@ -332,6 +395,7 @@ mod tests {
                 ArrowField::new("isBlindAppend", ArrowDataType::Boolean, true),
                 ArrowField::new("engineInfo", ArrowDataType::Utf8, true),
                 ArrowField::new("txnId", ArrowDataType::Utf8, true),
+                ArrowField::new("tags", connector_tags.data_type().clone(), true),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![Some(0i64)])) as ArrayRef,
@@ -343,6 +407,7 @@ mod tests {
                 Arc::new(BooleanArray::from(vec![None::<bool>])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["stale_engine"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["stale_txn"])) as ArrayRef,
+                connector_tags,
             ],
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;
@@ -367,6 +432,11 @@ mod tests {
         assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
         assert_eq!(get_str(commit_info, "engineInfo"), "test_engine/1.0");
         assert!(!get_bool(commit_info, "isBlindAppend"));
+        let tags = get_map(commit_info, "tags");
+        let tag_keys = tags.column(0).as_string::<i32>();
+        let tag_values = tags.column(1).as_string::<i32>();
+        assert_eq!(tag_keys.value(0), "stale_key");
+        assert_eq!(tag_values.value(0), "stale_value");
 
         Ok(())
     }

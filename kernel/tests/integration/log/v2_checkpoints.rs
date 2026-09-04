@@ -1454,7 +1454,6 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         HashMap::from([(path, dv.clone())]),
         scan_files.into_iter().map(Ok),
     )?;
-    #[cfg(feature = "row-tracking-preservation-in-dev")]
     txn.ack_row_tracking_preservation();
     let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
 

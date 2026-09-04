@@ -37,6 +37,7 @@ use crate::{
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
+pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
@@ -896,6 +897,8 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
     pub(crate) txn_id: Option<String>,
+    /// Map of tags associated with this commit.
+    pub(crate) tags: Option<HashMap<String, Option<String>>>,
 }
 
 impl CommitInfo {
@@ -916,6 +919,24 @@ impl CommitInfo {
             is_blind_append: is_blind_append.then_some(true),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
+            tags: None,
+        }
+    }
+
+    pub(crate) fn set_row_tracking_preserved(&mut self) {
+        self.tags.get_or_insert_default().insert(
+            ROW_TRACKING_PRESERVED_TAG.to_string(),
+            Some("true".to_string()),
+        );
+    }
+
+    pub(crate) fn merge_tags(&mut self, connector_tags: Option<HashMap<String, Option<String>>>) {
+        let Some(connector_tags) = connector_tags else {
+            return;
+        };
+        let kernel_tags = self.tags.get_or_insert_default();
+        for (key, value) in connector_tags {
+            kernel_tags.entry(key).or_insert(value);
         }
     }
 }
@@ -1959,6 +1980,7 @@ mod tests {
                 nullable "isBlindAppend": BOOLEAN,
                 nullable "engineInfo": STRING,
                 nullable "txnId": STRING,
+                nullable "tags": { STRING => nullable STRING },
             },
         };
         assert_eq!(schema, expected);
@@ -2274,6 +2296,9 @@ mod tests {
         let mut map_builder = create_string_map_builder(true);
         map_builder.append(false).unwrap();
         let operation_metrics = Arc::new(map_builder.finish());
+        let mut map_builder = create_string_map_builder(true);
+        map_builder.append(false).unwrap();
+        let tags = Arc::new(map_builder.finish());
 
         let expected = RecordBatch::try_new(
             record_batch.schema(),
@@ -2287,6 +2312,7 @@ mod tests {
                 Arc::new(BooleanArray::from(vec![None::<bool>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
+                tags,
             ],
         )
         .unwrap();
