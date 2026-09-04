@@ -223,8 +223,8 @@ impl LogSegment {
                 None
             };
 
-        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
         validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
+        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,
             &listed_files.checkpoint_parts,
@@ -530,14 +530,11 @@ impl LogSegment {
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = listed_commits.ascending_commit_files_mut();
-        if !commits.is_empty() {
-            let mut start_idx = commits.len() - 1;
-            while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version
-            {
-                start_idx -= 1;
-            }
-            commits.drain(..start_idx);
+        let mut start_idx = commits.len() - 1;
+        while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version {
+            start_idx -= 1;
         }
+        commits.drain(..start_idx);
 
         LogSegment::try_new(listed_commits, log_root, Some(end_version), None)
     }
