@@ -6,13 +6,15 @@ use Predicate as Pred;
 
 use super::*;
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray,
+    create_array, Array, ArrayRef, AsArray, BinaryViewArray, BooleanArray, GenericStringArray,
+    Int32Array, Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames,
+    StringArray, StringBuilder, StringViewArray, StructArray, TimestampNanosecondArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
-use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+use crate::arrow::datatypes::{
+    DataType, Field, Fields, Schema, TimeUnit, TimestampMicrosecondType,
+};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
@@ -389,7 +391,10 @@ fn test_invalid_array_sides() {
 
     let in_result = evaluate_predicate(&in_op, &batch, false);
 
-    assert_result_error_with_message(in_result, "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)");
+    assert_result_error_with_message(
+        in_result,
+        "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)",
+    );
 }
 
 #[test]
@@ -1289,6 +1294,63 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         .unwrap()
         .evaluate(&engine_data)
         .unwrap();
+}
+
+/// End-to-end through `ExpressionEvaluator`, on the shape that actually breaks: a `stats_parsed`
+/// struct read from a Spark-written checkpoint. Spark writes timestamps as Parquet INT96, arrow
+/// decodes INT96 as `Timestamp(Nanosecond, None)`, and kernel's `TIMESTAMP` is
+/// `Timestamp(Microsecond, "UTC")`. An engine that asks the evaluator for `TIMESTAMP` min/max
+/// columns and gets nanosecond columns back downcasts by the type it requested, gets nothing, and
+/// reads that as null min/max. The result is no file skipping at all, with no error anywhere.
+#[test]
+fn test_evaluator_output_schema_honors_timestamp_cast() {
+    let min_ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+        1_700_000_000_123_456_000i64,
+    ]));
+    let max_ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+        1_700_000_003_987_654_000i64,
+    ]));
+    let nanos = min_ts.data_type().clone();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("minTs", nanos.clone(), true),
+            Field::new("maxTs", nanos, true),
+        ])),
+        vec![min_ts, max_ts],
+    )
+    .unwrap();
+
+    let input_schema = schema_ref! {
+        nullable "minTs": TIMESTAMP,
+        nullable "maxTs": TIMESTAMP,
+    };
+    let output_type = KernelDataType::from(schema! {
+        nullable "minTs": TIMESTAMP,
+        nullable "maxTs": TIMESTAMP,
+    });
+    let expression: ExpressionRef = Arc::new(Expr::struct_from([col!("minTs"), col!("maxTs")]));
+
+    let output = ArrowEvaluationHandler
+        .new_expression_evaluator(input_schema, expression, output_type)
+        .unwrap()
+        .evaluate(&ArrowEngineData::new(batch))
+        .unwrap()
+        .try_into_record_batch()
+        .unwrap();
+
+    let micros = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    for (col, expected) in [(0, 1_700_000_000_123_456i64), (1, 1_700_000_003_987_654)] {
+        // The schema the engine sees must be the schema it asked for.
+        assert_eq!(output.schema().field(col).data_type(), &micros);
+        // And the values must survive the cast.
+        assert_eq!(
+            output
+                .column(col)
+                .as_primitive::<TimestampMicrosecondType>()
+                .value(0),
+            expected
+        );
+    }
 }
 
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`

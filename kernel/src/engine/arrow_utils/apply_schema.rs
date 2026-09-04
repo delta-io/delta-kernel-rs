@@ -12,10 +12,11 @@ use super::make_arrow_error;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };
+use crate::arrow::compute::cast;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
+use crate::engine::ensure_data_types::{ensure_data_types, DataTypeCompat, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField};
@@ -368,10 +369,15 @@ fn apply_schema_to_inner(
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
         Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
-        _ => {
-            ensure_data_types(schema, array.data_type(), ValidationMode::Full)?;
-            array.clone()
-        }
+        // A leaf whose arrow type is only cast-compatible with the kernel type must actually be
+        // cast, the same way `reorder_struct_array` resolves `NeedsCast` on the parquet read
+        // path. Skipping the cast here would hand back an array whose type contradicts the
+        // schema this function was asked to apply, and callers derive the output field type from
+        // the returned array, so the mismatch is silent.
+        _ => match ensure_data_types(schema, array.data_type(), ValidationMode::Full)? {
+            DataTypeCompat::NeedsCast(target) => cast(array, &target)?,
+            DataTypeCompat::Identical | DataTypeCompat::Nested => array.clone(),
+        },
     };
     Ok(array)
 }
@@ -384,11 +390,13 @@ mod apply_schema_validation_tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{ArrayRef, BinaryArray, Int32Array, RecordBatch, StructArray};
+    use crate::arrow::array::{
+        ArrayRef, BinaryArray, Int32Array, RecordBatch, StructArray, TimestampNanosecondArray,
+    };
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
-    use crate::arrow::compute::cast;
     use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
+        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema, TimeUnit,
+        TimestampMicrosecondType,
     };
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
@@ -426,6 +434,73 @@ mod apply_schema_validation_tests {
         let result = apply_schema_to(&variant, &DataType::unshredded_variant()).unwrap();
 
         assert_eq!(result.data_type(), variant.data_type());
+    }
+
+    // Build a `stats_parsed`-shaped struct whose timestamp leaves are nanoseconds, which is what
+    // arrow hands back for the INT96 timestamps Spark writes by default. Kernel's `TIMESTAMP` is
+    // `Timestamp(Microsecond, "UTC")`, so every leaf here is `NeedsCast`.
+    fn nanosecond_stats_input() -> StructArray {
+        // Micro-aligned values: a Delta table stores micros, so the INT96 Spark writes for it
+        // carries a zero sub-microsecond remainder and the cast is exact.
+        let min_ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+            1_700_000_000_123_456_000i64,
+        ]));
+        let max_ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+            1_700_000_003_987_654_000i64,
+        ]));
+        let leaf = |a: &ArrayRef| -> ArrayRef {
+            Arc::new(
+                StructArray::try_new(
+                    vec![ArrowField::new("ts", a.data_type().clone(), true)].into(),
+                    vec![a.clone()],
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let (min_values, max_values) = (leaf(&min_ts), leaf(&max_ts));
+        StructArray::try_new(
+            vec![
+                ArrowField::new("minValues", min_values.data_type().clone(), true),
+                ArrowField::new("maxValues", max_values.data_type().clone(), true),
+            ]
+            .into(),
+            vec![min_values, max_values],
+            None,
+        )
+        .unwrap()
+    }
+
+    fn nanosecond_stats_target() -> DataType {
+        DataType::from(schema! {
+            nullable "minValues": (schema! { nullable "ts": TIMESTAMP }),
+            nullable "maxValues": (schema! { nullable "ts": TIMESTAMP }),
+        })
+    }
+
+    // `apply_schema` must return data that actually matches the schema it was asked to apply.
+    // `transform_struct` derives each output field's arrow type from the *returned array*, so a
+    // leaf that is left uncast makes `apply_schema` emit `Timestamp(Nanosecond, None)` for a field
+    // the caller asked to be `TIMESTAMP`. No error is raised, which is why the reported symptom is
+    // null min/max and no file skipping rather than a failure.
+    #[test]
+    fn apply_schema_casts_cast_compatible_timestamp_leaf() {
+        let result = apply_schema(&nanosecond_stats_input(), &nanosecond_stats_target()).unwrap();
+
+        let expected = ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        for (col, expected_value) in [(0, 1_700_000_000_123_456i64), (1, 1_700_000_003_987_654)] {
+            let ts = result.column(col).as_struct().column(0);
+            assert_eq!(ts.data_type(), &expected);
+            assert_eq!(
+                ts.as_primitive::<TimestampMicrosecondType>().value(0),
+                expected_value
+            );
+            // The declared field type must agree with the array it describes.
+            assert_eq!(
+                result.schema().field(col).data_type(),
+                &ArrowDataType::Struct(vec![ArrowField::new("ts", expected.clone(), true)].into())
+            );
+        }
     }
 
     #[test]
