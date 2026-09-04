@@ -1913,8 +1913,30 @@ fn test_float_negative_nan_total_ordering_is_preserved() {
     let result = evaluate_predicate(&col.clone().lt(lit(0.0)), &batch, false).unwrap();
     assert_eq!(result, BooleanArray::from(vec![true, false]));
 
-    let result = evaluate_predicate(&col.gt(lit(0.0)), &batch, false).unwrap();
+    let result = evaluate_predicate(&col.clone().gt(lit(0.0)), &batch, false).unwrap();
     assert_eq!(result, BooleanArray::from(vec![false, true]));
+
+    let result = evaluate_predicate(&col.eq(lit(0.0)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![false, false]));
+}
+
+#[test]
+fn test_float_nan_payload_total_ordering_is_preserved() {
+    let lower_nan = f64::NAN;
+    let higher_nan = f64::from_bits(lower_nan.to_bits() + 1);
+    let array = Arc::new(Float64Array::from(vec![lower_nan, higher_nan])) as ArrayRef;
+    let schema = Schema::new([Arc::new(Field::new("col", DataType::Float64, false))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
+    let col = col!("col");
+
+    let result = evaluate_predicate(&col.clone().eq(lit(higher_nan)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![false, true]));
+
+    let result = evaluate_predicate(&col.clone().lt(lit(higher_nan)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![true, false]));
+
+    let result = evaluate_predicate(&col.distinct(lit(higher_nan)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![true, false]));
 }
 
 /// Empty and all-null float arrays should not panic and should produce the expected results.
