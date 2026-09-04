@@ -103,6 +103,14 @@ class InlineReviewTest(unittest.TestCase):
 
         self.assertEqual(standalone_prompt.strip(), "\n".join(configured_lines).strip())
 
+    def test_automatic_reviews_default_to_inline(self) -> None:
+        workflow = (Path(__file__).parents[2] / "workflows" / "ai-review.yml").read_text()
+        automatic_trigger = workflow.partition("            pull_request_target)")[2].partition(
+            "            workflow_dispatch)"
+        )[0]
+
+        self.assertIn("mode=inline", automatic_trigger)
+
     def test_diff_positions_tracks_both_sides_and_context(self) -> None:
         self.assertEqual(
             self.inline_review.diff_positions(DIFF),
