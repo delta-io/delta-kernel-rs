@@ -456,10 +456,11 @@ impl<S> Transaction<S> {
         );
 
         // Kernel always requires stable row tracking id/commitVersion preservation,
-        // so the flag is always true.
-        if self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::RowTracking)
+        // so the flag is always true(except for CREATE TABLE).
+        if !self.is_create_table()
+            && self
+                .effective_table_config
+                .is_feature_enabled(&TableFeature::RowTracking)
         {
             kernel_commit_info.set_row_tracking_preserved();
         }
@@ -639,21 +640,23 @@ impl<S> Transaction<S> {
 
     /// Set the content of the commitInfo action for this transaction. Note that kernel will
     /// _always_ write a commitInfo, this function simply allows engines to add their own data
-    /// into that action if they wish. Note that the following fields in `engine_commit_info`
-    /// will be overridden or merged by kernel if they are set:
-    /// - timestamp
-    /// - inCommitTimestamp
-    /// - operation
-    /// - operationParameters
-    /// - operationMetrics
-    /// - kernelVersion
-    /// - isBlindAppend
-    /// - engineInfo
-    /// - txnId
-    /// - tags
+    /// into that action if they wish. Kernel overrides the following fields if they are set in
+    /// `engine_commit_info`, so connectors should not set them:
     ///
-    /// When a connector tag has the same key as a Kernel-provided tag, Kernel's value takes
-    /// precedence. Otherwise, the connector-provided tag is preserved.
+    /// - `timestamp`
+    /// - `inCommitTimestamp`
+    /// - `operation`
+    /// - `operationParameters`
+    /// - `operationMetrics`
+    /// - `kernelVersion`
+    /// - `isBlindAppend`
+    /// - `engineInfo`
+    /// - `txnId`
+    ///
+    /// Kernel merges the following field if it is set:
+    ///
+    /// - `tags`: When a connector tag has the same key as a Kernel-provided tag, Kernel's value
+    ///   takes precedence. Otherwise, the connector-provided tag is preserved.
     pub fn with_commit_info(
         mut self,
         engine_commit_info: Box<dyn EngineData>,
