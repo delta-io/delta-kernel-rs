@@ -618,8 +618,12 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // (checkpoint batch), so do not try to extract remove actions in that case.
         let is_log_batch = self.deduplicator.is_log_batch();
         if !selected {
-            // Data-skipping predicates keep non-Add rows, so an unselected row is an Add. Count it
-            // without constructing the deduplication key that the predicate made unnecessary.
+            // Data-skipping predicates keep non-Add rows, so an unselected row is an Add. We
+            // don't put it into dedup in favor of performance and memory.
+
+            // TODO(#2945): A stats update can cause the newest Add to be pruned before
+            // deduplication, allowing an older Add for the same file to survive. We should
+            // fix the problem.
             self.metrics.record_add_file_seen(is_log_batch);
             return Ok(false);
         }
