@@ -132,6 +132,29 @@ pub(crate) fn assert_extern_result_error_with_message<T>(
     }
 }
 
+/// Check the error type and a stable message substring while recovering the error to prevent
+/// leaks.
+pub(crate) fn assert_extern_result_error_contains<T>(
+    res: ExternResult<T>,
+    expected_etype: KernelError,
+    expected_message: &str,
+) {
+    match res {
+        ExternResult::Err(e) => {
+            let error = unsafe { recover_error(e) };
+            assert_eq!(error.etype, expected_etype);
+            assert!(
+                error.message.contains(expected_message),
+                "expected error message to contain '{expected_message}', got '{}'",
+                error.message
+            );
+        }
+        _ => panic!(
+            "Expected error of type '{expected_etype:?}' containing message '{expected_message}'"
+        ),
+    }
+}
+
 /// Assert that `timestamp` (milliseconds since the Unix epoch) was written within the last day.
 #[cfg(test)]
 pub(crate) fn assert_timestamp_is_recent(timestamp: i64) {
