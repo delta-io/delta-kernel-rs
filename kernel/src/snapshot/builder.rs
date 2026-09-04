@@ -504,12 +504,17 @@ impl SnapshotBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::{actions_to_string, add_commit, TestAction};
+    use tracing::span::{Attributes, Id};
+    use tracing::Subscriber;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+    use tracing_subscriber::registry::LookupSpan;
 
     use super::*;
     use crate::engine::sync::SyncEngine;
@@ -519,6 +524,29 @@ mod tests {
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
+
+    #[derive(Clone, Default)]
+    struct ConstructorSpanFields(Arc<Mutex<BTreeMap<&'static str, BTreeSet<&'static str>>>>);
+
+    impl<S> Layer<S> for ConstructorSpanFields
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let span_name = attrs.metadata().name();
+            if !matches!(span_name, "try_new_from_log_segment" | "try_new_from") {
+                return;
+            }
+
+            let fields = attrs
+                .metadata()
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .collect();
+            self.0.lock().unwrap().insert(span_name, fields);
+        }
+    }
 
     fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
@@ -755,6 +783,50 @@ mod tests {
             .expect("expected SnapshotBuildSuccess event");
         assert_eq!(version, 1, "version should match the updated snapshot");
         assert!(duration > Duration::ZERO, "duration should be non-zero");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_constructor_spans_only_capture_explicit_fields(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+
+        let captured = ConstructorSpanFields::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        let snapshot = SnapshotBuilder::new_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())?;
+        let updated = SnapshotBuilder::new_from(snapshot).build(engine.as_ref())?;
+        assert_eq!(updated.version(), 1);
+
+        let expected = BTreeMap::from([
+            (
+                "try_new_from_log_segment",
+                BTreeSet::from([
+                    "path",
+                    "version",
+                    "operation_id",
+                    "correlation_id",
+                    "incremental_replay",
+                    "built_as_latest",
+                ]),
+            ),
+            (
+                "try_new_from",
+                BTreeSet::from([
+                    "version",
+                    "operation_id",
+                    "correlation_id",
+                    "incremental_replay",
+                    "built_as_latest",
+                ]),
+            ),
+        ]);
+        assert_eq!(*captured.0.lock().unwrap(), expected);
+
         Ok(())
     }
 
