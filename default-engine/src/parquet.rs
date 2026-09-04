@@ -260,7 +260,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
                 &write_context.write_dir(),
                 data,
                 write_context.stats_columns(),
-                write_context.physical_schema().as_ref(),
+                write_context.physical_data_schema().as_ref(),
             )
             .await?;
         super::build_add_file_metadata(file_metadata, write_context)

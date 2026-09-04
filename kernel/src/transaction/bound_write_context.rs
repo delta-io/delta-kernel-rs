@@ -14,10 +14,10 @@ use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
 /// A write context for a specific partition or an unpartitioned table. Created by a
-/// [`WriteContextBuilder`](super::WriteContextBuilder).
+/// [`BoundWriteContextBuilder`](super::BoundWriteContextBuilder).
 ///
-/// Note: clustered tables are unpartitioned and use [`WriteContextBuilder::build`] without calling
-/// [`with_partition_values`].
+/// Note: clustered tables are unpartitioned and use [`BoundWriteContextBuilder::build`] without
+/// calling [`with_partition_values`].
 ///
 /// Contains both table-wide state and per-partition state (serialized partition values with
 /// physical column names as keys). How you use a `BoundWriteContext` depends on your engine:
@@ -32,11 +32,15 @@ use crate::{DeltaResult, Error};
 ///
 /// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
-/// [`WriteContextBuilder::build`]: super::WriteContextBuilder::build
-/// [`with_partition_values`]: super::WriteContextBuilder::with_partition_values
+/// [`BoundWriteContextBuilder::build`]: super::BoundWriteContextBuilder::build
+/// [`with_partition_values`]: super::BoundWriteContextBuilder::with_partition_values
 #[derive(Debug)]
 pub struct BoundWriteContext {
     pub(super) write_state: Arc<WriteState>,
+    /// Schema expected for to-be-written logical data.
+    pub(super) logical_data_schema: SchemaRef,
+    /// Schema expected in the written Parquet file.
+    pub(super) physical_data_schema: SchemaRef,
     /// Transforms logical data to physical data for writing. The logical data must not contain
     /// any partition columns. The expression injects the partition columns when needed.
     pub(super) logical_to_physical: ExpressionRef,
@@ -136,15 +140,19 @@ impl BoundWriteContext {
         url
     }
 
-    /// Returns the schema which connectors' logical data should conform to.
-    pub fn logical_schema(&self) -> &SchemaRef {
-        &self.write_state.logical_schema
+    /// Returns the schema expected for to-be-written logical data.
+    ///
+    /// This schema contains the Delta schema excluding partition columns, followed by any
+    /// connector-specified Row ID and Row Commit Version columns. If both are present, the Row ID
+    /// column precedes the Row Commit Version column. If the table requires materialized partition
+    /// columns, Kernel inserts them during the logical-to-physical transform.
+    pub fn logical_data_schema(&self) -> &SchemaRef {
+        &self.logical_data_schema
     }
 
-    /// Returns the physical schema (partition columns removed if applicable, column mapping
-    /// applied). Partition columns are kept when `materializePartitionColumns` is enabled.
-    pub fn physical_schema(&self) -> &SchemaRef {
-        &self.write_state.physical_schema
+    /// Returns the schema for data written to Parquet.
+    pub fn physical_data_schema(&self) -> &SchemaRef {
+        &self.physical_data_schema
     }
 
     /// Returns the expression that transforms logical data to physical data for writing.
@@ -289,8 +297,12 @@ mod tests {
         let write_state = Arc::new(WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             full_logical_schema: schema.clone(),
-            logical_schema: schema.clone(),
-            physical_schema: schema.clone(),
+            base_logical_data_schema: schema.clone(),
+            base_physical_data_schema: schema.clone(),
+            materialized_row_id_column_name: None,
+            materialized_row_commit_version_column_name: None,
+            row_tracking_enabled: false,
+            iceberg_compat_v3_enabled: false,
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
@@ -301,6 +313,8 @@ mod tests {
         });
         BoundWriteContext {
             write_state,
+            logical_data_schema: schema.clone(),
+            physical_data_schema: schema,
             logical_to_physical: Arc::new(lit(true)),
             physical_partition_values: partition_values,
         }
