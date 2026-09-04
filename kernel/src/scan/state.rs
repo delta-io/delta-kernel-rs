@@ -129,10 +129,12 @@ pub struct ScanFile {
     pub partition_values: HashMap<String, String>,
 }
 
+/// Callback invoked by [`ScanMetadata::visit_scan_files`] for each scan file. Returning `false`
+/// stops iteration for the current batch; returning `true` continues it.
 pub type ScanCallback<T> = fn(context: &mut T, scan_file: ScanFile) -> bool;
 
 /// Request that the kernel call a callback on each valid file that needs to be read for the
-/// scan.
+/// scan. If the callback returns `false`, iteration will be stopped for the current batch.
 ///
 /// The arguments to the callback are:
 /// * `context`: an `&mut context` argument. this can be anything that engine needs to pass through
@@ -147,12 +149,19 @@ pub type ScanCallback<T> = fn(context: &mut T, scan_file: ScanFile) -> bool;
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
+/// let callback = |context: Context, scan_file: ScanFile| -> bool {
+///     [do something with [scan_file]
+///     keep_going(context)
+/// };
 /// for res in scan_metadata_iter { // scan metadata iterator from scan.scan_metadata()
 ///     let scan_metadata = res?;
 ///     context = scan_metadata.visit_scan_files(
 ///        context,
 ///        my_callback,
 ///     )?;
+///     if context.stop {
+///       break;
+///     }
 /// }
 /// ```
 impl ScanMetadata {

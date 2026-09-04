@@ -63,6 +63,9 @@ pub(crate) struct CdfScanFile {
     pub default_row_commit_version: Option<i64>,
 }
 
+/// Callback invoked by [`visit_cdf_scan_files`] for each CDF scan file. Returning `false` stops
+/// iteration for the current batch; returning `true` continues it. This mirrors
+/// [`crate::scan::state::ScanCallback`].
 pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile) -> bool;
 
 /// Describes one data file and the metadata required to reconstruct row-level changes.
