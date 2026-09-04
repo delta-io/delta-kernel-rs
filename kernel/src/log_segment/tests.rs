@@ -4253,7 +4253,8 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
     assert!(
         checkpoint_result
             .checkpoint_info
-            .has_partition_values_parsed,
+            .native_partition_values_schema
+            .is_some(),
         "Expected has_partition_values_parsed to be true"
     );
 
@@ -4316,9 +4317,10 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
 
     // Verify it's false
     assert!(
-        !checkpoint_result
+        checkpoint_result
             .checkpoint_info
-            .has_partition_values_parsed,
+            .native_partition_values_schema
+            .is_none(),
         "Expected has_partition_values_parsed to be false"
     );
 
@@ -4370,14 +4372,16 @@ fn test_partition_values_parsed_compatible_basic() {
         nullable "date": DATE,
         nullable "count": INTEGER,
     };
-    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+    let compatible = LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .expect("both native fields should be compatible");
+    assert_eq!(compatible.as_ref(), &partition_schema);
 }
 
 #[test]
-fn test_partition_values_parsed_missing_field_is_incompatible() {
+fn test_partition_values_parsed_missing_field_uses_available_subset() {
     let checkpoint_schema =
         create_checkpoint_schema_with_partition_parsed(vec![StructField::nullable(
             "date",
@@ -4387,10 +4391,12 @@ fn test_partition_values_parsed_missing_field_is_incompatible() {
         nullable "date": DATE,
         nullable "count": INTEGER,
     };
-    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+    let compatible = LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .expect("the date field should remain usable");
+    assert_eq!(compatible.as_ref(), &schema! { nullable "date": DATE });
 }
 
 #[test]
@@ -4402,10 +4408,12 @@ fn test_partition_values_parsed_extra_field() {
         StructField::nullable("extra", DataType::INTEGER),
     ]);
     let partition_schema = schema! { nullable "date": DATE };
-    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+    let compatible = LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .expect("the requested native field should be compatible");
+    assert_eq!(compatible.as_ref(), &partition_schema);
 }
 
 #[rstest::rstest]
@@ -4419,10 +4427,11 @@ fn test_partition_values_parsed_empty_string_types_are_incompatible(#[case] data
         )]);
     let partition_schema =
         StructType::new_unchecked(vec![StructField::nullable("part", data_type)]);
-    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .is_none());
 }
 
 #[test]
@@ -4433,20 +4442,22 @@ fn test_partition_values_parsed_type_mismatch() {
             DataType::STRING,
         )]);
     let partition_schema = schema! { nullable "date": DATE };
-    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .is_none());
 }
 
 #[test]
 fn test_partition_values_parsed_not_present() {
     let checkpoint_schema = create_checkpoint_schema_without_partition_parsed();
     let partition_schema = schema! { nullable "date": DATE };
-    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .is_none());
 }
 
 #[test]
@@ -4459,10 +4470,11 @@ fn test_partition_values_parsed_not_a_struct() {
         },
     };
     let partition_schema = schema! { nullable "date": DATE };
-    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .is_none());
 }
 
 #[test]
@@ -4472,12 +4484,34 @@ fn test_partition_values_parsed_empty_partition_schema() {
             "date",
             DataType::DATE,
         )]);
-    // Empty partition schema — any partitionValues_parsed is compatible
+    // An empty target has no native field to preserve.
     let partition_schema = schema! {};
-    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(LogSegment::compatible_partition_values_parsed_schema(
         &checkpoint_schema,
         &partition_schema,
-    ));
+    )
+    .is_none());
+}
+
+#[test]
+fn test_partition_values_parsed_mixed_schema_preserves_only_trusted_native_fields() {
+    let checkpoint_schema = create_checkpoint_schema_with_partition_parsed(vec![
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("event_time", DataType::TIMESTAMP),
+    ]);
+    let partition_schema = schema! {
+        nullable "name": STRING,
+        nullable "event_time": TIMESTAMP,
+    };
+    let compatible = LogSegment::compatible_partition_values_parsed_schema(
+        &checkpoint_schema,
+        &partition_schema,
+    )
+    .expect("timestamp should remain checkpoint-native");
+    assert_eq!(
+        compatible.as_ref(),
+        &schema! { nullable "event_time": TIMESTAMP }
+    );
 }
 
 // ============================================================================

@@ -978,7 +978,7 @@ impl Scan {
                 actions: existing_data.into_iter().map(apply_transform),
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
-                    has_partition_values_parsed: false,
+                    native_partition_values_schema: None,
                     checkpoint_read_schema: restored_add_schema().clone(),
                 },
             };
@@ -1291,7 +1291,7 @@ impl Scan {
         };
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
-            has_partition_values_parsed: false,
+            native_partition_values_schema: None,
             checkpoint_read_schema,
         };
         let processor = ScanLogReplayProcessor::new(
