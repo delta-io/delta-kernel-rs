@@ -841,9 +841,9 @@ fn scan_row_schema_with_parsed_columns(
 ///   the JSON stats column; JSON-only checkpoints and commits retain `add.stats` as fallback input.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
-/// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
-///   column (checkpoint). When true it is read directly; otherwise the struct is reconstructed from
-///   the `partitionValues` string map.
+/// - `has_partition_values_parsed`: Whether the source has a compatible native
+///   `partitionValues_parsed` column that can be read directly. Otherwise the struct is
+///   reconstructed from the `partitionValues` string map.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -902,10 +902,10 @@ fn get_add_transform_expr(
     // engine-facing typed output column.
     if partition_schema.is_some() {
         let pv_parsed_expr = if has_partition_values_parsed {
-            // Checkpoint carries a native partitionValues_parsed column - read it directly.
+            // Checkpoint carries a compatible native partitionValues_parsed column.
             col!("add.partitionValues_parsed")
         } else {
-            // No native column (JSON commit): reconstruct from the string map.
+            // Reconstruct from the string map when no compatible native column is available.
             Expression::map_to_struct(col!("add.partitionValues"))
         };
         fields.push(Arc::new(pv_parsed_expr));

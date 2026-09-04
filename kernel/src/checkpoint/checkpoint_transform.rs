@@ -52,7 +52,7 @@ impl StatsTransformConfig {
 /// - When `writeStatsAsStruct=false`: drop `stats_parsed` field
 ///
 /// For partitioned tables when `writeStatsAsStruct=true`, it also populates:
-/// - `partitionValues_parsed = COALESCE(partitionValues_parsed, MAP_TO_STRUCT(partitionValues))`
+/// - `partitionValues_parsed = MAP_TO_STRUCT(partitionValues)`
 ///
 /// Returns a top-level transform that wraps the nested Add transform, ensuring the
 /// full checkpoint batch is produced with the modified Add action.
@@ -193,24 +193,21 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     ]))
 }
 
-/// Builds expression: `partitionValues_parsed = COALESCE(partitionValues_parsed,
-///     MAP_TO_STRUCT(partitionValues))`
+/// Builds expression: `partitionValues_parsed = MAP_TO_STRUCT(partitionValues)`
 ///
-/// This expression prefers existing `partitionValues_parsed`, falling back to converting
-/// the string-valued `partitionValues` map into a native typed struct. The target struct
-/// type (field names and data types) is determined by the output schema — `MAP_TO_STRUCT`
-/// itself carries no schema, so the expression evaluator uses the expected output type to
-/// parse each string value into the correct native type.
+/// The target struct type (field names and data types) is determined by the output schema --
+/// `MAP_TO_STRUCT` itself carries no schema, so the expression evaluator uses the expected output
+/// type to parse each string value into the correct native type.
 ///
-/// The fallback uses the same `MAP_TO_STRUCT` the scan applies, so an empty-string partition value
-/// reconstructs as null in both a checkpoint and a scan of its source commit.
+/// Rebuilding from the serialized map applies the same normalization as scans and avoids preserving
+/// incompatible native values from an earlier checkpoint.
 ///
 /// Column paths are relative to the full batch, not the nested Add struct.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
-    Arc::new(Expression::coalesce([
-        col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD),
-        Expression::map_to_struct(col!(ADD_NAME, PARTITION_VALUES_FIELD)),
-    ]))
+    Arc::new(Expression::map_to_struct(col!(
+        ADD_NAME,
+        PARTITION_VALUES_FIELD
+    )))
 }
 
 /// Static expression: `stats = COALESCE(stats, ToJson(stats_parsed))`
@@ -434,21 +431,13 @@ mod tests {
         );
     }
 
-    /// The checkpoint falls back to `MAP_TO_STRUCT` over `partitionValues` when no native
-    /// `partitionValues_parsed` column is present, so a checkpoint reconstructs the same typed
-    /// struct the scan reads and the two can never disagree on a value.
+    /// Checkpoints rebuild `partitionValues_parsed` from the serialized map so native values from
+    /// an earlier checkpoint cannot bypass partition-value normalization.
     #[test]
-    fn build_partition_values_parsed_expr_falls_back_to_map_to_struct() {
+    fn build_partition_values_parsed_expr_uses_map_to_struct() {
         let expr = build_partition_values_parsed_expr();
-        let Expression::Variadic(coalesce) = expr.as_ref() else {
-            panic!("expected a COALESCE expression");
-        };
-        let has_map_to_struct_fallback = coalesce
-            .exprs
-            .iter()
-            .any(|e| matches!(e, Expression::MapToStruct(_)));
         assert!(
-            has_map_to_struct_fallback,
+            matches!(expr.as_ref(), Expression::MapToStruct(_)),
             "checkpoint partitionValues_parsed must reconstruct via MAP_TO_STRUCT"
         );
     }

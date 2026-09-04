@@ -282,8 +282,8 @@ of parsing the string map per file. The raw string map is still present, so this
 adds the typed column.
 
 > [!TIP]
-> When the checkpoint already stores typed partition values, Kernel reads that column directly
-> and skips parsing entirely.
+> Kernel reads compatible typed checkpoint values directly. String and Binary partition schemas
+> are reconstructed from the raw map so empty strings become null.
 
 ## Cancelling a scan
 

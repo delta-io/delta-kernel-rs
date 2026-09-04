@@ -4377,19 +4377,17 @@ fn test_partition_values_parsed_compatible_basic() {
 }
 
 #[test]
-fn test_partition_values_parsed_missing_field() {
+fn test_partition_values_parsed_missing_field_is_incompatible() {
     let checkpoint_schema =
         create_checkpoint_schema_with_partition_parsed(vec![StructField::nullable(
             "date",
             DataType::DATE,
         )]);
-    // Partition schema expects both date and count, but checkpoint only has date.
-    // Missing fields are OK — they just won't contribute to row group skipping.
     let partition_schema = schema! {
         nullable "date": DATE,
         nullable "count": INTEGER,
     };
-    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
         &checkpoint_schema,
         &partition_schema,
     ));

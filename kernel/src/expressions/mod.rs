@@ -703,19 +703,15 @@ impl ParseJsonExpression {
 ///   round or rescale.
 /// - BOOLEAN: accept case-insensitive `true` or `false`, with no numeric or yes/no aliases.
 /// - DATE: parse `{year}-{month}-{day}`.
-/// - TIMESTAMP: parse either 1) an ISO 8601 timestamp with an explicit offset, normalized to UTC;
-///   or 2) a space-separated timestamp without a zone. Currently, kernel expects case 2 to be
-///   interpreted as UTC, however the protocol specifies that it should be interpreted in the
-///   writer's time zone. TODO: MapToStruct needs to be updated to take in a timezone as a
-///   parameter.
+/// - TIMESTAMP: parse an ISO 8601 timestamp with an explicit offset and normalize it to UTC, or
+///   interpret a space-separated timestamp without a zone as UTC. The protocol assigns the latter
+///   form the writer's time zone, but this expression does not carry that zone.
 /// - TIMESTAMP_NTZ: parse a space-separated timestamp without an offset and preserve the local
 ///   wall-clock value.
 /// - Interval types: parse an ANSI interval literal accepted by [`PrimitiveType::parse_scalar`].
 /// - VOID: reject every non-empty value.
 ///
-/// Kernel's UTC interpretation of a zone-less TIMESTAMP is explicit here: the Delta protocol says
-/// that form is interpreted in the writer's time zone, but that time zone is not carried by this
-/// expression. Modern writers should use the protocol's UTC-adjusted ISO 8601 form.
+/// Writers should use the protocol's UTC-adjusted ISO 8601 timestamp form.
 ///
 /// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
 /// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
