@@ -143,16 +143,23 @@ fn synthesize_expr(schema: &Schema, expr: &PExpr) -> Option<(KExpr, DataType)> {
                 PBinOp::Minus => KExpr::binary(KBinOp::Minus, l, r),
                 PBinOp::Multiply => KExpr::binary(KBinOp::Multiply, l, r),
                 PBinOp::Divide => KExpr::binary(KBinOp::Divide, l, r),
-                // Modulo: a % b = a - (b * (a / b))
-                // This relies on kernel's Divide producing integer division for integer types,
-                // which truncates toward zero (like Rust/C, matching Spark behavior).
-                // Examples:
-                //   7 % 3  =  7 - (3 * (7 / 3))  =  7 - (3 * 2)  =  1
-                //  -7 % 3  = -7 - (3 * (-7 / 3)) = -7 - (3 * -2) = -1
-                //   7 % -3 =  7 - (-3 * (7 / -3)) = 7 - (-3 * -2) = 1
+                // The expression IR has no modulo operator. For integral operands, casting the
+                // fractional quotient back to the resolved type truncates it toward zero.
                 PBinOp::Modulo => {
+                    if !matches!(
+                        &ty,
+                        DataType::Primitive(
+                            PrimitiveType::Byte
+                                | PrimitiveType::Short
+                                | PrimitiveType::Integer
+                                | PrimitiveType::Long
+                        )
+                    ) {
+                        return None;
+                    }
                     let a_div_b = KExpr::binary(KBinOp::Divide, l.clone(), r.clone());
-                    let b_times_quotient = KExpr::binary(KBinOp::Multiply, r, a_div_b);
+                    let quotient = KExpr::cast(a_div_b, ty.clone());
+                    let b_times_quotient = KExpr::binary(KBinOp::Multiply, r, quotient);
                     KExpr::binary(KBinOp::Minus, l, b_times_quotient)
                 }
                 _ => return None,
@@ -762,6 +769,8 @@ mod tests {
     // IS NULL on non-column expressions
     #[case("(a > 0) IS NULL")]
     #[case("(a > 0 AND b > 1) IS NULL")]
+    // The expression IR can lower integral modulo but has no general remainder operator.
+    #[case("double_col % 2.0 > 0.0")]
     fn unsupported_predicates_fail_gracefully(#[case] sql: &str) {
         let schema = test_schema();
         let result = parse_predicate(sql, &schema);
@@ -841,7 +850,10 @@ mod tests {
                     KExpr::binary(
                         KBinOp::Multiply,
                         Long(100),
-                        KExpr::binary(KBinOp::Divide, col!("a"), Long(100))
+                        KExpr::cast(
+                            KExpr::binary(KBinOp::Divide, col!("a"), Long(100)),
+                            DataType::LONG
+                        )
                     )
                 ),
                 Long(10)

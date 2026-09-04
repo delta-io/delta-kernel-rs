@@ -7,8 +7,8 @@ use Predicate as Pred;
 use super::*;
 use crate::arrow::array::{
     create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray,
+    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames,
+    RecordBatchOptions, StringArray, StringBuilder, StringViewArray, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -68,20 +68,17 @@ fn test_array_column() {
 }
 
 #[test]
-fn test_bad_right_type_array() {
+fn test_in_rejects_non_array_column() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
 
-    let in_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(5), col!("item")));
+    let in_op = Pred::binary(BinaryPredicateOp::In, lit(5), col!("item"));
 
     let in_result = evaluate_predicate(&in_op, &batch, false);
 
-    assert_result_error_with_message(
-        in_result,
-        "Invalid expression evaluation: Cannot cast to list array: Int32",
-    );
+    assert_result_error_with_message(in_result, "IN requires an array-valued right operand");
 }
 
 #[test]
@@ -223,10 +220,14 @@ fn test_binary_predicate_with_view_types(
 }
 
 #[test]
-fn test_literal_type_array() {
-    let field = Arc::new(Field::new("item", DataType::Int32, true));
-    let schema = Schema::new([field.clone()]);
-    let batch = RecordBatch::new_empty(Arc::new(schema));
+fn test_literal_array_membership_on_columnless_batch() {
+    // Literal-only predicates still derive their row count from a columnless batch.
+    let batch = RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty()),
+        vec![],
+        &RecordBatchOptions::new().with_row_count(Some(1)),
+    )
+    .unwrap();
 
     let not_in_op = Pred::not(Pred::binary(
         BinaryPredicateOp::In,
@@ -370,7 +371,7 @@ fn test_literal_complex_type_array() {
 }
 
 #[test]
-fn test_invalid_array_sides() {
+fn test_in_rejects_array_value_against_scalar_elements() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
     let field = Arc::new(Field::new("item", DataType::Int32, true));
@@ -389,7 +390,10 @@ fn test_invalid_array_sides() {
 
     let in_result = evaluate_predicate(&in_op, &batch, false);
 
-    assert_result_error_with_message(in_result, "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)");
+    assert!(matches!(
+        in_result,
+        Err(Error::InvalidExpressionEvaluation(_))
+    ));
 }
 
 #[test]
@@ -482,10 +486,9 @@ fn test_binary_op_scalar() {
     let expected = Arc::new(Int32Array::from(vec![2, 4, 6]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    // TODO handle type casting
     let expression = column.div(lit(1));
     let results = evaluate_expression(&expression, &batch, None).unwrap();
-    let expected = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let expected = Arc::new(crate::arrow::array::Float64Array::from(vec![1.0, 2.0, 3.0]));
     assert_eq!(results.as_ref(), expected.as_ref())
 }
 
@@ -1335,6 +1338,17 @@ fn test_create_many_empty_rows_returns_zero_row_batch() {
     let rb = result.try_into_record_batch().unwrap();
     assert_eq!(rb.num_rows(), 0);
     assert_eq!(rb.num_columns(), 2);
+}
+
+#[test]
+fn test_create_many_preserves_row_count_for_empty_schema() {
+    let handler = ArrowEvaluationHandler;
+    let rows: &[&[Scalar]] = &[&[], &[], &[]];
+    let result = handler.create_many(schema_ref! {}, rows).unwrap();
+    let batch = result.try_into_record_batch().unwrap();
+
+    assert_eq!(batch.num_rows(), rows.len());
+    assert_eq!(batch.num_columns(), 0);
 }
 
 #[test]

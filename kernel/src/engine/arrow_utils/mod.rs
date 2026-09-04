@@ -42,35 +42,6 @@ use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error};
 
-macro_rules! prim_array_cmp {
-    ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
-
-        return match $left_arr.data_type() {
-        $(
-            $data_ty => {
-                let prim_array = $left_arr.as_primitive_opt::<$prim_ty>()
-                        .ok_or(Error::invalid_expression(
-                            format!("Cannot cast to primitive array: {}", $left_arr.data_type()))
-                        )?;
-                    let list_array = $right_arr.as_list_opt::<i32>()
-                        .ok_or(Error::invalid_expression(
-                            format!("Cannot cast to list array: {}", $right_arr.data_type()))
-                        )?;
-                crate::arrow::compute::kernels::comparison::in_list(prim_array, list_array)
-            }
-        )+
-            _ => Err(ArrowError::CastError(
-                        format!("Bad Comparison between: {:?} and {:?}",
-                            $left_arr.data_type(),
-                            $right_arr.data_type())
-                        )
-                )
-        }.map_err(Error::generic_err);
-    };
-}
-
-pub(crate) use prim_array_cmp;
-
 type FieldIndex = usize;
 type FlattenedRangeIterator<T> = std::iter::Flatten<std::vec::IntoIter<Range<T>>>;
 
