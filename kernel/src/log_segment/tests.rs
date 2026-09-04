@@ -1779,6 +1779,91 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     Ok(())
 }
 
+#[tokio::test]
+async fn test_json_v2_leaf_uses_hint_schema_for_native_partition_values() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
+    let checkpoint_json = r#"{"add":{"path":"file.parquet","partitionValues":{"event_time":"invalid-timestamp"},"partitionValues_parsed":{"event_time":"1970-01-01T08:00:00Z"},"size":1,"modificationTime":2,"dataChange":true}}"#;
+    store
+        .put(
+            &Path::from(format!("_delta_log/{filename}")),
+            checkpoint_json.to_string().into(),
+        )
+        .await?;
+
+    let action_schema = schema_ref! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "partitionValues": { STRING => nullable STRING },
+            nullable "size": LONG,
+            nullable "modificationTime": LONG,
+            nullable "dataChange": BOOLEAN,
+        },
+    };
+    let hint_schema = schema_ref! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "partitionValues": { STRING => nullable STRING },
+            nullable "partitionValues_parsed": { nullable "event_time": TIMESTAMP },
+            nullable "size": LONG,
+            nullable "modificationTime": LONG,
+            nullable "dataChange": BOOLEAN,
+        },
+    };
+    let partition_schema = schema_ref! { nullable "event_time": TIMESTAMP };
+    let checkpoint_file = log_root.join(filename)?.to_string();
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path(&checkpoint_file)],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHint {
+            version: 10,
+            checkpoint_schema: Some(hint_schema),
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: filename.to_string(),
+                sidecar_files: Some(vec![]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )?;
+
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        action_schema,
+        None,
+        None,
+        Some(partition_schema.as_ref()),
+        None,
+    )?;
+    assert_eq!(
+        checkpoint_result
+            .checkpoint_info
+            .native_partition_values_schema
+            .as_ref(),
+        Some(&partition_schema)
+    );
+    let read_schema = checkpoint_result.checkpoint_info.checkpoint_read_schema;
+    let mut actions = checkpoint_result.actions;
+    let ActionsBatch {
+        actions: actual,
+        is_log_batch,
+    } = actions.next().expect("JSON checkpoint batch")?;
+    assert!(!is_log_batch);
+    let expected_json: StringArray = vec![checkpoint_json].into();
+    let expected = SyncJsonHandler::new(None)
+        .parse_json(string_array_to_engine_data(expected_json), read_schema)
+        .unwrap();
+    assert_batch_matches(actual, expected);
+    assert!(actions.next().is_none());
+
+    Ok(())
+}
+
 // Tests the end-to-end process of creating a checkpoint stream.
 // Verifies that:
 // - The checkpoint file is read and produces batches containing references to sidecar files.

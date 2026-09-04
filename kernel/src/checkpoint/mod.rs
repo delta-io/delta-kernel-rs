@@ -141,6 +141,7 @@ pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
     build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
 };
+pub(crate) use checkpoint_transform::{raw_partition_values_expr, PartitionValuesSource};
 use sidecar::{create_sidecar_action_batch, SidecarSplitter, SingleSidecarDataIterator};
 #[cfg(test)]
 mod tests;

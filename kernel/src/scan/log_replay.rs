@@ -10,6 +10,7 @@ use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::checkpoint::{raw_partition_values_expr, PartitionValuesSource};
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef, Predicate,
@@ -828,9 +829,6 @@ fn scan_row_schema_with_parsed_columns(
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
-const RAW_PARTITION_VALUES_PARSED: &str = "__raw_partition_values_parsed";
-const NATIVE_PARTITION_VALUES_PARSED: &str = "__native_partition_values_parsed";
-
 #[allow(clippy::too_many_arguments)]
 fn build_checkpoint_transform_evaluators(
     engine: &dyn Engine,
@@ -843,10 +841,17 @@ fn build_checkpoint_transform_evaluators(
     native_partition_schema: Option<SchemaRef>,
     output_schema: SchemaRef,
 ) -> DeltaResult<Vec<Arc<dyn ExpressionEvaluator>>> {
-    let Some((partition_schema, native_partition_schema)) = partition_schema
+    let partition_values_source = partition_schema
         .as_ref()
-        .zip(native_partition_schema.as_ref())
-    else {
+        .map(|schema| PartitionValuesSource::for_schemas(schema, native_partition_schema.as_ref()));
+    if !matches!(
+        partition_values_source,
+        Some(PartitionValuesSource::Mixed(_))
+    ) {
+        let has_native_partition_values = matches!(
+            partition_values_source,
+            Some(PartitionValuesSource::Native(_))
+        );
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             checkpoint_read_schema,
             get_add_transform_expr(
@@ -855,24 +860,26 @@ fn build_checkpoint_transform_evaluators(
                 skip_stats,
                 synthesize_json,
                 partition_schema,
-                false,
+                has_native_partition_values,
             ),
             output_schema.into(),
         )?;
         return Ok(vec![evaluator]);
+    }
+    let Some(PartitionValuesSource::Mixed(staging)) = partition_values_source else {
+        return Err(Error::internal_error(
+            "mixed partition values source expected for staged transform",
+        ));
     };
 
     let base_schema = scan_row_schema_with_parsed_columns(physical_stats_schema.clone(), None)?;
+    let [(raw_field, raw_expr), (native_field, native_expr)] = staging.scan_columns();
+    let raw_field_name = raw_field.name().clone();
+    let native_field_name = native_field.name().clone();
     let staging_schema = Arc::new(
         SchemaStructPatchBuilder::new()
-            .append(StructField::nullable(
-                RAW_PARTITION_VALUES_PARSED,
-                partition_schema.as_ref().clone(),
-            ))
-            .append(StructField::nullable(
-                NATIVE_PARTITION_VALUES_PARSED,
-                native_partition_schema.as_ref().clone(),
-            ))
+            .append(raw_field)
+            .append(native_field)
             .build(&base_schema)?,
     );
     let mut staging_fields = get_add_transform_fields(
@@ -881,29 +888,22 @@ fn build_checkpoint_transform_evaluators(
         skip_stats,
         synthesize_json,
     );
-    staging_fields.push(Arc::new(Expression::map_to_struct(col!(
-        "add.partitionValues"
-    ))));
-    staging_fields.push(Arc::new(Expression::coalesce([
-        col!("add.partitionValues_parsed"),
-        Expression::map_to_struct(col!("add.partitionValues")),
-    ])));
+    staging_fields.extend([raw_expr, native_expr]);
     let staging_evaluator = engine.evaluation_handler().new_expression_evaluator(
         checkpoint_read_schema,
         Arc::new(Expression::struct_from(staging_fields)),
         staging_schema.clone().into(),
     )?;
 
-    let mixed_expr = mixed_partition_values_expr(partition_schema, native_partition_schema);
     let (_, output_expr) = ProjectionStructPatchBuilder::new(&staging_schema)
-        .drop(RAW_PARTITION_VALUES_PARSED)
-        .drop(NATIVE_PARTITION_VALUES_PARSED)
+        .drop(raw_field_name)
+        .drop(native_field_name)
         .append(
             StructField::nullable(
                 PARTITION_VALUES_PARSED_NAME,
-                partition_schema.as_ref().clone(),
+                staging.partition_schema().as_ref().clone(),
             ),
-            mixed_expr,
+            staging.merge_expr(),
         )
         .build()?;
     let output_evaluator = engine.evaluation_handler().new_expression_evaluator(
@@ -912,24 +912,6 @@ fn build_checkpoint_transform_evaluators(
         output_schema.into(),
     )?;
     Ok(vec![staging_evaluator, output_evaluator])
-}
-
-fn mixed_partition_values_expr(
-    partition_schema: &StructType,
-    native_partition_schema: &StructType,
-) -> Expression {
-    let fields = partition_schema.fields().map(|field| {
-        let source = if native_partition_schema.field(field.name()).is_some() {
-            NATIVE_PARTITION_VALUES_PARSED
-        } else {
-            RAW_PARTITION_VALUES_PARSED
-        };
-        Expression::column([source, field.name()])
-    });
-    Expression::struct_with_nullability_from(
-        fields,
-        Expression::from_pred(col!(RAW_PARTITION_VALUES_PARSED).is_not_null()),
-    )
 }
 
 /// Build the add transform expression with optional stats and partition value parsing.
@@ -974,7 +956,7 @@ fn get_add_transform_expr(
         let pv_parsed_expr = if has_partition_values_parsed {
             col!("add.partitionValues_parsed")
         } else {
-            Expression::map_to_struct(col!("add.partitionValues"))
+            raw_partition_values_expr()
         };
         fields.push(Arc::new(pv_parsed_expr));
     }
@@ -2323,7 +2305,8 @@ mod tests {
         .unwrap();
         let handler = SyncJsonHandler::new(None);
         let input_json: StringArray = vec![
-            r#"{"add":{"path":"file.parquet","partitionValues":{"name":"","event_time":"1970-01-01 00:00:00"},"partitionValues_parsed":{"event_time":"1970-01-01T08:00:00Z"},"size":1,"modificationTime":2,"dataChange":true}}"#,
+            r#"{"add":{"path":"file.parquet","partitionValues":{"name":"","event_time":"invalid-timestamp"},"partitionValues_parsed":{"event_time":"1970-01-01T08:00:00Z"},"size":1,"modificationTime":2,"dataChange":true}}"#,
+            r#"{}"#,
         ]
         .into();
         let input = handler
@@ -2334,7 +2317,8 @@ mod tests {
             actual = evaluator.evaluate(actual.as_ref()).unwrap();
         }
         let expected_json: StringArray = vec![
-            r#"{"path":"file.parquet","size":1,"modificationTime":2,"fileConstantValues":{"partitionValues":{"name":"","event_time":"1970-01-01 00:00:00"}},"partitionValues_parsed":{"name":null,"event_time":"1970-01-01T08:00:00Z"}}"#,
+            r#"{"path":"file.parquet","size":1,"modificationTime":2,"fileConstantValues":{"partitionValues":{"name":"","event_time":"invalid-timestamp"}},"partitionValues_parsed":{"name":null,"event_time":"1970-01-01T08:00:00Z"}}"#,
+            r#"{"fileConstantValues":{}}"#,
         ]
         .into();
         let expected = handler

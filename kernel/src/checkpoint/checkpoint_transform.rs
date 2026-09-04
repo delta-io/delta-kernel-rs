@@ -16,7 +16,7 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
-use crate::expressions::{col, Expression, ExpressionRef, UnaryExpressionOp};
+use crate::expressions::{col, Expression, ExpressionRef, Predicate, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
@@ -28,6 +28,94 @@ pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
 pub(crate) const PARTITION_VALUES_PARSED_FIELD: &str = "partitionValues_parsed";
 const RAW_PARTITION_VALUES_PARSED: &str = "__raw_partition_values_parsed";
 const NATIVE_PARTITION_VALUES_PARSED: &str = "__native_partition_values_parsed";
+
+/// Selects raw, native, or field-level mixed sourcing for parsed partition values.
+pub(crate) enum PartitionValuesSource {
+    Raw,
+    Native(SchemaRef),
+    Mixed(PartitionValuesStaging),
+}
+
+pub(crate) struct PartitionValuesStaging {
+    partition_schema: SchemaRef,
+    raw_schema: SchemaRef,
+    native_schema: SchemaRef,
+}
+
+impl PartitionValuesSource {
+    pub(crate) fn for_schemas(
+        partition_schema: &SchemaRef,
+        native_schema: Option<&SchemaRef>,
+    ) -> Self {
+        let Some(native_schema) = native_schema else {
+            return Self::Raw;
+        };
+        let raw_fields = partition_schema
+            .fields()
+            .filter(|field| native_schema.field(field.name()).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if raw_fields.is_empty() {
+            Self::Native(partition_schema.clone())
+        } else {
+            Self::Mixed(PartitionValuesStaging {
+                partition_schema: partition_schema.clone(),
+                raw_schema: Arc::new(StructType::new_unchecked(raw_fields)),
+                native_schema: native_schema.clone(),
+            })
+        }
+    }
+}
+
+impl PartitionValuesStaging {
+    pub(crate) fn partition_schema(&self) -> &SchemaRef {
+        &self.partition_schema
+    }
+
+    pub(crate) fn scan_columns(&self) -> [(StructField, ExpressionRef); 2] {
+        self.columns(col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD))
+    }
+
+    fn checkpoint_columns(&self) -> [(StructField, ExpressionRef); 2] {
+        self.columns(native_partition_values_with_raw_fallback(
+            self.native_schema.as_ref(),
+        ))
+    }
+
+    fn columns(&self, native_expr: Expression) -> [(StructField, ExpressionRef); 2] {
+        [
+            (
+                StructField::nullable(
+                    RAW_PARTITION_VALUES_PARSED,
+                    self.raw_schema.as_ref().clone(),
+                ),
+                Arc::new(raw_partition_values_expr()),
+            ),
+            (
+                StructField::nullable(
+                    NATIVE_PARTITION_VALUES_PARSED,
+                    self.native_schema.as_ref().clone(),
+                ),
+                Arc::new(native_expr),
+            ),
+        ]
+    }
+
+    pub(crate) fn merge_expr(&self) -> Expression {
+        let fields = self.partition_schema.fields().map(|field| {
+            let source = if self.native_schema.field(field.name()).is_some() {
+                NATIVE_PARTITION_VALUES_PARSED
+            } else {
+                RAW_PARTITION_VALUES_PARSED
+            };
+            Expression::column([source, field.name()])
+        });
+        Expression::struct_with_nullability_from(
+            fields,
+            Expression::from_pred(col!(RAW_PARTITION_VALUES_PARSED).is_not_null()),
+        )
+    }
+}
 
 pub(crate) struct CheckpointTransform {
     pub first_output_schema: SchemaRef,
@@ -60,8 +148,9 @@ impl StatsTransformConfig {
 /// - When `writeStatsAsStruct=true`: `stats_parsed = COALESCE(stats_parsed, ParseJson(stats))`
 /// - When `writeStatsAsStruct=false`: drop `stats_parsed` field
 ///
-/// For partitioned tables when `writeStatsAsStruct=true`, it also populates:
-/// - `partitionValues_parsed = MAP_TO_STRUCT(partitionValues)`
+/// For partitioned tables when `writeStatsAsStruct=true`, it also populates
+/// `partitionValues_parsed`, preserving compatible native fields and reconstructing the remaining
+/// fields from `partitionValues`.
 ///
 /// Returns a top-level transform that wraps the nested Add transform, ensuring the
 /// full checkpoint batch is produced with the modified Add action.
@@ -121,34 +210,37 @@ pub(crate) fn build_checkpoint_transform(
         patch_builder = patch_builder.drop_at([ADD_NAME], STATS_PARSED_FIELD);
     }
 
+    let partition_values_source = partition_schema
+        .map(|schema| PartitionValuesSource::for_schemas(schema, native_partition_schema));
+
     // Handle partitionValues_parsed field (only for partitioned tables)
-    if let Some(partition_schema) = partition_schema {
+    if partition_schema.is_some() {
         if config.write_stats_as_struct {
-            if let Some(native_schema) = native_partition_schema {
-                patch_builder = patch_builder
-                    .append(
-                        StructField::nullable(
-                            RAW_PARTITION_VALUES_PARSED,
-                            partition_schema.as_ref().clone(),
-                        ),
-                        build_partition_values_parsed_expr(),
-                    )
-                    .append(
-                        StructField::nullable(
-                            NATIVE_PARTITION_VALUES_PARSED,
-                            native_schema.as_ref().clone(),
-                        ),
-                        Expression::coalesce([
-                            col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD),
-                            Expression::map_to_struct(col!(ADD_NAME, PARTITION_VALUES_FIELD)),
-                        ]),
+            match partition_values_source.as_ref() {
+                Some(PartitionValuesSource::Raw) => {
+                    patch_builder = patch_builder.replace_expr_at(
+                        [ADD_NAME],
+                        PARTITION_VALUES_PARSED_FIELD,
+                        raw_partition_values_expr(),
                     );
-            } else {
-                patch_builder = patch_builder.replace_expr_at(
-                    [ADD_NAME],
-                    PARTITION_VALUES_PARSED_FIELD,
-                    build_partition_values_parsed_expr(),
-                );
+                }
+                Some(PartitionValuesSource::Native(native_schema)) => {
+                    patch_builder = patch_builder.replace_expr_at(
+                        [ADD_NAME],
+                        PARTITION_VALUES_PARSED_FIELD,
+                        native_partition_values_with_raw_fallback(native_schema.as_ref()),
+                    );
+                }
+                Some(PartitionValuesSource::Mixed(staging)) => {
+                    for (field, expr) in staging.checkpoint_columns() {
+                        patch_builder = patch_builder.append(field, expr);
+                    }
+                }
+                None => {
+                    return Err(Error::internal_error(
+                        "partition values source missing for partitioned table",
+                    ));
+                }
             }
         } else {
             // Drop partitionValues_parsed since it was added to read schema
@@ -157,8 +249,8 @@ pub(crate) fn build_checkpoint_transform(
     }
 
     let (first_output_schema, first_expr) = patch_builder.build()?;
-    let Some((partition_schema, native_schema)) = partition_schema
-        .zip(native_partition_schema)
+    let Some(PartitionValuesSource::Mixed(staging)) = partition_values_source
+        .as_ref()
         .filter(|_| config.write_stats_as_struct)
     else {
         return Ok(CheckpointTransform {
@@ -168,16 +260,15 @@ pub(crate) fn build_checkpoint_transform(
             output_expr: None,
         });
     };
-    let mixed_expr = mixed_partition_values_expr(partition_schema, native_schema);
     let (output_schema, output_expr) = ProjectionStructPatchBuilder::new(&first_output_schema)
         .replace_at(
             [ADD_NAME],
             PARTITION_VALUES_PARSED_FIELD,
             StructField::nullable(
                 PARTITION_VALUES_PARSED_FIELD,
-                partition_schema.as_ref().clone(),
+                staging.partition_schema.as_ref().clone(),
             ),
-            mixed_expr,
+            staging.merge_expr(),
         )
         .drop(RAW_PARTITION_VALUES_PARSED)
         .drop(NATIVE_PARTITION_VALUES_PARSED)
@@ -254,39 +345,23 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     ]))
 }
 
-/// Builds expression: `partitionValues_parsed = MAP_TO_STRUCT(partitionValues)`
-///
-/// The target struct type (field names and data types) is determined by the output schema --
-/// `MAP_TO_STRUCT` itself carries no schema, so the expression evaluator uses the expected output
-/// type to parse each string value into the correct native type.
-///
-/// Rebuilding from the serialized map applies the same normalization as scans. When compatible
-/// native fields exist, the caller combines this raw struct with those fields independently.
-///
-/// Column paths are relative to the full batch, not the nested Add struct.
-fn build_partition_values_parsed_expr() -> ExpressionRef {
-    Arc::new(Expression::map_to_struct(col!(
-        ADD_NAME,
-        PARTITION_VALUES_FIELD
-    )))
+pub(crate) fn raw_partition_values_expr() -> Expression {
+    Expression::map_to_struct(col!(ADD_NAME, PARTITION_VALUES_FIELD))
 }
 
-fn mixed_partition_values_expr(
-    partition_schema: &StructType,
-    native_partition_schema: &StructType,
-) -> Expression {
-    let fields = partition_schema.fields().map(|field| {
-        let source = if native_partition_schema.field(field.name()).is_some() {
-            NATIVE_PARTITION_VALUES_PARSED
-        } else {
-            RAW_PARTITION_VALUES_PARSED
-        };
-        Expression::column([source, field.name()])
-    });
-    Expression::struct_with_nullability_from(
-        fields,
-        Expression::from_pred(col!(RAW_PARTITION_VALUES_PARSED).is_not_null()),
-    )
+fn native_partition_values_with_raw_fallback(native_schema: &StructType) -> Expression {
+    let native_fields = native_schema
+        .fields()
+        .map(|field| Expression::column([ADD_NAME, PARTITION_VALUES_PARSED_FIELD, field.name()]));
+    let native_is_present_or_not_add = Predicate::or(
+        col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD).is_not_null(),
+        col!(ADD_NAME, PARTITION_VALUES_FIELD).is_null(),
+    );
+    let native_candidate = Expression::struct_with_nullability_from(
+        native_fields,
+        Expression::from_pred(native_is_present_or_not_add),
+    );
+    Expression::coalesce([native_candidate, raw_partition_values_expr()])
 }
 
 /// Static expression: `stats = COALESCE(stats, ToJson(stats_parsed))`
@@ -525,9 +600,9 @@ mod tests {
     /// Raw fallback fields use `MAP_TO_STRUCT`; compatible native fields are merged separately.
     #[test]
     fn build_partition_values_parsed_expr_uses_map_to_struct() {
-        let expr = build_partition_values_parsed_expr();
+        let expr = raw_partition_values_expr();
         assert!(
-            matches!(expr.as_ref(), Expression::MapToStruct(_)),
+            matches!(expr, Expression::MapToStruct(_)),
             "checkpoint partitionValues_parsed must reconstruct via MAP_TO_STRUCT"
         );
     }
@@ -561,7 +636,8 @@ mod tests {
         .unwrap();
         let handler = SyncJsonHandler::new(None);
         let input_json: StringArray = vec![
-            r#"{"add":{"path":"file.parquet","partitionValues":{"name":"","event_time":"1970-01-01 00:00:00"},"partitionValues_parsed":{"event_time":"1970-01-01T08:00:00Z"},"stats":"{\"numRecords\":1}"}}"#,
+            r#"{"add":{"path":"file.parquet","partitionValues":{"name":"","event_time":"invalid-timestamp"},"partitionValues_parsed":{"event_time":"1970-01-01T08:00:00Z"},"stats":"{\"numRecords\":1}"}}"#,
+            r#"{}"#,
         ]
         .into();
         let input = handler
@@ -589,7 +665,8 @@ mod tests {
             .evaluate(first.as_ref())
             .unwrap();
         let expected_json: StringArray = vec![
-            r#"{"add":{"path":"file.parquet","partitionValues":{"name":"","event_time":"1970-01-01 00:00:00"},"partitionValues_parsed":{"name":null,"event_time":"1970-01-01T08:00:00Z"},"stats":"{\"numRecords\":1}","stats_parsed":{"numRecords":1}}}"#,
+            r#"{"add":{"path":"file.parquet","partitionValues":{"name":"","event_time":"invalid-timestamp"},"partitionValues_parsed":{"name":null,"event_time":"1970-01-01T08:00:00Z"},"stats":"{\"numRecords\":1}","stats_parsed":{"numRecords":1}}}"#,
+            r#"{}"#,
         ]
         .into();
         let expected = handler
