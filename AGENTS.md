@@ -99,9 +99,6 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
   cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
   but writes are still blocked.
-- `row-tracking-preservation-in-dev`: enables `Transaction::ack_row_tracking_preservation()` and
-  acknowledged file removals and deletion-vector updates on Row Tracking tables. This remains
-  experimental until Kernel emits `delta.rowTracking.preserved` in CommitInfo tags.
 - `internal-api`: unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans`: experimental declarative-plan IR (`kernel/src/plans/`) and the prost

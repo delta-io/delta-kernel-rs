@@ -372,7 +372,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
 };
 
 // Row Tracking rewrites require connectors to preserve stable row metadata. Kernel records the
-// feature-gated acknowledgment but does not validate materialized values. IcebergCompatV3 removals
+// connector acknowledgment but does not validate materialized values. IcebergCompatV3 removals
 // remain unsupported.
 //
 // TODO: When kernel writes the materialized `row_id` / `row_commit_version` columns, they must
