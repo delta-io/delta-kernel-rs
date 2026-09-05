@@ -1490,8 +1490,9 @@ mod tests {
             .build()
             .unwrap();
 
-        fn push_path(paths: &mut Vec<String>, scan_file: ScanFile) {
+        fn push_path(paths: &mut Vec<String>, scan_file: ScanFile) -> bool {
             paths.push(scan_file.path);
+            true
         }
         let mut paths: Vec<String> = Vec::new();
         for sm in scan.scan_metadata(&engine).unwrap() {
@@ -1623,8 +1624,9 @@ mod tests {
             .build()
             .unwrap();
 
-        fn push_path(paths: &mut Vec<String>, scan_file: ScanFile) {
+        fn push_path(paths: &mut Vec<String>, scan_file: ScanFile) -> bool {
             paths.push(scan_file.path);
+            true
         }
         let mut paths: Vec<String> = Vec::new();
         for sm in scan.scan_metadata(&engine).unwrap() {

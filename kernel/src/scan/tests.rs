@@ -449,9 +449,10 @@ fn test_without_row_transforms_scan_metadata_lists_files_with_partition_values()
         .unwrap();
 
     // (saw a file, saw non-empty partition values)
-    fn collect(acc: &mut (bool, bool), scan_file: ScanFile) {
+    fn collect(acc: &mut (bool, bool), scan_file: ScanFile) -> bool {
         acc.0 = true;
         acc.1 |= !scan_file.partition_values.is_empty();
+        true
     }
     let mut acc = (false, false);
     for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
@@ -566,8 +567,9 @@ fn test_without_row_transforms_scan_metadata_surfaces_deletion_vectors() {
         .build()
         .unwrap();
 
-    fn dv_callback(seen: &mut bool, scan_file: ScanFile) {
+    fn dv_callback(seen: &mut bool, scan_file: ScanFile) -> bool {
         *seen |= scan_file.dv_info.deletion_vector.is_some();
+        true
     }
     let mut saw_dv = false;
     for res in scan.scan_metadata(&engine).unwrap() {
@@ -589,9 +591,10 @@ fn test_without_row_transforms_scan_metadata_surfaces_deletion_vectors() {
 
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
-    fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
+    fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) -> bool {
         paths.push(scan_file.path.to_string());
         assert!(scan_file.dv_info.deletion_vector.is_none());
+        true
     }
     let mut files = vec![];
     for res in scan_metadata_iter {
@@ -1743,8 +1746,9 @@ fn scan_execute_passes_scan_file_modification_time_to_parquet_handler() {
     fn collect_file_modification_times(
         file_modification_times: &mut Vec<(String, i64)>,
         scan_file: ScanFile,
-    ) {
+    ) -> bool {
         file_modification_times.push((scan_file.path.to_string(), scan_file.modification_time));
+        true
     }
 
     let mut expected = Vec::new();

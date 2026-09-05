@@ -2603,8 +2603,10 @@ mod tests {
 
         let mut paths = Vec::new();
         for metadata in &scan_metadata {
-            paths =
-                metadata.visit_scan_files(paths, |paths, scan_file| paths.push(scan_file.path))?;
+            paths = metadata.visit_scan_files(paths, |paths, scan_file| {
+                paths.push(scan_file.path);
+                true
+            })?;
         }
         let existing_path = paths
             .into_iter()
@@ -2653,8 +2655,10 @@ mod tests {
 
         let mut paths = Vec::new();
         for metadata in &scan_metadata {
-            paths =
-                metadata.visit_scan_files(paths, |paths, scan_file| paths.push(scan_file.path))?;
+            paths = metadata.visit_scan_files(paths, |paths, scan_file| {
+                paths.push(scan_file.path);
+                true
+            })?;
         }
         let existing_path = paths
             .into_iter()
