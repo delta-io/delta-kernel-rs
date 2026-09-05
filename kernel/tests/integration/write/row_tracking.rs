@@ -164,9 +164,9 @@ mod row_tracking_preservation {
     }
 
     #[rstest::rstest]
-    #[case::connector_commit_info_with_tags(ConnectorCommitInfoTestCase::WithTags)]
-    #[case::connector_commit_info_without_tags(ConnectorCommitInfoTestCase::WithoutTags)]
-    #[case::connector_commit_info_with_null_tags(ConnectorCommitInfoTestCase::NullTags)]
+    #[case::connector_commit_info_with_tags(ConnectorCommitInfoTestCase::PopulatedTags)]
+    #[case::connector_commit_info_without_tags(ConnectorCommitInfoTestCase::MissingTagsField)]
+    #[case::connector_commit_info_with_null_tags(ConnectorCommitInfoTestCase::NullTagsMap)]
     fn commit_info_preservation_tag_merges_connector_commit_info(
         #[case] test_case: ConnectorCommitInfoTestCase,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -205,26 +205,26 @@ mod row_tracking_preservation {
             "true"
         );
         match test_case {
-            ConnectorCommitInfoTestCase::WithTags => {
+            ConnectorCommitInfoTestCase::PopulatedTags => {
                 assert_eq!(
                     committed_commit_info["tags"]["connectorTag"],
                     "connectorValue"
                 );
                 assert!(committed_commit_info["tags"]["nullableConnectorTag"].is_null());
             }
-            ConnectorCommitInfoTestCase::WithoutTags => {
+            ConnectorCommitInfoTestCase::MissingTagsField => {
                 assert_eq!(committed_commit_info["customApp"], "connector");
             }
-            ConnectorCommitInfoTestCase::NullTags => {}
+            ConnectorCommitInfoTestCase::NullTagsMap => {}
         }
         Ok(())
     }
 
     #[derive(Clone, Copy, Debug)]
     enum ConnectorCommitInfoTestCase {
-        WithTags,
-        WithoutTags,
-        NullTags,
+        PopulatedTags,
+        MissingTagsField,
+        NullTagsMap,
     }
 
     impl ConnectorCommitInfoTestCase {
@@ -233,7 +233,7 @@ mod row_tracking_preservation {
             self,
         ) -> Result<(RecordBatch, SchemaRef), Box<dyn std::error::Error>> {
             match self {
-                Self::WithTags => {
+                Self::PopulatedTags => {
                     let mut tags =
                         MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
                     tags.keys().append_value("connectorTag");
@@ -251,14 +251,14 @@ mod row_tracking_preservation {
                         schema_ref! { nullable "tags": { STRING => nullable STRING } },
                     ))
                 }
-                Self::WithoutTags => Ok((
+                Self::MissingTagsField => Ok((
                     RecordBatch::try_from_iter([(
                         "customApp",
                         Arc::new(StringArray::from(vec!["connector"])) as ArrayRef,
                     )])?,
                     schema_ref! { nullable "customApp": STRING },
                 )),
-                Self::NullTags => {
+                Self::NullTagsMap => {
                     let mut tags =
                         MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
                     tags.append(false)?;
