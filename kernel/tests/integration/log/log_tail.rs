@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
+use delta_kernel::commit_range::CommitRange;
 use delta_kernel::history_manager::{first_version_after, latest_version_as_of, HistoryCommitType};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::Snapshot;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use rstest::rstest;
+use test_utils::delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
-    create_log_path, delta_path_for_version, TestAction,
+    create_log_path, delta_path_for_version, install_thread_local_metrics_reporter,
+    CountingReporter, TestAction,
 };
 use url::Url;
 
@@ -19,6 +24,24 @@ fn setup_test() -> (
     let storage = Arc::new(InMemory::new());
     let table_root = Url::parse("memory:///").unwrap();
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    (storage, engine, table_root)
+}
+
+fn setup_test_mt() -> (
+    Arc<InMemory>,
+    Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+    Url,
+) {
+    let storage = Arc::new(InMemory::new());
+    let table_root = Url::parse("memory:///").unwrap();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(storage.clone())
+            .with_task_executor(executor)
+            .build(),
+    );
     (storage, engine, table_root)
 }
 
@@ -288,9 +311,14 @@ async fn log_tail_behind_filesystem() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-#[tokio::test]
-async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::Error>> {
-    let (storage, engine, table_url) = setup_test();
+#[rstest]
+#[case::without_checkpoint(false)]
+#[case::with_checkpoint(true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_snapshot_skip_new_checkpoints_with_log_tail(
+    #[case] with_checkpoint: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test_mt();
     let table_root = table_url.as_str();
 
     // commits 0, 1, 2 in storage (catalog-managed)
@@ -307,14 +335,29 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     let actions = vec![TestAction::Add("file_2.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
 
-    // initial snapshot at version 1
-    let initial_snapshot = Snapshot::builder_for(table_root)
+    let mut initial_snapshot = Snapshot::builder_for(table_root)
         .at_version(1)
         .with_max_catalog_version(2)
         .build(engine.as_ref())?;
     assert_eq!(initial_snapshot.version(), 1);
+    if with_checkpoint {
+        initial_snapshot.clone().checkpoint(engine.as_ref(), None)?;
+        initial_snapshot = Snapshot::builder_for(table_root)
+            .at_version(1)
+            .with_max_catalog_version(2)
+            .build(engine.as_ref())?;
+        Snapshot::builder_for(table_root)
+            .at_version(2)
+            .with_max_catalog_version(2)
+            .build(engine.as_ref())?
+            .checkpoint(engine.as_ref(), None)?;
+    }
 
-    // add commit 3, 4
+    // Add a published version 3 that the staged catalog commit will supersede.
+    let actions = vec![TestAction::Add("published_file_3.parquet".to_string())];
+    add_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
+
+    // The catalog tail overrides the published version 3.
     let actions = vec![TestAction::Add("file_3.parquet".to_string())];
     let path3 =
         add_staged_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
@@ -322,21 +365,68 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     let path4 =
         add_staged_commit(table_root, storage.as_ref(), 4, actions_to_string(actions)).await?;
 
-    // log_tail with commits 2, 3, 4
     let log_tail = vec![
         create_log_path(&table_url, delta_path_for_version(2, "json")),
-        create_log_path(&table_url, path3),
-        create_log_path(&table_url, path4),
+        create_log_path(&table_url, path3.clone()),
+        create_log_path(&table_url, path4.clone()),
     ];
 
-    // Build incremental snapshot with log_tail
+    let reporter = Arc::new(CountingReporter::new());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
     let new_snapshot = Snapshot::builder_from(initial_snapshot)
         .with_log_tail(log_tail)
         .with_max_catalog_version(4)
+        .skip_new_checkpoints()
         .build(engine.as_ref())?;
 
-    // Verify we advanced to version 4
     assert_eq!(new_snapshot.version(), 4);
+    assert_eq!(reporter.list_calls.get(), 1);
+    assert_eq!(
+        new_snapshot.log_segment().checkpoint_version,
+        with_checkpoint.then_some(1)
+    );
+    assert_eq!(
+        new_snapshot.log_segment().listed.max_published_version,
+        Some(3)
+    );
+    assert_eq!(
+        new_snapshot
+            .log_segment()
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .map(|file| &file.location.location),
+        Some(&table_url.join(path4.as_ref())?)
+    );
+    let mut expected_commit_paths = if with_checkpoint {
+        Vec::new()
+    } else {
+        vec![
+            table_url.join(delta_path_for_version(0, "json").as_ref())?,
+            table_url.join(delta_path_for_version(1, "json").as_ref())?,
+        ]
+    };
+    expected_commit_paths.extend([
+        table_url.join(delta_path_for_version(2, "json").as_ref())?,
+        table_url.join(path3.as_ref())?,
+        table_url.join(path4.as_ref())?,
+    ]);
+    assert_eq!(
+        new_snapshot
+            .log_segment()
+            .listed
+            .ascending_commit_files
+            .iter()
+            .map(|file| file.location.location.clone())
+            .collect::<Vec<_>>(),
+        expected_commit_paths
+    );
+
+    let range = CommitRange::builder_from(new_snapshot, 2).build(engine.as_ref())?;
+    assert_eq!(range.start_version(), 2);
+    assert_eq!(range.end_version(), 4);
+    assert_eq!(reporter.list_calls.get(), 1);
 
     Ok(())
 }

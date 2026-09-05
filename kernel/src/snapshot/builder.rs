@@ -1,5 +1,6 @@
 //! Builder for creating [`Snapshot`] instances.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use tracing::{info, instrument};
@@ -7,12 +8,21 @@ use tracing::{info, instrument};
 use crate::cancellation::CancellationTokenRef;
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
+use crate::log_segment_files::CheckpointHandling;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{LogSegmentLoadType, MetricId, SnapshotLoadMetricContext};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
+
+/// Marker for builders that load a snapshot from a table root.
+#[doc(hidden)]
+pub struct FromTableRoot;
+
+/// Marker for builders that incrementally update an existing snapshot.
+#[doc(hidden)]
+pub struct FromSnapshot;
 
 /// Builder for creating [`Snapshot`] instances.
 ///
@@ -32,17 +42,14 @@ use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 /// # Ok(())
 /// # }
 /// ```
-//
-// Note the SnapshotBuilder must have either a table_root or an existing_snapshot (but not both).
-// We enforce this in the constructors. We could improve this in the future with different
-// types/add type state.
-pub struct SnapshotBuilder {
+pub struct SnapshotBuilder<Mode = FromTableRoot> {
     table_root: Option<String>,
     existing_snapshot: Option<SnapshotRef>,
     version: Option<Version>,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
     incremental_replay: IncrementalReplay,
+    checkpoint_handling: CheckpointHandling,
     /// Kernel-minted id correlating this build's metric events with its child events.
     operation_id: MetricId,
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
@@ -52,11 +59,15 @@ pub struct SnapshotBuilder {
     /// [`with_cancellation_token`](Self::with_cancellation_token). `None` means the build is not
     /// cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+    mode: PhantomData<Mode>,
 }
+
+/// Builder for incrementally updating an existing [`Snapshot`].
+pub type IncrementalSnapshotBuilder = SnapshotBuilder<FromSnapshot>;
 
 // Hand-written because `CancellationToken` is not `Debug`: the token is projected to a bool. Ends
 // with `finish_non_exhaustive` so a future field is not silently dropped from the output.
-impl std::fmt::Debug for SnapshotBuilder {
+impl<Mode> std::fmt::Debug for SnapshotBuilder<Mode> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotBuilder")
             .field("table_root", &self.table_root)
@@ -65,6 +76,7 @@ impl std::fmt::Debug for SnapshotBuilder {
             .field("log_tail", &self.log_tail)
             .field("max_catalog_version", &self.max_catalog_version)
             .field("incremental_replay", &self.incremental_replay)
+            .field("checkpoint_handling", &self.checkpoint_handling)
             .field("operation_id", &self.operation_id)
             .field("correlation_id", &self.correlation_id)
             .field("cancellable", &self.cancellation_token.is_some())
@@ -116,7 +128,7 @@ impl IncrementalReplay {
     }
 }
 
-impl SnapshotBuilder {
+impl SnapshotBuilder<FromTableRoot> {
     // ============================================================================
     // Constructors
     // ============================================================================
@@ -129,12 +141,16 @@ impl SnapshotBuilder {
             log_tail: Vec::new(),
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
+            checkpoint_handling: CheckpointHandling::default(),
             operation_id: MetricId::new(),
             correlation_id: None,
             cancellation_token: None,
+            mode: PhantomData,
         }
     }
+}
 
+impl SnapshotBuilder<FromSnapshot> {
     pub(crate) fn new_from(existing_snapshot: SnapshotRef) -> Self {
         Self {
             table_root: None,
@@ -143,12 +159,37 @@ impl SnapshotBuilder {
             log_tail: Vec::new(),
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
+            checkpoint_handling: CheckpointHandling::default(),
             operation_id: MetricId::new(),
             correlation_id: None,
             cancellation_token: None,
+            mode: PhantomData,
         }
     }
 
+    /// Skip adopting new checkpoints while updating the input snapshot.
+    ///
+    /// The updated snapshot retains the input snapshot's checkpoint and every subsequent commit.
+    /// The update fails if the new commits are not contiguous. A caller can pass the updated
+    /// snapshot to [`CommitRange::builder_from`] to inspect the complete update window without
+    /// another log listing.
+    ///
+    /// This option increases memory use and may increase full-scan log replay. It is available
+    /// only for builders created by [`Snapshot::builder_from`].
+    ///
+    /// ```compile_fail
+    /// # use delta_kernel::Snapshot;
+    /// Snapshot::builder_for("file:///path/to/table").skip_new_checkpoints();
+    /// ```
+    ///
+    /// [`CommitRange::builder_from`]: crate::commit_range::CommitRange::builder_from
+    pub fn skip_new_checkpoints(mut self) -> Self {
+        self.checkpoint_handling = CheckpointHandling::Ignore;
+        self
+    }
+}
+
+impl<Mode> SnapshotBuilder<Mode> {
     // ============================================================================
     // Chainable configuration
     // ============================================================================
@@ -282,9 +323,11 @@ impl SnapshotBuilder {
             log_tail,
             max_catalog_version,
             incremental_replay,
+            checkpoint_handling,
             operation_id,
             correlation_id,
             cancellation_token,
+            mode: _,
         } = self;
 
         let metric_context = SnapshotLoadMetricContext {
@@ -343,6 +386,7 @@ impl SnapshotBuilder {
                         effective_version,
                         metric_context,
                         incremental_replay,
+                        checkpoint_handling,
                         built_as_latest,
                         cancellation_token.as_ref(),
                     )
