@@ -177,6 +177,7 @@ impl RowVisitor for CommitInfoTagsVisitor {
 mod tests {
     use std::sync::Arc;
 
+    use super::CommitInfoTagsVisitor;
     use crate::actions::CommitInfo;
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BooleanArray, Int64Array, MapArray, MapBuilder, StringArray,
@@ -191,9 +192,9 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
     use crate::transaction::Transaction;
-    use crate::unit_test_utils::load_test_table;
+    use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
     use crate::utils::FoldWithOption as _;
-    use crate::{DeltaResult, Engine, EngineData};
+    use crate::{DeltaResult, Engine, EngineData, RowVisitor};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
 
@@ -293,6 +294,19 @@ mod tests {
                 txn.with_commit_info(data, schema)
             });
         Ok((engine, txn))
+    }
+
+    #[test]
+    fn commit_info_tags_visitor_rejects_invalid_callback_shape() {
+        let mut visitor = CommitInfoTagsVisitor::default();
+        assert_result_error_with_message(
+            visitor.visit(0, &[]),
+            "Connector commit info must contain exactly one row",
+        );
+        assert_result_error_with_message(
+            visitor.visit(1, &[]),
+            "CommitInfoTagsVisitor received 0 getters instead of one",
+        );
     }
 
     /// no engine_commit_info -- output is the kernel CommitInfo wrapped in a "commitInfo"
