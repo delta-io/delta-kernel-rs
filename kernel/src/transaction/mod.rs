@@ -455,8 +455,9 @@ impl<S> Transaction<S> {
             self.is_blind_append,
         );
 
-        // Kernel always requires stable row tracking id/commitVersion preservation,
-        // so the flag is always true(except for CREATE TABLE).
+        // Kernel requires every commit on an existing Row Tracking-enabled table to preserve
+        // Stable Row IDs and Stable Row Commit Versions, so it always emits true. CREATE TABLE has
+        // no existing Row Tracking state to preserve and therefore omits the flag.
         if !self.is_create_table()
             && self
                 .effective_table_config

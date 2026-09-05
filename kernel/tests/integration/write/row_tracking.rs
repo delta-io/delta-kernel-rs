@@ -20,8 +20,8 @@ mod row_tracking_preservation {
     use std::collections::HashMap;
 
     use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
-    use delta_kernel::arrow::array::{Array, ArrayRef, MapBuilder, StringBuilder};
-    use delta_kernel::schema::{DataType, StructField};
+    use delta_kernel::arrow::array::{Array, ArrayRef, MapBuilder, StringArray, StringBuilder};
+    use delta_kernel::schema::{DataType, SchemaRef, StructField};
     use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
     use test_utils::{read_actions_from_commit, read_add_infos};
@@ -163,9 +163,13 @@ mod row_tracking_preservation {
         Ok(())
     }
 
-    #[test]
-    fn commit_info_preservation_tag_merges_connector_tags() -> Result<(), Box<dyn std::error::Error>>
-    {
+    #[rstest::rstest]
+    #[case::connector_commit_info_with_tags(ConnectorCommitInfoTestCase::WithTags)]
+    #[case::connector_commit_info_without_tags(ConnectorCommitInfoTestCase::WithoutTags)]
+    #[case::connector_commit_info_with_null_tags(ConnectorCommitInfoTestCase::NullTags)]
+    fn commit_info_preservation_tag_merges_connector_commit_info(
+        #[case] test_case: ConnectorCommitInfoTestCase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // === Create a Row Tracking table ===
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -179,35 +183,95 @@ mod row_tracking_preservation {
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
-        // === Commit connector-provided tags ===
-        let mut tags = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-        tags.keys().append_value("connectorTag");
-        tags.values().append_value("connectorValue");
-        tags.keys().append_value("nullableConnectorTag");
-        tags.values().append_null();
-        tags.keys().append_value(ROW_TRACKING_PRESERVED_TAG);
-        tags.values().append_value("false");
-        tags.append(true)?;
-        let tags = Arc::new(tags.finish()) as ArrayRef;
-        let commit_info = RecordBatch::try_from_iter([("tags", tags)])?;
+        // === Commit with connector-provided CommitInfo ===
+        let (connector_commit_info, connector_commit_info_schema) =
+            test_case.connector_commit_info()?;
         let commit_version = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_commit_info(
-                Box::new(ArrowEngineData::new(commit_info)),
-                schema_ref! { nullable "tags": { STRING => nullable STRING } },
+                Box::new(ArrowEngineData::new(connector_commit_info)),
+                connector_commit_info_schema,
             )
             .commit(engine.as_ref())?
             .unwrap_committed()
             .commit_version();
 
-        // === Validate the merged tags ===
+        // === Validate the merged CommitInfo ===
         let commit_infos = read_actions_from_commit(&table_url, commit_version, "commitInfo")?;
         assert_eq!(commit_infos.len(), 1);
-        let tags = &commit_infos[0]["tags"];
-        assert_eq!(tags["connectorTag"], "connectorValue");
-        assert!(tags["nullableConnectorTag"].is_null());
-        assert_eq!(tags[ROW_TRACKING_PRESERVED_TAG], "true");
+        let committed_commit_info = &commit_infos[0];
+        assert_eq!(
+            committed_commit_info["tags"][ROW_TRACKING_PRESERVED_TAG],
+            "true"
+        );
+        match test_case {
+            ConnectorCommitInfoTestCase::WithTags => {
+                assert_eq!(
+                    committed_commit_info["tags"]["connectorTag"],
+                    "connectorValue"
+                );
+                assert!(committed_commit_info["tags"]["nullableConnectorTag"].is_null());
+            }
+            ConnectorCommitInfoTestCase::WithoutTags => {
+                assert_eq!(committed_commit_info["customApp"], "connector");
+            }
+            ConnectorCommitInfoTestCase::NullTags => {}
+        }
         Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ConnectorCommitInfoTestCase {
+        WithTags,
+        WithoutTags,
+        NullTags,
+    }
+
+    impl ConnectorCommitInfoTestCase {
+        /// Returns `(connector_commit_info, connector_commit_info_schema)` for this case.
+        fn connector_commit_info(
+            self,
+        ) -> Result<(RecordBatch, SchemaRef), Box<dyn std::error::Error>> {
+            match self {
+                Self::WithTags => {
+                    let mut tags =
+                        MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+                    tags.keys().append_value("connectorTag");
+                    tags.values().append_value("connectorValue");
+                    tags.keys().append_value("nullableConnectorTag");
+                    tags.values().append_null();
+                    tags.keys().append_value(ROW_TRACKING_PRESERVED_TAG);
+                    tags.values().append_value("false");
+                    tags.append(true)?;
+                    Ok((
+                        RecordBatch::try_from_iter([(
+                            "tags",
+                            Arc::new(tags.finish()) as ArrayRef,
+                        )])?,
+                        schema_ref! { nullable "tags": { STRING => nullable STRING } },
+                    ))
+                }
+                Self::WithoutTags => Ok((
+                    RecordBatch::try_from_iter([(
+                        "customApp",
+                        Arc::new(StringArray::from(vec!["connector"])) as ArrayRef,
+                    )])?,
+                    schema_ref! { nullable "customApp": STRING },
+                )),
+                Self::NullTags => {
+                    let mut tags =
+                        MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+                    tags.append(false)?;
+                    Ok((
+                        RecordBatch::try_from_iter([(
+                            "tags",
+                            Arc::new(tags.finish()) as ArrayRef,
+                        )])?,
+                        schema_ref! { nullable "tags": { STRING => nullable STRING } },
+                    ))
+                }
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
