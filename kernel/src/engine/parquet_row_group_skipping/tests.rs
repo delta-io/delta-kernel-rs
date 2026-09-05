@@ -1195,3 +1195,30 @@ fn checkpoint_filter_nested_struct_column_stats() {
         &NO_PARTITIONS
     ));
 }
+
+#[test]
+fn test_decimal_from_bytes_sign_extends_negative_stats() {
+    // Parquet stores decimal statistics as minimal-width big-endian two's-complement byte
+    // arrays, so a negative value occupies fewer than 16 bytes. Decoding must sign-extend the
+    // high bytes; zero-padding turns a negative stat into a large positive one, which makes
+    // row-group skipping prune groups that actually contain matching rows.
+    let dtype = DecimalType::try_new(38, 3).unwrap();
+
+    // -1 unscaled, one byte: 0xFF.
+    assert_eq!(
+        decimal_from_bytes(Some(&[0xFF]), dtype),
+        Some(Scalar::decimal(-1, 38, 3).unwrap())
+    );
+
+    // -256 unscaled, two bytes: 0xFF00.
+    assert_eq!(
+        decimal_from_bytes(Some(&[0xFF, 0x00]), dtype),
+        Some(Scalar::decimal(-256, 38, 3).unwrap())
+    );
+
+    // Positive minimal-width values must stay correct.
+    assert_eq!(
+        decimal_from_bytes(Some(&[0x01]), dtype),
+        Some(Scalar::decimal(1, 38, 3).unwrap())
+    );
+}
