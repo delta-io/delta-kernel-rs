@@ -85,8 +85,25 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
     assert_eq!(content_root["path"], json!(file.location.to_string()));
     assert_eq!(content_root["sizeInBytes"], json!(1024));
 
-    assert!(entries.iter().any(|e| e.get("protocol").is_some()));
-    assert!(entries.iter().any(|e| e.get("metaData").is_some()));
+    let protocol = entries
+        .iter()
+        .find_map(|e| e.get("protocol"))
+        .expect("protocol entry");
+    assert_eq!(protocol["minReaderVersion"], json!(3));
+    assert_eq!(protocol["minWriterVersion"], json!(7));
+    assert_eq!(protocol["readerFeatures"], json!(READER_FEATURES));
+    assert_eq!(protocol["writerFeatures"], json!(WRITER_FEATURES));
+
+    let metadata = entries
+        .iter()
+        .find_map(|e| e.get("metaData"))
+        .expect("metaData entry");
+    let schema: serde_json::Value =
+        serde_json::from_str(metadata["schemaString"].as_str().unwrap())?;
+    let fields = schema["fields"].as_array().expect("schema fields");
+    assert!(fields
+        .iter()
+        .any(|f| f["name"] == json!("id") && f["type"] == json!("integer")));
 
     Ok(())
 }

@@ -15,8 +15,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{version_as_i64, DeltaResult, Engine, FileMeta, RowVisitor as _, Version};
 
-/// A pointer to an on-disk root manifest file, produced by some other system, to be committed as
-/// the table's content root via a `checkpoint` action.
+/// A pointer to an on-disk root manifest file to be committed as the table's content root via a
+/// `checkpoint` action.
 pub(super) struct RootManifestFile {
     pub(super) file: FileMeta,
     /// The snapshot `file` was validated against, whose active content the checkpoint action folds
@@ -153,6 +153,12 @@ impl RootManifestFile {
             }
             if transactions_from_crc.is_none() {
                 set_transaction_visitor.visit_rows_of(data)?;
+            }
+            if checkpoint_action.is_some()
+                && domain_metadata_from_crc.is_some()
+                && transactions_from_crc.is_some()
+            {
+                break;
             }
         }
 
@@ -404,6 +410,45 @@ mod tests {
     }
 
     #[test]
+    fn compute_checkpoint_action_new_change_wins() -> DeltaResult<()> {
+        let (engine, table_root) = setup_table()?;
+        let write = |version, data| write_commit(&engine, &table_root, version, data);
+
+        let old_domain_metadata = DomainMetadata::new("test.domain".to_string(), "old".to_string());
+        write(
+            1,
+            old_domain_metadata.into_engine_data(LOG_DOMAIN_METADATA_SCHEMA.clone(), &engine)?,
+        )?;
+        let old_transaction = SetTransaction::new("app-1".to_string(), 1, None);
+        write(
+            2,
+            old_transaction.into_engine_data(LOG_TXN_SCHEMA.clone(), &engine)?,
+        )?;
+
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let manifest = root_manifest(
+            &table_root,
+            "metadata/root-v3.parquet",
+            1024,
+            snapshot.clone(),
+        );
+
+        let new_domain_metadata = DomainMetadata::new("test.domain".to_string(), "new".to_string());
+        let new_transaction = SetTransaction::new("app-1".to_string(), 2, None);
+        let checkpoint = manifest.compute_checkpoint_action(
+            &engine,
+            3,
+            snapshot.table_configuration(),
+            &[new_domain_metadata.clone()],
+            &[new_transaction.clone()],
+        )?;
+
+        assert_eq!(checkpoint.domain_metadata, vec![new_domain_metadata]);
+        assert_eq!(checkpoint.transactions, vec![new_transaction]);
+        Ok(())
+    }
+
+    #[test]
     fn new_rejects_a_same_scheme_file_outside_the_table_root() -> DeltaResult<()> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
@@ -462,8 +507,8 @@ mod tests {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
-        // `write_checksum` below validates protocol continuity, so this embeds the table's real
-        // protocol/metadata rather than `minimal_checkpoint_action`'s synthetic one.
+        // Checksum validation checks protocol continuity, so this uses the table's real
+        // protocol/metadata.
         let table_snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let checkpoint = CheckpointAction::new(
             1,
