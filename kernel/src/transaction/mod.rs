@@ -1709,7 +1709,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use ::test_utils::{assert_result_error_with_message, get_column};
+    use ::test_utils::get_column;
     use rstest::rstest;
     use url::Url;
 
