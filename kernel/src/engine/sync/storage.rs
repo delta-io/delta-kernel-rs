@@ -7,7 +7,7 @@ use url::Url;
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Error, FileMeta, FileSlice, StorageHandler};
 
 pub(crate) struct SyncStorageHandler {
     store: Option<Arc<DynObjectStore>>,
@@ -31,10 +31,7 @@ impl SyncStorageHandler {
 // token to interrupt. It deliberately does not override the `*_with_cancellation` methods: their
 // default up-front check is the only cancellation it can honor.
 impl StorageHandler for SyncStorageHandler {
-    fn list_from(
-        &self,
-        url_path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, url_path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
 
         // For directory URLs, prefix == offset and the offset acts as a lower bound that still
@@ -72,10 +69,7 @@ impl StorageHandler for SyncStorageHandler {
         Ok(Box::new(iter))
     }
 
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         let store = self.store.clone();
         let results: Vec<DeltaResult<Bytes>> = files
             .into_iter()

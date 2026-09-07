@@ -114,7 +114,7 @@ Key points:
 - **Case-insensitive keys**: `"YEAR"` matches schema column `"year"`. Kernel normalizes
   to the schema case.
 - **No partition columns in your logical data**: your data batches should follow the logical write
-  schema (`wc.logical_schema()`), which excludes partition columns.
+  schema (`wc.logical_data_schema()`), which excludes partition columns.
 - **Materialization is automatic**: some table features (such as
   `materializePartitionColumns` and `icebergCompatV3`) require partition values to also be
   written into the data files as regular columns. Kernel handles this through the
@@ -137,7 +137,8 @@ which you can collect into a `Vec<Option<String>>` group key for use in a `HashM
 
 ## Partition value validation
 
-`WriteContextBuilder::build` validates the provided values before creating the `BoundWriteContext`:
+`BoundWriteContextBuilder::build` validates the provided values before creating the
+`BoundWriteContext`:
 
 | Check | Example |
 |-------|---------|

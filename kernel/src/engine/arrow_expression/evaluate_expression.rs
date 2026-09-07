@@ -985,7 +985,7 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
-/// - Duplicate map keys are resolved by taking the rightmost entry
+/// - Duplicate keys are invalid input and their result is undefined
 fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
@@ -2857,7 +2857,8 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        // Rightmost entry wins
+        // The current implementation selects the rightmost entry. The public contract leaves
+        // duplicate-key behavior undefined because partitionValues maps must not contain them.
         assert_eq!(col.value(0), "last");
     }
 

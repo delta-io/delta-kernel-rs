@@ -32,11 +32,9 @@ files (as bytes) from storage.
 
 ```rust,ignore
 pub trait StorageHandler {
-    fn list_from(&self, path: &Url)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>>;
 
-    fn read_files(&self, files: Vec<FileSlice>)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>>;
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 

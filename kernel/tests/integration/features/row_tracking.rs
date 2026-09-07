@@ -31,6 +31,7 @@ use test_utils::{
 };
 use url::Url;
 
+use crate::common::read_utils::read_row_tracking_scan;
 use crate::common::write_utils::{
     create_dv_update_transaction, get_scan_files, set_table_properties,
     write_deletion_vector_to_store,
@@ -128,7 +129,7 @@ async fn setup_number_table(
 
 /// Helper function to create a row-tracking table with a single `number: INTEGER` column and
 /// additional features enabled.
-async fn setup_number_table_with_features(
+pub(crate) async fn setup_number_table_with_features(
     tmp_dir: &TempDir,
     name: &str,
     extra_reader_writer_features: &[&str],
@@ -858,32 +859,18 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     Ok(())
 }
 
-fn read_row_tracking_scan(
-    snapshot: Arc<Snapshot>,
-    engine: Arc<dyn delta_kernel::Engine>,
-    metadata_column: MetadataColumnSpec,
-) -> DeltaResult<Vec<RecordBatch>> {
-    let scan_schema = Arc::new(
-        snapshot
-            .schema()
-            .add_metadata_column(metadata_column.text_value(), metadata_column)?,
-    );
-    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
-    read_scan(&scan, engine)
-}
-
 fn read_row_id_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
 ) -> DeltaResult<Vec<RecordBatch>> {
-    read_row_tracking_scan(snapshot, engine, MetadataColumnSpec::RowId)
+    read_row_tracking_scan(snapshot, engine, [MetadataColumnSpec::RowId])
 }
 
 fn read_row_commit_version_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
 ) -> DeltaResult<Vec<RecordBatch>> {
-    read_row_tracking_scan(snapshot, engine, MetadataColumnSpec::RowCommitVersion)
+    read_row_tracking_scan(snapshot, engine, [MetadataColumnSpec::RowCommitVersion])
 }
 
 /// Basic read: write one file with 3 rows, verify row IDs are sequential starting from 0.
@@ -1216,7 +1203,7 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
     let column_name = metadata_column.text_value();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let before = collect_number_to_column(
-        &read_row_tracking_scan(snapshot.clone(), engine.clone(), metadata_column)?,
+        &read_row_tracking_scan(snapshot.clone(), engine.clone(), [metadata_column])?,
         column_name,
     );
     let expected_before = (100..110)
@@ -1259,11 +1246,13 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
             .into_iter()
             .map(Ok),
     )?;
+    #[cfg(feature = "row-tracking-preservation-in-dev")]
+    txn.ack_row_tracking_preservation();
     txn.commit(engine.as_ref())?.unwrap_committed();
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let after = collect_number_to_column(
-        &read_row_tracking_scan(snapshot, engine.clone(), metadata_column)?,
+        &read_row_tracking_scan(snapshot, engine.clone(), [metadata_column])?,
         column_name,
     );
 

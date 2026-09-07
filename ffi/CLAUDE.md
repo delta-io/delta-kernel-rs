@@ -17,6 +17,19 @@ options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelE
 
 Every handle has a corresponding `free_*` function (e.g. `free_engine`, `free_snapshot`).
 
+Handle parameters follow one of two ownership contracts:
+
+1. **Borrow:** Rust accesses the handle with `as_ref()` or `as_mut()`. The caller retains
+   ownership and remains responsible for passing the handle to its `free_*` function.
+2. **Unconditional consume:** Rust calls `into_inner()` before any fallible work. Rust owns the
+   value from native entry onward and is responsible for dropping it on every result, including
+   errors. The caller must not use or free the handle after the call.
+
+Do not conditionally consume a handle only when a fallible operation succeeds. Every function's
+safety documentation must state whether each handle is borrowed or consumed regardless of the
+result. For consuming functions, perform string parsing, visitor decoding, validation, and other
+fallible work only after all consumed handles have been converted with `into_inner()`.
+
 ## Error Handling
 
 Fallible functions return `ExternResult` (tagged union of Ok/Err). The caller provides an
@@ -166,9 +179,9 @@ transaction()
 
 The engine authors the DV file and passes descriptor fields to `dv_descriptor_new`. The
 descriptor map and scan iterator are both consumed by `transaction_update_deletion_vectors`;
-descriptor handles are consumed by `dv_descriptor_map_insert` only on success and must be
-freed by the caller on error. DV updates require both the `deletionVectors` reader/writer
-feature and `delta.enableDeletionVectors=true`.
+descriptor handles are consumed by `dv_descriptor_map_insert` regardless of the result. DV
+updates require both the `deletionVectors` reader/writer feature and
+`delta.enableDeletionVectors=true`.
 
 ## Tracing & Metrics
 

@@ -54,7 +54,12 @@ let write_context = write_state.write_context_builder().build()?;
 // 4. Write Parquet file(s)
 // Assumes the table schema is: name (STRING), age (INTEGER), city (STRING)
 let batch = RecordBatch::try_new(
-    Arc::new(write_context.logical_schema().as_ref().try_into_arrow()?),
+    Arc::new(
+        write_context
+            .logical_data_schema()
+            .as_ref()
+            .try_into_arrow()?,
+    ),
     vec![
         Arc::new(StringArray::from(vec!["Dave", "Eve", "Frank"])),
         Arc::new(Int32Array::from(vec![4, 5, 6])),
@@ -119,6 +124,24 @@ let write_context = write_state
     .build()?;
 ```
 
+If the connector input data contains materialized Row IDs or Row Commit Versions, provide their
+logical column names to the builder:
+
+```rust,ignore
+use delta_kernel::transaction::RowTrackingMetadataColumns;
+
+let write_context = write_state
+    .write_context_builder()
+    .with_row_tracking_columns(RowTrackingMetadataColumns {
+        row_id_col_name: Some("row_id"),
+        row_commit_version_col_name: Some("row_commit_version"),
+    })
+    .build()?;
+```
+
+Kernel maps each provided logical row-tracking metadata column to the corresponding physical
+column configured on the table. Row Tracking must be enabled when these options are provided.
+
 For partitioned tables, see
 [Writing to Partitioned Tables](./partitioned_writes.md).
 
@@ -128,8 +151,8 @@ For partitioned tables, see
 |--------|---------|---------|
 | `table_root_dir()` | `&Url` | The table root URL |
 | `write_dir()` | `Url` | The URL for writing files |
-| `logical_schema()` | `&SchemaRef` | The schema your logical data should conform to |
-| `physical_schema()` | `&SchemaRef` | The schema for the on-disk physical data |
+| `logical_data_schema()` | `&SchemaRef` | The schema your connector input data must conform to when using this write context |
+| `physical_data_schema()` | `&SchemaRef` | The schema for the data written to Parquet |
 | `logical_to_physical()` | `ExpressionRef` | Expression that transforms logical data to physical |
 | `column_mapping_mode()` | `ColumnMappingMode` | The column mapping mode for this table |
 | `stats_columns()` | `&[ColumnName]` | Columns that should have statistics collected |
@@ -138,7 +161,7 @@ For partitioned tables, see
 ## Writing Parquet files
 
 Start with the logical `data: EngineData` you want to write. Its schema should conform to
-`write_context.logical_schema()`.
+`write_context.logical_data_schema()`.
 
 ### Using `DefaultEngine`
 
@@ -172,9 +195,9 @@ If you do not use `DefaultEngine`, write the files yourself. The expected flow i
 
 // 1. Transform logical data into physical data
 let evaluator = engine.evaluation_handler().new_expression_evaluator(
-    write_context.logical_schema().clone(),
+    write_context.logical_data_schema().clone(),
     write_context.logical_to_physical(),
-    write_context.physical_schema().clone().into(),
+    write_context.physical_data_schema().clone().into(),
 )?;
 let physical_data = evaluator.evaluate(data.as_ref())?;
 

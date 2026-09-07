@@ -626,8 +626,7 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(&self, path: &Url)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>>;
 
     /// Cancellation-aware variant of [`list_from`](Self::list_from).
     ///
@@ -647,16 +646,13 @@ pub trait StorageHandler: AsAny {
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         check_cancelled(cancellation_token.as_ref())?;
         self.list_from(path)
     }
 
     /// Read data specified by the start and end offset from the file.
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>>;
 
     /// Cancellation-aware variant of [`read_files`](Self::read_files).
     ///
@@ -675,7 +671,7 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         check_cancelled(cancellation_token.as_ref())?;
         self.read_files(files)
     }
