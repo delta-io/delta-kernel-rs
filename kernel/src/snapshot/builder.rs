@@ -308,56 +308,47 @@ impl SnapshotBuilder {
         // requested version is exactly the max_catalog_version.
         let built_as_latest = version.is_none() || version == max_catalog_version;
 
-        let result = if let Some(table_root) = table_root {
-            try_parse_uri(table_root).and_then(|table_url| {
-                let log_segment = LogSegment::for_snapshot(
-                    engine.storage_handler().as_ref(),
-                    table_url.join("_delta_log/")?,
-                    log_tail,
-                    effective_version,
-                    metric_context.clone(),
-                    cancellation_token.as_ref(),
-                )?;
-                Snapshot::try_new_from_log_segment(
-                    table_url,
-                    log_segment,
-                    engine,
-                    metric_context,
-                    incremental_replay,
-                    built_as_latest,
-                )
-                .map(Into::into)
-            })
+        let snapshot = if let Some(table_root) = table_root {
+            let table_url = try_parse_uri(table_root)?;
+            let log_segment = LogSegment::for_snapshot(
+                engine.storage_handler().as_ref(),
+                table_url.join("_delta_log/")?,
+                log_tail,
+                effective_version,
+                metric_context.clone(),
+                cancellation_token.as_ref(),
+            )?;
+            Snapshot::try_new_from_log_segment(
+                table_url,
+                log_segment,
+                engine,
+                metric_context,
+                incremental_replay,
+                built_as_latest,
+            )
+            .map(Into::into)?
         } else {
-            existing_snapshot
-                .ok_or_else(|| {
-                    Error::internal_error(
-                        "SnapshotBuilder should have either table_root or existing_snapshot",
-                    )
-                })
-                .and_then(|existing_snapshot| {
-                    Snapshot::try_new_from(
-                        existing_snapshot,
-                        log_tail,
-                        engine,
-                        effective_version,
-                        metric_context,
-                        incremental_replay,
-                        built_as_latest,
-                        cancellation_token.as_ref(),
-                    )
-                })
+            let Some(existing_snapshot) = existing_snapshot else {
+                return Err(Error::internal_error(
+                    "SnapshotBuilder should have either table_root or existing_snapshot",
+                ));
+            };
+            Snapshot::try_new_from(
+                existing_snapshot,
+                log_tail,
+                engine,
+                effective_version,
+                metric_context,
+                incremental_replay,
+                built_as_latest,
+                cancellation_token.as_ref(),
+            )?
         };
 
         // Post-build validations for catalog-managed tables
-        let result = result.and_then(|snapshot| {
-            Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
-            Ok(snapshot)
-        });
-        if let Ok(ref snapshot) = result {
-            tracing::Span::current().record("version", snapshot.version());
-        }
-        result
+        Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
+        tracing::Span::current().record("version", snapshot.version());
+        Ok(snapshot)
     }
 
     // ============================================================================
