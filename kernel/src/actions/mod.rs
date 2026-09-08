@@ -747,7 +747,9 @@ impl Protocol {
                     if !orphaned_reader_writer_feature {
                         continue;
                     }
-                    if LEGACY_READER_FEATURES.contains(feature) {
+                    if LEGACY_READER_FEATURES.contains(feature)
+                        || feature == &TableFeature::V2Checkpoint
+                    {
                         legacy_orphans.push(feature);
                     } else {
                         return Err(Error::invalid_protocol(format!(
