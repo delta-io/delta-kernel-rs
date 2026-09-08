@@ -5,7 +5,7 @@ use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
 use crate::expressions::{lit, null_lit, MapData, Scalar};
 use crate::schema::{schema_ref, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
+use crate::{create_row, DataType, Engine, EngineData, Error, Expression, ExpressionRef};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -106,7 +106,7 @@ impl<S> Transaction<S> {
                 )?;
                 evaluator.evaluate(engine_commit_info.as_ref())
             }
-            None => kernel_commit_info.into_engine_data(LOG_COMMIT_INFO_SCHEMA.clone(), engine),
+            None => create_row(engine, LOG_COMMIT_INFO_SCHEMA.clone(), kernel_commit_info),
         }
     }
 }

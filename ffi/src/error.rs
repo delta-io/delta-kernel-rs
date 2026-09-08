@@ -66,7 +66,6 @@ pub enum KernelError {
     ChangeDataFeedUnsupported = 37,
     ChangeDataFeedIncompatibleSchema = 38,
     InvalidCheckpoint = 39,
-    LiteralExpressionTransformError = 40,
     CheckpointWriteError = 41,
     SchemaError = 42,
     LogHistoryError = 43,
@@ -135,9 +134,6 @@ impl From<Error> for KernelError {
                 KernelError::ChangeDataFeedIncompatibleSchema
             }
             Error::InvalidCheckpoint(_) => KernelError::InvalidCheckpoint,
-            Error::LiteralExpressionTransformError(_) => {
-                KernelError::LiteralExpressionTransformError
-            }
             Error::Schema(_) => KernelError::SchemaError,
             Error::InvalidTransactionState(_) => KernelError::InvalidTransactionStateError,
             Error::LogHistory(_) => KernelError::LogHistoryError,
@@ -352,7 +348,6 @@ impl From<EngineExecError> for Error {
             | KernelError::ChangeDataFeedUnsupported
             | KernelError::ChangeDataFeedIncompatibleSchema
             | KernelError::RowTrackingChangeFeedUnsupported
-            | KernelError::LiteralExpressionTransformError
             | KernelError::LogHistoryError) => {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
             }

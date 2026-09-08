@@ -126,8 +126,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error,
-    EvaluationHandlerExtension, FileMeta, Version,
+    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta,
+    Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -756,8 +756,8 @@ impl CheckpointWriter {
     }
 }
 
-/// Creates the data for the _last_checkpoint file containing checkpoint
-/// metadata with the `create_one` method. Factored out to facilitate testing.
+/// Creates the data for the _last_checkpoint file containing checkpoint metadata. Factored out to
+/// facilitate testing.
 ///
 /// # Parameters
 /// - `engine`: Engine for data processing
@@ -785,15 +785,15 @@ pub(crate) fn create_last_checkpoint_data(
     add_actions_counter: i64,
     size_in_bytes: i64,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    engine.evaluation_handler().create_one(
+    engine.evaluation_handler().create_many(
         LAST_CHECKPOINT_SCHEMA.clone(),
-        &[
+        &[&[
             version.into(),
             actions_counter.into(),
             None::<i64>.into(), // parts = None since we only support single-part checkpoints
             size_in_bytes.into(),
             add_actions_counter.into(),
-        ],
+        ]],
     )
 }
 

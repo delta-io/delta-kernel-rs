@@ -4,9 +4,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use delta_kernel_derive::{
-    internal_api, IntoEngineData, IntoStructData, ToSchema, TryFromStructData,
-};
+use delta_kernel_derive::{internal_api, IntoStructData, ToSchema, TryFromStructData};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use url::Url;
@@ -29,10 +27,7 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta, FileSize,
-    IntoEngineData, RowVisitor as _,
-};
+use crate::{DeltaResult, EngineData, Error, FileMeta, FileSize, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
@@ -525,42 +520,8 @@ impl Metadata {
     }
 }
 
-// NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
-// and create_one expects flattened values for nested schemas.
-impl IntoEngineData for Metadata {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        // For format, we need to provide individual scalars for provider and options
-        let values = [
-            self.id.into(),
-            self.name.into(),
-            self.description.into(),
-            self.format.provider.into(),
-            self.format.options.into(),
-            self.schema_string.into(),
-            self.partition_columns.into(),
-            self.created_time.into(),
-            self.configuration.into(),
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
-    }
-}
-
 #[derive(
-    Default,
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    ToSchema,
-    IntoStructData,
-    Serialize,
-    Deserialize,
-    IntoEngineData,
+    Default, Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize,
 )]
 // Deserialization goes through `ProtocolRaw` so every serde entry point (e.g. CRC files) is
 // validated by `try_new`, like the JSON-replay path. Otherwise a CRC file could load a malformed
@@ -864,7 +825,7 @@ impl Protocol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -1099,9 +1060,7 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, IntoEngineData,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct SetTransaction {
@@ -1223,6 +1182,7 @@ pub(crate) struct CheckpointAction {
 /// Build the `sidecar` element payload: a [`Sidecar`] scalar prefixed with a `type` discriminator
 /// (`"txn"` or `"domainMetadata"`), matching [`CONTENT_SIDECAR_FIELD`].
 #[cfg(feature = "adaptive-metadata-in-dev")]
+#[allow(unused)]
 fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> DeltaResult<Scalar> {
     let sidecar: StructData = sidecar.into();
     let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
@@ -1246,6 +1206,7 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> DeltaResult<Scal
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
 /// type: the field named `field_name` holds `value`, every other field is a typed null.
 #[cfg(feature = "adaptive-metadata-in-dev")]
+#[allow(unused)]
 fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> DeltaResult<Scalar> {
     let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
@@ -1267,18 +1228,15 @@ fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> DeltaResu
     Ok(Scalar::Struct(StructData::try_new(fields, values)?))
 }
 
-// `CheckpointAction` cannot use `#[derive(IntoEngineData)]`/`create_one`: its single `checkpoint`
-// column is an array whose elements are a union struct (one field per action kind), and
-// `create_one` only flattens to leaves. Instead we build the whole column as one non-flattened
-// `Scalar::Array` and materialize it via `create_many` (whose `Scalar::append_to` recurses through
-// Array/Struct/Null).
 #[cfg(feature = "adaptive-metadata-in-dev")]
-impl IntoEngineData for CheckpointAction {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+impl CheckpointAction {
+    /// Encodes this action as its single `checkpoint` column [`Scalar`]: an array whose elements
+    /// are a union struct (one field per action kind). Unlike the other actions, it has no derived
+    /// struct-scalar conversion because that nested array-of-union shape can't be expressed by the
+    /// derive, so we build the `Scalar::Array` by hand. This is also where the action is validated,
+    /// hence a fallible method rather than an infallible `From`.
+    #[allow(unused)]
+    fn try_into_scalar(self) -> DeltaResult<Scalar> {
         self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
             version: self.version,
@@ -1312,8 +1270,7 @@ impl IntoEngineData for CheckpointAction {
         }
 
         let array_type = ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false);
-        let array = Scalar::Array(ArrayData::try_new(array_type, elements)?);
-        engine.evaluation_handler().create_many(schema, &[&[array]])
+        Ok(Scalar::Array(ArrayData::try_new(array_type, elements)?))
     }
 }
 
@@ -1533,9 +1490,7 @@ pub(crate) struct CheckpointMetadata {
 /// Note that the `delta.*` domain is reserved for internal use.
 ///
 /// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, IntoEngineData,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData)]
 pub struct DomainMetadata {
     domain: String,
     configuration: String,
@@ -1592,8 +1547,7 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-        MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+        Array, Int32Array, ListBuilder, RecordBatch, StringBuilder, StructArray,
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use crate::arrow::json::ReaderBuilder;
@@ -1603,7 +1557,7 @@ mod tests {
     use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
-        Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
+        create_row, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
 
     #[rstest]
@@ -1647,25 +1601,6 @@ mod tests {
         fn storage_handler(&self) -> Arc<dyn StorageHandler> {
             unimplemented!()
         }
-    }
-
-    fn create_string_map_builder(
-        nullable_values: bool,
-    ) -> MapBuilder<StringBuilder, StringBuilder> {
-        MapBuilder::new(
-            Some(MapFieldNames {
-                entry: "key_value".to_string(),
-                key: "key".to_string(),
-                value: "value".to_string(),
-            }),
-            StringBuilder::new(),
-            StringBuilder::new(),
-        )
-        .with_values_field(Field::new(
-            "value".to_string(),
-            ArrowDataType::Utf8,
-            nullable_values,
-        ))
     }
 
     #[rstest]
@@ -2226,102 +2161,6 @@ mod tests {
     }
 
     #[test]
-    fn test_into_engine_data() {
-        let engine = ExprEngine::new();
-
-        let set_transaction = SetTransaction {
-            app_id: "app_id".to_string(),
-            version: 0,
-            last_updated: None,
-        };
-
-        let engine_data =
-            set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("appId", ArrowDataType::Utf8, false),
-            Field::new("version", ArrowDataType::Int64, false),
-            Field::new("lastUpdated", ArrowDataType::Int64, true),
-        ]));
-
-        let expected = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["app_id"])),
-                Arc::new(Int64Array::from(vec![0_i64])),
-                Arc::new(Int64Array::from(vec![None::<i64>])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
-    }
-
-    #[test]
-    fn test_commit_info_into_engine_data() {
-        let engine = ExprEngine::new();
-
-        let commit_info = CommitInfo::new(0, None, None, None, false);
-        let commit_info_txn_id = commit_info.txn_id.clone();
-
-        let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        let mut map_builder = create_string_map_builder(true);
-        map_builder.append(true).unwrap();
-        let operation_parameters = Arc::new(map_builder.finish());
-        let mut map_builder = create_string_map_builder(true);
-        map_builder.append(false).unwrap();
-        let operation_metrics = Arc::new(map_builder.finish());
-
-        let expected = RecordBatch::try_new(
-            record_batch.schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![Some(0)])),
-                Arc::new(Int64Array::from(vec![None::<i64>])),
-                Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
-                operation_parameters,
-                operation_metrics,
-                Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
-                Arc::new(BooleanArray::from(vec![None::<bool>])),
-                Arc::new(StringArray::from(vec![None::<String>])),
-                Arc::new(StringArray::from(vec![commit_info_txn_id])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
-    }
-
-    #[test]
-    fn test_domain_metadata_into_engine_data() {
-        let engine = ExprEngine::new();
-
-        let domain_metadata = DomainMetadata {
-            domain: "my.domain".to_string(),
-            configuration: "config_value".to_string(),
-            removed: false,
-        };
-
-        let engine_data =
-            domain_metadata.into_engine_data(DomainMetadata::to_schema().into(), &engine);
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        let expected = RecordBatch::try_new(
-            record_batch.schema(),
-            vec![
-                Arc::new(StringArray::from(vec!["my.domain"])),
-                Arc::new(StringArray::from(vec!["config_value"])),
-                Arc::new(BooleanArray::from(vec![false])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
-    }
-
-    #[test]
     fn test_metadata_try_new() {
         let schema = schema_ref! { not_null "id": INTEGER };
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
@@ -2408,54 +2247,6 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_into_engine_data() {
-        let engine = ExprEngine::new();
-        let schema = schema_ref! { not_null "id": INTEGER };
-
-        let test_metadata = Metadata::try_new(
-            Some("test".to_string()),
-            Some("my table".to_string()),
-            schema.clone(),
-            vec!["part".to_string()],
-            123,
-            HashMap::from([("k".to_string(), "v".to_string())]),
-        )
-        .unwrap();
-
-        // have to get the id since it's random
-        let test_id = test_metadata.id.clone();
-        let actual = test_metadata
-            .into_engine_data(Metadata::to_schema().into(), &engine)
-            .unwrap()
-            .try_into_record_batch()
-            .unwrap();
-
-        let expected_json = json!({
-            "id": test_id,
-            "name": "test",
-            "description": "my table",
-            "format": {
-                "provider": "parquet",
-                "options": {}
-            },
-            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
-            "partitionColumns": ["part"],
-            "createdTime": 123,
-            "configuration": {
-                "k": "v"
-            }
-        }).to_string();
-        let expected = ReaderBuilder::new(actual.schema())
-            .build(expected_json.as_bytes())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
         let schema = schema_ref! { not_null "id": INTEGER };
@@ -2474,8 +2265,7 @@ mod tests {
 
         // test with the full log schema that wraps metadata in a "metaData" field
         let commit_schema = LOG_METADATA_SCHEMA.clone();
-        let actual = metadata
-            .into_engine_data(commit_schema, &engine)
+        let actual = create_row(&engine, commit_schema, metadata)
             .unwrap()
             .try_into_record_batch()
             .unwrap();
@@ -2505,18 +2295,13 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_into_engine_data() {
+    fn test_protocol_creates_log_row() {
         let engine = ExprEngine::new();
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
         )
         .unwrap();
-
-        let engine_data = protocol
-            .clone()
-            .into_engine_data(Protocol::to_schema().into(), &engine);
-        let record_batch = engine_data.try_into_record_batch().unwrap();
 
         let list_field = Arc::new(Field::new("element", ArrowDataType::Utf8, false));
         let protocol_fields = vec![
@@ -2533,7 +2318,6 @@ mod tests {
                 true, // nullable
             ),
         ];
-        let schema = Arc::new(Schema::new(protocol_fields.clone()));
 
         let string_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
@@ -2549,22 +2333,8 @@ mod tests {
         list_builder.append(true);
         let writer_features_array = list_builder.finish();
 
-        let expected = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(vec![3])),
-                Arc::new(Int32Array::from(vec![7])),
-                Arc::new(reader_features_array.clone()),
-                Arc::new(writer_features_array.clone()),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
-
-        // test with the full log schema that wraps protocol in a "protocol" field
         let commit_schema = LOG_PROTOCOL_SCHEMA.clone();
-        let engine_data = protocol.into_engine_data(commit_schema, &engine);
+        let engine_data = create_row(&engine, commit_schema, protocol);
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "protocol",
@@ -2606,55 +2376,6 @@ mod tests {
         let record_batch = engine_data.try_into_record_batch().unwrap();
 
         assert_eq!(record_batch, expected);
-    }
-
-    #[test]
-    fn test_protocol_into_engine_data_empty_features() {
-        let engine = ExprEngine::new();
-        let protocol =
-            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
-
-        let engine_data = protocol
-            .into_engine_data(Protocol::to_schema().into(), &engine)
-            .unwrap();
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 4);
-
-        // reader/writer features are Some([]) lists
-        let reader_features_col = record_batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        assert_eq!(reader_features_col.len(), 1);
-        assert_eq!(reader_features_col.value(0).len(), 0); // empty list
-        let writer_features_col = record_batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        assert_eq!(writer_features_col.len(), 1);
-        assert_eq!(writer_features_col.value(0).len(), 0); // empty list
-    }
-
-    #[test]
-    fn test_protocol_into_engine_data_no_features() {
-        let engine = ExprEngine::new();
-        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
-
-        let engine_data = protocol
-            .into_engine_data(Protocol::to_schema().into(), &engine)
-            .unwrap();
-        let record_batch = engine_data.try_into_record_batch().unwrap();
-
-        assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 4);
-
-        // reader/writer features are null
-        assert!(record_batch.column(2).is_null(0));
-        assert!(record_batch.column(3).is_null(0));
     }
 
     #[test]
@@ -2938,12 +2659,11 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_into_engine_data_round_trip() -> DeltaResult<()> {
+    fn test_checkpoint_action_scalar_round_trip() -> DeltaResult<()> {
         let engine = ExprEngine::new();
         let action = sample_checkpoint_action();
-        let data = action
-            .clone()
-            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);
@@ -2952,10 +2672,10 @@ mod tests {
 
     // The `contentRoot.version <= checkpointMetadata.version` invariant is enforced on the
     // serialize path too, not just when parsing. `content_root_version_too_high` in visitors.rs
-    // covers the parse-path guard; this covers the `validate()` call inside `into_engine_data`.
+    // covers the parse-path guard; this covers the `validate()` call during scalar conversion.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_into_engine_data_rejects_invalid_content_root_version() {
+    fn test_checkpoint_action_scalar_rejects_invalid_content_root_version() {
         let base = sample_checkpoint_action();
         let action = CheckpointAction {
             content_root: ContentRoot {
@@ -2964,8 +2684,7 @@ mod tests {
             },
             ..sample_checkpoint_action()
         };
-        let engine = ExprEngine::new();
-        let result = action.into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine);
+        let result = action.try_into_scalar();
         assert_result_error_with_message(result, "exceeds checkpointMetadata.version");
     }
 
@@ -2980,8 +2699,8 @@ mod tests {
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
         // null union siblings collapse each element to a single-key tagged object).
         let engine = ExprEngine::new();
-        let data =
-            sample_checkpoint_action().into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let scalar = sample_checkpoint_action().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let filtered = FilteredEngineData::with_all_rows_selected(data);
         let bytes = to_json_bytes(std::iter::once(Ok(filtered)))?;
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -3066,9 +2785,8 @@ mod tests {
             domain_metadata_sidecars: vec![],
         };
         let engine = ExprEngine::new();
-        let data = action
-            .clone()
-            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);
@@ -3079,7 +2797,7 @@ mod tests {
     #[test]
     fn test_checkpoint_action_round_trip_protocol_with_features() -> DeltaResult<()> {
         // A (3, 7) protocol with the same ReaderWriter feature in both lists (required by the
-        // read-time feature-consistency check) must survive `into_engine_data` -> parse.
+        // read-time feature-consistency check) must survive scalar conversion -> parse.
         let action = CheckpointAction {
             protocol: Protocol::new_unchecked(
                 3,
@@ -3090,9 +2808,8 @@ mod tests {
             ..sample_checkpoint_action()
         };
         let engine = ExprEngine::new();
-        let data = action
-            .clone()
-            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);

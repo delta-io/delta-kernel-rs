@@ -47,8 +47,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData, Expression,
-    FileMeta, IntoEngineData, Predicate, RowVisitor, Version,
+    create_row, version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData,
+    Expression, FileMeta, Predicate, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -454,7 +454,7 @@ impl<S> Transaction<S> {
             .set_transactions
             .clone()
             .into_iter()
-            .map(|txn| txn.into_engine_data(LOG_TXN_SCHEMA.clone(), engine));
+            .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
@@ -471,7 +471,7 @@ impl<S> Transaction<S> {
         let (protocol_action, protocol) = if self.should_emit_protocol {
             let protocol = self.effective_table_config.protocol().clone();
             let schema = LOG_PROTOCOL_SCHEMA.clone();
-            let action = protocol.clone().into_engine_data(schema, engine)?;
+            let action = create_row(engine, schema, protocol.clone())?;
             (Some(action), Some(protocol))
         } else {
             (None, None)
@@ -479,7 +479,7 @@ impl<S> Transaction<S> {
         let (metadata_action, metadata) = if self.should_emit_metadata {
             let metadata = self.effective_table_config.metadata().clone();
             let schema = LOG_METADATA_SCHEMA.clone();
-            let action = metadata.clone().into_engine_data(schema, engine)?;
+            let action = create_row(engine, schema, metadata.clone())?;
             (Some(action), Some(metadata))
         } else {
             (None, None)
