@@ -69,6 +69,25 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::{CollectInto, FoldWithOption as _};
 use crate::{DeltaResult, Error};
 
+/// Projects a struct column to a narrowed schema while preserving null parent structs.
+pub(crate) fn project_struct_to_schema(
+    root: impl CollectInto<ColumnName>,
+    schema: &StructType,
+) -> Expression {
+    let root = root.collect_into();
+    let fields = schema.fields().map(|field| {
+        let column = root.join(&ColumnName::new([field.name()]));
+        match field.data_type() {
+            DataType::Struct(schema) => project_struct_to_schema(column, schema),
+            _ => Expression::from(column),
+        }
+    });
+    Expression::struct_with_nullability_from(
+        fields,
+        Expression::from_pred(Expression::from(root.clone()).is_not_null()),
+    )
+}
+
 // === Raw expression patch ===
 
 /// A patch affecting a single input field.

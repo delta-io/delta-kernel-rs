@@ -17,7 +17,6 @@ use itertools::Itertools;
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_replay::{ActionsBatch, LogReplayProcessor};
 use crate::log_segment::LogSegment;
-use crate::scan::COMMIT_READ_SCHEMA;
 use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta};
@@ -38,8 +37,13 @@ use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta};
 /// # Example
 ///
 /// ```ignore
-/// let mut sequential =
-///     SequentialPhase::try_new(processor, log_segment, engine, checkpoint_read_schema)?;
+/// let mut sequential = SequentialPhase::try_new(
+///     processor,
+///     log_segment,
+///     engine,
+///     commit_read_schema,
+///     checkpoint_read_schema,
+/// )?;
 ///
 /// // Iterate over sequential batches
 /// for batch in sequential.by_ref() {
@@ -97,16 +101,18 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// - `processor`: The log replay processor
     /// - `log_segment`: The log segment to process
     /// - `engine`: Engine for reading files
-    /// - `checkpoint_read_schema`: Schema for checkpoint manifests and leaf files
+    /// - `commit_read_schema`: Projection for JSON commit actions
+    /// - `checkpoint_read_schema`: Projection for the checkpoint manifest
     #[internal_api]
     pub(crate) fn try_new(
         processor: P,
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
+        commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
         let commit_phase: Option<DeltaResultIteratorStatic<ActionsBatch>> = Some(Box::new(
-            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
+            log_segment.read_commit_actions(engine.as_ref(), commit_read_schema, None)?,
         ));
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest

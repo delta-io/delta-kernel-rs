@@ -173,8 +173,8 @@ impl ParallelState {
 
     /// Get the schema to use for reading checkpoint files.
     ///
-    /// Returns the checkpoint read schema which may have stats excluded
-    /// if skip_stats was enabled when the scan was created.
+    /// Returns the checkpoint read schema, which excludes statistics when they're needed for
+    /// neither output nor data skipping.
     pub fn file_read_schema(&self) -> SchemaRef {
         self.inner.checkpoint_info().checkpoint_read_schema.clone()
     }
