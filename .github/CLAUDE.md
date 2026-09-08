@@ -67,3 +67,10 @@ env:
 run: |
     echo "Comment: $COMMENT_BODY"
 ```
+
+## Release tooling checks
+
+The `release-tooling` job in `build.yml` fetches full history and tags because it verifies the
+pending release changelog against every PR since the previous Kernel release. Keep `fetch-depth: 0`
+on that checkout. The job must run on every pull request so a release PR is rechecked whenever its
+base branch advances; do not add a path-based workflow filter.

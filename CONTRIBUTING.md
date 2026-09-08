@@ -140,5 +140,6 @@ If it was tested in a way different from regular unit tests, please clarify how 
 
 ## Resources
 
+- [Release process](RELEASING.md) - Maintainer runbook for changelogs, publishing, and tags
 - [Delta Protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 - [Delta Lake Slack](https://go.delta.io/slack) - Join us in the `#delta-kernel` channel
