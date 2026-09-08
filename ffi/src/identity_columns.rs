@@ -2,16 +2,16 @@
 //!
 //! Exposes pure-data kernel primitives that engines reuse without taking on
 //! kernel's Rust dependency surface:
-//! - [`reservation_next_values`]: wraps [`IdentityReservation::values`] so engines don't
-//!   reimplement the overflow-checked `start + step * i` arithmetic (which kernel gets right at i64
-//!   boundary cases).
+//! - [`reservation_next_values`]: wraps [`ReservedRange::values`] so engines don't reimplement the
+//!   overflow-checked `start + step * i` arithmetic (which kernel gets right at i64 boundary
+//!   cases).
 //!
 //! Kept outside the `delta-kernel-unity-catalog` feature gate because these
 //! are core CIC primitives, not UC-specific. The UC-specific plumbing
 //! (CreateSequence/ReserveIds HTTP, committer callbacks) lives in
 //! `delta_kernel_unity_catalog.rs` behind that feature.
 
-use delta_kernel::identity_columns::IdentityReservation;
+use delta_kernel::identity_columns::ReservedRange;
 use delta_kernel::{DeltaResult, Error};
 
 use crate::error::{ExternResult, IntoExternResult};
@@ -22,11 +22,11 @@ use crate::{KernelStringSlice, SharedExternEngine, TryFromStringSlice};
 /// caller-allocated i64 buffer. Value at index `i` of the output is
 /// `range_start + step * (offset + i)`.
 ///
-/// This is a thin pure-data wrapper over [`IdentityReservation::values`] so
+/// This is a thin pure-data wrapper over [`ReservedRange::values`] so
 /// engines can read the same overflow-checked arithmetic kernel uses without
 /// binding to kernel types. The caller provides the reservation bounds + step
-/// (which kernel otherwise stores on [`IdentityReservation`]), the row offset
-/// into the reservation, and the number of values to write.
+/// (which kernel stores on [`ReservedRange`]), the row offset into the
+/// reservation, and the number of values to write.
 ///
 /// # Parameters
 ///
@@ -113,13 +113,12 @@ unsafe fn reservation_next_values_impl(
     // Safety: caller affirms `column_name` is a valid kernel string slice
     // when `count > 0`, which we just confirmed.
     let column_name: String = unsafe { TryFromStringSlice::try_from_slice(&column_name) }?;
-    let reservation = IdentityReservation {
-        column_name,
+    let reservation = ReservedRange {
         range_start,
         range_end,
         step,
     };
-    let values = reservation.values(offset, count)?;
+    let values = reservation.values(&column_name, offset, count)?;
     // Safety: caller guaranteed `out` has at least `count` i64 slots.
     unsafe {
         std::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());

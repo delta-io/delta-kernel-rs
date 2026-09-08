@@ -1,10 +1,9 @@
 //! End-to-end walkthrough of Concurrent Identity Columns (CIC).
 //!
-//! Drives the full flow -- allocate sequences in UC, stamp the returned
-//! `sequence_id`s into a Delta schema, create the table, reserve ranges, inject
-//! identity values into a data batch, write a Parquet file, commit v1, and
-//! read the table back -- printing every step so you can verify what kernel
-//! does on disk.
+//! Drives the full flow -- mint sequence ids, register them in UC, stamp them
+//! into a Delta schema, create the table, reserve ranges and fill a data batch
+//! via an `IdentityColumnManager`, write a Parquet file, commit v1, and read the
+//! table back -- printing every step so you can verify what kernel does on disk.
 //!
 //! This example uses the [`InMemorySequenceClient`] — no external services
 //! required. A LiteBox-transport variant lives outside this OSS repository
@@ -29,8 +28,7 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::identity_columns::{
-    detect_identity_columns, identity_column_cic, IdentityColumnFiller, IdentityReservation,
-    SequenceReserver,
+    detect_identity_columns, identity_column_cic, IdentityColumnInfo,
 };
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
@@ -41,10 +39,9 @@ use delta_kernel::Engine as KernelEngine;
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel_unity_catalog::{
-    create_identity_sequences, IdentityColumnSpec, UCSequenceReserver,
-};
+use delta_kernel_unity_catalog::{create_identity_sequences, IdentityColumnManager};
 use unity_catalog_delta_client_api::{InMemorySequenceClient, SequenceClient};
+use uuid::Uuid;
 
 type DemoEngine = DefaultEngine<TokioMultiThreadExecutor>;
 type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -89,16 +86,20 @@ async fn run_flow<C>(
 where
     C: SequenceClient + 'static,
 {
-    let specs = [
-        IdentityColumnSpec::new("id", 1, 1),
-        IdentityColumnSpec::new("row_id", 1000, 10),
-    ];
+    // Mint a sequence_id per identity column, then register them all in UC in one batch.
+    let mint = |name: &str, start, step| IdentityColumnInfo {
+        column_name: name.to_string(),
+        sequence_id: Uuid::new_v4().to_string(),
+        start,
+        step,
+        allow_explicit_insert: false,
+    };
+    let infos = [mint("id", 1, 1), mint("row_id", 1000, 10)];
 
     println!(
         "\n[1/6] Allocating {} sequences (table_id={table_id})",
-        specs.len()
+        infos.len()
     );
-    let infos = create_identity_sequences(client.as_ref(), table_id, &specs).await?;
     for info in &infos {
         println!(
             "    minted sequence: column={} sequence_id={} start={} step={}",
@@ -128,6 +129,8 @@ where
         .commit(engine.as_ref())?;
     println!("    committed version 0");
 
+    create_identity_sequences(client.as_ref(), table_id, &infos).await?;
+
     let log_path = format!("{table_path}/_delta_log/00000000000000000000.json");
     println!("\n[3/6] Delta log on disk:");
     println!("    {log_path}");
@@ -156,27 +159,12 @@ where
     }
 
     println!("\n[5/6] Writing a Parquet file and committing v1");
-    let reserver = UCSequenceReserver::new(client.clone(), table_id);
+    // The manager hides the sequence client: the engine only reserves and fills.
+    let manager = IdentityColumnManager::new(&read_schema, client.clone(), table_id)?;
 
     const BATCH_ROWS: u64 = 3;
-    let reservations: Vec<IdentityReservation> = detected
-        .iter()
-        .map(|info| {
-            let range = reserver.reserve_ids(&info.sequence_id, info.step, BATCH_ROWS)?;
-            Ok::<_, DynError>(IdentityReservation {
-                column_name: info.column_name.clone(),
-                range_start: range.range_start,
-                range_end: range.range_end,
-                step: info.step,
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    for r in &reservations {
-        println!(
-            "    reserved for '{}': [{}, {}] step={}",
-            r.column_name, r.range_start, r.range_end, r.step
-        );
-    }
+    // Ensure enough is reserved for this batch (reserves the deficit if nothing was prefetched).
+    manager.ensure_available(BATCH_ROWS).await?;
 
     // Engine-side batch: only the non-identity columns. Kernel fills the rest.
     let payload: ArrayRef = Arc::new(StringArray::from(vec![
@@ -193,8 +181,11 @@ where
         vec![payload],
     )?;
 
-    let mut filler = IdentityColumnFiller::new(reservations)?;
-    let filled = filler.fill_arrow_batch(&input_batch, &read_schema)?;
+    let filled_data =
+        manager.fill_engine_batch(&ArrowEngineData::new(input_batch), &read_schema)?;
+    let filled = ArrowEngineData::try_from_engine_data(filled_data)?
+        .record_batch()
+        .clone();
     println!(
         "    filled batch ({} rows x {} columns):",
         filled.num_rows(),
