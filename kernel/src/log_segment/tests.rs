@@ -3509,6 +3509,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
 // ============================================================================
 
 #[rstest]
+#[case::published_through_snapshot(&[0, 1, 2], &[], None, None)]
 #[case::staged_only(&[], &[0, 1, 2], None, Some(0))]
 #[case::published_prefix(&[0, 1, 2], &[3, 4, 5], None, Some(3))]
 #[case::checkpoint_with_staged_tail(&[], &[6, 7, 8], Some(5), Some(6))]
@@ -3542,6 +3543,23 @@ async fn validate_published_uses_checkpoint_and_commit_watermarks(
         )),
         None => assert!(result.is_ok()),
     }
+}
+
+#[tokio::test]
+async fn validate_published_rejects_watermark_after_segment_end() {
+    let mut log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        ..Default::default()
+    })
+    .await;
+    log_segment.listed.max_published_version = Some(3);
+
+    let result = log_segment.validate_published();
+    assert!(matches!(
+        result,
+        Err(Error::InvalidLogSegment(message))
+            if message == "publication watermark 3 exceeds log segment end version 2"
+    ));
 }
 
 #[tokio::test]

@@ -1365,15 +1365,17 @@ impl LogSegment {
         let published_through = self
             .checkpoint_version
             .max(self.listed.max_published_version);
-        if published_through != Some(self.end_version) {
-            let first_unpublished_version = match published_through {
-                Some(version) if version < self.end_version => version + 1,
-                Some(_) => self.end_version,
-                None => 0,
-            };
-            return Err(Error::UnpublishedVersion(first_unpublished_version));
+        match published_through {
+            Some(version) if version == self.end_version => Ok(()),
+            Some(version) if version < self.end_version => {
+                Err(Error::UnpublishedVersion(version + 1))
+            }
+            Some(version) => Err(Error::invalid_log_segment(format!(
+                "publication watermark {version} exceeds log segment end version {}",
+                self.end_version
+            ))),
+            None => Err(Error::UnpublishedVersion(0)),
         }
-        Ok(())
     }
 
     /// Schema to read just the sidecar column from a checkpoint file.
