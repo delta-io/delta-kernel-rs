@@ -344,7 +344,7 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
         .into_extern_result(&allocate_error)
 }
 
-/// Visit a void field. Void fields contain no values.
+/// Visit a void field. Void fields are not materialized in data files and read as all-null columns.
 ///
 /// # Safety
 ///
