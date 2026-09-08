@@ -154,8 +154,8 @@ impl LogSegment {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
         };
-        // No commit boundaries here, so the delta stays incremental-safe. It covers the full
-        // table, which `into_complete_crc` turns into a Complete CRC.
+        // The checkpoint covers the full table, so `into_complete_crc` produces a Complete CRC.
+        // Invalid Add sizes mark replay unsafe and degrade its file stats to `Indeterminate`.
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
         let batches = self
