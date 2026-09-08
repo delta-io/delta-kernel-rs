@@ -10,6 +10,14 @@
 //!   awaits in-flight reservations and/or reserves the deficit, such that the fill succeeds.
 //! - calls [`IdentityColumnManager::fill_engine_batch`] to emit generated identity values into a
 //!   batch. It fails if a column is short (i.e. `ensure_available` was skipped).
+//!
+//! # Concurrency
+//!
+//! One manager may be shared by multiple concurrent consumers. `ensure_available(count)` claims
+//! `count` values for the caller before returning, so concurrent consumers each doing
+//! `ensure_available` + `fill` receive disjoint value ranges without conflicting. The contract is
+//! that a successful `ensure_available(count)` is always followed by a `fill` of exactly `count`
+//! rows. A claim that is never filled keeps those values reserved for the life of the manager.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -33,6 +41,8 @@ struct SequenceCursor {
     available: u64,
     /// Values requested from the service but not yet returned.
     inflight: u64,
+    /// Values promised to a caller by `ensure_available` but not yet consumed by `fill`.
+    claimed: u64,
     /// Error from the most recent failed reservation, cleared on the next success.
     error: Option<String>,
 }
@@ -86,13 +96,15 @@ impl SequenceCursor {
             remaining -= take;
         }
         self.available -= count;
+        // Release the portion of any outstanding claim this fill satisfies.
+        self.claimed = self.claimed.saturating_sub(count);
         Ok(out)
     }
 }
 
 /// What [`IdentityColumnManager::ensure_available`] should do this iteration.
 enum EnsureAction {
-    /// Every column already has enough available.
+    /// Every column had enough unclaimed values. `count` many more have now been claimed.
     Done,
     /// Reserve this many more values to cover the deficit.
     Reserve(u64),
@@ -132,6 +144,7 @@ impl<C: SequenceClient + 'static> IdentityColumnManager<C> {
                 queue: VecDeque::new(),
                 available: 0,
                 inflight: 0,
+                claimed: 0,
                 error: None,
             })
             .collect();
@@ -259,7 +272,7 @@ impl<C: SequenceClient + 'static> IdentityColumnManager<C> {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let action = self.decide_ensure(count)?;
+            let action = self.try_claim(count)?;
             match action {
                 EnsureAction::Done => return Ok(()),
                 EnsureAction::Reserve(deficit) => self.reserve(deficit).await?,
@@ -268,17 +281,24 @@ impl<C: SequenceClient + 'static> IdentityColumnManager<C> {
         }
     }
 
-    /// Inspects cursor state under the lock and decides the next [`EnsureAction`]. Returns an error
-    /// if a column is short and its most recent reservation failed with no in-flight cover.
-    fn decide_ensure(&self, count: u64) -> DeltaResult<EnsureAction> {
-        let guard = self.cursors.lock().unwrap();
+    /// Attempts to claim `count` values for every CIC. If every cursor
+    /// has at least `count` unclaimed values, marks them claimed and returns
+    /// [`EnsureAction::Done`]. Otherwise returns the action needed to
+    /// make progress ([`EnsureAction::Reserve`] or [`EnsureAction::Wait`]) without claiming.
+    /// # Errors
+    ///
+    /// Returns an error if a column is short and its most recent reservation failed with no
+    /// in-flight cover.
+    fn try_claim(&self, count: u64) -> DeltaResult<EnsureAction> {
+        let mut guard = self.cursors.lock().unwrap();
         let mut reserve_deficit = 0u64;
         let mut need_wait = false;
         for cursor in guard.iter() {
-            if cursor.available >= count {
+            let unclaimed = cursor.available.saturating_sub(cursor.claimed);
+            if unclaimed >= count {
                 continue;
             }
-            let projected = cursor.available + cursor.inflight;
+            let projected = (cursor.available + cursor.inflight).saturating_sub(cursor.claimed);
             if projected < count {
                 if let Some(msg) = &cursor.error {
                     return Err(Error::Generic(msg.clone()));
@@ -294,6 +314,10 @@ impl<C: SequenceClient + 'static> IdentityColumnManager<C> {
         } else if need_wait {
             EnsureAction::Wait
         } else {
+            // Every cursor had enough unclaimed values. `count` many more have now been claimed.
+            for cursor in guard.iter_mut() {
+                cursor.claimed += count;
+            }
             EnsureAction::Done
         })
     }
@@ -520,6 +544,39 @@ mod tests {
         let batch = to_batch(filled);
         assert_eq!(i64_col(&batch, "id"), vec![1, 2]);
         assert_eq!(i64_col(&batch, "row_id"), vec![1000, 1010]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_consumers_get_disjoint_values() {
+        use std::collections::HashSet;
+
+        // Four consumers share one manager, each independently ensure_available(100) + fill(100).
+        // Claiming in ensure_available must hand each consumer a disjoint range.
+        let mgr = Arc::new(seeded_manager().await);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let mgr = mgr.clone();
+            handles.push(tokio::spawn(async move {
+                mgr.ensure_available(100).await.unwrap();
+                let filled = mgr
+                    .fill_engine_batch(&payload_batch(100), &schema())
+                    .unwrap();
+                i64_col(&to_batch(filled), "id")
+            }));
+        }
+
+        let mut all = Vec::new();
+        for handle in handles {
+            all.extend(handle.await.unwrap());
+        }
+
+        assert_eq!(all.len(), 400);
+        let unique: HashSet<i64> = all.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            400,
+            "values must be unique across consumers: {all:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
