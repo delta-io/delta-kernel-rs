@@ -344,6 +344,24 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
         .into_extern_result(&allocate_error)
 }
 
+/// Visit a void field. Void fields contain no values.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_void(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable)
+        .into_extern_result(&allocate_error)
+}
+
 /// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified
 /// precision and scale.
 ///
@@ -793,6 +811,7 @@ mod tests {
         //   col_timestamp_ntz: timestamp_ntz,
         //   col_interval_year_month: interval year to month,
         //   col_interval_day_time: interval day to second,
+        //   col_void: void,
         //   col_decimal: decimal(10,2),
         //   col_array: array<string>,
         //   col_map: map<string, long>,
@@ -819,6 +838,7 @@ mod tests {
             visit_field!(interval_year_month, state, "col_interval_year_month", false);
         let col_interval_day_time =
             visit_field!(interval_day_time, state, "col_interval_day_time", false);
+        let col_void = visit_field!(void, state, "col_void", false);
         let col_decimal = visit_field!(decimal, state, "col_decimal", 10, 2, false);
 
         // Create array<string>
@@ -865,6 +885,7 @@ mod tests {
             col_timestamp_ntz,
             col_interval_year_month,
             col_interval_day_time,
+            col_void,
             col_decimal,
             col_array,
             col_map,
@@ -885,7 +906,7 @@ mod tests {
         // Verify the schema
         let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
-        assert_eq!(fields.len(), 19);
+        assert_eq!(fields.len(), 20);
 
         // Validate the primitive fields
         let primitive_field_expectations = [
@@ -903,6 +924,7 @@ mod tests {
             ("col_timestamp_ntz", PrimitiveType::TimestampNtz),
             ("col_interval_year_month", PrimitiveType::IntervalYearMonth),
             ("col_interval_day_time", PrimitiveType::IntervalDayTime),
+            ("col_void", PrimitiveType::Void),
         ];
 
         for (index, (expected_name, expected_type)) in
@@ -916,25 +938,25 @@ mod tests {
             assert!(!fields[index].is_nullable());
         }
 
-        assert_eq!(fields[14].name(), "col_decimal");
-        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[14].data_type()
+        assert_eq!(fields[15].name(), "col_decimal");
+        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[15].data_type()
         else {
             panic!("Field col_decimal is not a decimal type");
         };
         assert_eq!(decimal_type.precision(), 10);
         assert_eq!(decimal_type.scale(), 2);
 
-        assert_eq!(fields[15].name(), "col_array");
-        assert_array(fields[15], DataType::STRING, false);
+        assert_eq!(fields[16].name(), "col_array");
+        assert_array(fields[16], DataType::STRING, false);
 
-        assert_eq!(fields[16].name(), "col_map");
-        assert_map(fields[16], DataType::STRING, DataType::LONG, false);
+        assert_eq!(fields[17].name(), "col_map");
+        assert_map(fields[17], DataType::STRING, DataType::LONG, false);
 
-        assert_eq!(fields[17].name(), "col_struct");
-        assert_struct(fields[17], DataType::STRING, false);
+        assert_eq!(fields[18].name(), "col_struct");
+        assert_struct(fields[18], DataType::STRING, false);
 
-        assert_eq!(fields[18].name(), "col_variant");
-        let DataType::Variant(variant_type) = fields[18].data_type() else {
+        assert_eq!(fields[19].name(), "col_variant");
+        let DataType::Variant(variant_type) = fields[19].data_type() else {
             panic!("Expected variant type for col_variant");
         };
         let variant_fields: Vec<_> = variant_type.fields().collect();
