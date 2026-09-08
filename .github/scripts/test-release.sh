@@ -53,6 +53,8 @@ commit_file() {
 
 test_changelog_refresh_and_verification() {
     local repository="$TEST_ROOT/repository"
+    local failing_bin="$TEST_ROOT/failing-bin"
+    local saved_changelog="$TEST_ROOT/changelog-before-failure"
     mkdir -p "$repository"
     cp "$REPOSITORY_ROOT/release.sh" "$REPOSITORY_ROOT/cliff.toml" "$repository/"
 
@@ -104,10 +106,19 @@ test_changelog_refresh_and_verification() {
     }
     verify_release_changelog
 
+    mkdir -p "$failing_bin"
+    printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$failing_bin/git-cliff"
+    chmod +x "$failing_bin/git-cliff"
+    if PATH="$failing_bin:$PATH" verify_release_changelog 0.29.0 \
+        > tag-failure.log 2>&1; then
+        fail "tag lookup failure unexpectedly passed verification"
+    fi
+    assert_contains tag-failure.log "Could not resolve the latest Kernel release tag"
+
     commit_file "chore: refresh release changelog (#998)" "housekeeping"
     ./release.sh verify-changelog 0.29.0
 
-    commit_file "fix: include late change (#102)" "late"
+    commit_file "fix: include late change (#102) [skip ci]" "late"
     if ./release.sh verify-changelog 0.29.0 > verification.log 2>&1; then
         fail "stale changelog verification unexpectedly passed"
     fi
@@ -123,6 +134,14 @@ test_changelog_refresh_and_verification() {
     assert_count CHANGELOG.md 1 "## [v0.28.0]"
     assert_contains CHANGELOG.md "Previous release notes"
     ./release.sh verify-changelog 0.29.0
+
+    cp CHANGELOG.md "$saved_changelog"
+    if PATH="$failing_bin:$PATH" ./release.sh changelog 0.29.0 > refresh-failure.log 2>&1; then
+        fail "changelog refresh unexpectedly passed with a failing git-cliff"
+    fi
+    assert_contains refresh-failure.log "Failed to refresh CHANGELOG.md"
+    cmp -s CHANGELOG.md "$saved_changelog" || \
+        fail "failed changelog refresh did not restore CHANGELOG.md"
 }
 
 test_registry_override

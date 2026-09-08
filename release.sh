@@ -94,8 +94,8 @@ get_current_version() {
         jq -r --arg name "$crate_name" '.packages[] | select(.name == $name) | .version'
 }
 
-# Run cargo-release with an optional read registry. This avoids editing release.sh when the
-# maintainer's network requires dependency metadata to come from a registry proxy.
+# Run cargo-release with an optional registry selection. This avoids editing release.sh when a
+# maintainer's Cargo configuration requires a registry proxy.
 run_cargo_release() {
     local version="$1"
     local args=(
@@ -150,7 +150,10 @@ verify_release_changelog() {
         version=$(get_current_version "delta_kernel")
     fi
 
-    previous_tag=$(latest_kernel_release_tag)
+    if ! previous_tag=$(latest_kernel_release_tag); then
+        log_warning "Could not resolve the latest Kernel release tag"
+        return 1
+    fi
     if [[ -z "$previous_tag" ]]; then
         log_warning "No prior Kernel release tag found; skipping changelog verification"
         return 0
@@ -172,7 +175,8 @@ verify_release_changelog() {
     fi
 
     while IFS= read -r subject; do
-        if [[ "$subject" =~ \(\#([0-9]+)\)$ ]]; then
+        # The greedy prefix selects the last PR token, matching cliff.toml's link extraction.
+        if [[ "$subject" =~ .*\(\#([0-9]+)\) ]]; then
             pr="${BASH_REMATCH[1]}"
             if ! grep -Fq "[#$pr]:" <<< "$section"; then
                 log_warning "CHANGELOG.md v$version is missing PR #$pr: $subject"
