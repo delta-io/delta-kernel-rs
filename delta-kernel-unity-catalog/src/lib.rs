@@ -3,11 +3,14 @@
 mod committer;
 mod constants;
 mod errors;
+mod sequence_allocator;
+mod sequence_reserver;
 mod utils;
-
 pub use committer::UCCommitter;
 use delta_kernel::snapshot::SnapshotBuilder;
 use delta_kernel::{DeltaResult, Error, LogPath, Snapshot};
+pub use sequence_allocator::{create_identity_sequences, IdentityColumnSpec};
+pub use sequence_reserver::UCSequenceReserver;
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
 use url::Url;
 pub use utils::{

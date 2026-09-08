@@ -1132,6 +1132,44 @@ impl<S: SupportsDataFiles> Transaction<S> {
         )))
     }
 
+    /// Reserves identity value ranges for every Concurrent Identity Column (CIC) in this
+    /// table's schema.
+    ///
+    /// For each CIC identity column detected in the current snapshot schema, this calls
+    /// [`SequenceReserver::reserve_ids`] with the column's `sequence_id`, expected step
+    /// (taken from the schema metadata), and `row_count`. The returned reservations are
+    /// in schema order and are what the engine should feed into an
+    /// [`IdentityColumnFiller`] to populate the identity columns for the batches it writes.
+    ///
+    /// Returns an empty `Vec` if the table has no CIC identity columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if identity column metadata is malformed or if the sequence service
+    /// call fails (including a step-match violation enforced by the reserver).
+    ///
+    /// [`SequenceReserver::reserve_ids`]: crate::identity_columns::SequenceReserver::reserve_ids
+    /// [`IdentityColumnFiller`]: crate::identity_columns::IdentityColumnFiller
+    pub fn reserve_identity_ranges(
+        &self,
+        reserver: &dyn crate::identity_columns::SequenceReserver,
+        row_count: u64,
+    ) -> DeltaResult<Vec<crate::identity_columns::IdentityReservation>> {
+        let schema = self.read_snapshot()?.schema();
+        let identity_cols = crate::identity_columns::detect_identity_columns(&schema)?;
+        let mut reservations = Vec::with_capacity(identity_cols.len());
+        for col in identity_cols {
+            let range = reserver.reserve_ids(&col.sequence_id, col.step, row_count)?;
+            reservations.push(crate::identity_columns::IdentityReservation {
+                column_name: col.column_name,
+                range_start: range.range_start,
+                range_end: range.range_end,
+                step: col.step,
+            });
+        }
+        Ok(reservations)
+    }
+
     /// Add files to include in this transaction. This API generally enables the engine to
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.

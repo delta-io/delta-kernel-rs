@@ -30,16 +30,16 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 delta_kernel = { path = "../kernel", features = ["default-engine-base", "test-utils", "internal-api"] }
 delta_kernel_default_engine = { path = "../default-engine", features = ["rustls"] }
 unity-catalog-delta-rest-client = { path = "../unity-catalog-delta-rest-client", features = ["test-utils"] }
-unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
+unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", features = ["test-utils"] }
 test_utils = { path = "../test-utils" }
 rstest = "0.23"
 tempfile = "3"
-uuid = { version = "1", features = ["v4"] }
 # Only used by the gated live-server CREATE test, which hand-rolls the staging-tables/tables POSTs.
 # Mirrors the rest-client's reqwest config.
 reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "json", "rustls", "system-proxy"] }

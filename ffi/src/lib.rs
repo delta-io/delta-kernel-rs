@@ -68,6 +68,7 @@ pub mod expressions;
 pub mod ffi_metrics;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
+pub mod identity_columns;
 pub mod incremental_scan;
 pub mod log_path;
 #[cfg(feature = "declarative-plans")]
