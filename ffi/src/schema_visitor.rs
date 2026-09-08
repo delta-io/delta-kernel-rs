@@ -593,27 +593,8 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineError, KernelError};
-    use crate::ffi_test_utils::ok_or_panic;
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
     use crate::KernelStringSlice;
-
-    // Error allocator for tests that panics when invoked. It is used in tests where we don't expect
-    // errors.
-    #[no_mangle]
-    extern "C" fn test_allocate_error(
-        etype: KernelError,
-        msg: crate::KernelStringSlice,
-    ) -> *mut EngineError {
-        panic!(
-            "Error allocator called with type {:?}, message: {:?}",
-            etype,
-            unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    msg.ptr as *const u8,
-                    msg.len,
-                ))
-            }
-        );
-    }
 
     macro_rules! visit_field {
         ($type:ident, $state:ident, $name:expr, $nullable:tt) => {
@@ -622,7 +603,7 @@ mod tests {
                     &mut $state,
                     KernelStringSlice::new_unsafe($name),
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             }) }
         };
@@ -635,7 +616,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     arg1,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             }) }
         };
@@ -650,7 +631,7 @@ mod tests {
                     arg1,
                     arg2,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             }) }
         };
@@ -665,7 +646,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     ef,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             })
         }};
@@ -682,7 +663,7 @@ mod tests {
                     kf,
                     vf,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             })
         }};
@@ -699,7 +680,7 @@ mod tests {
                     fields.as_ptr(),
                     field_count,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             })
         }};
@@ -878,7 +859,7 @@ mod tests {
                 all_columns.as_ptr(),
                 all_columns.len(),
                 false,
-                test_allocate_error,
+                allocate_err,
             )
         });
 
@@ -1356,10 +1337,7 @@ mod tests {
             msg: crate::KernelStringSlice,
         ) -> *mut EngineError {
             let msg = unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    msg.ptr as *const u8,
-                    msg.len,
-                ))
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg.ptr.cast(), msg.len))
             };
             assert_eq!(
                 msg,

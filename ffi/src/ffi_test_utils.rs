@@ -156,13 +156,7 @@ mod tests {
     fn test_ok_or_panic_with_error() {
         // Create a test error
         let message = "Test error message";
-        let error_ptr = allocate_err(
-            KernelError::GenericError,
-            KernelStringSlice {
-                ptr: message.as_ptr() as *const i8,
-                len: message.len(),
-            },
-        );
+        let error_ptr = allocate_err(KernelError::GenericError, kernel_string_slice!(message));
         let result = ExternResult::<i32>::Err(error_ptr);
 
         // Test that ok_or_panic panics with the expected message
