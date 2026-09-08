@@ -17,6 +17,7 @@
 .cache/
 .clangd
 *.*~
+**/#*.*#
 
 # Rust
 .cargo-home
