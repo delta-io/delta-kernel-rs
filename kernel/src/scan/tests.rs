@@ -8,7 +8,9 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
+use crate::actions::{
+    ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED, TIGHT_BOUNDS,
+};
 use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
@@ -784,6 +786,16 @@ fn test_replay_for_scan_metadata() {
     // Metadata and protocol parts have an all-null `add.path` column and are skipped. Transaction
     // parts omit that column and are retained conservatively.
     assert_eq!(data.len(), 3);
+}
+
+#[test]
+fn bookkeeping_only_stats_schema_has_no_data_output() {
+    let bookkeeping_only = schema_ref! {
+        nullable NUM_RECORDS: LONG,
+        nullable NULL_COUNT: {},
+        nullable TIGHT_BOUNDS: BOOLEAN,
+    };
+    assert!(stats_schema_with_data_columns(bookkeeping_only).is_none());
 }
 
 #[test]
@@ -1775,10 +1787,12 @@ fn scan_execute_passes_scan_file_modification_time_to_parquet_handler() {
 }
 
 #[rstest]
+#[case::json_only(StatsOptions::json_only(), true, false)]
 #[case::all_struct(StatsOptions::all_struct(), false, false)]
 #[case::all(StatsOptions::all(), true, false)]
 #[case::none_with_predicate(StatsOptions::none(), false, true)]
-fn test_checkpoint_stats_projection_matches_requested_output(
+#[case::none_without_predicate(StatsOptions::none(), false, false)]
+fn checkpoint_stats_projection_follows_output_or_pruning(
     #[values(
         "v1-single-part-struct-stats-only",
         "v2-parquet-sidecars-struct-stats-only",
@@ -1787,7 +1801,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
     table: &str,
     #[case] stats: StatsOptions,
     #[case] request_json_stats: bool,
-    #[case] skip_stats: bool,
+    #[case] with_predicate: bool,
 ) {
     let extracted = load_test_data("tests/data", table).ok();
     let path = extracted
@@ -1804,21 +1818,28 @@ fn test_checkpoint_stats_projection_matches_requested_output(
     recorder.take_reads();
 
     let predicate: Option<PredicateRef> =
-        skip_stats.then(|| Arc::new(Pred::gt(col!("id"), lit(0i64))) as PredicateRef);
+        with_predicate.then(|| Arc::new(Pred::gt(col!("id"), lit(0i64))) as PredicateRef);
+    let needs_stats =
+        request_json_stats || with_predicate || !matches!(stats.struct_stats, StructStats::None);
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
         .with_stats(stats)
         .build()
         .unwrap();
+    let commit_schema = scan.commit_read_schema();
+    let DataType::Struct(commit_add) = commit_schema.field(ADD_NAME).unwrap().data_type() else {
+        panic!("commit add must be a struct");
+    };
+    assert_eq!(commit_add.field("stats").is_some(), needs_stats);
     for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
         action.unwrap();
     }
 
     let reads = recorder.take_reads();
     let compatible_structured_stats = table != "v2-checkpoints-parquet-with-sidecars";
-    let expect_parsed_stats = !skip_stats && compatible_structured_stats;
-    let expect_json_stats = !skip_stats && (request_json_stats || !expect_parsed_stats);
+    let expect_parsed_stats = needs_stats && compatible_structured_stats;
+    let expect_json_stats = needs_stats && (request_json_stats || !expect_parsed_stats);
     let expected_file_fragment = if table.starts_with("v2-") {
         "_sidecars/"
     } else {
@@ -1845,12 +1866,12 @@ fn test_checkpoint_stats_projection_matches_requested_output(
         assert_eq!(
             add.field("stats").is_some(),
             expect_json_stats,
-            "JSON checkpoint stats projection must match the requested output"
+            "JSON checkpoint stats projection must match output and pruning requirements"
         );
         assert_eq!(
             add.field("stats_parsed").is_some(),
             expect_parsed_stats,
-            "structured checkpoint stats projection must match the requested output"
+            "structured checkpoint stats projection must match output and pruning requirements"
         );
     }
 }
@@ -1949,17 +1970,21 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
     );
 }
 
-#[test]
-fn test_skip_stats_disables_data_skipping() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+#[rstest]
+#[case::data_stats("parsed-stats", Pred::gt(col!("id"), lit(400i64)))]
+#[case::partition_values(
+    "app-txn-checkpoint",
+    col!("modified").eq(lit("2021-02-01")),
+)]
+fn stats_none_preserves_pruning_without_output(#[case] table: &str, #[case] predicate: Pred) {
+    let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let predicate = Arc::new(Pred::gt(col!("id"), lit(400i64)));
     let scan = snapshot
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(Arc::new(predicate))
         .with_stats(StatsOptions::none())
         .build()
         .unwrap();
@@ -1979,7 +2004,7 @@ fn test_skip_stats_disables_data_skipping() {
             .count();
     }
 
-    assert_eq!(selected_file_count, 6);
+    assert_eq!(selected_file_count, 2);
 }
 
 /// Calling `with_stats` twice replaces the prior value; the last call wins.
@@ -2071,7 +2096,7 @@ fn test_default_stats_options_no_struct_output() {
 )]
 #[case::id_with_json_without_predicate(
     StatsOptions {
-        synthesize_json: true,
+        emit_json: true,
         struct_stats: StructStats::Columns {
             requested: vec![column_name!("id")],
         },
@@ -2097,21 +2122,21 @@ fn test_default_stats_options_no_struct_output() {
 )]
 #[case::id_predicate_not_requested(
     StatsOptions::struct_columns(vec![column_name!("name")]),
-    &["id", "name"],
+    &["name"],
     Some(col!("id").gt(lit(400i64))),
     "name",
     &[("name_401", "name_500"), ("name_501", "name_600")],
 )]
 #[case::salary_predicate_with_multiple_requested_columns(
     StatsOptions::struct_columns(vec![column_name!("id"), column_name!("name")]),
-    &["id", "name", "salary"],
+    &["id", "name"],
     Some(col!("salary").le(lit(70_000i64))),
     "id",
     &[("1", "100"), ("101", "200")],
 )]
 #[case::salary_requested_with_different_predicate_column(
     StatsOptions::struct_columns(vec![column_name!("salary")]),
-    &["id", "salary"],
+    &["salary"],
     Some(col!("id").gt(lit(500i64))),
     "salary",
     &[("100100", "110000")],
@@ -2239,7 +2264,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
     let result = snapshot
         .scan_builder()
         .with_stats(StatsOptions {
-            synthesize_json: true,
+            emit_json: true,
             struct_stats: StructStats::Columns {
                 requested: vec![column_name!("nonexistent_column")],
             },
