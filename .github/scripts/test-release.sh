@@ -68,14 +68,24 @@ test_changelog_refresh_and_verification() {
     git tag v0.28.0
 
     commit_file "chore: publish DAT artifact" "dat"
-    git tag v0.0.1_dat
+    git tag v999.0.0_dat
     commit_file "fix: include first change (#101)" "first"
+
+    # The artifact tag sorts above the real release numerically, but cliff.toml still defines
+    # v0.28.0 as the latest Kernel release boundary.
+    # shellcheck source=release.sh
+    source ./release.sh
+    [[ "$(latest_kernel_release_tag)" == "v0.28.0" ]] || \
+        fail "artifact tag was selected as the latest Kernel release"
 
     ./release.sh changelog 0.29.0
     assert_contains CHANGELOG.md "([#101])"
     assert_contains CHANGELOG.md "v0.28.0...v0.29.0"
     git add CHANGELOG.md
-    git commit -q -m "release 0.29.0"
+    git commit -q -m "release 0.29.0 (#999)"
+
+    # A release commit cannot mention its own PR in the changelog it introduced.
+    ./release.sh verify-changelog 0.29.0
 
     commit_file "fix: include late change (#102)" "late"
     if ./release.sh verify-changelog 0.29.0 > verification.log 2>&1; then

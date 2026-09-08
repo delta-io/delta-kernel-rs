@@ -55,6 +55,8 @@ check_changelog_requirements() {
 check_changelog_verification_requirements() {
     command -v cargo >/dev/null 2>&1 || log_error "cargo is required but not installed"
     command -v git >/dev/null 2>&1 || log_error "git is required but not installed"
+    command -v git-cliff >/dev/null 2>&1 || \
+        log_error "git-cliff is required but not installed. Install with: cargo install git-cliff"
     command -v jq >/dev/null 2>&1 || log_error "jq is required but not installed"
 }
 
@@ -107,11 +109,11 @@ run_cargo_release() {
     cargo "${args[@]}"
 }
 
-# Return the highest merged Kernel release tag. Other artifacts use suffixed tags such as
-# v0.0.1_dat; accepting those as Kernel releases can silently drop commits from the changelog.
+# Ask git-cliff for the latest Kernel release so changelog generation and verification use the
+# same tag grammar from cliff.toml.
 latest_kernel_release_tag() {
-    git -C "$REPO_ROOT" tag --merged HEAD --sort=-version:refname | \
-        awk '/^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$/ { print; exit }'
+    git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --latest --context | \
+        jq -r '.[0].version // empty'
 }
 
 release_changelog_section() {
