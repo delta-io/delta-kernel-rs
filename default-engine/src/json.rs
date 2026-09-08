@@ -425,6 +425,7 @@ mod tests {
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::engine_contract::test_json_handler_file_path_contract;
+    use test_utils::TestCancellationToken;
     use tracing::info;
 
     use super::*;
@@ -1127,6 +1128,132 @@ mod tests {
             Err(_) => panic!("expected JoinFailure, got a different error"),
             Ok(_) => panic!("expected JoinFailure, got a batch"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_empty_files() {
+        let store = Arc::new(InMemory::new());
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_parallel_chunks(NonZero::new(4));
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let result: Vec<_> = handler
+            .read_json_files(&[], physical_schema, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert!(result.is_empty(), "empty file list must yield no batches");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_missing_file_errors() {
+        let store = Arc::new(InMemory::new());
+        let missing_path = Path::from("test/missing");
+        let url = Url::parse(&format!("memory:/{missing_path}")).unwrap();
+        let files = vec![FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 100,
+        }];
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_parallel_chunks(NonZero::new(4));
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let result: DeltaResult<Vec<_>> = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .try_collect();
+        assert!(result.is_err(), "missing file must produce an error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_with_cancelled_token() {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &Path::from("test/0"),
+                Bytes::from(r#"{"val": 0}"#).into(),
+            )
+            .await
+            .unwrap();
+        let url = Url::parse("memory:///test/0").unwrap();
+        let files = vec![FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 12,
+        }];
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let handler = DefaultJsonHandler::new(store, executor)
+            .with_parallel_chunks(NonZero::new(4));
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let token: CancellationTokenRef =
+            Arc::new(TestCancellationToken::cancelled());
+        let result = handler
+            .read_json_files_with_cancellation(&files, physical_schema, None, Some(token));
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "pre-cancelled token must yield Cancelled, not data"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_via_builder() {
+        let store = Arc::new(InMemory::new());
+        for i in 0..100 {
+            store
+                .put(
+                    &Path::from(format!("test/{i}")),
+                    Bytes::from(format!("{{\"val\": {i}}}")).into(),
+                )
+                .await
+                .unwrap();
+        }
+        let files: Vec<FileMeta> = (0..100)
+            .map(|i| {
+                let url = Url::parse(&format!("memory:///test/{i}")).unwrap();
+                FileMeta {
+                    location: url,
+                    last_modified: 0,
+                    size: 12,
+                }
+            })
+            .collect();
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = crate::DefaultEngineBuilder::new(store)
+            .with_task_executor(executor)
+            .with_parallel_chunks(NonZero::new(10))
+            .build();
+
+        let json_handler = engine.json_handler();
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let data: Vec<RecordBatch> = json_handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .map_ok(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        let all_values: Vec<i32> = data
+            .iter()
+            .flat_map(|batch| {
+                let val_col: &Int32Array = batch.column(0).as_primitive();
+                (0..val_col.len()).map(|i| val_col.value(i)).collect_vec()
+            })
+            .collect();
+        assert_eq!(all_values, (0..100).collect_vec());
     }
 
     // Helper function to create test data
