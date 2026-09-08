@@ -289,7 +289,7 @@ impl Snapshot {
         if new_end_version < existing_snapshot_version {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
-            return Err(Error::Generic(format!(
+            return Err(Error::invalid_log_segment(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
             )));
@@ -2172,7 +2172,7 @@ mod tests {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
         let result = Snapshot::builder_from(base).build(ctx.engine.as_ref());
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
 
         let events = reporter.events();
         let failure = events

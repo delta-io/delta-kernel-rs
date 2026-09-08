@@ -195,14 +195,7 @@ impl LogSegment {
         };
         // A log with no checkpoint must start at version 0; a higher first version means a table
         // truncated without a checkpoint.
-        require!(
-            first.version == 0,
-            Error::generic(format!(
-                "Cannot build CRC: log has no checkpoint but its first commit is at version {} \
-                 (expected 0); the log appears truncated without a checkpoint",
-                first.version
-            ))
-        );
+        require!(first.version == 0, Error::MissingVersion(0));
         let delta = self.replay_commits_into_crc_delta(
             engine,
             self.listed.ascending_commit_files.iter(),
@@ -1087,9 +1080,9 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_result_error_with_message(
+        assert!(matches!(
             segment.build_crc_from_version_zero(&engine),
-            "log appears truncated without a checkpoint",
-        );
+            Err(Error::MissingVersion(0))
+        ));
     }
 }

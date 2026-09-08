@@ -1533,9 +1533,10 @@ impl LogSegment {
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
     for (i, f) in compactions.iter().enumerate() {
         let LogPathFileType::CompactedCommit { hi } = f.file_type else {
-            return Err(Error::invalid_log_segment(
-                "ascending_compaction_files contains non-compaction file",
-            ));
+            return Err(Error::invalid_log_segment(format!(
+                "ascending_compaction_files contains non-compaction file type: {:?}",
+                f.file_type
+            )));
         };
         if f.version > hi {
             return Err(Error::invalid_log_segment(format!(

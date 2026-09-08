@@ -809,7 +809,7 @@ impl Snapshot {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
                 Ok(Some(ict))
             }
-            None => Err(Error::generic("Last commit file not found in log segment")),
+            None => Err(Error::MissingVersion(self.version())),
         }
     }
 
@@ -837,28 +837,18 @@ impl Snapshot {
                         let ts = commit_file_meta.location.last_modified;
                         Ok(ts)
                     }
-                    None => Err(Error::generic(format!(
-                        "Last commit file not found in log segment for version {} \
-                         (ICT disabled): cannot read filesystem modification timestamp",
-                        self.version()
-                    ))),
+                    None => Err(Error::MissingVersion(self.version())),
                 }
             }
-            InCommitTimestampEnablement::Enabled { .. } => self
-                .get_in_commit_timestamp(engine)
-                .map_err(|e| {
-                    Error::generic(format!(
-                        "Unable to read in-commit timestamp for version {}: {e}",
-                        self.version()
-                    ))
-                })?
-                .ok_or_else(|| {
+            InCommitTimestampEnablement::Enabled { .. } => {
+                self.get_in_commit_timestamp(engine)?.ok_or_else(|| {
                     Error::internal_error(format!(
                         "Invalid state: version {}, ICT is enabled \
                         but get_in_commit_timestamp returned None",
                         self.version()
                     ))
-                }),
+                })
+            }
         }
     }
 
@@ -1995,9 +1985,8 @@ mod tests {
             snapshot.table_configuration().clone(),
         )?;
 
-        // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
-        assert_result_error_with_message(result, "Last commit file not found in log segment");
+        assert!(matches!(result, Err(Error::MissingVersion(0))));
 
         Ok(())
     }
@@ -2160,7 +2149,43 @@ mod tests {
         )?;
 
         let result = snapshot_no_commit.get_timestamp(&engine);
-        assert_result_error_with_message(result, "Last commit file not found in log segment");
+        assert!(matches!(result, Err(Error::MissingVersion(0))));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_timestamp_preserves_commit_read_error() -> DeltaResult<()> {
+        let table_root = "memory:///";
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let commit_data = vec![
+            create_commit_info(1677811175819, Some(1677811175999)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
+            create_metadata(
+                Some("test_id"),
+                Some("{\"type\":\"struct\",\"fields\":[]}"),
+                Some(1677811175819),
+                Some(("0".to_string(), "1612345678".to_string())),
+                false,
+            ),
+        ];
+        commit(table_root, store.as_ref(), 0, commit_data).await;
+        let loaded_snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        // Drop the synthesized CRC so timestamp resolution reads the referenced commit file.
+        let snapshot = Snapshot::new_with_crc(
+            loaded_snapshot.log_segment().clone(),
+            loaded_snapshot.table_configuration().clone(),
+            None,
+            false,
+        )?;
+        store.delete(&delta_path_for_version(0, "json")).await?;
+
+        let result = snapshot.get_timestamp(&engine);
+        assert!(
+            matches!(&result, Err(Error::FileNotFound(_))),
+            "expected FileNotFound, got {result:?}"
+        );
 
         Ok(())
     }

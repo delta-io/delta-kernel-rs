@@ -2749,7 +2749,10 @@ fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
+    assert!(matches!(
+        result,
+        Err(Error::InvalidLogSegment(message)) if message.contains("Commit")
+    ));
 }
 
 #[test]

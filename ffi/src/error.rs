@@ -1,4 +1,4 @@
-use delta_kernel::{DeltaResult, Error, Version};
+use delta_kernel::{DeltaResult, Error};
 use tracing::warn;
 
 use crate::handle::Handle;
@@ -90,7 +90,7 @@ impl From<Error> for KernelError {
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
             Error::MaxCatalogVersion(_) => KernelError::GenericError,
-            Error::LogTailVersionsNotContiguous { .. } => KernelError::GenericError,
+            Error::LogTailVersionsNotContiguous { .. } => KernelError::InvalidLogSegment,
             Error::IOError(_) => KernelError::IOErrorError,
             #[cfg(feature = "default-engine-base")]
             Error::Parquet(_) => KernelError::ParquetError,
@@ -258,9 +258,7 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
 ///
 /// The message is an [`ExclusiveRustString`] handle, which means the engine must
 /// downcall to [`allocate_kernel_string`](crate::allocate_kernel_string) to construct it. Kernel
-/// can then take ownership and free it appropriately after receiving the error. For
-/// [`KernelError::MissingVersionError`], the message must be the missing [`Version`] as an unsigned
-/// base-10 integer.
+/// can then take ownership and free it appropriately after receiving the error.
 #[repr(C)]
 pub struct EngineExecError {
     // TODO: we re-use KernelError for convenience, but we should ideally split this into a
@@ -293,15 +291,6 @@ fn messageless_error(code: KernelError, message: String, error: Error) -> Error 
         warn!("Discarding message for engine execution error ({code:?}): {message}");
     }
     error
-}
-
-fn missing_version_error(code: KernelError, message: String) -> Error {
-    match message.parse::<Version>() {
-        Ok(version) => Error::MissingVersion(version),
-        Err(_) => Error::generic(format!(
-            "engine execution error ({code:?}) has invalid missing-version payload: {message}"
-        )),
-    }
 }
 
 impl From<EngineExecError> for Error {
@@ -338,7 +327,6 @@ impl From<EngineExecError> for Error {
             KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
             KernelError::SchemaError => Error::Schema(message),
             KernelError::InvalidTransactionStateError => Error::InvalidTransactionState(message),
-            code @ KernelError::MissingVersionError => missing_version_error(code, message),
             code @ KernelError::EmptyLogError => messageless_error(code, message, Error::EmptyLog),
             code @ KernelError::MissingMetadataError => {
                 messageless_error(code, message, Error::MissingMetadata)
@@ -371,6 +359,7 @@ impl From<EngineExecError> for Error {
             | KernelError::RowTrackingChangeFeedUnsupported
             | KernelError::LiteralExpressionTransformError
             | KernelError::LogHistoryError
+            | KernelError::MissingVersionError
             | KernelError::UnpublishedVersionError) => {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
             }
@@ -427,15 +416,26 @@ mod error_code_tests {
             KernelError::from(Error::InvalidLogSegment("invalid".to_string())),
             KernelError::InvalidLogSegment
         );
+        assert_eq!(
+            KernelError::from(Error::LogTailVersionsNotContiguous {
+                first_version: 1,
+                second_version: 3,
+            }),
+            KernelError::InvalidLogSegment
+        );
         assert_eq!(KernelError::InvalidLogSegment as i32, 47);
         assert_eq!(KernelError::UnpublishedVersionError as i32, 48);
         assert_eq!(KernelError::EmptyLogError as i32, 49);
     }
 
     #[test]
-    fn log_segment_errors_preserve_their_ffi_contract() {
+    fn engine_log_segment_errors_use_supported_ffi_mappings() {
         let missing_version: Error = exec_error(KernelError::MissingVersionError, "7").into();
-        assert!(matches!(missing_version, Error::MissingVersion(7)));
+        assert!(matches!(
+            missing_version,
+            Error::Generic(message)
+                if message == "engine execution error (MissingVersionError): 7"
+        ));
 
         let empty_log: Error = exec_error(KernelError::EmptyLogError, "").into();
         assert_eq!(empty_log.to_string(), "No table version found.");
@@ -471,6 +471,10 @@ mod tests {
     #[case::fallback_row_tracking(
         KernelError::RowTrackingChangeFeedUnsupported,
         "Generic delta kernel error: engine execution error (RowTrackingChangeFeedUnsupported): boom"
+    )]
+    #[case::fallback_missing_version(
+        KernelError::MissingVersionError,
+        "Generic delta kernel error: engine execution error (MissingVersionError): boom"
     )]
     #[case::fallback_unpublished_version(
         KernelError::UnpublishedVersionError,
