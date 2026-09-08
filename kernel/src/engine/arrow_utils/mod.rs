@@ -13,6 +13,8 @@ use tracing::debug;
 
 use self::apply_schema::apply_schema_to_struct;
 use crate::arrow::array::cast::AsArray;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::arrow::array::BinaryBuilder;
 use crate::arrow::array::{
     make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
     MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
@@ -26,8 +28,14 @@ use crate::arrow::datatypes::{
 };
 use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
 use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
+#[cfg(feature = "geo-type-in-dev")]
+use crate::engine::arrow_conversion::geo::{
+    GEOARROW_EXTENSION_NAME_KEY, GEOARROW_WKB_EXTENSION_NAME,
+};
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::engine::arrow_geometry::wkt_to_wkb_bytes;
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
@@ -1282,6 +1290,8 @@ impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
         use PrimitiveType::*;
         match ptype {
             Timestamp | TimestampNtz | Date | Decimal(_) => Cow::Owned(String),
+            #[cfg(feature = "geo-type-in-dev")]
+            Geometry(_) => Cow::Owned(String),
             _ => Cow::Borrowed(ptype),
         }
     }
@@ -1310,7 +1320,7 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<
     let columns = columns
         .into_iter()
         .zip(target.fields().iter())
-        .map(|(arr, field)| cast_array_to_type(arr, field.data_type(), &opts))
+        .map(|(arr, field)| cast_array_to_field(arr, field, &opts))
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(RecordBatch::try_new_with_options(
         target.clone(),
@@ -1361,28 +1371,30 @@ pub(crate) fn coerce_columns_to_schema(
     columns
         .into_iter()
         .zip(target.fields().iter())
-        .map(|(arr, field)| cast_array_to_type(arr, field.data_type(), &opts))
+        .map(|(arr, field)| cast_array_to_field(arr, field, &opts))
         .collect()
 }
 
-/// Casts one Arrow [`ArrowArray`] of any type to `target`.
+/// Casts one Arrow [`ArrowArray`] of any type to `target`'s data type.
 ///
 /// A struct tracks which of its rows are null separately from its children, so casting a child
 /// means rebuilding the struct around it. This recurses into `Struct` by hand, carrying that
 /// row-level null information onto the rebuilt struct: given a struct column whose row 0 is null,
 /// row 0 is still null after the cast. Everything else, `Map` and `List` included, goes to
 /// [`cast_with_options`], which rebuilds the container using the field names in `target`.
+/// Geometry fields use `target`'s GeoArrow metadata to convert WKT strings to WKB bytes.
 ///
 /// `opts` decides what a failed leaf cast does: `safe: true` nulls the cell, strict errors.
-fn cast_array_to_type(
+fn cast_array_to_field(
     array: ArrowArrayRef,
-    target: &ArrowDataType,
+    target: &ArrowField,
     opts: &CastOptions<'_>,
 ) -> DeltaResult<ArrowArrayRef> {
-    if array.data_type() == target {
+    let target_type = target.data_type();
+    if array.data_type() == target_type {
         return Ok(array);
     }
-    match target {
+    match target_type {
         ArrowDataType::Struct(target_fields) => {
             let s = array.as_struct_opt().ok_or_else(|| {
                 Error::generic(format!(
@@ -1403,7 +1415,7 @@ fn cast_array_to_type(
                 .columns()
                 .iter()
                 .zip(target_fields.iter())
-                .map(|(c, f)| cast_array_to_type(c.clone(), f.data_type(), opts))
+                .map(|(c, f)| cast_array_to_field(c.clone(), f, opts))
                 .collect::<DeltaResult<Vec<_>>>()?;
             Ok(Arc::new(StructArray::try_new(
                 target_fields.clone(),
@@ -1411,8 +1423,69 @@ fn cast_array_to_type(
                 nulls,
             )?))
         }
-        _ => Ok(cast_with_options(&array, target, opts)?),
+        _ => {
+            #[cfg(feature = "geo-type-in-dev")]
+            if is_geoarrow_wkb_field(target) {
+                return cast_geometry_wkt_array_to_wkb(array, opts);
+            }
+            Ok(cast_with_options(&array, target_type, opts)?)
+        }
     }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn is_geoarrow_wkb_field(field: &ArrowField) -> bool {
+    field.data_type() == &ArrowDataType::Binary
+        && field
+            .metadata()
+            .get(GEOARROW_EXTENSION_NAME_KEY)
+            .is_some_and(|name| name == GEOARROW_WKB_EXTENSION_NAME)
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn cast_geometry_wkt_array_to_wkb(
+    array: ArrowArrayRef,
+    opts: &CastOptions<'_>,
+) -> DeltaResult<ArrowArrayRef> {
+    match array.data_type() {
+        ArrowDataType::Binary => Ok(array),
+        ArrowDataType::Utf8 => Ok(Arc::new(append_geometry_wkt_values(
+            array.as_string::<i32>().iter(),
+            array.len(),
+            opts.safe,
+        )?)),
+        ArrowDataType::LargeUtf8 => Ok(Arc::new(append_geometry_wkt_values(
+            array.as_string::<i64>().iter(),
+            array.len(),
+            opts.safe,
+        )?)),
+        ArrowDataType::Utf8View => Ok(Arc::new(append_geometry_wkt_values(
+            array.as_string_view().iter(),
+            array.len(),
+            opts.safe,
+        )?)),
+        _ => Ok(cast_with_options(&array, &ArrowDataType::Binary, opts)?),
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn append_geometry_wkt_values<'a>(
+    values: impl Iterator<Item = Option<&'a str>>,
+    len: usize,
+    safe: bool,
+) -> DeltaResult<crate::arrow::array::BinaryArray> {
+    let mut builder = BinaryBuilder::with_capacity(len, 0);
+    for value in values {
+        match value {
+            Some(raw) if !raw.is_empty() => match wkt_to_wkb_bytes(raw) {
+                Ok(bytes) => builder.append_value(bytes),
+                Err(_) if safe => builder.append_null(),
+                Err(err) => return Err(err),
+            },
+            _ => builder.append_null(),
+        }
+    }
+    Ok(builder.finish())
 }
 
 pub(crate) fn filter_to_record_batch(
@@ -1592,6 +1665,8 @@ mod tests {
     };
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::unit_test_utils::geometry_type;
 
     fn column_mapping_cases() -> [ColumnMappingMode; 3] {
         [
@@ -2009,6 +2084,60 @@ mod tests {
         // UserId min/max stay populated on every row even when the sibling EventTime fails.
         assert_eq!(min_user.null_count(), 0);
         assert_eq!(max_user.null_count(), 0);
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_parse_json_impl_geometry_stats_parse_to_binary() {
+        let schema = schema_ref! {
+            nullable "minValues": {
+                nullable "geom": (geometry_type("EPSG:4326")),
+            },
+            nullable "maxValues": {
+                nullable "geom": (geometry_type("EPSG:4326")),
+            },
+        };
+        let inputs: Vec<Option<&str>> = vec![Some(
+            r#"{"minValues": {"geom": "POINT(-122.419 37.774)"},
+                "maxValues": {"geom": "LINESTRING(-122.419 37.774, -120.503 38.021)"}}"#,
+        )];
+
+        let batch = parse_json_impl(&StringArray::from(inputs), schema).unwrap();
+        let min_values = batch.column_by_name("minValues").unwrap().as_struct();
+        let max_values = batch.column_by_name("maxValues").unwrap().as_struct();
+        let min_geom = min_values.column_by_name("geom").unwrap();
+        let max_geom = max_values.column_by_name("geom").unwrap();
+
+        assert_eq!(min_geom.data_type(), &ArrowDataType::Binary);
+        assert_eq!(max_geom.data_type(), &ArrowDataType::Binary);
+        assert!(!min_geom.as_binary::<i32>().value(0).is_empty());
+        assert!(!max_geom.as_binary::<i32>().value(0).is_empty());
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_parse_json_impl_geometry_stats_bad_values_become_null() {
+        let schema = schema_ref! {
+            nullable "minValues": {
+                nullable "geom": (geometry_type("EPSG:4326")),
+            },
+            nullable "maxValues": {
+                nullable "geom": (geometry_type("EPSG:4326")),
+            },
+        };
+        let inputs: Vec<Option<&str>> = vec![Some(
+            r#"{"minValues": {"geom": ""},
+                "maxValues": {"geom": "not-wkt"}}"#,
+        )];
+
+        let batch = parse_json_impl(&StringArray::from(inputs), schema).unwrap();
+        let min_values = batch.column_by_name("minValues").unwrap().as_struct();
+        let max_values = batch.column_by_name("maxValues").unwrap().as_struct();
+        let min_geom = min_values.column_by_name("geom").unwrap();
+        let max_geom = max_values.column_by_name("geom").unwrap();
+
+        assert!(min_geom.is_null(0));
+        assert!(max_geom.is_null(0));
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub mod arrow_utils;
 pub(crate) mod arrow_utils;
 #[cfg(all(feature = "internal-api", feature = "arrow-expression"))]
 pub use self::arrow_utils::{parse_json, to_json_bytes};
+#[cfg(all(feature = "arrow-expression", feature = "geo-type-in-dev"))]
+pub(crate) mod arrow_geometry;
 
 // The plan executor support modules read Arrow data (`arrow_utils`, `arrow_data`), so they
 // require the Arrow engine base in addition to the declarative-plans IR.

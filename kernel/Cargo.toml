@@ -65,6 +65,9 @@ z85 = "3.0.6"
 reqwest = { version = "0.13", default-features = false, optional = true }
 # both arrow versions below are optional and require object_store
 object_store_13 = { package = "object_store", version = "0.13.2", optional = true, features = ["aws", "azure", "gcp", "http"] }
+geoarrow-array = { version = "0.8.0", optional = true }
+geoarrow-schema = { version = "0.8.0", optional = true }
+geoarrow_arrow_array_58 = { package = "arrow-array", version = "58", optional = true }
 
 # arrow 58
 [dependencies.arrow_58]
@@ -131,7 +134,11 @@ check-constraints-in-dev = []
 adaptive-metadata-in-dev = []
 # Experimental, temporary, test-only feature flag guarding the in-progress geospatial
 # (geometry/geography) type work. TODO(#2949): remove once full geo support ships.
-geo-type-in-dev = []
+geo-type-in-dev = [
+  "dep:geoarrow-array",
+  "dep:geoarrow-schema",
+  "dep:geoarrow_arrow_array_58",
+]
 # Experimental feature flag guarding Row Tracking preservation for file removals and
 # deletion-vector updates. TODO(#3227): remove the flag and emit `delta.rowTracking.preserved` in
 # CommitInfo tags when preservation support is ready.
