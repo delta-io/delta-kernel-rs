@@ -537,6 +537,7 @@ mod tests {
             .with_task_executor(executor)
             .with_buffer_size(NonZero::new(4).unwrap())
             .with_batch_size(NonZero::new(8).unwrap())
+            .with_parallel_chunks(NonZero::new(4))
             .build();
         test_arrow_engine(&engine, &url);
     }
