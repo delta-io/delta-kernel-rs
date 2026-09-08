@@ -5,6 +5,7 @@ header = """
 # Changelog\n
 """
 # Tera template
+# release.sh parses the `## [v{{ version }}]` prefix below when it replaces and verifies a section.
 body = """
 ## [v{{ version }}](https://github.com/delta-io/delta-kernel-rs/tree/v{{ version }}/) ({{ timestamp | date(format="%Y-%m-%d") }})
 

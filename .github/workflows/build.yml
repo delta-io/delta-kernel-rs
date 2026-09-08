@@ -71,7 +71,7 @@ jobs:
       - name: Test release tooling
         run: .github/scripts/test-release.sh
       - name: Verify pending release changelog
-        if: startsWith(github.head_ref, 'release') || startsWith(github.ref_name, 'release')
+        if: startsWith(github.head_ref, 'release/') || startsWith(github.ref_name, 'release/')
         run: ./release.sh verify-changelog
 
   ai-review-config:

@@ -73,5 +73,5 @@ run: |
 The `release-tooling` job in `build.yml` fetches full history and tags because release branches
 verify the pending changelog against every PR since the previous Kernel release. Keep
 `fetch-depth: 0` on that checkout. The regression tests run on every pull request, while live
-verification is restricted to branches whose names start with `release`; otherwise the window
+verification is restricted to branches whose names start with `release/`; otherwise the window
 between merging a release PR and pushing its tag could block unrelated pull requests.

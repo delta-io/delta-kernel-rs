@@ -112,25 +112,38 @@ run_cargo_release() {
 # Ask git-cliff for the latest Kernel release so changelog generation and verification use the
 # same tag grammar from cliff.toml.
 latest_kernel_release_tag() {
-    git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --latest --context | \
-        jq -r '.[0].version // empty'
+    git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --use-branch-tags \
+        --latest --context | jq -r '.[0].version // empty'
+}
+
+release_changelog_heading() {
+    local version="$1"
+    printf '## [v%s]' "$version"
 }
 
 release_changelog_section() {
-    local version="$1"
-    awk -v heading="## [v$version]" '
+    local heading
+    heading=$(release_changelog_heading "$1")
+    awk -v heading="$heading" '
         index($0, heading) == 1 { in_release = 1 }
         in_release && /^## \[v/ && index($0, heading) != 1 { exit }
         in_release { print }
     ' "$REPO_ROOT/CHANGELOG.md"
 }
 
-# Verify that the current release section contains every PR reachable from the previous Kernel
-# release tag. The commit that introduced the section is excluded because that release PR cannot
-# list itself. This check runs against GitHub's merge ref, so it becomes stale whenever main moves.
+release_changelog_subjects() {
+    local version="$1"
+    git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --use-branch-tags \
+        --unreleased --include-path "*" --tag "$version" --context | \
+        jq -r '.[].commits[].message | split("\n")[0]'
+}
+
+# Verify that the current release section contains every PR git-cliff would render after the
+# previous Kernel release. This check runs against GitHub's merge ref, so it becomes stale whenever
+# main moves.
 verify_release_changelog() {
     local version="${1:-}"
-    local previous_tag section release_commit hash subject pr
+    local previous_tag section subjects subject pr
     local missing=0
 
     if [[ -z "$version" ]]; then
@@ -153,12 +166,12 @@ verify_release_changelog() {
         return 1
     fi
 
-    release_commit=$(git -C "$REPO_ROOT" log -S"## [v$version]" --format=%H \
-        "$previous_tag..HEAD" -- CHANGELOG.md | head -n 1)
+    if ! subjects=$(release_changelog_subjects "$version"); then
+        log_warning "Could not determine the changelog entries for v$version"
+        return 1
+    fi
 
-    while IFS=$'\t' read -r hash subject; do
-        [[ -n "$hash" ]] || continue
-        [[ "$hash" == "$release_commit" ]] && continue
+    while IFS= read -r subject; do
         if [[ "$subject" =~ \(\#([0-9]+)\)$ ]]; then
             pr="${BASH_REMATCH[1]}"
             if ! grep -Fq "[#$pr]:" <<< "$section"; then
@@ -166,7 +179,7 @@ verify_release_changelog() {
                 missing=1
             fi
         fi
-    done < <(git -C "$REPO_ROOT" log --format='%H%x09%s' "$previous_tag..HEAD")
+    done <<< "$subjects"
 
     if (( missing != 0 )); then
         log_warning "Update from main, then run: ./release.sh changelog $version"
@@ -177,8 +190,9 @@ verify_release_changelog() {
 }
 
 strip_release_changelog_section() {
-    local version="$1" output="$2"
-    awk -v heading="## [v$version]" '
+    local output="$2" heading
+    heading=$(release_changelog_heading "$1")
+    awk -v heading="$heading" '
         index($0, heading) == 1 { skipping = 1; next }
         skipping && /^## \[v/ { skipping = 0 }
         !skipping { print }
@@ -198,8 +212,9 @@ refresh_release_changelog() {
     strip_release_changelog_section "$version" "$stripped"
     mv "$stripped" "$changelog"
 
-    if ! git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --unreleased \
-        --prepend "$changelog" --include-path "*" --tag "$version"; then
+    if ! git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" \
+        --use-branch-tags --unreleased --prepend "$changelog" --include-path "*" \
+        --tag "$version"; then
         mv "$backup" "$changelog"
         log_error "Failed to refresh CHANGELOG.md"
     fi

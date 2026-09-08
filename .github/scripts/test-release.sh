@@ -57,15 +57,25 @@ test_changelog_refresh_and_verification() {
     cp "$REPOSITORY_ROOT/release.sh" "$REPOSITORY_ROOT/cliff.toml" "$repository/"
 
     cd "$repository"
-    git init -q
+    git init -q -b main
     git config user.email release-test@example.com
     git config user.name "Release Test"
     git config core.hooksPath /dev/null
 
-    printf '# Changelog\n' > CHANGELOG.md
+    printf '%s\n' \
+        '# Changelog' \
+        '' \
+        '## [v0.28.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.28.0/)' \
+        '' \
+        'Previous release notes' > CHANGELOG.md
     git add CHANGELOG.md
     git commit -q -m "chore: previous release"
     git tag v0.28.0
+
+    git switch -q -c divergent-release
+    commit_file "release 100.0.0" "divergent"
+    git tag v100.0.0
+    git switch -q main
 
     commit_file "chore: publish DAT artifact" "dat"
     git tag v999.0.0_dat
@@ -81,10 +91,20 @@ test_changelog_refresh_and_verification() {
     ./release.sh changelog 0.29.0
     assert_contains CHANGELOG.md "([#101])"
     assert_contains CHANGELOG.md "v0.28.0...v0.29.0"
+    assert_count CHANGELOG.md 1 "## [v0.28.0]"
+    assert_contains CHANGELOG.md "Previous release notes"
     git add CHANGELOG.md
     git commit -q -m "release 0.29.0 (#999)"
 
-    # A release commit cannot mention its own PR in the changelog it introduced.
+    # Exercise the no-argument path used by CI. A release commit cannot mention its own PR in the
+    # changelog it introduced, and cliff.toml deliberately skips it.
+    get_current_version() {
+        [[ "$1" == "delta_kernel" ]] || fail "unexpected crate name: $1"
+        echo 0.29.0
+    }
+    verify_release_changelog
+
+    commit_file "chore: refresh release changelog (#998)" "housekeeping"
     ./release.sh verify-changelog 0.29.0
 
     commit_file "fix: include late change (#102)" "late"
@@ -92,10 +112,16 @@ test_changelog_refresh_and_verification() {
         fail "stale changelog verification unexpectedly passed"
     fi
     assert_contains verification.log "missing PR #102"
+    if grep -Fq "missing PR #998" verification.log; then
+        fail "verification required a commit skipped by cliff.toml"
+    fi
 
     ./release.sh changelog 0.29.0
     assert_count CHANGELOG.md 1 "([#101])"
     assert_count CHANGELOG.md 1 "([#102])"
+    assert_count CHANGELOG.md 1 "## [v0.29.0]"
+    assert_count CHANGELOG.md 1 "## [v0.28.0]"
+    assert_contains CHANGELOG.md "Previous release notes"
     ./release.sh verify-changelog 0.29.0
 }
 
