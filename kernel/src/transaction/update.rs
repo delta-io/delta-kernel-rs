@@ -102,6 +102,7 @@ impl Transaction {
             commit_timestamp,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: vec![],
+            provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
@@ -174,6 +175,28 @@ impl Transaction {
     #[cfg(feature = "row-tracking-preservation-in-dev")]
     pub fn ack_row_tracking_preservation(&mut self) {
         self.row_tracking_preservation_acknowledged = true;
+    }
+
+    /// Set an explicit row-tracking high-water mark for this transaction.
+    ///
+    /// Use this when row IDs must also be coordinated with another system. Kernel still assigns
+    /// row-tracking fields to added files and rejects this value if it is less than the high-water
+    /// mark calculated from those files. Callers cannot use [`Self::with_domain_metadata`] to
+    /// modify `delta.rowTracking` or other `delta.*` domains. Table-feature and table-state
+    /// validation occurs during commit.
+    #[internal_api]
+    #[allow(dead_code)] // used in FFI
+    pub(crate) fn with_row_tracking_high_water_mark(
+        mut self,
+        high_water_mark: i64,
+    ) -> DeltaResult<Self> {
+        if self.provided_row_tracking_high_water_mark.is_some() {
+            return Err(Error::generic(
+                "Row-tracking high-water mark already specified in this transaction",
+            ));
+        }
+        self.provided_row_tracking_high_water_mark = Some(high_water_mark);
+        Ok(self)
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to

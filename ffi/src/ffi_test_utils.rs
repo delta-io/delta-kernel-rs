@@ -120,15 +120,38 @@ pub(crate) fn assert_extern_result_error_with_message<T>(
     expected_etype: KernelError,
     opt_message: Option<&str>,
 ) {
+    let error = expect_extern_result_error(res, expected_etype);
+    if let Some(expected_message) = opt_message {
+        assert_eq!(error.message, expected_message);
+    }
+}
+
+/// Check the error type and a stable message substring while recovering the error to prevent
+/// leaks.
+pub(crate) fn assert_extern_result_error_contains<T>(
+    res: ExternResult<T>,
+    expected_etype: KernelError,
+    expected_message: &str,
+) {
+    let error = expect_extern_result_error(res, expected_etype);
+    assert!(
+        error.message.contains(expected_message),
+        "expected error message to contain '{expected_message}', got '{}'",
+        error.message
+    );
+}
+
+fn expect_extern_result_error<T>(
+    res: ExternResult<T>,
+    expected_etype: KernelError,
+) -> EngineErrorWithMessage {
     match res {
         ExternResult::Err(e) => {
             let error = unsafe { recover_error(e) };
             assert_eq!(error.etype, expected_etype);
-            if let Some(expected_message) = opt_message {
-                assert_eq!(error.message, expected_message);
-            }
+            error
         }
-        _ => panic!("Expected error of type '{expected_etype:?}' and message '{opt_message:?}'"),
+        _ => panic!("Expected error of type '{expected_etype:?}'"),
     }
 }
 

@@ -33,6 +33,11 @@ impl RowTrackingDomainMetadata {
         }
     }
 
+    /// Returns the highest row ID represented by this metadata.
+    pub(crate) fn high_water_mark(&self) -> i64 {
+        self.row_id_high_water_mark
+    }
+
     /// Creates the initial row tracking domain metadata for a newly created table.
     ///
     /// Sets the high water mark to -1, meaning no rows have been assigned IDs yet.
