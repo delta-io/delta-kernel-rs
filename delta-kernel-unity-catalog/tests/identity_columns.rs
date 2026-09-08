@@ -204,21 +204,24 @@ async fn create_table_allocates_uc_sequence_and_enables_feature() -> Result<(), 
     let table_id = "tbl-cic-demo";
     let client = Arc::new(InMemorySequenceClient::new());
 
-    // 1. Mint ids and register the sequences in UC.
+    // 1. Mint ids (each column gets a distinct sequence_id).
     let cols = [column("id", 1, 1), column("row_id", 1000, 10)];
-    create_identity_sequences(client.as_ref(), table_id, &cols).await?;
     assert!(
         cols[0].sequence_id != cols[1].sequence_id,
         "each column should get a distinct minted id"
     );
 
-    // 2. Stamp sequence_ids into the schema and create the table (auto-enables identityColumnsCic).
+    // 2. Stamp sequence_ids into the schema and commit the CREATE-table transaction first
+    //    (auto-enables identityColumnsCic).
     let schema = schema_for(&cols);
     let _commit = create_table(&table_path, schema, "UCCatalogTest/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    // 3. Reload and assert protocol + schema.
+    // 3. Only after the table exists, register the sequences in UC.
+    create_identity_sequences(client.as_ref(), table_id, &cols).await?;
+
+    // 4. Reload and assert protocol + schema.
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert!(
@@ -234,7 +237,7 @@ async fn create_table_allocates_uc_sequence_and_enables_feature() -> Result<(), 
     assert_eq!(read_cols[0].sequence_id, cols[0].sequence_id);
     assert_eq!(read_cols[1].sequence_id, cols[1].sequence_id);
 
-    // 4. The sequences really exist in UC: a manager built from the reloaded schema can reserve and
+    // 5. The sequences really exist in UC: a manager built from the reloaded schema can reserve and
     //    fill.
     let manager = IdentityColumnManager::new(&read_schema, client, table_id)?;
     manager.ensure_available(3).await?;

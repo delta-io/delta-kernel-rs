@@ -1,9 +1,10 @@
 //! CREATE-table helper for allocating identity sequences.
 //!
-//! At CREATE-table time the caller mints a `sequence_id` per identity column, builds an
-//! [`IdentityColumnInfo`] for each, and calls [`create_identity_sequences`] to register them all
-//! with the UC Identity Sequence Service in one batch. The caller then stamps the ids into the
-//! table schema via [`delta_kernel::identity_columns::identity_column_cic`] and creates the table.
+//! At CREATE-table time the caller mints a `sequence_id` per identity column and builds an
+//! [`IdentityColumnInfo`] for each. It stamps those ids into the table schema via
+//! [`delta_kernel::identity_columns::identity_column_cic`] and commits the CREATE-table
+//! transaction first, then calls [`create_identity_sequences`] to register them all with the UC
+//! Identity Sequence Service in one batch.
 //!
 //! This is a one-shot setup phase, separate from the write-time reserve/fill path
 //! ([`crate::IdentityColumnManager`]), which is built later from the already-stamped schema.

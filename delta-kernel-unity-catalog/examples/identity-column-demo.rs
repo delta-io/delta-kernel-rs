@@ -86,7 +86,8 @@ async fn run_flow<C>(
 where
     C: SequenceClient + 'static,
 {
-    // Mint a sequence_id per identity column, then register them all in UC in one batch.
+    // Mint a sequence_id per identity column. Registration in UC happens only after the
+    // CREATE-table commit below, so a failed commit never orphans a sequence.
     let mint = |name: &str, start, step| IdentityColumnInfo {
         column_name: name.to_string(),
         sequence_id: Uuid::new_v4().to_string(),
@@ -97,7 +98,7 @@ where
     let infos = [mint("id", 1, 1), mint("row_id", 1000, 10)];
 
     println!(
-        "\n[1/6] Allocating {} sequences (table_id={table_id})",
+        "\n[1/6] Minting {} sequence ids (table_id={table_id})",
         infos.len()
     );
     for info in &infos {
@@ -107,7 +108,10 @@ where
         );
     }
 
-    println!("\n[2/6] Building schema with identity_column_cic and calling create_table");
+    println!(
+        "\n[2/6] Building schema with identity_column_cic, committing create_table, then \
+         registering sequences in UC"
+    );
     let schema = Arc::new(StructType::try_new(vec![
         identity_column_cic(
             &infos[0].column_name,
@@ -130,6 +134,7 @@ where
     println!("    committed version 0");
 
     create_identity_sequences(client.as_ref(), table_id, &infos).await?;
+    println!("    registered sequences in UC (after commit)");
 
     let log_path = format!("{table_path}/_delta_log/00000000000000000000.json");
     println!("\n[3/6] Delta log on disk:");
