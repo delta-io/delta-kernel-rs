@@ -3512,16 +3512,17 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
 #[case::published_through_snapshot(&[0, 1, 2], &[], None, None)]
 #[case::staged_only(&[], &[0, 1, 2], None, Some(0))]
 #[case::published_prefix(&[0, 1, 2], &[3, 4, 5], None, Some(3))]
-#[case::checkpoint_with_staged_tail(&[], &[6, 7, 8], Some(5), Some(6))]
+#[case::checkpoint_without_published_commit(&[], &[], Some(5), Some(0))]
+#[case::checkpoint_with_staged_tail(&[5], &[6, 7, 8], Some(5), Some(6))]
 #[case::checkpoint_supersedes_older_commits(
-    &[0, 1, 2, 3, 4],
+    &[0, 1, 2, 3, 4, 5],
     &[6, 7, 8],
     Some(5),
     Some(6)
 )]
-#[case::checkpoint_only(&[], &[], Some(5), None)]
+#[case::checkpoint_at_published_end(&[5], &[], Some(5), None)]
 #[tokio::test]
-async fn validate_published_uses_checkpoint_and_commit_watermarks(
+async fn validate_published_uses_published_commit_watermark(
     #[case] published_commit_versions: &[Version],
     #[case] staged_commit_versions: &[Version],
     #[case] checkpoint_version: Option<Version>,

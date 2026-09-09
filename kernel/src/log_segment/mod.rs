@@ -1362,10 +1362,7 @@ impl LogSegment {
     }
 
     pub(crate) fn validate_published(&self) -> DeltaResult<()> {
-        let published_through = self
-            .checkpoint_version
-            .max(self.listed.max_published_version);
-        match published_through {
+        match self.listed.max_published_version {
             Some(version) if version == self.end_version => Ok(()),
             Some(version) if version < self.end_version => {
                 Err(Error::UnpublishedVersion(version + 1))
