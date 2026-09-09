@@ -139,7 +139,7 @@ static DATA_CHANGE_COLUMN: LazyLock<StructField> =
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
-fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRef> {
+pub(crate) fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRef> {
     let patch = SchemaStructPatchBuilder::new()
         .append(StructField::nullable("baseRowId", DataType::LONG))
         .append(StructField::nullable(
