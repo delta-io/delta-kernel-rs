@@ -2,7 +2,7 @@
 //!
 //! Drives the full flow -- mint sequence ids, register them in UC, stamp them
 //! into a Delta schema, create the table, reserve ranges and fill a data batch
-//! via an `IdentityColumnManager`, write a Parquet file, commit v1, and read the
+//! via an `IdentityColumnWriter`, write a Parquet file, commit v1, and read the
 //! table back -- printing every step so you can verify what kernel does on disk.
 //!
 //! This example uses the [`InMemorySequenceClient`] — no external services
@@ -27,9 +27,7 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::identity_columns::{
-    detect_identity_columns, identity_column_cic, IdentityColumnInfo,
-};
+use delta_kernel::identity_columns::{cic_column, detect_identity_columns, IdentityColumnInfo};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
@@ -39,7 +37,7 @@ use delta_kernel::Engine as KernelEngine;
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel_unity_catalog::{create_identity_sequences, IdentityColumnManager};
+use delta_kernel_unity_catalog::{register_identity_sequences, IdentityColumnWriter};
 use unity_catalog_delta_client_api::{InMemorySequenceClient, SequenceClient};
 use uuid::Uuid;
 
@@ -109,18 +107,18 @@ where
     }
 
     println!(
-        "\n[2/6] Building schema with identity_column_cic, committing create_table, then \
+        "\n[2/6] Building schema with cic_column, committing create_table, then \
          registering sequences in UC"
     );
     let schema = Arc::new(StructType::try_new(vec![
-        identity_column_cic(
+        cic_column(
             &infos[0].column_name,
             &infos[0].sequence_id,
             infos[0].start,
             infos[0].step,
         ),
         StructField::new("payload", DataType::STRING, true),
-        identity_column_cic(
+        cic_column(
             &infos[1].column_name,
             &infos[1].sequence_id,
             infos[1].start,
@@ -133,7 +131,7 @@ where
         .commit(engine.as_ref())?;
     println!("    committed version 0");
 
-    create_identity_sequences(client.as_ref(), table_id, &infos).await?;
+    register_identity_sequences(client.as_ref(), table_id, &infos).await?;
     println!("    registered sequences in UC (after commit)");
 
     let log_path = format!("{table_path}/_delta_log/00000000000000000000.json");
@@ -164,12 +162,12 @@ where
     }
 
     println!("\n[5/6] Writing a Parquet file and committing v1");
-    // The manager hides the sequence client: the engine only reserves and fills.
-    let manager = IdentityColumnManager::new(&read_schema, client.clone(), table_id)?;
+    // The writer hides the sequence client: the engine only reserves and fills.
+    let writer = IdentityColumnWriter::new(&read_schema, client.clone(), table_id)?;
 
     const BATCH_ROWS: u64 = 3;
     // Ensure enough is reserved for this batch (reserves the deficit if nothing was prefetched).
-    manager.ensure_available(BATCH_ROWS).await?;
+    writer.ensure_available(BATCH_ROWS).await?;
 
     // Engine-side batch: only the non-identity columns. Kernel fills the rest.
     let payload: ArrayRef = Arc::new(StringArray::from(vec![
@@ -186,8 +184,11 @@ where
         vec![payload],
     )?;
 
-    let filled_data =
-        manager.fill_engine_batch(&ArrowEngineData::new(input_batch), &read_schema)?;
+    let filled_data = writer.fill_engine_batch(
+        engine.evaluation_handler().as_ref(),
+        &ArrowEngineData::new(input_batch),
+        &read_schema,
+    )?;
     let filled = ArrowEngineData::try_from_engine_data(filled_data)?
         .record_batch()
         .clone();

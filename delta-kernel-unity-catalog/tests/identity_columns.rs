@@ -2,9 +2,9 @@
 //!
 //! Covers both ends of the CIC write flow through the public API:
 //! - CREATE TABLE orchestration: mint sequence ids, register them via
-//!   [`create_identity_sequences`], stamp them into the schema via [`identity_column_cic`], and
-//!   commit a table with the `identityColumnsCic` writer feature auto-enabled.
-//! - Reserve + fill: an [`IdentityColumnManager`] built from the table schema reserves ranges and
+//!   [`register_identity_sequences`], stamp them into the schema via [`cic_column`], and commit a
+//!   table with the `identityColumnsCic` writer feature auto-enabled.
+//! - Reserve + fill: an [`IdentityColumnWriter`] built from the table schema reserves ranges and
 //!   fills batches with generated identity values.
 
 use std::sync::Arc;
@@ -13,9 +13,8 @@ use delta_kernel::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray}
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::identity_columns::{
-    detect_identity_columns, identity_column_cic, IdentityColumnInfo,
-};
+use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
+use delta_kernel::identity_columns::{cic_column, detect_identity_columns, IdentityColumnInfo};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
@@ -26,7 +25,7 @@ use delta_kernel::EngineData;
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::DefaultEngineBuilder;
-use delta_kernel_unity_catalog::{create_identity_sequences, IdentityColumnManager};
+use delta_kernel_unity_catalog::{register_identity_sequences, IdentityColumnWriter};
 use unity_catalog_delta_client_api::InMemorySequenceClient;
 use uuid::Uuid;
 
@@ -49,14 +48,14 @@ fn column(name: &str, start: i64, step: i64) -> IdentityColumnInfo {
 fn schema_for(cols: &[IdentityColumnInfo]) -> SchemaRef {
     Arc::new(
         StructType::try_new(vec![
-            identity_column_cic(
+            cic_column(
                 &cols[0].column_name,
                 &cols[0].sequence_id,
                 cols[0].start,
                 cols[0].step,
             ),
             StructField::new("payload", DataType::STRING, true),
-            identity_column_cic(
+            cic_column(
                 &cols[1].column_name,
                 &cols[1].sequence_id,
                 cols[1].start,
@@ -109,68 +108,68 @@ fn build_engine(
 }
 
 // ============================================================================
-// Reserve + fill via IdentityColumnManager
+// Reserve + fill via IdentityColumnWriter
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn manager_reserve_and_fill_multiple_columns() {
+async fn writer_reserve_and_fill_multiple_columns() {
     let cols = [column("id", 1, 1), column("row_id", 100, 10)];
     let client = Arc::new(InMemorySequenceClient::new());
-    create_identity_sequences(client.as_ref(), SEQ_TABLE, &cols)
+    register_identity_sequences(client.as_ref(), SEQ_TABLE, &cols)
         .await
         .unwrap();
     let schema = schema_for(&cols);
 
-    let manager = IdentityColumnManager::new(&schema, client, SEQ_TABLE).unwrap();
-    manager.reserve(5).await.unwrap();
+    let writer = IdentityColumnWriter::new(&schema, client, SEQ_TABLE).unwrap();
+    writer.reserve(5).await.unwrap();
 
-    let filled = manager
-        .fill_engine_batch(&payload_batch(3), &schema)
+    let filled = writer
+        .fill_engine_batch(&ArrowEvaluationHandler, &payload_batch(3), &schema)
         .unwrap();
     assert_eq!(i64_col(filled, "id").as_slice(), &[1, 2, 3]);
 
     // The second column advanced in lockstep from the same batched reserve.
-    let filled = manager
-        .fill_engine_batch(&payload_batch(2), &schema)
+    let filled = writer
+        .fill_engine_batch(&ArrowEvaluationHandler, &payload_batch(2), &schema)
         .unwrap();
     assert_eq!(i64_col(filled, "row_id").as_slice(), &[130, 140]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn manager_ensure_available_then_fill() {
+async fn writer_ensure_available_then_fill() {
     let cols = [column("id", 1, 1), column("row_id", 1000, 10)];
     let client = Arc::new(InMemorySequenceClient::new());
-    create_identity_sequences(client.as_ref(), SEQ_TABLE, &cols)
+    register_identity_sequences(client.as_ref(), SEQ_TABLE, &cols)
         .await
         .unwrap();
     let schema = schema_for(&cols);
 
-    let manager = IdentityColumnManager::new(&schema, client, SEQ_TABLE).unwrap();
+    let writer = IdentityColumnWriter::new(&schema, client, SEQ_TABLE).unwrap();
     // Nothing prefetched: ensure_available reserves the deficit itself.
-    manager.ensure_available(3).await.unwrap();
-    let filled = manager
-        .fill_engine_batch(&payload_batch(3), &schema)
+    writer.ensure_available(3).await.unwrap();
+    let filled = writer
+        .fill_engine_batch(&ArrowEvaluationHandler, &payload_batch(3), &schema)
         .unwrap();
     assert_eq!(i64_col(filled, "row_id").as_slice(), &[1000, 1010, 1020]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn manager_reports_step_mismatch() {
+async fn writer_reports_step_mismatch() {
     // Seed a sequence whose stored step (1) disagrees with the schema (2).
     let client = Arc::new(InMemorySequenceClient::new());
     client.seed_sequence(SEQ_TABLE, "seq-id", 1, 1).unwrap();
     client.seed_sequence(SEQ_TABLE, "seq-row", 1, 1).unwrap();
     let schema = Arc::new(
         StructType::try_new(vec![
-            identity_column_cic("id", "seq-id", 1, 2), // step 2, but seeded step is 1
+            cic_column("id", "seq-id", 1, 2), // step 2, but seeded step is 1
             StructField::new("payload", DataType::STRING, true),
-            identity_column_cic("row_id", "seq-row", 1, 1),
+            cic_column("row_id", "seq-row", 1, 1),
         ])
         .unwrap(),
     );
 
-    let manager = IdentityColumnManager::new(&schema, client, SEQ_TABLE).unwrap();
-    let err = manager.reserve(5).await.unwrap_err();
+    let writer = IdentityColumnWriter::new(&schema, client, SEQ_TABLE).unwrap();
+    let err = writer.reserve(5).await.unwrap_err();
     assert!(
         err.to_string().contains("step") && err.to_string().contains("seq-id"),
         "unexpected error: {err}"
@@ -219,7 +218,7 @@ async fn create_table_allocates_uc_sequence_and_enables_feature() -> Result<(), 
         .commit(engine.as_ref())?;
 
     // 3. Only after the table exists, register the sequences in UC.
-    create_identity_sequences(client.as_ref(), table_id, &cols).await?;
+    register_identity_sequences(client.as_ref(), table_id, &cols).await?;
 
     // 4. Reload and assert protocol + schema.
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -237,11 +236,12 @@ async fn create_table_allocates_uc_sequence_and_enables_feature() -> Result<(), 
     assert_eq!(read_cols[0].sequence_id, cols[0].sequence_id);
     assert_eq!(read_cols[1].sequence_id, cols[1].sequence_id);
 
-    // 5. The sequences really exist in UC: a manager built from the reloaded schema can reserve and
+    // 5. The sequences really exist in UC: a writer built from the reloaded schema can reserve and
     //    fill.
-    let manager = IdentityColumnManager::new(&read_schema, client, table_id)?;
-    manager.ensure_available(3).await?;
-    let filled = manager.fill_engine_batch(&payload_batch(3), &read_schema)?;
+    let writer = IdentityColumnWriter::new(&read_schema, client, table_id)?;
+    writer.ensure_available(3).await?;
+    let filled =
+        writer.fill_engine_batch(&ArrowEvaluationHandler, &payload_batch(3), &read_schema)?;
     assert_eq!(i64_col(filled, "id").as_slice(), &[1, 2, 3]);
 
     Ok(())

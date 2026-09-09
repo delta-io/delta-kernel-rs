@@ -1,13 +1,13 @@
-//! CREATE-table helper for allocating identity sequences.
+//! CREATE-table helper for registering identity sequences.
 //!
 //! At CREATE-table time the caller mints a `sequence_id` per identity column and builds an
 //! [`IdentityColumnInfo`] for each. It stamps those ids into the table schema via
-//! [`delta_kernel::identity_columns::identity_column_cic`] and commits the CREATE-table
-//! transaction first, then calls [`create_identity_sequences`] to register them all with the UC
+//! [`delta_kernel::identity_columns::cic_column`] and commits the CREATE-table
+//! transaction first, then calls [`register_identity_sequences`] to register them all with the UC
 //! Identity Sequence Service in one batch.
 //!
 //! This is a one-shot setup phase, separate from the write-time reserve/fill path
-//! ([`crate::IdentityColumnManager`]), which is built later from the already-stamped schema.
+//! ([`crate::IdentityColumnWriter`]), which is built later from the already-stamped schema.
 
 use delta_kernel::identity_columns::IdentityColumnInfo;
 use unity_catalog_delta_client_api::{
@@ -28,7 +28,7 @@ use unity_catalog_delta_client_api::{
 ///
 /// Returns the error from the batch create call. The batch is atomic at the service: on error no
 /// sequence is created, so the caller has nothing to roll back.
-pub async fn create_identity_sequences<C: SequenceClient>(
+pub async fn register_identity_sequences<C: SequenceClient>(
     client: &C,
     table_id: impl Into<String>,
     columns: &[IdentityColumnInfo],
@@ -72,11 +72,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_identity_sequences_registers_all_columns() {
+    async fn register_identity_sequences_registers_all_columns() {
         let client = InMemorySequenceClient::new();
         let columns = [column("id", 5, 2), column("row_id", 100, 10)];
 
-        create_identity_sequences(&client, "tbl-1", &columns)
+        register_identity_sequences(&client, "tbl-1", &columns)
             .await
             .unwrap();
 
@@ -98,9 +98,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_identity_sequences_empty_is_noop() {
+    async fn register_identity_sequences_empty_is_noop() {
         let client = InMemorySequenceClient::new();
-        create_identity_sequences(&client, "tbl-1", &[])
+        register_identity_sequences(&client, "tbl-1", &[])
             .await
             .unwrap();
     }

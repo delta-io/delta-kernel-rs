@@ -425,9 +425,9 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
 /// - The column must NOT also carry legacy `delta.identity.{start,step,highWaterMark}` metadata.
 ///
 /// Engines are expected to call create on the sequence service the commit to actually create the
-/// sequences on the service. See [`identity_column_cic`] for more details.
+/// sequences on the service. See [`cic_column`] for more details.
 /// [`detect_identity_columns`]: crate::identity_columns::detect_identity_columns
-/// [`identity_column_cic`]: crate::identity_columns::identity_column_cic
+/// [`cic_column`]: crate::identity_columns::cic_column
 fn maybe_enable_identity_columns_cic(
     schema: &SchemaRef,
     validated: &mut ValidatedTableProperties,
@@ -1067,7 +1067,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{column_name, ColumnName};
-    use crate::identity_columns::identity_column_cic;
+    use crate::identity_columns::cic_column;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
         schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
@@ -1642,7 +1642,7 @@ mod tests {
     #[test]
     fn identity_columns_cic_auto_enabled_when_schema_has_cic_column() {
         let schema = Arc::new(StructType::new_unchecked(vec![
-            identity_column_cic("id", "seq-abc", 1, 1),
+            cic_column("id", "seq-abc", 1, 1),
             StructField::new("name", DataType::STRING, true),
         ]));
         let mut validated = ValidatedTableProperties {
@@ -1700,7 +1700,7 @@ mod tests {
         let schema = Arc::new(StructType::new_unchecked(vec![
             bad_field,
             // Include a valid CIC column too.
-            identity_column_cic("ok", "seq-def", 0, 1),
+            cic_column("ok", "seq-def", 0, 1),
         ]));
         let mut validated = ValidatedTableProperties {
             properties: HashMap::new(),
@@ -1721,7 +1721,7 @@ mod tests {
 
     #[test]
     fn identity_columns_cic_rejects_step_zero() {
-        let schema = Arc::new(StructType::new_unchecked(vec![identity_column_cic(
+        let schema = Arc::new(StructType::new_unchecked(vec![cic_column(
             "id", "seq-abc", 1, 0,
         )]));
         let mut validated = ValidatedTableProperties {
@@ -1744,7 +1744,7 @@ mod tests {
         #[case] legacy_key: ColumnMetadataKey,
         #[case] legacy_value: MetadataValue,
     ) {
-        let field = identity_column_cic("id", "seq-abc", 1, 1)
+        let field = cic_column("id", "seq-abc", 1, 1)
             .add_metadata(vec![(legacy_key.as_ref().to_string(), legacy_value)]);
         let schema = Arc::new(StructType::new_unchecked(vec![field]));
         let mut validated = ValidatedTableProperties {
