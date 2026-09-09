@@ -33,9 +33,9 @@ test_registry_override() {
         printf '%s\n' "$@" > "$capture"
     }
 
-    DELTA_KERNEL_RELEASE_REGISTRY=databricks-proxy run_cargo_release 0.29.0
+    DELTA_KERNEL_RELEASE_REGISTRY=mirror run_cargo_release 0.29.0
     assert_contains "$capture" "--registry"
-    assert_contains "$capture" "databricks-proxy"
+    assert_contains "$capture" "mirror"
 
     unset DELTA_KERNEL_RELEASE_REGISTRY
     run_cargo_release 0.29.0

@@ -7,8 +7,8 @@
 # 3. refresh a release PR after merging/rebasing main: ./release.sh changelog <version>
 # 4. verify that a release changelog covers every merged PR: ./release.sh verify-changelog [version]
 #
-# Set DELTA_KERNEL_RELEASE_REGISTRY when cargo-release must resolve through another registry:
-#   DELTA_KERNEL_RELEASE_REGISTRY=databricks-proxy ./release.sh 0.29.0
+# Set DELTA_KERNEL_RELEASE_REGISTRY when cargo-release must use an alternate registry:
+#   DELTA_KERNEL_RELEASE_REGISTRY=<registry-name> ./release.sh 0.29.0
 ###################################################################################################
 
 # This is a script to automate a large portion of the release process for the crates we publish to

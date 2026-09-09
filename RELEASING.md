@@ -21,14 +21,13 @@ git switch -c release/0.29.0 upstream/main
 
 The working tree must be clean.
 
-### Databricks registry proxy
+### Alternate Cargo registry
 
-Databricks maintainers should use their standard Cargo configuration for the
-`databricks-proxy` registry. Select it for release preparation through the environment instead of
+If `cargo-release` must use an alternate registry, select it through the environment instead of
 editing `release.sh`:
 
 ```bash
-DELTA_KERNEL_RELEASE_REGISTRY=databricks-proxy ./release.sh 0.29.0
+DELTA_KERNEL_RELEASE_REGISTRY=<registry-name> ./release.sh 0.29.0
 ```
 
 The variable is passed only to `cargo release`; publishing still uses the release destination
@@ -89,38 +88,7 @@ Maintainers publishing directly to crates.io can then run:
 
 The script publishes in dependency order (`delta_kernel_derive`, `delta_kernel`, then
 `delta_kernel_default_engine`) and creates the `v<version>` tag. Check each crate on crates.io and
-announce the release in the Delta community channels. Databricks maintainers must instead use the
-secure publishing path below.
-
-### Databricks secure publishing access
-
-Databricks maintainers publish through the
-[`secure-public-registry-releases-eng` repository][secure-release-repository] rather than from a
-workstation.
-
-Before release day:
-
-1. Ask in `#unblock-release-public` for access to the repository and include your GitHub username.
-2. Request the [`app.github-databricks` group][release-repository-opal] through Opal.
-3. Confirm you can view and run the `delta-kernel-rs.yml` workflow.
-4. Ask the Kernel release-token owner to install a short-lived token in the repository secret.
-
-Run the workflow one crate at a time in dependency order. Dry-run each crate before publishing it;
-the next crate may need to wait until its newly published dependency is visible. Ask the token owner
-to revoke the token when the release is complete. Tag the release commit only after all crates are
-published:
-
-```bash
-git tag -a v0.29.0 -m "Release v0.29.0"
-git push upstream tag v0.29.0
-```
-
-For a new crate, first add it to the secure workflow's allowlist, run the security scan, confirm its
-SBOM appears, and update the dependency-proxy allowlist. Coordinate both reviews in
-`#unblock-release-public` before attempting the release.
-
-[secure-release-repository]: https://github.com/databricks/secure-public-registry-releases-eng
-[release-repository-opal]: https://app.opal.dev/groups/6e445be4-f11d-4d78-8a43-dafce57e2be6
+announce the release in the Delta community channels.
 
 ## Patch releases
 
