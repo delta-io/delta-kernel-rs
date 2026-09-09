@@ -27,23 +27,11 @@ fn commit_info_literal_exprs(
         ("operation", Arc::new(lit(commit_info.operation))),
         (
             "operationParameters",
-            Arc::new(match commit_info.operation_parameters {
-                Some(map) => lit(MapData::try_new(
-                    string_map_type.clone(),
-                    map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
-                )?),
-                None => null_lit(string_map_type.clone()),
-            }),
+            string_map_literal_expr(commit_info.operation_parameters, &string_map_type)?,
         ),
         (
             "operationMetrics",
-            Arc::new(match commit_info.operation_metrics {
-                Some(map) => lit(MapData::try_new(
-                    string_map_type.clone(),
-                    map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
-                )?),
-                None => null_lit(string_map_type.clone()),
-            }),
+            string_map_literal_expr(commit_info.operation_metrics, &string_map_type)?,
         ),
         ("kernelVersion", Arc::new(lit(commit_info.kernel_version))),
         ("isBlindAppend", Arc::new(lit(commit_info.is_blind_append))),
@@ -51,13 +39,7 @@ fn commit_info_literal_exprs(
         ("txnId", Arc::new(lit(commit_info.txn_id))),
         (
             "tags",
-            Arc::new(match commit_info.tags {
-                Some(map) => lit(MapData::try_new(
-                    string_map_type,
-                    map.into_iter().map(|(k, v)| (Scalar::String(k), v)),
-                )?),
-                None => null_lit(string_map_type),
-            }),
+            string_map_literal_expr(commit_info.tags, &string_map_type)?,
         ),
     ];
     let expected_expr_len = CommitInfo::to_schema().fields().len();
@@ -66,6 +48,21 @@ fn commit_info_literal_exprs(
             If CommitInfo field was added/removed, please update Expression::Literal in this function and update the with_commit_info doc comment", literal_exprs.len())));
     }
     Ok(literal_exprs)
+}
+
+fn string_map_literal_expr(
+    map: Option<HashMap<String, Option<String>>>,
+    map_type: &MapType,
+) -> Result<ExpressionRef, Error> {
+    let expression = match map {
+        Some(map) => lit(MapData::try_new(
+            map_type.clone(),
+            map.into_iter()
+                .map(|(key, value)| (Scalar::String(key), value)),
+        )?),
+        None => null_lit(map_type.clone()),
+    };
+    Ok(Arc::new(expression))
 }
 
 impl<S> Transaction<S> {

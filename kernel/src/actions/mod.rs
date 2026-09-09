@@ -930,13 +930,16 @@ impl CommitInfo {
         );
     }
 
-    pub(crate) fn merge_tags(&mut self, connector_tags: Option<HashMap<String, Option<String>>>) {
-        let Some(connector_tags) = connector_tags else {
+    /// Merges the supplied tags into this CommitInfo's tags.
+    ///
+    /// Existing values take precedence when both maps contain the same key.
+    pub(crate) fn merge_tags(&mut self, tags: Option<HashMap<String, Option<String>>>) {
+        let Some(tags) = tags else {
             return;
         };
-        let kernel_tags = self.tags.get_or_insert_default();
-        for (key, value) in connector_tags {
-            kernel_tags.entry(key).or_insert(value);
+        let current_tags = self.tags.get_or_insert_default();
+        for (key, value) in tags {
+            current_tags.entry(key).or_insert(value);
         }
     }
 }

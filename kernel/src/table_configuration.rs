@@ -819,15 +819,13 @@ impl TableConfiguration {
             .unwrap_or(false)
     }
 
-    /// Returns `true` if row tracking information should be written for this table.
+    /// Returns `true` if fresh Row IDs and fresh Row Commit Versions should be assigned for
+    /// this table.
     ///
-    /// Row tracking information should be written when:
+    /// Fresh Row IDs and fresh Row Commit Versions should be assigned when:
     /// - Row tracking is supported
     /// - Row tracking is not suspended
-    ///
-    /// Note: We ignore [`is_row_tracking_enabled`] at this point because Kernel does not
-    /// preserve row IDs and row commit versions yet.
-    pub(crate) fn should_write_row_tracking(&self) -> bool {
+    pub(crate) fn should_assign_fresh_row_tracking_metadata(&self) -> bool {
         self.is_feature_supported(&TableFeature::RowTracking) && !self.is_row_tracking_suspended()
     }
 
