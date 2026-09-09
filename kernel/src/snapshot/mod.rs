@@ -44,11 +44,12 @@ mod snapshot_crc;
 #[doc(hidden)]
 pub use builder::{FromSnapshot, FromTableRoot};
 pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
-pub use builder::SnapshotHintError;
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use builder::{SnapshotHint, SnapshotHintVersionStatus};
 use snapshot_crc::SnapshotCrc;
+
+pub use crate::error::SnapshotHintError;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;

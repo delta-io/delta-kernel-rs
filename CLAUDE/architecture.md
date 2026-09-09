@@ -34,8 +34,9 @@ Built via `Snapshot::builder_for(url).build(engine)` (latest version) or
 snapshot. Its opt-in `skip_new_checkpoints()` mode keeps the input checkpoint and every commit in
 the update window so a snapshot-derived `CommitRange` can inspect them without another log
 listing.
-Under `internal-api`, `.with_snapshot_hint(hint)` validates complete caller-supplied state without
-engine log I/O; the connector supplies the version's freshness status.
+Under `internal-api`, `.with_snapshot_hint(hint)` constructs a snapshot without engine log I/O.
+Kernel validates structural consistency; the connector owns table-root membership,
+protocol/metadata provenance, `max_published_version`, and freshness.
 
 **Snapshot loading internals:**
 1. Ordinary builds discover commits and checkpoints through **LogSegment**

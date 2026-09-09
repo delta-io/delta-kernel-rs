@@ -50,6 +50,8 @@ use crate::{
     StorageHandler,
 };
 
+const VERSION_ONE_COMMIT: &str = "file:///_delta_log/00000000000000000001.json";
+
 /// Processes sidecar files for the given checkpoint batch.
 ///
 /// This function extracts any sidecar file references from the provided batch.
@@ -1331,9 +1333,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,
@@ -1407,9 +1407,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
                 create_log_path_with_size(&checkpoint_one_file, cp1_size),
                 create_log_path_with_size(&checkpoint_two_file, cp2_size),
             ],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,
@@ -1475,9 +1473,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
                 &checkpoint_one_file,
                 checkpoint_size,
             )],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,
@@ -1561,9 +1557,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,
@@ -1623,9 +1617,7 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResu
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_file)],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,
@@ -1691,9 +1683,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,
@@ -1839,9 +1829,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
                 &checkpoint_file_path,
                 checkpoint_size,
             )],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,
@@ -2399,9 +2387,7 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )],
+            ascending_commit_files: vec![create_log_path(VERSION_ONE_COMMIT)],
             ascending_compaction_files: vec![
                 create_log_path(
                     "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
@@ -2425,9 +2411,7 @@ fn test_validate_listed_log_file_out_of_order_compaction_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )],
+            ascending_commit_files: vec![create_log_path(VERSION_ONE_COMMIT)],
             ascending_compaction_files: vec![
                 create_log_path(
                     "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
@@ -2864,9 +2848,7 @@ fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
             ascending_commit_files: vec![create_log_path(
                 "file:///_delta_log/00000000000000000002.json",
             )],
-            ascending_compaction_files: vec![create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )],
+            ascending_compaction_files: vec![create_log_path(VERSION_ONE_COMMIT)],
             ..Default::default()
         },
         log_root,
@@ -3256,7 +3238,7 @@ fn test_log_segment_contiguous_commit_files() {
     assert!(LogSegment::try_new(
         LogSegmentFiles {
             ascending_commit_files: vec![
-                create_log_path("file:///_delta_log/00000000000000000001.json"),
+                create_log_path(VERSION_ONE_COMMIT),
                 create_log_path("file:///_delta_log/00000000000000000002.json"),
                 create_log_path("file:///_delta_log/00000000000000000003.json"),
             ],
@@ -3275,8 +3257,8 @@ fn test_log_segment_contiguous_commit_files() {
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             ascending_commit_files: vec![
-                create_log_path("file:///_delta_log/00000000000000000001.json"),
-                create_log_path("file:///_delta_log/00000000000000000004.json"),
+                create_log_path(VERSION_ONE_COMMIT),
+                create_log_path("file:///_delta_log/00000000000000000003.json"),
             ],
             ..Default::default()
         },
@@ -3963,9 +3945,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,
@@ -4566,9 +4546,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,
@@ -4633,9 +4611,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
-            latest_commit_file: Some(create_log_path(
-                "file:///_delta_log/00000000000000000001.json",
-            )),
+            latest_commit_file: Some(create_log_path(VERSION_ONE_COMMIT)),
             ..Default::default()
         },
         log_root,

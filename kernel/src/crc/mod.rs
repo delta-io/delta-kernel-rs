@@ -172,8 +172,9 @@ impl Crc {
     /// Parses a `.crc` file body for `version`, which comes from the filename because the body does
     /// not carry it.
     ///
-    /// Returns the validated in-memory CRC state. Returns an error if the body is not valid CRC
-    /// JSON or violates CRC invariants.
+    /// Returns parsed CRC state after validating its JSON shape, required action counts,
+    /// non-negative aggregate statistics, and histogram structure. This does not compare the state
+    /// with log replay.
     #[internal_api]
     pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> DeltaResult<Self> {
         let raw: CrcRaw = serde_json::from_slice(bytes)?;

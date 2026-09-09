@@ -3247,7 +3247,7 @@ mod tests {
             KernelError::GenericError,
             Some(concat!(
                 "Max catalog version error: Max catalog version is required when providing ",
-                "staged commits in the log tail. ",
+                "staged commits. ",
                 "Use with_max_catalog_version()."
             )),
         );

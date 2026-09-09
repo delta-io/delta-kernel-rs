@@ -1722,8 +1722,6 @@ fn validate_end_version(
     Ok(effective_version)
 }
 
-/// Ensures `latest_commit_file` identifies the unfiltered replay tail, then replaces it with the
-/// tail's canonical location and file metadata.
 fn validate_and_canonicalize_latest_commit_file(listed: &mut LogSegmentFiles) -> DeltaResult<()> {
     require!(
         listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),

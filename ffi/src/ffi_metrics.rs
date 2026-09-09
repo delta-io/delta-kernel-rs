@@ -99,9 +99,9 @@ impl From<kernel::TableType> for TableType {
 pub enum SnapshotLoadType {
     Full = 0,
     Incremental = 1,
-    Unknown = 2,
     /// Snapshot construction used complete caller-supplied state without engine log I/O.
-    SnapshotHint = 3,
+    SnapshotHint = 2,
+    Unknown = 3,
 }
 
 /// How the log segment and protocol/metadata state were loaded.
@@ -634,6 +634,8 @@ mod tests {
     use std::mem::discriminant;
     use std::time::Duration;
 
+    use rstest::rstest;
+
     use super::*;
     use crate::TryFromStringSlice;
 
@@ -879,12 +881,24 @@ mod tests {
         });
     }
 
+    #[rstest]
+    #[case::full(kernel::SnapshotLoadType::Full, SnapshotLoadType::Full)]
+    #[case::incremental(kernel::SnapshotLoadType::Incremental, SnapshotLoadType::Incremental)]
+    #[case::snapshot_hint(kernel::SnapshotLoadType::SnapshotHint, SnapshotLoadType::SnapshotHint)]
+    #[case::unknown(kernel::SnapshotLoadType::Unknown, SnapshotLoadType::Unknown)]
+    fn kernel_snapshot_load_type_maps_to_ffi_variant(
+        #[case] source: kernel::SnapshotLoadType,
+        #[case] expected: SnapshotLoadType,
+    ) {
+        assert_eq!(SnapshotLoadType::from(source), expected);
+    }
+
     #[test]
     fn snapshot_load_type_discriminants_are_stable() {
         assert_eq!(SnapshotLoadType::Full as i32, 0);
         assert_eq!(SnapshotLoadType::Incremental as i32, 1);
-        assert_eq!(SnapshotLoadType::Unknown as i32, 2);
-        assert_eq!(SnapshotLoadType::SnapshotHint as i32, 3);
+        assert_eq!(SnapshotLoadType::SnapshotHint as i32, 2);
+        assert_eq!(SnapshotLoadType::Unknown as i32, 3);
     }
 
     #[test]

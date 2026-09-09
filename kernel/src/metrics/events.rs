@@ -343,8 +343,8 @@ pub enum SnapshotLoadType {
     /// The segment was listed from its base (a checkpoint, else version 0) up to the target. A
     /// fresh snapshot build (`LogSegment::for_snapshot`) reads this way.
     Full,
-    /// The segment was listed as a delta above an existing base. An incremental snapshot update
-    /// (`Snapshot::try_new_from`) reads only the commits above the existing snapshot.
+    /// The build started from an existing snapshot. It may return that snapshot unchanged, replay
+    /// newer commits, or rebuild from a newly discovered checkpoint.
     Incremental,
     /// The snapshot was constructed from complete caller-supplied state without asking the engine
     /// to list or read Delta log files.
@@ -357,13 +357,7 @@ pub enum SnapshotLoadType {
 
 impl SnapshotLoadType {
     fn parse_or_unknown(s: &str) -> Self {
-        if s.is_empty() {
-            return Self::Unknown;
-        }
-        Self::from_str(s).unwrap_or_else(|e| {
-            warn!("Invalid load_type '{s}': {e}. Using Unknown.");
-            Self::Unknown
-        })
+        parse_load_type_or_unknown(s)
     }
 }
 
@@ -376,7 +370,8 @@ impl SnapshotLoadType {
 pub enum LogSegmentLoadType {
     /// The segment was listed from its base through the target version.
     Full,
-    /// The segment was listed above an existing snapshot's segment.
+    /// The segment load started from an existing snapshot. It may reuse that segment, extend it,
+    /// or replace it after discovering a newer checkpoint.
     Incremental,
     /// Decode fell back here because the span field was unset or unrecognized.
     #[default]
@@ -385,14 +380,22 @@ pub enum LogSegmentLoadType {
 
 impl LogSegmentLoadType {
     fn parse_or_unknown(s: &str) -> Self {
-        if s.is_empty() {
-            return Self::Unknown;
-        }
-        Self::from_str(s).unwrap_or_else(|e| {
-            warn!("Invalid load_type '{s}': {e}. Using Unknown.");
-            Self::Unknown
-        })
+        parse_load_type_or_unknown(s)
     }
+}
+
+fn parse_load_type_or_unknown<T>(s: &str) -> T
+where
+    T: Default + FromStr,
+    T::Err: fmt::Display,
+{
+    if s.is_empty() {
+        return T::default();
+    }
+    s.parse().unwrap_or_else(|error| {
+        warn!("Invalid load_type '{s}': {error}. Using Unknown.");
+        T::default()
+    })
 }
 
 /// A log segment was listed and assembled for a snapshot.
