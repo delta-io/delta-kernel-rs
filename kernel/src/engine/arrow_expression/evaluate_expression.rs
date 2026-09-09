@@ -10,10 +10,10 @@ use tracing::warn;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
-    AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    PrimitiveArray, RecordBatch, StringArray, StructArray,
+    ArrowNativeTypeOp, AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData,
+    NullBufferBuilder, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
-use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
+use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
@@ -615,210 +615,6 @@ fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array
     }
 }
 
-// === Float comparison helpers ===
-//
-// Arrow's comparison kernels use IEEE total ordering, which distinguishes signed zero. Kernel's
-// logical comparison treats both zeros as equal. Preserve Arrow's ordering for every other value,
-// including NaNs, so this fix does not change established behavior beyond signed zero.
-
-trait LogicalFloat {
-    fn ieee_eq(self, other: Self) -> bool;
-    fn logical_eq(self, other: Self) -> bool;
-    fn logical_lt(self, other: Self) -> bool;
-    fn logical_gt(self, other: Self) -> bool;
-}
-
-impl LogicalFloat for f32 {
-    #[inline]
-    fn ieee_eq(self, other: Self) -> bool {
-        self == other
-    }
-
-    #[inline]
-    fn logical_eq(self, other: Self) -> bool {
-        self == other || self.to_bits() == other.to_bits()
-    }
-
-    #[inline]
-    fn logical_lt(self, other: Self) -> bool {
-        self.total_cmp(&other).is_lt() && !(self == 0.0 && other == 0.0)
-    }
-
-    #[inline]
-    fn logical_gt(self, other: Self) -> bool {
-        self.total_cmp(&other).is_gt() && !(self == 0.0 && other == 0.0)
-    }
-}
-
-impl LogicalFloat for f64 {
-    #[inline]
-    fn ieee_eq(self, other: Self) -> bool {
-        self == other
-    }
-
-    #[inline]
-    fn logical_eq(self, other: Self) -> bool {
-        self == other || self.to_bits() == other.to_bits()
-    }
-
-    #[inline]
-    fn logical_lt(self, other: Self) -> bool {
-        self.total_cmp(&other).is_lt() && !(self == 0.0 && other == 0.0)
-    }
-
-    #[inline]
-    fn logical_gt(self, other: Self) -> bool {
-        self.total_cmp(&other).is_gt() && !(self == 0.0 && other == 0.0)
-    }
-}
-
-fn collect_bool(len: usize, inverted: bool, f: impl Fn(usize) -> bool) -> BooleanBuffer {
-    let mut buffer = Vec::with_capacity(len.div_ceil(64));
-    let chunks = len / 64;
-
-    buffer.extend((0..chunks).map(|chunk| {
-        let mut packed = 0;
-        for bit in 0..64 {
-            packed |= (f(chunk * 64 + bit) as u64) << bit;
-        }
-        if inverted {
-            !packed
-        } else {
-            packed
-        }
-    }));
-
-    let remainder = len % 64;
-    if remainder != 0 {
-        let mut packed = 0;
-        for bit in 0..remainder {
-            packed |= (f(chunks * 64 + bit) as u64) << bit;
-        }
-        buffer.push(if inverted { !packed } else { packed });
-    }
-
-    BooleanBuffer::new(buffer.into(), 0, len)
-}
-
-fn float_logical_values<T: ArrowPrimitiveType>(
-    left: &PrimitiveArray<T>,
-    right: &PrimitiveArray<T>,
-    inverted: bool,
-    op: impl Fn(T::Native, T::Native) -> bool,
-) -> BooleanBuffer
-where
-    T::Native: LogicalFloat,
-{
-    let left = left.values();
-    let right = right.values();
-    // SAFETY: float_dispatch rejects unequal lengths, and collect_bool only visits 0..left.len().
-    collect_bool(left.len(), inverted, |index| unsafe {
-        op(*left.get_unchecked(index), *right.get_unchecked(index))
-    })
-}
-
-fn float_logical_cmp<T: ArrowPrimitiveType>(
-    left: &PrimitiveArray<T>,
-    right: &PrimitiveArray<T>,
-    inverted: bool,
-    op: impl Fn(T::Native, T::Native) -> bool,
-) -> BooleanArray
-where
-    T::Native: LogicalFloat,
-{
-    let values = float_logical_values(left, right, inverted, op);
-    let nulls = NullBuffer::union(left.nulls(), right.nulls());
-    BooleanArray::new(values, nulls)
-}
-
-fn float_logical_distinct<T: ArrowPrimitiveType>(
-    left: &PrimitiveArray<T>,
-    right: &PrimitiveArray<T>,
-    inverted: bool,
-    eq: impl Fn(T::Native, T::Native) -> bool,
-) -> BooleanArray
-where
-    T::Native: LogicalFloat,
-{
-    let len = left.len();
-    let equal = float_logical_values(left, right, false, eq);
-    let invert = |word: u64| if inverted { !word } else { word };
-    let buffer = match (left.nulls(), right.nulls()) {
-        (Some(left), Some(right)) => {
-            let left = left.inner().bit_chunks().iter_padded();
-            let right = right.inner().bit_chunks().iter_padded();
-            let equal = equal.bit_chunks().iter_padded();
-            left.zip(right)
-                .zip(equal)
-                .map(|((left, right), equal)| invert((left ^ right) | (left & right & !equal)))
-                .collect()
-        }
-        (Some(valid), None) | (None, Some(valid)) => {
-            let valid = valid.inner().bit_chunks().iter_padded();
-            let equal = equal.bit_chunks().iter_padded();
-            valid
-                .zip(equal)
-                .map(|(valid, equal)| invert(!valid | !equal))
-                .collect()
-        }
-        (None, None) => equal
-            .bit_chunks()
-            .iter_padded()
-            .map(|equal| invert(!equal))
-            .collect(),
-    };
-    BooleanArray::new(BooleanBuffer::new(buffer, 0, len), None)
-}
-
-/// Dispatches a float-array comparison to [`float_logical_cmp`] or [`float_logical_distinct`].
-/// Caller already established `op` is one of `Equal`, `LessThan`, `GreaterThan`, or
-/// `Distinct`; `In` is handled separately via `eval_in` and would be a programmer error here.
-fn float_dispatch<T: ArrowPrimitiveType>(
-    left: &PrimitiveArray<T>,
-    right: &PrimitiveArray<T>,
-    op: BinaryPredicateOp,
-    inverted: bool,
-    has_non_nan_literal: bool,
-) -> DeltaResult<BooleanArray>
-where
-    T::Native: LogicalFloat,
-{
-    if left.len() != right.len() {
-        return Err(Error::invalid_expression(format!(
-            "Cannot compare arrays of different lengths, got {} and {}",
-            left.len(),
-            right.len()
-        )));
-    }
-
-    use BinaryPredicateOp::*;
-    Ok(match op {
-        Distinct if has_non_nan_literal => {
-            float_logical_distinct(left, right, inverted, LogicalFloat::ieee_eq)
-        }
-        Distinct => float_logical_distinct(left, right, inverted, LogicalFloat::logical_eq),
-        LessThan => float_logical_cmp(left, right, inverted, LogicalFloat::logical_lt),
-        GreaterThan => float_logical_cmp(left, right, inverted, LogicalFloat::logical_gt),
-        Equal if has_non_nan_literal => {
-            float_logical_cmp(left, right, inverted, LogicalFloat::ieee_eq)
-        }
-        Equal => float_logical_cmp(left, right, inverted, LogicalFloat::logical_eq),
-        In => {
-            return Err(Error::internal_error(
-                "unexpected IN predicate in float comparison dispatch",
-            ))
-        }
-    })
-}
-
-fn is_non_nan_float_literal(expr: &Expression) -> bool {
-    match expr {
-        Expression::Literal(Scalar::Float(value)) => !value.is_nan(),
-        Expression::Literal(Scalar::Double(value)) => !value.is_nan(),
-        _ => false,
-    }
-}
-
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
 pub fn evaluate_predicate(
     predicate: &Predicate,
@@ -856,8 +652,6 @@ pub fn evaluate_predicate(
         }
         Binary(BinaryPredicate { op, left, right }) => {
             let (left, right) = (left.as_ref(), right.as_ref());
-            let has_non_nan_float_literal =
-                is_non_nan_float_literal(left) || is_non_nan_float_literal(right);
 
             // IN is different from all the others, and also quite complex, so factor it out.
             //
@@ -937,8 +731,33 @@ pub fn evaluate_predicate(
                 (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
             };
 
+            let has_non_nan_literal =
+                is_non_nan_float_literal(left) || is_non_nan_float_literal(right);
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
+            match (left.data_type(), right.data_type()) {
+                (ArrowDataType::Float32, ArrowDataType::Float32) => {
+                    return compare_float_arrays::<Float32Type>(
+                        left.as_primitive(),
+                        right.as_primitive(),
+                        *op,
+                        inverted,
+                        has_non_nan_literal,
+                    );
+                }
+                (ArrowDataType::Float64, ArrowDataType::Float64) => {
+                    return compare_float_arrays::<Float64Type>(
+                        left.as_primitive(),
+                        right.as_primitive(),
+                        *op,
+                        inverted,
+                        has_non_nan_literal,
+                    );
+                }
+                _ => {}
+            }
+            let left = normalize_comparison_zeros(left)?;
+            let right = normalize_comparison_zeros(right)?;
 
             // If the types differ (e.g. one side is a view type and the other is not),
             // normalize both to view types since benchamrking results show that casting from
@@ -952,26 +771,7 @@ pub fn evaluate_predicate(
                     arrow_convert_to_view_type(right)?,
                 )
             };
-
-            // Arrow's total ordering distinguishes signed zero, so use Kernel's logical float
-            // comparisons for Float32 and Float64.
-            match (left.data_type(), right.data_type()) {
-                (ArrowDataType::Float32, ArrowDataType::Float32) => float_dispatch(
-                    left.as_primitive::<Float32Type>(),
-                    right.as_primitive::<Float32Type>(),
-                    *op,
-                    inverted,
-                    has_non_nan_float_literal,
-                ),
-                (ArrowDataType::Float64, ArrowDataType::Float64) => float_dispatch(
-                    left.as_primitive::<Float64Type>(),
-                    right.as_primitive::<Float64Type>(),
-                    *op,
-                    inverted,
-                    has_non_nan_float_literal,
-                ),
-                _ => Ok(eval_fn(&left, &right)?),
-            }
+            Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
             // Leverage de Morgan's laws (invert the children and swap the operator):
@@ -1334,6 +1134,117 @@ fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaRes
         ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)?;
     }
     Ok(array)
+}
+
+// Fuse signed-zero handling into the comparison to avoid copying full float columns. Arrow's
+// native comparisons preserve NaN payload ordering; Rust equality makes the two zeros equal.
+fn compare_float_arrays<T: ArrowPrimitiveType>(
+    left: &PrimitiveArray<T>,
+    right: &PrimitiveArray<T>,
+    op: BinaryPredicateOp,
+    inverted: bool,
+    has_non_nan_literal: bool,
+) -> DeltaResult<BooleanArray> {
+    if left.len() != right.len() {
+        return Err(Error::invalid_expression(format!(
+            "Cannot compare arrays of different lengths, got {} and {}",
+            left.len(),
+            right.len()
+        )));
+    }
+
+    let result = match op {
+        // A non-NaN literal cannot match a NaN, so IEEE equality is sufficient.
+        BinaryPredicateOp::Equal | BinaryPredicateOp::Distinct if has_non_nan_literal => {
+            BooleanArray::from_binary(left, right, |a, b| a == b)
+        }
+        BinaryPredicateOp::Equal | BinaryPredicateOp::Distinct => {
+            BooleanArray::from_binary(left, right, |a, b| a == b || a.is_eq(b))
+        }
+        BinaryPredicateOp::LessThan => {
+            BooleanArray::from_binary(left, right, |a, b| a.is_lt(b) && a != b)
+        }
+        BinaryPredicateOp::GreaterThan => {
+            BooleanArray::from_binary(left, right, |a, b| a.is_gt(b) && a != b)
+        }
+        BinaryPredicateOp::In => {
+            return Err(Error::internal_error(
+                "unexpected IN predicate in float comparison",
+            ))
+        }
+    };
+    let (mut values, mut nulls) = result.into_parts();
+    if op == BinaryPredicateOp::Distinct {
+        // Null-safe equality: both null, or both valid and equal.
+        if let Some(valid) = &nulls {
+            values &= valid.inner();
+        }
+        if let (Some(left), Some(right)) = (left.nulls(), right.nulls()) {
+            let both_null = !&(left.inner() | right.inner());
+            values |= &both_null;
+        }
+        nulls = None;
+    }
+    if inverted != (op == BinaryPredicateOp::Distinct) {
+        values = !&values;
+    }
+    Ok(BooleanArray::new(values, nulls))
+}
+
+fn is_non_nan_float_literal(expr: &Expression) -> bool {
+    match expr {
+        Expression::Literal(Scalar::Float(value)) => !value.is_nan(),
+        Expression::Literal(Scalar::Double(value)) => !value.is_nan(),
+        _ => false,
+    }
+}
+
+// Dictionary comparisons stay encoded. Normalize only comparison operands so the original arrays
+// retain their signed-zero bits and Arrow preserves its NaN and null semantics.
+fn normalize_comparison_zeros(array: ArrayRef) -> DeltaResult<ArrayRef> {
+    match array.data_type() {
+        ArrowDataType::Float32 => Ok(normalize_float_zeros::<Float32Type>(array)),
+        ArrowDataType::Float64 => Ok(normalize_float_zeros::<Float64Type>(array)),
+        ArrowDataType::Dictionary(_, value_type) => {
+            let mut leaf_type = value_type.as_ref();
+            while let ArrowDataType::Dictionary(_, inner) = leaf_type {
+                leaf_type = inner;
+            }
+            if !matches!(leaf_type, ArrowDataType::Float32 | ArrowDataType::Float64) {
+                return Ok(array);
+            }
+            let dictionary = array.as_any_dictionary();
+            // Arrow comparisons support one dictionary layer. Flatten only nested values, keeping
+            // the outer keys shared instead of materializing every row.
+            let values = if dictionary.values().data_type() == leaf_type {
+                dictionary.values().clone()
+            } else {
+                cast(dictionary.values(), leaf_type)?
+            };
+            let values = normalize_comparison_zeros(values)?;
+            if Arc::ptr_eq(dictionary.values(), &values) {
+                Ok(array)
+            } else {
+                Ok(dictionary.with_values(values))
+            }
+        }
+        _ => Ok(array),
+    }
+}
+
+fn normalize_float_zeros<T: ArrowPrimitiveType>(array: ArrayRef) -> ArrayRef {
+    let floats = array.as_primitive::<T>();
+    let zero = T::Native::ZERO;
+    let negative_zero = zero.neg_wrapping();
+    // Arrow's is_eq compares float bits; the non-short-circuiting reduction can vectorize.
+    let needs_copy = floats
+        .values()
+        .iter()
+        .fold(false, |found, value| found | value.is_eq(negative_zero));
+    if !needs_copy {
+        return array;
+    }
+    Arc::new(floats.unary::<_, T>(|value| if value.is_zero() { zero } else { value }))
 }
 
 #[cfg(test)]
