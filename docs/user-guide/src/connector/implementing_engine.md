@@ -282,7 +282,7 @@ pub trait EvaluationHandler {
     fn create_many(
         &self,
         schema: SchemaRef,
-        rows: &[&[Scalar]],
+        rows: Vec<Vec<Scalar>>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 }
 ```
@@ -311,10 +311,10 @@ pub trait PredicateEvaluator {
 - **`null_row`** creates a single-row `EngineData` with all null values. The kernel uses
   this internally for partition column construction.
 
-- **`create_many`** creates a multi-row `EngineData` by applying the given schema to
-  multiple rows of `Scalar` values. Each element in `rows` contains one scalar per top-level
-  field in the schema. Returns an error if any row's scalar count doesn't match the schema's
-  field count, or if a scalar value's type doesn't match its corresponding field.
+- **`create_many`** creates a multi-row `EngineData` by applying the given schema to multiple rows
+  of `Scalar` values. Each row contains one scalar per top-level field in the schema. Returns an
+  error if any row's scalar count doesn't match the schema's field count, or if a scalar value's
+  type doesn't match its corresponding field.
 
 ### Default implementation
 

@@ -1124,7 +1124,7 @@ fn test_evaluator_mixed_string_types_struct_expression() {
 }
 
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`
-fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBatch) {
+fn assert_create_many(rows: Vec<Vec<Scalar>>, schema: SchemaRef, expected: RecordBatch) {
     let handler = ArrowEvaluationHandler;
     let actual = handler.create_many(schema, rows).unwrap();
     let actual_rb = actual.try_into_record_batch().unwrap();
@@ -1133,9 +1133,9 @@ fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBat
 
 #[test]
 fn test_create_many_multiple_rows() {
-    let row1: &[Scalar] = &[1.into(), "A".into()];
-    let row2: &[Scalar] = &[2.into(), "B".into()];
-    let row3: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), "C".into()];
+    let row1 = vec![1.into(), "A".into()];
+    let row2 = vec![2.into(), "B".into()];
+    let row3 = vec![Scalar::Null(KernelDataType::INTEGER), "C".into()];
     let schema = schema_ref! {
         nullable "id": INTEGER,
         nullable "name": STRING,
@@ -1152,7 +1152,7 @@ fn test_create_many_multiple_rows() {
         ],
     )
     .unwrap();
-    assert_create_many(&[row1, row2, row3], schema, expected);
+    assert_create_many(vec![row1, row2, row3], schema, expected);
 }
 
 #[test]
@@ -1162,7 +1162,7 @@ fn test_create_many_empty_rows_returns_zero_row_batch() {
         nullable "b": STRING,
     };
     let handler = ArrowEvaluationHandler;
-    let result = handler.create_many(schema.clone(), &[]).unwrap();
+    let result = handler.create_many(schema.clone(), vec![]).unwrap();
     assert_eq!(result.len(), 0);
     let rb = result.try_into_record_batch().unwrap();
     assert_eq!(rb.num_rows(), 0);
@@ -1176,10 +1176,10 @@ fn test_create_many_wrong_field_count_returns_error() {
         nullable "b": STRING,
     };
     // Row has 3 scalars but schema has 2 fields
-    let bad_row: &[Scalar] = &[1.into(), "x".into(), 99.into()];
+    let bad_row = vec![1.into(), "x".into(), 99.into()];
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
-        handler.create_many(schema, &[bad_row]),
+        handler.create_many(schema, vec![bad_row]),
         "Row 0 has 3 scalars but schema has 2 fields",
     );
 }
@@ -1191,11 +1191,11 @@ fn test_create_many_wrong_field_type_returns_error() {
         nullable "b": STRING,
     };
     // Row 1 passes a Long where an Integer is expected for field "a"
-    let good_row: &[Scalar] = &[1.into(), "x".into()];
-    let bad_row: &[Scalar] = &[1i64.into(), "y".into()];
+    let good_row = vec![1.into(), "x".into()];
+    let bad_row = vec![1i64.into(), "y".into()];
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
-        handler.create_many(schema, &[good_row, bad_row]),
+        handler.create_many(schema, vec![good_row, bad_row]),
         "Row 1, field 'a' (expected type integer, got long): Invalid expression evaluation: Invalid builder for long",
     );
 }
@@ -1213,7 +1213,7 @@ fn test_create_many_nested_struct() {
     };
 
     // Row 1: inner = Struct { x: 10, y: "hello" }, flag = true
-    let row1: &[Scalar] = &[
+    let row1 = vec![
         Scalar::Struct(
             crate::expressions::StructData::try_new(
                 vec![
@@ -1227,7 +1227,7 @@ fn test_create_many_nested_struct() {
         true.into(),
     ];
     // Row 2: inner = null struct, flag = false
-    let row2: &[Scalar] = &[Scalar::Null(inner_type), false.into()];
+    let row2 = vec![Scalar::Null(inner_type), false.into()];
 
     let arrow_inner_fields: Fields = vec![
         Field::new("x", DataType::Int32, true),
@@ -1254,7 +1254,7 @@ fn test_create_many_nested_struct() {
         vec![inner_col, create_array!(Boolean, [true, false])],
     )
     .unwrap();
-    assert_create_many(&[row1, row2], schema, expected);
+    assert_create_many(vec![row1, row2], schema, expected);
 }
 
 #[test]

@@ -287,7 +287,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     fn create_many(
         &self,
         schema: SchemaRef,
-        rows: &[&[Scalar]],
+        rows: Vec<Vec<Scalar>>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
         if rows.is_empty() {

@@ -787,7 +787,7 @@ pub(crate) fn create_last_checkpoint_data(
 ) -> DeltaResult<Box<dyn EngineData>> {
     engine.evaluation_handler().create_many(
         LAST_CHECKPOINT_SCHEMA.clone(),
-        &[&[
+        vec![vec![
             version.into(),
             actions_counter.into(),
             None::<i64>.into(), // parts = None since we only support single-part checkpoints

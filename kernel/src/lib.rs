@@ -512,18 +512,8 @@ pub trait EvaluationHandler: AsAny {
 
     /// Create a multi-row [`EngineData`] by applying the given schema to multiple rows of values.
     ///
-    /// Each element in `rows` represents one row of data, where each row is a slice of structured
-    /// scalar values (one scalar per top-level field in the schema).
-    ///
-    /// # Parameters
-    ///
-    /// - `schema`: Schema describing the structure of each row.
-    /// - `rows`: Slice of rows, where each row contains one structured scalar per top-level schema
-    ///   field.
-    ///
-    /// # Returns
-    ///
-    /// A multi-row `EngineData` containing all rows.
+    /// Each element in `rows` represents one row of data, where each row contains one structured
+    /// scalar per top-level field in the `schema`.
     ///
     /// # Errors
     ///
@@ -538,7 +528,7 @@ pub trait EvaluationHandler: AsAny {
     fn create_many(
         &self,
         schema: SchemaRef,
-        rows: &[&[Scalar]],
+        rows: Vec<Vec<Scalar>>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 }
 
@@ -551,7 +541,9 @@ pub(crate) fn create_row(
     value: impl Into<Scalar>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let value = value.into();
-    engine.evaluation_handler().create_many(schema, &[&[value]])
+    engine
+        .evaluation_handler()
+        .create_many(schema, vec![vec![value]])
 }
 
 /// Provides file system related functionalities to Delta Kernel.

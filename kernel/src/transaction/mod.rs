@@ -3212,7 +3212,8 @@ mod tests {
                 Scalar::Array(ArrayData::try_new(score_type, [30i32])?),
             ],
         )?);
-        ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
+        let rows = vec![vec![1i64.into(), info1], vec![2i64.into(), info2]];
+        ArrowEvaluationHandler.create_many(schema, rows)
     }
 
     /// Validates that [`BoundWriteContext::logical_to_physical`] correctly renames fields at all
@@ -3474,10 +3475,7 @@ mod tests {
                 ]
             })
             .collect();
-        let row_refs: Vec<&[Scalar]> = rows.iter().map(|r| r.as_slice()).collect();
-        ArrowEvaluationHandler
-            .create_many(schema, &row_refs)
-            .unwrap()
+        ArrowEvaluationHandler.create_many(schema, rows).unwrap()
     }
 
     #[test]
