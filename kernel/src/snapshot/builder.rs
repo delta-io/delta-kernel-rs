@@ -504,12 +504,17 @@ impl SnapshotBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::{actions_to_string, add_commit, TestAction};
+    use tracing::span::{Attributes, Id};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+    use tracing_subscriber::registry::LookupSpan;
 
     use super::*;
     use crate::engine::sync::SyncEngine;
@@ -519,6 +524,48 @@ mod tests {
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
+
+    #[derive(Clone, Default)]
+    struct ConstructorTrace {
+        span_fields: Arc<Mutex<BTreeMap<&'static str, BTreeSet<&'static str>>>>,
+        error_fields: Arc<Mutex<Vec<BTreeSet<&'static str>>>>,
+    }
+
+    impl<S> Layer<S> for ConstructorTrace
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let span_name = attrs.metadata().name();
+            if !matches!(span_name, "try_new_from_log_segment" | "try_new_from") {
+                return;
+            }
+
+            let fields = attrs
+                .metadata()
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .collect();
+            self.span_fields.lock().unwrap().insert(span_name, fields);
+        }
+
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() != Level::ERROR {
+                return;
+            }
+
+            let fields: BTreeSet<_> = event
+                .metadata()
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .collect();
+            if fields.contains("checkpoint_version") || fields.contains("existing_version") {
+                self.error_fields.lock().unwrap().push(fields);
+            }
+        }
+    }
 
     fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
@@ -755,6 +802,74 @@ mod tests {
             .expect("expected SnapshotBuildSuccess event");
         assert_eq!(version, 1, "version should match the updated snapshot");
         assert!(duration > Duration::ZERO, "duration should be non-zero");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_constructor_context_is_only_recorded_on_errors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+
+        let captured = ConstructorTrace::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        let snapshot = SnapshotBuilder::new_for(table_root.clone())
+            .at_version(0)
+            .build(engine.as_ref())?;
+        let updated = SnapshotBuilder::new_from(snapshot).build(engine.as_ref())?;
+        assert_eq!(updated.version(), 1);
+        assert!(captured.error_fields.lock().unwrap().is_empty());
+
+        let expected = BTreeMap::from([
+            ("try_new_from_log_segment", BTreeSet::new()),
+            ("try_new_from", BTreeSet::new()),
+        ]);
+        assert_eq!(*captured.span_fields.lock().unwrap(), expected);
+
+        assert!(SnapshotBuilder::new_from(updated)
+            .at_version(0)
+            .build(engine.as_ref())
+            .is_err());
+
+        let (invalid_engine, invalid_store, invalid_root) = setup_test();
+        add_commit(
+            &invalid_root,
+            invalid_store.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
+        )
+        .await?;
+        assert!(SnapshotBuilder::new_for(invalid_root)
+            .build(invalid_engine.as_ref())
+            .is_err());
+
+        let error_fields = captured.error_fields.lock().unwrap();
+        assert!(error_fields.contains(&BTreeSet::from([
+            "message",
+            "error",
+            "path",
+            "version",
+            "checkpoint_version",
+            "operation_id",
+            "correlation_id",
+            "incremental_replay",
+            "built_as_latest",
+        ])));
+        assert!(error_fields.contains(&BTreeSet::from([
+            "message",
+            "error",
+            "path",
+            "existing_version",
+            "requested_version",
+            "log_tail_len",
+            "operation_id",
+            "correlation_id",
+            "incremental_replay",
+            "built_as_latest",
+        ])));
+
         Ok(())
     }
 
