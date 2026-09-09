@@ -126,9 +126,6 @@ pub enum SnapshotHintError {
         /// The latest version ratified by the catalog.
         max_catalog_version: Version,
     },
-    /// Commit files were supplied without identifying the latest commit.
-    #[error("Invalid snapshot hint: latest_commit_file is required when commits are supplied")]
-    MissingLatestCommit,
     /// The supplied log files contain log compaction files, which snapshot hints do not support.
     #[error("Invalid snapshot hint: log compaction files are not supported")]
     LogCompaction,
@@ -393,7 +390,7 @@ pub enum Error {
     /// including invalid paths and checkpoints, are wrapped in `SnapshotHintError::LogSegment`.
     /// Failures outside hint validation retain their existing categories.
     #[error(transparent)]
-    SnapshotHint(#[from] Box<crate::snapshot::SnapshotHintError>),
+    SnapshotHint(#[from] Box<SnapshotHintError>),
 
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]

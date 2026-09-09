@@ -1723,12 +1723,8 @@ fn validate_end_version(
 }
 
 fn validate_and_canonicalize_latest_commit_file(listed: &mut LogSegmentFiles) -> DeltaResult<()> {
-    require!(
-        listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
-        Error::internal_error(
-            "latest_commit_file must be Some when ascending_commit_files is non-empty"
-        )
-    );
+    // TODO(#3293): Determine whether every non-empty commit list can require `latest_commit_file`;
+    // legacy callers may omit it.
     if let Some(commit) = &listed.latest_commit_file {
         require!(
             commit.is_commit(),

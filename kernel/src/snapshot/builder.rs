@@ -553,14 +553,16 @@ impl<Mode> SnapshotBuilder<Mode> {
             .iter()
             .chain(log_segment_files.latest_commit_file.iter())
             .any(|path| path.file_type == LogPathFileType::StagedCommit);
+        let latest_commit_version = log_segment_files
+            .latest_commit_file
+            .as_ref()
+            .or_else(|| log_segment_files.ascending_commit_files.last())
+            .map(|path| path.version);
         Self::validate_catalog_managed_versions(
             requested_version,
             max_catalog_version,
             has_staged_commits,
-            log_segment_files
-                .latest_commit_file
-                .as_ref()
-                .map(|path| path.version),
+            latest_commit_version,
         )?;
 
         require!(
@@ -573,11 +575,6 @@ impl<Mode> SnapshotBuilder<Mode> {
         // filesystem aliases or connector-specific URI forms. The connector must ensure that all
         // hinted locations belong to this table. Kernel validates only path self-consistency and
         // log-segment semantics.
-        require!(
-            log_segment_files.ascending_commit_files.is_empty()
-                || log_segment_files.latest_commit_file.is_some(),
-            SnapshotHintError::MissingLatestCommit.into()
-        );
         let log_segment = LogSegment::try_new(
             log_segment_files,
             log_root,
@@ -631,6 +628,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             table_configuration,
             crc,
             version_status == SnapshotHintVersionStatus::Latest,
+            false, /* skipped_new_checkpoints */
         )
         .map(Into::into)
     }
@@ -893,8 +891,8 @@ mod tests {
         Ok((engine, table_root, snapshot, hint))
     }
 
-    fn assert_hint_error(
-        builder: SnapshotBuilder,
+    fn assert_hint_error<Mode>(
+        builder: SnapshotBuilder<Mode>,
         hint: SnapshotHint,
         engine: &dyn Engine,
         expected: &str,
@@ -1095,11 +1093,14 @@ mod tests {
         let mut gapped = hint.clone();
         gapped.log_segment_files.ascending_commit_files[1] =
             create_log_path("memory:///_delta_log/00000000000000000003.json");
+        gapped.log_segment_files.latest_commit_file = Some(create_log_path(
+            "memory:///_delta_log/00000000000000000003.json",
+        ));
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(&table_root)
                 .with_snapshot_hint(gapped)
                 .build(engine.as_ref()),
-            "Expected contiguous commit files",
+            "Table version 1 is missing",
         );
 
         let mut inconsistent_path = hint.clone();
@@ -1156,18 +1157,16 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_hint_requires_latest_commit_file_when_commits_are_supplied(
+    async fn snapshot_hint_accepts_missing_latest_commit_file(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintVersionStatus::Unverified).await?;
         hint.log_segment_files.latest_commit_file = None;
 
-        assert_hint_error(
-            SnapshotBuilder::new_for(table_root),
-            hint,
-            engine.as_ref(),
-            "latest_commit_file is required when commits are supplied",
-        );
+        let snapshot = SnapshotBuilder::new_for(table_root)
+            .with_snapshot_hint(hint)
+            .build(engine.as_ref())?;
+        assert!(snapshot.log_segment().listed.latest_commit_file.is_none());
         Ok(())
     }
 
@@ -1191,6 +1190,7 @@ mod tests {
             let mut malformed = hint.clone();
             malformed.log_segment_files.latest_commit_file = Some(create_log_path(&latest));
             let err = SnapshotBuilder::new_for(&table_root)
+                .with_max_catalog_version(hint.version)
                 .with_snapshot_hint(malformed)
                 .build(engine.as_ref())
                 .unwrap_err();
@@ -1354,7 +1354,7 @@ mod tests {
             SnapshotBuilder::new_for(table_root)
                 .with_snapshot_hint(hint)
                 .build(engine.as_ref()),
-            "LogSegment end version",
+            "newer than requested end version",
         );
         Ok(())
     }
@@ -1786,7 +1786,7 @@ mod tests {
         }
 
         #[test_log::test(tokio::test)]
-        async fn snapshot_hint_accepts_staged_commit_with_catalog_version(
+        async fn snapshot_hint_accepts_staged_commit_without_latest_file_with_catalog_version(
         ) -> Result<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let staged =
@@ -1795,7 +1795,8 @@ mod tests {
                 .with_log_tail(vec![create_log_path(&table_root, staged)])
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
-            let hint = hint_from_snapshot(&snapshot, SnapshotHintVersionStatus::Unverified);
+            let mut hint = hint_from_snapshot(&snapshot, SnapshotHintVersionStatus::Unverified);
+            hint.log_segment_files.latest_commit_file = None;
 
             let hinted = SnapshotBuilder::new_for(&table_root)
                 .with_max_catalog_version(1)

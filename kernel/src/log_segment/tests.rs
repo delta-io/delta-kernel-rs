@@ -2800,7 +2800,7 @@ fn test_validate_listed_log_file_rejects_one_part_multipart_checkpoint() {
         None,
     )
     .unwrap_err();
-    assert!(matches!(err, Error::Generic(_)));
+    assert!(matches!(err, Error::InvalidCheckpoint(_)));
 }
 
 #[test]
