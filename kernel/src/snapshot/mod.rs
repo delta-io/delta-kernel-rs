@@ -41,7 +41,9 @@ use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 mod builder;
 mod incremental;
 mod snapshot_crc;
-pub use builder::{IncrementalReplay, SnapshotBuilder};
+#[doc(hidden)]
+pub use builder::{FromSnapshot, FromTableRoot};
+pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
 use snapshot_crc::SnapshotCrc;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
@@ -81,10 +83,12 @@ pub struct Snapshot {
     crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
+    /// Whether the last applicable incremental build requested ignoring new checkpoints.
+    skipped_new_checkpoints: bool,
 }
 
 impl PartialEq for Snapshot {
-    // Content equality: `built_as_latest` is best-effort build metadata, deliberately excluded.
+    // Content equality excludes build metadata that does not change the table state.
     fn eq(&self, other: &Self) -> bool {
         self.log_segment == other.log_segment
             && self.table_configuration == other.table_configuration
@@ -106,6 +110,7 @@ impl std::fmt::Debug for Snapshot {
             .field("version", &self.version())
             .field("metadata", &self.table_configuration().metadata())
             .field("log_segment", &self.log_segment)
+            .field("skipped_new_checkpoints", &self.skipped_new_checkpoints)
             .finish()
     }
 }
@@ -128,11 +133,9 @@ impl Snapshot {
         SnapshotBuilder::new_for(table_root)
     }
 
-    /// Create a new [`SnapshotBuilder`] to incrementally update an existing [`Snapshot`] to a
-    /// more recent version.
-    ///
-    /// See `Snapshot::try_new_from` for the case-by-case behavior.
-    pub fn builder_from(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
+    /// Create a new [`IncrementalSnapshotBuilder`] to incrementally update an existing [`Snapshot`]
+    /// to a more recent version.
+    pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
 
@@ -152,18 +155,21 @@ impl Snapshot {
             table_configuration,
             None,  /* crc */
             false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
         )
     }
 
     /// Internal constructor that accepts an explicit pre-resolved CRC.
     ///
     /// `built_as_latest` records whether the build confirmed this is the latest version
-    /// (best-effort). See [`Snapshot::built_as_latest`].
+    /// (best-effort). See [`Snapshot::built_as_latest`]. `skipped_new_checkpoints` records the last
+    /// applicable incremental build's checkpoint policy.
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         crc: Option<Arc<Crc>>,
         built_as_latest: bool,
+        skipped_new_checkpoints: bool,
     ) -> DeltaResult<Self> {
         // Will perform version validations.
         let crc = SnapshotCrc::try_new(
@@ -184,6 +190,7 @@ impl Snapshot {
             table_configuration,
             crc,
             built_as_latest,
+            skipped_new_checkpoints,
         })
     }
 
@@ -225,7 +232,13 @@ impl Snapshot {
         tracing::Span::current().record("version", table_configuration.version());
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        Self::new_with_crc(log_segment, table_configuration, crc, built_as_latest)
+        Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            crc,
+            built_as_latest,
+            false, /* skipped_new_checkpoints */
+        )
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -286,6 +299,7 @@ impl Snapshot {
             new_table_configuration,
             new_crc,
             true, /* built_as_latest */
+            self.skipped_new_checkpoints,
         )
     }
 
@@ -297,6 +311,13 @@ impl Snapshot {
     #[internal_api]
     pub(crate) fn log_segment(&self) -> &LogSegment {
         &self.log_segment
+    }
+
+    /// Whether the last applicable incremental build requested ignoring new checkpoints.
+    ///
+    /// This records the build policy, not whether its listing actually found a checkpoint.
+    pub(crate) fn skipped_new_checkpoints(&self) -> bool {
+        self.skipped_new_checkpoints
     }
 
     /// The CRC iff it sits exactly at this snapshot's version. When `Some`, queries backed by the
@@ -994,6 +1015,7 @@ impl Snapshot {
                     self.table_configuration().clone(),
                     Some(crc),
                     self.built_as_latest,
+                    self.skipped_new_checkpoints,
                 )?);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
@@ -1215,6 +1237,7 @@ impl Snapshot {
                 self.table_configuration().clone(),
                 self.crc_at_version().cloned(),
                 self.built_as_latest,
+                false, /* skipped_new_checkpoints */
             )?),
         ))
     }
@@ -1285,6 +1308,7 @@ impl Snapshot {
             self.table_configuration().clone(),
             self.base_crc().cloned(),
             self.built_as_latest,
+            self.skipped_new_checkpoints,
         )?))
     }
 }
@@ -1453,6 +1477,7 @@ mod tests {
             table_cfg,
             None,  /* crc */
             false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
         )
     }
 
@@ -2278,6 +2303,7 @@ mod tests {
             built.table_configuration().clone(),
             Some(stale_crc),
             false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
         )
         .unwrap();
         assert!(parent.crc_at_version().is_none());

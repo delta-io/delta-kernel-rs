@@ -10,8 +10,8 @@ use crate::{DeltaResult, Engine, Error, Version};
 ///
 /// Created via [`CommitRange::builder_for`] (path-based) or
 /// [`CommitRange::builder_from`] (snapshot-based). Supports configuring an end version
-/// and the commit ordering. [`Self::build`] performs delta-log listing and contiguity
-/// validation.
+/// and the commit ordering. [`Self::build`] lists the log for a path-based builder or reuses the
+/// commit-file metadata in a snapshot-based builder, then validates contiguity.
 // TODO(#2781): support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
 // `with_max_catalog_version(self, Version)`
 pub struct CommitRangeBuilder {
@@ -57,8 +57,9 @@ impl CommitRangeBuilder {
         self
     }
 
-    /// List `_delta_log/`, validate contiguity, and produce a [`CommitRange`]. Performs
-    /// filesystem listing but no JSON reads.
+    /// Resolve commit-file metadata, validate contiguity, and produce a [`CommitRange`]. A
+    /// path-based builder lists `_delta_log/`; a snapshot-based builder reuses the snapshot's log
+    /// segment. Neither path reads commit JSON.
     ///
     /// Returns [`Error::MissingVersion`] if a snapshot-derived range requires a commit that is not
     /// available in the snapshot's log segment. Returns an error if the resolved version range is
