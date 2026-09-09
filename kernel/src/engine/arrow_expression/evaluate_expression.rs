@@ -1332,6 +1332,27 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_float_arrays_rejects_invalid_inputs() {
+        let left = Float64Array::from(vec![0.0]);
+        let right = Float64Array::from(vec![0.0, 1.0]);
+        assert_result_error_with_message(
+            compare_float_arrays::<Float64Type>(
+                &left,
+                &right,
+                BinaryPredicateOp::Equal,
+                false,
+                true,
+            ),
+            "Cannot compare arrays of different lengths",
+        );
+
+        assert_result_error_with_message(
+            compare_float_arrays::<Float64Type>(&left, &left, BinaryPredicateOp::In, false, true),
+            "unexpected IN predicate in float comparison",
+        );
+    }
+
+    #[test]
     fn test_identity_transforms() {
         let batch = create_test_batch();
 
