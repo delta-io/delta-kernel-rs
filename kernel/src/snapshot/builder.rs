@@ -170,17 +170,14 @@ impl SnapshotBuilder<FromSnapshot> {
 
     /// Skip adopting new checkpoints while updating the input snapshot.
     ///
-    /// This supports conflict rebasing. If a transaction read snapshot N, attempted to commit at
-    /// N+1, and lost to commits N+1 through N+5, this option builds a snapshot that preserves that
-    /// full range for [`CommitRange::builder_from`]. A checkpoint at N+3 is recognized but not
-    /// adopted, so commits N+1 and N+2 remain available to the range.
+    /// The resulting snapshot retains newly listed commits instead of adopting a newer checkpoint
+    /// as its replay base. For example, when updating snapshot N to N+5, a checkpoint at N+3 is
+    /// recognized but not adopted, and commits N+1 through N+5 remain in the log segment.
     ///
     /// The update fails if the new commits are not contiguous.
     ///
     /// This option increases memory use and may increase full-scan log replay. It is available
     /// only for builders created by [`Snapshot::builder_from`].
-    ///
-    /// [`CommitRange::builder_from`]: crate::commit_range::CommitRange::builder_from
     pub fn skip_new_checkpoints(mut self) -> Self {
         self.checkpoint_handling = CheckpointHandling::Ignore;
         self

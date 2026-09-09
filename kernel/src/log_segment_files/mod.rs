@@ -339,36 +339,37 @@ impl ListingAccumulator {
     /// only the latest commit.
     fn select_checkpoint_for_group(&mut self, version: Version) {
         let pending_checkpoint_parts = std::mem::take(&mut self.pending_checkpoint_parts);
-        if let Some((_, complete_checkpoint)) = group_checkpoint_parts(pending_checkpoint_parts)
+        let Some((_, complete_checkpoint)) = group_checkpoint_parts(pending_checkpoint_parts)
             .into_iter()
             .filter(|(instance, part_files)| instance.is_complete(part_files))
             .max_by(|(a, _), (b, _)| a.cmp(b))
+        else {
+            return;
+        };
+        if self.checkpoint_handling == CheckpointHandling::Ignore {
+            // TODO(#3269): Return `complete_checkpoint` separately so `Snapshot` can
+            //              track it outside its active `LogSegment`.
+            return;
+        }
+        self.output.checkpoint_parts = complete_checkpoint;
+        // Keep the commit at the checkpoint version (if any) before clearing all older commits.
+        self.output.latest_commit_file = self
+            .output
+            .ascending_commit_files
+            .last()
+            .filter(|c| c.version == version)
+            .cloned();
+        // Log replay only uses commits/compactions after a complete checkpoint
+        self.output.ascending_commit_files.clear();
+        self.output.ascending_compaction_files.clear();
+        // Drop CRC file if older than checkpoint (CRC must be >= checkpoint version)
+        if self
+            .output
+            .latest_crc_file
+            .as_ref()
+            .is_some_and(|crc| crc.version < version)
         {
-            if self.checkpoint_handling == CheckpointHandling::Ignore {
-                // TODO(#3269): Return `complete_checkpoint` separately so `Snapshot` can
-                //              track it outside its active `LogSegment`.
-                return;
-            }
-            self.output.checkpoint_parts = complete_checkpoint;
-            // Keep the commit at the checkpoint version (if any) before clearing all older commits.
-            self.output.latest_commit_file = self
-                .output
-                .ascending_commit_files
-                .last()
-                .filter(|c| c.version == version)
-                .cloned();
-            // Log replay only uses commits/compactions after a complete checkpoint
-            self.output.ascending_commit_files.clear();
-            self.output.ascending_compaction_files.clear();
-            // Drop CRC file if older than checkpoint (CRC must be >= checkpoint version)
-            if self
-                .output
-                .latest_crc_file
-                .as_ref()
-                .is_some_and(|crc| crc.version < version)
-            {
-                self.output.latest_crc_file = None;
-            }
+            self.output.latest_crc_file = None;
         }
     }
 }

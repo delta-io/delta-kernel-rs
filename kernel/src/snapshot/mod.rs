@@ -2203,6 +2203,7 @@ mod tests {
             loaded_snapshot.table_configuration().clone(),
             None,
             false,
+            false, /* skipped_new_checkpoints */
         )?;
         store.delete(&delta_path_for_version(0, "json")).await?;
 

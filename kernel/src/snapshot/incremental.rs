@@ -1038,9 +1038,7 @@ mod tests {
             .expect_err("version 2 does not exist");
 
         // ===== THEN =====
-        assert!(unavailable
-            .to_string()
-            .contains("no new commits were found"));
+        assert!(matches!(unavailable, Error::MissingVersion(2)));
 
         // ===== WHEN =====
         commit(
@@ -1057,9 +1055,7 @@ mod tests {
             .expect_err("version 3 is beyond the latest commit");
 
         // ===== THEN =====
-        assert!(partially_available
-            .to_string()
-            .contains("end version 2 not the same as the specified end version 3"));
+        assert!(matches!(partially_available, Error::MissingVersion(3)));
 
         Ok(())
     }
@@ -1177,9 +1173,7 @@ mod tests {
 
         // ===== THEN =====
         let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
-        assert!(error
-            .to_string()
-            .contains("Expected contiguous commit files"));
+        assert!(matches!(error, Error::MissingVersion(3)));
 
         Ok(())
     }
