@@ -71,6 +71,36 @@ macro_rules! prim_array_cmp {
 
 pub(crate) use prim_array_cmp;
 
+/// Rebuilds a variable-length Arrow list type with a replacement element field while preserving
+/// its wrapper.
+///
+/// # Parameters
+///
+/// - `list_type`: The list type whose wrapper is preserved.
+/// - `element`: The replacement element field.
+///
+/// # Returns
+///
+/// The corresponding list type containing `element`.
+///
+/// # Errors
+///
+/// Returns an error if `list_type` is not `List`, `LargeList`, `ListView`, or `LargeListView`.
+pub(crate) fn list_type_with_element(
+    list_type: &ArrowDataType,
+    element: ArrowFieldRef,
+) -> DeltaResult<ArrowDataType> {
+    match list_type {
+        ArrowDataType::List(_) => Ok(ArrowDataType::List(element)),
+        ArrowDataType::LargeList(_) => Ok(ArrowDataType::LargeList(element)),
+        ArrowDataType::ListView(_) => Ok(ArrowDataType::ListView(element)),
+        ArrowDataType::LargeListView(_) => Ok(ArrowDataType::LargeListView(element)),
+        _ => Err(Error::internal_error(format!(
+            "Expected a variable-length list type, got {list_type:?}."
+        ))),
+    }
+}
+
 type FieldIndex = usize;
 type FlattenedRangeIterator<T> = std::iter::Flatten<std::vec::IntoIter<Range<T>>>;
 
@@ -527,7 +557,8 @@ fn get_indices(
                 }
                 ArrowDataType::List(list_field)
                 | ArrowDataType::LargeList(list_field)
-                | ArrowDataType::ListView(list_field) => {
+                | ArrowDataType::ListView(list_field)
+                | ArrowDataType::LargeListView(list_field) => {
                     // we just want to transparently recurse into lists, need to transform the
                     // kernel list data type into a schema
                     if let DataType::Array(array_type) = requested_field.data_type() {
@@ -580,22 +611,10 @@ fn get_indices(
                                         .clone()
                                         .with_data_type(element_target.clone()),
                                 );
-                                let target = match field.data_type() {
-                                    ArrowDataType::List(_) => {
-                                        ArrowDataType::List(target_element_field)
-                                    }
-                                    ArrowDataType::LargeList(_) => {
-                                        ArrowDataType::LargeList(target_element_field)
-                                    }
-                                    ArrowDataType::ListView(_) => {
-                                        ArrowDataType::ListView(target_element_field)
-                                    }
-                                    _ => {
-                                        return Err(Error::internal_error(
-                                            "List cast planned for a non-list Arrow type.",
-                                        ));
-                                    }
-                                };
+                                let target = list_type_with_element(
+                                    field.data_type(),
+                                    target_element_field,
+                                )?;
                                 child.transform = ReorderIndexTransform::Cast(target);
                             }
                             // the index is wrong, as it's the index from the inner schema.
@@ -3035,6 +3054,10 @@ mod tests {
     #[case::list_view(
         ArrowDataType::ListView(arrow_list_element(ArrowDataType::Int32)),
         ArrowDataType::ListView(arrow_list_element(ArrowDataType::Int64))
+    )]
+    #[case::large_list_view(
+        ArrowDataType::LargeListView(arrow_list_element(ArrowDataType::Int32)),
+        ArrowDataType::LargeListView(arrow_list_element(ArrowDataType::Int64))
     )]
     fn list_element_cast_preserves_physical_wrapper(
         #[case] physical_type: ArrowDataType,
