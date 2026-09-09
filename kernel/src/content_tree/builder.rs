@@ -4,10 +4,6 @@
 //! form of an AMT root manifest. This is the minimal blind-append path: it produces `Data`
 //! entries only, with deletion vectors, tags, and leaf-manifest information left null, and
 //! statistics and partition values omitted from the schema.
-//!
-//! The translation is purely columnar: it builds a single expression that maps a write-metadata
-//! batch to the entry schema and evaluates it, without materializing any [`ContentTreeNodeEntry`]
-//! Rust values.
 
 use std::sync::{Arc, LazyLock};
 
@@ -21,7 +17,7 @@ use crate::content_tree::{
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, null_lit, ColumnName, Expression};
 use crate::scan::log_replay::{
-    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PATH_NAME, SIZE_NAME,
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PATH_NAME, SIZE_NAME, STATS_NAME,
 };
 use crate::schema::{
     ColumnNamesAndTypes, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
@@ -30,16 +26,13 @@ use crate::schema::{
 use crate::transaction::{with_row_tracking_cols, BASE_ADD_FILES_SCHEMA};
 use crate::{DeltaResult, Engine, Error};
 
-/// The add-file write-metadata `stats` column name. Unlike `path`/`size`/`baseRowId`/
-/// `defaultRowCommitVersion`, `stats` has no shared name constant, so it is defined here.
-const STATS_NAME: &str = "stats";
-
 /// The AMT/Iceberg adaptive-metadata format version stamped onto each written entry: Iceberg
 /// format version 4 (the "V4 adaptive metadata tree").
 const AMT_FORMAT_VERSION: i32 = 4;
 
 /// The write-metadata leaf columns this path requires to be non-null on every row, in leaf order:
-/// `stats.numRecords`, `baseRowId`, `defaultRowCommitVersion`. See [`RequiredFieldsNonNull`].
+/// `stats.numRecords`, `baseRowId`, `defaultRowCommitVersion`. See
+/// [`RequiredFieldsNonNullVisitor`].
 static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     StructType::new_unchecked([
         StructField::nullable(
@@ -81,7 +74,7 @@ static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(
 /// Returns an error if the input schema cannot be derived, if a row's required `stats.numRecords`,
 /// `baseRowId`, or `defaultRowCommitVersion` is null, or if the evaluator cannot be constructed or
 /// fails to evaluate.
-pub(crate) fn write_metadata_to_entry_batch(
+pub(crate) fn convert_append_metadata_to_entry_batch(
     engine: &dyn Engine,
     write_metadata: &dyn EngineData,
     snapshot_id: i64,
@@ -89,7 +82,7 @@ pub(crate) fn write_metadata_to_entry_batch(
     // Row tracking guarantees these are assigned, but the evaluator does not enforce the input
     // schema's non-nullability, so a missing assignment would otherwise emit a root entry with a
     // null sequence/firstRowId (invalid for a root manifest). Reject it up front.
-    let mut validator = RequiredFieldsNonNull;
+    let mut validator = RequiredFieldsNonNullVisitor;
     validator.visit_rows_of(write_metadata)?;
 
     let output_schema = ContentTreeNodeEntry::to_schema();
@@ -118,12 +111,9 @@ pub(crate) fn write_metadata_to_entry_batch(
 
 // === Helpers ===
 
-/// The write-metadata input schema consumed by [`write_metadata_to_entry_batch`]; see that
-/// function's docs for field meanings. Derived from the canonical row-tracking-augmented add-file
-/// schema (`Transaction::add_files_schema`) so its field identities and types cannot drift, then
-/// narrowed to the fields this path reads: `path`, `size`, `stats.numRecords`, `baseRowId`, and
-/// `defaultRowCommitVersion`.
+/// The write-metadata input schema consumed by [`convert_append_metadata_to_entry_batch`].
 fn write_metadata_input_schema() -> DeltaResult<SchemaRef> {
+    // Derived from the canonical add-file schema so field identities and types cannot drift.
     let augmented = with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?;
     let projected = augmented.project(&[
         PATH_NAME,
@@ -149,19 +139,16 @@ fn write_metadata_input_schema() -> DeltaResult<SchemaRef> {
     Ok(Arc::new(narrowed))
 }
 
-/// Rejects any write-metadata row whose required row-tracking/statistic fields are null. The
-/// evaluator ignores the input schema's non-nullability, so this is the only guard that upholds the
-/// contract of [`write_metadata_to_entry_batch`].
-struct RequiredFieldsNonNull;
+/// Rejects any write-metadata row whose required row-tracking/statistic fields are null.
+struct RequiredFieldsNonNullVisitor;
 
-impl RowVisitor for RequiredFieldsNonNull {
+impl RowVisitor for RequiredFieldsNonNullVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         REQUIRED_NON_NULL_COLUMNS.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        // Column order matches REQUIRED_NON_NULL_COLUMNS: stats.numRecords, baseRowId,
-        // defaultRowCommitVersion.
+        // Column order matches REQUIRED_NON_NULL_COLUMNS.
         for row in 0..row_count {
             require_non_null(getters[0], row, "stats.numRecords")?;
             require_non_null(getters[1], row, BASE_ROW_ID_NAME)?;
@@ -258,15 +245,35 @@ mod tests {
     use crate::expressions::{Scalar, StructData};
     use crate::Engine;
 
-    /// A row of write-metadata input: `(path, size, numRecords, baseRowId,
-    /// defaultRowCommitVersion)`, where any field may be null (to exercise null rejection).
-    type InputRow = (
-        Option<&'static str>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    );
+    /// A row of write-metadata input, where any field may be null (to exercise null rejection).
+    #[derive(Clone, Copy)]
+    struct InputRow {
+        path: Option<&'static str>,
+        size: Option<i64>,
+        num_records: Option<i64>,
+        base_row_id: Option<i64>,
+        commit_version: Option<i64>,
+    }
+
+    impl From<(&'static str, i64, i64, i64, i64)> for InputRow {
+        fn from(
+            (path, size, num_records, base_row_id, commit_version): (
+                &'static str,
+                i64,
+                i64,
+                i64,
+                i64,
+            ),
+        ) -> Self {
+            InputRow {
+                path: Some(path),
+                size: Some(size),
+                num_records: Some(num_records),
+                base_row_id: Some(base_row_id),
+                commit_version: Some(commit_version),
+            }
+        }
+    }
 
     fn opt_long(value: Option<i64>) -> Scalar {
         value
@@ -280,10 +287,7 @@ mod tests {
         engine: &dyn Engine,
         files: &[(&'static str, i64, i64, i64, i64)],
     ) -> Box<dyn EngineData> {
-        let rows: Vec<InputRow> = files
-            .iter()
-            .map(|&(p, s, n, b, c)| (Some(p), Some(s), Some(n), Some(b), Some(c)))
-            .collect();
+        let rows: Vec<InputRow> = files.iter().map(|&f| f.into()).collect();
         write_metadata_input_nullable(engine, &rows)
     }
 
@@ -294,21 +298,29 @@ mod tests {
     ) -> Box<dyn EngineData> {
         let scalars: Vec<Vec<Scalar>> = rows
             .iter()
-            .map(|&(path, size, num_records, base_row_id, commit_version)| {
-                let stats = StructData::try_new(
-                    vec![StructField::nullable(NUM_RECORDS, DataType::LONG)],
-                    vec![opt_long(num_records)],
-                )
-                .unwrap();
-                vec![
-                    path.map(Scalar::from)
-                        .unwrap_or(Scalar::Null(DataType::STRING)),
-                    opt_long(size),
-                    Scalar::Struct(stats),
-                    opt_long(base_row_id),
-                    opt_long(commit_version),
-                ]
-            })
+            .map(
+                |&InputRow {
+                     path,
+                     size,
+                     num_records,
+                     base_row_id,
+                     commit_version,
+                 }| {
+                    let stats = StructData::try_new(
+                        vec![StructField::nullable(NUM_RECORDS, DataType::LONG)],
+                        vec![opt_long(num_records)],
+                    )
+                    .unwrap();
+                    vec![
+                        path.map(Scalar::from)
+                            .unwrap_or(Scalar::Null(DataType::STRING)),
+                        opt_long(size),
+                        Scalar::Struct(stats),
+                        opt_long(base_row_id),
+                        opt_long(commit_version),
+                    ]
+                },
+            )
             .collect();
         let row_refs: Vec<&[Scalar]> = scalars.iter().map(Vec::as_slice).collect();
         engine
@@ -317,20 +329,17 @@ mod tests {
             .unwrap()
     }
 
-    /// Builds the expected content-tree entry batch for `files`, so tests assert the whole
-    /// transform output by equality rather than inspecting individual Arrow columns. Values and
-    /// typed nulls are derived from `ContentTreeNodeEntry::to_schema`, so this tracks the schema.
+    /// Builds the expected content-tree entry batch for `files` from explicit
+    /// [`ContentTreeNodeEntry`] values.
     fn expected_entries(
         engine: &dyn Engine,
         files: &[(&'static str, i64, i64, i64, i64)],
         snapshot_id: i64,
     ) -> Box<dyn EngineData> {
-        let output_schema = Arc::new(ContentTreeNodeEntry::to_schema());
-        let rows: Vec<Vec<Scalar>> = files
+        let entries: Vec<StructData> = files
             .iter()
             .map(|&(path, size, num_records, base_row_id, commit_version)| {
-                entry_row(
-                    &output_schema,
+                expected_entry(
                     path,
                     size,
                     num_records,
@@ -338,66 +347,63 @@ mod tests {
                     commit_version,
                     snapshot_id,
                 )
+                .into()
             })
             .collect();
-        let row_refs: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
+        let rows: Vec<&[Scalar]> = entries.iter().map(StructData::values).collect();
         engine
             .evaluation_handler()
-            .create_many(output_schema, &row_refs)
+            .create_many(Arc::new(ContentTreeNodeEntry::to_schema()), &rows)
             .unwrap()
     }
 
-    /// One expected entry row as scalars, in `schema` field order; unmatched fields are typed
-    /// nulls.
-    fn entry_row(
-        schema: &StructType,
+    /// The expected `Added` `Data` entry for one input file.
+    fn expected_entry(
         path: &str,
         size: i64,
         num_records: i64,
         base_row_id: i64,
         commit_version: i64,
         snapshot_id: i64,
-    ) -> Vec<Scalar> {
-        let tracking_schema = TrackingInfo::to_schema();
-        let tracking_values = tracking_schema
-            .fields()
-            .map(|f| match f.name().as_str() {
-                TRACKING_STATUS => Scalar::from(TrackingStatus::Added),
-                TRACKING_SNAPSHOT_ID => Scalar::Long(snapshot_id),
-                SEQUENCE_NUMBER | FILE_SEQUENCE_NUMBER => Scalar::Long(commit_version),
-                FIRST_ROW_ID => Scalar::Long(base_row_id),
-                _ => Scalar::Null(f.data_type().clone()),
-            })
-            .collect();
-        let tracking = Scalar::Struct(
-            StructData::try_new(tracking_schema.fields().cloned().collect(), tracking_values)
-                .unwrap(),
-        );
-
-        schema
-            .fields()
-            .map(|f| match f.name().as_str() {
-                CONTENT_TYPE => Scalar::from(DataContentType::Data),
-                LOCATION => Scalar::from(path),
-                FILE_FORMAT => Scalar::from(DataFileFormat::Parquet),
-                TRACKING => tracking.clone(),
-                PARTITION_SPEC_ID => Scalar::Integer(0),
-                RECORD_COUNT => Scalar::Long(num_records),
-                FILE_SIZE_IN_BYTES => Scalar::Long(size),
-                FORMAT_VERSION => Scalar::Integer(AMT_FORMAT_VERSION),
-                _ => Scalar::Null(f.data_type().clone()),
-            })
-            .collect()
+    ) -> ContentTreeNodeEntry {
+        ContentTreeNodeEntry {
+            content_type: DataContentType::Data,
+            location: Some(path.to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking: TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(snapshot_id),
+                dv_snapshot_id: None,
+                sequence_number: Some(commit_version),
+                file_sequence_number: Some(commit_version),
+                first_row_id: Some(base_row_id),
+                deleted_positions: None,
+                replaced_positions: None,
+            },
+            deletion_vector: None,
+            spec_id: 0,
+            partition: None,
+            sort_order_id: None,
+            record_count: num_records,
+            file_size_in_bytes: Some(size),
+            content_stats: None,
+            manifest_info: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+            format_version: AMT_FORMAT_VERSION,
+            tags: None,
+        }
     }
 
     #[test]
-    fn write_metadata_to_entry_batch_produces_added_data_entries() {
+    fn convert_append_metadata_to_entry_batch_produces_added_data_entries() {
         let engine = SyncEngine::new();
         // (path, size, numRecords, baseRowId, defaultRowCommitVersion)
         let files = [("a.parquet", 100, 10, 0, 5), ("b.parquet", 200, 20, 10, 5)];
         let snapshot_id = 42;
 
-        let out = write_metadata_to_entry_batch(
+        let out = convert_append_metadata_to_entry_batch(
             &engine,
             write_metadata_input(&engine, &files).as_ref(),
             snapshot_id,
@@ -414,12 +420,11 @@ mod tests {
     #[rstest]
     #[case::spaced("a b.parquet")]
     #[case::percent_encoded("a%20b.parquet")]
-    fn write_metadata_to_entry_batch_location_is_verbatim(#[case] path: &'static str) {
-        // Pins the current (deferred-decode) contract: `location` carries the raw path byte-for-
-        // byte. When AMT `location` decoding lands (C1), the expected value here changes.
+    fn convert_append_metadata_to_entry_batch_location_is_verbatim(#[case] path: &'static str) {
+        // Pins the current contract: `location` carries the raw path byte-for-byte.
         let engine = SyncEngine::new();
         let files = [(path, 1, 1, 0, 0)];
-        let out = write_metadata_to_entry_batch(
+        let out = convert_append_metadata_to_entry_batch(
             &engine,
             write_metadata_input(&engine, &files).as_ref(),
             0,
@@ -434,16 +439,25 @@ mod tests {
     }
 
     #[rstest]
-    #[case::num_records((Some("a.parquet"), Some(1), None, Some(0), Some(0)), "stats.numRecords")]
-    #[case::base_row_id((Some("a.parquet"), Some(1), Some(1), None, Some(0)), BASE_ROW_ID_NAME)]
-    #[case::commit_version((Some("a.parquet"), Some(1), Some(1), Some(0), None), DEFAULT_ROW_COMMIT_VERSION_NAME)]
-    fn write_metadata_to_entry_batch_rejects_null_required_field(
+    #[case::num_records(
+        InputRow { path: Some("a.parquet"), size: Some(1), num_records: None, base_row_id: Some(0), commit_version: Some(0) },
+        "stats.numRecords"
+    )]
+    #[case::base_row_id(
+        InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: None, commit_version: Some(0) },
+        BASE_ROW_ID_NAME
+    )]
+    #[case::commit_version(
+        InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: Some(0), commit_version: None },
+        DEFAULT_ROW_COMMIT_VERSION_NAME
+    )]
+    fn convert_append_metadata_to_entry_batch_rejects_null_required_field(
         #[case] row: InputRow,
         #[case] field: &str,
     ) {
         let engine = SyncEngine::new();
         let input = write_metadata_input_nullable(&engine, &[row]);
-        let err = write_metadata_to_entry_batch(&engine, input.as_ref(), 0)
+        let err = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0)
             .err()
             .expect("null required field should be rejected");
         assert!(
@@ -456,7 +470,7 @@ mod tests {
     fn write_metadata_output_schema_matches_entry_schema() {
         let engine = SyncEngine::new();
         let input = write_metadata_input(&engine, &[("a.parquet", 1, 1, 0, 0)]);
-        let out = write_metadata_to_entry_batch(&engine, input.as_ref(), 0)
+        let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0)
             .unwrap()
             .try_into_record_batch()
             .unwrap();
@@ -468,10 +482,10 @@ mod tests {
     }
 
     #[test]
-    fn write_metadata_to_entry_batch_empty_input_yields_empty_batch() {
+    fn convert_append_metadata_to_entry_batch_empty_input_yields_empty_batch() {
         let engine = SyncEngine::new();
         let input = write_metadata_input(&engine, &[]);
-        let out = write_metadata_to_entry_batch(&engine, input.as_ref(), 0).unwrap();
+        let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0).unwrap();
         assert_eq!(out.len(), 0);
     }
 }

@@ -33,7 +33,8 @@ use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
-    PARTITION_VALUES_NAME, PARTITION_VALUES_PARSED_NAME, SIZE_NAME, STATS_PARSED_NAME, TAGS_NAME,
+    PARTITION_VALUES_NAME, PARTITION_VALUES_PARSED_NAME, SIZE_NAME, STATS_NAME, STATS_PARSED_NAME,
+    TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::validate_schema_for_write;
@@ -121,7 +122,7 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
 /// expected stats schema for a specific table.
 pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(mandatory_add_file_schema().fields().cloned()),
-    nullable "stats": {
+    nullable STATS_NAME: {
         nullable NUM_RECORDS: LONG,
         // nullCount, minValues, maxValues are dynamic based on data schema. Empty struct
         // placeholders indicate these fields exist but their inner structure depends on the
