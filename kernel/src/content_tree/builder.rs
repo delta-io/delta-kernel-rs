@@ -9,13 +9,13 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::NUM_RECORDS;
 use crate::content_tree::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo, TrackingStatus,
-    CONTENT_TYPE, FILE_FORMAT, FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES, FIRST_ROW_ID,
-    FORMAT_VERSION, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING,
-    TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
+    struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo,
+    TrackingStatus, CONTENT_TYPE, FILE_FORMAT, FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES,
+    FIRST_ROW_ID, FORMAT_VERSION, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER,
+    TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
 };
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{lit, null_lit, ColumnName, Expression};
+use crate::expressions::{lit, ColumnName, Expression};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PATH_NAME, SIZE_NAME, STATS_NAME,
 };
@@ -230,31 +230,6 @@ fn build_tracking_expression(projections: &ContentTreeEntryProjections) -> Delta
         FIRST_ROW_ID => Some(projections.first_row_id.clone()),
         _ => None,
     })
-}
-
-/// Builds a struct expression matching `schema` field-for-field. `project` supplies the expression
-/// for a named field; an unmatched nullable field (one returning `None`) becomes a typed null
-/// literal, so the result matches the schema in field order and type.
-///
-/// # Errors
-/// Returns an error if a non-nullable field has no projection: falling back to a typed null there
-/// would silently emit a null in a non-nullable column.
-fn struct_expr_from_schema(
-    schema: &StructType,
-    project: impl Fn(&str) -> Option<Expression>,
-) -> DeltaResult<Expression> {
-    let fields = schema
-        .fields()
-        .map(|field| match project(field.name().as_str()) {
-            Some(expr) => Ok(expr),
-            None if field.is_nullable() => Ok(null_lit(field.data_type().clone())),
-            None => Err(Error::generic(format!(
-                "no projection for required content-tree entry field '{}'",
-                field.name()
-            ))),
-        })
-        .collect::<DeltaResult<Vec<_>>>()?;
-    Ok(Expression::struct_from(fields))
 }
 
 #[cfg(test)]
