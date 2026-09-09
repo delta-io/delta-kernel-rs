@@ -11,7 +11,7 @@ pub(crate) mod stats;
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use delta_kernel_derive::{IntoStructData, ToSchema};
+use delta_kernel_derive::{IntoEngineData, ToSchema};
 use url::Url;
 
 use crate::engine_data::EngineData;
@@ -75,7 +75,8 @@ pub(super) struct ContentTreeNode {
 
 /// Sub-struct of ContentTreeNodeEntry that hold information about
 /// deletion vector applied to data files.
-#[derive(Debug, Clone, ToSchema, IntoStructData)]
+#[derive(Debug, Clone, ToSchema, IntoEngineData)]
+#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
 pub(crate) struct DeletionVectorInfo {
     /// Path to location that DV is stored in.
     #[field_id = 155]
@@ -98,7 +99,8 @@ pub(crate) struct DeletionVectorInfo {
 /// Sub-struct of ContentTreeNodeEntry that tracks details
 /// of the history of a file in the AMT (its current state,
 /// a sequence number for when it was added, etc).
-#[derive(Debug, Clone, ToSchema, IntoStructData)]
+#[derive(Debug, Clone, ToSchema, IntoEngineData)]
+#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
 pub struct TrackingInfo {
     /// Whether this entry is added, existing, or deleted.
     #[field_id = 0]
@@ -145,6 +147,7 @@ pub struct TrackingInfo {
 
 /// Represents an entry/row in a ContentTree node.
 #[derive(Debug, Clone, ToSchema)]
+#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
 pub(super) struct ContentTreeNodeEntry {
     /// Type of content stored by the entry.
     /// DataManifest and DeleteManifest can only be defined in the root manifest.
@@ -306,7 +309,8 @@ impl From<TrackingStatus> for Scalar {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, ToSchema, IntoStructData)]
+#[derive(Debug, Clone, Default, PartialEq, ToSchema, IntoEngineData)]
+#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
 pub(crate) struct ManifestInfo {
     /// Number of entries with ADDED status in the manifest.
     #[field_id = 504]
