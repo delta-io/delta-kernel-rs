@@ -46,7 +46,7 @@ pub use builder::{FromSnapshot, FromTableRoot};
 pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
 #[allow(unused_imports)]
 #[internal_api]
-pub(crate) use builder::{SnapshotHint, SnapshotHintVersionStatus};
+pub(crate) use builder::{SnapshotHint, SnapshotHintFreshness};
 use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;

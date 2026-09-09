@@ -16,7 +16,7 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::snapshot::IncrementalReplay;
 #[cfg(feature = "internal-api")]
-use delta_kernel::snapshot::{SnapshotHint, SnapshotHintVersionStatus};
+use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -56,7 +56,7 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> DeltaResult<()> {
         metadata: snapshot.table_configuration().metadata().clone(),
         last_checkpoint_hint: snapshot.log_segment().checkpoint_hint().cloned(),
         crc: snapshot.crc_at_version().cloned(),
-        version_status: SnapshotHintVersionStatus::Latest,
+        freshness: SnapshotHintFreshness::Latest,
     };
     reporter.reset();
 

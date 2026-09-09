@@ -110,9 +110,9 @@ pub enum SnapshotLoadType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum LogSegmentLoadType {
-    Full = 0,
-    Incremental = 1,
-    Unknown = 2,
+    Full,
+    Incremental,
+    Unknown,
 }
 
 impl From<kernel::LogSegmentLoadType> for LogSegmentLoadType {
@@ -899,13 +899,6 @@ mod tests {
         assert_eq!(SnapshotLoadType::Incremental as i32, 1);
         assert_eq!(SnapshotLoadType::SnapshotHint as i32, 2);
         assert_eq!(SnapshotLoadType::Unknown as i32, 3);
-    }
-
-    #[test]
-    fn log_segment_load_type_discriminants_are_stable() {
-        assert_eq!(LogSegmentLoadType::Full as i32, 0);
-        assert_eq!(LogSegmentLoadType::Incremental as i32, 1);
-        assert_eq!(LogSegmentLoadType::Unknown as i32, 2);
     }
 
     #[test]

@@ -284,14 +284,25 @@ where
 {
     let opt: Option<FileSizeHistogram> = Option::deserialize(deserializer)?;
     match opt {
-        Some(hist) => FileSizeHistogram::try_new(
-            hist.sorted_bin_boundaries,
-            hist.file_counts,
-            hist.total_bytes,
-        )
-        .and_then(FileSizeHistogram::check_non_negative)
-        .map(Some)
-        .map_err(serde::de::Error::custom),
+        Some(hist) => {
+            if let Some(bin) = hist
+                .file_counts
+                .iter()
+                .zip(&hist.total_bytes)
+                .position(|(count, bytes)| *count < 0 || *bytes < 0)
+            {
+                return Err(serde::de::Error::custom(format!(
+                    "CRC fileSizeHistogram has negative counts or bytes at bin {bin}"
+                )));
+            }
+            FileSizeHistogram::try_new(
+                hist.sorted_bin_boundaries,
+                hist.file_counts,
+                hist.total_bytes,
+            )
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+        }
         None => Ok(None),
     }
 }
@@ -757,6 +768,10 @@ mod tests {
         assert!(
             error.to_string().contains("negative counts or bytes"),
             "expected invalid {field}, got {error}"
+        );
+        assert!(
+            !error.to_string().contains("kernel bug"),
+            "malformed external data must not be reported as a kernel bug: {error}"
         );
     }
 
