@@ -1908,15 +1908,15 @@ fn test_float_distinct_nullable_slices_across_bitmap_boundaries(
 ) {
     let make_array = |zero: f64, nullable: bool, period: usize, start: usize| {
         let values: Float64Array = (0..start + len)
-            .map(|index| (!nullable || index % period != 0).then_some(zero))
+            .map(|index| (!nullable || !index.is_multiple_of(period)).then_some(zero))
             .collect();
         cast(&values, &data_type).unwrap().slice(start, len)
     };
     let left = make_array(-0.0, left_nullable, 3, offset);
     let right = make_array(0.0, right_nullable, 5, offset + 1);
     let expected = BooleanArray::from_iter((0..len).map(|row| {
-        let left_null = left_nullable && (offset + row) % 3 == 0;
-        let right_null = right_nullable && (offset + 1 + row) % 5 == 0;
+        let left_null = left_nullable && (offset + row).is_multiple_of(3);
+        let right_null = right_nullable && (offset + 1 + row).is_multiple_of(5);
         Some(match (left_null, right_null) {
             (true, true) | (false, false) => inverted,
             _ => !inverted,
