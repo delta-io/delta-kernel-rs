@@ -419,13 +419,13 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
     };
-    use delta_kernel::schema::schema_ref;
+    use delta_kernel::schema::{schema_ref, DataType as KernelDataType, StructField, StructType};
     use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
     use futures::future;
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::engine_contract::test_json_handler_file_path_contract;
-    use test_utils::TestCancellationToken;
+    use test_utils::{assert_result_error_with_message, TestCancellationToken};
     use tracing::info;
 
     use super::*;
@@ -1178,10 +1178,7 @@ mod tests {
     async fn test_read_json_files_parallel_with_cancelled_token() {
         let store = Arc::new(InMemory::new());
         store
-            .put(
-                &Path::from("test/0"),
-                Bytes::from(r#"{"val": 0}"#).into(),
-            )
+            .put(&Path::from("test/0"), Bytes::from(r#"{"val": 0}"#).into())
             .await
             .unwrap();
         let url = Url::parse("memory:///test/0").unwrap();
@@ -1193,17 +1190,100 @@ mod tests {
         let executor = Arc::new(TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
         ));
-        let handler = DefaultJsonHandler::new(store, executor)
-            .with_parallel_chunks(NonZero::new(4));
+        let handler =
+            DefaultJsonHandler::new(store, executor).with_parallel_chunks(NonZero::new(4));
         let physical_schema = schema_ref! { nullable "val": INTEGER };
-        let token: CancellationTokenRef =
-            Arc::new(TestCancellationToken::cancelled());
-        let result = handler
-            .read_json_files_with_cancellation(&files, physical_schema, None, Some(token));
+        let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+        let result =
+            handler.read_json_files_with_cancellation(&files, physical_schema, None, Some(token));
         assert!(
             matches!(result, Err(Error::Cancelled)),
             "pre-cancelled token must yield Cancelled, not data"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_propagates_schema_conversion_error() {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(&Path::from("test/0"), Bytes::from(r#"{"val": 0}"#).into())
+            .await
+            .unwrap();
+        let files = vec![FileMeta {
+            location: Url::parse("memory:///test/0").unwrap(),
+            last_modified: 0,
+            size: 12,
+        }];
+
+        // A shredded Variant is a valid kernel type but Arrow conversion only
+        // accepts the unshredded (metadata + value) shape. That makes
+        // json_arrow_schema fail inside each spawned chunk task.
+        let shredded_variant = KernelDataType::variant_type([
+            StructField::not_null("metadata", KernelDataType::BINARY),
+            StructField::not_null("value", KernelDataType::BINARY),
+            StructField::nullable("typed_value", KernelDataType::INTEGER),
+        ])
+        .unwrap();
+        let physical_schema =
+            Arc::new(StructType::try_new([StructField::nullable("v", shredded_variant)]).unwrap());
+
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_parallel_chunks(NonZero::new(2));
+        let result: DeltaResult<Vec<_>> = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .try_collect();
+        assert_result_error_with_message(result, "Incorrect Variant Schema");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_stops_when_consumer_drops() {
+        // More files per chunk than the per-chunk channel can hold, so producers
+        // block on send. Dropping after the first batch then hits is_err().
+        const N: usize = 64;
+        let memory_store = InMemory::new();
+        for i in 0..N {
+            memory_store
+                .put(
+                    &Path::from(format!("test/{i}")),
+                    Bytes::from(format!("{{\"val\": {i}}}")).into(),
+                )
+                .await
+                .unwrap();
+        }
+        let store = Arc::new(LatencyStore::new(memory_store, Duration::from_millis(5)));
+        let files: Vec<FileMeta> = (0..N)
+            .map(|i| FileMeta {
+                location: Url::parse(&format!("memory:///test/{i}")).unwrap(),
+                last_modified: 0,
+                size: 12,
+            })
+            .collect();
+
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_buffer_size(NonZero::new(1).unwrap())
+        .with_batch_size(NonZero::new(1).unwrap())
+        .with_parallel_chunks(NonZero::new(2));
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let mut iter = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap();
+        let first = iter.next().expect("at least one batch");
+        assert!(first.is_ok(), "first batch must succeed before drop");
+        drop(iter);
+        // Let blocked chunk tasks observe the closed channel and take the
+        // consumer-dropped return before the test runtime shuts down.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
