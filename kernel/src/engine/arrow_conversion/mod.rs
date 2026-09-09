@@ -15,6 +15,8 @@
 //! [`DefaultExpressionEvaluator`][crate::engine::arrow_expression::DefaultExpressionEvaluator]
 //! converts the logical schema to an Arrow schema as the output schema.
 
+#[cfg(feature = "geo-type-in-dev")]
+pub(crate) mod geo;
 pub mod scalar;
 
 use std::collections::HashMap;
@@ -183,6 +185,10 @@ impl TryFromKernel<&StructField> for ArrowField {
         // retained in Arrow; its content is processed by `kernel_field_into_arrow`.
         metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
         let arrow_type = kernel_field_into_arrow(f, f.name(), f.data_type())?;
+        #[cfg(feature = "geo-type-in-dev")]
+        if let DataType::Primitive(PrimitiveType::Geometry(geometry)) = f.data_type() {
+            metadata.extend(geo::geometry_geoarrow_metadata(geometry));
+        }
         Ok(ArrowField::new(f.name(), arrow_type, f.is_nullable()).with_metadata(metadata))
     }
 }
@@ -372,11 +378,11 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::IntervalYearMonth => Ok(ArrowDataType::Int32),
                     PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
                     #[cfg(feature = "geo-type-in-dev")]
-                    PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
-                        Err(ArrowError::SchemaError(format!(
-                            "Geo types are not yet supported in the default engine: {p}"
-                        )))
-                    }
+                    PrimitiveType::Geometry(_) => Ok(ArrowDataType::Binary),
+                    #[cfg(feature = "geo-type-in-dev")]
+                    PrimitiveType::Geography(_) => Err(ArrowError::SchemaError(format!(
+                        "Geo types are not yet supported in the default engine: {p}"
+                    ))),
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -681,12 +687,7 @@ mod tests {
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
-    #[case(geometry_type("EPSG:4326"))]
     #[case(geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical))]
-    #[case(DataType::from(schema! {
-        nullable "g": (geometry_type("EPSG:4326")),
-    }))]
-    #[case(DataType::from(ArrayType::new(geometry_type("EPSG:4326"), true)))]
     #[case(DataType::from(MapType::new(
         DataType::STRING,
         geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
@@ -696,6 +697,47 @@ mod tests {
         let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
         let err = result.unwrap_err();
         assert!(matches!(err, ArrowError::SchemaError(_)), "got: {err:?}");
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_geometry_type_arrow_conversion_uses_binary() -> DeltaResult<()> {
+        let arrow_type = ArrowDataType::try_from_kernel(&geometry_type("EPSG:4326"))?;
+        assert_eq!(arrow_type, ArrowDataType::Binary);
+        Ok(())
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_geometry_field_arrow_conversion_adds_geoarrow_metadata() -> DeltaResult<()> {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "description",
+            MetadataValue::String("bbox corner".to_owned()),
+        );
+        let field =
+            StructField::nullable("geom", geometry_type("EPSG:4326")).with_metadata(metadata);
+
+        let arrow_field = ArrowField::try_from_kernel(&field)?;
+
+        assert_eq!(arrow_field.data_type(), &ArrowDataType::Binary);
+        assert_eq!(
+            arrow_field.metadata().get("ARROW:extension:name"),
+            Some(&"geoarrow.wkb".to_owned())
+        );
+        assert_eq!(
+            arrow_field.metadata().get("description"),
+            Some(&"bbox corner".to_owned())
+        );
+        let extension_metadata = arrow_field
+            .metadata()
+            .get("ARROW:extension:metadata")
+            .expect("geometry Arrow field should include GeoArrow extension metadata");
+        let extension_metadata: serde_json::Value = serde_json::from_str(extension_metadata)
+            .expect("GeoArrow extension metadata should be valid JSON");
+        assert_eq!(extension_metadata["crs"], "EPSG:4326");
+        assert_eq!(extension_metadata["crs_type"], "authority_code");
+        Ok(())
     }
 
     #[test]
