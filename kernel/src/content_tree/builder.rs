@@ -20,27 +20,44 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PATH_NAME, SIZE_NAME, STATS_NAME,
 };
 use crate::schema::{
-    ColumnNamesAndTypes, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    lazy_schema_ref, ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType,
     ToSchema as _,
 };
-use crate::transaction::{with_row_tracking_cols, BASE_ADD_FILES_SCHEMA};
 use crate::{DeltaResult, Engine, Error};
 
 /// The AMT/Iceberg adaptive-metadata format version stamped onto each written entry: Iceberg
 /// format version 4 (the "V4 adaptive metadata tree").
 const AMT_FORMAT_VERSION: i32 = 4;
 
+/// Dotted path of the `stats.numRecords` leaf column, used for column selection and error messages.
+const STATS_NUM_RECORDS: &str = "stats.numRecords";
+
+/// The write-metadata input schema consumed by [`convert_append_metadata_to_entry_batch`]: a
+/// projection of the row-tracking-augmented add-file write-metadata schema, with `stats` narrowed
+/// to `numRecords`. Kept in lockstep with the canonical `BASE_ADD_FILES_SCHEMA` by
+/// `write_metadata_input_schema_matches_add_file_projection`, which fails if the two drift.
+static WRITE_METADATA_INPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null PATH_NAME: STRING,
+    not_null SIZE_NAME: LONG,
+    nullable STATS_NAME: {
+        nullable NUM_RECORDS: LONG,
+    },
+    nullable BASE_ROW_ID_NAME: LONG,
+    nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
+};
+
 /// The write-metadata leaf columns this path requires to be non-null on every row, in leaf order:
 /// `stats.numRecords`, `baseRowId`, `defaultRowCommitVersion`. See
-/// [`RequiredFieldsNonNullVisitor`].
+/// [`RequiredFieldsNonNullVisitor`]. Nullability is only used to name the selected leaves; the
+/// non-null contract is enforced by the visitor, not this schema.
 static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     StructType::new_unchecked([
-        StructField::nullable(
+        StructField::not_null(
             STATS_NAME,
-            StructType::new_unchecked([StructField::nullable(NUM_RECORDS, DataType::LONG)]),
+            StructType::new_unchecked([StructField::not_null(NUM_RECORDS, DataType::LONG)]),
         ),
-        StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
-        StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+        StructField::not_null(BASE_ROW_ID_NAME, DataType::LONG),
+        StructField::not_null(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
     ])
     .leaves(None)
 });
@@ -71,9 +88,9 @@ static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(
 /// An [`EngineData`] batch matching [`ContentTreeNodeEntry::to_schema`].
 ///
 /// # Errors
-/// Returns an error if the input schema cannot be derived, if a row's required `stats.numRecords`,
-/// `baseRowId`, or `defaultRowCommitVersion` is null, or if the evaluator cannot be constructed or
-/// fails to evaluate.
+/// Returns an error if a row's required `stats.numRecords`, `baseRowId`, or
+/// `defaultRowCommitVersion` is null, or if the evaluator cannot be constructed or fails to
+/// evaluate.
 pub(crate) fn convert_append_metadata_to_entry_batch(
     engine: &dyn Engine,
     write_metadata: &dyn EngineData,
@@ -102,7 +119,7 @@ pub(crate) fn convert_append_metadata_to_entry_batch(
 
     let expr = build_content_tree_entry_expression(&output_schema, &projections);
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        write_metadata_input_schema()?,
+        WRITE_METADATA_INPUT_SCHEMA.clone(),
         Arc::new(expr),
         DataType::from(output_schema),
     )?;
@@ -110,34 +127,6 @@ pub(crate) fn convert_append_metadata_to_entry_batch(
 }
 
 // === Helpers ===
-
-/// The write-metadata input schema consumed by [`convert_append_metadata_to_entry_batch`].
-fn write_metadata_input_schema() -> DeltaResult<SchemaRef> {
-    // Derived from the canonical add-file schema so field identities and types cannot drift.
-    let augmented = with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?;
-    let projected = augmented.project(&[
-        PATH_NAME,
-        SIZE_NAME,
-        STATS_NAME,
-        BASE_ROW_ID_NAME,
-        DEFAULT_ROW_COMMIT_VERSION_NAME,
-    ])?;
-    let narrowed_stats = match projected.field(STATS_NAME).map(StructField::data_type) {
-        Some(DataType::Struct(stats)) => stats.project_as_struct(&[NUM_RECORDS])?,
-        _ => {
-            return Err(Error::generic(
-                "add-file write-metadata schema is missing the `stats` struct",
-            ))
-        }
-    };
-    let narrowed = SchemaStructPatchBuilder::new()
-        .replace(
-            STATS_NAME,
-            StructField::nullable(STATS_NAME, narrowed_stats),
-        )
-        .build(&projected)?;
-    Ok(Arc::new(narrowed))
-}
 
 /// Rejects any write-metadata row whose required row-tracking/statistic fields are null.
 struct RequiredFieldsNonNullVisitor;
@@ -150,7 +139,7 @@ impl RowVisitor for RequiredFieldsNonNullVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         // Column order matches REQUIRED_NON_NULL_COLUMNS.
         for row in 0..row_count {
-            require_non_null(getters[0], row, "stats.numRecords")?;
+            require_non_null(getters[0], row, STATS_NUM_RECORDS)?;
             require_non_null(getters[1], row, BASE_ROW_ID_NAME)?;
             require_non_null(getters[2], row, DEFAULT_ROW_COMMIT_VERSION_NAME)?;
         }
@@ -172,6 +161,9 @@ fn require_non_null<'a>(getter: &'a dyn GetData<'a>, row: usize, field: &str) ->
 /// Per-field expressions driving [`build_content_tree_entry_expression`].
 struct ContentTreeEntryProjections {
     status: TrackingStatus,
+    // TODO: root-manifest entries always carry an explicit `snapshotId` and `sequenceNumber`. Leaf
+    // entries may instead inherit both from their manifest (a null value meaning "inherit"), so
+    // this becomes optional once leaf writing is supported.
     snapshot_id: i64,
     location: Expression,
     file_size_in_bytes: Expression,
@@ -193,6 +185,9 @@ fn build_content_tree_entry_expression(
         LOCATION => Some(projections.location.clone()),
         FILE_FORMAT => Some(lit(DataFileFormat::Parquet)),
         TRACKING => Some(build_tracking_expression(projections)),
+        // TODO: `specId` 0 is only correct for unpartitioned tables. A partitioned table's spec 0
+        // is its real (non-empty) partition spec, so this must carry the table's actual spec id
+        // once the write path supports partitioned AMT tables.
         PARTITION_SPEC_ID => Some(lit(0i32)),
         RECORD_COUNT => Some(projections.record_count.clone()),
         FILE_SIZE_IN_BYTES => Some(projections.file_size_in_bytes.clone()),
@@ -243,6 +238,8 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Scalar, StructData};
+    use crate::schema::SchemaStructPatchBuilder;
+    use crate::transaction::BASE_ADD_FILES_SCHEMA;
     use crate::Engine;
 
     /// A row of write-metadata input, where any field may be null (to exercise null rejection).
@@ -325,7 +322,7 @@ mod tests {
         let row_refs: Vec<&[Scalar]> = scalars.iter().map(Vec::as_slice).collect();
         engine
             .evaluation_handler()
-            .create_many(write_metadata_input_schema().unwrap(), &row_refs)
+            .create_many(WRITE_METADATA_INPUT_SCHEMA.clone(), &row_refs)
             .unwrap()
     }
 
@@ -487,5 +484,41 @@ mod tests {
         let input = write_metadata_input(&engine, &[]);
         let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0).unwrap();
         assert_eq!(out.len(), 0);
+    }
+
+    /// Guards [`WRITE_METADATA_INPUT_SCHEMA`] against silent drift from the canonical add-file
+    /// write-metadata schema: it must equal `BASE_ADD_FILES_SCHEMA` extended with the row-tracking
+    /// columns, projected to the columns this path reads, with `stats` narrowed to `numRecords`. If
+    /// that schema changes a field's identity, type, or nullability, this fails and the literal
+    /// must be updated to match.
+    #[test]
+    fn write_metadata_input_schema_matches_add_file_projection() -> DeltaResult<()> {
+        let augmented = SchemaStructPatchBuilder::new()
+            .append(StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG))
+            .append(StructField::nullable(
+                DEFAULT_ROW_COMMIT_VERSION_NAME,
+                DataType::LONG,
+            ))
+            .build(&BASE_ADD_FILES_SCHEMA)?;
+        let projected = augmented.project(&[
+            PATH_NAME,
+            SIZE_NAME,
+            STATS_NAME,
+            BASE_ROW_ID_NAME,
+            DEFAULT_ROW_COMMIT_VERSION_NAME,
+        ])?;
+        let narrowed_stats = match projected.field(STATS_NAME).map(StructField::data_type) {
+            Some(DataType::Struct(stats)) => stats.project_as_struct(&[NUM_RECORDS])?,
+            _ => panic!("add-file write-metadata schema is missing the `stats` struct"),
+        };
+        let derived = SchemaStructPatchBuilder::new()
+            .replace(
+                STATS_NAME,
+                StructField::nullable(STATS_NAME, narrowed_stats),
+            )
+            .build(&projected)?;
+
+        assert_eq!(*WRITE_METADATA_INPUT_SCHEMA, Arc::new(derived));
+        Ok(())
     }
 }
