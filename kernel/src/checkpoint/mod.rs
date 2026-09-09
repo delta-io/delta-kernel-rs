@@ -115,9 +115,7 @@ use crate::actions::{
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{
-    lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar, StructData,
-};
+use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
@@ -689,26 +687,25 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         schema: &SchemaRef,
     ) -> DeltaResult<ActionReconciliationBatch> {
-        // Start with an all-null row
-        let null_row = engine.evaluation_handler().null_row(schema.clone())?;
-
         // Build the checkpointMetadata struct value
         let checkpoint_metadata_value = Scalar::Struct(StructData::try_new(
             vec![StructField::not_null("version", DataType::LONG)],
             vec![Scalar::from(self.version)],
         )?);
-
-        // Use a struct patch to set just the checkpointMetadata field, keeping others null
-        let patch = ExpressionStructPatchBuilder::new()
-            .replace(CHECKPOINT_METADATA_NAME, lit(checkpoint_metadata_value));
-
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            schema.clone(),
-            Arc::new(Expression::struct_patch(patch)?),
-            schema.clone().into(),
-        )?;
-
-        let checkpoint_metadata_batch = evaluator.evaluate(null_row.as_ref())?;
+        // Build an action row with only the checkpointMetadata field set.
+        let row: Vec<Scalar> = schema
+            .fields()
+            .map(|field| {
+                if field.name() == CHECKPOINT_METADATA_NAME {
+                    checkpoint_metadata_value.clone()
+                } else {
+                    Scalar::null(field.data_type().clone())
+                }
+            })
+            .collect();
+        let checkpoint_metadata_batch = engine
+            .evaluation_handler()
+            .create_many(schema.clone(), vec![row])?;
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 

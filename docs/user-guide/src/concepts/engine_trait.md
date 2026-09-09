@@ -112,7 +112,6 @@ mapping).
 |--------|---------|
 | `new_expression_evaluator(schema, expr, output_type)` | Create a reusable evaluator for an expression |
 | `new_predicate_evaluator(schema, predicate)` | Create a reusable evaluator for a boolean predicate |
-| `null_row(output_schema)` | Create a single-row, all-null `EngineData` with the given schema |
 | `create_many(schema, rows)` | Create a multi-row `EngineData` from scalar values |
 
 The expression and predicate evaluators are reusable objects that you can call repeatedly on

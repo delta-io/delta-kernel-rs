@@ -767,7 +767,7 @@ fn test_opaque() {
 }
 
 #[test]
-fn test_null_row() {
+fn test_create_many_all_null_row() {
     // note that we _allow_ nested nulls, since the top-level struct can be NULL
     let schema = schema_ref! {
         nullable "x": {
@@ -777,7 +777,11 @@ fn test_null_row() {
         nullable "c": STRING,
     };
     let handler = ArrowEvaluationHandler;
-    let result = handler.null_row(schema.clone()).unwrap();
+    let row: Vec<Scalar> = schema
+        .fields()
+        .map(|f| Scalar::null(f.data_type().clone()))
+        .collect();
+    let result = handler.create_many(schema.clone(), vec![row]).unwrap();
     let expected = RecordBatch::try_new(
         Arc::new(schema.as_ref().try_into_arrow().unwrap()),
         vec![
@@ -799,13 +803,14 @@ fn test_null_row() {
 }
 
 #[test]
-fn test_null_row_err() {
+fn test_create_many_rejects_null_in_non_nullable_field() {
     let not_null_schema = schema_ref! {
         not_null "a": STRING,
     };
     let handler = ArrowEvaluationHandler;
+    let row = vec![Scalar::null(KernelDataType::STRING)];
     assert_result_error_with_message(
-        handler.null_row(not_null_schema),
+        handler.create_many(not_null_schema, vec![row]),
         "Invalid argument error: Column 'a' is declared as non-nullable but contains null values",
     );
 }

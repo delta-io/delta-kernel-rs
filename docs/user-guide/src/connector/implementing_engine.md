@@ -276,9 +276,6 @@ pub trait EvaluationHandler {
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>>;
 
-    fn null_row(&self, output_schema: SchemaRef)
-        -> DeltaResult<Box<dyn EngineData>>;
-
     fn create_many(
         &self,
         schema: SchemaRef,
@@ -307,9 +304,6 @@ pub trait PredicateEvaluator {
 
 - **Predicate evaluators** produce a single nullable boolean column. `true` means the row
   matches, `false` or `null` means it doesn't.
-
-- **`null_row`** creates a single-row `EngineData` with all null values. The kernel uses
-  this internally for partition column construction.
 
 - **`create_many`** creates a multi-row `EngineData` by applying the given schema to multiple rows
   of `Scalar` values. Each row contains one scalar per top-level field in the schema. Returns an

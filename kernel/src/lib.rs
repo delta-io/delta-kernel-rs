@@ -504,12 +504,6 @@ pub trait EvaluationHandler: AsAny {
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>>;
 
-    /// Create a single-row all-null-value [`EngineData`] with the schema specified by
-    /// `output_schema`.
-    // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
-    // future.
-    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
-
     /// Create a multi-row [`EngineData`] by applying the given schema to multiple rows of values.
     ///
     /// Each element in `rows` represents one row of data, where each row contains one structured
