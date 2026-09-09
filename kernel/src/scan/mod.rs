@@ -47,8 +47,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta, SnapshotRef,
-    Version,
+    AsAny, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta,
+    SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -86,6 +86,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = La
     }
 });
 
+pub use crate::log_replay::FileActionKey;
 #[allow(unused)]
 pub use crate::parallel::parallel_scan_metadata::{
     AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
@@ -251,6 +252,36 @@ impl PartitionValuesOptions {
     }
 }
 
+/// A shared reference to a [`ScanPlanner`].
+pub type ScanPlannerRef = Arc<dyn ScanPlanner>;
+
+/// An engine-supplied restriction on the logical files a scan may read; see
+/// [`ScanBuilder::with_planner`].
+///
+/// Log replay runs unchanged and its live file set is intersected with the planner's answer, so a
+/// planner can remove files from a listing but never add one, and every listed file's deletion
+/// vector, partition values, stats and transform still come from the log.
+///
+/// Files are identified as log replay identifies them, by `(path, deletionVector.uniqueId)` as a
+/// [`FileActionKey`]; a path alone does not match a file that carries a deletion vector. How an
+/// implementation produces its answer, including any serialization of the predicate it receives,
+/// is its own concern: kernel defines no wire format.
+pub trait ScanPlanner: AsAny {
+    /// Returns the logical files the scan may read at `snapshot_version` of the table at
+    /// `table_root`.
+    ///
+    /// `predicate` is the scan predicate as the caller set it (logical column names), if any. It
+    /// is a hint: an implementation may ignore it and answer with a superset, since kernel still
+    /// applies data skipping and the engine still evaluates the predicate on rows. An error fails
+    /// the scan.
+    fn plan(
+        &self,
+        table_root: &Url,
+        snapshot_version: Version,
+        predicate: Option<&Predicate>,
+    ) -> DeltaResult<HashSet<FileActionKey>>;
+}
+
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
@@ -261,6 +292,7 @@ pub struct ScanBuilder {
     without_row_transforms: bool,
     partition_values: PartitionValuesOptions,
     cancellation_token: Option<CancellationTokenRef>,
+    planner: Option<ScanPlannerRef>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -288,6 +320,7 @@ impl ScanBuilder {
             without_row_transforms: false,
             partition_values: PartitionValuesOptions::default(),
             cancellation_token: None,
+            planner: None,
         }
     }
 
@@ -403,6 +436,20 @@ impl ScanBuilder {
         self
     }
 
+    /// Restrict the scan to the logical files named by a [`ScanPlanner`]; without one the listing
+    /// is unchanged.
+    ///
+    /// The planner is consulted once per [`scan_metadata`](Scan::scan_metadata) call, not at
+    /// build time and not when the predicate is statically false. A planner error is returned
+    /// from `scan_metadata` rather than falling back to the unplanned listing: the caller gave the
+    /// planner authority over the file set, and a silent fallback would hide a wrong answer.
+    /// [`parallel_scan_metadata`](Scan::parallel_scan_metadata) rejects a planner rather than
+    /// ignoring it.
+    pub fn with_planner(mut self, planner: impl Into<Option<ScanPlannerRef>>) -> Self {
+        self.planner = planner.into();
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -437,7 +484,7 @@ impl ScanBuilder {
             logical_read_schema,
             table_schema,
             self.snapshot.table_configuration(),
-            self.predicate,
+            self.predicate.clone(),
             &self.stats,
             &self.partition_values,
             (), // No classifier, default is for scans
@@ -461,6 +508,8 @@ impl ScanBuilder {
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
             cancellation_token: self.cancellation_token,
+            predicate: self.predicate,
+            planner: self.planner,
         })
     }
 }
@@ -719,6 +768,11 @@ pub struct Scan {
     /// Optional cooperative cancellation token supplied via
     /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+    /// The predicate as the caller set it (logical column names), handed to the planner; the
+    /// physical rewrite used for data skipping is in `state_info`.
+    predicate: Option<PredicateRef>,
+    /// Optional planner supplied via [`ScanBuilder::with_planner`].
+    planner: Option<ScanPlannerRef>,
 }
 
 /// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
@@ -1058,6 +1112,19 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
+                // The planner only narrows replay's answer, so it is not consulted for a
+                // statically false predicate, which lists nothing anyway.
+                let planned_files = self
+                    .planner
+                    .as_ref()
+                    .map(|planner| {
+                        planner.plan(
+                            self.snapshot.table_root(),
+                            self.snapshot.version(),
+                            self.predicate.as_deref(),
+                        )
+                    })
+                    .transpose()?;
                 // Wrap the input iterator (not the shared `process_actions_iter`) so token
                 // polling stays scoped to scans.
                 let actions = CancellableIterator::new(
@@ -1071,6 +1138,7 @@ impl Scan {
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
                     self.partition_values_options(),
+                    planned_files,
                 )?;
                 (Some(it), m)
             }
@@ -1105,8 +1173,17 @@ impl Scan {
     /// # Errors
     ///
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
-    /// or if log discovery, checkpoint inspection, or plan construction fails.
+    /// if the scan has a [`ScanPlanner`] (the declarative plan does not apply it), or if log
+    /// discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+        // The declarative plan never runs log replay's per-file visitor, so a planner's answer
+        // would be silently ignored; fail fast instead.
+        if self.planner.is_some() {
+            return Err(Error::unsupported(
+                "a scan planner is not supported by declarative_metadata_scan_plan; \
+                 use scan_metadata for a planner-restricted scan",
+            ));
+        }
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
         let plan_executor = engine.require_plan_executor()?;
@@ -1208,7 +1285,8 @@ impl Scan {
     ///
     /// Cancellation is not supported on this path: it errors if a token was set via
     /// [`ScanBuilder::with_cancellation_token`], rather than silently running to completion.
-    /// Only [`scan_metadata`](Self::scan_metadata) honors the token today.
+    /// Only [`scan_metadata`](Self::scan_metadata) honors the token today. Likewise a
+    /// [`ScanPlanner`] set via [`ScanBuilder::with_planner`] is rejected rather than ignored.
     ///
     /// # Example
     ///
@@ -1270,6 +1348,14 @@ impl Scan {
             return Err(Error::unsupported(
                 "cancellation is not supported by parallel_scan_metadata; \
                  use scan_metadata for a cancellable scan",
+            ));
+        }
+        // Likewise for a planner: the distributed phase rebuilds its processor from serialized
+        // state, which does not carry the planner's answer.
+        if self.planner.is_some() {
+            return Err(Error::unsupported(
+                "a scan planner is not supported by parallel_scan_metadata; \
+                 use scan_metadata for a planner-restricted scan",
             ));
         }
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
