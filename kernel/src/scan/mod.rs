@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD};
+use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
@@ -83,6 +83,21 @@ pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = La
         nullable ADD_NAME: {
             ..(add_schema.fields().filter(|f| f.name() != "stats")),
         },
+    }
+});
+static PARALLEL_CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&SIDECAR_FIELD),
+};
+static PARALLEL_CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let add_schema = Add::to_schema();
+    schema_ref! {
+        nullable ADD_NAME: {
+            ..(add_schema.fields().filter(|f| f.name() != "stats")),
+        },
+        (&REMOVE_FIELD),
+        (&SIDECAR_FIELD),
     }
 });
 #[allow(unused)]
@@ -1279,14 +1294,14 @@ impl Scan {
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
         let checkpoint_read_schema = if self.skip_stats() {
-            CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
+            PARALLEL_CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
         } else {
-            CHECKPOINT_READ_SCHEMA.clone()
+            PARALLEL_CHECKPOINT_READ_SCHEMA.clone()
         };
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
-            checkpoint_read_schema,
+            checkpoint_read_schema: checkpoint_read_schema.clone(),
         };
         let processor = ScanLogReplayProcessor::new(
             engine.as_ref(),
@@ -1295,8 +1310,12 @@ impl Scan {
             self.stats_options(),
             self.partition_values_options(),
         )?;
-        let sequential =
-            SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
+        let sequential = SequentialPhase::try_new(
+            processor,
+            self.snapshot.log_segment(),
+            engine.clone(),
+            checkpoint_read_schema,
+        )?;
 
         Ok(SequentialScanMetadata::new(
             sequential,
