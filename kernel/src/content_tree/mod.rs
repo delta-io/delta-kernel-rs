@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 #![allow(unreachable_pub)]
 
+mod builder;
 mod dv_conversion;
 pub(crate) mod stats;
 
@@ -38,6 +39,13 @@ pub(crate) const EQUALITY_IDS: &str = "equalityIds";
 pub(crate) const FORMAT_VERSION: &str = "formatVersion";
 pub(crate) const TAGS: &str = "tags";
 
+/// Field names within the [`TrackingInfo`] sub-struct that the write path populates.
+pub(crate) const TRACKING_STATUS: &str = "status";
+pub(crate) const TRACKING_SNAPSHOT_ID: &str = "snapshotId";
+pub(crate) const SEQUENCE_NUMBER: &str = "sequenceNumber";
+pub(crate) const FILE_SEQUENCE_NUMBER: &str = "fileSequenceNumber";
+pub(crate) const FIRST_ROW_ID: &str = "firstRowId";
+
 /// Field names for the different fields within content_stats.
 pub(crate) const LOWER_BOUND: &str = "lower_bound";
 pub(crate) const UPPER_BOUND: &str = "upper_bound";
@@ -68,6 +76,7 @@ pub(super) struct ContentTreeNode {
 /// Sub-struct of ContentTreeNodeEntry that hold information about
 /// deletion vector applied to data files.
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
+#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
 pub(crate) struct DeletionVectorInfo {
     /// Path to location that DV is stored in.
     #[field_id = 155]
@@ -91,6 +100,7 @@ pub(crate) struct DeletionVectorInfo {
 /// of the history of a file in the AMT (its current state,
 /// a sequence number for when it was added, etc).
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
+#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
 pub struct TrackingInfo {
     /// Whether this entry is added, existing, or deleted.
     #[field_id = 0]
@@ -137,6 +147,7 @@ pub struct TrackingInfo {
 
 /// Represents an entry/row in a ContentTree node.
 #[derive(Debug, Clone, ToSchema)]
+#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
 pub(super) struct ContentTreeNodeEntry {
     /// Type of content stored by the entry.
     /// DataManifest and DeleteManifest can only be defined in the root manifest.
@@ -300,6 +311,7 @@ impl From<TrackingStatus> for Scalar {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, ToSchema, IntoEngineData)]
+#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
 pub(crate) struct ManifestInfo {
     /// Number of entries with ADDED status in the manifest.
     #[field_id = 504]
