@@ -18,8 +18,8 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler,
-    ParquetHandler, StorageHandler,
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error,
+    EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
 use futures::future::{self, Either};
 use futures::stream::{BoxStream, StreamExt as _};
@@ -73,7 +73,7 @@ pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::
         + Send
         + 'static,
     cancellation_token: Option<CancellationTokenRef>,
-) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<U>> + Send>> {
+) -> DeltaResult<DeltaResultIteratorStatic<U>> {
     let Some(token) = cancellation_token else {
         return stream_future_to_iter(task_executor, stream_future);
     };
@@ -380,7 +380,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
-        let output_schema = write_context.physical_schema();
+        let output_schema = write_context.physical_data_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tracing::{info, instrument};
 
+use crate::cancellation::CancellationTokenRef;
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
@@ -35,7 +36,6 @@ use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 // Note the SnapshotBuilder must have either a table_root or an existing_snapshot (but not both).
 // We enforce this in the constructors. We could improve this in the future with different
 // types/add type state.
-#[derive(Debug)]
 pub struct SnapshotBuilder {
     table_root: Option<String>,
     existing_snapshot: Option<SnapshotRef>,
@@ -48,6 +48,28 @@ pub struct SnapshotBuilder {
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
     /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
     correlation_id: Option<Arc<str>>,
+    /// Optional cooperative cancellation token supplied via
+    /// [`with_cancellation_token`](Self::with_cancellation_token). `None` means the build is not
+    /// cancellable.
+    cancellation_token: Option<CancellationTokenRef>,
+}
+
+// Hand-written because `CancellationToken` is not `Debug`: the token is projected to a bool. Ends
+// with `finish_non_exhaustive` so a future field is not silently dropped from the output.
+impl std::fmt::Debug for SnapshotBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotBuilder")
+            .field("table_root", &self.table_root)
+            .field("existing_snapshot", &self.existing_snapshot)
+            .field("version", &self.version)
+            .field("log_tail", &self.log_tail)
+            .field("max_catalog_version", &self.max_catalog_version)
+            .field("incremental_replay", &self.incremental_replay)
+            .field("operation_id", &self.operation_id)
+            .field("correlation_id", &self.correlation_id)
+            .field("cancellable", &self.cancellation_token.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Controls whether kernel replays commits to advance a stale base CRC (the existing snapshot's
@@ -109,6 +131,7 @@ impl SnapshotBuilder {
             incremental_replay: IncrementalReplay::default(),
             operation_id: MetricId::new(),
             correlation_id: None,
+            cancellation_token: None,
         }
     }
 
@@ -122,6 +145,7 @@ impl SnapshotBuilder {
             incremental_replay: IncrementalReplay::default(),
             operation_id: MetricId::new(),
             correlation_id: None,
+            cancellation_token: None,
         }
     }
 
@@ -169,6 +193,23 @@ impl SnapshotBuilder {
     /// [`at_version`]: Self::at_version
     pub fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {
         self.max_catalog_version = Some(max_catalog_version);
+        self
+    }
+
+    /// Supply a [`CancellationToken`] so building the snapshot can be abandoned partway.
+    ///
+    /// Kernel polls the token as it consumes the log listing, and a cancellation-aware [`Engine`]
+    /// additionally races its listing and log reads against it. On cancellation
+    /// [`build`](Self::build) returns [`Error::Cancelled`] rather than a snapshot built from a
+    /// partial listing. With no token the build is not cancellable.
+    ///
+    /// [`CancellationToken`]: crate::CancellationToken
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    pub fn with_cancellation_token(
+        mut self,
+        token: impl Into<Option<CancellationTokenRef>>,
+    ) -> Self {
+        self.cancellation_token = token.into();
         self
     }
 
@@ -243,6 +284,7 @@ impl SnapshotBuilder {
             incremental_replay,
             operation_id,
             correlation_id,
+            cancellation_token,
         } = self;
 
         let metric_context = SnapshotLoadMetricContext {
@@ -266,54 +308,47 @@ impl SnapshotBuilder {
         // requested version is exactly the max_catalog_version.
         let built_as_latest = version.is_none() || version == max_catalog_version;
 
-        let result = if let Some(table_root) = table_root {
-            try_parse_uri(table_root).and_then(|table_url| {
-                let log_segment = LogSegment::for_snapshot(
-                    engine.storage_handler().as_ref(),
-                    table_url.join("_delta_log/")?,
-                    log_tail,
-                    effective_version,
-                    metric_context.clone(),
-                )?;
-                Snapshot::try_new_from_log_segment(
-                    table_url,
-                    log_segment,
-                    engine,
-                    metric_context,
-                    incremental_replay,
-                    built_as_latest,
-                )
-                .map(Into::into)
-            })
+        let snapshot = if let Some(table_root) = table_root {
+            let table_url = try_parse_uri(table_root)?;
+            let log_segment = LogSegment::for_snapshot(
+                engine.storage_handler().as_ref(),
+                table_url.join("_delta_log/")?,
+                log_tail,
+                effective_version,
+                metric_context.clone(),
+                cancellation_token.as_ref(),
+            )?;
+            Snapshot::try_new_from_log_segment(
+                table_url,
+                log_segment,
+                engine,
+                metric_context,
+                incremental_replay,
+                built_as_latest,
+            )
+            .map(Into::into)?
         } else {
-            existing_snapshot
-                .ok_or_else(|| {
-                    Error::internal_error(
-                        "SnapshotBuilder should have either table_root or existing_snapshot",
-                    )
-                })
-                .and_then(|existing_snapshot| {
-                    Snapshot::try_new_from(
-                        existing_snapshot,
-                        log_tail,
-                        engine,
-                        effective_version,
-                        metric_context,
-                        incremental_replay,
-                        built_as_latest,
-                    )
-                })
+            let Some(existing_snapshot) = existing_snapshot else {
+                return Err(Error::internal_error(
+                    "SnapshotBuilder should have either table_root or existing_snapshot",
+                ));
+            };
+            Snapshot::try_new_from(
+                existing_snapshot,
+                log_tail,
+                engine,
+                effective_version,
+                metric_context,
+                incremental_replay,
+                built_as_latest,
+                cancellation_token.as_ref(),
+            )?
         };
 
         // Post-build validations for catalog-managed tables
-        let result = result.and_then(|snapshot| {
-            Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
-            Ok(snapshot)
-        });
-        if let Ok(ref snapshot) = result {
-            tracing::Span::current().record("version", snapshot.version());
-        }
-        result
+        Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
+        tracing::Span::current().record("version", snapshot.version());
+        Ok(snapshot)
     }
 
     // ============================================================================

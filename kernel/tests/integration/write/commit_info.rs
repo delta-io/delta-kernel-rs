@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, RecordBatch, StringArray};
+use delta_kernel::arrow::array::{ArrayRef, MapBuilder, RecordBatch, StringArray, StringBuilder};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
@@ -117,6 +117,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
 /// - Fields that overlap with kernel-managed CommitInfo fields are overridden by kernel values,
 /// - All kernel-managed fields (`timestamp`, `kernelVersion`, `txnId`, `operationParameters`) are
 ///   present with correct values.
+/// - `operationMetrics` remains absent from the written JSON when kernel has no metrics to write.
 #[tokio::test]
 async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -125,14 +126,26 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema, &[], None, "test_table").await?
     {
+        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        map_builder.keys().append_value("stale_metric");
+        map_builder.values().append_value("1");
+        map_builder.append(true)?;
+        let stale_operation_metrics = Arc::new(map_builder.finish()) as ArrayRef;
+
         // Build engine_commit_info with:
-        //   - "myApp"    : engine-only field, must pass through unchanged.
-        //   - "myVersion": engine-only field, must pass through unchanged.
-        //   - "operation": overlapping with CommitInfo; kernel must override with "WRITE".
+        //   - "myApp"           : engine-only field, must pass through unchanged.
+        //   - "myVersion"       : engine-only field, must pass through unchanged.
+        //   - "operation"       : overlapping with CommitInfo; kernel must override with "WRITE".
+        //   - "operationMetrics": overlapping with CommitInfo; kernel omits it when unset.
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("myApp", ArrowDataType::Utf8, false),
             Field::new("myVersion", ArrowDataType::Utf8, false),
             Field::new("operation", ArrowDataType::Utf8, false),
+            Field::new(
+                "operationMetrics",
+                stale_operation_metrics.data_type().clone(),
+                true,
+            ),
         ]));
         let batch = RecordBatch::try_new(
             arrow_schema,
@@ -140,12 +153,14 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
                 Arc::new(StringArray::from(vec!["spark"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["3.5.0"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
+                stale_operation_metrics,
             ],
         )?;
         let engine_schema = schema_ref! {
             not_null "myApp": STRING,
             not_null "myVersion": STRING,
             nullable "operation": STRING,
+            nullable "operationMetrics": { STRING => nullable STRING },
         };
 
         let txn = load_and_begin_transaction(table_url.clone(), &engine)?
@@ -170,6 +185,12 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
         // Zero out non-deterministic fields for stable comparison.
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
         set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+        assert!(
+            parsed_commits[0]["commitInfo"]
+                .get("operationMetrics")
+                .is_none(),
+            "unset operationMetrics should be omitted from commit JSON"
+        );
 
         // Null-valued CommitInfo fields (inCommitTimestamp, isBlindAppend, engineInfo) are
         // omitted from the JSON -- consistent with how the Delta log serializes optional fields.

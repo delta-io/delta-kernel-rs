@@ -11,7 +11,7 @@ Appending data to a Delta table follows these steps:
 
 1. Get a `Snapshot` of the table
 2. Create a `Transaction` from the snapshot
-3. Get the `BoundWriteContext` from the transaction
+3. Create a `WriteState` and bind a `BoundWriteContext`
 4. [Write Parquet files](#writing-parquet-files) using the engine and `BoundWriteContext`
 5. Register the written files with the transaction via `add_files`
 6. Commit the transaction
@@ -47,13 +47,19 @@ let mut txn = snapshot
     .with_engine_info("my-app/1.0")
     .with_data_change(true);
 
-// 3. Get write context
-let write_context = Arc::new(txn.unpartitioned_write_context()?);
+// 3. Create write state and bind a write context
+let write_state = txn.write_state()?;
+let write_context = write_state.write_context_builder().build()?;
 
 // 4. Write Parquet file(s)
 // Assumes the table schema is: name (STRING), age (INTEGER), city (STRING)
 let batch = RecordBatch::try_new(
-    Arc::new(write_context.logical_schema().as_ref().try_into_arrow()?),
+    Arc::new(
+        write_context
+            .logical_data_schema()
+            .as_ref()
+            .try_into_arrow()?,
+    ),
     vec![
         Arc::new(StringArray::from(vec!["Dave", "Eve", "Frank"])),
         Arc::new(Int32Array::from(vec![4, 5, 6])),
@@ -62,7 +68,7 @@ let batch = RecordBatch::try_new(
 )?;
 let data = ArrowEngineData::new(batch);
 let file_metadata = engine
-    .write_parquet(&data, write_context.as_ref())
+    .write_parquet(&data, &write_context)
     .await?;
 
 // 5. Register the files
@@ -100,18 +106,41 @@ The builder methods:
 | `with_engine_info(impl Into<String>)` | Identifies your application in the commit log |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
-## The BoundWriteContext
+## WriteState and BoundWriteContext
 
-Before writing data, obtain a `BoundWriteContext`. A `BoundWriteContext` bundles everything
-needed to correctly write Parquet files:
+Before writing data, obtain a `WriteState` from the transaction. Bind the state to create a
+`BoundWriteContext`, which bundles everything needed to correctly write Parquet files:
 
 ```rust,ignore
+let write_state = txn.write_state()?;
+
 // For unpartitioned tables
-let write_context = txn.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 
 // For partitioned tables, pass the partition values for this file
-let write_context = txn.partitioned_write_context(partition_values)?;
+let write_context = write_state
+    .write_context_builder()
+    .with_partition_values(partition_values)
+    .build()?;
 ```
+
+If the connector input data contains materialized Row IDs or Row Commit Versions, provide their
+logical column names to the builder:
+
+```rust,ignore
+use delta_kernel::transaction::RowTrackingMetadataColumns;
+
+let write_context = write_state
+    .write_context_builder()
+    .with_row_tracking_columns(RowTrackingMetadataColumns {
+        row_id_col_name: Some("row_id"),
+        row_commit_version_col_name: Some("row_commit_version"),
+    })
+    .build()?;
+```
+
+Kernel maps each provided logical row-tracking metadata column to the corresponding physical
+column configured on the table. Row Tracking must be enabled when these options are provided.
 
 For partitioned tables, see
 [Writing to Partitioned Tables](./partitioned_writes.md).
@@ -122,8 +151,8 @@ For partitioned tables, see
 |--------|---------|---------|
 | `table_root_dir()` | `&Url` | The table root URL |
 | `write_dir()` | `Url` | The URL for writing files |
-| `logical_schema()` | `&SchemaRef` | The schema your logical data should conform to |
-| `physical_schema()` | `&SchemaRef` | The schema for the on-disk physical data |
+| `logical_data_schema()` | `&SchemaRef` | The schema your connector input data must conform to when using this write context |
+| `physical_data_schema()` | `&SchemaRef` | The schema for the data written to Parquet |
 | `logical_to_physical()` | `ExpressionRef` | Expression that transforms logical data to physical |
 | `column_mapping_mode()` | `ColumnMappingMode` | The column mapping mode for this table |
 | `stats_columns()` | `&[ColumnName]` | Columns that should have statistics collected |
@@ -132,7 +161,7 @@ For partitioned tables, see
 ## Writing Parquet files
 
 Start with the logical `data: EngineData` you want to write. Its schema should conform to
-`write_context.logical_schema()`.
+`write_context.logical_data_schema()`.
 
 ### Using `DefaultEngine`
 
@@ -140,12 +169,12 @@ The `DefaultEngine` provides an async helper that does everything for you:
 
 ```rust,ignore
 let file_metadata = engine
-    .write_parquet(&data, write_context.as_ref())
+    .write_parquet(&data, &write_context)
     .await?;
 ```
 
 - **`data`**: An `ArrowEngineData` wrapping a `RecordBatch` matching the logical schema
-- **`write_context`**: From `unpartitioned_write_context()` or `partitioned_write_context()`
+- **`write_context`**: Built from a `WriteState` with `write_context_builder()`
 
 `DefaultEngine::write_parquet` handles the logical-to-physical transformation, generates a unique filename,
 writes the file, collects statistics, and returns file metadata that you pass to
@@ -166,9 +195,9 @@ If you do not use `DefaultEngine`, write the files yourself. The expected flow i
 
 // 1. Transform logical data into physical data
 let evaluator = engine.evaluation_handler().new_expression_evaluator(
-    write_context.logical_schema().clone(),
+    write_context.logical_data_schema().clone(),
     write_context.logical_to_physical(),
-    write_context.physical_schema().clone().into(),
+    write_context.physical_data_schema().clone().into(),
 )?;
 let physical_data = evaluator.evaluate(data.as_ref())?;
 
@@ -181,10 +210,9 @@ txn.add_files(add_file_metadata);
 You can call `add_files` multiple times to write multiple files in one transaction.
 
 > [!NOTE]
-> Methods that produce or register data files (`unpartitioned_write_context`,
-> `partitioned_write_context`, `add_files`, `stats_schema`) are gated by the
-> `SupportsDataFiles` trait bound and are available on standard write transactions but not
-> on metadata-only transaction states (such as a future `AlterTable`).
+> Transaction methods that prepare or register data files (`write_state`, `add_files`, and
+> `stats_schema`) are gated by the `SupportsDataFiles` trait bound. They're available on standard
+> write transactions but not on metadata-only transaction states such as `AlterTable`.
 
 ## Committing
 

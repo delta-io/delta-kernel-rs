@@ -34,9 +34,11 @@ use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
-    iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
+    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
+    V3_VALIDATOR,
 };
-use crate::utils::current_time_ms;
+use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
+use crate::utils::{current_time_ms, require};
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -78,11 +80,11 @@ impl Transaction {
 
         let effective_table_config = read_snapshot.table_configuration().clone();
 
-        // Surface IcebergCompatV3 interoperability risks without rejecting tables based on
-        // kernel parser limitations.
-        if effective_table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            iceberg_compat_v3_column_defaults_validation(&effective_table_config)?;
-        }
+        validate_iceberg_compat_if_needed(
+            &effective_table_config,
+            &V3_VALIDATOR,
+            IcebergCompatValidationContext::Write,
+        )?;
 
         Ok(Transaction {
             span,
@@ -101,9 +103,12 @@ impl Transaction {
             commit_timestamp,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: vec![],
+            provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
+            #[cfg(feature = "row-tracking-preservation-in-dev")]
+            row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
@@ -133,6 +138,50 @@ impl Transaction {
         self
     }
 
+    /// Stages schema changes for this transaction. Call before staging data-file actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are
+    /// enabled, data-file actions have already been staged, or an operation is invalid for the
+    /// current schema or table configuration.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn with_schema_changes(
+        mut self,
+        changes: Vec<SchemaOperation>,
+    ) -> DeltaResult<Self> {
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergCompatV3)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
+            ));
+        }
+        require!(
+            !changes.is_empty(),
+            Error::generic("with_schema_changes requires at least one schema operation")
+        );
+        require!(
+            !self.has_data_file_actions(),
+            Error::invalid_transaction_state(
+                "with_schema_changes must be called before staging data files"
+            )
+        );
+        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
+        self.should_emit_metadata = true;
+        Ok(self)
+    }
+
     /// Remove domain metadata from the Delta log.
     /// If the domain exists in the Delta log, this creates a tombstone to logically delete
     /// the domain. The tombstone preserves the previous configuration value.
@@ -145,6 +194,54 @@ impl Transaction {
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
+    }
+
+    /// Acknowledges that the connector correctly preserves Stable Row IDs and Stable Row Commit
+    /// Versions. That is:
+    ///
+    /// - Copied or updated rows retain their Stable Row IDs.
+    /// - Copied rows retain their Stable Row Commit Versions.
+    /// - The connector preserves these values in the materialized Row ID and Row Commit Version
+    ///   columns.
+    /// - The connector also satisfies all protocol MUST requirements for those columns.
+    ///
+    /// See [Row Tracking] in the Delta protocol for more details.
+    ///
+    /// Kernel does not validate rewritten files or materialized values. Calling this method asserts
+    /// that the connector has satisfied these requirements.
+    ///
+    /// The Delta protocol specifies this preservation as a SHOULD requirement. Kernel requires it
+    /// for compatibility.
+    ///
+    /// This acknowledgment is required before committing Remove actions or deletion-vector updates
+    /// on tables with Row Tracking enabled.
+    ///
+    /// [Row Tracking]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#row-tracking
+    #[cfg(feature = "row-tracking-preservation-in-dev")]
+    pub fn ack_row_tracking_preservation(&mut self) {
+        self.row_tracking_preservation_acknowledged = true;
+    }
+
+    /// Set an explicit row-tracking high-water mark for this transaction.
+    ///
+    /// Use this when row IDs must also be coordinated with another system. Kernel still assigns
+    /// row-tracking fields to added files and rejects this value if it is less than the high-water
+    /// mark calculated from those files. Callers cannot use [`Self::with_domain_metadata`] to
+    /// modify `delta.rowTracking` or other `delta.*` domains. Table-feature and table-state
+    /// validation occurs during commit.
+    #[internal_api]
+    #[allow(dead_code)] // used in FFI
+    pub(crate) fn with_row_tracking_high_water_mark(
+        mut self,
+        high_water_mark: i64,
+    ) -> DeltaResult<Self> {
+        if self.provided_row_tracking_high_water_mark.is_some() {
+            return Err(Error::generic(
+                "Row-tracking high-water mark already specified in this transaction",
+            ));
+        }
+        self.provided_row_tracking_high_water_mark = Some(high_water_mark);
+        Ok(self)
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to

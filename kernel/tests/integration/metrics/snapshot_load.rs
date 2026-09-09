@@ -116,7 +116,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
 
 /// When the latest version has a checkpoint and no subsequent commits exist, the snapshot
 /// has zero commit files and the JSON handler is called with an empty file list.
-/// CommitReader always invokes read_json_files even for an empty commit cover.
+/// read_commit_actions always invokes read_json_files even for an empty commit cover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> {
     let (table_url, _setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;

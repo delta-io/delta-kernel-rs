@@ -66,6 +66,9 @@ pub(crate) const CDC_NAME: &str = "cdc";
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
 #[internal_api]
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
+/// Optional `checkpointMetadata.tags` key whose value is the JSON-encoded `StructType` of the
+/// checkpoint's sidecar files
+pub(crate) const SIDECAR_FILE_SCHEMA_TAG: &str = "sidecarFileSchema";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -322,8 +325,7 @@ impl Default for Format {
     Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData,
 )]
 #[serde(rename_all = "camelCase")]
-#[internal_api]
-pub(crate) struct Metadata {
+pub struct Metadata {
     /// Unique identifier for this table
     id: String,
     /// User-provided identifier for this table
@@ -564,10 +566,9 @@ impl IntoEngineData for Metadata {
 // validated by `try_new`, like the JSON-replay path. Otherwise a CRC file could load a malformed
 // feature shape that log replay would reject.
 #[serde(rename_all = "camelCase", try_from = "ProtocolRaw")]
-#[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
-pub(crate) struct Protocol {
+pub struct Protocol {
     /// The minimum version of the Delta read protocol that a client must implement
     /// in order to correctly read this table
     min_reader_version: i32,
@@ -881,7 +882,10 @@ pub(crate) struct CommitInfo {
     pub(crate) operation: Option<String>,
     /// Map of arbitrary string key-value pairs that provide additional information about the
     /// operation. This is specified by the engine. For now this is always empty on write.
-    pub(crate) operation_parameters: Option<HashMap<String, String>>,
+    pub(crate) operation_parameters: Option<HashMap<String, Option<String>>>,
+    /// Map of arbitrary string key-value pairs that provide operation metrics.
+    /// This is specified by the engine.
+    pub(crate) operation_metrics: Option<HashMap<String, Option<String>>>,
     /// The version of the delta_kernel crate used to write this commit. The kernel will always
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
@@ -907,6 +911,7 @@ impl CommitInfo {
             in_commit_timestamp,
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: Some(HashMap::new()),
+            operation_metrics: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             is_blind_append: is_blind_append.then_some(true),
             engine_info,
@@ -1434,6 +1439,18 @@ impl CheckpointAction {
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
         self.content_root.to_filemeta(table_root)
     }
+
+    /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
+    #[internal_api]
+    pub(crate) fn protocol(&self) -> &Protocol {
+        &self.protocol
+    }
+
+    /// The table metadata embedded in this checkpoint action (at [`Self::version`]).
+    #[internal_api]
+    pub(crate) fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
 }
 
 /// The sidecar action references a sidecar file which provides some of the checkpoint's
@@ -1519,8 +1536,7 @@ pub(crate) struct CheckpointMetadata {
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, IntoEngineData,
 )]
-#[internal_api]
-pub(crate) struct DomainMetadata {
+pub struct DomainMetadata {
     domain: String,
     configuration: String,
     removed: bool,
@@ -1553,18 +1569,16 @@ impl DomainMetadata {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
     }
 
-    #[internal_api]
-    pub(crate) fn domain(&self) -> &str {
+    pub fn domain(&self) -> &str {
         &self.domain
     }
 
-    #[internal_api]
-    pub(crate) fn configuration(&self) -> &str {
+    pub fn configuration(&self) -> &str {
         &self.configuration
     }
 
     /// Returns `true` if this action is a tombstone (marking domain removal).
-    pub(crate) fn is_removed(&self) -> bool {
+    pub fn is_removed(&self) -> bool {
         self.removed
     }
 }
@@ -1939,7 +1953,8 @@ mod tests {
                 nullable "timestamp": LONG,
                 nullable "inCommitTimestamp": LONG,
                 nullable "operation": STRING,
-                nullable "operationParameters": { STRING => not_null STRING },
+                nullable "operationParameters": { STRING => nullable STRING },
+                nullable "operationMetrics": { STRING => nullable STRING },
                 nullable "kernelVersion": STRING,
                 nullable "isBlindAppend": BOOLEAN,
                 nullable "engineInfo": STRING,
@@ -2253,9 +2268,12 @@ mod tests {
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
         let record_batch = engine_data.try_into_record_batch().unwrap();
 
-        let mut map_builder = create_string_map_builder(false);
+        let mut map_builder = create_string_map_builder(true);
         map_builder.append(true).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
+        let mut map_builder = create_string_map_builder(true);
+        map_builder.append(false).unwrap();
+        let operation_metrics = Arc::new(map_builder.finish());
 
         let expected = RecordBatch::try_new(
             record_batch.schema(),
@@ -2264,6 +2282,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![None::<i64>])),
                 Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
                 operation_parameters,
+                operation_metrics,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(BooleanArray::from(vec![None::<bool>])),
                 Arc::new(StringArray::from(vec![None::<String>])),

@@ -122,7 +122,7 @@ define_sweeps! {
     // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
     //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,
     //       allowColumnDefaults, identityColumns, NTZ/variant (schema-driven),
-    //       catalogManaged, collations for CM=name, typeWidening write support).
+    //       catalogManaged, collations for CM=name).
     // TODO: iceV2+writer (needs icebergCompatV2 + icebergWriterCompatV1).
     // TODO: iceV3 (needs icebergCompatV3).
     feature_set_values = (no_features(), all_features_cm_id(), all_features_cm_name()),
@@ -1111,7 +1111,8 @@ pub async fn insert_data_with<E: TaskExecutor>(
         txn = txn.with_blind_append();
     }
 
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_state = txn.write_state()?;
+    let write_context = write_state.write_context_builder().build()?;
     let add_files_metadata = engine
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
@@ -1524,14 +1525,18 @@ pub async fn write_batch_to_table(
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
     txn.ack_column_defaults();
+    let write_state = txn.write_state()?;
     let write_context = if txn.logical_partition_columns().is_empty() {
         assert!(
             partition_values.is_empty(),
             "partition_values should be empty for unpartitioned tables"
         );
-        txn.unpartitioned_write_context()?
+        write_state.write_context_builder().build()?
     } else {
-        txn.partitioned_write_context(partition_values)?
+        write_state
+            .write_context_builder()
+            .with_partition_values(partition_values)
+            .build()?
     };
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
@@ -1713,7 +1718,7 @@ impl JsonHandler for CapturingJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<u64> {
         self.inner.write_json_file(path, data, overwrite)

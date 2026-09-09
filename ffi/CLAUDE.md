@@ -17,6 +17,19 @@ options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelE
 
 Every handle has a corresponding `free_*` function (e.g. `free_engine`, `free_snapshot`).
 
+Handle parameters follow one of two ownership contracts:
+
+1. **Borrow:** Rust accesses the handle with `as_ref()` or `as_mut()`. The caller retains
+   ownership and remains responsible for passing the handle to its `free_*` function.
+2. **Unconditional consume:** Rust calls `into_inner()` before any fallible work. Rust owns the
+   value from native entry onward and is responsible for dropping it on every result, including
+   errors. The caller must not use or free the handle after the call.
+
+Do not conditionally consume a handle only when a fallible operation succeeds. Every function's
+safety documentation must state whether each handle is borrowed or consumed regardless of the
+result. For consuming functions, perform string parsing, visitor decoding, validation, and other
+fallible work only after all consumed handles have been converted with `into_inner()`.
+
 ## Error Handling
 
 Fallible functions return `ExternResult` (tagged union of Ok/Err). The caller provides an
@@ -27,6 +40,7 @@ the caller's memory space.
 
 - `src/lib.rs` -- main FFI entry points and type definitions
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
+- `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
 - `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
@@ -140,6 +154,17 @@ snapshot is borrowed; the committer is consumed (do not free). The caller owns t
 snapshot handle. The returned snapshot carries the published watermark (`max_published_version`)
 needed for the next catalog commit; do not continue from the pre-publish post-commit snapshot.
 
+Column defaults (`allowColumnDefaults`) live in `ffi/src/column_default.rs`. The kernel reports
+defaults but never materializes them, so the connector fills every omitted column itself:
+
+```
+transaction()
+  -> transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)
+  -> transaction_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
+                                            // KernelError::InvalidTransactionStateError
+  -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
+```
+
 Deletion vector update flow:
 
 ```
@@ -154,9 +179,9 @@ transaction()
 
 The engine authors the DV file and passes descriptor fields to `dv_descriptor_new`. The
 descriptor map and scan iterator are both consumed by `transaction_update_deletion_vectors`;
-descriptor handles are consumed by `dv_descriptor_map_insert` only on success and must be
-freed by the caller on error. DV updates require both the `deletionVectors` reader/writer
-feature and `delta.enableDeletionVectors=true`.
+descriptor handles are consumed by `dv_descriptor_map_insert` regardless of the result. DV
+updates require both the `deletionVectors` reader/writer feature and
+`delta.enableDeletionVectors=true`.
 
 ## Tracing & Metrics
 

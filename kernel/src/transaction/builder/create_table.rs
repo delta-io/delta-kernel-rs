@@ -75,6 +75,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::ChangeDataFeed,
     TableFeature::TypeWidening,
     TableFeature::RowTracking,
+    TableFeature::VariantType,
+    TableFeature::VariantShredding,
     // Invariants is auto-enabled by `maybe_enable_invariants` when the schema has non-null
     // fields. Allowing explicit `delta.feature.invariants=supported` lets users pre-enable
     // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
@@ -503,12 +505,6 @@ fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTablePropertie
     }
 }
 
-/// Witness that all property-flipping passes which must run before column mapping is applied
-/// have completed.
-#[must_use]
-#[derive(Debug)]
-struct PreColumnMappingResolved;
-
 /// When `delta.enableIcebergCompatV3=true` is set, auto-enables V3's required dependencies in
 /// `validated.properties` (defaulting them when absent, rejecting conflicting values).
 ///
@@ -517,14 +513,11 @@ struct PreColumnMappingResolved;
 ///   * Set `delta.enableRowTracking` to `true` when absent, reject if it's `false`.
 ///   * Reject if `delta.rowTrackingSuspended` is `true`.
 ///   * Reject if `delta.enableIcebergCompatV1` or `delta.enableIcebergCompatV2` is `true`.
-///
-/// Returns a [`PreColumnMappingResolved`] witness that
-/// [`maybe_apply_column_mapping_for_table_create`] requires, ensuring this pass runs first.
 fn maybe_enable_iceberg_compat_v3_dependencies(
     validated: &mut ValidatedTableProperties,
-) -> DeltaResult<PreColumnMappingResolved> {
+) -> DeltaResult<()> {
     if !validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3) {
-        return Ok(PreColumnMappingResolved);
+        return Ok(());
     }
 
     // Column mapping: require `name` or `id`; default to `name`.
@@ -583,7 +576,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
         }
     }
 
-    Ok(PreColumnMappingResolved)
+    Ok(())
 }
 
 /// Conditionally applies column mapping for table creation based on the mode in properties.
@@ -607,7 +600,6 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
 fn maybe_apply_column_mapping_for_table_create(
     schema: &SchemaRef,
     validated: &mut ValidatedTableProperties,
-    _pre_cm: PreColumnMappingResolved,
 ) -> DeltaResult<(SchemaRef, ColumnMappingMode)> {
     let column_mapping_mode = get_column_mapping_mode_from_properties(&validated.properties)?;
 
@@ -699,17 +691,25 @@ fn validate_extract_table_features_and_properties(
             )));
         }
 
-        // Add to appropriate feature lists based on feature type
-        let needs_domain_metadata = feature == TableFeature::RowTracking;
-        add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
         // RowTracking requires DomainMetadata as a dependency
-        if needs_domain_metadata {
+        if feature == TableFeature::RowTracking {
             add_feature_to_lists(
                 TableFeature::DomainMetadata,
                 &mut reader_features,
                 &mut writer_features,
             );
         }
+        // VariantShredding requires VariantType as a dependency
+        if feature == TableFeature::VariantShredding {
+            add_feature_to_lists(
+                TableFeature::VariantType,
+                &mut reader_features,
+                &mut writer_features,
+            );
+        }
+
+        // Add to appropriate feature lists based on feature type
+        add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
     }
 
     // Validate remaining delta.* properties against the allow list
@@ -903,14 +903,15 @@ impl CreateTableTransactionBuilder {
         // - Returns reader/writer features to add to protocol
         let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
 
-        // When IcebergCompatV3 is enabled, fill in / validate required dependencies before
-        // column mapping is applied so the CM mode is in place. The returned witness is
-        // required by `maybe_apply_column_mapping_for_table_create` below.
-        let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
+        // When IcebergCompatV3 is enabled, fill in and validate its column-mapping and row-tracking
+        // dependencies. This must run before `maybe_apply_column_mapping_for_table_create`,
+        // `maybe_auto_enable_property_driven_features`, and
+        // `maybe_set_materialized_row_tracking_column_name_properties`.
+        maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
 
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
         let (mut effective_schema, column_mapping_mode) =
-            maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated, pre_cm)?;
+            maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
 
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
@@ -1516,6 +1517,8 @@ mod tests {
     #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
+    #[case::variant_type(TableFeature::VariantType, "variantType")]
+    #[case::variant_shredding(TableFeature::VariantShredding, "variantShredding")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
     #[case::invariants(TableFeature::Invariants, "invariants")]
     fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
@@ -1541,6 +1544,28 @@ mod tests {
                 "{feature:?} is WriterOnly but reader_features is not empty"
             ),
         }
+    }
+
+    #[test]
+    fn test_variant_shredding_feature_signal_adds_variant_type_dependency() {
+        let properties = HashMap::from([(
+            "delta.feature.variantShredding".to_string(),
+            "supported".to_string(),
+        )]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+
+        assert!(validated
+            .reader_features
+            .contains(&TableFeature::VariantType));
+        assert!(validated
+            .reader_features
+            .contains(&TableFeature::VariantShredding));
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::VariantType));
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::VariantShredding));
     }
 
     fn multi_column_schema() -> SchemaRef {
@@ -1918,7 +1943,7 @@ mod tests {
         let mut validated = validate_extract_table_features_and_properties(props).unwrap();
 
         // === V3 dependency defaults ===
-        let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
+        maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
         assert_eq!(
             validated
                 .properties
@@ -1936,7 +1961,7 @@ mod tests {
 
         // === Column mapping + nested-id assignment ===
         let (effective_schema, mode) =
-            maybe_apply_column_mapping_for_table_create(&schema, &mut validated, pre_cm).unwrap();
+            maybe_apply_column_mapping_for_table_create(&schema, &mut validated).unwrap();
         assert_eq!(mode, ColumnMappingMode::Name);
 
         // Spark-aligned two-pass numbering:
@@ -2072,9 +2097,8 @@ mod tests {
             "true".to_string(),
         )]))
         .unwrap();
-        let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
-        let err = maybe_apply_column_mapping_for_table_create(&schema, &mut validated, pre_cm)
-            .unwrap_err();
+        maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
+        let err = maybe_apply_column_mapping_for_table_create(&schema, &mut validated).unwrap_err();
         assert!(
             err.to_string().contains("has pre-populated"),
             "expected pre-populated metadata error, got: {err}",
@@ -2101,9 +2125,9 @@ mod tests {
                 .contains(&TableFeature::IcebergCompatV3),
             "V3 must be in writerFeatures (supported) for this test to be meaningful",
         );
-        let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
+        maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
         let (effective_schema, mode) =
-            maybe_apply_column_mapping_for_table_create(&schema, &mut validated, pre_cm).unwrap();
+            maybe_apply_column_mapping_for_table_create(&schema, &mut validated).unwrap();
         assert_eq!(mode, ColumnMappingMode::Name);
 
         // Top-level Map field gets CM id + physicalName but no nested-ids metadata under

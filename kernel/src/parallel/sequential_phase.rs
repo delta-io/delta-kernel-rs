@@ -15,12 +15,11 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
-use crate::log_reader::commit::CommitReader;
-use crate::log_replay::LogReplayProcessor;
+use crate::log_replay::{ActionsBatch, LogReplayProcessor};
 use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -68,8 +67,8 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     // The processor that will be used to process the action batches
     processor: P,
-    // The commit reader that will be used to read the commit files
-    commit_phase: Option<CommitReader>,
+    // Commit action batches, exhausted before the checkpoint manifest
+    commit_phase: Option<DeltaResultIteratorStatic<ActionsBatch>>,
     // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
     // If the checkpoint is single-part, this will be Some(CheckpointManifestReader).
     checkpoint_manifest_phase: Option<CheckpointManifestReader>,
@@ -102,12 +101,9 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Self> {
-        let commit_phase = Some(CommitReader::try_new(
-            engine.as_ref(),
-            log_segment,
-            COMMIT_READ_SCHEMA.clone(),
-            None,
-        )?);
+        let commit_phase: Option<DeltaResultIteratorStatic<ActionsBatch>> = Some(Box::new(
+            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
+        ));
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.

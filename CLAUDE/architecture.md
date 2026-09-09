@@ -67,20 +67,21 @@ file listing without re-scanning the table.
 
 ## Write Path
 
-`Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContext`) -> commit
+`Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContextBuilder` ->
+`BoundWriteContext`) -> commit
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
-partition values to create a `BoundWriteContext` containing validated partition values, schemas,
-statistics columns, and the recommended write directory. The transaction registers the resulting
-files, enforces protocol compliance, assembles commit actions, and delegates the atomic commit to
-a `Committer`.
+partition values and any logical materialized row-tracking columns to create a `BoundWriteContext`
+containing validated partition values, data schemas, statistics columns, and the recommended write
+directory. The transaction registers the resulting files, enforces protocol compliance, assembles
+commit actions, and delegates the atomic commit to a `Committer`.
 
 **Data-write steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
-2. For a single context, get a `BoundWriteContext` directly from the transaction. For multiple
-   partitions or distributed writers, call `txn.write_state()` once and bind each partition from
-   that immutable state. Calling a transaction convenience method creates a fresh state from the
-   transaction's current configuration.
+2. Call `txn.write_state()` after configuring the transaction, then use
+   `WriteState::write_context_builder()` to bind partition values and build a `BoundWriteContext`.
+   Distributed writers can encode the state and decode it on each worker before binding partition
+   values.
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)` and stage any removals or deletion-vector updates
 5. Commit: returns `CommittedTransaction`, `ConflictedTransaction`, or `RetryableTransaction`

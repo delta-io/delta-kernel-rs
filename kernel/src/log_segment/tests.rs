@@ -10,17 +10,17 @@ use url::Url;
 use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, Remove, Sidecar, ADD_NAME, COMMIT_INFO_NAME,
-    LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, REMOVE_NAME,
-    SIDECAR_NAME,
+    get_all_actions_schema, get_commit_schema, Add, CheckpointMetadata, Remove, Sidecar, ADD_NAME,
+    COMMIT_INFO_NAME, LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS,
+    REMOVE_NAME, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
-use crate::arrow::array::StringArray;
-use crate::engine::arrow_data::ArrowEngineData;
+use crate::arrow::array::{StringArray, StructArray};
+use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{col, column_name};
-use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
+use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -42,7 +42,7 @@ use crate::schema::{
 };
 use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
-    create_log_path_with_size, string_array_to_engine_data, Action,
+    create_log_path_with_size, load_test_table, string_array_to_engine_data, Action,
 };
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
@@ -334,6 +334,7 @@ async fn build_snapshot_with_uuid_checkpoint_parquet() {
         vec![], // log_tail
         None,
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -369,6 +370,7 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
         storage.as_ref(),
         log_root,
         vec![], // log_tail
+        None,
         None,
         None,
     )
@@ -422,6 +424,7 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -465,6 +468,7 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
         storage.as_ref(),
         log_root,
         vec![], // log_tail
+        None,
         None,
         None,
     )
@@ -514,6 +518,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
+        None,
         None,
     )
     .unwrap();
@@ -567,6 +572,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -618,6 +624,7 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
+        None,
         None,
     );
     assert_result_error_with_message(
@@ -677,6 +684,7 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
+        None,
         None,
     )
     .unwrap();
@@ -742,6 +750,7 @@ async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
         vec![], // log_tail
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -797,6 +806,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -837,6 +847,7 @@ async fn build_snapshot_without_checkpoints() {
         vec![], // log_tail
         None,
         None,
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -857,6 +868,7 @@ async fn build_snapshot_without_checkpoints() {
         vec![], // log_tail
         None,
         Some(2),
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -908,6 +920,7 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
+        None,
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -955,6 +968,7 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
+        None,
     )
     .unwrap();
 
@@ -984,7 +998,8 @@ async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5), None)
+            .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -1011,7 +1026,8 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5), None)
+            .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -1920,6 +1936,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         staged_commits_log_tail,
         None,
         segment.version_to_load,
+        None,
     )
     .unwrap()
 }
@@ -1942,6 +1959,7 @@ async fn test_list_log_files_with_version() -> DeltaResult<()> {
         &log_root,
         vec![], // log_tail
         Some(0),
+        None,
         None,
     )?;
     let latest_crc = result.latest_crc_file.unwrap();
@@ -2350,6 +2368,7 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         engine.storage_handler().as_ref(),
         log_root.clone(),
         vec![],
+        None,
         None,
         None,
     )
@@ -2880,6 +2899,7 @@ async fn test_latest_commit_file_field_is_captured() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -2913,6 +2933,7 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -2940,6 +2961,7 @@ async fn test_latest_commit_file_with_no_commits() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -2970,6 +2992,7 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -3002,6 +3025,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
+        None,
     )
     .unwrap();
 
@@ -3098,6 +3122,83 @@ fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
 
     assert_eq!(log_segment.checkpoint_hint_sidecars(), Some(&vec![]));
     Ok(())
+}
+
+/// The schema a valid `sidecarFileSchema` tag encodes, used both to build the tag and as the
+/// expected result of parsing it back.
+fn sidecar_hint_schema() -> StructType {
+    schema! { nullable "add": { nullable "path": STRING } }
+}
+
+/// A `checkpointMetadata` action carrying the given `(key, value)` tag (`None` omits the `tags`
+/// map entirely).
+fn checkpoint_metadata_action(tag: Option<(&str, &str)>) -> HintAction {
+    HintAction::CheckpointMetadata(CheckpointMetadata {
+        version: 1,
+        tags: tag.map(|(key, value)| {
+            std::collections::HashMap::from([(key.to_string(), value.to_string())])
+        }),
+    })
+}
+
+/// `checkpoint_hint_sidecar_file_schema` returns the parsed sidecar schema only when the applicable
+/// hint's `checkpointMetadata` carries a valid `sidecarFileSchema` tag. It returns `None` when the
+/// hint is inapplicable, the action or tag is missing, or the value fails to parse -- in which case
+/// the caller falls back to a footer read.
+#[rstest]
+#[case::valid_tag_applicable(
+    true,
+    Some(vec![checkpoint_metadata_action(Some((SIDECAR_FILE_SCHEMA_TAG, &serde_json::to_string(&sidecar_hint_schema()).unwrap())))]),
+    true
+)]
+#[case::valid_tag_mismatched_checkpoint(
+    false,
+    Some(vec![checkpoint_metadata_action(Some((SIDECAR_FILE_SCHEMA_TAG, &serde_json::to_string(&sidecar_hint_schema()).unwrap())))]),
+    false
+)]
+#[case::no_checkpoint_metadata(true, Some(vec![]), false)]
+#[case::metadata_without_tag(true, Some(vec![checkpoint_metadata_action(None)]), false)]
+#[case::metadata_with_unrelated_tag(true, Some(vec![checkpoint_metadata_action(Some(("numOfAddFiles", "42")))]), false)]
+#[case::unparseable_tag(true, Some(vec![checkpoint_metadata_action(Some((SIDECAR_FILE_SCHEMA_TAG, "not valid json")))]), false)]
+#[case::absent_non_file_actions(true, None, false)]
+fn checkpoint_hint_sidecar_file_schema_resolution(
+    #[case] path_matches: bool,
+    #[case] non_file_actions: Option<Vec<HintAction>>,
+    #[case] expect_schema: bool,
+) {
+    // A hint that names a different same-version checkpoint does not apply to the selected one.
+    let (_store, log_root) = new_in_memory_store();
+    let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
+    let other = "00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet";
+    let checkpoint_file = log_root.join(selected).unwrap().to_string();
+    let commit = create_log_path(log_root.join("00000000000000000002.json").unwrap().as_str());
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
+            ascending_commit_files: vec![commit.clone()],
+            latest_commit_file: Some(commit),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHint {
+            version: 1,
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: if path_matches { selected } else { other }.to_string(),
+                non_file_actions,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+
+    let resolved = log_segment.checkpoint_hint_sidecar_file_schema();
+    if expect_schema {
+        assert_eq!(resolved, Some(sidecar_hint_schema()));
+    } else {
+        assert!(resolved.is_none());
+    }
 }
 
 /// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
@@ -4900,10 +5001,8 @@ fn test_combine_checkpoint_predicates(
     "tags",
     r#"{"checkpointMetadata":{"version":0,"tags":{"key1":"val1","key2":null}}}"#
 )]
-// Known issues: these map fields don't yet have #[allow_null_container_values].
 // commitInfo.operationParameters.description: null
-#[should_panic(expected = "StructArray re-validation failed")]
-#[case::commit_info_operation_parameters_known_issue(
+#[case::commit_info_operation_parameters(
     "commitInfo",
     "operationParameters",
     r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","description":null}}}"#
@@ -5015,4 +5114,50 @@ fn new_for_version_zero_rejects_non_commit_file() {
         create_log_path("memory:///_delta_log/00000000000000000000.checkpoint.parquet");
     let err = super::LogSegment::new_for_version_zero(log_root, checkpoint_path).unwrap_err();
     assert!(err.to_string().contains("non-commit"));
+}
+
+#[test]
+fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, snapshot, _tempdir) = load_test_table("app-txn-no-checkpoint")?;
+    let log_segment = snapshot.log_segment();
+
+    let schema = COMMIT_READ_SCHEMA.clone();
+    let commit_actions = log_segment.read_commit_actions(engine.as_ref(), schema, None)?;
+
+    let mut file_paths = vec![];
+    for result in commit_actions {
+        let ActionsBatch {
+            actions,
+            is_log_batch,
+        } = result?;
+        assert!(is_log_batch);
+
+        let record_batch = actions.try_into_record_batch()?;
+        let add = record_batch.column_by_name("add").unwrap();
+        let add_struct = add.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let path = add_struct
+            .column_by_name("path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let batch_paths = path.iter().flatten().map(ToString::to_string).collect_vec();
+        file_paths.extend(batch_paths);
+    }
+
+    file_paths.sort();
+    let expected_files = vec![
+        "modified=2021-02-01/part-00001-80996595-a345-43b7-b213-e247d6f091f7-c000.snappy.parquet",
+        "modified=2021-02-01/part-00001-8ebcaf8b-0f48-4213-98c9-5c2156d20a7e-c000.snappy.parquet",
+        "modified=2021-02-02/part-00001-9a16b9f6-c12a-4609-a9c4-828eacb9526a-c000.snappy.parquet",
+        "modified=2021-02-02/part-00001-bfac5c74-426e-410f-ab74-21a64e518e9c-c000.snappy.parquet",
+    ];
+    assert_eq!(
+        file_paths, expected_files,
+        "read_commit_actions should find exactly the expected files"
+    );
+
+    Ok(())
 }

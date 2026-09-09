@@ -99,6 +99,9 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
   cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
   but writes are still blocked.
+- `row-tracking-preservation-in-dev`: enables `Transaction::ack_row_tracking_preservation()` and
+  acknowledged file removals and deletion-vector updates on Row Tracking tables. This remains
+  experimental until Kernel emits `delta.rowTracking.preserved` in CommitInfo tags.
 - `internal-api`: unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans`: experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -117,11 +120,11 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
 
-**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `BoundWriteContext`
-(via `partitioned_write_context` or `unpartitioned_write_context`) for local writers. Distributed
-writers can create and transport a `WriteState`, then bind partition values on each writer to get
-a `BoundWriteContext`. Kernel assembles commit actions, enforces protocol compliance, and delegates
-the atomic commit to a `Committer`.
+**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Writers call
+`Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
+`BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
+Kernel assembles commit actions, enforces protocol compliance, and delegates the atomic commit to a
+`Committer`.
 
 **Engine trait:** exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
 `EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing
@@ -154,6 +157,8 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
   when necessary: e.g. for states the builder cannot express, such as corrupt or malformed logs.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
+- When adding cloud-storage functionality to an engine, such as writing JSON files, make sure to
+  test it against S3, Azure, and GCS.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
   version (time travel), and updating from an existing snapshot.
 - Consider table state: only versioned JSON commits, after a checkpoint, after a version

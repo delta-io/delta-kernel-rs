@@ -175,6 +175,7 @@ to pass to `scan_builder_with_schema`).
 | Function | Purpose |
 |----------|---------|
 | `visit_field_byte` / `visit_field_short` / `visit_field_integer` / `visit_field_long` / `visit_field_float` / `visit_field_double` / `visit_field_boolean` | Build a numeric or boolean primitive `StructField` |
+| `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |

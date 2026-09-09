@@ -10,13 +10,13 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA, SIDECAR_NAME,
+    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA,
+    SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::log_reader::commit::CommitReader;
+use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
@@ -45,6 +45,8 @@ pub(crate) use domain_metadata_replay::DomainMetadataMap;
 
 #[cfg(test)]
 mod crc_tests;
+#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
+mod protocol_metadata_replay_amt_tests;
 #[cfg(test)]
 mod tests;
 
@@ -283,6 +285,29 @@ impl LogSegment {
             .as_ref()
     }
 
+    /// The sidecar files' schema from the applicable `_last_checkpoint` hint's
+    /// `checkpointMetadata.tags["sidecarFileSchema"]`.
+    ///
+    /// `None` when the hint is absent/mismatched, carried no `checkpointMetadata`
+    /// (e.g. `nonFileActions` was trimmed), lacked the tag, or the value failed to parse.
+    #[allow(unused)] // consumed by the scan-shape checkpoint classifier
+    pub(crate) fn checkpoint_hint_sidecar_file_schema(&self) -> Option<StructType> {
+        let non_file_actions = self
+            .checkpoint_hint()?
+            .v2_checkpoint
+            .as_ref()?
+            .non_file_actions
+            .as_ref()?;
+        let tags = non_file_actions.iter().find_map(|action| match action {
+            HintAction::CheckpointMetadata(cp) => cp.tags.as_ref(),
+            _ => None,
+        })?;
+        let raw = tags.get(SIDECAR_FILE_SCHEMA_TAG)?;
+        serde_json::from_str::<StructType>(raw)
+            .inspect_err(|e| warn!("Unparseable sidecarFileSchema tag, ignoring: {e}"))
+            .ok()
+    }
+
     /// Succinct summary string for logging purposes.
     fn summary(&self) -> String {
         format!(
@@ -324,17 +349,20 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
         let build = || {
-            let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
+            let checkpoint_hint =
+                LastCheckpointHint::try_read(storage, &log_root, cancellation_token)?;
             Self::for_snapshot_impl(
                 storage,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
+                cancellation_token,
             )
         };
         let log_segment =
@@ -362,6 +390,7 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
@@ -393,13 +422,20 @@ impl LogSegment {
                 &log_root,
                 log_tail,
                 end_version,
+                cancellation_token,
             )?,
             // Case 3
             (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage, &log_root, log_tail, end,
+                storage,
+                &log_root,
+                log_tail,
+                end,
+                cancellation_token,
             )?,
             // Case 4
-            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            (None, None) => {
+                LogSegmentFiles::list(storage, &log_root, log_tail, None, None, cancellation_token)?
+            }
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
@@ -435,6 +471,7 @@ impl LogSegment {
             vec![], // log-tail
             Some(start_version),
             end_version,
+            None, // table-changes does not thread a cancellation token
         )?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
@@ -490,6 +527,7 @@ impl LogSegment {
             log_tail,
             start_from,
             Some(end_version),
+            None, // timestamp conversion does not thread a cancellation token
         )?;
 
         // remove gaps - return latest contiguous chunk of commits
@@ -707,7 +745,7 @@ impl LogSegment {
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
         let commit_stream =
-            CommitReader::try_new(engine, self, commit_read_schema, cancellation_token)?;
+            self.read_commit_actions(engine, commit_read_schema, cancellation_token)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
@@ -743,6 +781,31 @@ impl LogSegment {
             None,
         )?;
         Ok(result.actions)
+    }
+
+    /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
+    /// true`).
+    ///
+    /// Files are returned in descending version order, as log replay expects. Only the commit
+    /// cover is read; checkpoints and sidecars are not consulted.
+    #[internal_api]
+    pub(crate) fn read_commit_actions(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        let commit_files = self.find_commit_cover();
+        let actions = engine
+            .json_handler()
+            .read_json_files_with_cancellation(
+                &commit_files,
+                schema,
+                None,
+                cancellation_token.cloned(),
+            )?
+            .map_ok(|batch| ActionsBatch::new(batch, true));
+        Ok(actions)
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always

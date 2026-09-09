@@ -1013,10 +1013,14 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     )?;
     let data = Box::new(ArrowEngineData::new(batch));
 
-    let write_context = txn.partitioned_write_context(HashMap::from([(
-        partition_col.to_string(),
-        Scalar::String("a".into()),
-    )]))?;
+    let write_state = txn.write_state()?;
+    let write_context = write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([(
+            partition_col.to_string(),
+            Scalar::String("a".into()),
+        )]))
+        .build()?;
     let result = engine.write_parquet(&data, &write_context).await?;
     txn.add_files(result);
     assert!(txn.commit(engine.as_ref())?.is_committed());
@@ -1108,11 +1112,15 @@ async fn test_materialize_partition_columns_e2e(
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("default engine")
         .with_data_change(true);
+    let write_state = txn.write_state()?;
     for (d1, d2, p1, p2) in [
         (vec![1, 2, 3], vec![10, 20, 30], "x", 5),
         (vec![4, 5], vec![40, 50], "y", 6),
     ] {
-        let wc = txn.partitioned_write_context(partition_values(p1, p2))?;
+        let wc = write_state
+            .write_context_builder()
+            .with_partition_values(partition_values(p1, p2))
+            .build()?;
         let add = engine
             .write_parquet(&ArrowEngineData::new(make_batch(d1, d2)), &wc)
             .await?;
@@ -1263,10 +1271,14 @@ async fn test_input_data_with_partition_column_errors(
     )?;
     let data = Box::new(ArrowEngineData::new(batch));
 
-    let write_context = txn.partitioned_write_context(HashMap::from([(
-        partition_col.to_string(),
-        Scalar::String("a".into()),
-    )]))?;
+    let write_state = txn.write_state()?;
+    let write_context = write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([(
+            partition_col.to_string(),
+            Scalar::String("a".into()),
+        )]))
+        .build()?;
     let err = engine
         .write_parquet(&data, &write_context)
         .await
@@ -1347,16 +1359,19 @@ async fn test_partition_null_validation(
         .commit(engine.as_ref())?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
-    let result = begin_transaction(snapshot, engine.as_ref())?
-        .with_engine_info("default engine")
-        .partitioned_write_context(HashMap::from([("p".to_string(), value)]));
+    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let write_state = txn.write_state()?;
+    let result = write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([("p".to_string(), value)]))
+        .build();
 
     match expected_err {
         Some(needle) => {
             let err = result
                 .err()
                 .ok_or(
-                    "expected partitioned_write_context to error for a null-equivalent value into NOT NULL partition",
+                    "expected write-context build to reject a null-equivalent value for a NOT NULL partition",
                 )?
                 .to_string();
             assert!(err.contains(needle), "{err}");
@@ -1401,26 +1416,32 @@ async fn test_partition_null_validation_mixed_nullability(
         false, // write_partition_values_parsed; unused, no checkpoint in this test
     )?;
 
-    begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("default engine")
-        .partitioned_write_context(HashMap::from([
+    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let write_state = txn.write_state()?;
+
+    write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([
             ("p_required".to_string(), Scalar::String("a".into())),
             ("p_optional".to_string(), Scalar::Null(DataType::STRING)),
-        ]))?;
+        ]))
+        .build()?;
 
-    begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("default engine")
-        .partitioned_write_context(HashMap::from([
+    write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([
             ("p_required".to_string(), Scalar::String("a".into())),
             ("p_optional".to_string(), Scalar::String(String::new())),
-        ]))?;
+        ]))
+        .build()?;
 
-    let err = begin_transaction(snapshot, engine.as_ref())?
-        .with_engine_info("default engine")
-        .partitioned_write_context(HashMap::from([
+    let err = write_state
+        .write_context_builder()
+        .with_partition_values(HashMap::from([
             ("p_required".to_string(), Scalar::Null(DataType::STRING)),
             ("p_optional".to_string(), Scalar::String("b".into())),
         ]))
+        .build()
         .unwrap_err()
         .to_string();
     assert!(err.contains("not nullable"), "{err}");

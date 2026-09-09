@@ -50,6 +50,10 @@ impl PlanNode {
 /// `nodes`: no other node lists its index in `inputs`, and its rows are the value the engine
 /// streams to the caller.
 ///
+/// The terminal node describes the rows produced by the plan. The calling API determines who
+/// consumes them: kernel may use [`PlanExecutor`](crate::plans::PlanExecutor), or the connector may
+/// consume them directly when kernel returns the plan.
+///
 /// # Optimization
 ///
 /// For the best performance, connectors are encouraged to run kernel-produced

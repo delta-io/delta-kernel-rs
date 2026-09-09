@@ -3,6 +3,8 @@
 //! This module contains [`StatsColumnFilter`], which determines which columns
 //! should have statistics collected based on table configuration.
 
+use std::collections::HashSet;
+
 use crate::column_trie::ColumnTrie;
 use crate::schema::{ColumnName, DataType, Schema, StructField};
 use crate::table_properties::DataSkippingNumIndexedCols;
@@ -129,24 +131,25 @@ impl<'col> StatsColumnFilter<'col> {
             self.collect_field(field, result);
         }
 
-        // Pass 2: Add required columns not already included
-        // Uses O(n) contains check, but required columns are typically few (1-4)
+        // Required struct columns expand to leaf paths because membership is exact and stats
+        // schemas contain leaves rather than their parent struct.
         if let Some(required_cols) = self.required_columns {
+            let mut seen: HashSet<_> = result.iter().cloned().collect();
             for col in required_cols {
-                if result.contains(col) {
+                let Ok(field) = schema.field_at(col) else {
+                    tracing::warn!(
+                        "Required column '{}' not found in table schema; skipping",
+                        col
+                    );
                     continue;
-                }
-                // Verify the required column exists in schema before adding
-                if schema.field_at(col).is_ok() {
+                };
+                let mut path: Vec<String> = col.iter().map(String::from).collect();
+                let before = result.len();
+                collect_required_leaf_paths(&mut path, field.data_type(), result, &mut seen);
+                if result.len() > before {
                     tracing::warn!(
                         "Required column '{}' exceeds dataSkippingNumIndexedCols limit; \
                          adding anyway",
-                        col
-                    );
-                    result.push(col.clone());
-                } else {
-                    tracing::warn!(
-                        "Required column '{}' not found in table schema; skipping",
                         col
                     );
                 }
@@ -239,6 +242,32 @@ impl<'col> StatsColumnFilter<'col> {
         }
 
         self.path.pop();
+    }
+}
+
+/// Appends missing leaf paths under `data_type`, rooted at `path`, to `result`.
+///
+/// Structs expand to descendant leaves so exact membership matches the leaf-based stats schema.
+fn collect_required_leaf_paths(
+    path: &mut Vec<String>,
+    data_type: &DataType,
+    result: &mut Vec<ColumnName>,
+    seen: &mut HashSet<ColumnName>,
+) {
+    match data_type {
+        DataType::Struct(struct_type) => {
+            for child in struct_type.fields() {
+                path.push(child.name.clone());
+                collect_required_leaf_paths(path, child.data_type(), result, seen);
+                path.pop();
+            }
+        }
+        _ => {
+            let name = ColumnName::new(&*path);
+            if seen.insert(name.clone()) {
+                result.push(name);
+            }
+        }
     }
 }
 
@@ -391,6 +420,39 @@ mod tests {
                 column_name!("user.address.city"),
             ]
         );
+    }
+
+    #[rstest::rstest]
+    #[case::all_struct_leaves_past_cap(
+        1,
+        vec![column_name!("a"), column_name!("s.x"), column_name!("s.y")],
+    )]
+    #[case::indexed_struct_leaf_is_not_duplicated(
+        3,
+        vec![
+            column_name!("a"),
+            column_name!("b"),
+            column_name!("s.x"),
+            column_name!("s.y"),
+        ],
+    )]
+    fn test_required_struct_column_expands_to_leaves(
+        #[case] num_indexed_cols: u64,
+        #[case] expected: Vec<ColumnName>,
+    ) {
+        let props = make_props_with_num_cols(num_indexed_cols);
+        let required_cols = vec![column_name!("s")];
+        let schema = schema! {
+            nullable "a": LONG,
+            nullable "b": LONG,
+            nullable "s": {
+                nullable "x": LONG,
+                nullable "y": LONG,
+            },
+        };
+
+        let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
+        assert_eq!(columns, expected);
     }
 
     #[test]

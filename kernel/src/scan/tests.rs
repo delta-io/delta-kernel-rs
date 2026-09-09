@@ -524,10 +524,12 @@ fn test_without_row_transforms_rejects_execute() {
     );
 }
 
-/// Row commit version metadata columns are unsupported by scans, so requesting one errors at
-/// build time regardless of `without_row_transforms`.
+/// Row commit version metadata columns require a row-tracking-enabled table, including when row
+/// transforms are disabled.
 #[rstest]
-fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_transforms: bool) {
+fn test_scan_rejects_row_commit_version_when_row_tracking_is_disabled(
+    #[values(false, true)] without_row_transforms: bool,
+) {
     let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
     let schema = Arc::new(
         snapshot
@@ -541,10 +543,10 @@ fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_trans
     }
     let err = builder
         .build()
-        .expect_err("row commit version columns are unsupported by scans");
+        .expect_err("row commit version columns require row tracking");
     assert!(
         err.to_string()
-            .contains("Row commit versions not supported"),
+            .contains("Row commit versions are not enabled on this table"),
         "unexpected error: {err}"
     );
 }
@@ -1674,7 +1676,7 @@ fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
 
 #[derive(Debug)]
 struct RecordedParquetRead {
-    files: Vec<String>,
+    files: Vec<FileMeta>,
     physical_schema: schema::SchemaRef,
     predicate: Option<PredicateRef>,
 }
@@ -1705,7 +1707,7 @@ impl ParquetHandler for RecordingParquetHandler {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         self.reads.lock().unwrap().push(RecordedParquetRead {
-            files: files.iter().map(|file| file.location.to_string()).collect(),
+            files: files.to_vec(),
             physical_schema: physical_schema.clone(),
             predicate: predicate.clone(),
         });
@@ -1724,6 +1726,52 @@ impl ParquetHandler for RecordingParquetHandler {
     ) -> DeltaResult<()> {
         self.inner.write_parquet_file(location, data)
     }
+}
+
+#[test_log::test]
+fn scan_execute_passes_scan_file_modification_time_to_parquet_handler() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = Arc::new(DelegatingEngine::new(sync).with_parquet_handler(recorder.clone()));
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    fn collect_file_modification_times(
+        file_modification_times: &mut Vec<(String, i64)>,
+        scan_file: ScanFile,
+    ) {
+        file_modification_times.push((scan_file.path.to_string(), scan_file.modification_time));
+    }
+
+    let mut expected = Vec::new();
+    for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        expected = scan_metadata
+            .unwrap()
+            .visit_scan_files(expected, collect_file_modification_times)
+            .unwrap();
+    }
+    recorder.take_reads();
+
+    let _: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+    let reads = recorder.take_reads();
+    let mut actual: Vec<_> = reads
+        .into_iter()
+        .flat_map(|read| read.files)
+        .filter_map(|file| {
+            file.location
+                .to_string()
+                .strip_prefix(url.as_str())
+                .map(|path| (path.to_string(), file.last_modified))
+        })
+        .collect();
+
+    expected.sort_unstable();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
 }
 
 #[rstest]
@@ -1781,7 +1829,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
         .filter(|read| {
             read.files
                 .iter()
-                .any(|file| file.contains(expected_file_fragment))
+                .any(|file| file.location.as_str().contains(expected_file_fragment))
                 && read.physical_schema.field("add").is_some()
         })
         .collect();
@@ -1891,7 +1939,7 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
         reads.iter().any(|read| {
             read.files
                 .iter()
-                .any(|file| file.contains(expected_file_fragment))
+                .any(|file| file.location.as_str().contains(expected_file_fragment))
                 && read
                     .predicate
                     .as_ref()
@@ -2024,7 +2072,9 @@ fn test_default_stats_options_no_struct_output() {
 #[case::id_with_json_without_predicate(
     StatsOptions {
         synthesize_json: true,
-        struct_stats: StructStats::Columns(vec![column_name!("id")]),
+        struct_stats: StructStats::Columns {
+            requested: vec![column_name!("id")],
+        },
     },
     &["id"],
     None,
@@ -2190,11 +2240,34 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         .scan_builder()
         .with_stats(StatsOptions {
             synthesize_json: true,
-            struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
+            struct_stats: StructStats::Columns {
+                requested: vec![column_name!("nonexistent_column")],
+            },
         })
         .build();
 
     assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
+}
+
+#[test]
+fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let result = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct_with_extra_indexed(vec![
+            column_name!("nonexistent_column"),
+        ]))
+        .build();
+
+    assert!(
+        result.is_ok(),
+        "unresolvable extra_indexed column should be dropped, not error: {:?}",
+        result.err()
+    );
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
@@ -2325,50 +2398,57 @@ mod scan_metadata_completed_tests {
     }
 
     #[rstest]
-    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 17236, 0, 0)]
+    #[case::basic_scan("./tests/data/parsed-stats/", None, (6, 2, 6, 17236, 0, 0))]
     #[case::static_skip_all(
         "./tests/data/parsed-stats/",
         Some(Arc::new(Pred::FALSE)),
-        0,
-        0,
-        0,
-        0,
-        0
+        (0, 0, 0, 0, 0, 0)
     )]
-    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 0, 2, 0)]
+    #[case::with_removes("./tests/data/table-with-cdf/", None, (1, 1, 0, 0, 2, 0))]
     #[case::with_checkpoint(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
         None,
-        2,
-        1,
-        1010,
-        1,
-        0
+        (2, 1, 1, 1010, 1, 0)
     )]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
         Some(Arc::new(Expr::eq(col!("letter"), lit("a")))),
-        2, 2, 1502, 0, 4
+        (6, 6, 2, 1502, 0, 4)
     )]
     fn test_scan_metrics(
         #[case] table: &str,
         #[case] predicate: Option<Arc<Pred>>,
-        #[case] expected_add_seen: u64,
-        #[case] expected_active: u64,
-        #[case] expected_active_bytes: u64,
-        #[case] expected_removes: u64,
-        #[case] expected_filtered: u64,
+        #[case] expected: (u64, u64, u64, u64, u64, u64),
     ) {
+        let (
+            expected_add_seen,
+            expected_add_seen_from_delta,
+            expected_active,
+            expected_active_bytes,
+            expected_removes,
+            expected_filtered,
+        ) = expected;
         let (reporter, _guard, _) = run_scan(table, predicate, None);
         let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
             panic!("expected ScanMetadataCompleted");
         };
         assert!(e.duration > Duration::ZERO);
         assert_eq!(e.num_add_files_seen, expected_add_seen);
-        assert_eq!(e.num_active_add_files, expected_active);
-        assert_eq!(e.active_add_files_bytes, expected_active_bytes);
-        assert_eq!(e.num_remove_files_seen, expected_removes);
+        assert_eq!(
+            e.num_add_files_seen_from_delta_files,
+            expected_add_seen_from_delta
+        );
+        assert_eq!(e.num_selected_add_files, expected_active);
+        assert_eq!(e.selected_add_files_bytes, expected_active_bytes);
+        assert_eq!(e.num_remove_files_seen_from_delta_files, expected_removes);
         assert_eq!(e.num_predicate_filtered, expected_filtered);
+        let rendered = e.to_string();
+        assert!(rendered.contains(&format!(
+            "add_files_seen_from_delta_files={expected_add_seen_from_delta}"
+        )));
+        assert!(rendered.contains(&format!(
+            "remove_files_seen_from_delta_files={expected_removes}"
+        )));
     }
 
     // The parallel-scan paths (both sequential and parallel phase events) are covered by
