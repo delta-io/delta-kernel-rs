@@ -9,13 +9,13 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::NUM_RECORDS;
 use crate::content_tree::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo, TrackingStatus,
-    CONTENT_TYPE, FILE_FORMAT, FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES, FIRST_ROW_ID,
-    FORMAT_VERSION, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING,
-    TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
+    struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo,
+    TrackingStatus, CONTENT_TYPE, FILE_FORMAT, FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES,
+    FIRST_ROW_ID, FORMAT_VERSION, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER,
+    TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
 };
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{lit, null_lit, ColumnName, Expression};
+use crate::expressions::{lit, ColumnName, Expression};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PATH_NAME, SIZE_NAME, STATS_NAME,
 };
@@ -210,28 +210,6 @@ fn build_tracking_expression(projections: &ContentTreeEntryProjections) -> Expre
         FIRST_ROW_ID => Some(projections.first_row_id.clone()),
         _ => None,
     })
-}
-
-/// Builds a struct expression matching `schema` field-for-field. `project` supplies the expression
-/// for a named field; unmatched fields (those returning `None`) become typed null literals, so the
-/// result matches the schema in field order and type.
-fn struct_expr_from_schema(
-    schema: &StructType,
-    project: impl Fn(&str) -> Option<Expression>,
-) -> Expression {
-    Expression::struct_from(schema.fields().map(|field| {
-        project(field.name().as_str()).unwrap_or_else(|| {
-            // A missing projection must only ever fall back to null for a nullable field; a
-            // required field with no projection would silently become a null of a non-nullable
-            // type.
-            debug_assert!(
-                field.is_nullable(),
-                "no projection for required field {}",
-                field.name()
-            );
-            null_lit(field.data_type().clone())
-        })
-    }))
 }
 
 #[cfg(test)]

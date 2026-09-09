@@ -6,6 +6,7 @@
 
 mod builder;
 mod dv_conversion;
+mod reader;
 pub(crate) mod stats;
 
 use std::collections::HashMap;
@@ -15,10 +16,10 @@ use delta_kernel_derive::{IntoEngineData, ToSchema};
 use url::Url;
 
 use crate::engine_data::EngineData;
-use crate::expressions::{Scalar, StructData};
+use crate::expressions::{null_lit, Expression, Scalar, StructData};
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::DataType;
-use crate::Version;
+use crate::schema::{DataType, StructType};
+use crate::{DeltaResult, Error, Version};
 
 /// Field names in the [`ContentTreeNodeEntry`] schema.
 pub(crate) const CONTENT_TYPE: &str = "contentType";
@@ -298,6 +299,28 @@ pub enum TrackingStatus {
     Modified = 4,
 }
 
+impl TrackingStatus {
+    /// Maps the on-disk integer representation to the enum, erroring on unknown values.
+    pub(crate) fn try_from_repr(value: i32) -> DeltaResult<Self> {
+        match value {
+            0 => Ok(Self::Existing),
+            1 => Ok(Self::Added),
+            2 => Ok(Self::Deleted),
+            3 => Ok(Self::Replaced),
+            4 => Ok(Self::Modified),
+            other => Err(Error::generic(format!(
+                "Invalid AMT tracking status value: {other}"
+            ))),
+        }
+    }
+
+    /// Whether this entry contributes rows to reads. Live entries (`Existing`, `Added`,
+    /// `Modified`) are surfaced as `Add` actions; not-live entries (`Deleted`, `Replaced`) are not.
+    pub(crate) fn is_live(self) -> bool {
+        self == Self::Existing || self == Self::Added || self == Self::Modified
+    }
+}
+
 impl ToDataType for TrackingStatus {
     fn to_data_type() -> DataType {
         DataType::INTEGER
@@ -351,4 +374,32 @@ pub(crate) struct ManifestInfo {
     /// Number of set bits (deleted rows) in [`Self::dv`], or `None` when `dv` is absent.
     #[field_id = 523]
     pub(crate) dv_cardinality: Option<i64>,
+}
+
+// === Helpers ===
+
+/// Builds a struct expression matching `schema` field-for-field. `project` supplies the expression
+/// for a named field; unmatched fields (those returning `None`) become typed null literals, so the
+/// result matches the schema in field order and type.
+///
+/// Shared by the AMT write path ([`builder`], write-metadata -> entry) and the AMT read path
+/// ([`reader`], entry -> `Add` action), which both assemble a schema-shaped struct from a subset of
+/// projected fields.
+pub(super) fn struct_expr_from_schema(
+    schema: &StructType,
+    project: impl Fn(&str) -> Option<Expression>,
+) -> Expression {
+    Expression::struct_from(schema.fields().map(|field| {
+        project(field.name().as_str()).unwrap_or_else(|| {
+            // A missing projection must only ever fall back to null for a nullable field; a
+            // required field with no projection would silently become a null of a non-nullable
+            // type.
+            debug_assert!(
+                field.is_nullable(),
+                "no projection for required field {}",
+                field.name()
+            );
+            null_lit(field.data_type().clone())
+        })
+    }))
 }
