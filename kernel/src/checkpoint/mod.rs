@@ -111,17 +111,16 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
 use crate::actions::{
-    ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
-    REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
+    CheckpointMetadata, ADD_FIELD, CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME,
+    DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
+    SIDECAR_FIELD,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{
-    lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar, StructData,
-};
+use crate::expressions::{lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
-use crate::schema::{lazy_schema_ref, schema, DataType, SchemaRef, StructField};
+use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
@@ -327,20 +326,10 @@ fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
 static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
     lazy_schema_ref! { ..(base_checkpoint_action_fields()) };
 
-/// Schema for the checkpointMetadata field in V2 checkpoints.
-/// We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
-/// we're not supporting yet due to the lack of map support TODO(#880).
-fn checkpoint_metadata_field() -> StructField {
-    StructField::nullable(
-        CHECKPOINT_METADATA_NAME,
-        schema! { not_null "version": LONG },
-    )
-}
-
 /// Schema for V2 checkpoints (includes checkpointMetadata action)
 static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(base_checkpoint_action_fields()),
-    (checkpoint_metadata_field()),
+    (&CHECKPOINT_METADATA_FIELD),
 };
 
 /// Orchestrates the process of creating a checkpoint for a table.
@@ -692,11 +681,13 @@ impl CheckpointWriter {
         // Start with an all-null row
         let null_row = engine.evaluation_handler().null_row(schema.clone())?;
 
-        // Build the checkpointMetadata struct value
-        let checkpoint_metadata_value = Scalar::Struct(StructData::try_new(
-            vec![StructField::not_null("version", DataType::LONG)],
-            vec![Scalar::from(self.version)],
-        )?);
+        // Build the checkpointMetadata struct value. `tags` is left unset (null) since kernel
+        // does not currently emit checkpoint tags.
+        let checkpoint_metadata_value: Scalar = CheckpointMetadata {
+            version: self.version,
+            tags: None,
+        }
+        .into();
 
         // Use a struct patch to set just the checkpointMetadata field, keeping others null
         let patch = ExpressionStructPatchBuilder::new()
