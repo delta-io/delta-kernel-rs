@@ -551,10 +551,11 @@ impl<S> Transaction<S> {
             ));
         }
 
-        // The rewritten stats are for the add action only, so they are dropped here.
-        static COLUMNS_TO_DROP: &[&str] = &[NEW_DELETION_VECTOR_NAME, NEW_STATS_NAME];
-        let remove_actions =
-            self.generate_remove_actions(engine, self.dv_matched_files.iter(), COLUMNS_TO_DROP)?;
+        let remove_actions = self.generate_remove_actions(
+            engine,
+            self.dv_matched_files.iter(),
+            Some(new_dv_column_schema().clone()),
+        )?;
         let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter())?;
         Ok(remove_actions.chain(add_actions))
     }

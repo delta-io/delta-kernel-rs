@@ -350,7 +350,8 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
-        validate_input_schema(&self.input_schema, batch.schema().as_ref())?;
+        // TODO(#3263): Validate nested fields.
+        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::StructPatch(patch), DataType::Struct(_)) if patch.is_empty() => {
                 // Empty patch optimization: Skip expression evaluation and directly apply the
@@ -389,7 +390,8 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
-        validate_input_schema(&self.input_schema, batch.schema().as_ref())?;
+        // TODO(#3263): Validate nested fields.
+        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
         let array = evaluate_predicate(&self.predicate, batch, false)?;
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "output",
@@ -401,87 +403,59 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
     }
 }
 
-fn validate_input_schema(input_schema: &SchemaRef, batch_schema: &ArrowSchema) -> DeltaResult<()> {
-    let batch_schema = StructType::try_from_arrow(batch_schema)?;
+fn validate_data_schema_top_level(
+    expected_schema: &SchemaRef,
+    data_schema: &ArrowSchema,
+) -> DeltaResult<()> {
+    let data_schema = StructType::try_from_arrow(data_schema)?;
     require!(
-        input_schema.num_fields() == batch_schema.num_fields(),
-        Error::generic(format!(
-            "Input schema fields {:?} do not match batch schema fields {:?}",
-            input_schema
+        expected_schema.num_fields() == data_schema.num_fields(),
+        Error::schema(format!(
+            "Expected schema fields {:?} do not match data schema fields {:?}",
+            expected_schema
                 .fields()
                 .map(|field| field.name())
                 .collect_vec(),
-            batch_schema
-                .fields()
-                .map(|field| field.name())
-                .collect_vec()
+            data_schema.fields().map(|field| field.name()).collect_vec()
         ))
     );
 
-    for (input_field, batch_field) in input_schema.fields().zip(batch_schema.fields()) {
+    for (expected_field, data_field) in expected_schema.fields().zip(data_schema.fields()) {
         require!(
-            input_field.name() == batch_field.name(),
-            Error::generic(format!(
-                "Input schema field '{}' does not match batch schema field '{}'",
-                input_field.name(),
-                batch_field.name()
+            expected_field.name() == data_field.name(),
+            Error::schema(format!(
+                "Expected schema field '{}' does not match data schema field '{}'",
+                expected_field.name(),
+                data_field.name()
             ))
         );
         require!(
-            input_types_compatible(
-                input_field.data_type(),
-                batch_field.data_type(),
-                input_field.is_nullable() || batch_field.is_nullable(),
-            ),
-            Error::generic(format!(
-                "Input schema type for '{}' does not match the batch schema type: {:?} != {:?}",
-                input_field.name(),
-                input_field.data_type(),
-                batch_field.data_type()
+            top_level_types_compatible(expected_field.data_type(), data_field.data_type()),
+            Error::schema(format!(
+                "Expected schema type for '{}' does not match the data schema type: {:?} != {:?}",
+                expected_field.name(),
+                expected_field.data_type(),
+                data_field.data_type()
             ))
         );
     }
     Ok(())
 }
 
-fn input_types_compatible(
-    input_type: &DataType,
-    batch_type: &DataType,
-    allow_omitted_struct_fields: bool,
-) -> bool {
-    match (input_type, batch_type) {
-        (DataType::Primitive(input), DataType::Primitive(batch)) => input == batch,
-        (DataType::Struct(input), DataType::Struct(batch)) => {
-            if !allow_omitted_struct_fields && input.num_fields() != batch.num_fields() {
-                return false;
-            }
-
-            input.fields().all(|input_field| {
-                batch.field(input_field.name()).is_none_or(|batch_field| {
-                    input_types_compatible(
-                        input_field.data_type(),
-                        batch_field.data_type(),
-                        input_field.is_nullable() || batch_field.is_nullable(),
-                    )
-                })
-            }) && batch.fields().all(|batch_field| {
-                input.field(batch_field.name()).is_some() || allow_omitted_struct_fields
-            })
-        }
-        (DataType::Array(input), DataType::Array(batch)) => input_types_compatible(
-            input.element_type(),
-            batch.element_type(),
-            input.contains_null() || batch.contains_null(),
-        ),
-        (DataType::Map(input), DataType::Map(batch)) => {
-            input_types_compatible(input.key_type(), batch.key_type(), false)
-                && input_types_compatible(
-                    input.value_type(),
-                    batch.value_type(),
-                    input.value_contains_null() || batch.value_contains_null(),
+fn top_level_types_compatible(expected_type: &DataType, data_type: &DataType) -> bool {
+    match (expected_type, data_type) {
+        (DataType::Primitive(expected), DataType::Primitive(data)) => {
+            expected == data
+                || matches!(
+                    (expected, data),
+                    (PrimitiveType::IntervalYearMonth, PrimitiveType::Integer)
+                        | (PrimitiveType::IntervalDayTime, PrimitiveType::Long)
                 )
         }
-        (DataType::Variant(input), DataType::Variant(batch)) => input == batch,
+        (DataType::Struct(_), DataType::Struct(_))
+        | (DataType::Array(_), DataType::Array(_))
+        | (DataType::Map(_), DataType::Map(_))
+        | (DataType::Variant(_), DataType::Struct(_)) => true,
         _ => false,
     }
 }

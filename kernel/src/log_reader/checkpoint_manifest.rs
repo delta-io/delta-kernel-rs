@@ -1,14 +1,15 @@
 //! Manifest phase for log replay - processes single-part checkpoints and manifest checkpoints.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
+use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::schema::SchemaRef;
+use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::utils::require;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
 
@@ -30,26 +31,30 @@ impl CheckpointManifestReader {
     /// phase needs to extract sidecar references for phase transitions.
     ///
     /// # Parameters
-    /// - `engine`: Engine for reading files
-    /// - `manifest`: The checkpoint manifest file to process
+    /// - `manifest_file`: The checkpoint manifest file to process
     /// - `log_root`: Root URL for resolving sidecar paths
-    /// - `read_schema`: Schema for reading the manifest actions
+    /// - `engine`: Engine for reading files
     #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         manifest: &ParsedLogPath,
         log_root: Url,
-        read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
+        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+            (&SIDECAR_FIELD),
+        };
+
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
-                read_schema.clone(),
+                MANIFEST_READ_SCHMEA.clone(),
                 None,
             )?,
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&manifest.location),
-                read_schema,
+                MANIFEST_READ_SCHMEA.clone(),
                 None,
             )?,
             extension => {
@@ -115,10 +120,8 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
-    use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
     use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::schema::schema_ref;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
     use crate::SnapshotRef;
 
@@ -133,12 +136,8 @@ mod tests {
         let log_root = log_segment.log_root.clone();
         assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
         let checkpoint_file = &log_segment.listed.checkpoint_parts[0];
-        let mut manifest_phase = CheckpointManifestReader::try_new(
-            engine.clone(),
-            checkpoint_file,
-            log_root,
-            manifest_read_schema(),
-        )?;
+        let mut manifest_phase =
+            CheckpointManifestReader::try_new(engine.clone(), checkpoint_file, log_root)?;
 
         // Extract add file paths and verify expectations
         let mut file_paths = vec![];
@@ -219,7 +218,6 @@ mod tests {
             engine.clone(),
             &snapshot.log_segment().listed.checkpoint_parts[0],
             snapshot.log_segment().log_root.clone(),
-            manifest_read_schema(),
         )?;
 
         let result = manifest_phase.extract_sidecars();
@@ -256,13 +254,5 @@ mod tests {
                 "00000000000000000006.checkpoint.0000000002.0000000002.4367b29c-0e87-447f-8e81-9814cc01ad1f.parquet",
             ],
         )
-    }
-
-    fn manifest_read_schema() -> SchemaRef {
-        schema_ref! {
-            (&ADD_FIELD),
-            (&REMOVE_FIELD),
-            (&SIDECAR_FIELD),
-        }
     }
 }
