@@ -561,13 +561,42 @@ fn get_indices(
                         } else {
                             // safety, checked that we have 1 element
                             let mut child = children.swap_remove(0);
-                            if matches!(&child.transform, ReorderIndexTransform::Cast(_)) {
+                            if let ReorderIndexTransform::Cast(element_target) = &child.transform {
                                 // The recursive plan targets the element type, but this reorder
                                 // entry consumes the outer list column. Cast the complete list so
-                                // Arrow applies the element conversion recursively.
+                                // Arrow applies the element conversion recursively while retaining
+                                // the physical list wrapper at each nesting level.
                                 let target_field: ArrowField = requested_field.try_into_arrow()?;
-                                child.transform =
-                                    ReorderIndexTransform::Cast(target_field.data_type().clone());
+                                let ArrowDataType::List(target_element_field) =
+                                    target_field.data_type()
+                                else {
+                                    return Err(Error::internal_error(
+                                        "Kernel array converted to a non-list Arrow type.",
+                                    ));
+                                };
+                                let target_element_field = Arc::new(
+                                    target_element_field
+                                        .as_ref()
+                                        .clone()
+                                        .with_data_type(element_target.clone()),
+                                );
+                                let target = match field.data_type() {
+                                    ArrowDataType::List(_) => {
+                                        ArrowDataType::List(target_element_field)
+                                    }
+                                    ArrowDataType::LargeList(_) => {
+                                        ArrowDataType::LargeList(target_element_field)
+                                    }
+                                    ArrowDataType::ListView(_) => {
+                                        ArrowDataType::ListView(target_element_field)
+                                    }
+                                    _ => {
+                                        return Err(Error::internal_error(
+                                            "List cast planned for a non-list Arrow type.",
+                                        ));
+                                    }
+                                };
+                                child.transform = ReorderIndexTransform::Cast(target);
                             }
                             // the index is wrong, as it's the index from the inner schema.
                             // Adjust it to be our index
@@ -2992,6 +3021,72 @@ mod tests {
             get_requested_indices(&requested_schema, &parquet_schema),
             "must be a JSON object",
         );
+    }
+
+    #[rstest]
+    #[case::list(
+        ArrowDataType::List(arrow_list_element(ArrowDataType::Int32)),
+        ArrowDataType::List(arrow_list_element(ArrowDataType::Int64))
+    )]
+    #[case::large_list(
+        ArrowDataType::LargeList(arrow_list_element(ArrowDataType::Int32)),
+        ArrowDataType::LargeList(arrow_list_element(ArrowDataType::Int64))
+    )]
+    #[case::list_view(
+        ArrowDataType::ListView(arrow_list_element(ArrowDataType::Int32)),
+        ArrowDataType::ListView(arrow_list_element(ArrowDataType::Int64))
+    )]
+    fn list_element_cast_preserves_physical_wrapper(
+        #[case] physical_type: ArrowDataType,
+        #[case] expected_type: ArrowDataType,
+    ) {
+        let requested_schema: SchemaRef = schema! {
+            (StructField::not_null("values", ArrayType::new(DataType::LONG, true))),
+        }
+        .into();
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "values",
+            physical_type,
+            false,
+        )]));
+
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+
+        assert_eq!(mask_indices, vec![0]);
+        assert_eq!(reorder_indices, vec![ReorderIndex::cast(0, expected_type)]);
+    }
+
+    #[test]
+    fn nested_list_element_cast_preserves_each_physical_wrapper() {
+        let requested_schema: SchemaRef = schema! {
+            (StructField::not_null(
+                "values",
+                ArrayType::new(ArrayType::new(DataType::LONG, true), true),
+            )),
+        }
+        .into();
+        let physical_type = ArrowDataType::LargeList(arrow_list_element(ArrowDataType::ListView(
+            arrow_list_element(ArrowDataType::Int32),
+        )));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "values",
+            physical_type,
+            false,
+        )]));
+        let expected_type = ArrowDataType::LargeList(arrow_list_element(ArrowDataType::ListView(
+            arrow_list_element(ArrowDataType::Int64),
+        )));
+
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+
+        assert_eq!(mask_indices, vec![0]);
+        assert_eq!(reorder_indices, vec![ReorderIndex::cast(0, expected_type)]);
+    }
+
+    fn arrow_list_element(data_type: ArrowDataType) -> Arc<ArrowField> {
+        Arc::new(ArrowField::new("element", data_type, true))
     }
 
     #[test]
