@@ -582,7 +582,7 @@ pub(crate) fn visit_back_reference_at<'a>(
 
     let manifest_opt: Option<String> = getters[0].get_opt(row_index, "backReference.manifest")?;
     if let Some(manifest) = manifest_opt {
-        let pos: i64 = getters[1].get(row_index, "backReference.pos")?;
+        let pos: i32 = getters[1].get(row_index, "backReference.pos")?;
         Ok(Some(BackReference { manifest, pos }))
     } else {
         Ok(None)
@@ -1575,6 +1575,22 @@ mod tests {
                 pos: 7,
             }),
             "back_reference mismatch"
+        );
+    }
+
+    #[test]
+    fn visit_back_reference_with_manifest_but_missing_pos_errors() {
+        // `pos` is required whenever the back reference is present (the visitor uses `get`, not
+        // `get_opt`), so a present `manifest` with an absent `pos` must error rather than produce a
+        // half-populated `BackReference`.
+        let manifest: StringArray = vec!["_delta_log/_tree/leaf-0001.parquet"].into();
+        let pos = ();
+        let getters: &[&dyn GetData<'_>] = &[&manifest, &pos];
+
+        let err = visit_back_reference_at(0, getters).unwrap_err();
+        assert!(
+            err.to_string().contains("backReference.pos"),
+            "unexpected error: {err}"
         );
     }
 

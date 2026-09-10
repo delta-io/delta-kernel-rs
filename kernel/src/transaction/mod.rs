@@ -9,9 +9,9 @@ use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
 use crate::actions::{
-    as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
-    LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
-    MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    as_log_add_schema, BackReference, CommitInfo, DomainMetadata, Metadata, Protocol,
+    SetTransaction, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA,
+    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
@@ -21,7 +21,7 @@ use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatch,
+    col, column_name, lit, null_lit, ArrayData, ColumnName, ExpressionStructPatch,
     ExpressionStructPatchBuilder,
 };
 use crate::log_replay::HasSelectionVector;
@@ -39,7 +39,7 @@ use crate::scan::scan_row_schema;
 use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{
     lazy_schema_ref, schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType,
+    StructField, StructType, ToSchema,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -1555,7 +1555,10 @@ fn build_remove_struct_patch(
         .drop(FILE_CONSTANT_VALUES_NAME)
         .drop("modificationTime")
         // Added to scan output when the predicate touches a partition column.
-        .drop_if_exists(PARTITION_VALUES_PARSED_NAME);
+        .drop_if_exists(PARTITION_VALUES_PARSED_NAME)
+        // Kernel does not populate adaptive-metadata-tree back references on writes, so emit a null
+        // to keep the produced struct aligned with the `backReference` field of LOG_REMOVE_SCHEMA.
+        .append(null_lit(BackReference::to_schema()));
 
     for column_to_drop in columns_to_drop {
         patch = patch.drop(*column_to_drop);

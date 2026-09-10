@@ -403,6 +403,8 @@ const ADD_FIELDS: &[&str] = &[
     "add.defaultRowCommitVersion",
     "add.tags",
     "add.clusteringProvider",
+    "add.backReference.manifest",
+    "add.backReference.pos",
 ];
 const ALL_STATS_PARSED_FIELDS: &[&str] = &[
     "add.stats_parsed.numRecords",

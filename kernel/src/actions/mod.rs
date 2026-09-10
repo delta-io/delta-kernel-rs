@@ -929,17 +929,13 @@ impl CommitInfo {
 ///
 /// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    test,
-    derive(Serialize, Deserialize, Default),
-    serde(rename_all = "camelCase")
-)]
-pub struct BackReference {
+#[cfg_attr(test, derive(Serialize, Deserialize), serde(rename_all = "camelCase"))]
+pub(crate) struct BackReference {
     /// Path to the leaf manifest containing this file, relative to the table root
     /// (e.g. `metadata/leaf-m1.parquet`).
-    pub manifest: String,
+    pub(crate) manifest: String,
     /// Row position (0-indexed) of the file entry within the manifest.
-    pub pos: i64,
+    pub(crate) pos: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
