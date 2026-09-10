@@ -506,8 +506,8 @@ pub trait EvaluationHandler: AsAny {
 
     /// Create a multi-row [`EngineData`] by applying the given schema to multiple rows of values.
     ///
-    /// Each element in `rows` represents one row of data, where each row contains one structured
-    /// scalar per top-level field in the `schema`.
+    /// Each element in `rows` represents one row of data, where each row contains one scalar per
+    /// top-level field in the `schema`.
     ///
     /// # Errors
     ///
