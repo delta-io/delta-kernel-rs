@@ -13,20 +13,25 @@ use crate::{DeltaResult, Engine, Error};
 /// handler. Returns [`Error::ChecksumWriteUnsupported`] if:
 /// - `file_stats_state` is not `Complete` (only `Complete` CRCs have a well-defined on-disk
 ///   representation); or
-/// - `delta.enableInCommitTimestamps` is `true` but `inCommitTimestampOpt` is absent.
+/// - the file-size histogram is inconsistent with its bin bounds or aggregate statistics; or
+/// - the presence of `inCommitTimestampOpt` does not match whether `delta.enableInCommitTimestamps`
+///   is `true`.
 ///
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
-    require!(
-        crc.file_stats_state.is_complete(),
+    let stats = crc.file_stats().ok_or_else(|| {
         Error::ChecksumWriteUnsupported(format!(
             "Cannot write CRC file with {:?} file stats",
             crc.file_stats_state
         ))
-    );
-    // If ICT is enabled, the CRC must carry an ICT value.
+    })?;
+    if let Some(histogram) = stats.file_size_histogram() {
+        histogram
+            .validate_complete(stats.num_files(), stats.table_size_bytes())
+            .map_err(|error| Error::ChecksumWriteUnsupported(error.to_string()))?;
+    }
     let ict_enabled = crc
         .metadata
         .configuration()
@@ -34,10 +39,11 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         .is_some_and(|v| v == "true");
     let ict_value_present = crc.in_commit_timestamp_opt.is_some();
     require!(
-        !ict_enabled || ict_value_present,
+        ict_enabled == ict_value_present,
         Error::ChecksumWriteUnsupported(
-            "Cannot write CRC file: In-Commit Timestamps enabled but inCommitTimestampOpt is absent"
-                .to_string()
+            "Cannot write CRC file: inCommitTimestampOpt presence does not match In-Commit \
+             Timestamps enablement"
+                .to_string(),
         )
     );
     let data = serde_json::to_vec(crc)?;
@@ -245,6 +251,22 @@ mod tests {
         assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
     }
 
+    #[test]
+    fn test_write_rejects_inconsistent_file_size_histogram() {
+        let (engine, crc_path) = writer_test_env(0);
+        let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
+        crc.file_stats_state = FileStatsState::Complete(FileStats {
+            num_files: 1,
+            table_size_bytes: 10,
+            file_size_histogram: Some(
+                FileSizeHistogram::try_new(vec![0, 10], vec![1, 0], vec![10, 0]).unwrap(),
+            ),
+        });
+
+        let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
+        assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
+    }
+
     #[rstest]
     #[case::not_supported(false, false)]
     #[case::supported_not_enabled(true, false)]
@@ -261,8 +283,7 @@ mod tests {
             crc.in_commit_timestamp_opt = None;
         }
 
-        // If ICT is enabled, then the ICT value must be present.
-        let should_succeed = !ict_enabled || ict_value_present;
+        let should_succeed = ict_enabled == ict_value_present;
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         if should_succeed {
             result.unwrap();

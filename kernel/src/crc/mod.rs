@@ -204,6 +204,11 @@ impl Crc {
                 )));
             }
         }
+        if let Some(histogram) = raw.file_size_histogram.as_ref() {
+            histogram
+                .validate_complete(raw.num_files, raw.table_size_bytes)
+                .map_err(|error| Error::generic(error.to_string()))?;
+        }
         // A CRC file on disk is by definition complete; we never deserialize a degraded state.
         let file_stats_state = FileStatsState::Complete(FileStats {
             num_files: raw.num_files,
@@ -252,6 +257,11 @@ impl TryFrom<&Crc> for CrcRaw {
                 crc.file_stats_state
             )));
         };
+        if let Some(histogram) = stats.file_size_histogram.as_ref() {
+            histogram
+                .validate_complete(stats.num_files, stats.table_size_bytes)
+                .map_err(|error| Error::ChecksumWriteUnsupported(error.to_string()))?;
+        }
         Ok(CrcRaw {
             table_size_bytes: stats.table_size_bytes,
             num_files: stats.num_files,
@@ -340,6 +350,7 @@ mod tests {
     use std::collections::HashMap;
 
     use rstest::rstest;
+    use test_utils::assert_result_error_with_message;
 
     use super::{Crc, CrcRaw, DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
@@ -779,6 +790,29 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::below_lower_bound(vec![0, 10], vec![0, 1], vec![0, 9], 1, 9)]
+    #[case::at_exclusive_upper_bound(vec![0, 10], vec![1, 0], vec![10, 0], 1, 10)]
+    fn de_impossible_file_size_histogram_bin_is_rejected(
+        #[case] boundaries: Vec<i64>,
+        #[case] file_counts: Vec<i64>,
+        #[case] total_bytes: Vec<i64>,
+        #[case] num_files: i64,
+        #[case] table_size_bytes: i64,
+    ) {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(table_size_bytes, num_files, 1, 1)).unwrap();
+        crc["fileSizeHistogram"] = serde_json::json!({
+            "sortedBinBoundaries": boundaries,
+            "fileCounts": file_counts,
+            "totalBytes": total_bytes,
+        });
+        assert_result_error_with_message(
+            Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0),
+            "inconsistent with its bounds",
+        );
+    }
+
     // ===== protocol validation on the CRC deserialization path =====
 
     /// Minimal CRC JSON whose `protocol` is the supplied fragment. Proves CRC deserialization
@@ -853,11 +887,16 @@ mod tests {
     /// Minimal CRC JSON with a file size histogram field spliced in under the given field name
     /// (`fileSizeHistogram` per the Delta spec, or `histogramOpt` for legacy Delta-Spark
     /// compatibility).
-    fn crc_json_with_histogram(field_name: &str, histogram_json: &str) -> String {
+    fn crc_json_with_histogram(
+        field_name: &str,
+        histogram_json: &str,
+        table_size_bytes: i64,
+        num_files: i64,
+    ) -> String {
         format!(
             r#"{{
-                "tableSizeBytes": 0,
-                "numFiles": 0,
+                "tableSizeBytes": {table_size_bytes},
+                "numFiles": {num_files},
                 "numMetadata": 1,
                 "numProtocol": 1,
                 "metadata": {{
@@ -881,7 +920,9 @@ mod tests {
     fn de_valid_file_size_histogram_succeeds(#[case] field_name: &str) {
         let json = crc_json_with_histogram(
             field_name,
-            r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [1, 2, 3], "totalBytes": [10, 200, 300]}"#,
+            r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [1, 2, 3], "totalBytes": [10, 250, 900]}"#,
+            1160,
+            6,
         );
         let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
         assert!(crc.file_stats().unwrap().file_size_histogram().is_some());
@@ -891,7 +932,7 @@ mod tests {
     #[case::spec_name("fileSizeHistogram")]
     #[case::legacy_name("histogramOpt")]
     fn de_null_file_size_histogram_deserializes_to_none(#[case] field_name: &str) {
-        let json = crc_json_with_histogram(field_name, "null");
+        let json = crc_json_with_histogram(field_name, "null", 0, 0);
         let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
         assert!(crc.file_stats().unwrap().file_size_histogram().is_none());
     }
@@ -915,7 +956,7 @@ mod tests {
         #[case] histogram_json: &str,
         #[values("fileSizeHistogram", "histogramOpt")] field_name: &str,
     ) {
-        let json = crc_json_with_histogram(field_name, histogram_json);
+        let json = crc_json_with_histogram(field_name, histogram_json, 0, 0);
         assert!(Crc::try_from_json_bytes(json.as_bytes(), 0).is_err());
     }
 
@@ -927,6 +968,8 @@ mod tests {
         let legacy_json = crc_json_with_histogram(
             "histogramOpt",
             r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [1, 0], "totalBytes": [50, 0]}"#,
+            50,
+            1,
         );
         let crc = Crc::try_from_json_bytes(legacy_json.as_bytes(), 0).unwrap();
 
