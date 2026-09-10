@@ -2706,6 +2706,8 @@ fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
 
 #[rstest]
 #[case::complete(&[1, 2], 2, None)]
+#[case::out_of_order(&[2, 1], 2, None)]
+#[case::three_complete(&[1, 2, 3], 3, None)]
 #[case::duplicate(&[1, 1], 2, Some("duplicate part number 1"))]
 #[case::zero(&[0, 2], 2, Some("part number 0 is outside 1..=2"))]
 #[case::above_range(&[1, 3], 2, Some("part number 3 is outside 1..=2"))]

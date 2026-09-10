@@ -1599,8 +1599,8 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
             } if num_parts >= 2 && num_parts as usize == n => {
                 let index = usize::try_from(part_num)
                     .ok()
-                    .and_then(|part_num| part_num.checked_sub(1))
-                    .filter(|part_num| *part_num < n)
+                    .and_then(|index| index.checked_sub(1))
+                    .filter(|index| *index < num_parts as usize)
                     .ok_or_else(|| {
                         Error::invalid_checkpoint(format!(
                             "multi-part checkpoint part number {part_num} is outside 1..={num_parts}"
@@ -1614,6 +1614,7 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
                 );
                 seen_part_numbers[index] = true;
             }
+            // The protocol requires p > 1; path parsing only validates 1 <= part_num <= p.
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts < 2 => {
                 return Err(Error::invalid_checkpoint(format!(
                     "multi-part checkpoint must contain at least two parts but num_parts field says {num_parts}"
