@@ -9,8 +9,11 @@ use bytes::{Buf, Bytes};
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::arrow::json::ReaderBuilder;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::engine::arrow_conversion::ArrowConversionOptions;
+#[cfg(feature = "geo-type-in-dev")]
+use delta_kernel::engine::arrow_conversion::GeometryArrowRepresentation;
 use delta_kernel::engine::arrow_utils::{
-    build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
+    build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json_with_options,
     to_json_bytes,
 };
 use delta_kernel::engine_data::FilteredEngineData;
@@ -29,7 +32,6 @@ use url::Url;
 
 use crate::executor::TaskExecutor;
 
-#[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// The object store to read files from
     store: Arc<DynObjectStore>,
@@ -42,6 +44,22 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
     batch_size: NonZero<usize>,
+    #[cfg(feature = "geo-type-in-dev")]
+    geometry: Option<Arc<dyn GeometryArrowRepresentation>>,
+}
+
+impl<E: TaskExecutor> std::fmt::Debug for DefaultJsonHandler<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("DefaultJsonHandler");
+        builder
+            .field("store", &self.store)
+            .field("task_executor", &std::any::type_name::<E>())
+            .field("buffer_size", &self.buffer_size)
+            .field("batch_size", &self.batch_size);
+        #[cfg(feature = "geo-type-in-dev")]
+        builder.field("geometry", &self.geometry.is_some());
+        builder.finish()
+    }
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -51,6 +69,29 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
             task_executor,
             buffer_size: super::DEFAULT_READ_BUFFER_SIZE,
             batch_size: super::DEFAULT_READ_BATCH_SIZE,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry: None,
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    /// Set the Arrow representation provider for kernel geometry values.
+    pub fn with_geometry_representation(
+        mut self,
+        geometry: Arc<dyn GeometryArrowRepresentation>,
+    ) -> Self {
+        self.geometry = Some(geometry);
+        self
+    }
+
+    fn arrow_conversion_options(&self) -> ArrowConversionOptions<'_> {
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            ArrowConversionOptions::new(self.geometry.as_deref())
+        }
+        #[cfg(not(feature = "geo-type-in-dev"))]
+        {
+            ArrowConversionOptions::empty()
         }
     }
 
@@ -157,7 +198,11 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        arrow_parse_json(json_strings, output_schema)
+        parse_json_with_options(
+            json_strings,
+            output_schema,
+            &self.arrow_conversion_options(),
+        )
     }
 
     fn read_json_files(
@@ -286,7 +331,13 @@ mod tests {
 
     use delta_kernel::actions::get_commit_schema;
     use delta_kernel::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::arrow::array::{ArrayRef, BinaryBuilder};
     use delta_kernel::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::engine::arrow_conversion::{
+        GeometryArrowRepresentation, GeometryStatsBuilder,
+    };
     use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
@@ -295,6 +346,8 @@ mod tests {
         PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
     };
     use delta_kernel::schema::schema_ref;
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::schema::{GeometryType, PrimitiveType};
     use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
     use futures::future;
     use itertools::Itertools;
@@ -304,6 +357,61 @@ mod tests {
 
     use super::*;
     use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
+
+    #[cfg(feature = "geo-type-in-dev")]
+    struct TestGeometryRepresentation;
+
+    #[cfg(feature = "geo-type-in-dev")]
+    impl GeometryArrowRepresentation for TestGeometryRepresentation {
+        fn geometry_field(
+            &self,
+            name: &str,
+            _geometry: &GeometryType,
+            nullable: bool,
+            metadata: HashMap<String, String>,
+        ) -> Result<Field, delta_kernel::arrow::error::ArrowError> {
+            Ok(Field::new(name, DataType::Binary, nullable).with_metadata(metadata))
+        }
+
+        fn stats_builder(
+            &self,
+            _geometry: &GeometryType,
+            field: &Field,
+            capacity: usize,
+        ) -> DeltaResult<Box<dyn GeometryStatsBuilder>> {
+            assert_eq!(field.data_type(), &DataType::Binary);
+            Ok(Box::new(TestGeometryStatsBuilder {
+                builder: BinaryBuilder::with_capacity(capacity, 0),
+            }))
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    struct TestGeometryStatsBuilder {
+        builder: BinaryBuilder,
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    impl GeometryStatsBuilder for TestGeometryStatsBuilder {
+        fn append_wkt(&mut self, raw: &str) -> DeltaResult<()> {
+            self.builder.append_value(raw.as_bytes());
+            Ok(())
+        }
+
+        fn append_null(&mut self) -> DeltaResult<()> {
+            self.builder.append_null();
+            Ok(())
+        }
+
+        fn finish(mut self: Box<Self>) -> DeltaResult<ArrayRef> {
+            Ok(Arc::new(self.builder.finish()))
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    fn geometry_type(crs: &str) -> delta_kernel::schema::DataType {
+        PrimitiveType::Geometry(Box::new(GeometryType::try_new(crs).unwrap())).into()
+    }
 
     /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests. Note
     /// that since the keys are resolved in order, requests to subsequent keys in the order will
@@ -496,6 +604,34 @@ mod tests {
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
         assert_eq!(batch.len(), 4);
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_parse_json_uses_geometry_provider() {
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()))
+            .with_geometry_representation(Arc::new(TestGeometryRepresentation));
+
+        let json_strings = StringArray::from(vec![Some(
+            r#"{"minValues": {"geom": "POINT(-122.419 37.774)"}}"#,
+        )]);
+        let output_schema = schema_ref! {
+            nullable "minValues": {
+                nullable "geom": (geometry_type("EPSG:4326")),
+            },
+        };
+
+        let batch = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+
+        let min_values = batch.column_by_name("minValues").unwrap().as_struct();
+        let geom = min_values.column_by_name("geom").unwrap();
+        assert_eq!(geom.data_type(), &DataType::Binary);
+        assert_eq!(geom.as_binary::<i32>().value(0), b"POINT(-122.419 37.774)");
     }
 
     // Test that operationParameters with boolean/numeric primitives are coerced to strings.

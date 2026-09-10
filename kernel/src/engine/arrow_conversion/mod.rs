@@ -18,6 +18,8 @@
 pub mod scalar;
 
 use std::collections::HashMap;
+#[cfg(not(feature = "geo-type-in-dev"))]
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -122,6 +124,8 @@ pub trait GeometryStatsBuilder {
 pub struct ArrowConversionOptions<'a> {
     #[cfg(feature = "geo-type-in-dev")]
     geometry: Option<&'a dyn GeometryArrowRepresentation>,
+    #[cfg(not(feature = "geo-type-in-dev"))]
+    _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> ArrowConversionOptions<'a> {
@@ -136,6 +140,8 @@ impl<'a> ArrowConversionOptions<'a> {
         Self {
             #[cfg(feature = "geo-type-in-dev")]
             geometry: None,
+            #[cfg(not(feature = "geo-type-in-dev"))]
+            _marker: PhantomData,
         }
     }
 

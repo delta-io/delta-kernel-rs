@@ -6,9 +6,9 @@ use std::ops::Deref;
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
-use super::arrow_conversion::{
-    ArrowConversionOptions, TryIntoArrow as _, TryIntoArrowWithOptions as _,
-};
+#[cfg(feature = "geo-type-in-dev")]
+use super::arrow_conversion::TryIntoArrowWithOptions as _;
+use super::arrow_conversion::{ArrowConversionOptions, TryIntoArrow as _};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::schema::{DataType, MetadataValue, StructField};
@@ -73,6 +73,7 @@ pub(crate) fn ensure_data_types_with_options(
 
 struct EnsureDataTypes<'a> {
     mode: ValidationMode,
+    #[cfg_attr(not(feature = "geo-type-in-dev"), allow(dead_code))]
     options: ArrowConversionOptions<'a>,
 }
 

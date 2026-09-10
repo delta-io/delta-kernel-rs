@@ -1172,6 +1172,10 @@ pub(crate) fn parse_json(
     parse_json_with_options(json_strings, schema, &ArrowConversionOptions::empty())
 }
 
+/// Parse a column of JSON strings into a typed `RecordBatch` using Arrow conversion options.
+///
+/// See [`parse_json`] for the parsing and per-cell NULL behavior.
+#[internal_api]
 pub(crate) fn parse_json_with_options(
     json_strings: Box<dyn EngineData>,
     schema: SchemaRef,

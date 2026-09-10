@@ -10,6 +10,8 @@ use std::future::Future;
 use std::num::NonZero;
 use std::sync::Arc;
 
+#[cfg(feature = "geo-type-in-dev")]
+use delta_kernel::engine::arrow_conversion::GeometryArrowRepresentation;
 use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
@@ -210,7 +212,6 @@ pub struct DefaultEngine<E: TaskExecutor> {
 ///     .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
 ///     .build();
 /// ```
-#[derive(Debug)]
 pub struct DefaultEngineBuilder<E> {
     object_store: Arc<DynObjectStore>,
     /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
@@ -218,6 +219,21 @@ pub struct DefaultEngineBuilder<E> {
     /// Read-path I/O concurrency config applied to the JSON and Parquet handlers. `None` fields
     /// fall back to the handlers' defaults.
     io_config: ReadIoConfig,
+    #[cfg(feature = "geo-type-in-dev")]
+    geometry: Option<Arc<dyn GeometryArrowRepresentation>>,
+}
+
+impl<E> std::fmt::Debug for DefaultEngineBuilder<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("DefaultEngineBuilder");
+        builder
+            .field("object_store", &self.object_store)
+            .field("task_executor", &std::any::type_name::<E>())
+            .field("io_config", &self.io_config);
+        #[cfg(feature = "geo-type-in-dev")]
+        builder.field("geometry", &self.geometry.is_some());
+        builder.finish()
+    }
 }
 
 /// Read-path I/O tuning for [`DefaultEngine`]'s JSON and Parquet handlers.
@@ -243,13 +259,21 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
             object_store,
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry: None,
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        DefaultEngine::new_with_opts(self.object_store, task_executor, self.io_config)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            task_executor,
+            self.io_config,
+            #[cfg(feature = "geo-type-in-dev")]
+            self.geometry,
+        )
     }
 }
 
@@ -265,7 +289,19 @@ impl<E> DefaultEngineBuilder<E> {
             object_store: self.object_store,
             task_executor,
             io_config: self.io_config,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry: self.geometry,
         }
+    }
+
+    /// Set the Arrow representation provider for kernel geometry values.
+    #[cfg(feature = "geo-type-in-dev")]
+    pub fn with_geometry_representation(
+        mut self,
+        geometry: Arc<dyn GeometryArrowRepresentation>,
+    ) -> Self {
+        self.geometry = Some(geometry);
+        self
     }
 
     /// Set the maximum number of files read concurrently by the JSON and Parquet handlers in their
@@ -293,7 +329,13 @@ impl<E> DefaultEngineBuilder<E> {
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.io_config)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            self.task_executor,
+            self.io_config,
+            #[cfg(feature = "geo-type-in-dev")]
+            self.geometry,
+        )
     }
 }
 
@@ -313,6 +355,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
         io_config: ReadIoConfig,
+        #[cfg(feature = "geo-type-in-dev")] geometry: Option<Arc<dyn GeometryArrowRepresentation>>,
     ) -> Self {
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
@@ -321,14 +364,31 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 
         let buffer_size = io_config.buffer_size.unwrap_or(DEFAULT_READ_BUFFER_SIZE);
         let batch_size = io_config.batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
-        let json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
+        let mut json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
             .with_batch_size(batch_size);
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            if let Some(geometry) = geometry.clone() {
+                json = json.with_geometry_representation(geometry);
+            }
+        }
         let parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
             .with_batch_size(batch_size);
         let raw_json: Arc<dyn JsonHandler> = Arc::new(json);
         let raw_parquet = Arc::new(parquet);
+        #[cfg(feature = "geo-type-in-dev")]
+        let evaluation = geometry.map_or_else(
+            || Arc::new(ArrowEvaluationHandler::new()),
+            |geometry| {
+                Arc::new(ArrowEvaluationHandler::with_geometry_representation(
+                    geometry,
+                ))
+            },
+        );
+        #[cfg(not(feature = "geo-type-in-dev"))]
+        let evaluation = Arc::new(ArrowEvaluationHandler::new());
         Self {
             storage: Arc::new(MeteredStorageHandler::new(raw_storage)),
             json: Arc::new(MeteredJsonHandler::new(raw_json)),
@@ -336,7 +396,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             raw_parquet,
             object_store,
             task_executor,
-            evaluation: Arc::new(ArrowEvaluationHandler::new()),
+            evaluation,
         }
     }
 
@@ -463,10 +523,82 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::arrow::array::{ArrayRef, AsArray, BinaryBuilder, StringArray};
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::engine::arrow_conversion::{
+        GeometryArrowRepresentation, GeometryStatsBuilder,
+    };
+    use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
     use delta_kernel::object_store::local::LocalFileSystem;
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::schema::{schema_ref, DataType, GeometryType, PrimitiveType};
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel::DeltaResult;
+    #[cfg(feature = "geo-type-in-dev")]
+    use delta_kernel_default_engine_test_utils::string_array_to_engine_data;
     use test_utils::engine_contract::test_arrow_engine;
 
     use super::*;
+
+    #[cfg(feature = "geo-type-in-dev")]
+    struct TestGeometryRepresentation;
+
+    #[cfg(feature = "geo-type-in-dev")]
+    impl GeometryArrowRepresentation for TestGeometryRepresentation {
+        fn geometry_field(
+            &self,
+            name: &str,
+            _geometry: &GeometryType,
+            nullable: bool,
+            metadata: HashMap<String, String>,
+        ) -> Result<ArrowField, delta_kernel::arrow::error::ArrowError> {
+            Ok(ArrowField::new(name, ArrowDataType::Binary, nullable).with_metadata(metadata))
+        }
+
+        fn stats_builder(
+            &self,
+            _geometry: &GeometryType,
+            field: &ArrowField,
+            capacity: usize,
+        ) -> DeltaResult<Box<dyn GeometryStatsBuilder>> {
+            assert_eq!(field.data_type(), &ArrowDataType::Binary);
+            Ok(Box::new(TestGeometryStatsBuilder {
+                builder: BinaryBuilder::with_capacity(capacity, 0),
+            }))
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    struct TestGeometryStatsBuilder {
+        builder: BinaryBuilder,
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    impl GeometryStatsBuilder for TestGeometryStatsBuilder {
+        fn append_wkt(&mut self, raw: &str) -> DeltaResult<()> {
+            self.builder.append_value(raw.as_bytes());
+            Ok(())
+        }
+
+        fn append_null(&mut self) -> DeltaResult<()> {
+            self.builder.append_null();
+            Ok(())
+        }
+
+        fn finish(mut self: Box<Self>) -> DeltaResult<ArrayRef> {
+            Ok(Arc::new(self.builder.finish()))
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    fn geometry_type(crs: &str) -> DataType {
+        PrimitiveType::Geometry(Box::new(GeometryType::try_new(crs).unwrap())).into()
+    }
 
     #[test]
     fn test_default_engine() {
@@ -525,6 +657,64 @@ mod tests {
             .with_batch_size(NonZero::new(8).unwrap())
             .build();
         test_arrow_engine(&engine, &url);
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_default_engine_builder_threads_geometry_provider() {
+        let object_store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngineBuilder::new(object_store)
+            .with_geometry_representation(Arc::new(TestGeometryRepresentation))
+            .build();
+        let output_schema = schema_ref! {
+            nullable "minValues": {
+                nullable "geom": (geometry_type("EPSG:4326")),
+            },
+        };
+        let json_strings = StringArray::from(vec![Some(
+            r#"{"minValues": {"geom": "POINT(-122.419 37.774)"}}"#,
+        )]);
+
+        let parsed = engine
+            .json_handler()
+            .parse_json(
+                string_array_to_engine_data(json_strings.clone()),
+                output_schema.clone(),
+            )
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+        let min_values = parsed.column_by_name("minValues").unwrap().as_struct();
+        let geom = min_values.column_by_name("geom").unwrap();
+        assert_eq!(geom.as_binary::<i32>().value(0), b"POINT(-122.419 37.774)");
+
+        let input_schema = schema_ref! {
+            nullable "json_col": STRING,
+        };
+        let expression = Arc::new(delta_kernel::expressions::Expression::parse_json(
+            delta_kernel::expressions::col!("json_col"),
+            output_schema.clone(),
+        ));
+        let input = delta_kernel::engine::arrow_expression::ArrowEvaluationHandler::new()
+            .create_many(
+                input_schema.clone(),
+                vec![vec![
+                    r#"{"minValues": {"geom": "POINT(-122.419 37.774)"}}"#.into()
+                ]],
+            )
+            .unwrap();
+        let output_type = DataType::from(output_schema.as_ref().clone());
+        let evaluated = engine
+            .evaluation_handler()
+            .new_expression_evaluator(input_schema, expression, output_type)
+            .unwrap()
+            .evaluate(input.as_ref())
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+        let min_values = evaluated.column_by_name("minValues").unwrap().as_struct();
+        let geom = min_values.column_by_name("geom").unwrap();
+        assert_eq!(geom.as_binary::<i32>().value(0), b"POINT(-122.419 37.774)");
     }
 
     #[test]
