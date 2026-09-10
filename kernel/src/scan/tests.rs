@@ -2270,6 +2270,89 @@ fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
     );
 }
 
+#[rstest]
+#[case::no_column_mapping(None)]
+#[case::name_column_mapping(Some("name"))]
+#[case::id_column_mapping(Some("id"))]
+fn snapshot_expected_stats_schemas_match_scan_output(#[case] column_mapping_mode: Option<&str>) {
+    let table_root = "memory:///expected-stats-schemas/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": LONG,
+    };
+    let mut create_builder = create_table(table_root, schema, "DefaultEngine")
+        .with_table_properties([("delta.dataSkippingNumIndexedCols", "1")]);
+    if let Some(mode) = column_mapping_mode {
+        create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
+    }
+    create_builder
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    let extra_indexed_columns = vec![column_name!("value"), column_name!("unresolvable_extra")];
+    let expected = snapshot
+        .expected_stats_schemas(&extra_indexed_columns)
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct_with_extra_indexed(
+            extra_indexed_columns,
+        ))
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        scan.physical_stats_output_schema.as_ref(),
+        Some(&expected.physical)
+    );
+
+    let DataType::Struct(logical_min_values) = expected
+        .logical
+        .field(MIN_VALUES)
+        .expect("logical stats should have minValues")
+        .data_type()
+    else {
+        panic!("logical minValues should be a struct");
+    };
+    assert!(logical_min_values.field("id").is_some());
+    assert!(logical_min_values.field("value").is_some());
+    assert!(logical_min_values.field("unresolvable_extra").is_none());
+
+    let DataType::Struct(physical_min_values) = expected
+        .physical
+        .field(MIN_VALUES)
+        .expect("physical stats should have minValues")
+        .data_type()
+    else {
+        panic!("physical minValues should be a struct");
+    };
+    assert_eq!(physical_min_values.num_fields(), 2);
+    if column_mapping_mode.is_some() {
+        assert!(logical_min_values.fields().all(|field| {
+            field
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+                .is_none()
+                && field
+                    .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                    .is_none()
+        }));
+        assert!(physical_min_values.fields().all(|field| {
+            field.name().starts_with("col-")
+                && field
+                    .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                    .is_none()
+        }));
+    } else {
+        assert_eq!(physical_min_values, logical_min_values);
+    }
+}
+
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
 /// Used to simulate a buggy connector that drops all data for a file.
 struct EmptyParquetHandler;
