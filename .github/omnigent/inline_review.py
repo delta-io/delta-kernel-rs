@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections import Counter
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any
@@ -269,10 +270,17 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
         return review
 
     headings, unclosed_fence_start = _parse_review_boundaries(review)
+    finding_id_counts = Counter(
+        finding.group(1)
+        for _, line in headings
+        if (finding := _FINDING_HEADING.match(line)) is not None
+    )
     ranges: list[tuple[int, int]] = []
     for index, (start, line) in enumerate(headings):
         finding = _FINDING_HEADING.match(line)
         if finding is None or finding.group(1) not in finding_ids:
+            continue
+        if finding_id_counts[finding.group(1)] != 1:
             continue
         end = headings[index + 1][0] if index + 1 < len(headings) else len(review)
         if (

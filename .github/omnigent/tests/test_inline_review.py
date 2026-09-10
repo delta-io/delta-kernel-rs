@@ -281,6 +281,34 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(unmapped, ["Blocker1"])
         self.assertEqual(duplicates, [])
 
+    def test_duplicate_prose_ids_fail_open_during_body_removal(self) -> None:
+        payload, unmapped, duplicates = self.inline_review.build_review_payload(
+            review=(
+                "## Non-blocking notes\n"
+                "### Nit1\nFirst finding detail.\n"
+                "### Nit1\nSecond finding detail.\n"
+                "## Summary\nNeeds review."
+            ),
+            findings=[
+                {
+                    "id": "Nit1",
+                    "path": "kernel/src/example.rs",
+                    "line": 10,
+                    "side": "RIGHT",
+                    "body": "First finding detail.",
+                }
+            ],
+            diff=DIFF,
+            head_sha="c" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+        )
+
+        self.assertEqual(len(payload["comments"]), 1)
+        self.assertIn("First finding detail.", payload["body"])
+        self.assertIn("Second finding detail.", payload["body"])
+        self.assertEqual(unmapped, [])
+        self.assertEqual(duplicates, [])
+
     def test_build_payload_skips_untrusted_finding_fields(self) -> None:
         valid = {
             "id": "Nit1",
