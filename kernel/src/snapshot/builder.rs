@@ -504,12 +504,18 @@ impl SnapshotBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::{actions_to_string, add_commit, TestAction};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+    use tracing_subscriber::registry::LookupSpan;
 
     use super::*;
     use crate::engine::sync::SyncEngine;
@@ -519,6 +525,90 @@ mod tests {
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
+
+    type TraceFields = BTreeMap<&'static str, String>;
+    type CapturedTraces = Vec<(&'static str, TraceFields)>;
+
+    #[derive(Clone, Default)]
+    struct ConstructorTrace {
+        span_fields: Arc<Mutex<BTreeMap<&'static str, BTreeSet<&'static str>>>>,
+        span_values: Arc<Mutex<CapturedTraces>>,
+        span_records: Arc<Mutex<CapturedTraces>>,
+        error_events: Arc<Mutex<CapturedTraces>>,
+    }
+
+    #[derive(Default)]
+    struct FieldValueVisitor(TraceFields);
+
+    impl Visit for FieldValueVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> Layer<S> for ConstructorTrace
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let span_name = attrs.metadata().name();
+            if !matches!(span_name, "try_new_from_log_segment" | "try_new_from") {
+                return;
+            }
+
+            let fields = attrs
+                .metadata()
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .collect();
+            self.span_fields.lock().unwrap().insert(span_name, fields);
+
+            let mut values = FieldValueVisitor::default();
+            attrs.record(&mut values);
+            self.span_values.lock().unwrap().push((span_name, values.0));
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+            let Some(span) = ctx.span(id) else {
+                return;
+            };
+            let span_name = span.name();
+            if !matches!(span_name, "try_new_from_log_segment" | "try_new_from") {
+                return;
+            }
+
+            let mut fields = FieldValueVisitor::default();
+            values.record(&mut fields);
+            self.span_records
+                .lock()
+                .unwrap()
+                .push((span_name, fields.0));
+        }
+
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            if *event.metadata().level() != Level::ERROR {
+                return;
+            }
+            let Some(span) = ctx.event_span(event) else {
+                return;
+            };
+            if !matches!(span.name(), "try_new_from_log_segment" | "try_new_from") {
+                return;
+            }
+
+            let mut fields = FieldValueVisitor::default();
+            event.record(&mut fields);
+            self.error_events
+                .lock()
+                .unwrap()
+                .push((span.name(), fields.0));
+        }
+    }
 
     fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
@@ -755,6 +845,194 @@ mod tests {
             .expect("expected SnapshotBuildSuccess event");
         assert_eq!(version, 1, "version should match the updated snapshot");
         assert!(duration > Duration::ZERO, "duration should be non-zero");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_constructor_spans_capture_compact_context_and_full_error_arguments(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+
+        let captured = ConstructorTrace::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        let snapshot = SnapshotBuilder::new_for(table_root.clone())
+            .at_version(0)
+            .build(engine.as_ref())?;
+        let updated = SnapshotBuilder::new_from(snapshot).build(engine.as_ref())?;
+        assert_eq!(updated.version(), 1);
+        assert!(captured.error_events.lock().unwrap().is_empty());
+
+        {
+            let span_fields = captured.span_fields.lock().unwrap();
+            let expected_fields = BTreeSet::from([
+                "path",
+                "version",
+                "operation_id",
+                "correlation_id",
+                "incremental_replay",
+                "built_as_latest",
+            ]);
+            assert_eq!(
+                span_fields.keys().copied().collect::<BTreeSet<_>>(),
+                BTreeSet::from(["try_new_from_log_segment", "try_new_from"])
+            );
+            assert!(span_fields
+                .values()
+                .all(|fields| fields == &expected_fields));
+        }
+        {
+            let span_values = captured.span_values.lock().unwrap();
+            assert!(!span_values.is_empty());
+            assert!(span_values.iter().all(|(_, fields)| {
+                fields.values().all(|value| value.len() < 256)
+                    && fields
+                        .get("path")
+                        .is_some_and(|path| path.contains(&table_root))
+            }));
+            let fresh_values = span_values
+                .iter()
+                .find(|(span_name, _)| *span_name == "try_new_from_log_segment")
+                .map(|(_, fields)| fields)
+                .expect("expected fresh constructor span values");
+            assert_eq!(fresh_values["version"], "0");
+        }
+        {
+            let span_records = captured.span_records.lock().unwrap();
+            assert!(!span_records.is_empty());
+            assert!(span_records.iter().all(|(_, fields)| {
+                fields.keys().copied().collect::<BTreeSet<_>>() == BTreeSet::from(["version"])
+                    && fields["version"].len() < 32
+            }));
+            assert_eq!(
+                span_records
+                    .iter()
+                    .filter(|(span_name, _)| *span_name == "try_new_from")
+                    .map(|(_, fields)| fields["version"].as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["0", "1"])
+            );
+        }
+
+        let same_version = SnapshotBuilder::new_from(updated.clone())
+            .at_version(1)
+            .build(engine.as_ref())?;
+        assert!(Arc::ptr_eq(&updated, &same_version));
+        let unchanged = SnapshotBuilder::new_from(updated.clone()).build(engine.as_ref())?;
+        assert!(Arc::ptr_eq(&updated, &unchanged));
+        assert!(captured.error_events.lock().unwrap().is_empty());
+
+        assert!(SnapshotBuilder::new_from(updated.clone())
+            .at_version(0)
+            .with_correlation_id("incremental-test")
+            .build(engine.as_ref())
+            .is_err());
+
+        let (invalid_engine, invalid_store, invalid_root) = setup_test();
+        add_commit(
+            &invalid_root,
+            invalid_store.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
+        )
+        .await?;
+        assert!(SnapshotBuilder::new_for(invalid_root)
+            .with_correlation_id("fresh-test")
+            .build(invalid_engine.as_ref())
+            .is_err());
+
+        let error_events = captured.error_events.lock().unwrap();
+        assert_eq!(error_events.len(), 2);
+        let incremental_error = error_events
+            .iter()
+            .find(|(span_name, _)| *span_name == "try_new_from")
+            .map(|(_, event)| event)
+            .expect("expected incremental constructor error event");
+        assert_eq!(
+            incremental_error.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "built_as_latest",
+                "error",
+                "existing_snapshot",
+                "incremental_replay",
+                "log_tail",
+                "message",
+                "metric_context",
+            ])
+        );
+        assert!(!incremental_error["error"].is_empty());
+        assert!(incremental_error["existing_snapshot"].contains("Snapshot"));
+        assert_eq!(incremental_error["log_tail"], "[]");
+        assert!(incremental_error["metric_context"].contains("incremental-test"));
+        assert_eq!(incremental_error["incremental_replay"], "Disabled");
+        assert_eq!(incremental_error["message"], "failed to update snapshot");
+
+        let fresh_error = error_events
+            .iter()
+            .find(|(span_name, _)| *span_name == "try_new_from_log_segment")
+            .map(|(_, event)| event)
+            .expect("expected fresh constructor error event");
+        assert_eq!(
+            fresh_error.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "built_as_latest",
+                "error",
+                "incremental_replay",
+                "location",
+                "log_segment",
+                "message",
+                "metric_context",
+            ])
+        );
+        assert!(!fresh_error["error"].is_empty());
+        assert!(fresh_error["location"].contains("memory"));
+        assert!(fresh_error["log_segment"].contains("LogSegment"));
+        assert!(fresh_error["metric_context"].contains("fresh-test"));
+        assert_eq!(fresh_error["incremental_replay"], "Disabled");
+        assert_eq!(
+            fresh_error["message"],
+            "failed to construct snapshot from log segment"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+        let snapshot = SnapshotBuilder::new_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())?;
+
+        store
+            .put(
+                &Path::from("_delta_log/00000000000000000001.checkpoint.parquet"),
+                b"not parquet".to_vec().into(),
+            )
+            .await?;
+
+        let captured = ConstructorTrace::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        assert!(SnapshotBuilder::new_from(snapshot)
+            .build(engine.as_ref())
+            .is_err());
+
+        let error_events = captured.error_events.lock().unwrap();
+        assert_eq!(error_events.len(), 2);
+        assert_eq!(
+            error_events
+                .iter()
+                .map(|(span_name, _)| *span_name)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["try_new_from", "try_new_from_log_segment"])
+        );
+
         Ok(())
     }
 

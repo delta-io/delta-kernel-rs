@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
@@ -191,12 +191,43 @@ impl Snapshot {
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
+    #[instrument(skip_all, fields(path = %location, version = log_segment.end_version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
         metric_context: SnapshotLoadMetricContext,
+        incremental_replay: IncrementalReplay,
+        built_as_latest: bool,
+    ) -> DeltaResult<Self> {
+        // Full failure dumps require retaining these consumed values. The eager LogSegment clone
+        // allocates with the listing size even on success; that is the cost of exact diagnostics.
+        let result = Self::try_new_from_log_segment_impl(
+            location.clone(),
+            log_segment.clone(),
+            engine,
+            &metric_context,
+            incremental_replay,
+            built_as_latest,
+        );
+        result.inspect_err(|error| {
+            error!(
+                %error,
+                ?location,
+                ?log_segment,
+                ?metric_context,
+                ?incremental_replay,
+                built_as_latest,
+                "failed to construct snapshot from log segment"
+            );
+        })
+    }
+
+    fn try_new_from_log_segment_impl(
+        location: Url,
+        log_segment: LogSegment,
+        engine: &dyn Engine,
+        metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
     ) -> DeltaResult<Self> {
@@ -207,7 +238,7 @@ impl Snapshot {
         let base_crc = log_segment.read_latest_crc(engine);
         let crc_at_version = log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
-            .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
+            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
         //         first commit. The replay reports its own source (seeded vs full).
@@ -215,14 +246,12 @@ impl Snapshot {
             Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
             None => log_segment
                 .read_protocol_metadata(engine, base_crc.as_ref())
-                .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
+                .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
         };
-        emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
+        emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
 
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
-
-        tracing::Span::current().record("version", table_configuration.version());
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
         Self::new_with_crc(log_segment, table_configuration, crc, built_as_latest)
