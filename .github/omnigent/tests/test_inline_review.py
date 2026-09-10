@@ -103,6 +103,26 @@ class InlineReviewTest(unittest.TestCase):
 
         self.assertEqual(standalone_prompt.strip(), "\n".join(configured_lines).strip())
 
+    def test_known_issue_policy_reaches_parent_and_child_reviewers(self) -> None:
+        omnigent_dir = Path(__file__).parents[1]
+        reviewer_dir = omnigent_dir / "reviewer"
+        reviewer_contract = (reviewer_dir / "REVIEW.md").read_text()
+        workflow = (omnigent_dir.parent / "workflows" / "ai-review.yml").read_text()
+        review_policy = _load_module("review_policy")
+        policy = review_policy.KNOWN_ISSUE_POLICY.strip()
+
+        self.assertIn(policy, reviewer_contract)
+        for agent_dir in (reviewer_dir / "agents").iterdir():
+            if not agent_dir.is_dir():
+                continue
+            with self.subTest(agent=agent_dir.name):
+                self.assertIn(policy, (agent_dir / "REVIEW.md").read_text())
+        self.assertIn(
+            'f"{known_issue_policy}\\n\\n"',
+            workflow,
+        )
+        self.assertIn("{known_issue_policy}", workflow)
+
     def test_automatic_reviews_default_to_inline(self) -> None:
         workflow = (Path(__file__).parents[2] / "workflows" / "ai-review.yml").read_text()
         automatic_trigger = workflow.partition("            pull_request_target)")[2].partition(
