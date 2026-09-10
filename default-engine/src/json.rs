@@ -26,6 +26,7 @@ use delta_kernel::{
 use futures::stream::{self, BoxStream};
 use futures::{ready, FutureExt, StreamExt, TryStreamExt};
 use tokio::sync::mpsc;
+use tokio::task::{JoinError, JoinHandle};
 use url::Url;
 
 use crate::executor::TaskExecutor;
@@ -166,21 +167,17 @@ async fn read_json_files_parallel_impl(
     let num_chunks = chunks.len();
     let per_chunk_buffer = (buffer_size / num_chunks).max(1);
 
-    // Spawn each chunk as a tokio task. Each task streams batches through a
-    // channel as they are produced. We keep the JoinHandle so a panic becomes
-    // JoinFailure instead of a silent hole in the file list.
-    let channel_cap = per_chunk_buffer.saturating_mul(4).max(1);
     let mut receivers = Vec::new();
     let mut handles = Vec::new();
     for chunk in chunks {
-        let (tx, rx) = mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(channel_cap);
+        let (tx, rx) = mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(per_chunk_buffer);
         receivers.push(rx);
 
         let store = store.clone();
         let physical_schema = physical_schema.clone();
         let predicate = predicate.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = AbortOnDropHandle::new(tokio::spawn(async move {
             let result = read_json_files_impl(
                 store,
                 chunk,
@@ -204,7 +201,7 @@ async fn read_json_files_parallel_impl(
                     let _ = tx.send(Err(e)).await;
                 }
             }
-        });
+        }));
         handles.push(handle);
     }
 
@@ -215,22 +212,51 @@ async fn read_json_files_parallel_impl(
     Ok(result_stream.boxed())
 }
 
+/// `JoinHandle` that aborts the task if dropped without being joined.
+/// Dropping a raw `JoinHandle` detaches the task; aborting stops in-flight
+/// object-store GETs when the consumer cancels or stops early.
+struct AbortOnDropHandle {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl AbortOnDropHandle {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<(), JoinError> {
+        match self.handle.take() {
+            Some(handle) => handle.await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for AbortOnDropHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Drain `rx` then join `handle`. A panicked task is `Error::JoinFailure`, not EOF.
 fn drain_chunk(
     rx: mpsc::Receiver<DeltaResult<Box<dyn EngineData>>>,
-    handle: tokio::task::JoinHandle<()>,
+    handle: AbortOnDropHandle,
 ) -> impl futures::Stream<Item = DeltaResult<Box<dyn EngineData>>> {
     let batches = stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     });
-    let join = stream::once(async move { handle.await.map_err(Error::join_failure) }).filter_map(
-        |result| async move {
+    let join = stream::once(async move { handle.join().await.map_err(Error::join_failure) })
+        .filter_map(|result| async move {
             match result {
                 Ok(()) => None,
                 Err(e) => Some(Err(e)),
             }
-        },
-    );
+        });
     batches.chain(join)
 }
 
@@ -1112,9 +1138,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drain_chunk_panicked_task_is_join_failure_not_eof() {
         let (tx, rx) = tokio::sync::mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(1);
-        let handle = tokio::spawn(async {
+        let handle = AbortOnDropHandle::new(tokio::spawn(async {
             panic!("chunk task panicked");
-        });
+        }));
         drop(tx);
 
         let items: Vec<_> = drain_chunk(rx, handle).collect().await;
@@ -1128,6 +1154,59 @@ mod tests {
             Err(_) => panic!("expected JoinFailure, got a different error"),
             Ok(_) => panic!("expected JoinFailure, got a batch"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_abort_on_drop_handle_aborts_unjoined_task() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _tx = tx;
+            std::future::pending::<()>().await;
+        }));
+        drop(handle);
+        assert!(
+            rx.await.is_err(),
+            "dropping AbortOnDropHandle must abort the task"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_abort_on_drop_handle_join_completed_task() {
+        let handle = AbortOnDropHandle::new(tokio::spawn(async {}));
+        handle
+            .join()
+            .await
+            .expect("joining a completed task must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drain_chunk_successful_task_yields_no_join_item() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(1);
+        let handle = AbortOnDropHandle::new(tokio::spawn(async {}));
+        drop(tx);
+
+        let items: Vec<_> = drain_chunk(rx, handle).collect().await;
+        assert!(
+            items.is_empty(),
+            "successful chunk must yield no extra item after the channel closes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drain_chunk_drop_aborts_unjoined_task() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(1);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _tx = tx;
+            let _done_tx = done_tx;
+            std::future::pending::<()>().await;
+        }));
+
+        drop(drain_chunk(rx, handle));
+        assert!(
+            done_rx.await.is_err(),
+            "dropping drain_chunk must abort the unjoined task"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
