@@ -16,7 +16,9 @@ def _load_module():
     return module
 
 
-def _document(*, author_type: str = "Bot") -> dict:
+def _document(
+    *, author_type: str = "Bot", author_login: str = "github-actions"
+) -> dict:
     marker = "<!-- ai-review-bot -->"
     return {
         "data": {
@@ -25,16 +27,24 @@ def _document(*, author_type: str = "Bot") -> dict:
                     "comments": {
                         "nodes": [
                             {
-                                "author": {"__typename": author_type, "login": "reviewer"},
+                                "author": {
+                                    "__typename": author_type,
+                                    "login": author_login,
+                                },
                                 "body": f"{marker}\n## AI Review\n\nOld collapsed finding",
+                                "createdAt": "2026-09-10T01:00:00Z",
                             }
                         ]
                     },
                     "reviews": {
                         "nodes": [
                             {
-                                "author": {"__typename": author_type, "login": "reviewer"},
+                                "author": {
+                                    "__typename": author_type,
+                                    "login": author_login,
+                                },
                                 "body": f"{marker}\n## AI Review\n\nOld review summary",
+                                "submittedAt": "2026-09-10T02:00:00Z",
                                 "comments": {
                                     "nodes": [
                                         {
@@ -75,6 +85,30 @@ class ReviewHistoryTest(unittest.TestCase):
             "No previous AI review findings were found.",
         )
         self.assertEqual(module.previous_inline_comments(document), [])
+
+    def test_history_ignores_marker_from_untrusted_bot(self) -> None:
+        module = _load_module()
+        document = _document(author_login="untrusted-app")
+
+        self.assertEqual(
+            module.format_review_history(document),
+            "No previous AI review findings were found.",
+        )
+        self.assertEqual(module.previous_inline_comments(document), [])
+        self.assertFalse(module.is_duplicate_review("Old collapsed finding", document))
+
+    def test_history_accepts_configured_bot_with_optional_suffix(self) -> None:
+        module = _load_module()
+        document = _document(author_login="omnigent-reviewer[bot]")
+        trusted_logins = ["omnigent-reviewer"]
+
+        self.assertIn(
+            "Old collapsed finding",
+            module.format_review_history(document, trusted_logins),
+        )
+        self.assertEqual(
+            len(module.previous_inline_comments(document, trusted_logins)), 1
+        )
 
     def test_inline_comments_are_available_for_exact_deduplication(self) -> None:
         comments = _load_module().previous_inline_comments(_document())
@@ -178,19 +212,36 @@ class ReviewHistoryTest(unittest.TestCase):
         document = _document()
         nodes = document["data"]["repository"]["pullRequest"]["comments"]["nodes"]
         nodes.clear()
+        review_nodes = document["data"]["repository"]["pullRequest"]["reviews"][
+            "nodes"
+        ]
+        review_nodes.clear()
         marker = module.BOT_MARKER
-        for index in range(4):
+        for index in (0, 2, 3):
             nodes.append(
                 {
-                    "author": {"__typename": "Bot", "login": "reviewer"},
-                    "body": f"{marker}\nreview-{index}-" + "x" * 4_000,
+                    "author": {
+                        "__typename": "Bot",
+                        "login": "github-actions",
+                    },
+                    "body": f"{marker}\nreview-{index}-" + "x" * 3_500,
+                    "createdAt": f"2026-09-10T0{index}:00:00Z",
                 }
             )
+        review_nodes.append(
+            {
+                "author": {"__typename": "Bot", "login": "github-actions"},
+                "body": f"{marker}\nreview-1-" + "x" * 3_500,
+                "submittedAt": "2026-09-10T01:00:00Z",
+                "comments": {"nodes": []},
+            }
+        )
 
         history = module.format_review_history(document)
 
         self.assertLessEqual(len(history), module.MAX_HISTORY_CHARS)
         self.assertLess(history.index("review-3"), history.index("review-2"))
+        self.assertLess(history.index("review-2"), history.index("review-1"))
         self.assertNotIn("review-0", history)
 
     def test_history_truncates_each_entry(self) -> None:

@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
 from review_history import (
+    DEFAULT_TRUSTED_BOT_LOGINS,
     canonical_finding_body,
     is_duplicate_review,
     previous_inline_comments,
@@ -22,20 +24,18 @@ INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
 _FINDING_ID = re.compile(r"(?:Blocker|Nit)[1-9][0-9]*")
 _FINDING_HEADING = re.compile(r"^###\s+((?:Blocker|Nit)[1-9][0-9]*)\b")
 _SECTION_HEADING = re.compile(
-    r"^(?:(?:##\s+)?|(?:\d+\.\s+\*\*))"
-    r"(?:Blocking issues|Non-blocking notes|Summary)"
-    r"(?:\*\*)?\s*:?\s*$",
+    r"^(?:(?:##\s+)(?:Blocking issues|Non-blocking notes|Summary)\s*:?|"
+    r"(?:\d+\.\s+\*\*)(?:Blocking issues|Non-blocking notes|Summary)\*\*\s*:?|"
+    r"(?:Blocking issues|Non-blocking notes|Summary)\s*:)\s*$",
+    re.IGNORECASE,
+)
+_FINDING_GROUP_HEADING = re.compile(
+    r"^(?:(?:##\s+)(?:Blocking issues|Non-blocking notes)\s*:?|"
+    r"(?:\d+\.\s+\*\*)(?:Blocking issues|Non-blocking notes)\*\*\s*:?|"
+    r"(?:Blocking issues|Non-blocking notes)\s*:)\s*$",
     re.IGNORECASE,
 )
 _CODE_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
-_EMPTY_FINDING_GROUP = re.compile(
-    r"^(?:(?:##\s+)?(?:Blocking issues|Non-blocking notes)|"
-    r"(?:\d+\.\s+\*\*(?:Blocking issues|Non-blocking notes)\*\*))\s*:?\s*\n"
-    r"(?=\s*(?:(?:(?:##\s+)?(?:Blocking issues|Non-blocking notes|Summary)|"
-    r"(?:\d+\.\s+\*\*(?:Blocking issues|Non-blocking notes|Summary)\*\*))"
-    r"\s*:?\s*$|\Z))",
-    re.IGNORECASE | re.MULTILINE,
-)
 _HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
 )
@@ -180,6 +180,7 @@ def build_review_payload(
     head_sha: str,
     run_url: str,
     history: Any = None,
+    trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     """Build a non-blocking review and classify unmapped and duplicate findings."""
     if re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
@@ -203,7 +204,7 @@ def build_review_payload(
             comment["side"],
             canonical_finding_body(comment["body"]),
         )
-        for comment in previous_inline_comments(history)
+        for comment in previous_inline_comments(history, trusted_bot_logins)
     }
     omitted_ids: set[str] = set()
 
@@ -218,17 +219,16 @@ def build_review_payload(
             continue
         seen_ids.add(finding_id)
 
-        if finding_id not in review_ids:
-            unmapped.append(finding_id)
-            continue
         if (path, line, side, canonical_finding_body(body)) in prior_comments:
             duplicates.append(finding_id)
-            omitted_ids.add(finding_id)
+            if finding_id in review_ids:
+                omitted_ids.add(finding_id)
             continue
         if (path, line, side) not in allowed_positions:
             unmapped.append(finding_id)
             continue
-        omitted_ids.add(finding_id)
+        if finding_id in review_ids:
+            omitted_ids.add(finding_id)
         comments.append(
             {
                 "path": path,
@@ -270,8 +270,23 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
 
     for start, end in reversed(ranges):
         review = review[:start] + review[end:]
-    review = _EMPTY_FINDING_GROUP.sub("", review)
-    return review.strip()
+    return _remove_empty_finding_groups(review).strip()
+
+
+def _remove_empty_finding_groups(review: str) -> str:
+    """Remove finding-group headings that contain no remaining content."""
+    boundaries = _review_boundaries(review)
+    ranges: list[tuple[int, int]] = []
+    for index, (start, line) in enumerate(boundaries):
+        if _FINDING_GROUP_HEADING.match(line) is None:
+            continue
+        end = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(review)
+        if not review[start + len(line) : end].strip():
+            ranges.append((start, end))
+
+    for start, end in reversed(ranges):
+        review = review[:start] + review[end:]
+    return review
 
 
 def _review_boundaries(review: str) -> list[tuple[int, str]]:
@@ -279,6 +294,7 @@ def _review_boundaries(review: str) -> list[tuple[int, str]]:
     headings: list[tuple[int, str]] = []
     fence_character: str | None = None
     fence_length = 0
+    fence_start: int | None = None
     offset = 0
 
     for line in review.splitlines(keepends=True):
@@ -288,23 +304,29 @@ def _review_boundaries(review: str) -> list[tuple[int, str]]:
             if fence_character is None:
                 fence_character = marker[0]
                 fence_length = len(marker)
+                fence_start = offset
             elif marker[0] == fence_character and len(marker) >= fence_length:
                 fence_character = None
                 fence_length = 0
+                fence_start = None
             offset += len(line)
             continue
         if fence_character is None and _is_review_boundary(line):
             headings.append((offset, line))
         offset += len(line)
-    if fence_character is not None:
-        return _review_boundaries_without_fences(review)
+    if fence_character is not None and fence_start is not None:
+        headings.extend(
+            _review_boundaries_without_fences(review[fence_start:], fence_start)
+        )
     return headings
 
 
-def _review_boundaries_without_fences(review: str) -> list[tuple[int, str]]:
+def _review_boundaries_without_fences(
+    review: str, base_offset: int
+) -> list[tuple[int, str]]:
     """Recover structural boundaries when model output has an open code fence."""
     headings: list[tuple[int, str]] = []
-    offset = 0
+    offset = base_offset
     for line in review.splitlines(keepends=True):
         if _is_review_boundary(line):
             headings.append((offset, line))
@@ -319,14 +341,18 @@ def _is_review_boundary(line: str) -> bool:
     )
 
 
-def should_skip_inline_review(payload: dict[str, Any], history: Any) -> bool:
+def should_skip_inline_review(
+    payload: dict[str, Any],
+    history: Any,
+    trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
+) -> bool:
     """Return whether a comment-free inline payload repeats a prior review body."""
     comments = payload.get("comments")
     body = payload.get("body")
     return (
         comments == []
         and isinstance(body, str)
-        and is_duplicate_review(body, history)
+        and is_duplicate_review(body, history, trusted_bot_logins)
     )
 
 
@@ -388,6 +414,7 @@ def main() -> None:
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--run-url", required=True)
     parser.add_argument("--history", required=True, type=Path)
+    parser.add_argument("--trusted-bot-logins", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--unmapped-output", required=True, type=Path)
     parser.add_argument("--duplicate-output", required=True, type=Path)
@@ -395,6 +422,11 @@ def main() -> None:
     args = parser.parse_args()
 
     history = json.loads(args.history.read_text())
+    trusted_bot_logins = json.loads(args.trusted_bot_logins.read_text())
+    if not isinstance(trusted_bot_logins, list) or not all(
+        isinstance(login, str) for login in trusted_bot_logins
+    ):
+        raise ValueError("trusted bot logins must be a JSON array of strings")
     payload, unmapped, duplicates = build_review_payload(
         review=args.review.read_text(),
         findings=json.loads(args.findings.read_text()),
@@ -402,6 +434,7 @@ def main() -> None:
         head_sha=args.head_sha,
         run_url=args.run_url,
         history=history,
+        trusted_bot_logins=trusted_bot_logins,
     )
     args.output.write_text(json.dumps(payload))
     args.unmapped_output.write_text("\n".join(unmapped) + ("\n" if unmapped else ""))
@@ -409,7 +442,11 @@ def main() -> None:
         "\n".join(duplicates) + ("\n" if duplicates else "")
     )
     args.skip_duplicate_review_output.write_text(
-        "true\n" if should_skip_inline_review(payload, history) else "false\n"
+        (
+            "true\n"
+            if should_skip_inline_review(payload, history, trusted_bot_logins)
+            else "false\n"
+        )
     )
 
 

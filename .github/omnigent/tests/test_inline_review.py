@@ -138,6 +138,8 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(workflow.count("{known_issue_policy}"), 1)
         self.assertEqual(workflow.count("{previous_review_policy}"), 1)
         self.assertIn("format_review_history", workflow)
+        self.assertIn("OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}", workflow)
+        self.assertIn("--trusted-bot-logins /tmp/trusted_bot_logins.json", workflow)
 
     def test_automatic_reviews_default_to_inline(self) -> None:
         workflow = (Path(__file__).parents[2] / "workflows" / "ai-review.yml").read_text()
@@ -360,7 +362,10 @@ class InlineReviewTest(unittest.TestCase):
                         "reviews": {
                             "nodes": [
                                 {
-                                    "author": {"__typename": "Bot"},
+                                    "author": {
+                                        "__typename": "Bot",
+                                        "login": "github-actions",
+                                    },
                                     "body": "<!-- ai-review-bot -->\nprior review",
                                     "comments": {
                                         "nodes": [
@@ -508,6 +513,46 @@ class InlineReviewTest(unittest.TestCase):
         self.assertIn("### Blocker2", remaining)
         self.assertIn("Summary:\nNeeds changes.", remaining)
 
+    def test_unclosed_fence_recovery_preserves_earlier_fence_parsing(self) -> None:
+        review = (
+            "## Blocking issues\n"
+            "### Blocker1\n"
+            "```text\n"
+            "### Blocker9\n"
+            "This is code, not a finding.\n"
+            "```\n"
+            "Finding detail.\n"
+            "```text\n"
+            "Unclosed example.\n"
+            "### Blocker2\n"
+            "Finding that remains.\n"
+            "Summary:\n"
+            "Needs changes."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
+
+        self.assertNotIn("This is code", remaining)
+        self.assertNotIn("Unclosed example", remaining)
+        self.assertIn("### Blocker2", remaining)
+        self.assertIn("Summary:\nNeeds changes.", remaining)
+
+    def test_bare_section_word_inside_finding_is_not_a_boundary(self) -> None:
+        review = (
+            "## Non-blocking notes\n"
+            "### Nit1\n"
+            "Finding detail.\n"
+            "Summary\n"
+            "This word is part of the finding.\n"
+            "Summary:\n"
+            "Overall assessment."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Nit1"})
+
+        self.assertNotIn("This word is part of the finding", remaining)
+        self.assertIn("Summary:\nOverall assessment.", remaining)
+
     def test_removed_finding_preserves_plain_summary_and_drops_empty_group(self) -> None:
         review = (
             "No blocking issues.\n\n"
@@ -541,7 +586,14 @@ class InlineReviewTest(unittest.TestCase):
         self.assertNotIn("Finding published inline", remaining)
         self.assertIn("2. **Summary**\nOverall assessment.", remaining)
 
-    def test_build_payload_keeps_finding_without_matching_heading_in_summary(self) -> None:
+    def test_removed_finding_drops_final_empty_group_without_newline(self) -> None:
+        review = "## Summary\nOverall assessment.\n\n## Non-blocking notes"
+
+        remaining = self.inline_review._remove_empty_finding_groups(review)
+
+        self.assertEqual(remaining, "## Summary\nOverall assessment.\n\n")
+
+    def test_build_payload_posts_mapped_finding_without_matching_heading(self) -> None:
         payload, unmapped, duplicates = self.inline_review.build_review_payload(
             review="## Summary\nNit1 needs attention.",
             findings=[
@@ -558,9 +610,19 @@ class InlineReviewTest(unittest.TestCase):
             run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
         )
 
-        self.assertEqual(payload["comments"], [])
+        self.assertEqual(
+            payload["comments"],
+            [
+                {
+                    "path": "kernel/src/example.rs",
+                    "line": 10,
+                    "side": "RIGHT",
+                    "body": "**Nit1** Finding.",
+                }
+            ],
+        )
         self.assertIn("Nit1 needs attention", payload["body"])
-        self.assertEqual(unmapped, ["Nit1"])
+        self.assertEqual(unmapped, [])
         self.assertEqual(duplicates, [])
 
     def test_exact_duplicate_inline_body_is_skipped_without_new_comments(self) -> None:
@@ -578,7 +640,10 @@ class InlineReviewTest(unittest.TestCase):
                         "reviews": {
                             "nodes": [
                                 {
-                                    "author": {"__typename": "Bot"},
+                                    "author": {
+                                        "__typename": "Bot",
+                                        "login": "github-actions",
+                                    },
                                     "body": prior_body,
                                     "comments": {"nodes": []},
                                 }
