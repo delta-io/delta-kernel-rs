@@ -23,8 +23,6 @@ mod reader;
 mod state;
 mod writer;
 
-use std::collections::HashMap;
-
 #[allow(unused)]
 pub(crate) use delta::{merge_domain_metadata, CrcDelta};
 use delta_kernel_derive::internal_api;
@@ -105,7 +103,103 @@ pub struct Crc {
     pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
 }
 
+/// Typed fields used to reconstruct a CRC from connector-provided state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[internal_api]
+pub(crate) struct ReconstructedCrc {
+    /// Table version described by the CRC.
+    version: Version,
+    /// Metadata active at `version`.
+    metadata: Metadata,
+    /// Protocol active at `version`.
+    protocol: Protocol,
+    /// Complete file statistics at `version`.
+    file_stats: FileStats,
+    /// In-commit timestamp for `version`, when enabled by the table state.
+    in_commit_timestamp_opt: Option<i64>,
+    /// Explicit completeness state for active set-transaction actions.
+    set_transaction_state: SetTransactionState,
+    /// Explicit completeness state for active domain-metadata actions.
+    domain_metadata_state: DomainMetadataState,
+}
+
+/// File-statistics fields supplied while reconstructing a CRC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[internal_api]
+pub(crate) struct ReconstructedFileStats {
+    /// Number of active files.
+    pub num_files: i64,
+    /// Total size of all active files in bytes.
+    pub table_size_bytes: i64,
+    /// Optional size distribution of active files.
+    pub file_size_histogram: Option<FileSizeHistogram>,
+}
+
+impl ReconstructedCrc {
+    /// Groups reconstructed CRC fields while preserving explicit completeness states.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn new(
+        version: Version,
+        metadata: Metadata,
+        protocol: Protocol,
+        file_stats: ReconstructedFileStats,
+        in_commit_timestamp_opt: Option<i64>,
+        set_transaction_state: SetTransactionState,
+        domain_metadata_state: DomainMetadataState,
+    ) -> Self {
+        Self {
+            version,
+            metadata,
+            protocol,
+            file_stats: FileStats {
+                num_files: file_stats.num_files,
+                table_size_bytes: file_stats.table_size_bytes,
+                file_size_histogram: file_stats.file_size_histogram,
+            },
+            in_commit_timestamp_opt,
+            set_transaction_state,
+            domain_metadata_state,
+        }
+    }
+}
+
 impl Crc {
+    /// Creates a validated CRC with complete file statistics from reconstructed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for negative file totals or an invalid or inconsistent file-size
+    /// histogram.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn try_new_complete(parts: ReconstructedCrc) -> DeltaResult<Self> {
+        let ReconstructedCrc {
+            version,
+            metadata,
+            protocol,
+            file_stats,
+            in_commit_timestamp_opt,
+            set_transaction_state,
+            domain_metadata_state,
+        } = parts;
+        let file_stats = validate_reconstructed_file_stats(file_stats)?;
+        Ok(Self {
+            version,
+            metadata,
+            protocol,
+            file_stats_state: FileStatsState::Complete(file_stats),
+            in_commit_timestamp_opt,
+            set_transaction_state,
+            domain_metadata_state,
+            txn_id: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        })
+    }
+
     /// Returns absolute file-level statistics only if `file_stats_state` is `Complete`.
     ///
     /// Returns `None` when file stats cannot be trusted -- for example, when the CRC was
@@ -121,6 +215,74 @@ impl Crc {
     pub fn file_stats_state(&self) -> &FileStatsState {
         &self.file_stats_state
     }
+}
+
+/// Creates a validated histogram for reconstructed CRC state.
+///
+/// The three arrays contain bin boundaries, file counts, and byte totals, respectively.
+///
+/// # Errors
+///
+/// Returns an error when the arrays do not describe a valid histogram shape.
+#[internal_api]
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+pub(crate) fn try_new_file_size_histogram(
+    sorted_bin_boundaries: Vec<i64>,
+    file_counts: Vec<i64>,
+    total_bytes: Vec<i64>,
+) -> DeltaResult<FileSizeHistogram> {
+    FileSizeHistogram::try_new(sorted_bin_boundaries, file_counts, total_bytes)
+}
+
+fn validate_reconstructed_file_stats(file_stats: FileStats) -> DeltaResult<FileStats> {
+    for (name, value) in [
+        ("numFiles", file_stats.num_files),
+        ("tableSizeBytes", file_stats.table_size_bytes),
+    ] {
+        if value < 0 {
+            return Err(Error::generic(format!(
+                "CRC has invalid {name}: expected a non-negative value, got {value}"
+            )));
+        }
+    }
+    let file_size_histogram = file_stats
+        .file_size_histogram
+        .map(|histogram| {
+            let histogram = histogram.check_non_negative()?;
+            let file_count = histogram
+                .file_counts()
+                .iter()
+                .try_fold(0_i64, |sum, count| {
+                    sum.checked_add(*count)
+                        .ok_or_else(|| Error::internal_error("Histogram file count overflow"))
+                })?;
+            let total_bytes = histogram
+                .total_bytes()
+                .iter()
+                .try_fold(0_i64, |sum, bytes| {
+                    sum.checked_add(*bytes)
+                        .ok_or_else(|| Error::internal_error("Histogram total bytes overflow"))
+                })?;
+            if file_count != file_stats.num_files {
+                return Err(Error::internal_error(format!(
+                    "Histogram file count {file_count} does not match numFiles {}",
+                    file_stats.num_files
+                )));
+            }
+            if total_bytes != file_stats.table_size_bytes {
+                return Err(Error::internal_error(format!(
+                    "Histogram total bytes {total_bytes} does not match tableSizeBytes {}",
+                    file_stats.table_size_bytes
+                )));
+            }
+            Ok(histogram)
+        })
+        .transpose()
+        .map_err(|error: Error| Error::generic(error.to_string()))?;
+    Ok(FileStats {
+        file_size_histogram,
+        ..file_stats
+    })
 }
 
 /// Refuses to serialize a degraded (non-`Complete`) CRC, so an invalid state can never
@@ -218,20 +380,18 @@ impl Crc {
             in_commit_timestamp_opt: raw.in_commit_timestamp_opt,
             // Present array (including empty `[]`) deserializes as Complete; absent or null
             // deserializes as Partial(empty).
-            set_transaction_state: match raw.set_transactions {
-                Some(v) => SetTransactionState::Complete(
-                    v.into_iter().map(|t| (t.app_id.clone(), t)).collect(),
-                ),
-                None => SetTransactionState::Partial(HashMap::new()),
-            },
+            set_transaction_state: raw
+                .set_transactions
+                .map(SetTransactionState::try_complete)
+                .transpose()?
+                .unwrap_or_default(),
             // Present array (including empty `[]`) deserializes as Complete; absent or null
             // deserializes as Partial(empty).
-            domain_metadata_state: match raw.domain_metadata {
-                Some(v) => DomainMetadataState::Complete(
-                    v.into_iter().map(|d| (d.domain().to_string(), d)).collect(),
-                ),
-                None => DomainMetadataState::Partial(HashMap::new()),
-            },
+            domain_metadata_state: raw
+                .domain_metadata
+                .map(DomainMetadataState::try_complete)
+                .transpose()?
+                .unwrap_or_default(),
             // Not yet round-tripped through CrcRaw; see the "not yet supported" fields on Crc.
             txn_id: None,
             all_files: None,
@@ -340,10 +500,15 @@ mod tests {
     use std::collections::HashMap;
 
     use rstest::rstest;
+    use test_utils::assert_result_error_with_message;
 
-    use super::{Crc, CrcRaw, DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
-    use crate::actions::{DomainMetadata, Protocol, SetTransaction};
+    use super::{
+        Crc, CrcRaw, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState,
+        ReconstructedCrc, ReconstructedFileStats, SetTransactionState,
+    };
+    use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
     use crate::table_features::TableFeature;
+    use crate::Error;
 
     /// A minimal valid protocol for round-trip tests. `Protocol::default()` is `(0, 0)`, which
     /// `try_new` rejects, so a default protocol can't round-trip through serde (deserialization
@@ -364,6 +529,81 @@ mod tests {
             domain_metadata_state,
             ..Default::default()
         }
+    }
+
+    fn complete_crc(
+        histogram: Option<FileSizeHistogram>,
+        transactions: Option<Vec<SetTransaction>>,
+        domains: Option<Vec<DomainMetadata>>,
+    ) -> Result<Crc, Error> {
+        Crc::try_new_complete(ReconstructedCrc::new(
+            0,
+            Metadata::default(),
+            valid_protocol(),
+            ReconstructedFileStats {
+                num_files: 0,
+                table_size_bytes: 0,
+                file_size_histogram: histogram,
+            },
+            None,
+            transactions
+                .map(SetTransactionState::try_complete)
+                .transpose()?
+                .unwrap_or_default(),
+            domains
+                .map(DomainMetadataState::try_complete)
+                .transpose()?
+                .unwrap_or_default(),
+        ))
+    }
+
+    #[test]
+    fn complete_crc_rejects_negative_histogram_bins() {
+        let histogram = FileSizeHistogram::try_new(vec![0, 10], vec![-1, 0], vec![-5, 0]).unwrap();
+        assert!(complete_crc(Some(histogram), None, None).is_err());
+    }
+
+    #[rstest]
+    #[case::file_count(vec![1, 0], vec![0, 0], "does not match numFiles")]
+    #[case::total_bytes(vec![0, 0], vec![1, 0], "does not match tableSizeBytes")]
+    #[case::file_count_overflow(
+        vec![i64::MAX, 1],
+        vec![0, 0],
+        "Histogram file count overflow"
+    )]
+    #[case::total_bytes_overflow(
+        vec![0, 0],
+        vec![i64::MAX, 1],
+        "Histogram total bytes overflow"
+    )]
+    fn complete_crc_rejects_histogram_totals_that_disagree_with_file_stats(
+        #[case] file_counts: Vec<i64>,
+        #[case] total_bytes: Vec<i64>,
+        #[case] expected: &str,
+    ) {
+        let histogram = FileSizeHistogram::try_new(vec![0, 10], file_counts, total_bytes).unwrap();
+        assert_result_error_with_message(complete_crc(Some(histogram), None, None), expected);
+    }
+
+    #[test]
+    fn complete_crc_rejects_duplicate_transaction_ids() {
+        let transactions = vec![
+            SetTransaction::new("app".to_string(), 1, None),
+            SetTransaction::new("app".to_string(), 2, None),
+        ];
+        assert!(complete_crc(None, Some(transactions), None).is_err());
+    }
+
+    #[test]
+    fn complete_crc_rejects_domain_tombstones_and_duplicates() {
+        let tombstone = DomainMetadata::remove("domain".to_string(), "{}".to_string());
+        assert!(complete_crc(None, None, Some(vec![tombstone])).is_err());
+
+        let domains = vec![
+            DomainMetadata::new("domain".to_string(), "one".to_string()),
+            DomainMetadata::new("domain".to_string(), "two".to_string()),
+        ];
+        assert!(complete_crc(None, None, Some(domains)).is_err());
     }
 
     #[test]

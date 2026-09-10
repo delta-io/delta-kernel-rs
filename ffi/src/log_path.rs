@@ -1,6 +1,6 @@
 //! FFI interface for LogPath.
 
-use delta_kernel::{DeltaResult, FileMeta, LogPath};
+use delta_kernel::{DeltaResult, Error, FileMeta, LogPath};
 use url::Url;
 
 use crate::{KernelStringSlice, TryFromStringSlice};
@@ -35,8 +35,14 @@ impl LogPathArray {
     /// The ptr must point to `len` valid FfiLogPath elements, and those elements
     /// must remain valid for the duration of this call
     pub(crate) unsafe fn log_paths(&self) -> DeltaResult<Vec<LogPath>> {
-        if self.ptr.is_null() || self.len == 0 {
+        if self.len == 0 {
             return Ok(Vec::new());
+        }
+        if self.ptr.is_null() {
+            return Err(Error::generic(format!(
+                "log path pointer is null with length {}",
+                self.len
+            )));
         }
 
         let slice = unsafe { std::slice::from_raw_parts(self.ptr, self.len) };

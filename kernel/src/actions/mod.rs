@@ -346,6 +346,36 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    /// Reconstructs metadata from its serialized fields.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        id: String,
+        name: Option<String>,
+        description: Option<String>,
+        format_provider: String,
+        format_options: HashMap<String, String>,
+        schema_string: String,
+        partition_columns: Vec<String>,
+        created_time: Option<i64>,
+        configuration: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+            format: Format {
+                provider: format_provider,
+                options: format_options,
+            },
+            schema_string,
+            partition_columns,
+            created_time,
+            configuration,
+        }
+    }
+
     /// Create a new [`Metadata`] instances.
     ///
     /// # Errors
@@ -649,6 +679,7 @@ impl Protocol {
     }
 
     /// Try to create a new Protocol instance from reader/writer versions and table features.
+    #[internal_api]
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
@@ -1140,6 +1171,8 @@ pub(crate) struct SetTransaction {
 }
 
 impl SetTransaction {
+    /// Creates a set-transaction action from snapshot hint state.
+    #[internal_api]
     pub(crate) fn new(app_id: String, version: i64, last_updated: Option<i64>) -> Self {
         Self {
             app_id,
@@ -1516,6 +1549,23 @@ fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
 }
 
 impl Sidecar {
+    /// Creates a sidecar action from snapshot hint state.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn new(
+        path: String,
+        size_in_bytes: i64,
+        modification_time: i64,
+        tags: Option<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            path,
+            size_in_bytes,
+            modification_time,
+            tags,
+        }
+    }
+
     /// Convert a Sidecar record to a FileMeta.
     ///
     /// This helper first builds the URL by joining the provided log_root with
@@ -1550,6 +1600,15 @@ pub(crate) struct CheckpointMetadata {
     pub(crate) tags: Option<HashMap<String, String>>,
 }
 
+impl CheckpointMetadata {
+    /// Creates checkpoint metadata from snapshot hint state.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn new(version: i64, tags: Option<HashMap<String, String>>) -> Self {
+        Self { version, tags }
+    }
+}
+
 /// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two
 /// overlapping transactions conflict if they both contain a domain metadata action for the same
 /// metadata domain.
@@ -1568,6 +1627,7 @@ pub struct DomainMetadata {
 
 impl DomainMetadata {
     /// Create a new DomainMetadata action.
+    #[internal_api]
     pub(crate) fn new(domain: String, configuration: String) -> Self {
         Self {
             domain,
@@ -1577,6 +1637,7 @@ impl DomainMetadata {
     }
 
     /// Create a new DomainMetadata action to remove a domain.
+    #[internal_api]
     pub(crate) fn remove(domain: String, configuration: String) -> Self {
         Self {
             domain,

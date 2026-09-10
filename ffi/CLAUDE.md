@@ -39,6 +39,7 @@ the caller's memory space.
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
+- `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -60,10 +61,20 @@ Snapshot builder API (`ffi/src/lib.rs`):
 - `snapshot_builder_set_version(builder, version)` -- optional: pin to a specific version
 - `snapshot_builder_set_log_tail(builder, log_tail)` -- optional: set log tail (for catalog-managed tables)
 - `snapshot_builder_set_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
+- `snapshot_builder_snapshot_hint_begin(builder, version, freshness)` -- optional: begin a
+  complete typed snapshot hint
+- `snapshot_builder_snapshot_hint_set_*` -- copy the hint's log paths, protocol, metadata, and
+  optional checkpoint or CRC state into the builder. Snapshot hints accept commit and checkpoint
+  paths, but not log compaction paths
+- `snapshot_builder_snapshot_hint_finish(builder)` -- install a structurally complete hint;
+  cross-component and table validation occurs when the builder is built. A failed finish consumes
+  the in-progress visitor, so call `snapshot_builder_snapshot_hint_begin` before retrying
 - `snapshot_builder_build(builder)` -- consume the builder and produce a `SharedSnapshot`
 - `free_snapshot_builder(builder)` -- discard without building (e.g. on error paths)
 
-The caller owns the returned builder handle and must call either `snapshot_builder_build` or `free_snapshot_builder`.
+Snapshot-hint setter inputs are borrowed only for each call and copied into the builder. The caller
+owns the returned builder handle and must call either `snapshot_builder_build` or
+`free_snapshot_builder`.
 
 Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
 `snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar

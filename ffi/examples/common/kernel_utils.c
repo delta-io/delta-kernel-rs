@@ -76,6 +76,160 @@ bool set_builder_opt(EngineBuilder* engine_builder, char* key, char* val)
   return true;
 }
 
+void compile_snapshot_hint_abi(const FfiProtocol* protocol)
+{
+  KernelStringSlice string = { .ptr = NULL, .len = 0 };
+  FfiOptionalString optional_string = { .has_value = false, .value = string };
+  FfiOptionalI64 optional_i64 = { .has_value = false, .value = 0 };
+  FfiOptionalU64 optional_u64 = { .has_value = false, .value = 0 };
+  FfiStringArray string_array = { .ptr = NULL, .len = 0 };
+  FfiOptionalStringArray optional_string_array = {
+    .has_value = false,
+    .value = string_array,
+  };
+  FfiStringMapEntry string_map_entry = { .key = string, .value = string };
+  FfiStringMap string_map = { .ptr = &string_map_entry, .len = 1 };
+  FfiOptionalStringMap optional_string_map = {
+    .has_value = false,
+    .value = string_map,
+  };
+  FfiI64Array i64_array = { .ptr = NULL, .len = 0 };
+  FfiFileSizeHistogram histogram = {
+    .sorted_bin_boundaries = i64_array,
+    .file_counts = i64_array,
+    .total_bytes = i64_array,
+  };
+  FfiProtocol protocol_value = {
+    .min_reader_version = 1,
+    .min_writer_version = 2,
+    .reader_features = optional_string_array,
+    .writer_features = optional_string_array,
+  };
+  FfiMetadata metadata = {
+    .id = string,
+    .name = optional_string,
+    .description = optional_string,
+    .format_provider = string,
+    .format_options = string_map,
+    .schema_string = string,
+    .partition_columns = string_array,
+    .created_time = optional_i64,
+    .configuration = string_map,
+  };
+  FfiSetTransaction transaction = {
+    .app_id = string,
+    .version = 0,
+    .last_updated = optional_i64,
+  };
+  FfiDomainMetadata domain_metadata = {
+    .domain = string,
+    .configuration = string,
+    .removed = false,
+  };
+  FfiCheckpointMetadata checkpoint_metadata = {
+    .version = 0,
+    .tags = optional_string_map,
+  };
+  FfiSidecar sidecar = {
+    .path = string,
+    .size_in_bytes = 0,
+    .modification_time = 0,
+    .tags = optional_string_map,
+  };
+  FfiSnapshotHintAction actions[] = {
+    {
+      .kind = SNAPSHOT_HINT_ACTION_METADATA,
+      .value = { .metadata = &metadata },
+    },
+    {
+      .kind = SNAPSHOT_HINT_ACTION_PROTOCOL,
+      .value = { .protocol = &protocol_value },
+    },
+    {
+      .kind = SNAPSHOT_HINT_ACTION_TRANSACTION,
+      .value = { .transaction = &transaction },
+    },
+    {
+      .kind = SNAPSHOT_HINT_ACTION_DOMAIN_METADATA,
+      .value = { .domain_metadata = &domain_metadata },
+    },
+    {
+      .kind = SNAPSHOT_HINT_ACTION_CHECKPOINT_METADATA,
+      .value = { .checkpoint_metadata = &checkpoint_metadata },
+    },
+  };
+  FfiSidecarArray sidecar_array = { .ptr = &sidecar, .len = 1 };
+  FfiSnapshotHintActionArray action_array = {
+    .ptr = actions,
+    .len = sizeof(actions) / sizeof(actions[0]),
+  };
+  FfiSnapshotHintV2Checkpoint v2_checkpoint = {
+    .path = string,
+    .size_in_bytes = optional_i64,
+    .modification_time = optional_i64,
+    .has_sidecar_files = true,
+    .sidecar_files = sidecar_array,
+    .has_non_file_actions = true,
+    .non_file_actions = action_array,
+  };
+  FfiSnapshotHintLastCheckpoint last_checkpoint = {
+    .version = 0,
+    .size = 0,
+    .parts = optional_u64,
+    .size_in_bytes = optional_i64,
+    .num_of_add_files = optional_i64,
+    .checkpoint_schema = optional_string,
+    .checksum = optional_string,
+    .tags = optional_string_map,
+    .v2_checkpoint = &v2_checkpoint,
+  };
+  FfiSetTransactionArray transaction_array = { .ptr = &transaction, .len = 1 };
+  FfiDomainMetadataArray domain_metadata_array = {
+    .ptr = &domain_metadata,
+    .len = 1,
+  };
+  FfiSnapshotHintCrc crc = {
+    .table_size_bytes = 0,
+    .num_files = 0,
+    .in_commit_timestamp = optional_i64,
+    .file_size_histogram = &histogram,
+    .has_set_transactions = true,
+    .set_transactions = transaction_array,
+    .has_domain_metadata = true,
+    .domain_metadata = domain_metadata_array,
+  };
+  LogPathArray log_paths = { .ptr = NULL, .len = 0 };
+
+  ExternResultbool (*begin)(HandleMutableFfiSnapshotBuilder*, Version,
+                            FfiSnapshotHintFreshness) =
+      snapshot_builder_snapshot_hint_begin;
+  ExternResultbool (*set_log_paths)(HandleMutableFfiSnapshotBuilder*, LogPathArray) =
+      snapshot_builder_snapshot_hint_set_log_paths;
+  ExternResultbool (*set_protocol)(HandleMutableFfiSnapshotBuilder*, const FfiProtocol*) =
+      snapshot_builder_snapshot_hint_set_protocol;
+  ExternResultbool (*set_metadata)(HandleMutableFfiSnapshotBuilder*, const FfiMetadata*) =
+      snapshot_builder_snapshot_hint_set_metadata;
+  ExternResultbool (*set_last_checkpoint)(HandleMutableFfiSnapshotBuilder*,
+                                          const FfiSnapshotHintLastCheckpoint*) =
+      snapshot_builder_snapshot_hint_set_last_checkpoint;
+  ExternResultbool (*set_crc)(HandleMutableFfiSnapshotBuilder*, const FfiSnapshotHintCrc*) =
+      snapshot_builder_snapshot_hint_set_crc;
+  ExternResultbool (*finish)(HandleMutableFfiSnapshotBuilder*) =
+      snapshot_builder_snapshot_hint_finish;
+
+  (void)last_checkpoint;
+  (void)crc;
+  (void)log_paths;
+  (void)protocol;
+  (void)begin;
+  (void)set_log_paths;
+  (void)set_protocol;
+  (void)set_metadata;
+  (void)set_last_checkpoint;
+  (void)set_crc;
+  (void)finish;
+}
+
 // utility to print out a metric id as a uuid
 void print_metric_id(const char* name, MetricId id) {
   const uint8_t* b = id.bytes;

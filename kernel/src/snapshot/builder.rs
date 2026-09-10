@@ -16,9 +16,9 @@ use crate::log_segment::LogSegment;
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
-use crate::path::LogPathFileType;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
-use crate::table_configuration::TableConfiguration;
+use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::utils::{require, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
@@ -46,8 +46,9 @@ pub(crate) enum SnapshotHintFreshness {
 
 /// Complete state for constructing a [`Snapshot`] without engine I/O.
 ///
-/// Kernel validates the log segment, protocol, metadata, and optional CRC before constructing the
-/// snapshot. It records the connector-provided freshness without validating it.
+/// Kernel validates the log-segment shape, table configuration, and optional CRC consistency
+/// before constructing the snapshot. It does not replay the log to verify the supplied state's
+/// provenance, and records the connector-provided freshness without validating it.
 #[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct SnapshotHint {
@@ -55,24 +56,74 @@ pub(crate) struct SnapshotHint {
     ///
     /// Historical commits and checkpoints in [`Self::log_segment_files`] may describe earlier
     /// versions.
-    pub version: Version,
+    version: Version,
     /// The complete set of log files required by the snapshot.
     ///
     /// `latest_crc_file` identifies the latest CRC present in storage and may be older than
     /// `version`.
-    pub log_segment_files: LogSegmentFiles,
+    log_segment_files: LogSegmentFiles,
     /// The table protocol at `version`.
-    pub protocol: Protocol,
+    protocol: Protocol,
     /// The table metadata at `version`.
-    pub metadata: Metadata,
+    metadata: Metadata,
     /// The optional `_last_checkpoint` contents associated with the log segment.
-    pub last_checkpoint_hint: Option<LastCheckpointHint>,
+    last_checkpoint_hint: Option<LastCheckpointHint>,
     /// The optional CRC state resolved at `version`.
     ///
     /// This may have been advanced from an older `latest_crc_file`.
-    pub crc: Option<Arc<Crc>>,
+    crc: Option<Arc<Crc>>,
     /// Whether the connector established that `version` was latest.
-    pub freshness: SnapshotHintFreshness,
+    freshness: SnapshotHintFreshness,
+}
+
+impl SnapshotHint {
+    /// Creates a hint from connector-provided log paths and table state.
+    ///
+    /// The paths pass through the same classification logic used by storage listing. Snapshot
+    /// construction performs the remaining consistency and table-configuration validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the paths cannot be classified as supported Delta log files. Log
+    /// compaction paths are not supported by snapshot hints.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn try_new(
+        version: Version,
+        log_paths: Vec<LogPath>,
+        protocol: Protocol,
+        metadata: Metadata,
+        last_checkpoint_hint: Option<LastCheckpointHint>,
+        crc: Option<Arc<Crc>>,
+        freshness: SnapshotHintFreshness,
+    ) -> DeltaResult<Self> {
+        let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
+        require!(
+            !parsed_paths
+                .iter()
+                .any(|path| matches!(path.file_type, LogPathFileType::CompactedCommit { .. })),
+            SnapshotHintError::LogCompaction.into()
+        );
+        parsed_paths
+            .sort_unstable_by(|a, b| (a.version, &a.filename).cmp(&(b.version, &b.filename)));
+        let parsed_paths = parsed_paths.into_iter().map(Ok);
+        let log_segment_files = LogSegmentFiles::build_log_segment_files(
+            parsed_paths,
+            Vec::new(),
+            0,
+            None,
+            CheckpointHandling::Adopt,
+        )?;
+        Ok(Self {
+            version,
+            log_segment_files,
+            protocol,
+            metadata,
+            last_checkpoint_hint,
+            crc,
+            freshness,
+        })
+    }
 }
 
 /// Builder for creating [`Snapshot`] instances.
@@ -363,7 +414,8 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// matches the version of an existing snapshot.
     ///
     /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
-    /// [`MetricEvent::SnapshotBuildFailure`].
+    /// [`MetricEvent::SnapshotBuildFailure`]. Events include `load_type`; hinted builds use
+    /// `snapshot_hint` and emit no child log-load events because they perform no engine I/O.
     ///
     /// # Parameters
     ///
@@ -621,6 +673,17 @@ impl<Mode> SnapshotBuilder<Mode> {
                 crc.metadata == *table_configuration.metadata(),
                 SnapshotHintError::CrcMetadata.into()
             );
+            require!(
+                !matches!(
+                    table_configuration.in_commit_timestamp_enablement()?,
+                    InCommitTimestampEnablement::Enabled { .. }
+                ) || crc.in_commit_timestamp_opt.is_some(),
+                SnapshotHintError::Connector {
+                    message: "ICT-enabled CRC is missing inCommitTimestamp".to_string(),
+                    source: None,
+                }
+                .into()
+            );
         }
 
         Snapshot::new_with_crc(
@@ -825,6 +888,8 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::schema::schema_ref;
+    use crate::table_features::TableFeature;
+    use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::unit_test_utils::{
         create_log_path, install_thread_local_metrics_reporter, CapturingReporter,
         TestCancellationToken,
@@ -918,6 +983,36 @@ mod tests {
             .source()
             .expect("LogSegment error must preserve its source");
         assert!(source.to_string().contains(expected_source));
+    }
+
+    #[test]
+    fn snapshot_hint_sorts_caller_supplied_log_paths() -> DeltaResult<()> {
+        let log_paths = [
+            "memory:///_delta_log/00000000000000000001.json",
+            "memory:///_delta_log/00000000000000000000.json",
+        ]
+        .into_iter()
+        .map(|path| LogPath::try_new(create_log_path(path).location))
+        .collect::<DeltaResult<Vec<_>>>()?;
+        let hint = SnapshotHint::try_new(
+            1,
+            log_paths,
+            Protocol::default(),
+            Metadata::default(),
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )?;
+
+        assert_eq!(
+            hint.log_segment_files
+                .ascending_commit_files
+                .iter()
+                .map(|path| path.version)
+                .collect_vec(),
+            vec![0, 1]
+        );
+        Ok(())
     }
 
     #[rstest::rstest]
@@ -1215,16 +1310,40 @@ mod tests {
             "CRC protocol does not match",
         );
 
-        let mut wrong_metadata = hint;
+        let mut wrong_metadata = hint.clone();
         wrong_metadata.crc = Some(Arc::new(Crc {
             metadata: Metadata::default(),
-            ..matching_crc
+            ..matching_crc.clone()
         }));
         assert_hint_error(
             SnapshotBuilder::new_for(&table_root),
             wrong_metadata,
             engine.as_ref(),
             "CRC metadata does not match",
+        );
+
+        let protocol = Protocol::try_new_modern(
+            std::iter::empty::<TableFeature>(),
+            [TableFeature::InCommitTimestamp],
+        )?;
+        let metadata = hint
+            .metadata
+            .clone()
+            .with_configuration_entry(ENABLE_IN_COMMIT_TIMESTAMPS, "true");
+        let mut missing_ict = hint;
+        missing_ict.protocol = protocol.clone();
+        missing_ict.metadata = metadata.clone();
+        missing_ict.crc = Some(Arc::new(Crc {
+            protocol,
+            metadata,
+            in_commit_timestamp_opt: None,
+            ..matching_crc
+        }));
+        assert_hint_error(
+            SnapshotBuilder::new_for(&table_root),
+            missing_ict,
+            engine.as_ref(),
+            "ICT-enabled CRC is missing inCommitTimestamp",
         );
         Ok(())
     }

@@ -51,6 +51,7 @@ mod alloc_stats;
 
 pub mod column_default;
 pub mod commit_range;
+pub mod delta_types;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
@@ -75,6 +76,7 @@ pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
+pub mod snapshot_hint;
 
 #[cfg(test)]
 mod ffi_test_utils;
@@ -1120,15 +1122,17 @@ pub struct SharedMetadata;
 /// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
 /// (incrementally from an existing snapshot). Configure with [`snapshot_builder_set_version`],
 /// [`snapshot_builder_set_log_tail`], and [`snapshot_builder_set_max_catalog_version`] (for
-/// catalog-managed tables). Finally, call [`snapshot_builder_build`] to consume the builder and
-/// obtain the snapshot. If you need to discard the builder without building, call
-/// [`free_snapshot_builder`].
+/// catalog-managed tables). Builders returned by [`get_snapshot_builder`] may instead construct a
+/// complete typed snapshot hint with [`snapshot_hint::snapshot_builder_snapshot_hint_begin`] and
+/// its setters. Finally, call [`snapshot_builder_build`] to consume the builder and obtain the
+/// snapshot. If you need to discard the builder without building, call [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
     engine: Arc<dyn ExternEngine>,
     source: FfiSnapshotBuilderSource,
     version: Option<Version>,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
+    snapshot_hint: snapshot_hint::FfiSnapshotHintState,
 }
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiSnapshotBuilder`].
@@ -1150,6 +1154,7 @@ fn make_snapshot_builder(
         version: None,
         log_tail: Vec::new(),
         max_catalog_version: None,
+        snapshot_hint: snapshot_hint::FfiSnapshotHintState::None,
     })
     .into())
 }
@@ -1204,8 +1209,9 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
     .into_extern_result(&engine_ref)
 }
 
-/// Set the target version on a snapshot builder. When omitted, the snapshot is created at the
-/// latest version of the table.
+/// Sets an explicit target version on a snapshot builder. Without a snapshot hint, omission
+/// selects the latest listed table version. With a hint, omission uses the hinted version; an
+/// explicit version must match it or build returns `InvalidSnapshotHint`.
 ///
 /// # Safety
 ///
@@ -1281,16 +1287,16 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         version,
         log_tail,
         max_catalog_version,
+        snapshot_hint,
     } = builder;
     let engine = engine.engine();
 
-    fn build<Mode>(
+    fn configure<Mode>(
         mut builder: delta_kernel::snapshot::SnapshotBuilder<Mode>,
-        engine: &dyn Engine,
         version: Option<Version>,
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
-    ) -> DeltaResult<SnapshotRef> {
+    ) -> delta_kernel::snapshot::SnapshotBuilder<Mode> {
         if let Some(version) = version {
             builder = builder.at_version(version);
         }
@@ -1300,24 +1306,44 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         if let Some(max_catalog_version) = max_catalog_version {
             builder = builder.with_max_catalog_version(max_catalog_version);
         }
-        builder.build(engine)
+        builder
     }
 
     let snapshot = match source {
-        FfiSnapshotBuilderSource::TableRoot(url) => build(
-            Snapshot::builder_for(url),
-            engine.as_ref(),
-            version,
-            log_tail,
-            max_catalog_version,
-        ),
-        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => build(
-            Snapshot::builder_from(snapshot),
-            engine.as_ref(),
-            version,
-            log_tail,
-            max_catalog_version,
-        ),
+        FfiSnapshotBuilderSource::TableRoot(url) => {
+            let builder = configure(
+                Snapshot::builder_for(url),
+                version,
+                log_tail,
+                max_catalog_version,
+            );
+            match snapshot_hint {
+                snapshot_hint::FfiSnapshotHintState::None => builder.build(engine.as_ref()),
+                snapshot_hint::FfiSnapshotHintState::Ready(hint) => {
+                    builder.with_snapshot_hint(*hint).build(engine.as_ref())
+                }
+                snapshot_hint::FfiSnapshotHintState::Building(_) => Err(snapshot_hint::invalid(
+                    "snapshot hint visitor is unfinished",
+                )),
+            }
+        }
+        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => {
+            let builder = configure(
+                Snapshot::builder_from(snapshot),
+                version,
+                log_tail,
+                max_catalog_version,
+            );
+            match snapshot_hint {
+                snapshot_hint::FfiSnapshotHintState::None => builder.build(engine.as_ref()),
+                snapshot_hint::FfiSnapshotHintState::Ready(_) => Err(snapshot_hint::invalid(
+                    "A snapshot hint cannot be used with Snapshot::builder_from",
+                )),
+                snapshot_hint::FfiSnapshotHintState::Building(_) => Err(snapshot_hint::invalid(
+                    "snapshot hint visitor is unfinished",
+                )),
+            }
+        }
     }?;
     Ok(snapshot.into())
 }
