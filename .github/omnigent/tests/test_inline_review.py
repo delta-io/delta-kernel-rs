@@ -103,25 +103,30 @@ class InlineReviewTest(unittest.TestCase):
 
         self.assertEqual(standalone_prompt.strip(), "\n".join(configured_lines).strip())
 
-    def test_known_issue_policy_reaches_parent_and_child_reviewers(self) -> None:
+    def test_shared_policies_reach_parent_and_child_reviewers(self) -> None:
         omnigent_dir = Path(__file__).parents[1]
         reviewer_dir = omnigent_dir / "reviewer"
         reviewer_contract = (reviewer_dir / "REVIEW.md").read_text()
         workflow = (omnigent_dir.parent / "workflows" / "ai-review.yml").read_text()
         review_policy = _load_module("review_policy")
-        policy = review_policy.KNOWN_ISSUE_POLICY.strip()
-
-        self.assertIn(policy, reviewer_contract)
-        for agent_dir in (reviewer_dir / "agents").iterdir():
-            if not agent_dir.is_dir():
-                continue
-            with self.subTest(agent=agent_dir.name):
-                self.assertIn(policy, (agent_dir / "REVIEW.md").read_text())
+        for policy in (
+            review_policy.KNOWN_ISSUE_POLICY.strip(),
+            review_policy.PREVIOUS_REVIEW_POLICY.strip(),
+        ):
+            self.assertIn(policy, reviewer_contract)
+            for agent_dir in (reviewer_dir / "agents").iterdir():
+                if not agent_dir.is_dir():
+                    continue
+                with self.subTest(agent=agent_dir.name, policy=policy.partition("\n")[0]):
+                    self.assertIn(policy, (agent_dir / "REVIEW.md").read_text())
         self.assertIn(
             'f"{known_issue_policy}\\n\\n"',
             workflow,
         )
         self.assertIn("{known_issue_policy}", workflow)
+        self.assertIn('f"{previous_review_policy}\\n\\n"', workflow)
+        self.assertIn("{previous_review_policy}", workflow)
+        self.assertIn("format_review_history", workflow)
 
     def test_automatic_reviews_default_to_inline(self) -> None:
         workflow = (Path(__file__).parents[2] / "workflows" / "ai-review.yml").read_text()
@@ -155,8 +160,13 @@ class InlineReviewTest(unittest.TestCase):
         )
 
     def test_build_payload_keeps_only_locations_in_diff(self) -> None:
-        payload, unmapped = self.inline_review.build_review_payload(
-            review="### Nit1: use the new call",
+        payload, unmapped, duplicates = self.inline_review.build_review_payload(
+            review=(
+                "## Non-blocking notes\n"
+                "### Nit1: use the new call\nAttached detail.\n"
+                "### Nit2: check the other call\nUnmapped detail.\n"
+                "## Summary\nNeeds a small follow-up."
+            ),
             findings=[
                 {
                     "id": "Nit1",
@@ -193,11 +203,15 @@ class InlineReviewTest(unittest.TestCase):
         )
         self.assertIn("<details><summary>Show review</summary>", payload["body"])
         self.assertTrue(payload["body"].startswith("<!-- ai-review-bot -->"))
+        self.assertNotIn("### Nit1", payload["body"])
+        self.assertIn("### Nit2", payload["body"])
+        self.assertIn("## Summary", payload["body"])
         self.assertEqual(unmapped, ["Nit2"])
+        self.assertEqual(duplicates, [])
 
     def test_build_payload_accepts_multiline_finding_body(self) -> None:
-        payload, unmapped = self.inline_review.build_review_payload(
-            review="review",
+        payload, unmapped, duplicates = self.inline_review.build_review_payload(
+            review="### Nit1\nreview\n\n## Summary\nsummary",
             findings=[
                 {
                     "id": "Nit1",
@@ -214,6 +228,7 @@ class InlineReviewTest(unittest.TestCase):
 
         self.assertEqual(len(payload["comments"]), 1)
         self.assertEqual(unmapped, [])
+        self.assertEqual(duplicates, [])
 
     def test_format_review_body_supports_expanded_comments(self) -> None:
         body = self.review_publish.format_review_body(
@@ -234,8 +249,8 @@ class InlineReviewTest(unittest.TestCase):
             "body": "Duplicate.",
         }
 
-        payload, unmapped = self.inline_review.build_review_payload(
-            review="review",
+        payload, unmapped, duplicates = self.inline_review.build_review_payload(
+            review="### Blocker1\nreview\n\n## Summary\nsummary",
             findings=[finding, finding],
             diff=DIFF,
             head_sha="c" * 40,
@@ -244,6 +259,7 @@ class InlineReviewTest(unittest.TestCase):
 
         self.assertEqual(len(payload["comments"]), 1)
         self.assertEqual(unmapped, ["Blocker1"])
+        self.assertEqual(duplicates, [])
 
     def test_build_payload_skips_untrusted_finding_fields(self) -> None:
         valid = {
@@ -273,8 +289,8 @@ class InlineReviewTest(unittest.TestCase):
 
         for update in invalid_updates:
             with self.subTest(update=update):
-                payload, unmapped = self.inline_review.build_review_payload(
-                    review="review",
+                payload, unmapped, duplicates = self.inline_review.build_review_payload(
+                    review="### Nit1\nreview\n\n## Summary\nsummary",
                     findings=[valid | update, valid],
                     diff=DIFF,
                     head_sha="d" * 40,
@@ -282,12 +298,13 @@ class InlineReviewTest(unittest.TestCase):
                 )
                 self.assertEqual(len(payload["comments"]), 1)
                 self.assertEqual(unmapped, ["entry 1"])
+                self.assertEqual(duplicates, [])
 
         invalid_findings = (None, {}, valid | {"extra": "field"})
         for finding in invalid_findings:
             with self.subTest(finding=finding):
-                payload, unmapped = self.inline_review.build_review_payload(
-                    review="review",
+                payload, unmapped, duplicates = self.inline_review.build_review_payload(
+                    review="### Nit1\nreview\n\n## Summary\nsummary",
                     findings=[finding, valid],
                     diff=DIFF,
                     head_sha="d" * 40,
@@ -295,6 +312,7 @@ class InlineReviewTest(unittest.TestCase):
                 )
                 self.assertEqual(len(payload["comments"]), 1)
                 self.assertEqual(unmapped, ["entry 1"])
+                self.assertEqual(duplicates, [])
 
     def test_build_payload_rejects_untrusted_metadata(self) -> None:
         finding = {
@@ -312,7 +330,7 @@ class InlineReviewTest(unittest.TestCase):
 
         for update in invalid_metadata:
             arguments = {
-                "review": "review",
+                "review": "### Nit1\nreview\n\n## Summary\nsummary",
                 "findings": [finding],
                 "diff": DIFF,
                 "head_sha": "d" * 40,
@@ -320,6 +338,83 @@ class InlineReviewTest(unittest.TestCase):
             }
             with self.subTest(update=update), self.assertRaises(ValueError):
                 self.inline_review.build_review_payload(**(arguments | update))
+
+    def test_build_payload_suppresses_exact_prior_inline_finding(self) -> None:
+        history = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "comments": {"nodes": []},
+                        "reviews": {
+                            "nodes": [
+                                {
+                                    "author": {"__typename": "Bot"},
+                                    "body": "<!-- ai-review-bot -->\nprior review",
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "path": "kernel/src/example.rs",
+                                                "body": "**Blocker9** Repeated finding.",
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                }
+            }
+        }
+
+        payload, unmapped, duplicates = self.inline_review.build_review_payload(
+            review=(
+                "## Blocking issues\n"
+                "### Blocker1: repeated\nRepeated finding.\n"
+                "## Summary\nNo new findings."
+            ),
+            findings=[
+                {
+                    "id": "Blocker1",
+                    "path": "kernel/src/example.rs",
+                    "line": 10,
+                    "side": "RIGHT",
+                    "body": "Repeated finding.",
+                }
+            ],
+            diff=DIFF,
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+            history=history,
+        )
+
+        self.assertEqual(payload["comments"], [])
+        self.assertNotIn("Blocker1", payload["body"])
+        self.assertNotIn("Blocking issues", payload["body"])
+        self.assertIn("## Summary", payload["body"])
+        self.assertEqual(unmapped, [])
+        self.assertEqual(duplicates, ["Blocker1"])
+
+    def test_build_payload_keeps_finding_without_matching_heading_in_summary(self) -> None:
+        payload, unmapped, duplicates = self.inline_review.build_review_payload(
+            review="## Summary\nNit1 needs attention.",
+            findings=[
+                {
+                    "id": "Nit1",
+                    "path": "kernel/src/example.rs",
+                    "line": 10,
+                    "side": "RIGHT",
+                    "body": "Finding.",
+                }
+            ],
+            diff=DIFF,
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+        )
+
+        self.assertEqual(payload["comments"], [])
+        self.assertIn("Nit1 needs attention", payload["body"])
+        self.assertEqual(unmapped, ["Nit1"])
+        self.assertEqual(duplicates, [])
 
     def test_extract_inline_findings_rejects_invalid_envelopes(self) -> None:
         marker = "e" * 32

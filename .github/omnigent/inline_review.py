@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from review_history import canonical_finding_body, previous_inline_comments
 from review_publish import format_review_body as _format_review_body
 
 
@@ -15,6 +16,12 @@ MAX_INLINE_FINDINGS = 12
 INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
 INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
 _FINDING_ID = re.compile(r"(?:Blocker|Nit)[1-9][0-9]*")
+_FINDING_HEADING = re.compile(r"^###\s+((?:Blocker|Nit)[1-9][0-9]*)\b", re.MULTILINE)
+_MARKDOWN_HEADING = re.compile(r"^(#{1,3})\s+", re.MULTILINE)
+_EMPTY_FINDING_GROUP = re.compile(
+    r"^##\s+(?:Blocking issues|Non-blocking notes)\s*\n(?=\s*(?:##\s|\Z))",
+    re.IGNORECASE | re.MULTILINE,
+)
 _HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
 )
@@ -86,9 +93,12 @@ machine-readable block:
 
 Include entries for up to {MAX_INLINE_FINDINGS} Blocker/Nit findings, prioritizing
 blockers and then the most useful notes. Findings omitted from this block remain
-in the collapsed review. Use IDs matching `{_FINDING_ID.pattern}` (for example,
-`Blocker1` or `Nit1`) and do not add an entry for the Summary. Use the repository-relative
-path with no backticks. Use {INLINE_FINDING_SIDES[1]} and the head-file line
+in the collapsed review. Start every human-readable finding on its own Markdown
+heading matching `### BlockerN` or `### NitN`, using the same ID in this block.
+Keep the Summary to an overall assessment rather than repeating finding details.
+Use IDs matching `{_FINDING_ID.pattern}` (for example, `Blocker1` or `Nit1`) and
+do not add an entry for the Summary. Use the repository-relative path with no
+backticks. Use {INLINE_FINDING_SIDES[1]} and the head-file line
 number for additions or context; use {INLINE_FINDING_SIDES[0]} and the base-file
 line number only for deleted lines. The location must occur in the supplied
 unified diff. Use an empty findings list when there are no findings. Do not wrap
@@ -155,15 +165,23 @@ def build_review_payload(
     diff: str,
     head_sha: str,
     run_url: str,
-) -> tuple[dict[str, Any], list[str]]:
-    """Build a non-blocking review and return labels for findings not attached."""
+    history: Any = None,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Build a non-blocking review and classify unmapped and duplicate findings."""
     if re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
         raise ValueError("head SHA must be a 40-character lowercase hex value")
 
     allowed_positions = diff_positions(diff)
     comments: list[dict[str, Any]] = []
     unmapped: list[str] = []
+    duplicates: list[str] = []
     seen_ids: set[str] = set()
+    review_ids = set(_FINDING_HEADING.findall(review))
+    prior_comments = {
+        (comment["path"], canonical_finding_body(comment["body"]))
+        for comment in previous_inline_comments(history)
+    }
+    omitted_ids: set[str] = set()
 
     for index, finding in enumerate(findings, start=1):
         try:
@@ -176,9 +194,17 @@ def build_review_payload(
             continue
         seen_ids.add(finding_id)
 
+        if finding_id not in review_ids:
+            unmapped.append(finding_id)
+            continue
+        if (path, canonical_finding_body(body)) in prior_comments:
+            duplicates.append(finding_id)
+            omitted_ids.add(finding_id)
+            continue
         if (path, line, side) not in allowed_positions:
             unmapped.append(finding_id)
             continue
+        omitted_ids.add(finding_id)
         comments.append(
             {
                 "path": path,
@@ -190,13 +216,38 @@ def build_review_payload(
 
     return (
         {
-            "body": _format_review_body(review, run_url, collapsed=True),
+            "body": _format_review_body(
+                _remove_finding_sections(review, omitted_ids),
+                run_url,
+                collapsed=True,
+            ),
             "commit_id": head_sha,
             "event": "COMMENT",
             "comments": comments,
         },
         unmapped,
+        duplicates,
     )
+
+
+def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
+    """Remove finding sections that are published inline or already present."""
+    if not finding_ids:
+        return review
+
+    headings = list(_MARKDOWN_HEADING.finditer(review))
+    ranges: list[tuple[int, int]] = []
+    for index, heading in enumerate(headings):
+        finding = _FINDING_HEADING.match(review, heading.start())
+        if finding is None or finding.group(1) not in finding_ids:
+            continue
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(review)
+        ranges.append((heading.start(), end))
+
+    for start, end in reversed(ranges):
+        review = review[:start] + review[end:]
+    review = _EMPTY_FINDING_GROUP.sub("", review)
+    return review.strip()
 
 
 def _diff_path(value: str) -> str | None:
@@ -256,19 +307,25 @@ def main() -> None:
     parser.add_argument("--diff", required=True, type=Path)
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--run-url", required=True)
+    parser.add_argument("--history", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--unmapped-output", required=True, type=Path)
+    parser.add_argument("--duplicate-output", required=True, type=Path)
     args = parser.parse_args()
 
-    payload, unmapped = build_review_payload(
+    payload, unmapped, duplicates = build_review_payload(
         review=args.review.read_text(),
         findings=json.loads(args.findings.read_text()),
         diff=args.diff.read_text(errors="replace"),
         head_sha=args.head_sha,
         run_url=args.run_url,
+        history=json.loads(args.history.read_text()),
     )
     args.output.write_text(json.dumps(payload))
     args.unmapped_output.write_text("\n".join(unmapped) + ("\n" if unmapped else ""))
+    args.duplicate_output.write_text(
+        "\n".join(duplicates) + ("\n" if duplicates else "")
+    )
 
 
 if __name__ == "__main__":

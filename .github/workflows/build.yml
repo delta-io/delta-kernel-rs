@@ -70,7 +70,7 @@ jobs:
         run: >-
           python3 -m unittest discover
           --start-directory .github/omnigent/tests
-          --pattern test_inline_review.py
+          --pattern 'test_*.py'
 
   format:
     runs-on: ubuntu-latest
