@@ -364,15 +364,15 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 
         let buffer_size = io_config.buffer_size.unwrap_or(DEFAULT_READ_BUFFER_SIZE);
         let batch_size = io_config.batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
-        let mut json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
+        let json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
             .with_batch_size(batch_size);
         #[cfg(feature = "geo-type-in-dev")]
-        {
-            if let Some(geometry) = geometry.clone() {
-                json = json.with_geometry_representation(geometry);
-            }
-        }
+        let json = if let Some(geometry) = geometry.clone() {
+            json.with_geometry_representation(geometry)
+        } else {
+            json
+        };
         let parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
             .with_batch_size(batch_size);

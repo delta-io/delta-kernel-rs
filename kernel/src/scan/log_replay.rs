@@ -1181,6 +1181,18 @@ mod tests {
         ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
     use crate::actions::get_commit_schema;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::arrow::array::{ArrayRef, AsArray, BinaryBuilder, StringArray};
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::engine::arrow_conversion::{GeometryArrowRepresentation, GeometryStatsBuilder};
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::engine::arrow_data::ArrowEngineData;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::engine::sync::json::SyncJsonHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
@@ -1190,7 +1202,7 @@ mod tests {
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::log_replay::ActionsBatch;
+    use crate::log_replay::{ActionsBatch, LogReplayProcessor};
     use crate::log_segment::CheckpointReadInfo;
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
@@ -1204,9 +1216,15 @@ mod tests {
     };
     use crate::scan::PhysicalPredicate;
     use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{GeometryType, PrimitiveType};
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::unit_test_utils::string_array_to_engine_data;
     use crate::{DeltaResult, Expression as Expr, ExpressionRef};
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
@@ -1250,6 +1268,152 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
+    struct TestGeometryRepresentation;
+
+    #[cfg(feature = "geo-type-in-dev")]
+    impl GeometryArrowRepresentation for TestGeometryRepresentation {
+        fn geometry_field(
+            &self,
+            name: &str,
+            _geometry: &GeometryType,
+            nullable: bool,
+            metadata: HashMap<String, String>,
+        ) -> Result<ArrowField, crate::arrow::error::ArrowError> {
+            Ok(ArrowField::new(name, ArrowDataType::Binary, nullable).with_metadata(metadata))
+        }
+
+        fn stats_builder(
+            &self,
+            _geometry: &GeometryType,
+            field: &ArrowField,
+            capacity: usize,
+        ) -> DeltaResult<Box<dyn GeometryStatsBuilder>> {
+            assert_eq!(field.data_type(), &ArrowDataType::Binary);
+            Ok(Box::new(TestGeometryStatsBuilder {
+                builder: BinaryBuilder::with_capacity(capacity, 0),
+            }))
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    struct TestGeometryStatsBuilder {
+        builder: BinaryBuilder,
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    impl GeometryStatsBuilder for TestGeometryStatsBuilder {
+        fn append_wkt(&mut self, raw: &str) -> DeltaResult<()> {
+            self.builder.append_value(raw.as_bytes());
+            Ok(())
+        }
+
+        fn append_null(&mut self) -> DeltaResult<()> {
+            self.builder.append_null();
+            Ok(())
+        }
+
+        fn finish(mut self: Box<Self>) -> DeltaResult<ArrayRef> {
+            Ok(Arc::new(self.builder.finish()))
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    struct GeometryEngine {
+        inner: SyncEngine,
+        evaluation: Arc<ArrowEvaluationHandler>,
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    impl GeometryEngine {
+        fn new() -> Self {
+            Self {
+                inner: SyncEngine::new(),
+                evaluation: Arc::new(ArrowEvaluationHandler::with_geometry_representation(
+                    Arc::new(TestGeometryRepresentation),
+                )),
+            }
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    impl Engine for GeometryEngine {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+            self.evaluation.clone()
+        }
+
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+            self.inner.storage_handler()
+        }
+
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
+            self.inner.json_handler()
+        }
+
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+            self.inner.parquet_handler()
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    fn geometry_type(crs: &str) -> DataType {
+        PrimitiveType::Geometry(Box::new(GeometryType::try_new(crs).unwrap())).into()
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    fn nested_geometry_stats_schema() -> SchemaRef {
+        schema_ref! {
+            nullable "numRecords": LONG,
+            nullable "nullCount": {
+                nullable "nested": {
+                    nullable "geom": LONG,
+                },
+            },
+            nullable "minValues": {
+                nullable "nested": {
+                    nullable "geom": (geometry_type("EPSG:4326")),
+                },
+            },
+            nullable "maxValues": {
+                nullable "nested": {
+                    nullable "geom": (geometry_type("EPSG:4326")),
+                },
+            },
+            nullable "tightBounds": BOOLEAN,
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    fn add_batch_with_nested_geometry_stats() -> Box<ArrowEngineData> {
+        let stats = serde_json::json!({
+            "numRecords": 1,
+            "nullCount": { "nested": { "geom": 0 } },
+            "minValues": { "nested": { "geom": "POINT(-122.419 37.774)" } },
+            "maxValues": { "nested": { "geom": "POINT(-122.418 37.775)" } },
+            "tightBounds": true
+        })
+        .to_string();
+        let action = serde_json::json!({
+            "add": {
+                "path": "part-00000.snappy.parquet",
+                "partitionValues": {},
+                "size": 635,
+                "modificationTime": 1677811178336_i64,
+                "dataChange": true,
+                "stats": stats
+            }
+        })
+        .to_string();
+        let handler = SyncJsonHandler::new(None);
+        let parsed = handler
+            .parse_json(
+                string_array_to_engine_data(StringArray::from_iter_values([action])),
+                get_commit_schema().clone(),
+            )
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    }
+
     // dv-info is more complex to validate, we validate that works in the test for visit_scan_files
     // in state.rs
     fn validate_simple(_: &mut (), scan_file: ScanFile) {
@@ -1289,6 +1453,61 @@ mod tests {
             (),
             validate_simple,
         );
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_commit_transform_parse_json_uses_geometry_provider() {
+        let engine = GeometryEngine::new();
+        let logical_schema = schema_ref! {
+            nullable "nested": {
+                nullable "geom": (geometry_type("EPSG:4326")),
+            },
+        };
+        let state_info = Arc::new(StateInfo {
+            logical_schema: logical_schema.clone(),
+            physical_schema: logical_schema,
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schema: Some(nested_geometry_stats_schema()),
+            physical_partition_schema: None,
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: false,
+        });
+        let mut processor = ScanLogReplayProcessor::new(
+            &engine,
+            state_info,
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+
+        let scan_metadata = processor
+            .process_actions_batch(ActionsBatch::new(
+                add_batch_with_nested_geometry_stats() as _,
+                true,
+            ))
+            .unwrap();
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        assert_eq!(selection_vector, vec![true]);
+
+        let batch: crate::arrow::record_batch::RecordBatch =
+            ArrowEngineData::try_from_engine_data(underlying_data)
+                .unwrap()
+                .into();
+        let stats_parsed = batch.column_by_name("stats_parsed").unwrap().as_struct();
+        let min_values = stats_parsed
+            .column_by_name("minValues")
+            .unwrap()
+            .as_struct();
+        let nested = min_values.column_by_name("nested").unwrap().as_struct();
+        let geom = nested.column_by_name("geom").unwrap();
+        assert_eq!(geom.data_type(), &ArrowDataType::Binary);
+        assert_eq!(geom.as_binary::<i32>().value(0), b"POINT(-122.419 37.774)");
     }
 
     #[test]
