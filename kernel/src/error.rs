@@ -91,6 +91,102 @@ pub type DeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + 
 /// reference borrowed data.
 pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
 
+/// An error validating connector-provided state for snapshot construction.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SnapshotHintError {
+    /// A hint was combined with a log tail.
+    #[error("Invalid snapshot hint: A snapshot hint cannot be combined with a log tail")]
+    LogTail,
+    /// A hint was combined with incremental CRC replay.
+    #[error(
+        "Invalid snapshot hint: A snapshot hint cannot be combined with incremental CRC replay"
+    )]
+    IncrementalReplay,
+    /// The builder requested a version different from the hint's version.
+    #[error(
+        "Invalid snapshot hint: Requested version {requested} does not match snapshot hint version {hint}"
+    )]
+    VersionMismatch {
+        /// The version requested from the snapshot builder.
+        requested: Version,
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
+    /// The maximum catalog version differs from the hint when no time-travel version was
+    /// requested.
+    #[error(
+        "Invalid snapshot hint: Max catalog version {max_catalog_version} does not match snapshot \
+         hint version {hint}"
+    )]
+    MaxCatalogVersionMismatch {
+        /// The maximum version ratified by the catalog.
+        max_catalog_version: Version,
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
+    /// A hint marked latest conflicts with a later catalog-ratified version.
+    #[error(
+        "Invalid snapshot hint: version {hint} is marked latest but max catalog version is {max_catalog_version}"
+    )]
+    LatestVersionConflict {
+        /// The version described by the snapshot hint.
+        hint: Version,
+        /// The latest version ratified by the catalog.
+        max_catalog_version: Version,
+    },
+    /// The supplied log files contain log compaction files, which snapshot hints do not support.
+    #[error("Invalid snapshot hint: log compaction files are not supported")]
+    LogCompaction,
+    /// The supplied log files cannot form a valid log segment.
+    #[error("Invalid snapshot hint: supplied log files do not form a valid log segment")]
+    LogSegment {
+        /// The log-segment construction error.
+        #[source]
+        source: Box<Error>,
+    },
+    /// The hint includes a published version after its snapshot version.
+    #[error("Invalid snapshot hint: max_published_version exceeds snapshot hint version {hint}")]
+    MaxPublishedVersion {
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
+    /// The hint has neither a complete checkpoint nor commit version zero.
+    #[error("Invalid snapshot hint: snapshot history does not start at version 0")]
+    MissingHistoryAnchor,
+    /// The supplied CRC describes a different table version.
+    #[error(
+        "Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}"
+    )]
+    CrcVersion {
+        /// The version described by the CRC.
+        crc: Version,
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
+    /// The supplied CRC protocol differs from the hint protocol.
+    #[error("Invalid snapshot hint: CRC protocol does not match snapshot hint protocol")]
+    CrcProtocol,
+    /// The supplied CRC metadata differs from the hint metadata.
+    #[error("Invalid snapshot hint: CRC metadata does not match snapshot hint metadata")]
+    CrcMetadata,
+    /// A connector reported invalid snapshot-hint state, optionally with an underlying error.
+    #[error("Invalid snapshot hint: {message}")]
+    Connector {
+        /// A description of the invalid connector state.
+        message: String,
+        /// The underlying validation error, if available.
+        #[source]
+        source: Option<Box<Error>>,
+    },
+}
+
+impl From<SnapshotHintError> for Error {
+    fn from(error: SnapshotHintError) -> Self {
+        Box::new(error).into()
+    }
+}
+
 /// All the types of errors that the kernel can run into
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
@@ -298,6 +394,12 @@ pub enum Error {
     /// version bounds. Malformed checkpoint file sets use [`Error::InvalidCheckpoint`].
     #[error("Invalid log segment: {0}")]
     InvalidLogSegment(String),
+
+    /// Snapshot-hint validation failed. Log-segment errors caused by supplied hint state,
+    /// including invalid paths and checkpoints, are wrapped in `SnapshotHintError::LogSegment`.
+    /// Failures outside hint validation retain their existing categories.
+    #[error(transparent)]
+    SnapshotHint(#[from] Box<SnapshotHintError>),
 
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]

@@ -248,7 +248,6 @@ pub struct Transaction<S = ExistingTable> {
     column_defaults_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
-    #[cfg(feature = "row-tracking-preservation-in-dev")]
     row_tracking_preservation_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
@@ -362,19 +361,12 @@ impl<S> Transaction<S> {
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
 
-        #[cfg(feature = "row-tracking-preservation-in-dev")]
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
         // that accompany copied or updated rows, so both require the preservation acknowledgment.
         if !self.remove_files_metadata.is_empty() || self.num_dv_updates > 0 {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;
             self.ensure_row_tracking_preservation_acknowledged()?;
-        }
-
-        #[cfg(not(feature = "row-tracking-preservation-in-dev"))]
-        if !self.remove_files_metadata.is_empty() {
-            self.effective_table_config
-                .validate_feature_support_for_remove()?;
         }
 
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
@@ -457,13 +449,24 @@ impl<S> Transaction<S> {
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
-        let kernel_commit_info = CommitInfo::new(
+        let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
         );
+
+        // Kernel requires every commit on an existing Row Tracking-enabled table to preserve
+        // Stable Row IDs and Stable Row Commit Versions, so it always emits true. CREATE TABLE has
+        // no existing Row Tracking state to preserve and therefore omits the flag.
+        if !self.is_create_table()
+            && self
+                .effective_table_config
+                .is_feature_enabled(&TableFeature::RowTracking)
+        {
+            kernel_commit_info.set_row_tracking_preserved();
+        }
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions based on emit flags
@@ -640,17 +643,23 @@ impl<S> Transaction<S> {
 
     /// Set the content of the commitInfo action for this transaction. Note that kernel will
     /// _always_ write a commitInfo, this function simply allows engines to add their own data
-    /// into that action if they wish. Note that the following fields in `engine_commit_info`
-    /// will be overridden by kernel if they are set (meaning you should not set them):
-    /// - timestamp
-    /// - inCommitTimestamp
-    /// - operation
-    /// - operationParameters
-    /// - operationMetrics
-    /// - kernelVersion
-    /// - isBlindAppend
-    /// - engineInfo
-    /// - txnId
+    /// into that action if they wish. Kernel overrides the following fields if they are set in
+    /// `engine_commit_info`, so connectors should not set them:
+    ///
+    /// - `timestamp`
+    /// - `inCommitTimestamp`
+    /// - `operation`
+    /// - `operationParameters`
+    /// - `operationMetrics`
+    /// - `kernelVersion`
+    /// - `isBlindAppend`
+    /// - `engineInfo`
+    /// - `txnId`
+    ///
+    /// Kernel merges the following field if it is set:
+    ///
+    /// - `tags`: When a connector tag has the same key as a Kernel-provided tag, Kernel's value
+    ///   takes precedence. Otherwise, the connector-provided tag is preserved.
     pub fn with_commit_info(
         mut self,
         engine_commit_info: Box<dyn EngineData>,
@@ -872,7 +881,6 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    #[cfg(feature = "row-tracking-preservation-in-dev")]
     fn ensure_row_tracking_preservation_acknowledged(&self) -> DeltaResult<()> {
         if !self
             .effective_table_config
@@ -1208,21 +1216,23 @@ impl<S> Transaction<S> {
     )> {
         // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
         // for writers to assign row IDs.
-        let row_tracking_supported = self.effective_table_config.should_write_row_tracking();
+        let assign_fresh_row_tracking_metadata = self
+            .effective_table_config
+            .should_assign_fresh_row_tracking_metadata();
 
         if self.add_files_metadata.is_empty() {
             // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
             // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
             // have a valid starting point. For all other empty commits (metadata-only, etc.),
             // nothing row-tracking-related needs to be written.
-            let row_tracking_dm = (row_tracking_supported && self.is_create_table())
+            let row_tracking_dm = (assign_fresh_row_tracking_metadata && self.is_create_table())
                 .then(RowTrackingDomainMetadata::initial);
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
         let commit_version = version_as_i64(commit_version)?;
 
-        if row_tracking_supported {
+        if assign_fresh_row_tracking_metadata {
             self.generate_adds_with_row_tracking(engine, commit_version)
         } else {
             let add_actions = build_add_actions(
@@ -1345,7 +1355,8 @@ impl<S> Transaction<S> {
                     log_segment,
                     self.effective_table_config,
                     Some(Arc::new(crc)),
-                    true, /* built_as_latest */
+                    true,  /* built_as_latest */
+                    false, /* skipped_new_checkpoints */
                 )?;
                 (stats, Arc::new(snapshot))
             }

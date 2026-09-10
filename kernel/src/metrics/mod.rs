@@ -89,8 +89,8 @@ pub use events::{
     LogSegmentLoadType, MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
     ProtocolMetadataLoadSuccess, ProtocolMetadataSource, ScanMetadataCompleted, ScanType,
     SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess,
-    SnapshotLoadMetricContext, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
-    TableType, TransactionCommitFailure, TransactionCommitSuccess,
+    SnapshotLoadMetricContext, SnapshotLoadType, StorageCopyCompleted, StorageListCompleted,
+    StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,
 };
 pub(crate) use events::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,

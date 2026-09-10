@@ -206,6 +206,7 @@ impl LogSegment {
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
     ) -> DeltaResult<Self> {
+        validate_log_path_fields(&listed_files)?;
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
         validate_commit_file_types(&listed_files.ascending_commit_files)?;
@@ -1558,12 +1559,29 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
     Ok(())
 }
 
+fn validate_log_path_fields(listed_files: &LogSegmentFiles) -> DeltaResult<()> {
+    for path in listed_files.iter_all_paths() {
+        let reparsed = ParsedLogPath::try_from(path.location.clone())?
+            .ok_or_else(|| Error::invalid_log_path(path.location.location.as_str()))?;
+        require!(
+            reparsed == *path,
+            Error::invalid_log_path(format!(
+                "Parsed log path fields do not match its location: {}",
+                path.location.location
+            ))
+        );
+    }
+    Ok(())
+}
+
 fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
     if parts.is_empty() {
         return Ok(());
     }
     let n = parts.len();
     let first_version = parts[0].version;
+    // TODO(#3297): Validate multi-part checkpoint part-number range and uniqueness, and require
+    // more than one part.
     for p in parts {
         if !p.is_checkpoint() {
             return Err(Error::invalid_checkpoint(
@@ -1619,7 +1637,12 @@ fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> DeltaResult<()> {
 
 fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for pair in commits.windows(2) {
-        let expected_version = pair[0].version + 1;
+        let Some(expected_version) = pair[0].version.checked_add(1) else {
+            return Err(Error::invalid_log_segment(format!(
+                "Expected contiguous commit files, but the version after {:?} overflows",
+                pair[0]
+            )));
+        };
         if expected_version != pair[1].version {
             return Err(Error::MissingVersion(expected_version));
         }
@@ -1637,7 +1660,12 @@ fn validate_checkpoint_commit_gap(
     commits: &[ParsedLogPath],
 ) -> DeltaResult<()> {
     if let (Some(checkpoint_version), Some(first_commit)) = (checkpoint_version, commits.first()) {
-        let expected_version = checkpoint_version + 1;
+        let Some(expected_version) = checkpoint_version.checked_add(1) else {
+            return Err(Error::invalid_checkpoint(format!(
+                "checkpoint version {checkpoint_version} is the maximum supported version and \
+                 cannot have a subsequent commit"
+            )));
+        };
         require!(
             expected_version == first_commit.version,
             Error::MissingVersion(expected_version)
@@ -1683,6 +1711,8 @@ fn validate_latest_commit_file(
     listed: &LogSegmentFiles,
     effective_version: Version,
 ) -> DeltaResult<()> {
+    // TODO(#3293): Determine whether every non-empty commit list can require `latest_commit_file`;
+    // legacy callers may omit it.
     require!(
         listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
         Error::internal_error(
@@ -1711,6 +1741,10 @@ fn validate_crc(
     let Some(crc) = crc else {
         return Ok(());
     };
+    require!(
+        crc.file_type == LogPathFileType::Crc,
+        Error::invalid_log_path("latest_crc_file contains a non-CRC path")
+    );
     if let Some(checkpoint_version) = checkpoint_version {
         require!(
             crc.version >= checkpoint_version,
