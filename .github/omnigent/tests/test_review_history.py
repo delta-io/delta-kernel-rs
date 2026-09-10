@@ -153,6 +153,18 @@ class ReviewHistoryTest(unittest.TestCase):
 
         self.assertEqual(module.previous_inline_comments(document)[0]["side"], "LEFT")
 
+    def test_inline_dedup_fails_open_without_rest_side_metadata(self) -> None:
+        module = _load_module()
+        document = _document()
+        comment = document["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0][
+            "comments"
+        ]["nodes"][0]
+        comment.pop("side")
+
+        module.attach_inline_comment_sides(document, [])
+
+        self.assertEqual(module.previous_inline_comments(document), [])
+
     def test_empty_history_document_is_supported(self) -> None:
         module = _load_module()
 

@@ -798,7 +798,11 @@ jobs:
 
           sys.path.insert(0, ".github/omnigent")
           from inline_review import inline_prompt_instructions
-          from review_history import attach_inline_comment_sides, format_review_history
+          from review_history import (
+              DEFAULT_TRUSTED_BOT_LOGINS,
+              attach_inline_comment_sides,
+              format_review_history,
+          )
           from review_policy import KNOWN_ISSUE_POLICY, PREVIOUS_REVIEW_POLICY
 
           max_diff_bytes = 80_000
@@ -818,7 +822,7 @@ jobs:
           )
           attach_inline_comment_sides(history_document, review_comments)
           history_path.write_text(json.dumps(history_document))
-          trusted_bot_logins = ["github-actions"]
+          trusted_bot_logins = list(DEFAULT_TRUSTED_BOT_LOGINS)
           if omnigent_bot_login := os.environ.get("OMNIGENT_BOT_LOGIN", "").strip():
               trusted_bot_logins.append(omnigent_bot_login)
           pathlib.Path("/tmp/trusted_bot_logins.json").write_text(
