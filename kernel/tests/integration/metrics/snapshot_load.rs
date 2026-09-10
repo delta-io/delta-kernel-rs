@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
+#[cfg(feature = "internal-api")]
+use delta_kernel::crc::Crc;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::metrics::SnapshotLoadType;
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -75,6 +77,51 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> DeltaResult<()> {
         ),
         1
     );
+    Ok(())
+}
+
+#[cfg(feature = "internal-api")]
+#[test]
+fn external_snapshot_hint_accepts_parsed_advanced_crc() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(2).with_crc_at([1]))
+        .with_data(1, 1)
+        .build()?;
+    let (engine, reporter, _guard) = measuring_engine(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(&engine)?;
+    assert_eq!(
+        snapshot
+            .log_segment()
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .unwrap()
+            .version,
+        1
+    );
+    let crc_bytes = serde_json::to_vec(snapshot.crc_at_version().unwrap())?;
+    let parsed_crc = Arc::new(Crc::try_from_json_bytes(&crc_bytes, snapshot.version())?);
+    let hint = SnapshotHint {
+        version: snapshot.version(),
+        log_segment_files: snapshot.log_segment().listed.clone(),
+        protocol: snapshot.table_configuration().protocol().clone(),
+        metadata: snapshot.table_configuration().metadata().clone(),
+        last_checkpoint_hint: snapshot.log_segment().checkpoint_hint().cloned(),
+        crc: Some(parsed_crc),
+        freshness: SnapshotHintFreshness::Latest,
+    };
+    reporter.reset();
+
+    let hinted = Snapshot::builder_for(table.table_root())
+        .with_snapshot_hint(hint)
+        .build(&engine)?;
+
+    assert_eq!(hinted.crc_at_version().unwrap().version, hinted.version());
+    assert_eq!(reporter.list_calls.get(), 0);
+    assert_eq!(reporter.json_read_calls.get(), 0);
+    assert_eq!(reporter.parquet_read_calls.get(), 0);
     Ok(())
 }
 

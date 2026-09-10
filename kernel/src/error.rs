@@ -95,9 +95,6 @@ pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SnapshotHintError {
-    /// A hint was supplied while updating an existing snapshot.
-    #[error("Invalid snapshot hint: A snapshot hint cannot be used with Snapshot::builder_from")]
-    ExistingSnapshot,
     /// A hint was combined with a log tail.
     #[error("Invalid snapshot hint: A snapshot hint cannot be combined with a log tail")]
     LogTail,
@@ -113,6 +110,18 @@ pub enum SnapshotHintError {
     VersionMismatch {
         /// The version requested from the snapshot builder.
         requested: Version,
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
+    /// The maximum catalog version differs from the hint when no time-travel version was
+    /// requested.
+    #[error(
+        "Invalid snapshot hint: Max catalog version {max_catalog_version} does not match snapshot \
+         hint version {hint}"
+    )]
+    MaxCatalogVersionMismatch {
+        /// The maximum version ratified by the catalog.
+        max_catalog_version: Version,
         /// The version described by the snapshot hint.
         hint: Version,
     },

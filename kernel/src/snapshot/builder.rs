@@ -207,6 +207,28 @@ impl SnapshotBuilder<FromTableRoot> {
             mode: PhantomData,
         }
     }
+
+    /// Supply complete snapshot state that Kernel can validate and construct without engine I/O.
+    ///
+    /// The hint conflicts with [`with_log_tail`](Self::with_log_tail) and non-disabled incremental
+    /// CRC replay. An explicit [`at_version`](Self::at_version) must equal the hint version. When
+    /// no explicit version is set, a supplied maximum catalog version must also equal the hint
+    /// version. Kernel validates structural consistency without reading the supplied files. The
+    /// caller must ensure every path belongs to this builder's table root, the protocol and
+    /// metadata came from those files, and `max_published_version` accurately describes the
+    /// published commit prefix.
+    ///
+    /// # Errors
+    ///
+    /// [`build`](Self::build) returns [`Error::SnapshotHint`] for hint conflicts and hinted
+    /// log-segment validation failures. Catalog-version, table-root URI, protocol, and metadata
+    /// failures retain their normal error variants.
+    #[allow(dead_code)]
+    #[internal_api]
+    pub(crate) fn with_snapshot_hint(mut self, hint: SnapshotHint) -> Self {
+        self.snapshot_hint = Some(hint);
+        self
+    }
 }
 
 impl SnapshotBuilder<FromSnapshot> {
@@ -324,28 +346,6 @@ impl<Mode> SnapshotBuilder<Mode> {
         self
     }
 
-    /// Supply complete snapshot state that Kernel can validate and construct without engine I/O.
-    ///
-    /// The hint conflicts with [`with_log_tail`](Self::with_log_tail),
-    /// [`builder_from`](Snapshot::builder_from), and non-disabled incremental CRC replay. An
-    /// explicit [`at_version`](Self::at_version) must equal the hint version. When no explicit
-    /// version is set, a supplied maximum catalog version must also equal the hint version.
-    /// Kernel validates structural consistency without reading the supplied files. The caller must
-    /// ensure every path belongs to this builder's table root, the protocol and metadata came from
-    /// those files, and `max_published_version` accurately describes the published commit prefix.
-    ///
-    /// # Errors
-    ///
-    /// [`build`](Self::build) returns [`Error::SnapshotHint`] for hint-specific conflicts or
-    /// inconsistencies. General builder, path, protocol, and metadata failures retain their normal
-    /// error variants.
-    #[allow(dead_code)]
-    #[internal_api]
-    pub(crate) fn with_snapshot_hint(mut self, hint: SnapshotHint) -> Self {
-        self.snapshot_hint = Some(hint);
-        self
-    }
-
     /// Attach an opaque, caller-supplied correlation id for joining this build's metric events to
     /// the caller's own request or operation id. An empty id is treated as unset. When unset,
     /// behavior is unchanged.
@@ -421,7 +421,6 @@ impl<Mode> SnapshotBuilder<Mode> {
         let snapshot = if let Some(snapshot_hint) = snapshot_hint {
             Self::build_from_snapshot_hint(
                 table_root,
-                existing_snapshot,
                 version,
                 log_tail,
                 max_catalog_version,
@@ -494,17 +493,12 @@ impl<Mode> SnapshotBuilder<Mode> {
 
     fn build_from_snapshot_hint(
         table_root: Option<String>,
-        existing_snapshot: Option<SnapshotRef>,
         requested_version: Option<Version>,
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
         snapshot_hint: SnapshotHint,
     ) -> DeltaResult<SnapshotRef> {
-        require!(
-            existing_snapshot.is_none(),
-            SnapshotHintError::ExistingSnapshot.into()
-        );
         require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
         require!(
             incremental_replay.is_disabled(),
@@ -522,11 +516,11 @@ impl<Mode> SnapshotBuilder<Mode> {
         } else if let Some(max_catalog_version) = max_catalog_version {
             require!(
                 max_catalog_version == snapshot_hint.version,
-                Error::MaxCatalogVersion(format!(
-                    "Max catalog version {max_catalog_version} does not match snapshot hint \
-                     version {}",
-                    snapshot_hint.version
-                ))
+                SnapshotHintError::MaxCatalogVersionMismatch {
+                    max_catalog_version,
+                    hint: snapshot_hint.version,
+                }
+                .into()
             );
         }
 
@@ -546,7 +540,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         } = snapshot_hint;
         if freshness == SnapshotHintFreshness::Latest {
             require!(
-                max_catalog_version.is_none_or(|max| max == version),
+                max_catalog_version.is_none_or(|max| max <= version),
                 SnapshotHintError::LatestVersionConflict {
                     hint: version,
                     max_catalog_version: max_catalog_version.unwrap_or(version),
@@ -897,8 +891,8 @@ mod tests {
         Ok((engine, table_root, snapshot, hint))
     }
 
-    fn assert_hint_error<Mode>(
-        builder: SnapshotBuilder<Mode>,
+    fn assert_hint_error(
+        builder: SnapshotBuilder<FromTableRoot>,
         hint: SnapshotHint,
         engine: &dyn Engine,
         expected: &str,
@@ -1263,12 +1257,6 @@ mod tests {
             engine.as_ref(),
             "cannot be combined with a log tail",
         );
-        assert_hint_error(
-            SnapshotBuilder::new_from(snapshot),
-            hint.clone(),
-            engine.as_ref(),
-            "cannot be used with Snapshot::builder_from",
-        );
         let zero_budget = SnapshotBuilder::new_for(&table_root)
             .with_incremental_crc_replay(IncrementalReplay::UpToCommits(0))
             .with_snapshot_hint(hint.clone())
@@ -1294,7 +1282,7 @@ mod tests {
             .with_max_catalog_version(hint.version + 1)
             .with_snapshot_hint(hint)
             .build(engine.as_ref());
-        assert!(matches!(&result, Err(Error::MaxCatalogVersion(_))));
+        assert!(matches!(&result, Err(Error::SnapshotHint(_))));
         assert_result_error_with_message(result, "does not match snapshot hint version");
         let events = reporter.events();
         assert_eq!(events.len(), 1);
@@ -1351,6 +1339,12 @@ mod tests {
                 .build(engine.as_ref()),
             "Max catalog version is required",
         );
+        assert_hint_error(
+            SnapshotBuilder::new_for(&table_root).with_max_catalog_version(2),
+            hint.clone(),
+            engine.as_ref(),
+            "Max catalog version 2 does not match snapshot hint version 1",
+        );
         let latest = SnapshotBuilder::new_for(&table_root)
             .with_max_catalog_version(1)
             .with_snapshot_hint(hint.clone())
@@ -1358,7 +1352,16 @@ mod tests {
         assert_eq!(latest.version(), 1);
         assert!(!latest.is_built_as_latest());
 
-        let hinted = SnapshotBuilder::new_for(table_root)
+        let mut lower_bound_hint = hint.clone();
+        lower_bound_hint.freshness = SnapshotHintFreshness::Latest;
+        let result = SnapshotBuilder::new_for(&table_root)
+            .at_version(1)
+            .with_max_catalog_version(0)
+            .with_snapshot_hint(lower_bound_hint)
+            .build(engine.as_ref());
+        assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+
+        let hinted = SnapshotBuilder::new_for(&table_root)
             .at_version(1)
             .with_max_catalog_version(2)
             .with_snapshot_hint(hint)
@@ -1766,6 +1769,28 @@ mod tests {
         }
 
         #[test_log::test(tokio::test)]
+        async fn snapshot_hint_accepts_staged_commit_with_catalog_version(
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let actions = actions_to_string(vec![TestAction::Add("file_1.parquet".to_string())]);
+            let staged_path = add_staged_commit(&table_root, store.as_ref(), 1, actions).await?;
+            let source = SnapshotBuilder::new_for(&table_root)
+                .with_log_tail(vec![create_log_path(&table_root, staged_path)])
+                .with_max_catalog_version(1)
+                .build(engine.as_ref())?;
+            let hint = hint_from_snapshot(&source, SnapshotHintFreshness::Latest);
+
+            let hinted = SnapshotBuilder::new_for(table_root)
+                .with_max_catalog_version(1)
+                .with_snapshot_hint(hint)
+                .build(engine.as_ref())?;
+
+            assert_eq!(hinted.version(), 1);
+            assert!(hinted.is_built_as_latest());
+            Ok(())
+        }
+
+        #[test_log::test(tokio::test)]
         async fn test_version_exceeds_max_catalog_version_errors(
         ) -> Result<(), Box<dyn std::error::Error>> {
             let (engine, _store, table_root) = setup_catalog_managed_test().await;
@@ -1916,6 +1941,7 @@ mod tests {
         #[case::gap(vec![1, 3], vec![1, 3], 3)]
         #[case::duplicates(vec![1], vec![1, 1], 1)]
         #[case::unsorted(vec![1, 2], vec![2, 1], 2)]
+        #[case::overflow(vec![], vec![Version::MAX, 0], 0)]
         #[test_log::test(tokio::test)]
         async fn test_non_contiguous_log_tail_errors(
             #[case] commit_versions: Vec<u64>,

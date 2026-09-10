@@ -175,6 +175,10 @@ impl Crc {
     /// Returns parsed CRC state after validating its JSON shape, required action counts,
     /// non-negative aggregate statistics, and histogram structure. This does not compare the state
     /// with log replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed JSON or invalid counts, statistics, or histogram fields.
     #[internal_api]
     pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> DeltaResult<Self> {
         let raw: CrcRaw = serde_json::from_slice(bytes)?;
