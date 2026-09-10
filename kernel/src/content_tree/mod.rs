@@ -101,7 +101,7 @@ pub struct TrackingInfo {
     #[field_id = 1]
     pub snapshot_id: Option<i64>,
 
-    /// Snapshot ID in which this entry's deletion vector last changed. Set on Modified entries.
+    /// Snapshot ID in which this entry's deletion vector last changed.
     #[field_id = 5]
     pub(crate) dv_snapshot_id: Option<i64>,
 
@@ -284,7 +284,6 @@ pub enum TrackingStatus {
     Added = 1,
     Deleted = 2,
     Replaced = 3,
-    Modified = 4,
 }
 
 impl ToDataType for TrackingStatus {
