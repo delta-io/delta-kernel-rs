@@ -4,6 +4,9 @@
 //! snapshot creation, scans, and transactions. Metrics are collected during operations
 //! and reported as events via the `MetricsReporter` trait.
 //!
+//! [`FrameReporterLayer`] separately reports dynamic enter/exit notifications for tracing spans
+//! that opt in with [`ENABLE_CALL_FRAME_FIELD`]. It does not create or modify [`MetricEvent`]s.
+//!
 //! Each operation (Snapshot, Transaction, Scan) is assigned a unique operation ID ([`MetricId`])
 //! when it starts, and all subsequent events for that operation reference this ID.
 //! This allows reporters to correlate events and track operation lifecycles.
@@ -73,6 +76,7 @@
 //! [`Engine`]: crate::Engine
 
 pub(crate) mod events;
+mod frame_reporter;
 mod metered_engine;
 mod metered_json;
 mod metered_parquet;
@@ -96,6 +100,7 @@ pub(crate) use events::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
     emit_protocol_metadata_load_failure,
 };
+pub use frame_reporter::{FrameReporter, FrameReporterLayer, ENABLE_CALL_FRAME_FIELD};
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_json::MeteredJsonHandler;
 pub use metered_parquet::MeteredParquetHandler;
