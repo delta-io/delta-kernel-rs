@@ -452,6 +452,24 @@ class InlineReviewTest(unittest.TestCase):
         self.assertIn("### Blocker2", remaining)
         self.assertIn("## Summary", remaining)
 
+    def test_removed_finding_preserves_plain_summary_and_drops_empty_group(self) -> None:
+        review = (
+            "No blocking issues.\n\n"
+            "Review overview.\n\n"
+            "Non-blocking notes:\n\n"
+            "### Nit1\n"
+            "Finding published inline.\n\n"
+            "Summary:\n"
+            "Overall assessment."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Nit1"})
+
+        self.assertIn("Review overview.", remaining)
+        self.assertNotIn("Non-blocking notes", remaining)
+        self.assertNotIn("Finding published inline", remaining)
+        self.assertIn("Summary:\nOverall assessment.", remaining)
+
     def test_build_payload_keeps_finding_without_matching_heading_in_summary(self) -> None:
         payload, unmapped, duplicates = self.inline_review.build_review_payload(
             review="## Summary\nNit1 needs attention.",

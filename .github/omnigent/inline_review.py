@@ -18,9 +18,13 @@ INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
 _FINDING_ID = re.compile(r"(?:Blocker|Nit)[1-9][0-9]*")
 _FINDING_HEADING = re.compile(r"^###\s+((?:Blocker|Nit)[1-9][0-9]*)\b")
 _MARKDOWN_HEADING = re.compile(r"^(#{1,3})\s+")
+_PLAIN_SECTION_HEADING = re.compile(
+    r"^(?:Blocking issues|Non-blocking notes|Summary)\s*:?\s*$", re.IGNORECASE
+)
 _CODE_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _EMPTY_FINDING_GROUP = re.compile(
-    r"^##\s+(?:Blocking issues|Non-blocking notes)\s*\n(?=\s*(?:##\s|\Z))",
+    r"^(?:##\s+)?(?:Blocking issues|Non-blocking notes)\s*:?\s*\n"
+    r"(?=\s*(?:(?:##\s+)?(?:Blocking issues|Non-blocking notes|Summary)\s*:?\s*$|\Z))",
     re.IGNORECASE | re.MULTILINE,
 )
 _HUNK_HEADER = re.compile(
@@ -275,7 +279,10 @@ def _markdown_headings(review: str) -> list[tuple[int, str]]:
                 fence_length = 0
             offset += len(line)
             continue
-        if fence_character is None and _MARKDOWN_HEADING.match(line) is not None:
+        if fence_character is None and (
+            _MARKDOWN_HEADING.match(line) is not None
+            or _PLAIN_SECTION_HEADING.match(line) is not None
+        ):
             headings.append((offset, line))
         offset += len(line)
     return headings
