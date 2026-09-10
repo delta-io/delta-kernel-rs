@@ -95,8 +95,17 @@ void print_table_type(TableType tt) {
   }
 }
 
-// utility to print out a log-segment load type
-void print_load_type(LogSegmentLoadType lt) {
+void print_load_type(SnapshotLoadType lt) {
+  printf("  load_type:");
+  switch (lt) {
+  case SnapshotLoadTypeFull: printf(" Full,\n"); break;
+  case SnapshotLoadTypeIncremental: printf(" Incremental,\n"); break;
+  case SnapshotLoadTypeSnapshotHint: printf(" SnapshotHint,\n"); break;
+  case SnapshotLoadTypeUnknown: printf(" Unknown,\n"); break;
+  }
+}
+
+void print_log_segment_load_type(LogSegmentLoadType lt) {
   printf("  load_type:");
   switch (lt) {
   case LogSegmentLoadTypeFull: printf(" Full,\n"); break;
@@ -121,7 +130,7 @@ void print_metric(MetricEvent event) {
     PM_ID(lsls, operation_id);
     PM_SLICE(lsls, correlation_id);
     print_table_type(lsls.table_type);
-    print_load_type(lsls.load_type);
+    print_log_segment_load_type(lsls.load_type);
     PM_U64(lsls, duration_ns);
     PM_U64(lsls, num_commit_files);
     PM_U64(lsls, num_checkpoint_files);
@@ -137,7 +146,7 @@ void print_metric(MetricEvent event) {
     PM_ID(lslf, operation_id);
     PM_SLICE(lslf, correlation_id);
     print_table_type(lslf.table_type);
-    print_load_type(lslf.load_type);
+    print_log_segment_load_type(lslf.load_type);
     PM_END;
     return;
 
@@ -147,7 +156,7 @@ void print_metric(MetricEvent event) {
     PM_ID(pmls, operation_id);
     PM_SLICE(pmls, correlation_id);
     print_table_type(pmls.table_type);
-    print_load_type(pmls.load_type);
+    print_log_segment_load_type(pmls.load_type);
     PM_U64(pmls, duration_ns);
     PM_END;
     return;
@@ -158,7 +167,7 @@ void print_metric(MetricEvent event) {
     PM_ID(pmlf, operation_id);
     PM_SLICE(pmlf, correlation_id);
     print_table_type(pmlf.table_type);
-    print_load_type(pmlf.load_type);
+    print_log_segment_load_type(pmlf.load_type);
     PM_END;
     return;
 

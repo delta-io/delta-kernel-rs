@@ -49,6 +49,7 @@ extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
 
+pub mod column_default;
 pub mod commit_range;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
@@ -1274,21 +1275,50 @@ pub unsafe extern "C" fn snapshot_builder_build(
 }
 
 fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handle<SharedSnapshot>> {
-    let engine = builder.engine.engine();
-    let mut rust_builder = match builder.source {
-        FfiSnapshotBuilderSource::TableRoot(url) => Snapshot::builder_for(url),
-        FfiSnapshotBuilderSource::ExistingSnapshot(snap) => Snapshot::builder_from(snap),
-    };
-    if let Some(v) = builder.version {
-        rust_builder = rust_builder.at_version(v);
+    let FfiSnapshotBuilder {
+        engine,
+        source,
+        version,
+        log_tail,
+        max_catalog_version,
+    } = builder;
+    let engine = engine.engine();
+
+    fn build<Mode>(
+        mut builder: delta_kernel::snapshot::SnapshotBuilder<Mode>,
+        engine: &dyn Engine,
+        version: Option<Version>,
+        log_tail: Vec<LogPath>,
+        max_catalog_version: Option<Version>,
+    ) -> DeltaResult<SnapshotRef> {
+        if let Some(version) = version {
+            builder = builder.at_version(version);
+        }
+        if !log_tail.is_empty() {
+            builder = builder.with_log_tail(log_tail);
+        }
+        if let Some(max_catalog_version) = max_catalog_version {
+            builder = builder.with_max_catalog_version(max_catalog_version);
+        }
+        builder.build(engine)
     }
-    if !builder.log_tail.is_empty() {
-        rust_builder = rust_builder.with_log_tail(builder.log_tail);
-    }
-    if let Some(mcv) = builder.max_catalog_version {
-        rust_builder = rust_builder.with_max_catalog_version(mcv);
-    }
-    let snapshot = rust_builder.build(engine.as_ref())?;
+
+    let snapshot = match source {
+        FfiSnapshotBuilderSource::TableRoot(url) => build(
+            Snapshot::builder_for(url),
+            engine.as_ref(),
+            version,
+            log_tail,
+            max_catalog_version,
+        ),
+        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => build(
+            Snapshot::builder_from(snapshot),
+            engine.as_ref(),
+            version,
+            log_tail,
+            max_catalog_version,
+        ),
+    }?;
     Ok(snapshot.into())
 }
 
@@ -2182,7 +2212,11 @@ mod tests {
             snapshot_builder_set_version(&mut ptr, 1);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, Some("Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1"));
+        assert_extern_result_error_with_message(
+            snapshot_at_non_existent_version,
+            KernelError::MissingVersionError,
+            Some("Table version 1 is missing or unavailable for this log operation."),
+        );
 
         let snapshot_table_root_str =
             unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
@@ -3213,7 +3247,7 @@ mod tests {
             KernelError::GenericError,
             Some(concat!(
                 "Max catalog version error: Max catalog version is required when providing ",
-                "staged commits in the log tail. ",
+                "staged commits. ",
                 "Use with_max_catalog_version()."
             )),
         );
@@ -3648,7 +3682,11 @@ mod tests {
             snapshot_builder_set_version(&mut ptr, 99);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::MissingVersionError,
+            Some("Table version 1 is missing or unavailable for this log operation."),
+        );
 
         unsafe { free_engine(engine) }
         Ok(())

@@ -15,8 +15,10 @@ pub(crate) use column_mapping::{
 use delta_kernel_derive::internal_api;
 #[cfg(feature = "geo-type-in-dev")]
 pub(crate) use geospatial::validate_geospatial_feature_support;
-pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
-pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
+pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::{
+    validate_iceberg_compat_if_needed, IcebergCompatValidationContext,
+};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -369,12 +371,9 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-// TODO(#2538): Currently we reject `Transaction::commit` when it contains staged remove-file
-// actions on RowTracking-supported (and not-suspended) tables because
-//   1. kernel does not yet materialize stable row IDs / commit versions on write, which blocks COW
-//      rewrites,
-//   2. kernel does not yet validate if remove actions correctly reserved row IDs / commit versions.
-// Unblock after both 1 and 2 are supported.
+// Row Tracking rewrites require connectors to preserve stable row metadata. Kernel records the
+// connector acknowledgment but does not validate materialized values. IcebergCompatV3 removals
+// remain unsupported.
 //
 // TODO: When kernel writes the materialized `row_id` / `row_commit_version` columns, they must
 // use the reserved parquet field IDs defined by the protocol on IcebergCompatV3 tables, not
@@ -446,10 +445,10 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 ///
 /// Spec: <https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md>
 ///
-/// TODO: Implement the write-side requirements for IcebergCompatV3.
+/// TODO(#2492): Implement the schema-evolution requirements for IcebergCompatV3.
 /// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
 ///
-/// Attention in the future:
+/// Requirements to enforce when the corresponding write paths are supported:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
 ///   tables.
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
@@ -563,35 +562,25 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-/// TODO: When type widening is supported on writes, restrict the allowed
-/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg v3
-/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
-            "Feature 'typeWidening' is not supported for writes",
-        )),
-    }),
+    // TODO(#2492): When type widening is supported on ALTER TABLE, restrict the allowed widenings
+    // on IcebergCompatV3 tables to the subset permitted by Iceberg V3 schema-evolution rules.
+    // Ref: <https://iceberg.apache.org/spec/#schema-evolution>
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
-/// TODO: When type widening is supported on writes, restrict the allowed
-/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg
-/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
-            "Feature 'typeWidening-preview' is not supported for writes",
-        )),
-    }),
+    // TODO(#2492): When type widening is supported on ALTER TABLE, restrict the allowed widenings
+    // on IcebergCompatV3 tables to the subset permitted by Iceberg V3 schema-evolution rules.
+    // Ref: <https://iceberg.apache.org/spec/#schema-evolution>
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 

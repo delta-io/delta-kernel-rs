@@ -21,7 +21,9 @@ use crate::log_replay::{
     ParallelLogReplayProcessor,
 };
 use crate::log_segment::CheckpointReadInfo;
-use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::scan::transform_spec::{
+    get_transform_expr, parse_partition_values, FileRowTrackingMetadata, TransformSpec,
+};
 use crate::schema::{
     lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
@@ -78,13 +80,17 @@ struct InternalScanState {
     partition_values_options: ScanPartitionValuesOptions,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
-    /// Physical leaf paths which are expected to have stats collected. Carried alongside
+    /// Physical leaf paths eligible for data skipping. Carried alongside
     /// `physical_stats_schema` so the distributed `DataSkippingFilter` rebuilds the same
     /// filter the sequential phase used. `#[serde(default)]` keeps older blobs readable:
     /// an empty set drops every data-column reference, which means no skipping but is
     /// still correct.
     #[serde(default)]
-    physical_stats_columns: HashSet<ColumnName>,
+    eligible_physical_stats_columns: HashSet<ColumnName>,
+    /// Caller-requested physical stats columns preserved across distributed log replay.
+    /// `serde(default)` accepts serialized representations that omit this field.
+    #[serde(default)]
+    requested_physical_stats_columns: Vec<ColumnName>,
     #[serde(default)]
     is_catalog_managed: bool,
     skip_row_transforms: bool,
@@ -183,14 +189,17 @@ struct RetryTransformAndDataSkipOutput {
 
 impl ScanLogReplayProcessor {
     // These index positions correspond to the order of columns defined in
-    // `selected_column_names_and_types()`
+    // `AddRemoveDedupVisitor::selected_column_names_and_types()`
     const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
     const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
     const ADD_SIZE_INDEX: usize = 2; // Position of "add.size" in getters
     const ADD_DV_START_INDEX: usize = 3; // Start position of add deletion vector columns
     const BASE_ROW_ID_INDEX: usize = 6; // Position of add.baseRowId in getters
-    const REMOVE_PATH_INDEX: usize = 7; // Position of "remove.path" in getters
-    const REMOVE_DV_START_INDEX: usize = 8; // Start position of remove deletion vector columns
+
+    // Position of add.defaultRowCommitVersion in getters
+    const DEFAULT_ROW_COMMIT_VERSION_INDEX: usize = 7;
+    const REMOVE_PATH_INDEX: usize = 8; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 9; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
     pub(crate) fn new(
@@ -297,7 +306,7 @@ impl ScanLogReplayProcessor {
                 // exactly for Add rows.
                 Arc::new(Predicate::is_not_null(col!("path")).into()),
                 output_schema.clone(),
-                &state_info.physical_stats_columns,
+                &state_info.eligible_physical_stats_columns,
                 Some(metrics.clone()),
             )
         };
@@ -376,7 +385,8 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             physical_partition_schema,
-            physical_stats_columns,
+            eligible_physical_stats_columns,
+            requested_physical_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
         } = self.state_info.as_ref().clone();
@@ -398,7 +408,8 @@ impl ScanLogReplayProcessor {
             stats_options: self.stats_options,
             partition_values_options: self.partition_values_options,
             physical_partition_schema,
-            physical_stats_columns,
+            eligible_physical_stats_columns,
+            requested_physical_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
         };
@@ -457,7 +468,8 @@ impl ScanLogReplayProcessor {
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
-            physical_stats_columns: internal_state.physical_stats_columns,
+            eligible_physical_stats_columns: internal_state.eligible_physical_stats_columns,
+            requested_physical_stats_columns: internal_state.requested_physical_stats_columns,
             is_catalog_managed: internal_state.is_catalog_managed,
             skip_row_transforms: internal_state.skip_row_transforms,
         });
@@ -599,15 +611,19 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // action type:
         // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
         //   3-5
-        // - For Remove actions (in log batches only): path is at index 7, followed by DV fields at
-        //   indexes 8-10
+        // - For Remove actions (in log batches only): path is at index 8, followed by DV fields at
+        //   indexes 9-11
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.
         let is_log_batch = self.deduplicator.is_log_batch();
         if !selected {
-            // Data-skipping predicates keep non-Add rows, so an unselected row is an Add. Count it
-            // without constructing the deduplication key that the predicate made unnecessary.
+            // Data-skipping predicates keep non-Add rows, so an unselected row is an Add. We
+            // don't put it into dedup in favor of performance and memory.
+
+            // TODO(#2945): A stats update can cause the newest Add to be pruned before
+            // deduplication, allowing an older Add for the same file to survive. We should
+            // fix the problem.
             self.metrics.record_add_file_seen(is_log_batch);
             return Ok(false);
         }
@@ -658,6 +674,9 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         if !self.state_info.skip_row_transforms {
             let base_row_id: Option<i64> =
                 getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
+            let default_row_commit_version: Option<i64> = getters
+                [ScanLogReplayProcessor::DEFAULT_ROW_COMMIT_VERSION_INDEX]
+                .get_opt(row, "add.defaultRowCommitVersion")?;
             let patch_expr = self
                 .state_info
                 .transform_spec
@@ -667,7 +686,10 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
                         transform_spec,
                         partition_values,
                         &self.state_info.physical_schema,
-                        base_row_id,
+                        FileRowTrackingMetadata {
+                            base_row_id,
+                            default_row_commit_version,
+                        },
                     )
                 })
                 .transpose()?;
@@ -698,6 +720,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
                 (LONG, column_name!("add.baseRowId")),
+                (LONG, column_name!("add.defaultRowCommitVersion")),
                 (STRING, column_name!("remove.path")),
                 (STRING, column_name!("remove.deletionVector.storageType")),
                 (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
@@ -721,7 +744,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let start = std::time::Instant::now();
 
         let is_log_batch = self.deduplicator.is_log_batch();
-        let expected_getters = if is_log_batch { 11 } else { 7 };
+        let expected_getters = if is_log_batch { 12 } else { 8 };
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
@@ -1171,11 +1194,12 @@ mod tests {
     use crate::log_segment::CheckpointReadInfo;
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
-        assert_transform_spec, get_simple_state_info, get_state_info, ROW_TRACKING_FEATURES,
+        assert_transform_spec, get_simple_state_info, get_state_info, RowTrackingState,
+        ROW_TRACKING_FEATURES,
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
-        add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
+        add_batch_for_row_tracking, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
@@ -1279,7 +1303,8 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         });
@@ -1394,7 +1419,7 @@ mod tests {
             "row_indexes_for_row_id_0",
         );
 
-        let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
+        let batch = vec![add_batch_for_row_tracking(get_commit_schema().clone())];
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
@@ -1433,6 +1458,63 @@ mod tests {
                 panic!("Should have been a StructPatch expression");
             }
         }
+    }
+
+    #[rstest]
+    #[case::supported_not_enabled(RowTrackingState::SupportedNotEnabled)]
+    #[case::enabled(RowTrackingState::Enabled)]
+    #[case::suspended(RowTrackingState::Suspended)]
+    fn test_row_commit_version_patch(
+        #[case] row_tracking_state: RowTrackingState,
+    ) -> DeltaResult<()> {
+        let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            row_tracking_state.features(),
+            row_tracking_state.properties(),
+            vec![("row_commit_version", MetadataColumnSpec::RowCommitVersion)],
+        );
+        if row_tracking_state != RowTrackingState::Enabled {
+            assert_result_error_with_message(
+                state_info,
+                "Row commit versions are not enabled on this table",
+            );
+            return Ok(());
+        }
+
+        let batch = add_batch_for_row_tracking(get_commit_schema().clone());
+        let (iter, _metrics) = scan_action_iter(
+            &SyncEngine::new(),
+            [Ok(ActionsBatch::new(batch, true))].into_iter(),
+            Arc::new(state_info?),
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )?;
+
+        let mut iter = iter.peekable();
+        assert!(iter.peek().is_some(), "scan metadata must not be empty");
+        for scan_metadata in iter {
+            let transforms = scan_metadata?.scan_file_transforms;
+            assert_eq!(transforms.len(), 1);
+            let Some(Expr::StructPatch(patch)) = transforms[0].as_ref().map(Arc::as_ref) else {
+                panic!("Expected a StructPatch expression");
+            };
+            let row_commit_version_patch = patch
+                .field_patches
+                .get("row_commit_version_col")
+                .expect("Should have row_commit_version_col patch");
+            assert_eq!(
+                row_commit_version_patch.insertions,
+                [Arc::new(Expr::coalesce([
+                    col!("row_commit_version_col"),
+                    lit(5i64),
+                ]))]
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -1606,7 +1688,8 @@ mod tests {
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
                 physical_partition_schema: None,
-                physical_stats_columns: HashSet::new(),
+                eligible_physical_stats_columns: HashSet::new(),
+                requested_physical_stats_columns: Vec::new(),
                 is_catalog_managed: false,
                 skip_row_transforms: false,
             });
@@ -1642,7 +1725,8 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         });
@@ -1674,7 +1758,8 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: true,
             skip_row_transforms: false,
         });
@@ -1706,7 +1791,8 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: skip,
         });
@@ -1756,7 +1842,8 @@ mod tests {
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         };
@@ -1788,7 +1875,8 @@ mod tests {
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
         };

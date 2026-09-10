@@ -2000,7 +2000,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         (
             "row_commit_version",
             MetadataColumnSpec::RowCommitVersion,
-            "Row commit versions not supported",
+            "Row commit versions are not enabled on this table",
         ),
     ];
 
@@ -2169,7 +2169,7 @@ fn checkpoint_stats_skipping(
 // schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
 // Cross-product covers all five checkpoint variants against four stats option
 // shapes: ScanFile.stats should be populated via the COALESCE/ToJson fallback
-// when both `json=true` and `struct_stats=All` are set; otherwise null on these
+// when both `json=true` and `struct_stats=AllIndexed` are set; otherwise null on these
 // struct-stats-only checkpoints.
 #[rstest::rstest]
 #[case::default_json_only(StatsOptions::default(), false)]

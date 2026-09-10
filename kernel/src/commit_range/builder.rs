@@ -10,8 +10,8 @@ use crate::{DeltaResult, Engine, Error, Version};
 ///
 /// Created via [`CommitRange::builder_for`] (path-based) or
 /// [`CommitRange::builder_from`] (snapshot-based). Supports configuring an end version
-/// and the commit ordering. [`Self::build`] performs delta-log listing and contiguity
-/// validation.
+/// and the commit ordering. [`Self::build`] lists the log for a path-based builder or reuses the
+/// commit-file metadata in a snapshot-based builder, then validates contiguity.
 // TODO(#2781): support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
 // `with_max_catalog_version(self, Version)`
 pub struct CommitRangeBuilder {
@@ -57,12 +57,14 @@ impl CommitRangeBuilder {
         self
     }
 
-    /// List `_delta_log/`, validate contiguity, and produce a [`CommitRange`]. Performs
-    /// filesystem listing but no JSON reads.
+    /// Resolve commit-file metadata, validate contiguity, and produce a [`CommitRange`]. A
+    /// path-based builder lists `_delta_log/`; a snapshot-based builder reuses the snapshot's log
+    /// segment. Neither path reads commit JSON.
     ///
-    /// Returns an error if the resolved version range is invalid (start > end), the
-    /// listed commits are non-contiguous, or the requested start version is not present
-    /// on the filesystem.
+    /// Returns [`Error::MissingVersion`] if a snapshot-derived range requires a commit that is not
+    /// available in the snapshot's log segment. Returns an error if the resolved version range is
+    /// invalid (start > end), the listed commits are non-contiguous, or the requested start version
+    /// is not present on the filesystem.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
@@ -80,15 +82,12 @@ impl CommitRangeBuilder {
             )?,
         };
 
-        let end_version = end_version.unwrap_or(log_segment.end_version);
-
-        // Snapshot-derived ranges can't extend past the snapshot version.
-        if self.snapshot.is_some() && end_version > log_segment.end_version {
-            return Err(Error::generic(format!(
-                "end_version ({end_version}) cannot exceed snapshot version ({})",
-                log_segment.end_version
-            )));
+        // Preserve invalid-input errors for an explicitly reversed range. When no end was
+        // supplied, a start beyond a snapshot is an availability error instead.
+        if let Some(end_version) = end_version {
+            validate_version_range(start_version, end_version)?;
         }
+        let end_version = end_version.unwrap_or(log_segment.end_version);
 
         // Snapshot's log segment may extend past [start, end]; filter to the requested range.
         let mut commit_files: Vec<ParsedLogPath> = log_segment
@@ -98,9 +97,11 @@ impl CommitRangeBuilder {
             .filter(|f| f.version >= start_version && f.version <= end_version)
             .collect();
 
-        validate_version_range(start_version, end_version)?;
         if self.snapshot.is_some() {
             validate_start_version_available(start_version, commit_files.first())?;
+            if end_version > log_segment.end_version {
+                return Err(Error::MissingVersion(log_segment.end_version + 1));
+            }
         }
         validate_number_of_commit_files(start_version, end_version, commit_files.len())?;
 
@@ -151,13 +152,7 @@ fn validate_start_version_available(
     if first_commit.map(|f| f.version) == Some(start_version) {
         return Ok(());
     }
-    let earliest_available_commit = first_commit
-        .map(|f| f.version)
-        .ok_or_else(|| Error::generic("snapshot's log segment must have at least one commit"))?;
-    Err(Error::generic(format!(
-        "start_version {start_version} is not available in the snapshot's log segment \
-         (earliest available commit: {earliest_available_commit})",
-    )))
+    Err(Error::MissingVersion(start_version))
 }
 
 fn validate_number_of_commit_files(
@@ -225,24 +220,13 @@ mod tests {
         assert_eq!(range.end_version(), snapshot_version);
     }
 
-    /// Snapshot-based ranges must reject any version that lands past the snapshot's
-    /// version. Both the start-past-snapshot and end-past-snapshot cases surface as a
-    /// generic error before the iterator is constructed.
     #[rstest::rstest]
-    #[case::start_past_snapshot_version(
-        5,
-        None,
-        &["start_version (5)", "end_version"],
-    )]
-    #[case::end_past_snapshot_version(
-        0,
-        Some(99),
-        &["99", "snapshot"],
-    )]
-    fn test_build_errors_on_version_past_snapshot_version(
+    #[case::start_past_snapshot_version(5, None, 5)]
+    #[case::end_past_snapshot_version(0, Some(99), 2)]
+    fn test_build_snapshot_based_reports_unavailable_version(
         #[case] start: Version,
         #[case] end: Option<Version>,
-        #[case] expected_substrings: &[&str],
+        #[case] expected_missing_version: Version,
     ) {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
@@ -253,13 +237,46 @@ mod tests {
             .fold_with(end, CommitRangeBuilder::with_end_version)
             .build(&engine)
             .expect_err("must error");
-        let msg = format!("{err}");
-        for needle in expected_substrings {
-            assert!(
-                msg.contains(needle),
-                "expected message to contain {needle:?}, got: {msg}",
-            );
-        }
+        assert!(matches!(
+            err,
+            Error::MissingVersion(version) if version == expected_missing_version
+        ));
+    }
+
+    #[test]
+    fn test_build_snapshot_based_preserves_explicit_reversed_range_error() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(table_root.as_str())
+            .build(&engine)
+            .unwrap();
+        let err = CommitRange::builder_from(snapshot, 1)
+            .with_end_version(0)
+            .build(&engine)
+            .expect_err("must error");
+        assert!(matches!(
+            err,
+            Error::Generic(message)
+                if message.contains("start_version (1) must be <= end_version (0)")
+        ));
+    }
+
+    #[test]
+    fn test_build_snapshot_based_reports_start_trimmed_by_checkpoint() {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/with_checkpoint_no_last_checkpoint/",
+        ))
+        .unwrap();
+        let table_root = Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(table_root.as_str())
+            .build(&engine)
+            .unwrap();
+
+        let err = CommitRange::builder_from(snapshot, 1)
+            .build(&engine)
+            .expect_err("commit at version 1 must be unavailable after checkpoint filtering");
+        assert!(matches!(err, Error::MissingVersion(1)));
     }
 
     #[test]

@@ -9,23 +9,146 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
+#[cfg(feature = "internal-api")]
+use delta_kernel::crc::Crc;
 use delta_kernel::engine::to_json_bytes;
+use delta_kernel::metrics::SnapshotLoadType;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::snapshot::IncrementalReplay;
+#[cfg(feature = "internal-api")]
+use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
-use test_utils::{insert_data, test_table_setup, test_table_setup_mt};
+use test_utils::{
+    insert_data, test_table_setup, test_table_setup_mt, CountingReporter, SnapshotCompletionStatus,
+};
 use url::Url;
 
 use super::{
     insert_rows, measuring_engine, setup_table_with_v1_checkpoint, simple_schema, LogState,
     TestTableBuilder,
 };
+
+fn assert_full_snapshot_completed(reporter: &CountingReporter) {
+    assert_eq!(
+        reporter
+            .snapshot_completion_count(SnapshotCompletionStatus::Success, SnapshotLoadType::Full,),
+        1
+    );
+}
+
+#[cfg(feature = "internal-api")]
+#[test]
+fn external_snapshot_hint_api_builds_without_storage_io() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(1))
+        .with_data(1, 1)
+        .build()?;
+    let (engine, reporter, _guard) = measuring_engine(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let hint = SnapshotHint {
+        version: snapshot.version(),
+        log_segment_files: snapshot.log_segment().listed.clone(),
+        protocol: snapshot.table_configuration().protocol().clone(),
+        metadata: snapshot.table_configuration().metadata().clone(),
+        last_checkpoint_hint: snapshot.log_segment().checkpoint_hint().cloned(),
+        crc: snapshot.crc_at_version().cloned(),
+        freshness: SnapshotHintFreshness::Latest,
+    };
+    reporter.reset();
+
+    let hinted = Snapshot::builder_for(table.table_root())
+        .with_snapshot_hint(hint)
+        .build(&engine)?;
+
+    assert_eq!(hinted.version(), snapshot.version());
+    assert_eq!(reporter.list_calls.get(), 0);
+    assert_eq!(reporter.json_read_calls.get(), 0);
+    assert_eq!(reporter.parquet_read_calls.get(), 0);
+    assert_eq!(
+        reporter.snapshot_completion_count(
+            SnapshotCompletionStatus::Success,
+            SnapshotLoadType::SnapshotHint,
+        ),
+        1
+    );
+    Ok(())
+}
+
+#[cfg(feature = "internal-api")]
+#[test]
+fn external_snapshot_hint_accepts_parsed_advanced_crc() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(2).with_crc_at([1]))
+        .with_data(1, 1)
+        .build()?;
+    let (engine, reporter, _guard) = measuring_engine(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(&engine)?;
+    assert_eq!(
+        snapshot
+            .log_segment()
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .unwrap()
+            .version,
+        1
+    );
+    let crc_bytes = serde_json::to_vec(snapshot.crc_at_version().unwrap())?;
+    let parsed_crc = Arc::new(Crc::try_from_json_bytes(&crc_bytes, snapshot.version())?);
+    let hint = SnapshotHint {
+        version: snapshot.version(),
+        log_segment_files: snapshot.log_segment().listed.clone(),
+        protocol: snapshot.table_configuration().protocol().clone(),
+        metadata: snapshot.table_configuration().metadata().clone(),
+        last_checkpoint_hint: snapshot.log_segment().checkpoint_hint().cloned(),
+        crc: Some(parsed_crc),
+        freshness: SnapshotHintFreshness::Latest,
+    };
+    reporter.reset();
+
+    let hinted = Snapshot::builder_for(table.table_root())
+        .with_snapshot_hint(hint)
+        .build(&engine)?;
+
+    assert_eq!(hinted.crc_at_version().unwrap().version, hinted.version());
+    assert_eq!(reporter.list_calls.get(), 0);
+    assert_eq!(reporter.json_read_calls.get(), 0);
+    assert_eq!(reporter.parquet_read_calls.get(), 0);
+    Ok(())
+}
+
+#[test]
+fn incremental_snapshot_build_emits_incremental_completion() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(1))
+        .with_data(1, 1)
+        .build()?;
+    let (engine, reporter, _guard) = measuring_engine(table.store().clone());
+    let base = Snapshot::builder_for(table.table_root())
+        .at_version(0)
+        .build(&engine)?;
+    reporter.reset();
+
+    let snapshot = Snapshot::builder_from(base).build(&engine)?;
+
+    assert_eq!(snapshot.version(), 1);
+    assert_eq!(
+        reporter.snapshot_completion_count(
+            SnapshotCompletionStatus::Success,
+            SnapshotLoadType::Incremental,
+        ),
+        1
+    );
+    Ok(())
+}
 
 // ============================================================================
 // Scenario 1: delta-only (2 commits, no checkpoint, no compaction)
@@ -44,7 +167,7 @@ fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
     let (engine, reporter, _guard) = measuring_engine(table.store().clone());
     let _snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 2);
     assert_eq!(reporter.checkpoint_files.get(), 0);
@@ -87,7 +210,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 1); // only tail commit (v2)
     assert_eq!(reporter.checkpoint_files.get(), 1);
@@ -116,7 +239,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
 
 /// When the latest version has a checkpoint and no subsequent commits exist, the snapshot
 /// has zero commit files and the JSON handler is called with an empty file list.
-/// CommitReader always invokes read_json_files even for an empty commit cover.
+/// read_commit_actions always invokes read_json_files even for an empty commit cover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> {
     let (table_url, _setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;
@@ -124,7 +247,7 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> 
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 0);
     assert_eq!(reporter.checkpoint_files.get(), 1);
@@ -182,7 +305,7 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
     let (engine, reporter, _guard) = measuring_engine(store);
     let _snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     // ascending_commit_files contains all 4 individual .json files (0, 1, 2, 3)
     assert_eq!(reporter.commit_files.get(), 4);
@@ -215,7 +338,7 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
     let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_root).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 1);
     assert_eq!(reporter.checkpoint_files.get(), 0);
@@ -301,7 +424,7 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
         expected_crc_version
     );
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 3); // v0, v1, v2
 
@@ -346,7 +469,7 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_full_snapshot_completed(&reporter);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     // Checkpoint at v1 -- listing starts from v2; tail is v2, v3, v4
     assert_eq!(reporter.commit_files.get(), 3);

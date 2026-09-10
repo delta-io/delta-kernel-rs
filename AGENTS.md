@@ -117,11 +117,11 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
 
-**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `BoundWriteContext`
-(via `partitioned_write_context` or `unpartitioned_write_context`) for local writers. Distributed
-writers can create and transport a `WriteState`, then bind partition values on each writer to get
-a `BoundWriteContext`. Kernel assembles commit actions, enforces protocol compliance, and delegates
-the atomic commit to a `Committer`.
+**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Writers call
+`Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
+`BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
+Kernel assembles commit actions, enforces protocol compliance, and delegates the atomic commit to a
+`Committer`.
 
 **Engine trait:** exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
 `EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing

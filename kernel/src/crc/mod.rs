@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 #[allow(unused)]
 pub(crate) use delta::{merge_domain_metadata, CrcDelta};
+use delta_kernel_derive::internal_api;
 pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
@@ -168,7 +169,17 @@ struct CrcRaw {
 }
 
 impl Crc {
-    /// Parse a `.crc` file body. `version` comes from the filename (the body does not carry it).
+    /// Parses a `.crc` file body for `version`, which comes from the filename because the body does
+    /// not carry it.
+    ///
+    /// Returns parsed CRC state after validating its JSON shape, required action counts,
+    /// non-negative aggregate statistics, and histogram structure. This does not compare the state
+    /// with log replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed JSON or invalid counts, statistics, or histogram fields.
+    #[internal_api]
     pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> DeltaResult<Self> {
         let raw: CrcRaw = serde_json::from_slice(bytes)?;
         // Per the Delta protocol spec, numMetadata and numProtocol MUST be 1 in any CRC file.
@@ -180,6 +191,16 @@ impl Crc {
             if value != 1 {
                 return Err(Error::generic(format!(
                     "CRC file has invalid {name}: expected 1, got {value}"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("numFiles", raw.num_files),
+            ("tableSizeBytes", raw.table_size_bytes),
+        ] {
+            if value < 0 {
+                return Err(Error::generic(format!(
+                    "CRC file has invalid {name}: expected a non-negative value, got {value}"
                 )));
             }
         }
@@ -267,13 +288,25 @@ where
 {
     let opt: Option<FileSizeHistogram> = Option::deserialize(deserializer)?;
     match opt {
-        Some(hist) => FileSizeHistogram::try_new(
-            hist.sorted_bin_boundaries,
-            hist.file_counts,
-            hist.total_bytes,
-        )
-        .map(Some)
-        .map_err(serde::de::Error::custom),
+        Some(hist) => {
+            if let Some(bin) = hist
+                .file_counts
+                .iter()
+                .zip(&hist.total_bytes)
+                .position(|(count, bytes)| *count < 0 || *bytes < 0)
+            {
+                return Err(serde::de::Error::custom(format!(
+                    "CRC fileSizeHistogram has negative counts or bytes at bin {bin}"
+                )));
+            }
+            FileSizeHistogram::try_new(
+                hist.sorted_bin_boundaries,
+                hist.file_counts,
+                hist.total_bytes,
+            )
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+        }
         None => Ok(None),
     }
 }
@@ -656,11 +689,16 @@ mod tests {
 
     /// Minimal CRC JSON with the supplied numMetadata / numProtocol values; used to construct
     /// invalid CRCs and verify rejection.
-    fn crc_json_with_counts(num_metadata: i64, num_protocol: i64) -> String {
+    fn crc_json_with_counts(
+        table_size_bytes: i64,
+        num_files: i64,
+        num_metadata: i64,
+        num_protocol: i64,
+    ) -> String {
         format!(
             r#"{{
-                "tableSizeBytes": 0,
-                "numFiles": 0,
+                "tableSizeBytes": {table_size_bytes},
+                "numFiles": {num_files},
                 "numMetadata": {num_metadata},
                 "numProtocol": {num_protocol},
                 "metadata": {{
@@ -687,13 +725,57 @@ mod tests {
         #[values(0i64, 2, 3, -1)] bad: i64,
     ) {
         let (m, p) = counts(bad);
-        let json = crc_json_with_counts(m, p);
+        let json = crc_json_with_counts(0, 0, m, p);
         let err = Crc::try_from_json_bytes(json.as_bytes(), 0)
             .unwrap_err()
             .to_string();
         assert!(
             err.contains(field),
             "expected error to mention {field} for value {bad}, got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::num_files("numFiles", 0, -1)]
+    #[case::table_size_bytes("tableSizeBytes", -1, 0)]
+    fn de_negative_file_stat_is_rejected(
+        #[case] field: &str,
+        #[case] table_size_bytes: i64,
+        #[case] num_files: i64,
+    ) {
+        let json = crc_json_with_counts(table_size_bytes, num_files, 1, 1);
+        let err = Crc::try_from_json_bytes(json.as_bytes(), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(field),
+            "expected error to mention {field}: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::file_count("fileCounts", vec![-1, 0], vec![0, 0])]
+    #[case::total_bytes("totalBytes", vec![0, 0], vec![0, -1])]
+    fn de_negative_file_size_histogram_stat_is_rejected(
+        #[case] field: &str,
+        #[case] file_counts: Vec<i64>,
+        #[case] total_bytes: Vec<i64>,
+    ) {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(0, 0, 1, 1)).unwrap();
+        crc["fileSizeHistogram"] = serde_json::json!({
+            "sortedBinBoundaries": [0, 1],
+            "fileCounts": file_counts,
+            "totalBytes": total_bytes,
+        });
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            error.to_string().contains("negative counts or bytes"),
+            "expected invalid {field}, got {error}"
+        );
+        assert!(
+            !error.to_string().contains("kernel bug"),
+            "malformed external data must not be reported as a kernel bug: {error}"
         );
     }
 

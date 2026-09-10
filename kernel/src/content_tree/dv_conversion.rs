@@ -373,7 +373,7 @@ mod tests {
             let row = vec![self.root_scalar(dv_schema.clone(), dv)];
             SyncEngine::new()
                 .evaluation_handler()
-                .create_many(self.schema(dv_schema), &[row.as_slice()])
+                .create_many(self.schema(dv_schema), vec![row])
                 .unwrap()
         }
 
@@ -392,10 +392,9 @@ mod tests {
                     vec![self.root_scalar(dv_schema.clone(), scalar)]
                 })
                 .collect();
-            let row_refs: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
             SyncEngine::new()
                 .evaluation_handler()
-                .create_many(self.schema(dv_schema), &row_refs)
+                .create_many(self.schema(dv_schema), rows)
                 .unwrap()
         }
 
