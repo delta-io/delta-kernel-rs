@@ -14,7 +14,7 @@ use crate::content_tree::{
     FIRST_ROW_ID, FORMAT_VERSION, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER,
     TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
 };
-use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
+use crate::engine_data::{EngineData, FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, ColumnName, Expression};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PATH_NAME, SIZE_NAME, STATS_NAME,
@@ -109,7 +109,9 @@ static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(
 /// - `snapshot_id`: the AMT snapshot id the files are added in; stored in each entry's tracking.
 ///
 /// # Returns
-/// An [`EngineData`] batch matching [`ContentTreeNodeEntry::to_schema`].
+/// A [`FilteredEngineData`] whose batch matches [`ContentTreeNodeEntry::to_schema`], with every row
+/// selected (each input file produces exactly one live entry). The selection is carried explicitly
+/// so this path is symmetric with the AMT read path ([`super::reader`]), which drops rows.
 ///
 /// # Errors
 /// Returns an error if a row's required `stats.numRecords`, `baseRowId`, or
@@ -119,7 +121,7 @@ pub(crate) fn convert_append_metadata_to_entry_batch(
     engine: &dyn Engine,
     write_metadata: &dyn EngineData,
     snapshot_id: i64,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> DeltaResult<FilteredEngineData> {
     // Row tracking guarantees these are assigned, but the evaluator does not enforce the input
     // schema's non-nullability, so a missing assignment would otherwise emit a root entry with a
     // null sequence/firstRowId (invalid for a root manifest). Reject it up front.
@@ -147,7 +149,8 @@ pub(crate) fn convert_append_metadata_to_entry_batch(
         Arc::new(expr),
         DataType::from(output_schema),
     )?;
-    evaluator.evaluate(write_metadata)
+    let entries = evaluator.evaluate(write_metadata)?;
+    Ok(FilteredEngineData::with_all_rows_selected(entries))
 }
 
 // === Helpers ===
@@ -393,6 +396,16 @@ mod tests {
         }
     }
 
+    /// Unwraps a [`FilteredEngineData`] to its batch, asserting the write path selected every row.
+    fn all_selected_data(filtered: FilteredEngineData) -> Box<dyn EngineData> {
+        let (data, selection) = filtered.into_parts();
+        assert!(
+            selection.iter().all(|&selected| selected),
+            "write path must select every entry, got {selection:?}"
+        );
+        data
+    }
+
     #[test]
     fn convert_append_metadata_to_entry_batch_produces_added_data_entries() {
         let engine = SyncEngine::new();
@@ -400,12 +413,14 @@ mod tests {
         let files = [("a.parquet", 100, 10, 0, 5), ("b.parquet", 200, 20, 10, 5)];
         let snapshot_id = 42;
 
-        let out = convert_append_metadata_to_entry_batch(
-            &engine,
-            write_metadata_input(&engine, &files).as_ref(),
-            snapshot_id,
-        )
-        .unwrap();
+        let out = all_selected_data(
+            convert_append_metadata_to_entry_batch(
+                &engine,
+                write_metadata_input(&engine, &files).as_ref(),
+                snapshot_id,
+            )
+            .unwrap(),
+        );
         let expected = expected_entries(&engine, &files, snapshot_id);
 
         assert_eq!(
@@ -421,12 +436,14 @@ mod tests {
         // Pins the current contract: `location` carries the raw path byte-for-byte.
         let engine = SyncEngine::new();
         let files = [(path, 1, 1, 0, 0)];
-        let out = convert_append_metadata_to_entry_batch(
-            &engine,
-            write_metadata_input(&engine, &files).as_ref(),
-            0,
-        )
-        .unwrap();
+        let out = all_selected_data(
+            convert_append_metadata_to_entry_batch(
+                &engine,
+                write_metadata_input(&engine, &files).as_ref(),
+                0,
+            )
+            .unwrap(),
+        );
         assert_eq!(
             out.try_into_record_batch().unwrap(),
             expected_entries(&engine, &files, 0)
@@ -476,10 +493,11 @@ mod tests {
     fn write_metadata_output_schema_matches_entry_schema() {
         let engine = SyncEngine::new();
         let input = write_metadata_input(&engine, &[("a.parquet", 1, 1, 0, 0)]);
-        let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0)
-            .unwrap()
-            .try_into_record_batch()
-            .unwrap();
+        let out = all_selected_data(
+            convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0).unwrap(),
+        )
+        .try_into_record_batch()
+        .unwrap();
 
         let expected = (&ContentTreeNodeEntry::to_schema())
             .try_into_arrow()
@@ -491,7 +509,9 @@ mod tests {
     fn convert_append_metadata_to_entry_batch_empty_input_yields_empty_batch() {
         let engine = SyncEngine::new();
         let input = write_metadata_input(&engine, &[]);
-        let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0).unwrap();
+        let out = all_selected_data(
+            convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0).unwrap(),
+        );
         assert_eq!(out.len(), 0);
     }
 
