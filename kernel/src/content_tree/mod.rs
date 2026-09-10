@@ -143,9 +143,9 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 134]
     pub content_type: DataContentType,
 
-    /// Location of the file. Required for most content types.
+    /// Location of the file.
     #[field_id = 100]
-    pub location: Option<String>,
+    pub location: String,
 
     /// File format of the entry: `parquet` for data files or `puffin` for deletion vectors (the
     /// only formats kernel supports). See [`DataFileFormat`].
@@ -178,9 +178,9 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 103]
     pub(crate) record_count: i64,
 
-    /// Total file size in bytes. Must be defined if location is defined
+    /// Total file size in bytes.
     #[field_id = 104]
-    pub(crate) file_size_in_bytes: Option<i64>,
+    pub(crate) file_size_in_bytes: i64,
 
     /// Column-level statistics for the data file.
     /// The schema of this struct is dynamically generated based on the table schema
