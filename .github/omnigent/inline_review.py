@@ -219,13 +219,13 @@ def build_review_payload(
             continue
         seen_ids.add(finding_id)
 
+        if (path, line, side) not in allowed_positions:
+            unmapped.append(finding_id)
+            continue
         if (path, line, side, canonical_finding_body(body)) in prior_comments:
             duplicates.append(finding_id)
             if finding_id in review_ids:
                 omitted_ids.add(finding_id)
-            continue
-        if (path, line, side) not in allowed_positions:
-            unmapped.append(finding_id)
             continue
         if finding_id in review_ids:
             omitted_ids.add(finding_id)
@@ -405,6 +405,24 @@ def _validate_finding(finding: Any) -> tuple[str, str, int, str, str]:
     return finding_id, path, line, side, body.strip()
 
 
+def _load_history(path: Path) -> Any:
+    """Load review history, falling back to no history when it is unavailable."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _load_trusted_bot_logins(path: Path) -> list[str]:
+    """Load the workflow-owned bot allowlist, rejecting malformed input."""
+    trusted_bot_logins = json.loads(path.read_text())
+    if not isinstance(trusted_bot_logins, list) or not all(
+        isinstance(login, str) for login in trusted_bot_logins
+    ):
+        raise ValueError("trusted bot logins must be a JSON array of strings")
+    return trusted_bot_logins
+
+
 def main() -> None:
     """Build a GitHub review request from workflow-owned files."""
     parser = argparse.ArgumentParser()
@@ -421,12 +439,8 @@ def main() -> None:
     parser.add_argument("--skip-duplicate-review-output", required=True, type=Path)
     args = parser.parse_args()
 
-    history = json.loads(args.history.read_text())
-    trusted_bot_logins = json.loads(args.trusted_bot_logins.read_text())
-    if not isinstance(trusted_bot_logins, list) or not all(
-        isinstance(login, str) for login in trusted_bot_logins
-    ):
-        raise ValueError("trusted bot logins must be a JSON array of strings")
+    history = _load_history(args.history)
+    trusted_bot_logins = _load_trusted_bot_logins(args.trusted_bot_logins)
     payload, unmapped, duplicates = build_review_payload(
         review=args.review.read_text(),
         findings=json.loads(args.findings.read_text()),

@@ -5,8 +5,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _load_module(name):
@@ -414,6 +416,32 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(unmapped, [])
         self.assertEqual(duplicates, ["Blocker1"])
 
+        payload, unmapped, duplicates = self.inline_review.build_review_payload(
+            review=(
+                "## Blocking issues\n"
+                "### Blocker1: repeated\nRepeated finding.\n"
+                "## Summary\nThe location is no longer part of this diff."
+            ),
+            findings=[
+                {
+                    "id": "Blocker1",
+                    "path": "kernel/src/example.rs",
+                    "line": 10,
+                    "side": "RIGHT",
+                    "body": "Repeated finding.",
+                }
+            ],
+            diff=DIFF.replace("@@ -8,5 +8,6", "@@ -20,5 +20,6"),
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+            history=history,
+        )
+
+        self.assertEqual(payload["comments"], [])
+        self.assertIn("### Blocker1", payload["body"])
+        self.assertEqual(unmapped, ["Blocker1"])
+        self.assertEqual(duplicates, [])
+
         findings = [
             {
                 "id": "Blocker1",
@@ -666,6 +694,131 @@ class InlineReviewTest(unittest.TestCase):
 
         payload["comments"].append({"body": "new finding"})
         self.assertFalse(self.inline_review.should_skip_inline_review(payload, history))
+
+    def test_duplicate_review_round_trip_uses_published_inline_body(self) -> None:
+        review = "### Nit1\nRepeated finding.\n\n## Summary\nNo new findings."
+        finding = {
+            "id": "Nit1",
+            "path": "kernel/src/example.rs",
+            "line": 10,
+            "side": "RIGHT",
+            "body": "Repeated finding.",
+        }
+        first_payload, _, _ = self.inline_review.build_review_payload(
+            review=review,
+            findings=[finding],
+            diff=DIFF,
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+        )
+        history = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "comments": {"nodes": []},
+                        "reviews": {
+                            "nodes": [
+                                {
+                                    "author": {
+                                        "__typename": "Bot",
+                                        "login": "github-actions",
+                                    },
+                                    "body": first_payload["body"],
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "path": finding["path"],
+                                                "line": finding["line"],
+                                                "side": finding["side"],
+                                                "body": "**Nit9** Repeated finding.",
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                }
+            }
+        }
+
+        next_payload, _, duplicates = self.inline_review.build_review_payload(
+            review=review,
+            findings=[finding],
+            diff=DIFF,
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/2",
+            history=history,
+        )
+
+        self.assertEqual(duplicates, ["Nit1"])
+        self.assertTrue(
+            self.inline_review.should_skip_inline_review(next_payload, history)
+        )
+
+    def test_main_falls_back_from_malformed_history_and_writes_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {
+                name: root / name
+                for name in (
+                    "review",
+                    "findings",
+                    "diff",
+                    "history",
+                    "trusted",
+                    "output",
+                    "unmapped",
+                    "duplicate",
+                    "skip",
+                )
+            }
+            paths["review"].write_text("## Summary\nNo findings.")
+            paths["findings"].write_text("[]")
+            paths["diff"].write_text(DIFF)
+            paths["history"].write_text("not JSON")
+            paths["trusted"].write_text('["github-actions"]')
+            arguments = [
+                "inline_review.py",
+                "--review",
+                str(paths["review"]),
+                "--findings",
+                str(paths["findings"]),
+                "--diff",
+                str(paths["diff"]),
+                "--head-sha",
+                "f" * 40,
+                "--run-url",
+                "https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+                "--history",
+                str(paths["history"]),
+                "--trusted-bot-logins",
+                str(paths["trusted"]),
+                "--output",
+                str(paths["output"]),
+                "--unmapped-output",
+                str(paths["unmapped"]),
+                "--duplicate-output",
+                str(paths["duplicate"]),
+                "--skip-duplicate-review-output",
+                str(paths["skip"]),
+            ]
+
+            with patch.object(sys, "argv", arguments):
+                self.inline_review.main()
+
+            self.assertEqual(json.loads(paths["output"].read_text())["comments"], [])
+            self.assertEqual(paths["unmapped"].read_text(), "")
+            self.assertEqual(paths["duplicate"].read_text(), "")
+            self.assertEqual(paths["skip"].read_text(), "false\n")
+
+    def test_trusted_bot_login_file_rejects_mixed_types(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trusted.json"
+            path.write_text('["github-actions", 1]')
+
+            with self.assertRaisesRegex(ValueError, "JSON array of strings"):
+                self.inline_review._load_trusted_bot_logins(path)
 
     def test_extract_inline_findings_rejects_invalid_envelopes(self) -> None:
         marker = "e" * 32
