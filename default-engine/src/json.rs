@@ -92,8 +92,9 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     /// `None` (the default) means no parallelism, no chunking.
     ///
     /// Chunk tasks are spawned on the current Tokio runtime. Real speedup needs a
-    /// multi-thread executor ([`TokioMultiThreadExecutor`]). The default
-    /// [`TokioBackgroundExecutor`] is single-threaded, so chunks share one thread.
+    /// multi-thread executor ([`crate::executor::tokio::TokioMultiThreadExecutor`]).
+    /// The default [`crate::executor::tokio::TokioBackgroundExecutor`] is
+    /// single-threaded, so chunks share one thread.
     pub fn with_parallel_chunks(mut self, parallel_chunks: Option<NonZero<usize>>) -> Self {
         self.parallel_chunks = parallel_chunks;
         self
