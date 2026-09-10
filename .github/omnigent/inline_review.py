@@ -16,8 +16,9 @@ MAX_INLINE_FINDINGS = 12
 INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
 INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
 _FINDING_ID = re.compile(r"(?:Blocker|Nit)[1-9][0-9]*")
-_FINDING_HEADING = re.compile(r"^###\s+((?:Blocker|Nit)[1-9][0-9]*)\b", re.MULTILINE)
-_MARKDOWN_HEADING = re.compile(r"^(#{1,3})\s+", re.MULTILINE)
+_FINDING_HEADING = re.compile(r"^###\s+((?:Blocker|Nit)[1-9][0-9]*)\b")
+_MARKDOWN_HEADING = re.compile(r"^(#{1,3})\s+")
+_CODE_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _EMPTY_FINDING_GROUP = re.compile(
     r"^##\s+(?:Blocking issues|Non-blocking notes)\s*\n(?=\s*(?:##\s|\Z))",
     re.IGNORECASE | re.MULTILINE,
@@ -176,9 +177,14 @@ def build_review_payload(
     unmapped: list[str] = []
     duplicates: list[str] = []
     seen_ids: set[str] = set()
-    review_ids = set(_FINDING_HEADING.findall(review))
+    headings = _markdown_headings(review)
+    review_ids = {
+        finding.group(1)
+        for _, line in headings
+        if (finding := _FINDING_HEADING.match(line)) is not None
+    }
     prior_comments = {
-        (comment["path"], canonical_finding_body(comment["body"]))
+        (comment["path"], comment["line"], canonical_finding_body(comment["body"]))
         for comment in previous_inline_comments(history)
     }
     omitted_ids: set[str] = set()
@@ -197,7 +203,7 @@ def build_review_payload(
         if finding_id not in review_ids:
             unmapped.append(finding_id)
             continue
-        if (path, canonical_finding_body(body)) in prior_comments:
+        if (path, line, canonical_finding_body(body)) in prior_comments:
             duplicates.append(finding_id)
             omitted_ids.add(finding_id)
             continue
@@ -235,19 +241,44 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
     if not finding_ids:
         return review
 
-    headings = list(_MARKDOWN_HEADING.finditer(review))
+    headings = _markdown_headings(review)
     ranges: list[tuple[int, int]] = []
-    for index, heading in enumerate(headings):
-        finding = _FINDING_HEADING.match(review, heading.start())
+    for index, (start, line) in enumerate(headings):
+        finding = _FINDING_HEADING.match(line)
         if finding is None or finding.group(1) not in finding_ids:
             continue
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(review)
-        ranges.append((heading.start(), end))
+        end = headings[index + 1][0] if index + 1 < len(headings) else len(review)
+        ranges.append((start, end))
 
     for start, end in reversed(ranges):
         review = review[:start] + review[end:]
     review = _EMPTY_FINDING_GROUP.sub("", review)
     return review.strip()
+
+
+def _markdown_headings(review: str) -> list[tuple[int, str]]:
+    """Return heading offsets while ignoring heading-like lines in code fences."""
+    headings: list[tuple[int, str]] = []
+    fence_character: str | None = None
+    fence_length = 0
+    offset = 0
+
+    for line in review.splitlines(keepends=True):
+        fence = _CODE_FENCE.match(line)
+        if fence is not None:
+            marker = fence.group(1)
+            if fence_character is None:
+                fence_character = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character = None
+                fence_length = 0
+            offset += len(line)
+            continue
+        if fence_character is None and _MARKDOWN_HEADING.match(line) is not None:
+            headings.append((offset, line))
+        offset += len(line)
+    return headings
 
 
 def _diff_path(value: str) -> str | None:

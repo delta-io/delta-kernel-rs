@@ -35,17 +35,24 @@ def format_review_history(document: Any) -> str:
     return "".join(chunks).strip()
 
 
-def previous_inline_comments(document: Any) -> list[dict[str, str]]:
+def previous_inline_comments(document: Any) -> list[dict[str, str | int]]:
     """Return inline comments belonging to marked bot-authored reviews."""
-    comments: list[dict[str, str]] = []
+    comments: list[dict[str, str | int]] = []
     for review in _review_nodes(document):
         if not _is_marked_bot_entry(review):
             continue
         for comment in _nodes(review.get("comments")):
             path = comment.get("path")
             body = comment.get("body")
-            if isinstance(path, str) and isinstance(body, str):
-                comments.append({"path": path, "body": body})
+            line = comment.get("line")
+            if not isinstance(line, int):
+                line = comment.get("originalLine")
+            if (
+                isinstance(path, str)
+                and isinstance(body, str)
+                and isinstance(line, int)
+            ):
+                comments.append({"path": path, "line": line, "body": body})
     return comments
 
 

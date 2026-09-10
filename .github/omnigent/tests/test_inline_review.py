@@ -23,6 +23,18 @@ def _load_module(name):
     return module
 
 
+def _configured_prompt(path: Path) -> str:
+    config = path.read_text()
+    _, separator, prompt_block = config.partition("prompt: |\n")
+    assert separator
+    configured_lines = []
+    for line in prompt_block.splitlines():
+        if line and not line.startswith("  "):
+            break
+        configured_lines.append(line[2:])
+    return "\n".join(configured_lines).strip()
+
+
 DIFF = """\
 diff --git a/kernel/src/example.rs b/kernel/src/example.rs
 index 1111111..2222222 100644
@@ -92,16 +104,10 @@ class InlineReviewTest(unittest.TestCase):
         _, separator, standalone_prompt = contract.partition("\n---\n\n")
         self.assertTrue(separator)
 
-        config = (reviewer_dir / "config.yaml").read_text()
-        _, separator, prompt_block = config.partition("prompt: |\n")
-        self.assertTrue(separator)
-        configured_lines = []
-        for line in prompt_block.splitlines():
-            if line and not line.startswith("  "):
-                break
-            configured_lines.append(line[2:])
-
-        self.assertEqual(standalone_prompt.strip(), "\n".join(configured_lines).strip())
+        self.assertEqual(
+            standalone_prompt.strip(),
+            _configured_prompt(reviewer_dir / "config.yaml"),
+        )
 
     def test_shared_policies_reach_parent_and_child_reviewers(self) -> None:
         omnigent_dir = Path(__file__).parents[1]
@@ -114,18 +120,23 @@ class InlineReviewTest(unittest.TestCase):
             review_policy.PREVIOUS_REVIEW_POLICY.strip(),
         ):
             self.assertIn(policy, reviewer_contract)
+            self.assertIn(policy, _configured_prompt(reviewer_dir / "config.yaml"))
             for agent_dir in (reviewer_dir / "agents").iterdir():
                 if not agent_dir.is_dir():
                     continue
                 with self.subTest(agent=agent_dir.name, policy=policy.partition("\n")[0]):
                     self.assertIn(policy, (agent_dir / "REVIEW.md").read_text())
+                    self.assertIn(policy, _configured_prompt(agent_dir / "config.yaml"))
         self.assertIn(
-            'f"{known_issue_policy}\\n\\n"',
+            "from review_policy import KNOWN_ISSUE_POLICY, PREVIOUS_REVIEW_POLICY",
             workflow,
         )
-        self.assertIn("{known_issue_policy}", workflow)
-        self.assertIn('f"{previous_review_policy}\\n\\n"', workflow)
-        self.assertIn("{previous_review_policy}", workflow)
+        self.assertIn("known_issue_policy = KNOWN_ISSUE_POLICY.strip()", workflow)
+        self.assertIn(
+            "previous_review_policy = PREVIOUS_REVIEW_POLICY.strip()", workflow
+        )
+        self.assertEqual(workflow.count("{known_issue_policy}"), 1)
+        self.assertEqual(workflow.count("{previous_review_policy}"), 1)
         self.assertIn("format_review_history", workflow)
 
     def test_automatic_reviews_default_to_inline(self) -> None:
@@ -354,6 +365,8 @@ class InlineReviewTest(unittest.TestCase):
                                         "nodes": [
                                             {
                                                 "path": "kernel/src/example.rs",
+                                                "line": 10,
+                                                "originalLine": 10,
                                                 "body": "**Blocker9** Repeated finding.",
                                             }
                                         ]
@@ -393,6 +406,51 @@ class InlineReviewTest(unittest.TestCase):
         self.assertIn("## Summary", payload["body"])
         self.assertEqual(unmapped, [])
         self.assertEqual(duplicates, ["Blocker1"])
+
+        findings = [
+            {
+                "id": "Blocker1",
+                "path": "kernel/src/example.rs",
+                "line": 11,
+                "side": "RIGHT",
+                "body": "Repeated finding.",
+            }
+        ]
+        payload, unmapped, duplicates = self.inline_review.build_review_payload(
+            review="### Blocker1\nRepeated finding.\n\n## Summary\nNew location.",
+            findings=findings,
+            diff=DIFF,
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+            history=history,
+        )
+
+        self.assertEqual(len(payload["comments"]), 1)
+        self.assertEqual(unmapped, [])
+        self.assertEqual(duplicates, [])
+
+    def test_removed_finding_ignores_heading_like_code_fence_lines(self) -> None:
+        review = (
+            "## Blocking issues\n"
+            "### Blocker1\n"
+            "The command demonstrates the failure:\n\n"
+            "```bash\n"
+            "# fetch history\n"
+            "gh api graphql\n"
+            "```\n\n"
+            "Trailing finding detail.\n"
+            "### Blocker2\n"
+            "Finding that remains.\n"
+            "## Summary\n"
+            "Needs changes."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
+
+        self.assertNotIn("fetch history", remaining)
+        self.assertNotIn("Trailing finding detail", remaining)
+        self.assertIn("### Blocker2", remaining)
+        self.assertIn("## Summary", remaining)
 
     def test_build_payload_keeps_finding_without_matching_heading_in_summary(self) -> None:
         payload, unmapped, duplicates = self.inline_review.build_review_payload(

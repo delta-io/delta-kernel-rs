@@ -39,6 +39,8 @@ def _document(*, author_type: str = "Bot") -> dict:
                                     "nodes": [
                                         {
                                             "path": "kernel/src/example.rs",
+                                            "line": 10,
+                                            "originalLine": 10,
                                             "body": "**Blocker1** Repeated finding.",
                                         }
                                     ]
@@ -80,6 +82,7 @@ class ReviewHistoryTest(unittest.TestCase):
             [
                 {
                     "path": "kernel/src/example.rs",
+                    "line": 10,
                     "body": "**Blocker1** Repeated finding.",
                 }
             ],
@@ -93,11 +96,58 @@ class ReviewHistoryTest(unittest.TestCase):
             module.canonical_finding_body("**Blocker1** Repeated finding."),
         )
 
-    def test_complete_review_deduplication_ignores_publication_wrapper(self) -> None:
+    def test_complete_review_deduplication_round_trips_publication_wrapper(self) -> None:
         module = _load_module()
+        review_publish_path = Path(__file__).parents[1] / "review_publish.py"
+        spec = importlib.util.spec_from_file_location(
+            "review_publish", review_publish_path
+        )
+        assert spec is not None and spec.loader is not None
+        review_publish = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(review_publish)
+        document = _document()
+        document["data"]["repository"]["pullRequest"]["comments"]["nodes"][0][
+            "body"
+        ] = review_publish.format_review_body(
+            "Old collapsed finding",
+            "https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+            collapsed=True,
+        )
 
-        self.assertTrue(module.is_duplicate_review("Old collapsed finding", _document()))
-        self.assertFalse(module.is_duplicate_review("New finding", _document()))
+        self.assertTrue(module.is_duplicate_review("Old collapsed finding", document))
+        self.assertIn("Old collapsed finding", module.format_review_history(document))
+        self.assertNotIn("<details>", module.format_review_history(document))
+        self.assertFalse(module.is_duplicate_review("New finding", document))
+
+    def test_history_is_newest_first_and_bounded(self) -> None:
+        module = _load_module()
+        document = _document()
+        nodes = document["data"]["repository"]["pullRequest"]["comments"]["nodes"]
+        nodes.clear()
+        marker = module.BOT_MARKER
+        for index in range(4):
+            nodes.append(
+                {
+                    "author": {"__typename": "Bot", "login": "reviewer"},
+                    "body": f"{marker}\nreview-{index}-" + "x" * 4_000,
+                }
+            )
+
+        history = module.format_review_history(document)
+
+        self.assertLessEqual(len(history), module.MAX_HISTORY_CHARS)
+        self.assertLess(history.index("review-3"), history.index("review-2"))
+        self.assertNotIn("review-0", history)
+
+    def test_history_truncates_each_entry(self) -> None:
+        module = _load_module()
+        document = _document()
+        node = document["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]
+        node["body"] = module.BOT_MARKER + "\n" + "Z" * (module.MAX_ENTRY_CHARS + 100)
+
+        history = module.format_review_history(document)
+
+        self.assertEqual(history.count("Z"), module.MAX_ENTRY_CHARS)
 
 
 if __name__ == "__main__":
