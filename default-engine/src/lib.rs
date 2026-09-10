@@ -299,8 +299,9 @@ impl<E> DefaultEngineBuilder<E> {
     /// parses them concurrently, and concatenates results in the proper order.
     ///
     /// Chunk tasks are spawned on the current Tokio runtime. Real speedup needs a
-    /// multi-thread executor ([`TokioMultiThreadExecutor`]). The default
-    /// [`TokioBackgroundExecutor`] is single-threaded, so chunks share one thread.
+    /// multi-thread executor ([`executor::tokio::TokioMultiThreadExecutor`]). The
+    /// default [`executor::tokio::TokioBackgroundExecutor`] is single-threaded, so
+    /// chunks share one thread.
     pub fn with_parallel_chunks(mut self, parallel_chunks: Option<NonZero<usize>>) -> Self {
         self.io_config.parallel_chunks = parallel_chunks;
         self
