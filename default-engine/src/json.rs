@@ -90,6 +90,10 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
 
     /// Number of ordered file chunks to parse concurrently in [`Self::read_json_files`].
     /// `None` (the default) means no parallelism, no chunking.
+    ///
+    /// Chunk tasks are spawned on the current Tokio runtime. Real speedup needs a
+    /// multi-thread executor ([`TokioMultiThreadExecutor`]). The default
+    /// [`TokioBackgroundExecutor`] is single-threaded, so chunks share one thread.
     pub fn with_parallel_chunks(mut self, parallel_chunks: Option<NonZero<usize>>) -> Self {
         self.parallel_chunks = parallel_chunks;
         self
@@ -1251,6 +1255,89 @@ mod tests {
             .unwrap()
             .try_collect();
         assert!(result.is_err(), "missing file must produce an error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_later_chunk_errors_after_data() {
+        // 4 files / 2 chunks -> [0,1] then [missing, 3]. Chunk 0 yields data;
+        // chunk 1 errors. try_collect would hide that ordering.
+        let store = Arc::new(InMemory::new());
+        for i in [0, 1, 3] {
+            store
+                .put(
+                    &Path::from(format!("test/{i}")),
+                    Bytes::from(format!("{{\"val\": {i}}}")).into(),
+                )
+                .await
+                .unwrap();
+        }
+        let files: Vec<FileMeta> = (0..4)
+            .map(|i| FileMeta {
+                location: Url::parse(&format!("memory:///test/{i}")).unwrap(),
+                last_modified: 0,
+                size: 12,
+            })
+            .collect();
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_parallel_chunks(NonZero::new(2));
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let mut iter = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap();
+        let first = iter.next().expect("chunk 0 must yield a batch");
+        assert!(first.is_ok(), "chunk 0 must succeed before chunk 1 errors");
+        let rest: DeltaResult<Vec<_>> = iter.try_collect();
+        assert!(rest.is_err(), "missing file in a later chunk must error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_ragged_chunk_sizes() {
+        // 7 files / 3 chunks -> sizes 3, 3, 1 (not an even split).
+        const N: i32 = 7;
+        let store = Arc::new(InMemory::new());
+        for i in 0..N {
+            store
+                .put(
+                    &Path::from(format!("test/{i}")),
+                    Bytes::from(format!("{{\"val\": {i}}}")).into(),
+                )
+                .await
+                .unwrap();
+        }
+        let files: Vec<FileMeta> = (0..N)
+            .map(|i| FileMeta {
+                location: Url::parse(&format!("memory:///test/{i}")).unwrap(),
+                last_modified: 0,
+                size: 12,
+            })
+            .collect();
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_parallel_chunks(NonZero::new(3));
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let data: Vec<RecordBatch> = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .map_ok(into_record_batch)
+            .try_collect()
+            .unwrap();
+        let all_values: Vec<i32> = data
+            .iter()
+            .flat_map(|batch| {
+                let val_col: &Int32Array = batch.column(0).as_primitive();
+                (0..val_col.len()).map(|i| val_col.value(i)).collect_vec()
+            })
+            .collect();
+        assert_eq!(all_values, (0..N).collect_vec());
     }
 
     #[tokio::test(flavor = "multi_thread")]
