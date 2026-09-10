@@ -13,7 +13,7 @@ use crate::content_tree::{
     struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, TrackingStatus, CONTENT_TYPE,
     FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, SEQUENCE_NUMBER, TRACKING, TRACKING_STATUS,
 };
-use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
+use crate::engine_data::{EngineData, FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, ColumnName, Expression, MapData, Scalar};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
@@ -31,8 +31,9 @@ const DATA_CHANGE: &str = "dataChange";
 ///
 /// An entry becomes an `Add` when its `contentType` is [`DataContentType::Data`] and its tracking
 /// status is [live](TrackingStatus::is_live); every other entry (manifest references, tombstones)
-/// is dropped. The produced batch matches [`crate::actions::LOG_ADD_SCHEMA`] (`{ add: Add }`), so
-/// it can flow into log replay exactly like an `Add` parsed from a JSON commit.
+/// is dropped via the returned selection vector. The batch matches
+/// [`crate::actions::LOG_ADD_SCHEMA`] (`{ add: Add }`), so it can flow into log replay exactly like
+/// an `Add` parsed from a JSON commit.
 ///
 /// Field mapping, per surviving row: `add.path` <- `location`, `add.size` <- `fileSizeInBytes`
 /// (0 when null), `add.baseRowId` <- `tracking.firstRowId`, and `add.defaultRowCommitVersion` <-
@@ -45,15 +46,18 @@ const DATA_CHANGE: &str = "dataChange";
 ///   columnar form produced by [`super::builder`]).
 ///
 /// # Returns
-/// An [`EngineData`] batch of `Add` actions, containing one row per surviving entry.
+/// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
+/// [`crate::actions::LOG_ADD_SCHEMA`]), whose selection vector keeps only the entries that read as
+/// live data files. The selection is carried rather than applied so this path is symmetric with the
+/// AMT write path ([`super::builder`]).
 ///
 /// # Errors
 /// Returns an error if a row carries an unknown tracking-status value, if the evaluator cannot be
-/// constructed or fails to evaluate, or if the selection vector cannot be applied.
+/// constructed or fails to evaluate, or if the selection vector length exceeds the batch.
 pub(crate) fn convert_root_entries_to_add_actions(
     engine: &dyn Engine,
     entries: &dyn EngineData,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> DeltaResult<FilteredEngineData> {
     let mut selector = AddSelectionVisitor::default();
     selector.visit_rows_of(entries)?;
 
@@ -66,7 +70,7 @@ pub(crate) fn convert_root_entries_to_add_actions(
         output_type,
     )?;
     let actions = evaluator.evaluate(entries)?;
-    actions.apply_selection_vector(selector.selection)
+    FilteredEngineData::try_new(actions, selector.selection)
 }
 
 // === Helpers ===
@@ -295,9 +299,10 @@ mod tests {
             added_data_entry("a.parquet", 100, 10, 0, 5),
             added_data_entry("b.parquet", 200, 20, 10, 5),
         ];
-        let out =
+        let out = filtered_to_batch(
             convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
-                .unwrap();
+                .unwrap(),
+        );
 
         let expected = expected_batch(
             &engine,
@@ -317,11 +322,12 @@ mod tests {
         use crate::engine::arrow_conversion::TryIntoArrow as _;
         let engine = SyncEngine::new();
         let entries = [added_data_entry("a.parquet", 1, 1, 0, 0)];
-        let out =
+        let out = filtered_to_batch(
             convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
-                .unwrap()
-                .try_into_record_batch()
-                .unwrap();
+                .unwrap(),
+        )
+        .try_into_record_batch()
+        .unwrap();
         let expected = LOG_ADD_SCHEMA.as_ref().try_into_arrow().unwrap();
         assert_eq!(out.schema().as_ref(), &expected);
     }
@@ -336,11 +342,13 @@ mod tests {
         manifest.manifest_info = Some(ManifestInfo::default());
         let live = added_data_entry("live.parquet", 42, 7, 3, 9);
 
-        let out = convert_root_entries_to_add_actions(
-            &engine,
-            entry_batch(&engine, &[deleted, manifest, live]).as_ref(),
-        )
-        .unwrap();
+        let out = filtered_to_batch(
+            convert_root_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &[deleted, manifest, live]).as_ref(),
+            )
+            .unwrap(),
+        );
 
         let expected = expected_batch(&engine, &[expected_add_row("live.parquet", 42, 3, 9)]);
         assert_eq!(
@@ -354,9 +362,10 @@ mod tests {
         let engine = SyncEngine::new();
         let mut entry = added_data_entry("a.parquet", 0, 1, 0, 0);
         entry.file_size_in_bytes = None;
-        let out =
+        let out = filtered_to_batch(
             convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref())
-                .unwrap();
+                .unwrap(),
+        );
         let expected = expected_batch(&engine, &[expected_add_row("a.parquet", 0, 0, 0)]);
         assert_eq!(
             out.try_into_record_batch().unwrap(),
@@ -367,8 +376,16 @@ mod tests {
     #[test]
     fn empty_input_yields_empty_batch() {
         let engine = SyncEngine::new();
-        let out = convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[]).as_ref())
-            .unwrap();
+        let out = filtered_to_batch(
+            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[]).as_ref())
+                .unwrap(),
+        );
         assert_eq!(out.len(), 0);
+    }
+
+    /// Materializes a [`FilteredEngineData`] by applying its selection vector, so tests can compare
+    /// against the surviving `Add` rows.
+    fn filtered_to_batch(filtered: FilteredEngineData) -> Box<dyn EngineData> {
+        filtered.apply_selection_vector().unwrap()
     }
 }
