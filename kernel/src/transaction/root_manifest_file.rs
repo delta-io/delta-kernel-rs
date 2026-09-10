@@ -110,7 +110,8 @@ impl RootManifestFile {
 
     /// Returns the read snapshot's active domain metadata, set transactions, and latest checkpoint
     /// action. Domain metadata and set transactions come from a `Complete` CRC when present, else a
-    /// log scan; the checkpoint action is always scanned, since the snapshot does not cache it.
+    /// log scan folded onto the checkpoint action's own nested sets; the checkpoint action is
+    /// always scanned, since the snapshot does not cache it.
     fn scan_non_content_metadata(
         &self,
         engine: &dyn Engine,
@@ -162,10 +163,38 @@ impl RootManifestFile {
             }
         }
 
-        let domain_metadata =
-            domain_metadata_from_crc.unwrap_or(domain_metadata_visitor.into_domain_metadatas());
-        let transactions =
+        let from_log_scan = (
+            domain_metadata_from_crc.is_none(),
+            transactions_from_crc.is_none(),
+        );
+        let mut domain_metadata = domain_metadata_from_crc
+            .unwrap_or_else(|| domain_metadata_visitor.into_domain_metadatas());
+        let mut transactions =
             transactions_from_crc.unwrap_or(set_transaction_visitor.set_transactions);
+
+        // The log scan reads only top-level rows; fold in the checkpoint's nested set too.
+        // TODO: fold in sidecar-spilled domain metadata and transactions, not just inline entries.
+        if let Some(checkpoint) = &checkpoint_action {
+            if from_log_scan.0 {
+                merge_domain_metadata(
+                    &mut domain_metadata,
+                    checkpoint
+                        .domain_metadata
+                        .iter()
+                        .cloned()
+                        .map(|dm| (dm.domain().to_string(), dm)),
+                );
+            }
+            if from_log_scan.1 {
+                transactions.extend(
+                    checkpoint
+                        .transactions
+                        .iter()
+                        .cloned()
+                        .map(|txn| (txn.app_id.clone(), txn)),
+                );
+            }
+        }
 
         Ok((domain_metadata, transactions, checkpoint_action))
     }
@@ -175,6 +204,8 @@ impl RootManifestFile {
 mod tests {
     use std::iter;
     use std::sync::Arc;
+
+    use rstest::rstest;
 
     use super::*;
     use crate::actions::{
@@ -578,6 +609,66 @@ mod tests {
         assert_eq!(transactions.len(), 1);
         assert!(transactions.contains_key("app-1"));
         assert_eq!(existing_checkpoint, None);
+        Ok(())
+    }
+
+    // A domain/txn living only in a prior checkpoint's nested set must survive into the new one; a
+    // tombstone in this txn drops the domain.
+    #[rstest]
+    #[case::kept(vec![], true)]
+    #[case::removed(vec![DomainMetadata::remove("test.domain".into(), "{}".into())], false)]
+    fn compute_checkpoint_action_folds_prior_checkpoint_nested_set(
+        #[case] dm_changes: Vec<DomainMetadata>,
+        #[case] domain_kept: bool,
+    ) -> DeltaResult<()> {
+        let (engine, table_root) = setup_table()?;
+        let config = Snapshot::builder_for(table_root.clone())
+            .build(&engine)?
+            .table_configuration()
+            .clone();
+        let existing = CheckpointAction::new(
+            1,
+            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
+            config.protocol().clone(),
+            config.metadata().clone(),
+            vec![SetTransaction::new("app-1".to_string(), 5, None)],
+            vec![DomainMetadata::new(
+                "test.domain".to_string(),
+                "{}".to_string(),
+            )],
+        );
+        write_commit(
+            &engine,
+            &table_root,
+            1,
+            existing.into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?,
+        )?;
+
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        assert!(snapshot.crc_at_version().is_none());
+
+        let manifest = root_manifest(
+            &table_root,
+            "metadata/root-v2.parquet",
+            2048,
+            snapshot.clone(),
+        );
+        let checkpoint = manifest.compute_checkpoint_action(
+            &engine,
+            2,
+            snapshot.table_configuration(),
+            &dm_changes,
+            &[],
+        )?;
+
+        assert_eq!(
+            checkpoint
+                .domain_metadata
+                .iter()
+                .any(|d| d.domain() == "test.domain"),
+            domain_kept
+        );
+        assert!(checkpoint.transactions.iter().any(|t| t.app_id == "app-1"));
         Ok(())
     }
 
