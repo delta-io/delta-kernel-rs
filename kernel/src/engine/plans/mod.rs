@@ -51,7 +51,7 @@ impl PlanBasedEngine {
     /// implementation.
     pub fn new(fallback: Option<Arc<dyn Engine>>, plan_executor: Arc<dyn PlanExecutor>) -> Self {
         let evaluation: Arc<dyn EvaluationHandler> = fallback.as_ref().map_or_else(
-            || Arc::new(ArrowEvaluationHandler) as Arc<dyn EvaluationHandler>,
+            || Arc::new(ArrowEvaluationHandler::new()) as Arc<dyn EvaluationHandler>,
             |engine| engine.evaluation_handler(),
         );
         Self {

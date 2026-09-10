@@ -6,7 +6,7 @@ use itertools::Itertools;
 
 use super::super::arrow_conversion::{
     kernel_flat_parquet_id_to_arrow_metadata, lookup_nested_field_id, parquet_field_id_metadata,
-    LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT,
+    ArrowConversionOptions, LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT,
 };
 use super::make_arrow_error;
 use crate::arrow::array::{
@@ -15,7 +15,7 @@ use crate::arrow::array::{
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
+use crate::engine::ensure_data_types::{ensure_data_types_with_options, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField};
@@ -28,13 +28,23 @@ use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, Str
 // those nulls propagated. Arrow's JSON reader does this automatically, and parquet data goes
 // through `fix_nested_null_masks` which handles it. We decompose the struct and discard its null
 // buffer since RecordBatch cannot have top-level nulls.
+#[cfg(test)]
 pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
+    apply_schema_with_options(array, schema, &ArrowConversionOptions::empty())
+}
+
+/// Apply a schema to an array using Arrow conversion options.
+pub(crate) fn apply_schema_with_options(
+    array: &dyn Array,
+    schema: &DataType,
+    options: &ArrowConversionOptions<'_>,
+) -> DeltaResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
         return Err(Error::generic(
             "apply_schema at top-level must be passed a struct schema",
         ));
     };
-    let applied = apply_schema_to_struct(array, struct_schema)?;
+    let applied = apply_schema_to_struct_with_options(array, struct_schema, options)?;
     let (fields, columns, _nulls) = applied.into_parts();
 
     Ok(RecordBatch::try_new(
@@ -67,6 +77,7 @@ fn new_field_with_metadata(
 fn transform_struct(
     struct_array: &StructArray,
     target_fields: impl Iterator<Item = impl Borrow<StructField>>,
+    options: &ArrowConversionOptions<'_>,
 ) -> DeltaResult<StructArray> {
     let (input_fields, arrow_cols, nulls) = struct_array.clone().into_parts();
     let input_col_count = arrow_cols.len();
@@ -81,6 +92,7 @@ fn transform_struct(
                 target_field.data_type(),
                 Some(target_field),
                 &target_field.name,
+                options,
             )?;
             let mut arrow_metadata = kernel_flat_parquet_id_to_arrow_metadata(target_field)?;
             // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
@@ -128,12 +140,20 @@ pub(crate) fn apply_schema_to_struct(
     array: &dyn Array,
     kernel_fields: &Schema,
 ) -> DeltaResult<StructArray> {
+    apply_schema_to_struct_with_options(array, kernel_fields, &ArrowConversionOptions::empty())
+}
+
+pub(crate) fn apply_schema_to_struct_with_options(
+    array: &dyn Array,
+    kernel_fields: &Schema,
+    options: &ArrowConversionOptions<'_>,
+) -> DeltaResult<StructArray> {
     let Some(sa) = array.as_struct_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a struct but isn't a StructArray",
         ));
     };
-    transform_struct(sa, kernel_fields.fields())
+    transform_struct(sa, kernel_fields.fields(), options)
 }
 
 // Rebuild a [`ListArray`] under the contract of [`apply_schema_to_inner`] (see that fn's doc
@@ -144,6 +164,7 @@ fn apply_schema_to_list(
     target_inner_type: &ArrayType,
     nearest_ancestor_struct_field: Option<&StructField>,
     relative_path: &str,
+    options: &ArrowConversionOptions<'_>,
 ) -> DeltaResult<ListArray> {
     let Some(la) = array.as_list_opt() else {
         return Err(make_arrow_error(
@@ -162,6 +183,7 @@ fn apply_schema_to_list(
         &target_inner_type.element_type,
         nearest_ancestor_struct_field,
         &element_path,
+        options,
     )?;
 
     // Bare element type carries no kernel-side metadata; `PARQUET:field_id` is the only
@@ -188,6 +210,7 @@ fn apply_schema_to_map(
     kernel_map_type: &MapType,
     ancestor: Option<&StructField>,
     relative_path: &str,
+    options: &ArrowConversionOptions<'_>,
 ) -> DeltaResult<MapArray> {
     let Some(ma) = array.as_map_opt() else {
         return Err(make_arrow_error(
@@ -227,12 +250,14 @@ fn apply_schema_to_map(
         &kernel_map_type.key_type,
         ancestor,
         &key_path,
+        options,
     )?;
     let transformed_arrow_value = apply_schema_to_inner(
         &arrow_value_col,
         &kernel_map_type.value_type,
         ancestor,
         &value_path,
+        options,
     )?;
 
     // Bare key/value types carry no kernel-side metadata; `PARQUET:field_id` is the only
@@ -270,8 +295,17 @@ fn apply_schema_to_map(
 
 // Apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
 // actual data types don't match, this will return an error.
+#[cfg(test)]
 pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResult<ArrayRef> {
-    apply_schema_to_inner(array, schema, None, "")
+    apply_schema_to_with_options(array, schema, &ArrowConversionOptions::empty())
+}
+
+pub(crate) fn apply_schema_to_with_options(
+    array: &ArrayRef,
+    schema: &DataType,
+    options: &ArrowConversionOptions<'_>,
+) -> DeltaResult<ArrayRef> {
+    apply_schema_to_inner(array, schema, None, "", options)
 }
 
 /// Recursive worker for [`apply_schema_to`]. Rebuilds `array` recursively so that its schema is
@@ -362,14 +396,32 @@ fn apply_schema_to_inner(
     schema: &DataType,
     ancestor: Option<&StructField>,
     relative_path: &str,
+    options: &ArrowConversionOptions<'_>,
 ) -> DeltaResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
-        Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
-        Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
-        Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
+        Struct(stype) => Arc::new(apply_schema_to_struct_with_options(array, stype, options)?),
+        Array(atype) => Arc::new(apply_schema_to_list(
+            array,
+            atype,
+            ancestor,
+            relative_path,
+            options,
+        )?),
+        Map(mtype) => Arc::new(apply_schema_to_map(
+            array,
+            mtype,
+            ancestor,
+            relative_path,
+            options,
+        )?),
         _ => {
-            ensure_data_types(schema, array.data_type(), ValidationMode::Full)?;
+            ensure_data_types_with_options(
+                schema,
+                array.data_type(),
+                ValidationMode::Full,
+                options,
+            )?;
             array.clone()
         }
     };

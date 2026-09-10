@@ -714,7 +714,8 @@ fn dummy_struct() -> DataType {
 )]
 fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expected_msg: &str) {
     let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
-    let result = SidecarSplitter::new(iter, &ArrowEvaluationHandler, Arc::new(schema));
+    let handler = ArrowEvaluationHandler::new();
+    let result = SidecarSplitter::new(iter, &handler, Arc::new(schema));
     assert!(result.is_err(), "should reject invalid schema");
     let err = result.err().unwrap();
     assert!(
@@ -730,7 +731,8 @@ fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
         nullable "remove": (dummy_struct()),
     };
     let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
-    let splitter = SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema).unwrap();
+    let handler = ArrowEvaluationHandler::new();
+    let splitter = SidecarSplitter::new_mut_shared(iter, &handler, schema).unwrap();
     let result = SingleSidecarDataIterator::new(splitter, 0);
     assert!(result.is_err());
     let err = result.err().unwrap();

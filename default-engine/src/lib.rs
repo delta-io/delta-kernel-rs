@@ -336,7 +336,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             raw_parquet,
             object_store,
             task_executor,
-            evaluation: Arc::new(ArrowEvaluationHandler {}),
+            evaluation: Arc::new(ArrowEvaluationHandler::new()),
         }
     }
 

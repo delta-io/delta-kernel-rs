@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::{Add, Div, Mul, Sub};
 
 use rstest::rstest;
@@ -6,15 +7,18 @@ use Predicate as Pred;
 
 use super::*;
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray,
+    create_array, Array, ArrayRef, AsArray, BinaryBuilder, BinaryViewArray, BooleanArray,
+    GenericStringArray, Int32Array, Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder,
+    MapFieldNames, StringArray, StringBuilder, StringViewArray, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+use crate::engine::arrow_conversion::TryIntoArrow as _;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::engine::arrow_conversion::{GeometryArrowRepresentation, GeometryStatsBuilder};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
-use crate::engine::arrow_expression::evaluate_expression::to_json;
+use crate::engine::arrow_expression::evaluate_expression::{evaluate_expression, to_json};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
     ArrowOpaquePredicateOp,
@@ -25,14 +29,64 @@ use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-#[cfg(feature = "geo-type-in-dev")]
-use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{
     schema, schema_ref, ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::{EdgeInterpolationAlgorithm, GeometryType};
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
+
+#[cfg(feature = "geo-type-in-dev")]
+struct TestGeometryRepresentation;
+
+#[cfg(feature = "geo-type-in-dev")]
+impl GeometryArrowRepresentation for TestGeometryRepresentation {
+    fn geometry_field(
+        &self,
+        name: &str,
+        _geometry: &GeometryType,
+        nullable: bool,
+        metadata: HashMap<String, String>,
+    ) -> Result<Field, crate::arrow::error::ArrowError> {
+        Ok(Field::new(name, DataType::Binary, nullable).with_metadata(metadata))
+    }
+
+    fn stats_builder(
+        &self,
+        _geometry: &GeometryType,
+        field: &Field,
+        capacity: usize,
+    ) -> DeltaResult<Box<dyn GeometryStatsBuilder>> {
+        assert_eq!(field.data_type(), &DataType::Binary);
+        Ok(Box::new(TestGeometryStatsBuilder {
+            builder: BinaryBuilder::with_capacity(capacity, 0),
+        }))
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+struct TestGeometryStatsBuilder {
+    builder: BinaryBuilder,
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl GeometryStatsBuilder for TestGeometryStatsBuilder {
+    fn append_wkt(&mut self, raw: &str) -> DeltaResult<()> {
+        self.builder.append_value(raw.as_bytes());
+        Ok(())
+    }
+
+    fn append_null(&mut self) -> DeltaResult<()> {
+        self.builder.append_null();
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> DeltaResult<ArrayRef> {
+        Ok(Arc::new(self.builder.finish()))
+    }
+}
 
 #[test]
 fn test_array_column() {
@@ -776,7 +830,7 @@ fn test_create_many_all_null_row() {
         },
         nullable "c": STRING,
     };
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::new();
     let row: Vec<Scalar> = schema
         .fields()
         .map(|f| Scalar::null(f.data_type().clone()))
@@ -807,7 +861,7 @@ fn test_create_many_rejects_null_in_non_nullable_field() {
     let not_null_schema = schema_ref! {
         not_null "a": STRING,
     };
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::new();
     let row = vec![Scalar::null(KernelDataType::STRING)];
     assert_result_error_with_message(
         handler.create_many(not_null_schema, vec![row]),
@@ -1089,7 +1143,7 @@ fn test_evaluator_mixed_string_types_identity_transform() {
     let input_schema = Arc::new(schema.clone());
     let output_type = KernelDataType::from(schema);
 
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::new();
     let expression: ExpressionRef =
         Arc::new(Expression::struct_patch(ExpressionStructPatchBuilder::new()).unwrap());
     handler
@@ -1119,7 +1173,7 @@ fn test_evaluator_mixed_string_types_struct_expression() {
     };
     let output_type = KernelDataType::from(schema);
 
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::new();
     let expression: ExpressionRef = Arc::new(col!("st"));
     handler
         .new_expression_evaluator(input_schema, expression, output_type)
@@ -1128,9 +1182,53 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         .unwrap();
 }
 
+#[cfg(feature = "geo-type-in-dev")]
+#[test]
+fn test_evaluator_parse_json_uses_geometry_provider() {
+    let input_schema = schema_ref! {
+        nullable "json_col": STRING,
+    };
+    let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+        "json_col",
+        DataType::Utf8,
+        true,
+    )]));
+    let json = StringArray::from(vec![Some(
+        r#"{"minValues": {"geom": "POINT(-122.419 37.774)"}}"#,
+    )]);
+    let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(json)]).unwrap();
+    let engine_data = ArrowEngineData::new(batch);
+
+    let output_schema = schema_ref! {
+        nullable "minValues": {
+            nullable "geom": (geometry_type("EPSG:4326")),
+        },
+    };
+    let expression = Arc::new(Expression::parse_json(
+        col!("json_col"),
+        output_schema.clone(),
+    ));
+    let output_type = KernelDataType::from(output_schema.as_ref().clone());
+    let handler =
+        ArrowEvaluationHandler::with_geometry_representation(Arc::new(TestGeometryRepresentation));
+
+    let actual = handler
+        .new_expression_evaluator(input_schema, expression, output_type)
+        .unwrap()
+        .evaluate(&engine_data)
+        .unwrap()
+        .try_into_record_batch()
+        .unwrap();
+    let min_values = actual.column_by_name("minValues").unwrap().as_struct();
+    let geom = min_values.column_by_name("geom").unwrap();
+
+    assert_eq!(geom.data_type(), &DataType::Binary);
+    assert_eq!(geom.as_binary::<i32>().value(0), b"POINT(-122.419 37.774)");
+}
+
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`
 fn assert_create_many(rows: Vec<Vec<Scalar>>, schema: SchemaRef, expected: RecordBatch) {
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::new();
     let actual = handler.create_many(schema, rows).unwrap();
     let actual_rb = actual.try_into_record_batch().unwrap();
     assert_eq!(actual_rb, expected);
@@ -1166,7 +1264,7 @@ fn test_create_many_empty_rows_returns_zero_row_batch() {
         nullable "a": INTEGER,
         nullable "b": STRING,
     };
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::new();
     let result = handler.create_many(schema.clone(), vec![]).unwrap();
     assert_eq!(result.len(), 0);
     let rb = result.try_into_record_batch().unwrap();
@@ -1182,7 +1280,7 @@ fn test_create_many_wrong_field_count_returns_error() {
     };
     // Row has 3 scalars but schema has 2 fields
     let bad_row = vec![1.into(), "x".into(), 99.into()];
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::new();
     assert_result_error_with_message(
         handler.create_many(schema, vec![bad_row]),
         "Row 0 has 3 scalars but schema has 2 fields",
@@ -1198,7 +1296,7 @@ fn test_create_many_wrong_field_type_returns_error() {
     // Row 1 passes a Long where an Integer is expected for field "a"
     let good_row = vec![1.into(), "x".into()];
     let bad_row = vec![1i64.into(), "y".into()];
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::new();
     assert_result_error_with_message(
         handler.create_many(schema, vec![good_row, bad_row]),
         "Row 1, field 'a' (expected type integer, got long): Invalid expression evaluation: Invalid builder for long",

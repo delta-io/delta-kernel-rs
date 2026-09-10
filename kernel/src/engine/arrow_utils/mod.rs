@@ -1186,6 +1186,7 @@ pub(crate) fn parse_json_with_options(
 ///
 /// Accepts any string array type (`StringArray`, `LargeStringArray`, `StringViewArray`) to
 /// avoid narrowing casts that could overflow.
+#[cfg(test)]
 pub(crate) fn parse_json_impl(
     json_strings: &dyn ArrowArray,
     schema: SchemaRef,

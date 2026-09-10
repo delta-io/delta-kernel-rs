@@ -6,7 +6,9 @@ use std::ops::Deref;
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
-use super::arrow_conversion::TryIntoArrow as _;
+use super::arrow_conversion::{
+    ArrowConversionOptions, TryIntoArrow as _, TryIntoArrowWithOptions as _,
+};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::schema::{DataType, MetadataValue, StructField};
@@ -46,12 +48,32 @@ pub(crate) fn ensure_data_types(
     arrow_type: &ArrowDataType,
     mode: ValidationMode,
 ) -> DeltaResult<DataTypeCompat> {
-    let check = EnsureDataTypes { mode };
+    ensure_data_types_with_options(
+        kernel_type,
+        arrow_type,
+        mode,
+        &ArrowConversionOptions::empty(),
+    )
+}
+
+/// Ensure a kernel data type matches an Arrow data type using conversion options.
+#[internal_api]
+pub(crate) fn ensure_data_types_with_options(
+    kernel_type: &DataType,
+    arrow_type: &ArrowDataType,
+    mode: ValidationMode,
+    options: &ArrowConversionOptions<'_>,
+) -> DeltaResult<DataTypeCompat> {
+    let check = EnsureDataTypes {
+        mode,
+        options: *options,
+    };
     check.ensure_data_types(kernel_type, arrow_type)
 }
 
-struct EnsureDataTypes {
+struct EnsureDataTypes<'a> {
     mode: ValidationMode,
+    options: ArrowConversionOptions<'a>,
 }
 
 /// Capture the compatibility between two data-types, as passed to [`ensure_data_types`]
@@ -67,7 +89,7 @@ pub(crate) enum DataTypeCompat {
     Nested,
 }
 
-impl EnsureDataTypes {
+impl EnsureDataTypes<'_> {
     // Perform the check. See documentation for `ensure_data_types` entry point method above
     fn ensure_data_types(
         &self,
@@ -75,6 +97,13 @@ impl EnsureDataTypes {
         arrow_type: &ArrowDataType,
     ) -> DeltaResult<DataTypeCompat> {
         match (kernel_type, arrow_type) {
+            #[cfg(feature = "geo-type-in-dev")]
+            (DataType::Primitive(crate::schema::PrimitiveType::Geometry(_)), _) => {
+                let expected =
+                    crate::schema::StructField::nullable("geometry", kernel_type.clone())
+                        .try_into_arrow_with_options(&self.options)?;
+                check_cast_compat(expected.data_type().clone(), arrow_type)
+            }
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }

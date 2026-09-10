@@ -22,18 +22,20 @@ use crate::arrow::compute::{
     and_kleene, can_cast_types, cast, is_not_null, is_null, not, or_kleene,
 };
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
-    Schema as ArrowSchema, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
 use crate::delta_kernel_derive::internal_api;
-use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_ROOT};
+use crate::engine::arrow_conversion::{
+    TryFromKernel, TryIntoArrow, TryIntoArrowWithOptions, LIST_ARRAY_ROOT,
+};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::{parse_json_impl, prim_array_cmp};
+use crate::engine::arrow_expression::ArrowEvaluationOptions;
+use crate::engine::arrow_utils::{parse_json_impl_with_options, prim_array_cmp};
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
@@ -123,6 +125,7 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
     nullability_predicate: Option<&ExpressionRef>,
+    options: &ArrowEvaluationOptions,
 ) -> DeltaResult<ArrayRef> {
     if fields.len() != output_schema.num_fields() {
         return Err(Error::generic(format!(
@@ -135,7 +138,9 @@ fn evaluate_struct_expression(
     let output_cols: Vec<ArrayRef> = fields
         .iter()
         .zip(output_schema.fields())
-        .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())))
+        .map(|(expr, field)| {
+            evaluate_expression_with_options(expr, batch, Some(field.data_type()), options)
+        })
         .try_collect()?;
     let output_fields: Vec<ArrowField> = output_cols
         .iter()
@@ -150,7 +155,12 @@ fn evaluate_struct_expression(
         })
         .collect();
     let null_buffer = if let Some(predicate_expr) = nullability_predicate {
-        let predicate_array = evaluate_expression(predicate_expr, batch, Some(&DataType::BOOLEAN))?;
+        let predicate_array = evaluate_expression_with_options(
+            predicate_expr,
+            batch,
+            Some(&DataType::BOOLEAN),
+            options,
+        )?;
         let bool_array = predicate_array
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -173,6 +183,7 @@ fn evaluate_struct_patch_expression(
     patch: &ExpressionStructPatch,
     batch: &RecordBatch,
     output_schema: &StructType,
+    options: &ArrowEvaluationOptions,
 ) -> DeltaResult<ArrayRef> {
     let mut used_field_patches = 0;
 
@@ -190,7 +201,12 @@ fn evaluate_struct_patch_expression(
 
     // Handle prepends (insertions before any field)
     for expr in &patch.prepended_fields {
-        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+        output_cols.push(evaluate_expression_with_options(
+            expr,
+            batch,
+            Some(next_output_type()?),
+            options,
+        )?);
     }
 
     // Extract the input path, if any
@@ -220,7 +236,12 @@ fn evaluate_struct_patch_expression(
         // Process any insertions that come at or after this field's output position.
         if let Some(field_patch) = field_patch {
             for expr in &field_patch.insertions {
-                output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+                output_cols.push(evaluate_expression_with_options(
+                    expr,
+                    batch,
+                    Some(next_output_type()?),
+                    options,
+                )?);
             }
             used_field_patches += 1;
         }
@@ -240,7 +261,12 @@ fn evaluate_struct_patch_expression(
 
     // Handle appends (insertions after all input fields and field-specific insertions)
     for expr in &patch.appended_fields {
-        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+        output_cols.push(evaluate_expression_with_options(
+            expr,
+            batch,
+            Some(next_output_type()?),
+            options,
+        )?);
     }
 
     // Verify we consumed all output schema fields
@@ -278,6 +304,21 @@ pub fn evaluate_expression(
     batch: &RecordBatch,
     result_type: Option<&DataType>,
 ) -> DeltaResult<ArrayRef> {
+    evaluate_expression_with_options(
+        expression,
+        batch,
+        result_type,
+        &ArrowEvaluationOptions::default(),
+    )
+}
+
+/// Evaluates a kernel expression over a record batch using Arrow evaluation options.
+pub(crate) fn evaluate_expression_with_options(
+    expression: &Expression,
+    batch: &RecordBatch,
+    result_type: Option<&DataType>,
+    options: &ArrowEvaluationOptions,
+) -> DeltaResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
     use UnaryExpressionOp::*;
@@ -288,13 +329,13 @@ pub fn evaluate_expression(
         }
         (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
         (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
-            evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
+            evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref(), options)
         }
         (Struct(..), dt) => Err(Error::Generic(format!(
             "Struct expression expects a DataType::Struct result, but got {dt:?}"
         ))),
         (StructPatch(patch), Some(DataType::Struct(output_schema))) => {
-            evaluate_struct_patch_expression(patch, batch, output_schema)
+            evaluate_struct_patch_expression(patch, batch, output_schema, options)
         }
         (StructPatch(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct patch expressions",
@@ -308,7 +349,7 @@ pub fn evaluate_expression(
         ))),
         (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
             None | Some(&DataType::STRING) => {
-                let input = evaluate_expression(expr, batch, None)?;
+                let input = evaluate_expression_with_options(expr, batch, None, options)?;
                 Ok(to_json(&input)?)
             }
             Some(data_type) => Err(Error::generic(format!(
@@ -316,8 +357,8 @@ pub fn evaluate_expression(
             ))),
         },
         (Binary(BinaryExpression { op, left, right }), _) => {
-            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            let left_arr = evaluate_expression_with_options(left.as_ref(), batch, None, options)?;
+            let right_arr = evaluate_expression_with_options(right.as_ref(), batch, None, options)?;
 
             type Operation = fn(&dyn Datum, &dyn Datum) -> Result<ArrayRef, ArrowError>;
             let eval: Operation = match op {
@@ -339,7 +380,7 @@ pub fn evaluate_expression(
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
 
             for expr in exprs {
-                let array = evaluate_expression(expr, batch, result_type)?;
+                let array = evaluate_expression_with_options(expr, batch, result_type, options)?;
                 let null_count = array.null_count();
                 arrays.push(array);
                 // Short-circuit: if this array has no nulls, we can stop evaluating
@@ -353,7 +394,7 @@ pub fn evaluate_expression(
             Ok(coalesce_arrays(&arrays, result_type)?)
         }
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
-            evaluate_array_expression(exprs, batch, result_type)
+            evaluate_array_expression(exprs, batch, result_type, options)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -367,19 +408,31 @@ pub fn evaluate_expression(
             }
         }
         (ParseJson(p), _) => {
-            let json_arr = evaluate_expression(&p.json_expr, batch, Some(&DataType::STRING))?;
+            let json_arr = evaluate_expression_with_options(
+                &p.json_expr,
+                batch,
+                Some(&DataType::STRING),
+                options,
+            )?;
             // Coarser backstop for genuinely malformed JSON (incomplete records, unmatched
             // braces, etc.). Cell-level type-parse failures in failure-prone leaves
             // (Timestamp/Date/Decimal) are handled inside `parse_json_impl` itself, which
             // converts them to per-cell NULL rather than failing the batch.
-            match parse_json_impl(json_arr.as_ref(), p.output_schema.clone()) {
+            match parse_json_impl_with_options(
+                json_arr.as_ref(),
+                p.output_schema.clone(),
+                &options.arrow_conversion_options(),
+            ) {
                 Ok(batch) => Ok(Arc::new(StructArray::from(batch)) as ArrayRef),
                 Err(e) => {
                     warn!(
                         "Failed to parse JSON stats as {}: {e}. Using null stats.",
                         p.output_schema,
                     );
-                    let arrow_schema = ArrowSchema::try_from_kernel(p.output_schema.as_ref())?;
+                    let arrow_schema = p
+                        .output_schema
+                        .as_ref()
+                        .try_into_arrow_with_options(&options.arrow_conversion_options())?;
                     Ok(new_null_array(
                         &ArrowDataType::Struct(arrow_schema.fields().clone()),
                         json_arr.len(),
@@ -388,7 +441,7 @@ pub fn evaluate_expression(
             }
         }
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
-            let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
+            let map_arr = evaluate_expression_with_options(&m.map_expr, batch, None, options)?;
             let result = evaluate_map_to_struct(&map_arr, output_schema)?;
             Ok(Arc::new(result) as ArrayRef)
         }
@@ -396,7 +449,7 @@ pub fn evaluate_expression(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
         ))),
         (Cast(c), result_type) => {
-            let input = evaluate_expression(&c.expr, batch, None)?;
+            let input = evaluate_expression_with_options(&c.expr, batch, None, options)?;
             let target = ArrowDataType::try_from_kernel(&c.target)?;
             // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
             // that to an all-NULL column so an unsupported cast keeps the file.
@@ -427,6 +480,7 @@ fn evaluate_array_expression(
     exprs: &[Expression],
     batch: &RecordBatch,
     result_type: Option<&DataType>,
+    options: &ArrowEvaluationOptions,
 ) -> DeltaResult<ArrayRef> {
     let num_rows = batch.num_rows();
 
@@ -444,7 +498,7 @@ fn evaluate_array_expression(
 
     let element_arrays: Vec<ArrayRef> = exprs
         .iter()
-        .map(|expr| evaluate_expression(expr, batch, element_kernel_type))
+        .map(|expr| evaluate_expression_with_options(expr, batch, element_kernel_type, options))
         .try_collect()?;
 
     let element_type = element_arrays

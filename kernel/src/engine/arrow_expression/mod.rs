@@ -2,16 +2,22 @@
 use std::sync::Arc;
 
 pub(crate) use evaluate_expression::extract_column;
-use evaluate_expression::{evaluate_expression, evaluate_predicate};
+use evaluate_expression::{evaluate_expression_with_options, evaluate_predicate};
 use tracing::debug;
 
-use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
+#[cfg(feature = "geo-type-in-dev")]
+use super::arrow_conversion::GeometryArrowRepresentation;
+use super::arrow_conversion::{
+    ArrowConversionOptions, TryFromKernel as _, TryIntoArrowWithOptions as _,
+};
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
-use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
+use crate::engine::arrow_utils::apply_schema::{
+    apply_schema_to_with_options, apply_schema_with_options,
+};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
@@ -242,8 +248,53 @@ impl ArrayData {
     }
 }
 
-#[derive(Debug)]
-pub struct ArrowEvaluationHandler;
+#[derive(Clone, Default)]
+pub struct ArrowEvaluationOptions {
+    #[cfg(feature = "geo-type-in-dev")]
+    geometry: Option<Arc<dyn GeometryArrowRepresentation>>,
+}
+
+impl std::fmt::Debug for ArrowEvaluationOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("ArrowEvaluationOptions");
+        #[cfg(feature = "geo-type-in-dev")]
+        builder.field("geometry", &self.geometry.is_some());
+        builder.finish()
+    }
+}
+
+impl ArrowEvaluationOptions {
+    pub(crate) fn arrow_conversion_options(&self) -> ArrowConversionOptions<'_> {
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            ArrowConversionOptions::new(self.geometry.as_deref())
+        }
+        #[cfg(not(feature = "geo-type-in-dev"))]
+        {
+            ArrowConversionOptions::empty()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ArrowEvaluationHandler {
+    options: ArrowEvaluationOptions,
+}
+
+impl ArrowEvaluationHandler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    pub fn with_geometry_representation(geometry: Arc<dyn GeometryArrowRepresentation>) -> Self {
+        Self {
+            options: ArrowEvaluationOptions {
+                geometry: Some(geometry),
+            },
+        }
+    }
+}
 
 impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_expression_evaluator(
@@ -256,6 +307,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             _input_schema: schema,
             expression,
             output_type,
+            options: self.options.clone(),
         }))
     }
 
@@ -275,7 +327,11 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         schema: SchemaRef,
         rows: Vec<Vec<Scalar>>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+        let arrow_schema: Arc<ArrowSchema> = Arc::new(
+            schema
+                .as_ref()
+                .try_into_arrow_with_options(&self.options.arrow_conversion_options())?,
+        );
         if rows.is_empty() {
             return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
                 arrow_schema,
@@ -330,6 +386,7 @@ pub struct DefaultExpressionEvaluator {
     _input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
+    options: ArrowEvaluationOptions,
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
@@ -353,17 +410,41 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
                     None => Arc::new(StructArray::from(batch.clone())),
                     Some(path) => extract_column(batch, path)?,
                 };
-                apply_schema(&array, &self.output_type)?
+                apply_schema_with_options(
+                    &array,
+                    &self.output_type,
+                    &self.options.arrow_conversion_options(),
+                )?
             }
             (expr, output_type @ DataType::Struct(_)) => {
-                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
-                apply_schema(&array_ref, output_type)?
+                let array_ref = evaluate_expression_with_options(
+                    expr,
+                    batch,
+                    Some(output_type),
+                    &self.options,
+                )?;
+                apply_schema_with_options(
+                    &array_ref,
+                    output_type,
+                    &self.options.arrow_conversion_options(),
+                )?
             }
             (expr, output_type) => {
-                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
-                let array_ref = apply_schema_to(&array_ref, output_type)?;
-                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
-                let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
+                let array_ref = evaluate_expression_with_options(
+                    expr,
+                    batch,
+                    Some(output_type),
+                    &self.options,
+                )?;
+                let array_ref = apply_schema_to_with_options(
+                    &array_ref,
+                    output_type,
+                    &self.options.arrow_conversion_options(),
+                )?;
+                let field = crate::schema::StructField::nullable("output", output_type.clone());
+                let arrow_field =
+                    field.try_into_arrow_with_options(&self.options.arrow_conversion_options())?;
+                let schema = ArrowSchema::new(vec![arrow_field]);
                 RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
             }
         };

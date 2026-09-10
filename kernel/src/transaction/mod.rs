@@ -2439,7 +2439,7 @@ mod tests {
         let physical_schema = wc.physical_data_schema();
         let l2p = wc.logical_to_physical();
 
-        let handler = ArrowEvaluationHandler;
+        let handler = ArrowEvaluationHandler::new();
         let evaluator = handler.new_expression_evaluator(
             input_schema.into(),
             l2p,
@@ -3223,7 +3223,7 @@ mod tests {
             ],
         )?);
         let rows = vec![vec![1i64.into(), info1], vec![2i64.into(), info2]];
-        ArrowEvaluationHandler.create_many(schema, rows)
+        ArrowEvaluationHandler::new().create_many(schema, rows)
     }
 
     /// Validates that [`BoundWriteContext::logical_to_physical`] correctly renames fields at all
@@ -3251,7 +3251,7 @@ mod tests {
 
         // Evaluate the logical_to_physical expression
         let input_schema: SchemaRef = logical_schema.clone();
-        let handler = ArrowEvaluationHandler;
+        let handler = ArrowEvaluationHandler::new();
         let evaluator = handler.new_expression_evaluator(
             input_schema,
             logical_to_physical_expression.clone(),
@@ -3485,7 +3485,9 @@ mod tests {
                 ]
             })
             .collect();
-        ArrowEvaluationHandler.create_many(schema, rows).unwrap()
+        ArrowEvaluationHandler::new()
+            .create_many(schema, rows)
+            .unwrap()
     }
 
     #[test]

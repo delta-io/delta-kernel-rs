@@ -351,7 +351,7 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> DeltaResult<Vec<Reco
         return Ok(vec![]);
     };
     let input_schema = Arc::new(StructType::try_from_arrow(first_batch.schema().as_ref())?);
-    let evaluator = ArrowEvaluationHandler.new_expression_evaluator(
+    let evaluator = ArrowEvaluationHandler::new().new_expression_evaluator(
         input_schema,
         project.expr,
         project.schema.as_ref().clone().into(),
@@ -371,7 +371,8 @@ fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> DeltaResult<Ve
         return Ok(vec![]);
     };
     let input_schema = Arc::new(StructType::try_from_arrow(first_batch.schema().as_ref())?);
-    let evaluator = ArrowEvaluationHandler.new_predicate_evaluator(input_schema, predicate)?;
+    let evaluator =
+        ArrowEvaluationHandler::new().new_predicate_evaluator(input_schema, predicate)?;
     input
         .iter()
         .map(|batch| {
