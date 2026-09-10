@@ -41,6 +41,8 @@ def _document(*, author_type: str = "Bot") -> dict:
                                             "path": "kernel/src/example.rs",
                                             "line": 10,
                                             "originalLine": 10,
+                                            "fullDatabaseId": 101,
+                                            "side": "RIGHT",
                                             "body": "**Blocker1** Repeated finding.",
                                         }
                                     ]
@@ -83,6 +85,7 @@ class ReviewHistoryTest(unittest.TestCase):
                 {
                     "path": "kernel/src/example.rs",
                     "line": 10,
+                    "side": "RIGHT",
                     "body": "**Blocker1** Repeated finding.",
                 }
             ],
@@ -101,6 +104,21 @@ class ReviewHistoryTest(unittest.TestCase):
         comment["originalLine"] = None
         self.assertEqual(module.previous_inline_comments(document), [])
 
+    def test_inline_comment_sides_are_joined_from_rest_metadata(self) -> None:
+        module = _load_module()
+        document = _document()
+        comment = document["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0][
+            "comments"
+        ]["nodes"][0]
+        comment.pop("side")
+
+        module.attach_inline_comment_sides(
+            document,
+            [{"id": 101, "side": None, "original_side": "LEFT"}],
+        )
+
+        self.assertEqual(module.previous_inline_comments(document)[0]["side"], "LEFT")
+
     def test_empty_history_document_is_supported(self) -> None:
         module = _load_module()
 
@@ -109,6 +127,20 @@ class ReviewHistoryTest(unittest.TestCase):
             "No previous AI review findings were found.",
         )
         self.assertEqual(module.previous_inline_comments({}), [])
+        self.assertFalse(module.is_duplicate_review("review", {}))
+
+    def test_history_ignores_unmarked_bot_entries(self) -> None:
+        module = _load_module()
+        document = _document()
+        pull_request = document["data"]["repository"]["pullRequest"]
+        pull_request["comments"]["nodes"][0]["body"] = "Unmarked bot comment"
+        pull_request["reviews"]["nodes"][0]["body"] = "Unmarked bot review"
+
+        self.assertEqual(
+            module.format_review_history(document),
+            "No previous AI review findings were found.",
+        )
+        self.assertEqual(module.previous_inline_comments(document), [])
 
     def test_finding_normalization_ignores_run_specific_id_and_whitespace(self) -> None:
         module = _load_module()

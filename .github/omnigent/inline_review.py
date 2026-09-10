@@ -17,14 +17,19 @@ INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
 INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
 _FINDING_ID = re.compile(r"(?:Blocker|Nit)[1-9][0-9]*")
 _FINDING_HEADING = re.compile(r"^###\s+((?:Blocker|Nit)[1-9][0-9]*)\b")
-_MARKDOWN_HEADING = re.compile(r"^(#{1,3})\s+")
-_PLAIN_SECTION_HEADING = re.compile(
-    r"^(?:Blocking issues|Non-blocking notes|Summary)\s*:?\s*$", re.IGNORECASE
+_SECTION_HEADING = re.compile(
+    r"^(?:(?:##\s+)?|(?:\d+\.\s+\*\*))"
+    r"(?:Blocking issues|Non-blocking notes|Summary)"
+    r"(?:\*\*)?\s*:?\s*$",
+    re.IGNORECASE,
 )
 _CODE_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _EMPTY_FINDING_GROUP = re.compile(
-    r"^(?:##\s+)?(?:Blocking issues|Non-blocking notes)\s*:?\s*\n"
-    r"(?=\s*(?:(?:##\s+)?(?:Blocking issues|Non-blocking notes|Summary)\s*:?\s*$|\Z))",
+    r"^(?:(?:##\s+)?(?:Blocking issues|Non-blocking notes)|"
+    r"(?:\d+\.\s+\*\*(?:Blocking issues|Non-blocking notes)\*\*))\s*:?\s*\n"
+    r"(?=\s*(?:(?:(?:##\s+)?(?:Blocking issues|Non-blocking notes|Summary)|"
+    r"(?:\d+\.\s+\*\*(?:Blocking issues|Non-blocking notes|Summary)\*\*))"
+    r"\s*:?\s*$|\Z))",
     re.IGNORECASE | re.MULTILINE,
 )
 _HUNK_HEADER = re.compile(
@@ -181,14 +186,19 @@ def build_review_payload(
     unmapped: list[str] = []
     duplicates: list[str] = []
     seen_ids: set[str] = set()
-    headings = _markdown_headings(review)
+    headings = _review_boundaries(review)
     review_ids = {
         finding.group(1)
         for _, line in headings
         if (finding := _FINDING_HEADING.match(line)) is not None
     }
     prior_comments = {
-        (comment["path"], comment["line"], canonical_finding_body(comment["body"]))
+        (
+            comment["path"],
+            comment["line"],
+            comment["side"],
+            canonical_finding_body(comment["body"]),
+        )
         for comment in previous_inline_comments(history)
     }
     omitted_ids: set[str] = set()
@@ -207,7 +217,7 @@ def build_review_payload(
         if finding_id not in review_ids:
             unmapped.append(finding_id)
             continue
-        if (path, line, canonical_finding_body(body)) in prior_comments:
+        if (path, line, side, canonical_finding_body(body)) in prior_comments:
             duplicates.append(finding_id)
             omitted_ids.add(finding_id)
             continue
@@ -245,7 +255,7 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
     if not finding_ids:
         return review
 
-    headings = _markdown_headings(review)
+    headings = _review_boundaries(review)
     ranges: list[tuple[int, int]] = []
     for index, (start, line) in enumerate(headings):
         finding = _FINDING_HEADING.match(line)
@@ -260,8 +270,8 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
     return review.strip()
 
 
-def _markdown_headings(review: str) -> list[tuple[int, str]]:
-    """Return heading offsets while ignoring heading-like lines in code fences."""
+def _review_boundaries(review: str) -> list[tuple[int, str]]:
+    """Return finding and section boundaries, ignoring balanced code fences."""
     headings: list[tuple[int, str]] = []
     fence_character: str | None = None
     fence_length = 0
@@ -279,13 +289,30 @@ def _markdown_headings(review: str) -> list[tuple[int, str]]:
                 fence_length = 0
             offset += len(line)
             continue
-        if fence_character is None and (
-            _MARKDOWN_HEADING.match(line) is not None
-            or _PLAIN_SECTION_HEADING.match(line) is not None
-        ):
+        if fence_character is None and _is_review_boundary(line):
+            headings.append((offset, line))
+        offset += len(line)
+    if fence_character is not None:
+        return _review_boundaries_without_fences(review)
+    return headings
+
+
+def _review_boundaries_without_fences(review: str) -> list[tuple[int, str]]:
+    """Recover structural boundaries when model output has an open code fence."""
+    headings: list[tuple[int, str]] = []
+    offset = 0
+    for line in review.splitlines(keepends=True):
+        if _is_review_boundary(line):
             headings.append((offset, line))
         offset += len(line)
     return headings
+
+
+def _is_review_boundary(line: str) -> bool:
+    return (
+        _FINDING_HEADING.match(line) is not None
+        or _SECTION_HEADING.match(line) is not None
+    )
 
 
 def _diff_path(value: str) -> str | None:

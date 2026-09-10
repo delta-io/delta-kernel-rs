@@ -368,6 +368,7 @@ class InlineReviewTest(unittest.TestCase):
                                                 "path": "kernel/src/example.rs",
                                                 "line": 10,
                                                 "originalLine": 10,
+                                                "side": "RIGHT",
                                                 "body": "**Blocker9** Repeated finding.",
                                             }
                                         ]
@@ -430,6 +431,22 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(unmapped, [])
         self.assertEqual(duplicates, [])
 
+        findings[0]["line"] = 10
+        findings[0]["side"] = "LEFT"
+        payload, unmapped, duplicates = self.inline_review.build_review_payload(
+            review="### Blocker1\nRepeated finding.\n\n## Summary\nDifferent side.",
+            findings=findings,
+            diff=DIFF,
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+            history=history,
+        )
+
+        self.assertEqual(len(payload["comments"]), 1)
+        self.assertEqual(payload["comments"][0]["side"], "LEFT")
+        self.assertEqual(unmapped, [])
+        self.assertEqual(duplicates, [])
+
     def test_removed_finding_ignores_heading_like_code_fence_lines(self) -> None:
         review = (
             "## Blocking issues\n"
@@ -453,6 +470,44 @@ class InlineReviewTest(unittest.TestCase):
         self.assertIn("### Blocker2", remaining)
         self.assertIn("## Summary", remaining)
 
+    def test_removed_finding_ignores_internal_markdown_heading(self) -> None:
+        review = (
+            "## Blocking issues\n"
+            "### Blocker1\n"
+            "Finding detail.\n"
+            "### Reproduction\n"
+            "More finding detail.\n"
+            "### Blocker2\n"
+            "Finding that remains.\n"
+            "## Summary\n"
+            "Needs changes."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
+
+        self.assertNotIn("Reproduction", remaining)
+        self.assertNotIn("More finding detail", remaining)
+        self.assertIn("### Blocker2", remaining)
+        self.assertIn("## Summary", remaining)
+
+    def test_removed_finding_recovers_from_unclosed_code_fence(self) -> None:
+        review = (
+            "## Blocking issues\n"
+            "### Blocker1\n"
+            "```text\n"
+            "Unclosed example.\n"
+            "### Blocker2\n"
+            "Finding that remains.\n"
+            "Summary:\n"
+            "Needs changes."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
+
+        self.assertNotIn("Unclosed example", remaining)
+        self.assertIn("### Blocker2", remaining)
+        self.assertIn("Summary:\nNeeds changes.", remaining)
+
     def test_removed_finding_preserves_plain_summary_and_drops_empty_group(self) -> None:
         review = (
             "No blocking issues.\n\n"
@@ -470,6 +525,21 @@ class InlineReviewTest(unittest.TestCase):
         self.assertNotIn("Non-blocking notes", remaining)
         self.assertNotIn("Finding published inline", remaining)
         self.assertIn("Summary:\nOverall assessment.", remaining)
+
+    def test_removed_finding_drops_empty_numbered_group(self) -> None:
+        review = (
+            "1. **Non-blocking notes**\n\n"
+            "### Nit1\n"
+            "Finding published inline.\n\n"
+            "2. **Summary**\n"
+            "Overall assessment."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Nit1"})
+
+        self.assertNotIn("Non-blocking notes", remaining)
+        self.assertNotIn("Finding published inline", remaining)
+        self.assertIn("2. **Summary**\nOverall assessment.", remaining)
 
     def test_build_payload_keeps_finding_without_matching_heading_in_summary(self) -> None:
         payload, unmapped, duplicates = self.inline_review.build_review_payload(

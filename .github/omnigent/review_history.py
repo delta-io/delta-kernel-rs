@@ -5,11 +5,31 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from review_publish import BOT_MARKER, strip_review_body
 
-BOT_MARKER = "<!-- ai-review-bot -->"
 MAX_HISTORY_CHARS = 12_000
 MAX_ENTRY_CHARS = 6_000
 _FINDING_PREFIX = re.compile(r"^\*\*(?:(?:Blocker|Nit)|[BN])\d+\*\*\s*", re.I)
+
+
+def attach_inline_comment_sides(document: Any, rest_comments: Any) -> None:
+    """Attach REST-only diff-side metadata to GraphQL review comments by ID."""
+    if not isinstance(rest_comments, list):
+        return
+    sides: dict[str, str] = {}
+    for comment in rest_comments:
+        if not isinstance(comment, dict):
+            continue
+        comment_id = comment.get("id")
+        side = comment.get("side") or comment.get("original_side")
+        if isinstance(comment_id, int) and side in {"LEFT", "RIGHT"}:
+            sides[str(comment_id)] = side
+
+    for review in _review_nodes(document):
+        for comment in _nodes(review.get("comments")):
+            side = sides.get(str(comment.get("fullDatabaseId")))
+            if side is not None:
+                comment["side"] = side
 
 
 def format_review_history(document: Any) -> str:
@@ -45,14 +65,18 @@ def previous_inline_comments(document: Any) -> list[dict[str, str | int]]:
             path = comment.get("path")
             body = comment.get("body")
             line = comment.get("line")
+            side = comment.get("side")
             if not isinstance(line, int):
                 line = comment.get("originalLine")
             if (
                 isinstance(path, str)
                 and isinstance(body, str)
                 and isinstance(line, int)
+                and side in {"LEFT", "RIGHT"}
             ):
-                comments.append({"path": path, "line": line, "body": body})
+                comments.append(
+                    {"path": path, "line": line, "side": side, "body": body}
+                )
     return comments
 
 
@@ -136,18 +160,7 @@ def _nodes(connection: Any) -> list[dict[str, Any]]:
 
 
 def _clean_published_body(body: str) -> str:
-    body = body.strip()
-    if body.startswith(BOT_MARKER):
-        body = body[len(BOT_MARKER) :].lstrip()
-    body = re.sub(r"^## AI Review[^\n]*\n+", "", body)
-    body = re.sub(r"^<details><summary>Show review</summary>\n+", "", body)
-    body = re.sub(
-        r"\n+---\n+<sub>Automated review - \[workflow run\]\([^\n]+\)</sub>\s*$",
-        "",
-        body,
-    )
-    body = re.sub(r"\n+</details>\s*$", "", body)
-    return _sanitize(body).strip()
+    return _sanitize(strip_review_body(body)).strip()
 
 
 def _normalize(value: str) -> str:
