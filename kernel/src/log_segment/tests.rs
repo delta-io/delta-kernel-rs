@@ -2704,6 +2704,39 @@ fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
     assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
 }
 
+#[rstest]
+#[case::complete(&[1, 2], 2, None)]
+#[case::out_of_order(&[2, 1], 2, None)]
+#[case::three_complete(&[1, 2, 3], 3, None)]
+#[case::duplicate(&[1, 1], 2, Some("duplicate part number 1"))]
+#[case::zero(&[0, 2], 2, Some("part number 0 is outside 1..=2"))]
+#[case::above_range(&[1, 3], 2, Some("part number 3 is outside 1..=2"))]
+#[case::one_part(&[1], 1, Some("must contain at least two parts"))]
+fn test_validate_multipart_checkpoint_part_numbers(
+    #[case] part_numbers: &[u32],
+    #[case] num_parts: u32,
+    #[case] expected_error: Option<&str>,
+) {
+    let parts = part_numbers
+        .iter()
+        .map(|part_num| {
+            let mut part =
+                create_log_path("file:///_delta_log/00000000000000000010.checkpoint.parquet");
+            part.file_type = LogPathFileType::MultiPartCheckpoint {
+                part_num: *part_num,
+                num_parts,
+            };
+            part
+        })
+        .collect_vec();
+
+    let result = validate_checkpoint_parts(&parts);
+    match expected_error {
+        Some(expected_error) => assert_result_error_with_message(result, expected_error),
+        None => result.unwrap(),
+    }
+}
+
 #[test]
 fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
     // Two parts that agree on version but claim num_parts=3 (count mismatch: 2 != 3)

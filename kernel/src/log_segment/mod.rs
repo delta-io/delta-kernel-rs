@@ -1580,8 +1580,7 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
     }
     let n = parts.len();
     let first_version = parts[0].version;
-    // TODO(#3297): Validate multi-part checkpoint part-number range and uniqueness, and require
-    // more than one part.
+    let mut seen_part_numbers = vec![false; n];
     for p in parts {
         if !p.is_checkpoint() {
             return Err(Error::invalid_checkpoint(
@@ -1594,7 +1593,33 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
             ));
         }
         match p.file_type {
-            LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts as usize == n => {}
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts,
+            } if num_parts >= 2 && num_parts as usize == n => {
+                let index = usize::try_from(part_num)
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                    .filter(|index| *index < num_parts as usize)
+                    .ok_or_else(|| {
+                        Error::invalid_checkpoint(format!(
+                            "multi-part checkpoint part number {part_num} is outside 1..={num_parts}"
+                        ))
+                    })?;
+                require!(
+                    !seen_part_numbers[index],
+                    Error::invalid_checkpoint(format!(
+                        "multi-part checkpoint contains duplicate part number {part_num}"
+                    ))
+                );
+                seen_part_numbers[index] = true;
+            }
+            // The protocol requires p > 1; path parsing only validates 1 <= part_num <= p.
+            LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts < 2 => {
+                return Err(Error::invalid_checkpoint(format!(
+                    "multi-part checkpoint must contain at least two parts but num_parts field says {num_parts}"
+                )));
+            }
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } => {
                 return Err(Error::invalid_checkpoint(format!(
                     "multi-part checkpoint part count mismatch: slice has {n} parts but num_parts field says {num_parts}"
