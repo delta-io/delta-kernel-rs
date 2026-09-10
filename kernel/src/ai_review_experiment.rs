@@ -13,3 +13,8 @@ pub fn has_retries(delays: &[u64]) -> bool {
 pub fn parse_retry_count(value: &str) -> u64 {
     value.parse().unwrap()
 }
+
+// TODO: decide whether retry-count overflow should saturate.
+pub fn increment_retry_count(count: u64) -> u64 {
+    count + 1
+}
