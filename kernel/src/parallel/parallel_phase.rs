@@ -1091,13 +1091,21 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_parallel_none_preserves_data_skipping_after_serde() -> DeltaResult<()> {
+    #[rstest::rstest]
+    #[case::none(StatsOptions::none(), false, false)]
+    #[case::json_only(StatsOptions::json_only(), true, false)]
+    #[case::all_struct(StatsOptions::all_struct(), false, true)]
+    #[case::all(StatsOptions::all(), true, true)]
+    fn test_parallel_stats_output_modes_preserve_skipping_after_serde(
+        #[case] stats: StatsOptions,
+        #[case] expect_json: bool,
+        #[case] expect_struct: bool,
+    ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) =
             load_test_table("v2-parquet-sidecars-struct-stats-only")?;
         let scan = snapshot
             .scan_builder()
-            .with_stats(StatsOptions::none())
+            .with_stats(stats)
             .with_predicate(Arc::new(col!("id").gt(lit(3i64))))
             .build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
@@ -1121,7 +1129,20 @@ mod tests {
             let metadata = result?;
             let (data, selection) = metadata.scan_files.into_parts();
             let data = ArrowEngineData::try_from_engine_data(data)?;
-            assert!(data.record_batch().column_by_name("stats_parsed").is_none());
+            let batch = data.record_batch();
+            let json_stats = batch
+                .column_by_name("stats")
+                .expect("scan output must contain the nullable JSON stats column");
+            let struct_stats = batch.column_by_name("stats_parsed");
+            assert_eq!(struct_stats.is_some(), expect_struct);
+            for (row, selected) in selection.iter().enumerate() {
+                if *selected {
+                    assert_eq!(!json_stats.is_null(row), expect_json);
+                    if let Some(struct_stats) = struct_stats {
+                        assert!(!struct_stats.is_null(row));
+                    }
+                }
+            }
             selected_files += selection.into_iter().filter(|selected| *selected).count();
         }
         assert_eq!(selected_files, 2);

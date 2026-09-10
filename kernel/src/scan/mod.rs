@@ -96,8 +96,10 @@ pub use crate::parallel::parallel_scan_metadata::{
 
 /// Configures structured and JSON statistics in scan metadata.
 ///
-/// Output is independent of data skipping: predicates may use internal statistics that are removed
-/// from the returned metadata.
+/// Choosing an output shape does not disable data skipping for indexed predicate columns:
+/// predicates may use internal statistics that are removed from the returned metadata. Explicit
+/// column requests can also make columns outside the table's configured indexed set eligible for
+/// skipping.
 ///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
@@ -157,7 +159,8 @@ impl StatsOptions {
         Self::default()
     }
 
-    /// All struct stats without JSON output. Compatible checkpoints avoid per-batch `ToJson`.
+    /// All struct stats without JSON output. Checkpoints whose native `stats_parsed` field can be
+    /// read as the scan's physical stats schema avoid per-batch JSON parsing.
     pub fn all_struct() -> Self {
         Self {
             emit_json: false,
@@ -778,6 +781,10 @@ impl Scan {
     }
 
     #[cfg(feature = "declarative-plans")]
+    /// Returns the schema that a declarative plan must normalize into `add.stats_parsed`.
+    ///
+    /// Structured output and predicate pruning consume that normalized column. JSON-only output
+    /// can serialize a checkpoint's native `stats_parsed` directly and then drop the column.
     fn stats_schema_for_transform(&self) -> Option<&SchemaRef> {
         if self.physical_stats_output_schema.is_some()
             || matches!(
@@ -1286,10 +1293,10 @@ impl Scan {
             .create_checkpoint_stream(
                 engine.as_ref(),
                 checkpoint_read_schema,
-                None,
+                None, // Checkpoint discovery does not evaluate a metadata predicate.
                 self.state_info.physical_stats_schema.as_deref(),
                 self.state_info.physical_partition_schema.as_deref(),
-                None,
+                None, // Cancellation is rejected above for parallel scans.
             )?
             .checkpoint_info;
         let checkpoint_read_schema = checkpoint_info.checkpoint_read_schema.clone();
