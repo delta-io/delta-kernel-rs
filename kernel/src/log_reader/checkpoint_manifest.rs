@@ -27,10 +27,6 @@ pub(crate) struct CheckpointManifestReader {
 impl CheckpointManifestReader {
     /// Creates a manifest reader for a single-part checkpoint.
     ///
-    /// The Add projection is combined with the full Remove and Sidecar fields required by replay
-    /// and sidecar discovery. The read is unfiltered because sidecar actions have null Add fields
-    /// and must remain visible to sidecar discovery.
-    ///
     /// # Parameters
     ///
     /// - `engine`: Engine for reading the checkpoint manifest.
@@ -45,7 +41,8 @@ impl CheckpointManifestReader {
         checkpoint_read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
         // Preserve the scan's projected Add schema so unneeded stats stay unread. Replay still
-        // needs full Remove actions, while sidecar discovery needs Sidecar actions.
+        // needs full Remove actions, while sidecar discovery needs Sidecar actions. The read stays
+        // unfiltered because sidecar rows have null Add fields.
         let manifest_read_schema = checkpoint_read_schema
             .project_as_struct(&[ADD_NAME])?
             .add([(*REMOVE_FIELD).clone(), (*SIDECAR_FIELD).clone()])?;

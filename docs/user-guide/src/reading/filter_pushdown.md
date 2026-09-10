@@ -215,8 +215,9 @@ This happens for several reasons:
 By default, Kernel reads file-level statistics from the transaction log
 and uses them internally for data skipping, and exposes those statistics as JSON to your
 connector. To override the default, call `ScanBuilder::with_stats` with a
-`StatsOptions` value. The named constructors cover the supported shapes. Statistics output is
-independent of data skipping.
+`StatsOptions` value. The named constructors cover the supported shapes. Choosing whether to emit
+statistics does not disable data skipping for predicate columns in the table's configured indexed
+set. Explicit column requests can also make columns outside that set eligible for skipping.
 
 ### Omitting statistics from scan metadata
 
@@ -315,6 +316,11 @@ let scan = snapshot
 Only the named data columns appear in structured output. Kernel removes any additional statistics
 read internally for data skipping. An empty column list is equivalent to `StatsOptions::none()`.
 
+Use `StatsOptions::all_struct_with_extra_indexed(cols)` when the connector knows that columns
+outside the table's configured indexed set have on-disk statistics. Those columns are included in
+structured output and become eligible for predicate-based data skipping. Missing per-file values
+remain conservative and do not prune the file.
+
 ### Choosing the right mode
 
 | Goal | Constructor |
@@ -322,6 +328,7 @@ read internally for data skipping. An empty column list is equivalent to `StatsO
 | JSON statistics only (default) | No call needed (or `StatsOptions::json_only()`) |
 | No statistics output | `StatsOptions::none()` |
 | All structured statistics without JSON | `StatsOptions::all_struct()` |
+| All indexed structured statistics plus known extra columns | `StatsOptions::all_struct_with_extra_indexed(cols)` |
 | JSON and all structured statistics | `StatsOptions::all()` |
 | Selected structured statistics without JSON | `StatsOptions::struct_columns(cols)` |
 

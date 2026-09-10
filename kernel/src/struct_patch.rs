@@ -70,6 +70,10 @@ use crate::utils::{CollectInto, FoldWithOption as _};
 use crate::{DeltaResult, Error};
 
 /// Projects a struct column to a narrowed schema while preserving null parent structs.
+///
+/// For example, projecting root `stats_parsed` from `{ minValues: { a, b }, numRecords }` to
+/// `{ minValues: { b } }` produces that narrower struct. If `stats_parsed` is null, the projected
+/// struct is null rather than a non-null struct containing null children.
 pub(crate) fn project_struct_to_schema(
     root: impl CollectInto<ColumnName>,
     schema: &StructType,
