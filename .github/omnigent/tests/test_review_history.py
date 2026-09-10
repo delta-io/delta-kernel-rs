@@ -165,6 +165,26 @@ class ReviewHistoryTest(unittest.TestCase):
 
         self.assertEqual(module.previous_inline_comments(document), [])
 
+    def test_inline_comment_sides_ignore_malformed_rest_metadata(self) -> None:
+        module = _load_module()
+        malformed_metadata = (
+            {},
+            [{"id": "101", "side": "RIGHT"}],
+            [{"id": 101, "side": "right"}],
+        )
+
+        for rest_comments in malformed_metadata:
+            with self.subTest(rest_comments=rest_comments):
+                document = _document()
+                comment = document["data"]["repository"]["pullRequest"]["reviews"][
+                    "nodes"
+                ][0]["comments"]["nodes"][0]
+                comment.pop("side")
+
+                module.attach_inline_comment_sides(document, rest_comments)
+
+                self.assertEqual(module.previous_inline_comments(document), [])
+
     def test_empty_history_document_is_supported(self) -> None:
         module = _load_module()
 

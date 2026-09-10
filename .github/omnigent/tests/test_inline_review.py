@@ -220,6 +220,7 @@ class InlineReviewTest(unittest.TestCase):
         self.assertIn("<details><summary>Show review</summary>", payload["body"])
         self.assertTrue(payload["body"].startswith("<!-- ai-review-bot -->"))
         self.assertNotIn("### Nit1", payload["body"])
+        self.assertIn("## Non-blocking notes", payload["body"])
         self.assertIn("### Nit2", payload["body"])
         self.assertIn("## Summary", payload["body"])
         self.assertEqual(unmapped, ["Nit2"])
@@ -537,7 +538,8 @@ class InlineReviewTest(unittest.TestCase):
 
         remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
 
-        self.assertNotIn("Unclosed example", remaining)
+        self.assertIn("### Blocker1", remaining)
+        self.assertIn("Unclosed example", remaining)
         self.assertIn("### Blocker2", remaining)
         self.assertIn("Summary:\nNeeds changes.", remaining)
 
@@ -560,10 +562,28 @@ class InlineReviewTest(unittest.TestCase):
 
         remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
 
-        self.assertNotIn("This is code", remaining)
-        self.assertNotIn("Unclosed example", remaining)
+        self.assertIn("### Blocker1", remaining)
+        self.assertIn("This is code", remaining)
+        self.assertIn("Unclosed example", remaining)
         self.assertIn("### Blocker2", remaining)
         self.assertIn("Summary:\nNeeds changes.", remaining)
+
+    def test_unclosed_fence_does_not_treat_example_finding_as_boundary(self) -> None:
+        review = (
+            "## Blocking issues\n"
+            "### Blocker1\n"
+            "Finding detail.\n"
+            "```text\n"
+            "### Blocker99\n"
+            "This heading is part of the unclosed example.\n"
+            "Unrelated trailing prose.\n"
+            "## Summary\n"
+            "Needs changes."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
+
+        self.assertEqual(remaining, review)
 
     def test_bare_section_word_inside_finding_is_not_a_boundary(self) -> None:
         review = (
@@ -819,6 +839,33 @@ class InlineReviewTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "JSON array of strings"):
                 self.inline_review._load_trusted_bot_logins(path)
+
+    def test_trusted_bot_login_file_rejects_non_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trusted.json"
+            path.write_text('{"login":"github-actions"}')
+
+            with self.assertRaisesRegex(ValueError, "JSON array of strings"):
+                self.inline_review._load_trusted_bot_logins(path)
+
+    def test_history_load_falls_back_when_file_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing_path = Path(directory) / "missing.json"
+
+            self.assertEqual(self.inline_review._load_history(missing_path), {})
+
+    def test_strip_review_body_preserves_partial_details_wrapper(self) -> None:
+        body = (
+            f"{self.review_publish.BOT_MARKER}\n"
+            f"{self.review_publish.REVIEW_HEADER}\n\n"
+            "<details><summary>Show review</summary>\n\n"
+            "Review content without a closing details tag."
+        )
+
+        stripped = self.review_publish.strip_review_body(body)
+
+        self.assertTrue(stripped.startswith("<details>"))
+        self.assertIn("Review content without a closing details tag.", stripped)
 
     def test_extract_inline_findings_rejects_invalid_envelopes(self) -> None:
         marker = "e" * 32

@@ -259,13 +259,20 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
     if not finding_ids:
         return review
 
-    headings = _review_boundaries(review)
+    headings, unclosed_fence_start = _parse_review_boundaries(review)
     ranges: list[tuple[int, int]] = []
     for index, (start, line) in enumerate(headings):
         finding = _FINDING_HEADING.match(line)
         if finding is None or finding.group(1) not in finding_ids:
             continue
         end = headings[index + 1][0] if index + 1 < len(headings) else len(review)
+        if (
+            unclosed_fence_start is not None
+            and start < unclosed_fence_start < end
+        ):
+            # Once structure becomes ambiguous, preserving extra prose is safer than
+            # deleting a genuine later finding or the summary.
+            continue
         ranges.append((start, end))
 
     for start, end in reversed(ranges):
@@ -280,7 +287,14 @@ def _remove_empty_finding_groups(review: str) -> str:
     for index, (start, line) in enumerate(boundaries):
         if _FINDING_GROUP_HEADING.match(line) is None:
             continue
-        end = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(review)
+        end = next(
+            (
+                boundary_start
+                for boundary_start, boundary_line in boundaries[index + 1 :]
+                if _SECTION_HEADING.match(boundary_line) is not None
+            ),
+            len(review),
+        )
         if not review[start + len(line) : end].strip():
             ranges.append((start, end))
 
@@ -291,6 +305,13 @@ def _remove_empty_finding_groups(review: str) -> str:
 
 def _review_boundaries(review: str) -> list[tuple[int, str]]:
     """Return finding and section boundaries, ignoring balanced code fences."""
+    return _parse_review_boundaries(review)[0]
+
+
+def _parse_review_boundaries(
+    review: str,
+) -> tuple[list[tuple[int, str]], int | None]:
+    """Return reliable boundaries and the start of any unterminated fence."""
     headings: list[tuple[int, str]] = []
     fence_character: str | None = None
     fence_length = 0
@@ -314,24 +335,7 @@ def _review_boundaries(review: str) -> list[tuple[int, str]]:
         if fence_character is None and _is_review_boundary(line):
             headings.append((offset, line))
         offset += len(line)
-    if fence_character is not None and fence_start is not None:
-        headings.extend(
-            _review_boundaries_without_fences(review[fence_start:], fence_start)
-        )
-    return headings
-
-
-def _review_boundaries_without_fences(
-    review: str, base_offset: int
-) -> list[tuple[int, str]]:
-    """Recover structural boundaries when model output has an open code fence."""
-    headings: list[tuple[int, str]] = []
-    offset = base_offset
-    for line in review.splitlines(keepends=True):
-        if _is_review_boundary(line):
-            headings.append((offset, line))
-        offset += len(line)
-    return headings
+    return headings, fence_start
 
 
 def _is_review_boundary(line: str) -> bool:
