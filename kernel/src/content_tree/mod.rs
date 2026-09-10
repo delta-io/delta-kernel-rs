@@ -340,3 +340,59 @@ pub(crate) struct ManifestInfo {
     #[field_id = 523]
     pub(crate) dv_cardinality: Option<i64>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{ColumnMetadataKey, MetadataValue, ToSchema};
+
+    /// The `ContentTreeNodeEntry` Parquet field IDs and nullability are a protocol contract. This
+    /// pins the name, field ID, and nullability of every field in `to_schema()` so an accidental
+    /// change (e.g. reverting `location` or `fileSizeInBytes` back to `Option<...>`) fails loudly.
+    /// `partition` and `content_stats` are `#[skip_schema]` and only appear in
+    /// `to_schema_with_content_stats`, so they are intentionally absent here.
+    #[test]
+    fn content_tree_node_entry_schema_field_contract() {
+        let schema = ContentTreeNodeEntry::to_schema();
+
+        // (field name, Parquet field ID, nullable). `tags` carries no field ID (matched by name).
+        let expected: &[(&str, Option<i64>, bool)] = &[
+            (CONTENT_TYPE, Some(134), false),
+            (LOCATION, Some(100), false),
+            (FILE_FORMAT, Some(101), false),
+            (TRACKING, Some(147), false),
+            (DV_INFO, Some(148), true),
+            (PARTITION_SPEC_ID, Some(141), false),
+            (SORT_ORDER_ID, Some(140), true),
+            (RECORD_COUNT, Some(103), false),
+            (FILE_SIZE_IN_BYTES, Some(104), false),
+            (MANIFEST_INFO, Some(150), true),
+            (KEY_METADATA, Some(131), true),
+            (SPLIT_OFFSETS, Some(132), true),
+            (EQUALITY_IDS, Some(135), true),
+            (FORMAT_VERSION, Some(157), false),
+            (TAGS, None, true),
+        ];
+
+        // Assert the exact set and order of fields, catching added, removed, or reordered fields.
+        let actual_names: Vec<&str> = schema.fields().map(|f| f.name().as_str()).collect();
+        let expected_names: Vec<&str> = expected.iter().map(|(name, _, _)| *name).collect();
+        assert_eq!(actual_names, expected_names, "schema fields drifted");
+
+        for &(name, field_id, nullable) in expected {
+            let field = schema.field(name).expect("field present in schema");
+            assert_eq!(
+                field.is_nullable(),
+                nullable,
+                "nullability mismatch for {name}"
+            );
+            assert_eq!(
+                field
+                    .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                    .cloned(),
+                field_id.map(MetadataValue::Number),
+                "field id mismatch for {name}",
+            );
+        }
+    }
+}
