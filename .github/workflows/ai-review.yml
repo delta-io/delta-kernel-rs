@@ -1267,11 +1267,16 @@ jobs:
             --history /tmp/pr_history.json \
             --output /tmp/inline-review.json \
             --unmapped-output /tmp/unmapped-findings.txt \
-            --duplicate-output /tmp/duplicate-findings.txt
+            --duplicate-output /tmp/duplicate-findings.txt \
+            --skip-duplicate-review-output /tmp/skip-duplicate-inline-review.txt
 
           mapped_count="$(jq '.comments | length' /tmp/inline-review.json)"
           unmapped_count="$(wc -l < /tmp/unmapped-findings.txt | tr -d ' ')"
           duplicate_count="$(wc -l < /tmp/duplicate-findings.txt | tr -d ' ')"
+          if [ "$(cat /tmp/skip-duplicate-inline-review.txt)" = "true" ]; then
+            echo "Skipped an exact duplicate inline review body with no new comments."
+            exit 0
+          fi
           if ! gh api --method POST "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
             --input /tmp/inline-review.json --silent; then
             echo "::warning::GitHub rejected the inline review; posting the collapsed review without inline comments."

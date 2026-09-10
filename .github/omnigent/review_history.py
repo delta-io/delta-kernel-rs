@@ -82,7 +82,7 @@ def previous_inline_comments(document: Any) -> list[dict[str, str | int]]:
 
 def is_duplicate_review(review: str, document: Any) -> bool:
     """Return whether the same complete review was already published by the bot."""
-    current = _normalize(review)
+    current = _normalize(_clean_published_body(review))
     return bool(current) and any(
         _normalize(entry) == current for entry in _bot_review_bodies(document)
     )

@@ -8,7 +8,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from review_history import canonical_finding_body, previous_inline_comments
+from review_history import (
+    canonical_finding_body,
+    is_duplicate_review,
+    previous_inline_comments,
+)
 from review_publish import format_review_body as _format_review_body
 
 
@@ -315,6 +319,17 @@ def _is_review_boundary(line: str) -> bool:
     )
 
 
+def should_skip_inline_review(payload: dict[str, Any], history: Any) -> bool:
+    """Return whether a comment-free inline payload repeats a prior review body."""
+    comments = payload.get("comments")
+    body = payload.get("body")
+    return (
+        comments == []
+        and isinstance(body, str)
+        and is_duplicate_review(body, history)
+    )
+
+
 def _diff_path(value: str) -> str | None:
     value = value.split("\t", 1)[0]
     if value == "/dev/null":
@@ -376,20 +391,25 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--unmapped-output", required=True, type=Path)
     parser.add_argument("--duplicate-output", required=True, type=Path)
+    parser.add_argument("--skip-duplicate-review-output", required=True, type=Path)
     args = parser.parse_args()
 
+    history = json.loads(args.history.read_text())
     payload, unmapped, duplicates = build_review_payload(
         review=args.review.read_text(),
         findings=json.loads(args.findings.read_text()),
         diff=args.diff.read_text(errors="replace"),
         head_sha=args.head_sha,
         run_url=args.run_url,
-        history=json.loads(args.history.read_text()),
+        history=history,
     )
     args.output.write_text(json.dumps(payload))
     args.unmapped_output.write_text("\n".join(unmapped) + ("\n" if unmapped else ""))
     args.duplicate_output.write_text(
         "\n".join(duplicates) + ("\n" if duplicates else "")
+    )
+    args.skip_duplicate_review_output.write_text(
+        "true\n" if should_skip_inline_review(payload, history) else "false\n"
     )
 
 

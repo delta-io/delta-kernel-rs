@@ -563,6 +563,45 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(unmapped, ["Nit1"])
         self.assertEqual(duplicates, [])
 
+    def test_exact_duplicate_inline_body_is_skipped_without_new_comments(self) -> None:
+        review = "## Summary\nNo new findings."
+        prior_body = self.review_publish.format_review_body(
+            review,
+            "https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+            collapsed=True,
+        )
+        history = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "comments": {"nodes": []},
+                        "reviews": {
+                            "nodes": [
+                                {
+                                    "author": {"__typename": "Bot"},
+                                    "body": prior_body,
+                                    "comments": {"nodes": []},
+                                }
+                            ]
+                        },
+                    }
+                }
+            }
+        }
+        payload, _, _ = self.inline_review.build_review_payload(
+            review=review,
+            findings=[],
+            diff=DIFF,
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/2",
+            history=history,
+        )
+
+        self.assertTrue(self.inline_review.should_skip_inline_review(payload, history))
+
+        payload["comments"].append({"body": "new finding"})
+        self.assertFalse(self.inline_review.should_skip_inline_review(payload, history))
+
     def test_extract_inline_findings_rejects_invalid_envelopes(self) -> None:
         marker = "e" * 32
         start = f"<!-- AI_REVIEW_INLINE_START_{marker} -->"
