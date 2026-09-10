@@ -110,8 +110,9 @@ machine-readable block it specifies after the human-readable review and before
 the final per-run marker. Select findings according to the invocation's cap and
 priority order, using locations from the supplied unified diff. Findings not
 selected for inline publication remain in the collapsed review. The workflow
-validates this data, removes successfully attached findings from the collapsed
-body, and retains findings whose locations cannot be mapped to the diff.
+validates this data, removes successfully attached findings and exact duplicates
+of prior AI inline comments from the collapsed body, and retains findings whose
+locations cannot be mapped to the diff.
 
 ## Final writing pass
 Before returning the final comment, do one human-style polish pass over the

@@ -88,6 +88,28 @@ class ReviewHistoryTest(unittest.TestCase):
             ],
         )
 
+    def test_inline_comments_fall_back_to_original_line(self) -> None:
+        module = _load_module()
+        document = _document()
+        comment = document["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0][
+            "comments"
+        ]["nodes"][0]
+        comment["line"] = None
+
+        self.assertEqual(module.previous_inline_comments(document)[0]["line"], 10)
+
+        comment["originalLine"] = None
+        self.assertEqual(module.previous_inline_comments(document), [])
+
+    def test_empty_history_document_is_supported(self) -> None:
+        module = _load_module()
+
+        self.assertEqual(
+            module.format_review_history({}),
+            "No previous AI review findings were found.",
+        )
+        self.assertEqual(module.previous_inline_comments({}), [])
+
     def test_finding_normalization_ignores_run_specific_id_and_whitespace(self) -> None:
         module = _load_module()
 

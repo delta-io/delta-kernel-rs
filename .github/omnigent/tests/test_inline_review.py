@@ -197,6 +197,7 @@ class InlineReviewTest(unittest.TestCase):
             diff=DIFF,
             head_sha="b" * 40,
             run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+            history={},
         )
 
         self.assertEqual(payload["event"], "COMMENT")
