@@ -1,13 +1,3 @@
-# Maintainer Claude Reviewer
-
-Source config: `config.yaml`
-
-Claude maintainer-level Rust + Delta protocol review.
-
-Use this file when running the same reviewer locally outside GitHub Actions. Provide the PR metadata and diff as review context.
-
----
-
 ## Base Context
 
 Apply the delta-kernel-rs project conventions, architecture, and coding

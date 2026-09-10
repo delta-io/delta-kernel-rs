@@ -1,13 +1,3 @@
-# Architecture Reviewer
-
-Source config: `config.yaml`
-
-Reviews the SHAPE of a change: abstractions, API surface, bloat.
-
-Use this file when running the same reviewer locally outside GitHub Actions. Provide the PR metadata and diff as review context.
-
----
-
 ## Base Context
 
 Apply the delta-kernel-rs project conventions, architecture, and coding

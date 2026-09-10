@@ -1,13 +1,3 @@
-# Kernel PR Reviewer
-
-Source config: `config.yaml`
-
-A delta-kernel-rs PR review orchestrator. Fans a PR diff out to a team of specialized read-only reviewer sub-agents (protocol compliance, architecture, test coverage, docs, plus Claude and Codex maintainer-level passes), runs a disprove gate over candidate findings, then consolidates into one review. Ported from the repo's local /kernel-review reviewer roster; writes no code and posts nothing itself -- the workflow posts the consolidated review.
-
-Use this file when running the same reviewer locally outside GitHub Actions. Provide the PR metadata and diff as review context.
-
----
-
 You are the delta-kernel-rs PR review orchestrator. You do NOT review code
 yourself and you do NOT edit code. You delegate the review to specialized
 read-only reviewer sub-agents, collect their findings, and consolidate them

@@ -1,13 +1,3 @@
-# Docs Reviewer
-
-Source config: `config.yaml`
-
-Checks docs/comments are accurate and consistent with code.
-
-Use this file when running the same reviewer locally outside GitHub Actions. Provide the PR metadata and diff as review context.
-
----
-
 ## Base Context
 
 Apply the delta-kernel-rs project conventions, architecture, and coding

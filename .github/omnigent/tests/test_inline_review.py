@@ -8,6 +8,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 def _load_module(name):
     module_dir = Path(__file__).parents[1]
@@ -88,20 +90,12 @@ class InlineReviewTest(unittest.TestCase):
 
     def test_reviewer_contract_matches_configured_prompt(self) -> None:
         reviewer_dir = Path(__file__).parents[1] / "reviewer"
-        contract = (reviewer_dir / "REVIEW.md").read_text()
-        _, separator, standalone_prompt = contract.partition("\n---\n\n")
-        self.assertTrue(separator)
-
-        config = (reviewer_dir / "config.yaml").read_text()
-        _, separator, prompt_block = config.partition("prompt: |\n")
-        self.assertTrue(separator)
-        configured_lines = []
-        for line in prompt_block.splitlines():
-            if line and not line.startswith("  "):
-                break
-            configured_lines.append(line[2:])
-
-        self.assertEqual(standalone_prompt.strip(), "\n".join(configured_lines).strip())
+        for config_path in reviewer_dir.rglob("config.yaml"):
+            with self.subTest(config=config_path.parent.name):
+                config = yaml.safe_load(config_path.read_text())
+                self.assertEqual(config.get("instructions"), "REVIEW.md")
+                self.assertNotIn("prompt", config)
+                self.assertTrue(config_path.with_name("REVIEW.md").read_text().strip())
 
     def test_automatic_reviews_default_to_inline(self) -> None:
         workflow = (Path(__file__).parents[2] / "workflows" / "ai-review.yml").read_text()
