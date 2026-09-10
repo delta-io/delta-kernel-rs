@@ -1,7 +1,7 @@
 //! FFI functions to allow engines to receive log, tracing, and metrics events from kernel.
 //!
 //! We use a single global tracing subscriber, registered the first time any of
-//! [`enable_event_tracing`], [`enable_log_line_tracing`], [`enable_formatted_log_line_tracing`], or
+//! [`enable_event_tracing`], [`enable_log_line_tracing`], [`enable_formatted_log_line_tracing`],
 //! [`enable_metrics_reporting`], or [`enable_frame_reporting`] is called. The subscriber has
 //! independent layers for log events, metric reports, and frame lifecycle events:
 //!

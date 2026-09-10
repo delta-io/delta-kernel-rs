@@ -162,12 +162,25 @@ mod tests {
 
     #[test]
     fn registers_interest_only_in_marked_spans() {
-        capture(|| {
+        let reporter = Arc::new(CapturingFrameReporter::default());
+        let layer = FrameReporterLayer::new(reporter);
+
+        with_default(Registry::default(), || {
             let unmarked = trace_span!("unmarked-trace");
             let marked = trace_span!("marked-trace", enable_call_frame = Empty);
+            let unmarked_metadata = unmarked.metadata().unwrap();
+            let marked_metadata = marked.metadata().unwrap();
 
-            assert!(unmarked.is_disabled());
-            assert!(!marked.is_disabled());
+            assert!(<FrameReporterLayer as Layer<Registry>>::register_callsite(
+                &layer,
+                unmarked_metadata
+            )
+            .is_never());
+            assert!(<FrameReporterLayer as Layer<Registry>>::register_callsite(
+                &layer,
+                marked_metadata
+            )
+            .is_always());
         });
     }
 
