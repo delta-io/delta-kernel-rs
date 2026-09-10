@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
+#[cfg(feature = "geo-type-in-dev")]
+use crate::arrow::array::ArrayRef as ArrowArrayRef;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
@@ -29,15 +31,119 @@ use crate::arrow::datatypes::{
 use crate::arrow::error::ArrowError;
 use crate::error::Error;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::GeometryType;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::DeltaResult;
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
 pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
 pub(crate) const MAP_KEY_DEFAULT: &str = "key";
 pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
+
+/// Chooses how kernel geometry values are represented in Arrow.
+///
+/// The returned Arrow values must use this crate's active Arrow version. Implementations using
+/// another Arrow version internally must translate before returning.
+#[cfg(feature = "geo-type-in-dev")]
+pub trait GeometryArrowRepresentation: Send + Sync {
+    /// Builds the Arrow field for a kernel geometry field.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: Arrow field name to use.
+    /// - `geometry`: Kernel geometry type carrying semantic geometry properties such as CRS.
+    /// - `nullable`: Whether the resulting Arrow field accepts null values.
+    /// - `metadata`: Kernel field metadata already translated into Arrow metadata keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this representation cannot materialize the requested geometry field.
+    fn geometry_field(
+        &self,
+        name: &str,
+        geometry: &GeometryType,
+        nullable: bool,
+        metadata: HashMap<String, String>,
+    ) -> Result<ArrowField, ArrowError>;
+
+    /// Creates a stats builder that produces an array matching `field`.
+    ///
+    /// `field` must be the Arrow field this provider produced for `geometry`.
+    ///
+    /// # Parameters
+    ///
+    /// - `geometry`: Kernel geometry type for the stats leaf.
+    /// - `field`: Target Arrow field, including data type and metadata.
+    /// - `capacity`: Expected number of rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this representation cannot build stats arrays for `field`.
+    fn stats_builder(
+        &self,
+        geometry: &GeometryType,
+        field: &ArrowField,
+        capacity: usize,
+    ) -> DeltaResult<Box<dyn GeometryStatsBuilder>>;
+}
+
+/// Builds Arrow arrays for geometry stats values parsed from WKT JSON strings.
+#[cfg(feature = "geo-type-in-dev")]
+pub trait GeometryStatsBuilder {
+    /// Appends one non-empty WKT stats value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `raw` cannot be represented by this builder.
+    fn append_wkt(&mut self, raw: &str) -> DeltaResult<()>;
+
+    /// Appends one null stats value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing builder rejects a null append.
+    fn append_null(&mut self) -> DeltaResult<()>;
+
+    /// Finishes the builder and returns its Arrow array.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the finished array cannot be materialized.
+    fn finish(self: Box<Self>) -> DeltaResult<ArrowArrayRef>;
+}
+
+/// Options for kernel-to-Arrow schema conversion.
+#[derive(Clone, Copy, Default)]
+pub struct ArrowConversionOptions<'a> {
+    #[cfg(feature = "geo-type-in-dev")]
+    geometry: Option<&'a dyn GeometryArrowRepresentation>,
+}
+
+impl<'a> ArrowConversionOptions<'a> {
+    /// Creates kernel-to-Arrow conversion options.
+    #[cfg(feature = "geo-type-in-dev")]
+    pub fn new(geometry: Option<&'a dyn GeometryArrowRepresentation>) -> Self {
+        Self { geometry }
+    }
+
+    /// Creates conversion options with no optional providers configured.
+    pub fn empty() -> Self {
+        Self {
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry: None,
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    pub(crate) fn geometry(self) -> Option<&'a dyn GeometryArrowRepresentation> {
+        self.geometry
+    }
+}
 
 /// Translate a kernel [`StructField`]'s flat (non-nested) parquet field id metadata into Arrow
 /// field metadata: rewrites kernel-side `"parquet.field.id"` to arrow-side `"PARQUET:field_id"`
@@ -147,6 +253,15 @@ pub trait TryFromKernel<KernelType>: Sized {
     fn try_from_kernel(t: KernelType) -> Result<Self, ArrowError>;
 }
 
+/// Convert a kernel type into an arrow type using conversion options.
+pub trait TryIntoArrowWithOptions<ArrowType> {
+    /// Converts `self` into an Arrow type using `options`.
+    fn try_into_arrow_with_options(
+        self,
+        options: &ArrowConversionOptions<'_>,
+    ) -> Result<ArrowType, ArrowError>;
+}
+
 impl<KernelType, ArrowType> TryIntoArrow<ArrowType> for KernelType
 where
     ArrowType: TryFromKernel<KernelType>,
@@ -170,19 +285,59 @@ fn try_kernel_struct_to_arrow_fields(s: &StructType) -> Result<Vec<ArrowField>, 
     s.fields().map(|f| f.try_into_arrow()).try_collect()
 }
 
+/// Converts a kernel [`StructType`] to Arrow fields using conversion options.
+pub fn try_kernel_struct_to_arrow_fields_with_options(
+    s: &StructType,
+    options: &ArrowConversionOptions<'_>,
+) -> Result<Vec<ArrowField>, ArrowError> {
+    s.fields()
+        .map(|f| f.try_into_arrow_with_options(options))
+        .try_collect()
+}
+
 impl TryFromKernel<&StructType> for ArrowSchema {
     fn try_from_kernel(s: &StructType) -> Result<Self, ArrowError> {
         Ok(ArrowSchema::new(try_kernel_struct_to_arrow_fields(s)?))
     }
 }
 
+impl TryIntoArrowWithOptions<ArrowSchema> for &StructType {
+    fn try_into_arrow_with_options(
+        self,
+        options: &ArrowConversionOptions<'_>,
+    ) -> Result<ArrowSchema, ArrowError> {
+        Ok(ArrowSchema::new(
+            try_kernel_struct_to_arrow_fields_with_options(self, options)?,
+        ))
+    }
+}
+
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
+        f.try_into_arrow_with_options(&ArrowConversionOptions::empty())
+    }
+}
+
+impl TryIntoArrowWithOptions<ArrowField> for &StructField {
+    fn try_into_arrow_with_options(
+        self,
+        options: &ArrowConversionOptions<'_>,
+    ) -> Result<ArrowField, ArrowError> {
+        let f = self;
         let mut metadata = kernel_flat_parquet_id_to_arrow_metadata(f)?;
         // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
         // retained in Arrow; its content is processed by `kernel_field_into_arrow`.
         metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
-        let arrow_type = kernel_field_into_arrow(f, f.name(), f.data_type())?;
+        #[cfg(feature = "geo-type-in-dev")]
+        if let DataType::Primitive(PrimitiveType::Geometry(geometry)) = f.data_type() {
+            let provider = options.geometry().ok_or_else(|| {
+                ArrowError::SchemaError(
+                    "Geometry conversion requires a GeometryArrowRepresentation".to_string(),
+                )
+            })?;
+            return provider.geometry_field(f.name(), geometry, f.is_nullable(), metadata);
+        }
+        let arrow_type = kernel_field_into_arrow(f, f.name(), f.data_type(), options)?;
         Ok(ArrowField::new(f.name(), arrow_type, f.is_nullable()).with_metadata(metadata))
     }
 }
@@ -262,13 +417,14 @@ fn kernel_field_into_arrow(
     ancestor: &StructField,
     relative_path: &str,
     datatype: &DataType,
+    options: &ArrowConversionOptions<'_>,
 ) -> Result<ArrowDataType, ArrowError> {
     match datatype {
         DataType::Array(a) => {
             let element_path = format!("{relative_path}.{LIST_ARRAY_ROOT}");
             let element_id = lookup_nested_field_id(ancestor, &element_path)?;
             let arrow_element_type =
-                kernel_field_into_arrow(ancestor, &element_path, a.element_type())?;
+                kernel_field_into_arrow(ancestor, &element_path, a.element_type(), options)?;
             // Kernel's array element field is anonymous; we use `LIST_ARRAY_ROOT` as the
             // synthesized field name by convention. Same below for map's `key`/`value` fields.
             let arrow_element_field =
@@ -281,8 +437,10 @@ fn kernel_field_into_arrow(
             let value_path = format!("{relative_path}.{MAP_VALUE_DEFAULT}");
             let key_id = lookup_nested_field_id(ancestor, &key_path)?;
             let value_id = lookup_nested_field_id(ancestor, &value_path)?;
-            let arrow_key_type = kernel_field_into_arrow(ancestor, &key_path, m.key_type())?;
-            let arrow_value_type = kernel_field_into_arrow(ancestor, &value_path, m.value_type())?;
+            let arrow_key_type =
+                kernel_field_into_arrow(ancestor, &key_path, m.key_type(), options)?;
+            let arrow_value_type =
+                kernel_field_into_arrow(ancestor, &value_path, m.value_type(), options)?;
             // Map keys are never nullable.
             let arrow_key_field = ArrowField::new(MAP_KEY_DEFAULT, arrow_key_type, false)
                 .with_metadata(parquet_field_id_metadata(key_id));
@@ -301,9 +459,10 @@ fn kernel_field_into_arrow(
                 false, /* keys_sorted */
             ))
         }
-        DataType::Struct(_) | DataType::Primitive(_) | DataType::Variant(_) => {
-            datatype.try_into_arrow()
-        }
+        DataType::Struct(s) => Ok(ArrowDataType::Struct(
+            try_kernel_struct_to_arrow_fields_with_options(s, options)?.into(),
+        )),
+        DataType::Primitive(_) | DataType::Variant(_) => datatype.try_into_arrow(),
     }
 }
 
@@ -680,19 +839,85 @@ mod tests {
     use crate::DeltaResult;
 
     #[cfg(feature = "geo-type-in-dev")]
+    struct TestGeometryRepresentation;
+
+    #[cfg(feature = "geo-type-in-dev")]
+    impl GeometryArrowRepresentation for TestGeometryRepresentation {
+        fn geometry_field(
+            &self,
+            name: &str,
+            _geometry: &crate::schema::GeometryType,
+            nullable: bool,
+            mut metadata: HashMap<String, String>,
+        ) -> Result<ArrowField, ArrowError> {
+            metadata.insert("test.geometry".to_string(), "wkt-bytes".to_string());
+            Ok(ArrowField::new(name, ArrowDataType::Binary, nullable).with_metadata(metadata))
+        }
+
+        fn stats_builder(
+            &self,
+            _geometry: &crate::schema::GeometryType,
+            _field: &ArrowField,
+            _capacity: usize,
+        ) -> DeltaResult<Box<dyn GeometryStatsBuilder>> {
+            unimplemented!("arrow conversion tests only use geometry_field")
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_geometry_provider_converts_top_level_field() -> DeltaResult<()> {
+        let field = StructField::nullable("geom", geometry_type("EPSG:4326")).with_metadata(
+            HashMap::from([("source".to_string(), "kernel".to_string())]),
+        );
+
+        let arrow_field = field.try_into_arrow_with_options(&ArrowConversionOptions::new(Some(
+            &TestGeometryRepresentation,
+        )))?;
+
+        assert_eq!(arrow_field.name(), "geom");
+        assert_eq!(arrow_field.data_type(), &ArrowDataType::Binary);
+        assert!(arrow_field.is_nullable());
+        assert_eq!(arrow_field.metadata().get("source").unwrap(), "kernel");
+        assert_eq!(
+            arrow_field.metadata().get("test.geometry").unwrap(),
+            "wkt-bytes"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_geometry_provider_converts_nested_struct_field() -> DeltaResult<()> {
+        let schema = schema! {
+            nullable "outer": {
+                nullable "geom": (geometry_type("EPSG:4326")),
+            },
+        };
+
+        let arrow_schema = schema.try_into_arrow_with_options(&ArrowConversionOptions::new(
+            Some(&TestGeometryRepresentation),
+        ))?;
+        let outer = arrow_schema.field(0);
+        let ArrowDataType::Struct(fields) = outer.data_type() else {
+            panic!("outer should be a struct");
+        };
+        let geom = fields.iter().find(|field| field.name() == "geom").unwrap();
+
+        assert_eq!(geom.data_type(), &ArrowDataType::Binary);
+        assert_eq!(geom.metadata().get("test.geometry").unwrap(), "wkt-bytes");
+        Ok(())
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
-    #[case(geometry_type("EPSG:4326"))]
     #[case(geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical))]
-    #[case(DataType::from(schema! {
-        nullable "g": (geometry_type("EPSG:4326")),
-    }))]
-    #[case(DataType::from(ArrayType::new(geometry_type("EPSG:4326"), true)))]
     #[case(DataType::from(MapType::new(
         DataType::STRING,
         geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
         true,
     )))]
-    fn test_geo_type_arrow_conversion_unsupported(#[case] dt: DataType) {
+    fn test_unsupported_geo_types_still_reject_arrow_conversion(#[case] dt: DataType) {
         let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
         let err = result.unwrap_err();
         assert!(matches!(err, ArrowError::SchemaError(_)), "got: {err:?}");
