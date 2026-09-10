@@ -819,15 +819,13 @@ impl TableConfiguration {
             .unwrap_or(false)
     }
 
-    /// Returns `true` if row tracking information should be written for this table.
+    /// Returns `true` if fresh Row IDs and fresh Row Commit Versions should be assigned for
+    /// this table.
     ///
-    /// Row tracking information should be written when:
+    /// Fresh Row IDs and fresh Row Commit Versions should be assigned when:
     /// - Row tracking is supported
     /// - Row tracking is not suspended
-    ///
-    /// Note: We ignore [`is_row_tracking_enabled`] at this point because Kernel does not
-    /// preserve row IDs and row commit versions yet.
-    pub(crate) fn should_write_row_tracking(&self) -> bool {
+    pub(crate) fn should_assign_fresh_row_tracking_metadata(&self) -> bool {
         self.is_feature_supported(&TableFeature::RowTracking) && !self.is_row_tracking_suspended()
     }
 
@@ -923,14 +921,6 @@ impl TableConfiguration {
     }
 
     pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
-        #[cfg(not(feature = "row-tracking-preservation-in-dev"))]
-        require!(
-            !self.should_write_row_tracking(),
-            Error::unsupported(
-                "Remove actions are not yet supported on tables with rowTracking supported \
-                 and not suspended",
-            )
-        );
         if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
             return Err(Error::unsupported(
                 "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
@@ -956,8 +946,6 @@ mod test {
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
-    #[cfg(not(feature = "row-tracking-preservation-in-dev"))]
-    use crate::table_properties::ROW_TRACKING_SUSPENDED;
     use crate::table_properties::{
         TableProperties, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
         ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
@@ -2875,7 +2863,6 @@ mod test {
         );
     }
 
-    #[cfg(feature = "row-tracking-preservation-in-dev")]
     #[rstest]
     #[case::iceberg_compat_v3_supported(&[], None)]
     #[case::iceberg_compat_v3_enabled(
@@ -2902,32 +2889,6 @@ mod test {
             assert_result_error_with_message(result, expected_error);
         } else {
             assert!(result.is_ok(), "expected Ok, got {result:?}");
-        }
-    }
-
-    #[cfg(not(feature = "row-tracking-preservation-in-dev"))]
-    /// `validate_feature_support_for_remove` must fire whenever row tracking is _supported_
-    /// and not _suspended_, which is broader than _enabled_.
-    #[rstest]
-    #[case::supported_only(&[], Some("rowTracking"))]
-    #[case::supported_and_enabled(&[(ENABLE_ROW_TRACKING, "true")], Some("rowTracking"))]
-    #[case::supported_and_suspended(&[(ROW_TRACKING_SUSPENDED, "true")], None /*expected_error_substring */)]
-    fn test_validate_feature_support_for_remove_row_tracking(
-        #[case] props: &[(&str, &str)],
-        #[case] expected_error_substring: Option<&str>,
-    ) {
-        let config = MockTableConfigurationBuilder::new()
-            .with_properties(props)
-            .with_protocol(
-                MockProtocolBuilder::new()
-                    .with_features([TableFeature::RowTracking])
-                    .build(),
-            )
-            .build();
-        let result = config.validate_feature_support_for_remove();
-        match expected_error_substring {
-            Some(msg) => assert_result_error_with_message(result, msg),
-            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
         }
     }
 }

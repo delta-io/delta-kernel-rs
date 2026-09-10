@@ -168,10 +168,10 @@ impl CreateTableTransaction {
             commit_timestamp: current_time_ms()?,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: system_domain_metadata,
+            provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
-            #[cfg(feature = "row-tracking-preservation-in-dev")]
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,

@@ -1302,6 +1302,44 @@ async fn test_list_commits_keeps_commits_across_checkpoint() {
     assert_eq!(versions, vec![0, 1, 2, 3, 4, 5]);
 }
 
+#[tokio::test]
+async fn test_list_ignoring_checkpoints_keeps_commits_and_crc() {
+    let mut files: Vec<_> = (0..=5)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    files.extend([
+        (
+            3,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ),
+        (4, LogPathFileType::Crc, CommitSource::Filesystem),
+    ]);
+    let (storage, log_root) = create_storage(files).await;
+
+    let result = LogSegmentFiles::list_with_checkpoint_handling(
+        storage.as_ref(),
+        &log_root,
+        vec![],
+        Some(0),
+        Some(5),
+        CheckpointHandling::Ignore,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result
+            .ascending_commit_files
+            .iter()
+            .map(|commit| commit.version)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5]
+    );
+    assert!(result.checkpoint_parts.is_empty());
+    assert_eq!(result.latest_crc_file.unwrap().version, 4);
+}
+
 // ---------------------------------------------------------------------------
 // find_complete_checkpoint_version direct unit tests
 // (other cases already covered by tests above)

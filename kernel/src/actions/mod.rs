@@ -32,6 +32,7 @@ use crate::{DeltaResult, EngineData, Error, FileMeta, FileSize, RowVisitor as _}
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
+pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
 
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
@@ -857,6 +858,8 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
     pub(crate) txn_id: Option<String>,
+    /// Map of tags associated with this commit.
+    pub(crate) tags: Option<HashMap<String, Option<String>>>,
 }
 
 impl CommitInfo {
@@ -877,6 +880,27 @@ impl CommitInfo {
             is_blind_append: is_blind_append.then_some(true),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
+            tags: None,
+        }
+    }
+
+    pub(crate) fn set_row_tracking_preserved(&mut self) {
+        self.tags.get_or_insert_default().insert(
+            ROW_TRACKING_PRESERVED_TAG.to_string(),
+            Some("true".to_string()),
+        );
+    }
+
+    /// Merges the supplied tags into this CommitInfo's tags.
+    ///
+    /// Existing values take precedence when both maps contain the same key.
+    pub(crate) fn merge_tags(&mut self, tags: Option<HashMap<String, Option<String>>>) {
+        let Some(tags) = tags else {
+            return;
+        };
+        let current_tags = self.tags.get_or_insert_default();
+        for (key, value) in tags {
+            current_tags.entry(key).or_insert(value);
         }
     }
 }
@@ -1892,6 +1916,7 @@ mod tests {
                 nullable "isBlindAppend": BOOLEAN,
                 nullable "engineInfo": STRING,
                 nullable "txnId": STRING,
+                nullable "tags": { STRING => nullable STRING },
             },
         };
         assert_eq!(schema, expected);

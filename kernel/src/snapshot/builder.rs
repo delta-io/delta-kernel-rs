@@ -1,5 +1,6 @@
 //! Builder for creating [`Snapshot`] instances.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use tracing::{info, instrument};
@@ -7,12 +8,21 @@ use tracing::{info, instrument};
 use crate::cancellation::CancellationTokenRef;
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
+use crate::log_segment_files::CheckpointHandling;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{LogSegmentLoadType, MetricId, SnapshotLoadMetricContext};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
+
+/// Marker for builders that load a snapshot from a table root.
+#[doc(hidden)]
+pub struct FromTableRoot;
+
+/// Marker for builders that incrementally update an existing snapshot.
+#[doc(hidden)]
+pub struct FromSnapshot;
 
 /// Builder for creating [`Snapshot`] instances.
 ///
@@ -32,17 +42,14 @@ use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 /// # Ok(())
 /// # }
 /// ```
-//
-// Note the SnapshotBuilder must have either a table_root or an existing_snapshot (but not both).
-// We enforce this in the constructors. We could improve this in the future with different
-// types/add type state.
-pub struct SnapshotBuilder {
+pub struct SnapshotBuilder<Mode = FromTableRoot> {
     table_root: Option<String>,
     existing_snapshot: Option<SnapshotRef>,
     version: Option<Version>,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
     incremental_replay: IncrementalReplay,
+    checkpoint_handling: CheckpointHandling,
     /// Kernel-minted id correlating this build's metric events with its child events.
     operation_id: MetricId,
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
@@ -52,11 +59,16 @@ pub struct SnapshotBuilder {
     /// [`with_cancellation_token`](Self::with_cancellation_token). `None` means the build is not
     /// cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+    // Carries the zero-sized typestate that limits mode-specific methods at compile time.
+    mode: PhantomData<Mode>,
 }
+
+/// Builder for incrementally updating an existing [`Snapshot`].
+pub type IncrementalSnapshotBuilder = SnapshotBuilder<FromSnapshot>;
 
 // Hand-written because `CancellationToken` is not `Debug`: the token is projected to a bool. Ends
 // with `finish_non_exhaustive` so a future field is not silently dropped from the output.
-impl std::fmt::Debug for SnapshotBuilder {
+impl<Mode> std::fmt::Debug for SnapshotBuilder<Mode> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotBuilder")
             .field("table_root", &self.table_root)
@@ -65,6 +77,7 @@ impl std::fmt::Debug for SnapshotBuilder {
             .field("log_tail", &self.log_tail)
             .field("max_catalog_version", &self.max_catalog_version)
             .field("incremental_replay", &self.incremental_replay)
+            .field("checkpoint_handling", &self.checkpoint_handling)
             .field("operation_id", &self.operation_id)
             .field("correlation_id", &self.correlation_id)
             .field("cancellable", &self.cancellation_token.is_some())
@@ -116,7 +129,7 @@ impl IncrementalReplay {
     }
 }
 
-impl SnapshotBuilder {
+impl SnapshotBuilder<FromTableRoot> {
     // ============================================================================
     // Constructors
     // ============================================================================
@@ -129,12 +142,16 @@ impl SnapshotBuilder {
             log_tail: Vec::new(),
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
+            checkpoint_handling: CheckpointHandling::Adopt,
             operation_id: MetricId::new(),
             correlation_id: None,
             cancellation_token: None,
+            mode: PhantomData,
         }
     }
+}
 
+impl SnapshotBuilder<FromSnapshot> {
     pub(crate) fn new_from(existing_snapshot: SnapshotRef) -> Self {
         Self {
             table_root: None,
@@ -143,12 +160,31 @@ impl SnapshotBuilder {
             log_tail: Vec::new(),
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
+            checkpoint_handling: CheckpointHandling::Adopt,
             operation_id: MetricId::new(),
             correlation_id: None,
             cancellation_token: None,
+            mode: PhantomData,
         }
     }
 
+    /// Skip adopting new checkpoints while updating the input snapshot.
+    ///
+    /// The resulting snapshot retains newly listed commits instead of adopting a newer checkpoint
+    /// as its replay base. For example, when updating snapshot N to N+5, a checkpoint at N+3 is
+    /// recognized but not adopted, and commits N+1 through N+5 remain in the log segment.
+    ///
+    /// The update fails if the new commits are not contiguous.
+    ///
+    /// This option increases memory use and may increase full-scan log replay. It is available
+    /// only for builders created by [`Snapshot::builder_from`].
+    pub fn skip_new_checkpoints(mut self) -> Self {
+        self.checkpoint_handling = CheckpointHandling::Ignore;
+        self
+    }
+}
+
+impl<Mode> SnapshotBuilder<Mode> {
     // ============================================================================
     // Chainable configuration
     // ============================================================================
@@ -282,9 +318,11 @@ impl SnapshotBuilder {
             log_tail,
             max_catalog_version,
             incremental_replay,
+            checkpoint_handling,
             operation_id,
             correlation_id,
             cancellation_token,
+            mode: _,
         } = self;
 
         let metric_context = SnapshotLoadMetricContext {
@@ -308,56 +346,48 @@ impl SnapshotBuilder {
         // requested version is exactly the max_catalog_version.
         let built_as_latest = version.is_none() || version == max_catalog_version;
 
-        let result = if let Some(table_root) = table_root {
-            try_parse_uri(table_root).and_then(|table_url| {
-                let log_segment = LogSegment::for_snapshot(
-                    engine.storage_handler().as_ref(),
-                    table_url.join("_delta_log/")?,
-                    log_tail,
-                    effective_version,
-                    metric_context.clone(),
-                    cancellation_token.as_ref(),
-                )?;
-                Snapshot::try_new_from_log_segment(
-                    table_url,
-                    log_segment,
-                    engine,
-                    metric_context,
-                    incremental_replay,
-                    built_as_latest,
-                )
-                .map(Into::into)
-            })
+        let snapshot = if let Some(table_root) = table_root {
+            let table_url = try_parse_uri(table_root)?;
+            let log_segment = LogSegment::for_snapshot(
+                engine.storage_handler().as_ref(),
+                table_url.join("_delta_log/")?,
+                log_tail,
+                effective_version,
+                metric_context.clone(),
+                cancellation_token.as_ref(),
+            )?;
+            Snapshot::try_new_from_log_segment(
+                table_url,
+                log_segment,
+                engine,
+                metric_context,
+                incremental_replay,
+                built_as_latest,
+            )
+            .map(Into::into)?
         } else {
-            existing_snapshot
-                .ok_or_else(|| {
-                    Error::internal_error(
-                        "SnapshotBuilder should have either table_root or existing_snapshot",
-                    )
-                })
-                .and_then(|existing_snapshot| {
-                    Snapshot::try_new_from(
-                        existing_snapshot,
-                        log_tail,
-                        engine,
-                        effective_version,
-                        metric_context,
-                        incremental_replay,
-                        built_as_latest,
-                        cancellation_token.as_ref(),
-                    )
-                })
+            let Some(existing_snapshot) = existing_snapshot else {
+                return Err(Error::internal_error(
+                    "SnapshotBuilder should have either table_root or existing_snapshot",
+                ));
+            };
+            Snapshot::try_new_from(
+                existing_snapshot,
+                log_tail,
+                engine,
+                effective_version,
+                metric_context,
+                incremental_replay,
+                checkpoint_handling,
+                built_as_latest,
+                cancellation_token.as_ref(),
+            )?
         };
 
         // Post-build validations for catalog-managed tables
-        let result = result.and_then(|snapshot| {
-            Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
-            Ok(snapshot)
-        });
-        if let Ok(ref snapshot) = result {
-            tracing::Span::current().record("version", snapshot.version());
-        }
-        result
+        Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
+        tracing::Span::current().record("version", snapshot.version());
+        Ok(snapshot)
     }
 
     // ============================================================================
