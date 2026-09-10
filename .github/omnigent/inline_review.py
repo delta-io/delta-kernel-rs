@@ -21,18 +21,27 @@ from review_publish import format_review_body as _format_review_body
 MAX_INLINE_FINDINGS = 12
 INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
 INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
+_FINDING_HEADING_MARKER = "###"
+_FINDING_HEADING_TEMPLATE = f"{_FINDING_HEADING_MARKER} <ID>"
+_REVIEW_SECTION_NAMES = ("Blocking issues", "Non-blocking notes", "Summary")
 _FINDING_ID = re.compile(r"(?:Blocker|Nit)[1-9][0-9]*")
-_FINDING_HEADING = re.compile(r"^###\s+((?:Blocker|Nit)[1-9][0-9]*)\b")
+_FINDING_HEADING = re.compile(
+    rf"^{re.escape(_FINDING_HEADING_MARKER)}\s+({_FINDING_ID.pattern})\b"
+)
+_SECTION_NAME_PATTERN = "|".join(re.escape(name) for name in _REVIEW_SECTION_NAMES)
 _SECTION_HEADING = re.compile(
-    r"^(?:(?:##\s+)(?:Blocking issues|Non-blocking notes|Summary)\s*:?|"
-    r"(?:\d+\.\s+\*\*)(?:Blocking issues|Non-blocking notes|Summary)\*\*\s*:?|"
-    r"(?:Blocking issues|Non-blocking notes|Summary)\s*:)\s*$",
+    rf"^(?:(?:##\s+)(?:{_SECTION_NAME_PATTERN})\s*:?|"
+    rf"(?:\d+\.\s+\*\*)(?:{_SECTION_NAME_PATTERN})\*\*\s*:?|"
+    rf"(?:{_SECTION_NAME_PATTERN})\s*:)\s*$",
     re.IGNORECASE,
 )
+_FINDING_GROUP_NAME_PATTERN = "|".join(
+    re.escape(name) for name in _REVIEW_SECTION_NAMES[:2]
+)
 _FINDING_GROUP_HEADING = re.compile(
-    r"^(?:(?:##\s+)(?:Blocking issues|Non-blocking notes)\s*:?|"
-    r"(?:\d+\.\s+\*\*)(?:Blocking issues|Non-blocking notes)\*\*\s*:?|"
-    r"(?:Blocking issues|Non-blocking notes)\s*:)\s*$",
+    rf"^(?:(?:##\s+)(?:{_FINDING_GROUP_NAME_PATTERN})\s*:?|"
+    rf"(?:\d+\.\s+\*\*)(?:{_FINDING_GROUP_NAME_PATTERN})\*\*\s*:?|"
+    rf"(?:{_FINDING_GROUP_NAME_PATTERN})\s*:)\s*$",
     re.IGNORECASE,
 )
 _CODE_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
@@ -108,7 +117,7 @@ machine-readable block:
 Include entries for up to {MAX_INLINE_FINDINGS} Blocker/Nit findings, prioritizing
 blockers and then the most useful notes. Findings omitted from this block remain
 in the collapsed review. Start every human-readable finding on its own Markdown
-heading matching `### BlockerN` or `### NitN`, using the same ID in this block.
+heading matching `{_FINDING_HEADING_TEMPLATE}`, using the same ID in this block.
 Keep the Summary to an overall assessment rather than repeating finding details.
 Use IDs matching `{_FINDING_ID.pattern}` (for example, `Blocker1` or `Nit1`) and
 do not add an entry for the Summary. Use the repository-relative path with no
@@ -413,7 +422,7 @@ def _load_history(path: Path) -> Any:
     """Load review history, falling back to no history when it is unavailable."""
     try:
         return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return {}
 
 

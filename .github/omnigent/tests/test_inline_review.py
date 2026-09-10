@@ -110,6 +110,9 @@ class InlineReviewTest(unittest.TestCase):
             standalone_prompt.strip(),
             _configured_prompt(reviewer_dir / "config.yaml"),
         )
+        self.assertIn(self.inline_review._FINDING_HEADING_TEMPLATE, contract)
+        for section in self.inline_review._REVIEW_SECTION_NAMES:
+            self.assertIn(section, contract)
 
     def test_shared_policies_reach_parent_and_child_reviewers(self) -> None:
         omnigent_dir = Path(__file__).parents[1]
@@ -634,6 +637,26 @@ class InlineReviewTest(unittest.TestCase):
         self.assertNotIn("Finding published inline", remaining)
         self.assertIn("2. **Summary**\nOverall assessment.", remaining)
 
+    def test_reviewer_output_contract_round_trips_finding_removal(self) -> None:
+        review = (
+            "1. **Blocking issues**\n\n"
+            "### Blocker1\n"
+            "Finding published inline.\n\n"
+            "2. **Non-blocking notes**\n\n"
+            "### Nit1\n"
+            "Finding that remains.\n\n"
+            "3. **Summary**\n"
+            "Overall assessment."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
+
+        self.assertNotIn("Blocking issues", remaining)
+        self.assertNotIn("### Blocker1", remaining)
+        self.assertIn("2. **Non-blocking notes**", remaining)
+        self.assertIn("### Nit1", remaining)
+        self.assertIn("3. **Summary**\nOverall assessment.", remaining)
+
     def test_removed_finding_drops_final_empty_group_without_newline(self) -> None:
         review = "## Summary\nOverall assessment.\n\n## Non-blocking notes"
 
@@ -853,6 +876,13 @@ class InlineReviewTest(unittest.TestCase):
             missing_path = Path(directory) / "missing.json"
 
             self.assertEqual(self.inline_review._load_history(missing_path), {})
+
+    def test_history_load_falls_back_for_non_utf8_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            path.write_bytes(b"\xff")
+
+            self.assertEqual(self.inline_review._load_history(path), {})
 
     def test_strip_review_body_preserves_partial_details_wrapper(self) -> None:
         body = (
