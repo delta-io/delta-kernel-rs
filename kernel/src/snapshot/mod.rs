@@ -345,30 +345,28 @@ impl Snapshot {
         self.table_configuration.logical_schema()
     }
 
-    /// Returns the expected logical and physical schemas for file statistics.
+    /// Returns aligned schemas for scans using all indexed structured statistics.
     ///
     /// `extra_indexed_columns` are logical column paths that may have statistics even when they
-    /// fall outside the table's configured indexed-column set. Resolvable extra columns are
-    /// included in both returned schemas; partition columns and unresolvable paths are omitted.
-    /// The physical schema applies the table's column-mapping mode.
+    /// fall outside the table's configured indexed-column set. Pass the same columns to
+    /// [`StatsOptions::all_struct_with_extra_indexed`] when building the scan. Partition columns
+    /// and unresolvable paths are omitted.
     ///
-    /// Both schemas contain `numRecords` and `tightBounds`. When at least one data column is
-    /// selected, they also contain `nullCount` and, for eligible data types, `minValues` and
-    /// `maxValues`. Nested fields mirror the selected portion of the table schema.
-    ///
-    /// Pass the same extra columns to [`StatsOptions::all_struct_with_extra_indexed`] when building
-    /// a scan that returns structured statistics.
+    /// The returned schemas have the same shape and field order. The logical schema uses table
+    /// column names, while the physical schema applies the table's column-mapping mode. Returns
+    /// `None` when no data columns are selected and the scan will not emit `stats_parsed`.
     ///
     /// # Errors
     ///
-    /// Returns an error if kernel cannot construct a valid stats schema.
+    /// Returns an error if a selected logical column cannot be mapped to the physical schema or
+    /// the selected fields cannot form a valid stats schema.
     ///
     /// [`StatsOptions::all_struct_with_extra_indexed`]:
     /// crate::scan::StatsOptions::all_struct_with_extra_indexed
     pub fn expected_stats_schemas(
         &self,
         extra_indexed_columns: &[ColumnName],
-    ) -> DeltaResult<ExpectedStatsSchemas> {
+    ) -> DeltaResult<Option<ExpectedStatsSchemas>> {
         self.table_configuration
             .build_expected_stats_schemas(extra_indexed_columns)
     }

@@ -41,13 +41,16 @@ use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 
-/// Expected logical and physical schemas for file statistics.
+/// Aligned logical and physical schemas for structured file statistics.
+///
+/// The schemas have the same shape and field order. They differ only in the names of table
+/// columns when column mapping is enabled. All field metadata is removed.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ExpectedStatsSchemas {
-    /// Stats schema using logical table column names for connector-facing processing.
+    /// Schema using logical table column names.
     pub logical: SchemaRef,
-    /// Stats schema using physical column names as encoded in Delta statistics.
+    /// Schema using physical column names as encoded in Delta statistics.
     pub physical: SchemaRef,
 }
 
@@ -72,6 +75,18 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
         Cow::Owned(s) => Arc::new(s),
         _ => schema,
     }
+}
+
+fn build_stats_schema_for_columns(
+    data_schema: &StructType,
+    selected_columns: &[ColumnName],
+) -> DeltaResult<SchemaRef> {
+    let config = StatsConfig {
+        data_skipping_stats_columns: Some(selected_columns),
+        data_skipping_num_indexed_cols: None,
+    };
+    let schema = Arc::new(expected_stats_schema(data_schema, &config, None, None)?);
+    Ok(strip_metadata(schema))
 }
 
 fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> DeltaResult<()> {
@@ -291,7 +306,7 @@ impl TableConfiguration {
         Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
-    /// Generates the logical and physical expected schemas for file statistics.
+    /// Generates aligned logical and physical schemas for structured file statistics.
     ///
     /// `extra_indexed_columns` use logical table column names. Resolvable columns are always
     /// included, even when they fall outside the configured indexed-column set. Unresolvable
@@ -299,16 +314,17 @@ impl TableConfiguration {
     pub(crate) fn build_expected_stats_schemas(
         &self,
         extra_indexed_columns: &[ColumnName],
-    ) -> DeltaResult<ExpectedStatsSchemas> {
-        let resolved_extra_columns: Vec<_> = extra_indexed_columns
+    ) -> DeltaResult<Option<ExpectedStatsSchemas>> {
+        let logical_schema = self.logical_schema_without_partition_columns();
+        let column_mapping_mode = self.column_mapping_mode();
+        let required_logical_columns: Vec<_> = extra_indexed_columns
             .iter()
             .filter_map(|logical_column| {
                 get_any_level_column_physical_name(
-                    &self.logical_schema_without_partition_columns(),
+                    &logical_schema,
                     logical_column,
-                    self.column_mapping_mode(),
+                    column_mapping_mode,
                 )
-                .map(|physical_column| (logical_column.clone(), physical_column))
                 .inspect_err(|e| {
                     warn!(
                         "Couldn't translate extra indexed stats column '{logical_column}' to a \
@@ -316,15 +332,8 @@ impl TableConfiguration {
                     );
                 })
                 .ok()
+                .map(|_| logical_column.clone())
             })
-            .collect();
-        let required_logical_columns: Vec<_> = resolved_extra_columns
-            .iter()
-            .map(|(logical, _)| logical.clone())
-            .collect();
-        let required_physical_columns: Vec<_> = resolved_extra_columns
-            .into_iter()
-            .map(|(_, physical)| physical)
             .collect();
 
         let logical_config = StatsConfig {
@@ -334,19 +343,33 @@ impl TableConfiguration {
                 .as_deref(),
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
         };
-        let logical = Arc::new(expected_stats_schema(
-            &self.logical_schema_without_partition_columns(),
+        let logical_columns = stats_column_names(
+            &logical_schema,
             &logical_config,
             Some(&required_logical_columns),
-            None,
-        )?);
-        let physical =
-            self.build_expected_physical_stats_schema(Some(&required_physical_columns), None)?;
+        );
+        if logical_columns.is_empty() {
+            return Ok(None);
+        }
 
-        Ok(ExpectedStatsSchemas {
-            logical: strip_metadata(logical),
-            physical,
-        })
+        let physical_columns = logical_columns
+            .iter()
+            .map(|logical_column| {
+                get_any_level_column_physical_name(
+                    &logical_schema,
+                    logical_column,
+                    column_mapping_mode,
+                )
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        let logical = build_stats_schema_for_columns(&logical_schema, &logical_columns)?;
+        let physical = build_stats_schema_for_columns(
+            &self.physical_data_schema_without_partition_columns(),
+            &physical_columns,
+        )?;
+
+        Ok(Some(ExpectedStatsSchemas { logical, physical }))
     }
 
     /// Generates the expected physical schema for file statistics.
@@ -361,10 +384,11 @@ impl TableConfiguration {
     ///   nullCount: { <columns with LONG type> },
     ///   minValues: { <columns with original types> },
     ///   maxValues: { <columns with original types> },
+    ///   tightBounds: boolean,
     /// }
     /// ```
     ///
-    /// The schemas are affected by:
+    /// The schema is affected by:
     /// - **Column mapping mode**: Physical schema field names use physical names from column
     ///   mapping metadata.
     /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
@@ -377,7 +401,6 @@ impl TableConfiguration {
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
-    #[allow(unused)]
     #[internal_api]
     pub(crate) fn build_expected_physical_stats_schema(
         &self,
