@@ -27,7 +27,7 @@ If `cargo-release` must use an alternate registry, select it through the environ
 editing `release.sh`:
 
 ```bash
-DELTA_KERNEL_RELEASE_REGISTRY=<registry-name> ./release.sh 0.29.0
+DELTA_KERNEL_RELEASE_REGISTRY=<registry-name> ./release.sh release 0.29.0
 ```
 
 The variable is passed only to `cargo release`; publishing still uses the release destination
@@ -38,7 +38,7 @@ described below. Do not mark `release.sh` as `skip-worktree` or keep a private e
 Run the release script from a branch created at the latest `upstream/main`:
 
 ```bash
-./release.sh 0.29.0
+./release.sh release 0.29.0
 ```
 
 The script updates workspace versions, refreshes `CHANGELOG.md`, creates the release commit, and
@@ -83,7 +83,7 @@ git pull --ff-only upstream main
 Maintainers publishing directly to crates.io can then run:
 
 ```bash
-./release.sh
+./release.sh release
 ```
 
 The script publishes in dependency order (`delta_kernel_derive`, `delta_kernel`, then

@@ -5,6 +5,7 @@ set -euo pipefail
 REPOSITORY_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/delta-kernel-release-test.XXXXXX")
 trap 'rm -rf "$TEST_ROOT"' EXIT
+export TMPDIR="$TEST_ROOT"
 
 fail() {
     echo "release tooling test failed: $1" >&2
@@ -44,6 +45,32 @@ test_registry_override() {
     fi
 }
 
+test_release_command_dispatch() {
+    local capture="$TEST_ROOT/release-command"
+
+    (
+        # shellcheck source=release.sh
+        source "$REPOSITORY_ROOT/release.sh"
+        check_requirements() { :; }
+        is_main_branch() { return 1; }
+        handle_release_branch() { printf 'branch %s\n' "$1" > "$capture"; }
+
+        main release 0.29.0
+    )
+    assert_contains "$capture" "branch 0.29.0"
+
+    (
+        # shellcheck source=release.sh
+        source "$REPOSITORY_ROOT/release.sh"
+        check_requirements() { :; }
+        is_main_branch() { return 0; }
+        handle_main_branch() { printf 'main\n' > "$capture"; }
+
+        main release
+    )
+    assert_contains "$capture" "main"
+}
+
 commit_file() {
     local message="$1" contents="$2"
     printf '%s\n' "$contents" > tracked.txt
@@ -55,6 +82,7 @@ test_changelog_refresh_and_verification() {
     local repository="$TEST_ROOT/repository"
     local failing_bin="$TEST_ROOT/failing-bin"
     local saved_changelog="$TEST_ROOT/changelog-before-failure"
+    local backup refresh_log failure_backup
     mkdir -p "$repository"
     cp "$REPOSITORY_ROOT/release.sh" "$REPOSITORY_ROOT/cliff.toml" "$repository/"
 
@@ -90,7 +118,22 @@ test_changelog_refresh_and_verification() {
     [[ "$(latest_kernel_release_tag)" == "v0.28.0" ]] || \
         fail "artifact tag was selected as the latest Kernel release"
 
-    ./release.sh changelog 0.29.0
+    if (
+        latest_kernel_release_tag() { :; }
+        verify_release_changelog 0.29.0
+    ) > no-tag.log 2>&1; then
+        fail "verification unexpectedly passed without a prior Kernel release tag"
+    fi
+    assert_contains no-tag.log "No prior Kernel release tag found"
+
+    ./release.sh > help.log
+    assert_contains help.log "./release.sh release [version]"
+
+    refresh_log="$TEST_ROOT/refresh.log"
+    ./release.sh changelog 0.29.0 > "$refresh_log"
+    assert_contains "$refresh_log" "backup retained at"
+    backup=$(sed -n 's/.*backup retained at //p' "$refresh_log")
+    [[ -f "$backup" ]] || fail "successful changelog refresh did not retain its backup"
     assert_contains CHANGELOG.md "([#101])"
     assert_contains CHANGELOG.md "v0.28.0...v0.29.0"
     assert_count CHANGELOG.md 1 "## [v0.28.0]"
@@ -142,7 +185,12 @@ test_changelog_refresh_and_verification() {
     assert_contains refresh-failure.log "Failed to refresh CHANGELOG.md"
     cmp -s CHANGELOG.md "$saved_changelog" || \
         fail "failed changelog refresh did not restore CHANGELOG.md"
+    failure_backup=$(sed -n 's/.*original saved at //p' refresh-failure.log)
+    [[ -f "$failure_backup" ]] || fail "failed changelog refresh did not retain its backup"
+    cmp -s "$failure_backup" "$saved_changelog" || \
+        fail "failed changelog refresh retained the wrong backup contents"
 }
 
 test_registry_override
+test_release_command_dispatch
 test_changelog_refresh_and_verification

@@ -2,13 +2,13 @@
 
 ###################################################################################################
 # USAGE:
-# 1. on a release branch: ./release.sh <version> (example: ./release.sh 0.1.0)
-# 2. on main branch (after merging release branch): ./release.sh
+# 1. on a release branch: ./release.sh release <version> (example: ./release.sh release 0.1.0)
+# 2. on main branch (after merging release branch): ./release.sh release
 # 3. refresh a release PR after merging/rebasing main: ./release.sh changelog <version>
 # 4. verify that a release changelog covers every merged PR: ./release.sh verify-changelog [version]
 #
 # Set DELTA_KERNEL_RELEASE_REGISTRY when cargo-release must use an alternate registry:
-#   DELTA_KERNEL_RELEASE_REGISTRY=<registry-name> ./release.sh 0.29.0
+#   DELTA_KERNEL_RELEASE_REGISTRY=<registry-name> ./release.sh release 0.29.0
 ###################################################################################################
 
 # This is a script to automate a large portion of the release process for the crates we publish to
@@ -19,6 +19,7 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+RELEASE_CHANGELOG_HEADING=
 
 # print commands before executing them for debugging
 # set -x
@@ -94,8 +95,7 @@ get_current_version() {
         jq -r --arg name "$crate_name" '.packages[] | select(.name == $name) | .version'
 }
 
-# Run cargo-release with an optional registry selection. This avoids editing release.sh when a
-# maintainer's Cargo configuration requires a registry proxy.
+# Run cargo-release with an optional registry selection.
 run_cargo_release() {
     local version="$1"
     local args=(
@@ -118,13 +118,12 @@ latest_kernel_release_tag() {
 
 release_changelog_heading() {
     local version="$1"
-    printf '## [v%s]' "$version"
+    printf -v RELEASE_CHANGELOG_HEADING '## [v%s]' "$version"
 }
 
 release_changelog_section() {
-    local heading
-    heading=$(release_changelog_heading "$1")
-    awk -v heading="$heading" '
+    release_changelog_heading "$1"
+    awk -v heading="$RELEASE_CHANGELOG_HEADING" '
         index($0, heading) == 1 { in_release = 1 }
         in_release && /^## \[v/ && index($0, heading) != 1 { exit }
         in_release { print }
@@ -155,8 +154,8 @@ verify_release_changelog() {
         return 1
     fi
     if [[ -z "$previous_tag" ]]; then
-        log_warning "No prior Kernel release tag found; skipping changelog verification"
-        return 0
+        log_warning "No prior Kernel release tag found"
+        return 1
     fi
     if [[ "$previous_tag" == "v$version" ]]; then
         log_info "Workspace version $version is already tagged; no release changelog to verify"
@@ -193,10 +192,11 @@ verify_release_changelog() {
     log_success "CHANGELOG.md v$version covers every merged PR since $previous_tag"
 }
 
+# Remove the changelog section for the version specified as the first argument.
 strip_release_changelog_section() {
-    local output="$2" heading
-    heading=$(release_changelog_heading "$1")
-    awk -v heading="$heading" '
+    local output="$2"
+    release_changelog_heading "$1"
+    awk -v heading="$RELEASE_CHANGELOG_HEADING" '
         index($0, heading) == 1 { skipping = 1; next }
         skipping && /^## \[v/ { skipping = 0 }
         !skipping { print }
@@ -219,12 +219,11 @@ refresh_release_changelog() {
     if ! git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" \
         --use-branch-tags --unreleased --prepend "$changelog" --include-path "*" \
         --tag "$version"; then
-        mv "$backup" "$changelog"
-        log_error "Failed to refresh CHANGELOG.md"
+        cp "$backup" "$changelog"
+        log_error "Failed to refresh CHANGELOG.md; original saved at $backup"
     fi
 
-    rm -f "$backup"
-    log_success "Refreshed CHANGELOG.md for v$version"
+    log_success "Refreshed CHANGELOG.md for v$version; backup retained at $backup"
 }
 
 # Prompt user for confirmation
@@ -330,6 +329,14 @@ validate_version() {
     fi
 }
 
+usage() {
+    printf '%s\n' \
+        "Usage:" \
+        "  $0 release [version]" \
+        "  $0 changelog <version>" \
+        "  $0 verify-changelog [version]"
+}
+
 main() {
     case "${1:-}" in
         changelog)
@@ -349,20 +356,29 @@ main() {
                 log_error "Release changelog is incomplete"
             fi
             ;;
-        *)
+        release)
             check_requirements
             if is_main_branch; then
-                if [[ $# -ne 0 ]]; then
-                    log_error "Version argument not expected on main branch\nUsage: $0"
+                if [[ $# -ne 1 ]]; then
+                    usage >&2
+                    log_error "Version argument not expected on main branch"
                 fi
                 handle_main_branch
             else
-                if [[ $# -ne 1 ]]; then
-                    log_error "Version argument required when on release branch\nUsage: $0 <version>"
+                if [[ $# -ne 2 ]]; then
+                    usage >&2
+                    log_error "Version argument required when on release branch"
                 fi
-                validate_version "$1"
-                handle_release_branch "$1"
+                validate_version "$2"
+                handle_release_branch "$2"
             fi
+            ;;
+        "" | help | -h | --help)
+            usage
+            ;;
+        *)
+            usage >&2
+            log_error "Unknown command: $1"
             ;;
     esac
 }
