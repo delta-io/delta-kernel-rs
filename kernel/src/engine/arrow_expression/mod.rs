@@ -15,7 +15,7 @@ use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::{DataType, PrimitiveType, SchemaRef, StructType};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
@@ -407,31 +407,29 @@ fn validate_data_schema_top_level(
     expected_schema: &SchemaRef,
     data_schema: &ArrowSchema,
 ) -> DeltaResult<()> {
-    let data_schema = StructType::try_from_arrow(data_schema)?;
-    require!(
-        expected_schema.num_fields() == data_schema.num_fields(),
-        Error::schema(format!(
-            "Expected schema fields {:?} do not match data schema fields {:?}",
-            expected_schema
-                .fields()
-                .map(|field| field.name())
-                .collect::<Vec<_>>(),
-            data_schema
-                .fields()
-                .map(|field| field.name())
-                .collect::<Vec<_>>()
-        ))
-    );
-
-    for (expected_field, data_field) in expected_schema.fields().zip(data_schema.fields()) {
-        require!(
-            expected_field.name() == data_field.name(),
-            Error::schema(format!(
-                "Expected schema field '{}' does not match data schema field '{}'",
-                expected_field.name(),
-                data_field.name()
-            ))
-        );
+    let mut data_fields = data_schema.fields().iter();
+    // Some Kernel code does not provide the full input schema to the evaluator. For example,
+    // `scan_metadata_from` may evaluate scan rows containing optional `stats_parsed` and
+    // `partitionValues_parsed` columns using only the base scan-row schema.
+    // TODO(#3263): Require evaluator input schemas to declare every top-level field.
+    for expected_field in expected_schema.fields() {
+        let data_field = data_fields
+            .find(|field| field.name() == expected_field.name())
+            .ok_or_else(|| {
+                Error::schema(format!(
+                    "Expected schema field '{}' is missing or out of order in data schema fields \
+                     {:?}",
+                    expected_field.name(),
+                    data_schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name())
+                        .collect::<Vec<_>>()
+                ))
+            })?;
+        // Only the top-level type is validated. `try_from_arrow` translates the entire field, but
+        // we use it here to keep the validation simple.
+        let data_field = StructField::try_from_arrow(data_field.as_ref())?;
         require!(
             top_level_types_compatible(expected_field.data_type(), data_field.data_type()),
             Error::schema(format!(

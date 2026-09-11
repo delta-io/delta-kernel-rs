@@ -1299,7 +1299,6 @@ enum EvaluatorKind {
 
 #[derive(Clone, Copy, Debug)]
 enum TopLevelSchemaMismatch {
-    ExtraField,
     MissingField,
     ReorderedFields,
     RenamedField,
@@ -1316,11 +1315,6 @@ impl TopLevelSchemaMismatch {
 
     fn data_schema(self) -> Schema {
         match self {
-            Self::ExtraField => Schema::new(vec![
-                Field::new("a", DataType::Int32, true),
-                Field::new("b", DataType::Utf8, true),
-                Field::new("c", DataType::Boolean, true),
-            ]),
             Self::MissingField => Schema::new(vec![Field::new("a", DataType::Int32, true)]),
             Self::ReorderedFields => Schema::new(vec![
                 Field::new("b", DataType::Utf8, true),
@@ -1339,27 +1333,21 @@ impl TopLevelSchemaMismatch {
 
     fn expected_error(self) -> &'static str {
         match self {
-            Self::ExtraField => {
-                "Expected schema fields [\"a\", \"b\"] do not match data schema fields [\"a\", \"b\", \"c\"]"
-            }
             Self::MissingField => {
-                "Expected schema fields [\"a\", \"b\"] do not match data schema fields [\"a\"]"
+                "Expected schema field 'b' is missing or out of order in data schema fields"
             }
             Self::ReorderedFields => {
-                "Expected schema field 'a' does not match data schema field 'b'"
+                "Expected schema field 'b' is missing or out of order in data schema fields"
             }
             Self::RenamedField => {
-                "Expected schema field 'b' does not match data schema field 'c'"
+                "Expected schema field 'b' is missing or out of order in data schema fields"
             }
-            Self::WrongType => {
-                "Expected schema type for 'a' does not match the data schema type"
-            }
+            Self::WrongType => "Expected schema type for 'a' does not match the data schema type",
         }
     }
 }
 
 #[rstest]
-#[case::extra_field(TopLevelSchemaMismatch::ExtraField)]
 #[case::missing_field(TopLevelSchemaMismatch::MissingField)]
 #[case::reordered_fields(TopLevelSchemaMismatch::ReorderedFields)]
 #[case::renamed_field(TopLevelSchemaMismatch::RenamedField)]
@@ -1388,6 +1376,42 @@ fn evaluator_rejects_mismatched_top_level_schema(
     };
 
     assert_result_error_with_message(result, mismatch.expected_error());
+}
+
+#[rstest]
+fn evaluator_accepts_extra_top_level_fields(
+    #[values(EvaluatorKind::Expression, EvaluatorKind::Predicate)] evaluator_kind: EvaluatorKind,
+) {
+    let expected_schema = schema_ref! {
+        nullable "a": INTEGER,
+        nullable "b": STRING,
+    };
+    let data_schema = Schema::new(vec![
+        Field::new("before", DataType::Duration(TimeUnit::Second), true),
+        Field::new("a", DataType::Int32, true),
+        Field::new("between", DataType::Boolean, true),
+        Field::new("b", DataType::Utf8, true),
+        Field::new("after", DataType::Boolean, true),
+    ]);
+    let batch = ArrowEngineData::new(RecordBatch::new_empty(Arc::new(data_schema)));
+    let handler = ArrowEvaluationHandler;
+
+    match evaluator_kind {
+        EvaluatorKind::Expression => handler
+            .new_expression_evaluator(
+                expected_schema,
+                Arc::new(col!("a")),
+                KernelDataType::INTEGER,
+            )
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap(),
+        EvaluatorKind::Predicate => handler
+            .new_predicate_evaluator(expected_schema, Arc::new(Predicate::TRUE))
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap(),
+    };
 }
 
 #[test]

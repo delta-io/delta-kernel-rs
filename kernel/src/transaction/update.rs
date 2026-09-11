@@ -578,6 +578,8 @@ impl<S> Transaction<S> {
                 .drop(NEW_DELETION_VECTOR_NAME)
                 .drop(NEW_STATS_NAME),
         )?;
+        // TODO(#3263): `file_metadata_batch` may contain `stats_parsed` and
+        // `partitionValues_parsed`; provide its full schema to both evaluators.
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),
             Arc::new(with_new_dv_expr),

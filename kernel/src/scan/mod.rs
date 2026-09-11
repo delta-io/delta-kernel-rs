@@ -972,6 +972,8 @@ impl Scan {
         // in order to be processed by our log replay, we must re-shape the existing scan metadata
         // back into shape as we read it from the log. Since it is already reconciled data,
         // we treat it as if it originated from a checkpoint.
+        // TODO(#3263): Existing data may contain `stats_parsed` and `partitionValues_parsed`;
+        // provide its full schema to the evaluator.
         let transform = engine.evaluation_handler().new_expression_evaluator(
             scan_row_schema(),
             get_scan_metadata_transform_expr(),
