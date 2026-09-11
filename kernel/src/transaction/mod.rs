@@ -85,6 +85,7 @@ mod write_validation;
 
 pub use bound_write_context::BoundWriteContext;
 use stats_verifier::StatsColumnVerifier;
+use update::new_dv_column_schema;
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -499,8 +500,11 @@ impl<S> Transaction<S> {
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
         // Step 6: Generate remove actions (collect to avoid borrowing self)
-        let remove_actions =
-            self.generate_remove_actions(engine, self.remove_files_metadata.iter(), None)?;
+        let remove_actions = self.generate_remove_actions(
+            engine,
+            self.remove_files_metadata.iter(),
+            false, /* has_dv_update_columns */
+        )?;
 
         // Build the action chain
         // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata
@@ -1428,8 +1432,8 @@ impl<S> Transaction<S> {
     ///
     /// - `engine`: The engine used for expression evaluation
     /// - `remove_files_metadata`: Iterator over scan file metadata to transform into Remove actions
-    /// - `extra_input_schema`: Temporary columns appended to the scan metadata. These columns are
-    ///   included in the evaluator input schema and dropped from the Remove action.
+    /// - `has_dv_update_columns`: Whether `remove_files_metadata` contains the temporary columns
+    ///   added for a deletion vector update
     ///
     /// # Returns
     ///
@@ -1442,7 +1446,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &dyn Engine,
         remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
-        extra_input_schema: Option<SchemaRef>,
+        has_dv_update_columns: bool,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
@@ -1454,8 +1458,9 @@ impl<S> Transaction<S> {
 
         let target_schema = schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA);
         let evaluation_handler = engine.evaluation_handler();
-        let columns_to_drop: Vec<_> = extra_input_schema
-            .iter()
+        let columns_to_drop: Vec<_> = has_dv_update_columns
+            .then(new_dv_column_schema)
+            .into_iter()
             .flat_map(|schema| schema.fields().map(|field| field.name().to_owned()))
             .collect();
 
@@ -1472,7 +1477,7 @@ impl<S> Transaction<S> {
                 scan_row_input_schema(
                     has_stats_parsed,
                     has_partition_values_parsed,
-                    extra_input_schema.as_ref(),
+                    has_dv_update_columns,
                 )?,
                 expr,
                 target_schema.clone().into(),
@@ -1480,10 +1485,22 @@ impl<S> Transaction<S> {
         };
 
         let evaluators = [
-            make_eval(false, false)?,
-            make_eval(true, false)?,
-            make_eval(false, true)?,
-            make_eval(true, true)?,
+            make_eval(
+                false, /* has_stats_parsed */
+                false, /* has_partition_values_parsed */
+            )?,
+            make_eval(
+                true,  /* has_stats_parsed */
+                false, /* has_partition_values_parsed */
+            )?,
+            make_eval(
+                false, /* has_stats_parsed */
+                true,  /* has_partition_values_parsed */
+            )?,
+            make_eval(
+                true, /* has_stats_parsed */
+                true, /* has_partition_values_parsed */
+            )?,
         ];
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
         let partition_values_parsed_col = column_name!(PARTITION_VALUES_PARSED_NAME);
@@ -1511,7 +1528,7 @@ impl<S> Transaction<S> {
 fn scan_row_input_schema(
     has_stats_parsed: bool,
     has_partition_values_parsed: bool,
-    extra_fields: Option<&SchemaRef>,
+    has_dv_update_columns: bool,
 ) -> DeltaResult<SchemaRef> {
     let parsed_column_type = StructType::try_new([])?;
     let mut patch = SchemaStructPatchBuilder::new();
@@ -1527,10 +1544,10 @@ fn scan_row_input_schema(
             parsed_column_type,
         ));
     }
-    if let Some(extra_fields) = extra_fields {
-        for field in extra_fields.fields() {
-            patch = patch.append(field.clone());
-        }
+    if has_dv_update_columns {
+        patch = new_dv_column_schema()
+            .fields()
+            .fold(patch, |patch, field| patch.append(field.clone()));
     }
     Ok(Arc::new(patch.build(&scan_row_schema())?))
 }

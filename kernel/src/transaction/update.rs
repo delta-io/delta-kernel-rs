@@ -517,15 +517,13 @@ fn struct_deletion_vector_schema() -> &'static ArrayType {
 
 /// Schema for the intermediate column holding new DV descriptors.
 /// This temporary column is dropped during transformation to final add actions.
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable NEW_DELETION_VECTOR_NAME: (DeletionVectorDescriptor::to_schema()),
     nullable NEW_STATS_NAME: STRING,
 };
 
 /// Returns the schema for the intermediate column holding new DV descriptors.
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-fn new_dv_column_schema() -> &'static SchemaRef {
+pub(super) fn new_dv_column_schema() -> &'static SchemaRef {
     &NEW_DV_COLUMN_SCHEMA
 }
 
@@ -554,7 +552,7 @@ impl<S> Transaction<S> {
         let remove_actions = self.generate_remove_actions(
             engine,
             self.dv_matched_files.iter(),
-            Some(new_dv_column_schema().clone()),
+            true, /* has_dv_update_columns */
         )?;
         let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter())?;
         Ok(remove_actions.chain(add_actions))
@@ -572,10 +570,7 @@ impl<S> Transaction<S> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
-        // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME columns. The engine data has this
-        // temporary column appended by update_deletion_vectors(), but it is not expected by
-        // the transforms used in generate_remove_actions() which expect only the scan row
-        // schema fields.
+        // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME columns.
         let with_new_dv_expr = Expression::struct_patch(
             ExpressionStructPatchBuilder::new()
                 .replace("deletionVector", col!(NEW_DELETION_VECTOR_NAME))

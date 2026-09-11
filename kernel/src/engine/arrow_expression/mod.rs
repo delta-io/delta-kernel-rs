@@ -454,8 +454,9 @@ fn top_level_types_compatible(expected_type: &DataType, data_type: &DataType) ->
         }
         (DataType::Struct(_), DataType::Struct(_))
         | (DataType::Array(_), DataType::Array(_))
-        | (DataType::Map(_), DataType::Map(_))
-        | (DataType::Variant(_), DataType::Struct(_)) => true,
+        | (DataType::Map(_), DataType::Map(_)) => true,
+        // Arrow has no Variant type, and it will be converted to structs.
+        (DataType::Variant(_), DataType::Struct(_)) => true,
         _ => false,
     }
 }

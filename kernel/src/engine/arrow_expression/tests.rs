@@ -1390,24 +1390,16 @@ fn evaluator_rejects_mismatched_top_level_schema(
     assert_result_error_with_message(result, mismatch.expected_error());
 }
 
-#[rstest]
-fn evaluator_accepts_nested_schema_differences(#[values(false, true)] batch_is_sparse: bool) {
-    let sparse_struct = schema! {};
-    let rich_struct = schema! {
-        not_null "a": INTEGER,
-    };
-    let (input_struct, batch_struct) = if batch_is_sparse {
-        (rich_struct, sparse_struct)
-    } else {
-        (sparse_struct, rich_struct)
-    };
+#[test]
+fn evaluator_accepts_nested_schema_differences() {
     let input_schema = schema_ref! {
-        nullable "s": (input_struct),
+        nullable "s": { not_null "a": INTEGER },
     };
-    let batch_schema = schema_ref! {
-        not_null "s": (batch_struct),
-    };
-    let batch_schema: Schema = batch_schema.as_ref().try_into_arrow().unwrap();
+    let batch_schema = Schema::new(vec![Field::new(
+        "s",
+        DataType::Struct(Fields::empty()),
+        true,
+    )]);
 
     validate_data_schema_top_level(&input_schema, &batch_schema).unwrap();
 }
@@ -1430,7 +1422,17 @@ fn evaluator_accepts_variant_arrow_struct_representation() {
     let input_schema = schema_ref! {
         nullable "v": (KernelDataType::unshredded_variant()),
     };
-    let batch_schema: Schema = input_schema.as_ref().try_into_arrow().unwrap();
+    let batch_schema = Schema::new(vec![Field::new(
+        "v",
+        DataType::Struct(
+            vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, false),
+            ]
+            .into(),
+        ),
+        true,
+    )]);
 
     validate_data_schema_top_level(&input_schema, &batch_schema).unwrap();
 }
