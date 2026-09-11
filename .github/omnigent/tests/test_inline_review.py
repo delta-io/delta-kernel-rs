@@ -88,6 +88,37 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(review, "Summary")
         self.assertEqual(findings, [{"id": "Nit1"}])
 
+    def test_extract_marked_review_returns_final_complete_revision(self) -> None:
+        marker = "a" * 32
+        start = f"<!-- AI_REVIEW_START_{marker} -->"
+        end = f"<!-- AI_REVIEW_END_{marker} -->"
+
+        review = self.review_publish.extract_marked_review(
+            f"status\n{start}\nFirst draft.\n{end}\n"
+            f"more status\n{start}\nCorrected review.\n{end}\ndone",
+            marker,
+        )
+
+        self.assertEqual(review, "Corrected review.")
+
+    def test_extract_marked_review_rejects_nested_markers(self) -> None:
+        marker = "a" * 32
+        start = f"<!-- AI_REVIEW_START_{marker} -->"
+        end = f"<!-- AI_REVIEW_END_{marker} -->"
+
+        with self.assertRaisesRegex(ValueError, "nested"):
+            self.review_publish.extract_marked_review(
+                f"{start}\nFirst draft.\n{start}\nSecond draft.\n{end}\n{end}",
+                marker,
+            )
+
+    def test_extract_marked_review_rejects_unmatched_markers(self) -> None:
+        marker = "a" * 32
+        start = f"<!-- AI_REVIEW_START_{marker} -->"
+
+        with self.assertRaisesRegex(ValueError, "no matching end"):
+            self.review_publish.extract_marked_review(start, marker)
+
     def test_inline_prompt_uses_parser_contract(self) -> None:
         marker = "a" * 32
         prompt = self.inline_review.inline_prompt_instructions(marker)
@@ -144,6 +175,8 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(workflow.count("{previous_review_policy}"), 1)
         self.assertIn("format_review_history", workflow)
         self.assertIn("OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}", workflow)
+        self.assertIn("OMNIGENT_BOT_APP_ID: ${{ vars.OMNIGENT_BOT_APP_ID }}", workflow)
+        self.assertIn("from review_publish import extract_marked_review", workflow)
         self.assertIn("--trusted-bot-logins /tmp/trusted_bot_logins.json", workflow)
 
     def test_automatic_reviews_default_to_inline(self) -> None:
@@ -573,6 +606,24 @@ class InlineReviewTest(unittest.TestCase):
         self.assertIn("Unclosed example", remaining)
         self.assertIn("### Blocker2", remaining)
         self.assertIn("Summary:\nNeeds changes.", remaining)
+
+    def test_removed_finding_preserves_heading_hidden_by_balanced_fence(self) -> None:
+        review = (
+            "## Blocking issues\n"
+            "### Blocker1\n"
+            "```rust\n"
+            "let x = 1;\n"
+            "### Nit1\n"
+            "still code\n"
+            "```\n"
+            "Nit1 real detail.\n"
+            "## Summary\n"
+            "Needs changes."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
+
+        self.assertEqual(remaining, review)
 
     def test_unclosed_fence_recovery_preserves_earlier_fence_parsing(self) -> None:
         review = (

@@ -70,6 +70,11 @@ enough coverage when at least one maintainer reviewer and one other primary
 reviewer complete. If that quorum completes, continue with the successful
 reviews and list agents still unavailable after retry in the final Summary.
 
+Track every dispatched reviewer by name. An empty inbox does not prove that all
+in-flight reviewers have completed. Do not emit a marked review until every
+dispatch has produced a result or exhausted its retry and every required
+disprove gate has returned a verdict.
+
 ## Disprove gate
 Before publishing any Blocker or Should Fix, run `disprove-reviewer` on the
 candidate finding list. Dispatch exactly one `disprove-reviewer` call for the

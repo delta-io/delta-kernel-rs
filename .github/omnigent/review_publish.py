@@ -10,6 +10,37 @@ REVIEW_HEADER = "## AI Review <sub>(draft - human review required)</sub>"
 _REVIEW_FOOTER = re.compile(
     r"\n+---\n+<sub>Automated review - \[workflow run\]\([^\n]+\)</sub>\s*$"
 )
+_PUBLICATION_MARKER = re.compile(r"[0-9a-f]{32}")
+
+
+def extract_marked_review(raw: str, marker: str) -> str:
+    """Return the final complete review delimited by a per-run marker pair."""
+    if _PUBLICATION_MARKER.fullmatch(marker) is None:
+        raise ValueError("publication marker is invalid")
+
+    start = f"<!-- AI_REVIEW_START_{marker} -->"
+    end = f"<!-- AI_REVIEW_END_{marker} -->"
+    token_pattern = re.compile(f"({re.escape(start)}|{re.escape(end)})")
+    current_start: int | None = None
+    reviews: list[str] = []
+    for token in token_pattern.finditer(raw):
+        if token.group(0) == start:
+            if current_start is not None:
+                raise ValueError("publication markers are nested")
+            current_start = token.end()
+            continue
+        if current_start is None:
+            raise ValueError("publication end marker has no matching start marker")
+        reviews.append(raw[current_start : token.start()].strip())
+        current_start = None
+
+    if current_start is not None:
+        raise ValueError("publication start marker has no matching end marker")
+    if not reviews:
+        raise ValueError("publication markers are missing")
+    if not reviews[-1]:
+        raise ValueError("final marked review is empty")
+    return reviews[-1]
 
 
 def format_review_body(review: str, run_url: str, *, collapsed: bool) -> str:

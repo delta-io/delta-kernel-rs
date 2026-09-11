@@ -269,7 +269,9 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
     if not finding_ids:
         return review
 
-    headings, unclosed_fence_start = _parse_review_boundaries(review)
+    headings, unclosed_fence_start, hidden_finding_offsets = _parse_review_boundaries(
+        review
+    )
     finding_id_counts = Counter(
         finding.group(1)
         for _, line in headings
@@ -289,6 +291,10 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
         ):
             # Once structure becomes ambiguous, preserving extra prose is safer than
             # deleting a genuine later finding or the summary.
+            continue
+        if any(start < offset < end for offset in hidden_finding_offsets):
+            # A malformed fence can hide a real finding heading. Preserve the
+            # whole range when its structure is ambiguous.
             continue
         ranges.append((start, end))
 
@@ -327,9 +333,10 @@ def _review_boundaries(review: str) -> list[tuple[int, str]]:
 
 def _parse_review_boundaries(
     review: str,
-) -> tuple[list[tuple[int, str]], int | None]:
-    """Return reliable boundaries and the start of any unterminated fence."""
+) -> tuple[list[tuple[int, str]], int | None, list[int]]:
+    """Return reliable boundaries plus locations made ambiguous by fences."""
     headings: list[tuple[int, str]] = []
+    hidden_finding_offsets: list[int] = []
     fence_character: str | None = None
     fence_length = 0
     fence_start: int | None = None
@@ -349,10 +356,13 @@ def _parse_review_boundaries(
                 fence_start = None
             offset += len(line)
             continue
-        if fence_character is None and _is_review_boundary(line):
-            headings.append((offset, line))
+        if _is_review_boundary(line):
+            if fence_character is None:
+                headings.append((offset, line))
+            elif _FINDING_HEADING.match(line) is not None:
+                hidden_finding_offsets.append(offset)
         offset += len(line)
-    return headings, fence_start
+    return headings, fence_start, hidden_finding_offsets
 
 
 def _is_review_boundary(line: str) -> bool:

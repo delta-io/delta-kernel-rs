@@ -278,6 +278,8 @@ jobs:
           CODEX_MAINTAINER_MODEL: ${{ vars.CODEX_MAINTAINER_MODEL }}
           DISPROVE_MODEL: ${{ vars.DISPROVE_MODEL }}
           MODEL: ${{ vars.MODEL }}
+          OMNIGENT_BOT_APP_ID: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}
         run: |
           set -euo pipefail
           model_variables=(
@@ -292,6 +294,9 @@ jobs:
               exit 1
             fi
           done
+          if [ -n "$OMNIGENT_BOT_APP_ID" ] && [ -z "$OMNIGENT_BOT_LOGIN" ]; then
+            echo "::warning::OMNIGENT_BOT_LOGIN is not set; App-authored review deduplication is disabled."
+          fi
 
       - name: Check out repo
         if: steps.creds.outputs.available == 'true'
@@ -917,9 +922,15 @@ jobs:
           {start_marker} on its own line, then the review. End with the exact
           marker {end_marker} on its own line.{inline_instructions}
 
-          Emit those markers only if every dispatched reviewer completed
-          successfully and every required disprove gate returned a verdict. If
-          either fails, do not emit the start or end markers. Output only:
+          Track every dispatched reviewer by name. An empty inbox does not
+          prove that all in-flight reviewers have completed. Do not emit a
+          marked review until every dispatch has produced a result or exhausted
+          its retry and every required disprove gate has returned a verdict.
+
+          Emit those markers only after every dispatched reviewer completed or
+          exhausted its retry, reviewer quorum was reached, and every required
+          disprove gate returned a verdict. If quorum or a required gate fails,
+          do not emit the start or end markers. Output only:
           <!-- AI_REVIEW_INCOMPLETE -->
           Failure code: dispatch_failed|reviewer_failed|disprove_failed|timeout|other
           Failed agents: comma-separated checked-in agent names, or none
@@ -1110,22 +1121,21 @@ jobs:
           import json
           import os
           import pathlib
-          import re
           import sys
 
           sys.path.insert(0, ".github/omnigent")
           from inline_review import extract_inline_findings
+          from review_publish import extract_marked_review
 
           raw = pathlib.Path("/tmp/review_raw_output.txt").read_text(errors="replace")
           marker = os.environ.get("REVIEW_MARKER", "")
-          if re.fullmatch(r"[0-9a-f]{32}", marker) is None:
-              print("::error::AI review publication marker is invalid.")
-              sys.exit(1)
           start = f"<!-- AI_REVIEW_START_{marker} -->"
           end = f"<!-- AI_REVIEW_END_{marker} -->"
           start_count = raw.count(start)
           end_count = raw.count(end)
-          if start_count != 1 or end_count != 1:
+          try:
+              body = extract_marked_review(raw, marker)
+          except ValueError as error:
               incomplete = "<!-- AI_REVIEW_INCOMPLETE -->"
               if incomplete in raw:
                   reason = raw.rsplit(incomplete, 1)[-1].lower()
@@ -1164,18 +1174,12 @@ jobs:
                   detail = "the reviewer used legacy fixed markers"
               else:
                   detail = (
-                      f"marker counts were start={start_count}, end={end_count}; "
+                      f"{error}; marker counts were start={start_count}, end={end_count}; "
                       f"captured {len(raw.encode('utf-8'))} bytes"
                   )
               print(f"::error::AI review is not publishable: {detail}.")
               sys.exit(1)
 
-          start_idx = raw.index(start) + len(start)
-          end_idx = raw.index(end, start_idx)
-          body = raw[start_idx:end_idx].strip()
-          if not body:
-              print("::error::AI review produced an empty publishable result.")
-              sys.exit(1)
           if len(body) > 60_000:
               print("::error::AI review exceeded the 60000-character publication limit.")
               sys.exit(1)
