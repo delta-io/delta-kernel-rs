@@ -2,15 +2,16 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tracing::debug;
 use url::Url;
 
-use crate::engine::arrow_utils;
-use crate::plans::{Operation, PlanBuilder, PlanExecutor};
+use crate::engine::arrow_utils::{self, read_json_bytes};
+use crate::plans::{IoOperation, Operation, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    FileSize, FilteredEngineData, JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
@@ -51,12 +52,25 @@ impl JsonHandler for PlanBasedJsonHandler {
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
-        // single-node executor can then match the filter -> scan shape.
-        let query = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)?.build()?;
-        self.executor
-            .execute_op(Operation::QueryPlan(query))?
-            .into_data()
+        let locations = files
+            .iter()
+            .map(|file| file.location.clone())
+            .collect::<Vec<_>>();
+        let slices = locations
+            .iter()
+            .map(|location| (location.clone(), None))
+            .collect();
+        let buffers = self
+            .executor
+            .execute_op(Operation::IoOperation(IoOperation::read_bytes(slices)))?
+            .into_bytes()?;
+        let data = locations
+            .into_iter()
+            .zip(buffers)
+            .flat_map(move |(location, buffer)| {
+                parse_json_bytes(buffer, physical_schema.clone(), location.to_string())
+            });
+        Ok(Box::new(data))
     }
 
     fn write_json_file(
@@ -73,6 +87,22 @@ impl JsonHandler for PlanBasedJsonHandler {
         };
         debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
         fallback.write_json_file(path, data, overwrite)
+    }
+}
+
+fn parse_json_bytes(
+    buffer: DeltaResult<Bytes>,
+    schema: SchemaRef,
+    location: String,
+) -> DeltaResultIteratorStatic<Box<dyn EngineData>> {
+    match buffer.and_then(|bytes| {
+        read_json_bytes(bytes, schema, location).map(|iter| {
+            Box::new(iter.map(|batch| batch.map(|data| Box::new(data) as Box<dyn EngineData>)))
+                as DeltaResultIteratorStatic<Box<dyn EngineData>>
+        })
+    }) {
+        Ok(data) => data,
+        Err(error) => Box::new(std::iter::once(Err(error))),
     }
 }
 
@@ -100,9 +130,21 @@ mod tests {
         JsonHandler as _, ParquetHandler as _,
     };
 
+    struct IoOnlyPlanExecutor(SyncPlanExecutor);
+
+    impl crate::plans::PlanExecutor for IoOnlyPlanExecutor {
+        fn execute_op(&self, op: crate::plans::Operation) -> DeltaResult<crate::plans::PlanResult> {
+            assert!(
+                matches!(&op, crate::plans::Operation::IoOperation(_)),
+                "JSON reads must bypass generic query-plan execution"
+            );
+            crate::plans::PlanExecutor::execute_op(&self.0, op)
+        }
+    }
+
     fn make_handler() -> PlanBasedJsonHandler {
         PlanBasedJsonHandler::new(
-            Arc::new(SyncPlanExecutor::default()),
+            Arc::new(IoOnlyPlanExecutor(SyncPlanExecutor::default())),
             Some(SyncEngine::new().json_handler()),
         )
     }

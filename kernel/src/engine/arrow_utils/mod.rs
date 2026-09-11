@@ -4,9 +4,19 @@ pub(crate) mod apply_schema;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+#[cfg(any(
+    test,
+    all(feature = "declarative-plans", feature = "default-engine-base")
+))]
+use std::io::{BufReader, Cursor};
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, OnceLock};
 
+#[cfg(any(
+    test,
+    all(feature = "declarative-plans", feature = "default-engine-base")
+))]
+use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tracing::debug;
@@ -1560,6 +1570,25 @@ pub(crate) fn fixup_json_read(
 ) -> DeltaResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
     Ok(data.into())
+}
+
+/// Parse line-delimited JSON bytes directly into Arrow batches matching `schema`.
+#[cfg(any(
+    test,
+    all(feature = "declarative-plans", feature = "default-engine-base")
+))]
+pub(crate) fn read_json_bytes(
+    data: Bytes,
+    schema: SchemaRef,
+    file_location: String,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
+    let json_schema = Arc::new(json_arrow_schema(&schema)?);
+    let reorder_indices = build_json_reorder_indices(&schema)?;
+    let json = ReaderBuilder::new(json_schema)
+        .with_coerce_primitive(true)
+        .build(BufReader::new(Cursor::new(data)))?
+        .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
+    Ok(json)
 }
 
 /// Builds the [`ReorderIndex`] vec for post-processing JSON read batches.
