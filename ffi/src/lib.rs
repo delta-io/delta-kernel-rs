@@ -21,7 +21,7 @@ use delta_kernel::history_manager::{
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
-use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
+use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotHint, SnapshotRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -1127,17 +1127,17 @@ pub struct SharedMetadata;
 /// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
 /// (incrementally from an existing snapshot). Configure with [`snapshot_builder_set_version`],
 /// [`snapshot_builder_set_log_tail`], and [`snapshot_builder_set_max_catalog_version`] (for
-/// catalog-managed tables). Builders returned by [`get_snapshot_builder`] may instead construct a
-/// complete typed snapshot hint with [`snapshot_hint::snapshot_builder_snapshot_hint_begin`] and
-/// its setters. Finally, call [`snapshot_builder_build`] to consume the builder and obtain the
-/// snapshot. If you need to discard the builder without building, call [`free_snapshot_builder`].
+/// catalog-managed tables). Builders returned by [`get_snapshot_builder`] may instead receive a
+/// complete typed snapshot hint with [`snapshot_hint::snapshot_builder_set_snapshot_hint`].
+/// Finally, call [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you
+/// need to discard the builder without building, call [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
     engine: Arc<dyn ExternEngine>,
     source: FfiSnapshotBuilderSource,
     version: Option<Version>,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
-    snapshot_hint: snapshot_hint::FfiSnapshotHintState,
+    snapshot_hint: Option<Box<SnapshotHint>>,
 }
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiSnapshotBuilder`].
@@ -1159,7 +1159,7 @@ fn make_snapshot_builder(
         version: None,
         log_tail: Vec::new(),
         max_catalog_version: None,
-        snapshot_hint: snapshot_hint::FfiSnapshotHintState::None,
+        snapshot_hint: None,
     })
     .into())
 }
@@ -1323,14 +1323,10 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
                 log_tail,
                 max_catalog_version,
             );
-            match snapshot_hint {
-                snapshot_hint::FfiSnapshotHintState::None => builder.build(engine.as_ref()),
-                snapshot_hint::FfiSnapshotHintState::Ready(hint) => {
-                    builder.with_snapshot_hint(*hint).build(engine.as_ref())
-                }
-                snapshot_hint::FfiSnapshotHintState::Building(_) => Err(snapshot_hint::invalid(
-                    "snapshot hint visitor is unfinished",
-                )),
+            if let Some(hint) = snapshot_hint {
+                builder.with_snapshot_hint(*hint).build(engine.as_ref())
+            } else {
+                builder.build(engine.as_ref())
             }
         }
         FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => {
@@ -1340,14 +1336,12 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
                 log_tail,
                 max_catalog_version,
             );
-            match snapshot_hint {
-                snapshot_hint::FfiSnapshotHintState::None => builder.build(engine.as_ref()),
-                snapshot_hint::FfiSnapshotHintState::Ready(_) => Err(snapshot_hint::invalid(
+            if snapshot_hint.is_some() {
+                Err(snapshot_hint::invalid(
                     "A snapshot hint cannot be used with Snapshot::builder_from",
-                )),
-                snapshot_hint::FfiSnapshotHintState::Building(_) => Err(snapshot_hint::invalid(
-                    "snapshot hint visitor is unfinished",
-                )),
+                ))
+            } else {
+                builder.build(engine.as_ref())
             }
         }
     }?;

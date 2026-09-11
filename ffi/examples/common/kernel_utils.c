@@ -76,7 +76,7 @@ bool set_builder_opt(EngineBuilder* engine_builder, char* key, char* val)
   return true;
 }
 
-void compile_snapshot_hint_abi(const FfiProtocol* protocol)
+void compile_snapshot_hint_abi(void)
 {
   KernelStringSlice string = { .ptr = NULL, .len = 0 };
   OptionalValueKernelStringSlice optional_string = { .tag = NoneKernelStringSlice };
@@ -161,14 +161,20 @@ void compile_snapshot_hint_abi(const FfiProtocol* protocol)
     .ptr = actions,
     .len = sizeof(actions) / sizeof(actions[0]),
   };
+  OptionalValueFfiSidecarArray optional_sidecar_array = {
+    .tag = SomeFfiSidecarArray,
+    .some = sidecar_array,
+  };
+  OptionalValueFfiSnapshotHintV2ActionArray optional_action_array = {
+    .tag = SomeFfiSnapshotHintV2ActionArray,
+    .some = action_array,
+  };
   FfiSnapshotHintV2Checkpoint v2_checkpoint = {
     .path = string,
     .size_in_bytes = optional_i64,
     .modification_time = optional_i64,
-    .has_sidecar_files = true,
-    .sidecar_files = sidecar_array,
-    .has_non_file_actions = true,
-    .non_file_actions = action_array,
+    .sidecar_files = optional_sidecar_array,
+    .non_file_actions = optional_action_array,
   };
   FfiSnapshotHintLastCheckpoint last_checkpoint = {
     .version = 0,
@@ -186,46 +192,38 @@ void compile_snapshot_hint_abi(const FfiProtocol* protocol)
     .ptr = &domain_metadata,
     .len = 1,
   };
+  OptionalValueFfiSetTransactionArray optional_transaction_array = {
+    .tag = SomeFfiSetTransactionArray,
+    .some = transaction_array,
+  };
+  OptionalValueFfiDomainMetadataArray optional_domain_metadata_array = {
+    .tag = SomeFfiDomainMetadataArray,
+    .some = domain_metadata_array,
+  };
   FfiSnapshotHintCrc crc = {
     .table_size_bytes = 0,
     .num_files = 0,
     .in_commit_timestamp = optional_i64,
     .file_size_histogram = &histogram,
-    .has_set_transactions = true,
-    .set_transactions = transaction_array,
-    .has_domain_metadata = true,
-    .domain_metadata = domain_metadata_array,
+    .set_transactions = optional_transaction_array,
+    .domain_metadata = optional_domain_metadata_array,
   };
   LogPathArray log_paths = { .ptr = NULL, .len = 0 };
+  FfiSnapshotHint snapshot_hint = {
+    .version = 0,
+    .freshness = SNAPSHOT_HINT_FRESHNESS_LATEST,
+    .log_paths = log_paths,
+    .protocol = protocol_value,
+    .metadata = metadata,
+    .last_checkpoint = &last_checkpoint,
+    .crc = &crc,
+  };
+  ExternResultbool (*set_snapshot_hint)(HandleMutableFfiSnapshotBuilder*,
+                                        const FfiSnapshotHint*) =
+      snapshot_builder_set_snapshot_hint;
 
-  ExternResultbool (*begin)(HandleMutableFfiSnapshotBuilder*, Version,
-                            FfiSnapshotHintFreshness) =
-      snapshot_builder_snapshot_hint_begin;
-  ExternResultbool (*set_log_paths)(HandleMutableFfiSnapshotBuilder*, LogPathArray) =
-      snapshot_builder_snapshot_hint_set_log_paths;
-  ExternResultbool (*set_protocol)(HandleMutableFfiSnapshotBuilder*, const FfiProtocol*) =
-      snapshot_builder_snapshot_hint_set_protocol;
-  ExternResultbool (*set_metadata)(HandleMutableFfiSnapshotBuilder*, const FfiMetadata*) =
-      snapshot_builder_snapshot_hint_set_metadata;
-  ExternResultbool (*set_last_checkpoint)(HandleMutableFfiSnapshotBuilder*,
-                                          const FfiSnapshotHintLastCheckpoint*) =
-      snapshot_builder_snapshot_hint_set_last_checkpoint;
-  ExternResultbool (*set_crc)(HandleMutableFfiSnapshotBuilder*, const FfiSnapshotHintCrc*) =
-      snapshot_builder_snapshot_hint_set_crc;
-  ExternResultbool (*finish)(HandleMutableFfiSnapshotBuilder*) =
-      snapshot_builder_snapshot_hint_finish;
-
-  (void)last_checkpoint;
-  (void)crc;
-  (void)log_paths;
-  (void)protocol;
-  (void)begin;
-  (void)set_log_paths;
-  (void)set_protocol;
-  (void)set_metadata;
-  (void)set_last_checkpoint;
-  (void)set_crc;
-  (void)finish;
+  (void)snapshot_hint;
+  (void)set_snapshot_hint;
 }
 
 // utility to print out a metric id as a uuid

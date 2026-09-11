@@ -110,7 +110,7 @@ impl FileSizeHistogram {
     /// Validates that:
     /// - All arrays have the same non-zero length
     /// - The first boundary is 0
-    /// - Boundaries are sorted in ascending order
+    /// - Boundaries are sorted in strictly ascending order
     #[internal_api]
     pub(crate) fn try_new(
         sorted_bin_boundaries: Vec<i64>,

@@ -85,7 +85,8 @@ impl SnapshotHint {
     ///
     /// # Errors
     ///
-    /// Returns [`SnapshotHintError::LogCompaction`] if any path is a compacted commit.
+    /// Returns [`SnapshotHintError::LogCompaction`] if any path is a compacted commit. Returns an
+    /// error when the supplied paths cannot be grouped into a valid log-segment file set.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn try_new(

@@ -346,7 +346,10 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// Reconstructs metadata from its serialized fields.
+    /// Reconstructs metadata from its serialized action fields.
+    ///
+    /// This constructor does not validate the schema, partition columns, format, or table
+    /// configuration. Callers must validate the result before using it as table state.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]

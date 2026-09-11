@@ -4,17 +4,19 @@ use std::sync::Arc;
 use delta_kernel::actions::{CheckpointMetadata, Sidecar};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel_default_engine::DefaultEngineBuilder;
+use test_utils::assert_result_error_with_message;
 
 use super::*;
 use crate::delta_types::{
-    file_size_histogram, optional_strings, strings, FfiStringArray, FfiStringMap, FfiStringMapEntry,
+    file_size_histogram, strings, FfiStringArray, FfiStringMap, FfiStringMapEntry,
 };
 use crate::error::KernelError;
 use crate::ffi_test_utils::{allocate_err, assert_extern_result_error_with_message, ok_or_panic};
 use crate::log_path::FfiLogPath;
 use crate::{
     engine_to_handle, free_engine, free_snapshot, free_snapshot_builder, get_snapshot_builder,
-    get_snapshot_builder_from, snapshot_builder_build, KernelI64Slice, SharedExternEngine,
+    get_snapshot_builder_from, snapshot_builder_build, snapshot_builder_set_version,
+    KernelI64Slice, SharedExternEngine,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -91,16 +93,8 @@ fn empty_crc() -> FfiSnapshotHintCrc {
         num_files: 0,
         in_commit_timestamp: none_i64(),
         file_size_histogram: std::ptr::null(),
-        has_set_transactions: false,
-        set_transactions: FfiSetTransactionArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-        has_domain_metadata: false,
-        domain_metadata: FfiDomainMetadataArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
+        set_transactions: OptionalValue::None,
+        domain_metadata: OptionalValue::None,
     }
 }
 
@@ -120,35 +114,37 @@ fn test_builder(engine: &Handle<SharedExternEngine>) -> Handle<MutableFfiSnapsho
     }
 }
 
-unsafe fn finish_minimal_hint(builder: &mut Handle<MutableFfiSnapshotBuilder>) {
+fn test_snapshot_hint(
+    log_paths: &[FfiLogPath],
+    version: Version,
+    freshness: FfiSnapshotHintFreshness,
+) -> FfiSnapshotHint {
+    FfiSnapshotHint {
+        version,
+        freshness,
+        log_paths: LogPathArray {
+            ptr: log_paths.as_ptr(),
+            len: log_paths.len(),
+        },
+        protocol: test_protocol(),
+        metadata: test_metadata(),
+        last_checkpoint: std::ptr::null(),
+        crc: std::ptr::null(),
+    }
+}
+
+unsafe fn set_minimal_hint(builder: &mut Handle<MutableFfiSnapshotBuilder>) {
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
         1,
         1,
     );
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_log_paths(
-            builder,
-            LogPathArray {
-                ptr: &log_path,
-                len: 1,
-            },
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_protocol(
-            builder,
-            &test_protocol(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_metadata(
-            builder,
-            &test_metadata(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_finish(builder));
-    }
+    let hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
+    );
+    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(builder, &hint)) };
 }
 
 #[test]
@@ -201,22 +197,22 @@ fn typed_components_construct_rich_snapshot_state() {
         num_files: 1,
         in_commit_timestamp: none_i64(),
         file_size_histogram: &histogram,
-        has_set_transactions: true,
-        set_transactions: FfiSetTransactionArray {
+        set_transactions: OptionalValue::Some(FfiSetTransactionArray {
             ptr: &transaction,
             len: 1,
-        },
-        has_domain_metadata: true,
-        domain_metadata: FfiDomainMetadataArray {
+        }),
+        domain_metadata: OptionalValue::Some(FfiDomainMetadataArray {
             ptr: &domain,
             len: 1,
-        },
+        }),
     };
-    let complete_crc =
-        unsafe { pending_crc(&crc_value) }
-            .unwrap()
-            .finish(5, metadata.clone(), protocol.clone());
-    assert_eq!(complete_crc.file_stats().unwrap().num_files(), 1);
+    let complete_crc = unsafe { crc(&crc_value, 5, metadata.clone(), protocol.clone()) }.unwrap();
+    let file_stats = complete_crc.file_stats().unwrap();
+    assert_eq!(file_stats.num_files(), 1);
+    let histogram = file_stats.file_size_histogram().unwrap();
+    assert_eq!(histogram.sorted_bin_boundaries(), &[0, 1024]);
+    assert_eq!(histogram.file_counts(), &[1, 0]);
+    assert_eq!(histogram.total_bytes(), &[512, 0]);
     assert_eq!(
         complete_crc.set_transaction_state.expect_complete().len(),
         1
@@ -225,10 +221,7 @@ fn typed_components_construct_rich_snapshot_state() {
         complete_crc.domain_metadata_state.expect_complete().len(),
         1
     );
-    let partial_crc =
-        unsafe { pending_crc(&empty_crc()) }
-            .unwrap()
-            .finish(5, metadata.clone(), protocol.clone());
+    let partial_crc = unsafe { crc(&empty_crc(), 5, metadata.clone(), protocol.clone()) }.unwrap();
     assert!(matches!(
         partial_crc.set_transaction_state,
         SetTransactionState::Partial(ref values) if values.is_empty()
@@ -258,16 +251,14 @@ fn typed_components_construct_rich_snapshot_state() {
         path: slice("00000000000000000005.checkpoint.uuid.parquet"),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
-        has_sidecar_files: true,
-        sidecar_files: FfiSidecarArray {
+        sidecar_files: OptionalValue::Some(FfiSidecarArray {
             ptr: &sidecar,
             len: 1,
-        },
-        has_non_file_actions: true,
-        non_file_actions: FfiSnapshotHintV2ActionArray {
+        }),
+        non_file_actions: OptionalValue::Some(FfiSnapshotHintV2ActionArray {
             ptr: &non_file_action,
             len: 1,
-        },
+        }),
     };
     let checkpoint_tags = [FfiStringMapEntry {
         key: slice("source"),
@@ -300,12 +291,91 @@ fn typed_components_construct_rich_snapshot_state() {
 #[test]
 fn typed_arrays_preserve_absent_and_present_empty() {
     assert_eq!(
-        unsafe { optional_strings(&empty_strings(false), invalid) }.unwrap(),
+        optional_value(&empty_strings(false), |value| unsafe {
+            strings(value, invalid)
+        })
+        .unwrap(),
         None
     );
     assert_eq!(
-        unsafe { optional_strings(&empty_strings(true), invalid) }.unwrap(),
+        optional_value(&empty_strings(true), |value| unsafe {
+            strings(value, invalid)
+        })
+        .unwrap(),
         Some(vec![])
+    );
+
+    let v2 = FfiSnapshotHintV2Checkpoint {
+        path: slice("checkpoint.parquet"),
+        size_in_bytes: OptionalValue::None,
+        modification_time: OptionalValue::None,
+        sidecar_files: OptionalValue::Some(FfiSidecarArray {
+            ptr: std::ptr::null(),
+            len: 0,
+        }),
+        non_file_actions: OptionalValue::Some(FfiSnapshotHintV2ActionArray {
+            ptr: std::ptr::null(),
+            len: 0,
+        }),
+    };
+    let parsed_v2 = unsafe { v2_checkpoint(&v2) }.unwrap();
+    let parsed_v2_json = serde_json::to_value(parsed_v2).unwrap();
+    assert_eq!(parsed_v2_json["sidecarFiles"], serde_json::json!([]));
+    assert_eq!(parsed_v2_json["nonFileActions"], serde_json::json!([]));
+
+    let crc_value = FfiSnapshotHintCrc {
+        set_transactions: OptionalValue::Some(FfiSetTransactionArray {
+            ptr: std::ptr::null(),
+            len: 0,
+        }),
+        domain_metadata: OptionalValue::Some(FfiDomainMetadataArray {
+            ptr: std::ptr::null(),
+            len: 0,
+        }),
+        ..empty_crc()
+    };
+    let protocol = unsafe { protocol(&test_protocol(), invalid) }.unwrap();
+    let metadata = unsafe { metadata(&test_metadata(), invalid) }.unwrap();
+    let parsed_crc = unsafe { crc(&crc_value, 0, metadata, protocol) }.unwrap();
+    assert!(parsed_crc
+        .set_transaction_state
+        .expect_complete()
+        .is_empty());
+    assert!(parsed_crc
+        .domain_metadata_state
+        .expect_complete()
+        .is_empty());
+}
+
+#[test]
+fn typed_strings_accept_null_empty_and_reject_null_nonempty() {
+    let null_empty = KernelStringSlice {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    assert_eq!(unsafe { string(&null_empty) }.unwrap(), "");
+
+    let null_nonempty = KernelStringSlice {
+        ptr: std::ptr::null(),
+        len: 1,
+    };
+    assert_result_error_with_message(
+        unsafe { string(&null_nonempty) },
+        "string pointer is null with length 1",
+    );
+}
+
+#[test]
+fn typed_sidecar_rejects_negative_size() {
+    let sidecar_value = FfiSidecar {
+        path: slice("sidecar.parquet"),
+        size_in_bytes: -1,
+        modification_time: 123,
+        tags: none_map(),
+    };
+    assert_result_error_with_message(
+        unsafe { sidecar(&sidecar_value, invalid) },
+        "sidecar size must be non-negative: -1",
     );
 }
 
@@ -465,6 +535,8 @@ fn typed_components_reject_invalid_strings() {
 
 #[test]
 fn typed_nested_arrays_reject_null_nonempty_pointers() {
+    let protocol = unsafe { protocol(&test_protocol(), invalid) }.unwrap();
+    let metadata = unsafe { metadata(&test_metadata(), invalid) }.unwrap();
     let values = [0, 1];
     let valid = KernelI64Slice {
         ptr: values.as_ptr(),
@@ -520,16 +592,11 @@ fn typed_nested_arrays_reject_null_nonempty_pointers() {
         path: slice("checkpoint.parquet"),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
-        has_sidecar_files: true,
-        sidecar_files: FfiSidecarArray {
+        sidecar_files: OptionalValue::Some(FfiSidecarArray {
             ptr: std::ptr::null(),
             len: 1,
-        },
-        has_non_file_actions: false,
-        non_file_actions: FfiSnapshotHintV2ActionArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
+        }),
+        non_file_actions: OptionalValue::None,
     };
     assert!(unsafe { v2_checkpoint(&checkpoint) }.is_err());
 
@@ -537,38 +604,31 @@ fn typed_nested_arrays_reject_null_nonempty_pointers() {
         path: slice("checkpoint.parquet"),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
-        has_sidecar_files: false,
-        sidecar_files: FfiSidecarArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-        has_non_file_actions: true,
-        non_file_actions: FfiSnapshotHintV2ActionArray {
+        sidecar_files: OptionalValue::None,
+        non_file_actions: OptionalValue::Some(FfiSnapshotHintV2ActionArray {
             ptr: std::ptr::null(),
             len: 1,
-        },
+        }),
     };
     assert!(unsafe { v2_checkpoint(&checkpoint) }.is_err());
 
     let crc = FfiSnapshotHintCrc {
-        has_set_transactions: true,
-        set_transactions: FfiSetTransactionArray {
+        set_transactions: OptionalValue::Some(FfiSetTransactionArray {
             ptr: std::ptr::null(),
             len: 1,
-        },
+        }),
         ..empty_crc()
     };
-    assert!(unsafe { pending_crc(&crc) }.is_err());
+    assert!(unsafe { super::crc(&crc, 0, metadata.clone(), protocol.clone()) }.is_err());
 
     let crc = FfiSnapshotHintCrc {
-        has_domain_metadata: true,
-        domain_metadata: FfiDomainMetadataArray {
+        domain_metadata: OptionalValue::Some(FfiDomainMetadataArray {
             ptr: std::ptr::null(),
             len: 1,
-        },
+        }),
         ..empty_crc()
     };
-    assert!(unsafe { pending_crc(&crc) }.is_err());
+    assert!(unsafe { super::crc(&crc, 0, metadata, protocol) }.is_err());
 }
 
 #[test]
@@ -715,20 +775,14 @@ fn typed_actions_reject_invalid_payload_contents() {
 
 #[test]
 fn typed_checkpoint_and_crc_reject_invalid_nested_state() {
+    let protocol = unsafe { protocol(&test_protocol(), invalid) }.unwrap();
+    let metadata = unsafe { metadata(&test_metadata(), invalid) }.unwrap();
     let invalid_v2 = FfiSnapshotHintV2Checkpoint {
         path: invalid_utf8(),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
-        has_sidecar_files: false,
-        sidecar_files: FfiSidecarArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-        has_non_file_actions: false,
-        non_file_actions: FfiSnapshotHintV2ActionArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
+        sidecar_files: OptionalValue::None,
+        non_file_actions: OptionalValue::None,
     };
     assert!(unsafe { v2_checkpoint(&invalid_v2) }.is_err());
 
@@ -765,14 +819,13 @@ fn typed_checkpoint_and_crc_reject_invalid_nested_state() {
         },
     ];
     let crc = FfiSnapshotHintCrc {
-        has_set_transactions: true,
-        set_transactions: FfiSetTransactionArray {
+        set_transactions: OptionalValue::Some(FfiSetTransactionArray {
             ptr: transactions.as_ptr(),
             len: transactions.len(),
-        },
+        }),
         ..empty_crc()
     };
-    assert!(unsafe { pending_crc(&crc) }.is_err());
+    assert!(unsafe { super::crc(&crc, 0, metadata.clone(), protocol.clone()) }.is_err());
 
     let domain = FfiDomainMetadata {
         domain: slice("domain"),
@@ -780,197 +833,111 @@ fn typed_checkpoint_and_crc_reject_invalid_nested_state() {
         removed: true,
     };
     let crc = FfiSnapshotHintCrc {
-        has_domain_metadata: true,
-        domain_metadata: FfiDomainMetadataArray {
+        domain_metadata: OptionalValue::Some(FfiDomainMetadataArray {
             ptr: &domain,
             len: 1,
-        },
+        }),
         ..empty_crc()
     };
-    assert!(unsafe { pending_crc(&crc) }.is_err());
+    assert!(unsafe { super::crc(&crc, 0, metadata.clone(), protocol.clone()) }.is_err());
 
     let crc = FfiSnapshotHintCrc {
         num_files: -1,
         ..empty_crc()
     };
-    assert!(unsafe { pending_crc(&crc) }.is_err());
+    assert!(unsafe { super::crc(&crc, 0, metadata, protocol) }.is_err());
 }
 
 #[test]
-fn typed_visitor_rejects_unknown_freshness_and_unfinished_build() {
+fn aggregate_setter_rejects_unknown_freshness_without_mutating_builder() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
-    let result = unsafe { snapshot_builder_snapshot_hint_begin(&mut builder, 0, u32::MAX) };
+    unsafe { set_minimal_hint(&mut builder) };
+
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        1,
+        1,
+    );
+    let invalid_hint = test_snapshot_hint(std::slice::from_ref(&log_path), 0, u32::MAX);
+    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &invalid_hint) };
     assert_extern_result_error_with_message(
         result,
         KernelError::InvalidSnapshotHint,
         Some("Invalid snapshot hint: unknown snapshot hint freshness: 4294967295"),
     );
-    let result =
-        unsafe { snapshot_builder_snapshot_hint_set_metadata(&mut builder, &test_metadata()) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint visitor has not been started"),
-    );
 
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    assert!(!unsafe { snapshot.as_ref() }.is_built_as_latest());
     unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            5,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-    }
-    let result = unsafe { snapshot_builder_snapshot_hint_begin(&mut builder, 6, u32::MAX) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: unknown snapshot hint freshness: 4294967295"),
-    );
-    let result =
-        unsafe { snapshot_builder_snapshot_hint_set_metadata(&mut builder, &test_metadata()) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint visitor has not been started"),
-    );
-
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-    }
-    let result = unsafe { snapshot_builder_build(builder) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint visitor is unfinished"),
-    );
-    unsafe { free_engine(engine) };
-}
-
-#[test]
-fn invalid_begin_clears_finished_snapshot_hint() {
-    let engine = test_engine();
-    let mut builder = test_builder(&engine);
-    unsafe { finish_minimal_hint(&mut builder) };
-
-    let result = unsafe { snapshot_builder_snapshot_hint_begin(&mut builder, 0, u32::MAX) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: unknown snapshot hint freshness: 4294967295"),
-    );
-    let result = unsafe { snapshot_builder_snapshot_hint_finish(&mut builder) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint visitor has not been started"),
-    );
-
-    unsafe {
-        free_snapshot_builder(builder);
+        free_snapshot(snapshot);
         free_engine(engine);
     }
 }
 
-#[derive(Clone, Copy)]
-enum InactiveVisitor {
-    NotStarted,
-    Finished,
-}
-
-#[derive(Clone, Copy)]
-enum MalformedPayload {
-    LogPaths,
-    Protocol,
-    Metadata,
-    LastCheckpoint,
-}
-
-#[rstest::rstest]
-#[case::not_started_log_paths(InactiveVisitor::NotStarted, MalformedPayload::LogPaths)]
-#[case::not_started_protocol(InactiveVisitor::NotStarted, MalformedPayload::Protocol)]
-#[case::not_started_metadata(InactiveVisitor::NotStarted, MalformedPayload::Metadata)]
-#[case::not_started_checkpoint(InactiveVisitor::NotStarted, MalformedPayload::LastCheckpoint)]
-#[case::finished_log_paths(InactiveVisitor::Finished, MalformedPayload::LogPaths)]
-#[case::finished_protocol(InactiveVisitor::Finished, MalformedPayload::Protocol)]
-#[case::finished_metadata(InactiveVisitor::Finished, MalformedPayload::Metadata)]
-#[case::finished_checkpoint(InactiveVisitor::Finished, MalformedPayload::LastCheckpoint)]
-fn typed_setters_report_lifecycle_before_malformed_payload(
-    #[case] lifecycle: InactiveVisitor,
-    #[case] payload: MalformedPayload,
-) {
+#[test]
+fn aggregate_setter_late_failure_preserves_existing_hint() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
-    if let InactiveVisitor::Finished = lifecycle {
-        unsafe { finish_minimal_hint(&mut builder) };
-    }
+    unsafe { set_minimal_hint(&mut builder) };
 
-    let invalid_array = FfiStringArray {
-        ptr: std::ptr::null(),
-        len: 1,
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        1,
+        1,
+    );
+    let invalid_crc_state = FfiSnapshotHintCrc {
+        num_files: -1,
+        ..empty_crc()
     };
-    let protocol = FfiProtocol {
-        reader_features: OptionalValue::Some(invalid_array),
-        ..test_protocol()
-    };
-    let metadata = FfiMetadata {
-        partition_columns: FfiStringArray {
-            ptr: std::ptr::null(),
-            len: 1,
-        },
-        ..test_metadata()
-    };
-    let checkpoint = FfiSnapshotHintLastCheckpoint {
-        version: 0,
-        size: 1,
-        parts: OptionalValue::None,
-        size_in_bytes: none_i64(),
-        num_of_add_files: none_i64(),
-        checkpoint_schema: OptionalValue::Some(slice("not a schema")),
-        checksum: none_string(),
-        tags: none_map(),
-        v2_checkpoint: std::ptr::null(),
-    };
-    let result = unsafe {
-        match payload {
-            MalformedPayload::LogPaths => snapshot_builder_snapshot_hint_set_log_paths(
-                &mut builder,
-                LogPathArray {
-                    ptr: std::ptr::null(),
-                    len: 1,
-                },
-            ),
-            MalformedPayload::Protocol => {
-                snapshot_builder_snapshot_hint_set_protocol(&mut builder, &protocol)
-            }
-            MalformedPayload::Metadata => {
-                snapshot_builder_snapshot_hint_set_metadata(&mut builder, &metadata)
-            }
-            MalformedPayload::LastCheckpoint => {
-                snapshot_builder_snapshot_hint_set_last_checkpoint(&mut builder, &checkpoint)
-            }
-        }
-    };
-    let expected = match lifecycle {
-        InactiveVisitor::NotStarted => {
-            "Invalid snapshot hint: snapshot hint visitor has not been started"
-        }
-        InactiveVisitor::Finished => {
-            "Invalid snapshot hint: snapshot hint visitor has already been finished"
-        }
-    };
+    let mut replacement = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        SNAPSHOT_HINT_FRESHNESS_LATEST,
+    );
+    replacement.crc = &invalid_crc_state;
+    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &replacement) };
     assert_extern_result_error_with_message(
         result,
         KernelError::InvalidSnapshotHint,
-        Some(expected),
+        Some("Invalid snapshot hint: supplied CRC is invalid"),
     );
 
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    assert!(!unsafe { snapshot.as_ref() }.is_built_as_latest());
     unsafe {
-        free_snapshot_builder(builder);
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+}
+
+#[test]
+fn aggregate_setter_replaces_existing_hint_after_successful_validation() {
+    let engine = test_engine();
+    let mut builder = test_builder(&engine);
+    unsafe { set_minimal_hint(&mut builder) };
+
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        1,
+        1,
+    );
+    let replacement = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        SNAPSHOT_HINT_FRESHNESS_LATEST,
+    );
+    unsafe {
+        ok_or_panic(snapshot_builder_set_snapshot_hint(
+            &mut builder,
+            &replacement,
+        ))
+    };
+
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    assert!(unsafe { snapshot.as_ref() }.is_built_as_latest());
+    unsafe {
+        free_snapshot(snapshot);
         free_engine(engine);
     }
 }
@@ -978,26 +945,16 @@ fn typed_setters_report_lifecycle_before_malformed_payload(
 #[rstest::rstest]
 #[case("not-a-url")]
 #[case("memory:///hinted-table/_delta_log/not-a-log-file")]
-fn typed_visitor_wraps_invalid_log_path_errors(#[case] location: &'static str) {
+fn aggregate_setter_wraps_invalid_log_path_errors(#[case] location: &'static str) {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-    }
     let log_path = FfiLogPath::new(slice(location), 1, 1);
-    let result = unsafe {
-        snapshot_builder_snapshot_hint_set_log_paths(
-            &mut builder,
-            LogPathArray {
-                ptr: &log_path,
-                len: 1,
-            },
-        )
-    };
+    let hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
+    );
+    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
     assert_extern_result_error_with_message(
         result,
         KernelError::InvalidSnapshotHint,
@@ -1011,205 +968,27 @@ fn typed_visitor_wraps_invalid_log_path_errors(#[case] location: &'static str) {
 }
 
 #[test]
-fn typed_visitor_accepts_crc_before_protocol_and_metadata() {
+fn aggregate_setter_rejects_null_nonempty_log_path_array() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
-    let log_path = FfiLogPath::new(
-        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
-        1,
-        1,
-    );
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-    }
-
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_set_crc(
-            &mut builder,
-            &empty_crc(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_metadata(
-            &mut builder,
-            &test_metadata(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_protocol(
-            &mut builder,
-            &test_protocol(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_log_paths(
-            &mut builder,
-            LogPathArray {
-                ptr: &log_path,
-                len: 1,
-            },
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_finish(&mut builder));
-    }
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-    assert!(unsafe { snapshot.as_ref() }
-        .get_file_stats_if_present()
-        .is_some());
-    unsafe {
-        free_snapshot(snapshot);
-        free_engine(engine);
-    }
-}
-
-#[derive(Clone, Copy)]
-enum CrcDependency {
-    Protocol,
-    Metadata,
-}
-
-#[rstest::rstest]
-#[case::protocol(CrcDependency::Protocol)]
-#[case::metadata(CrcDependency::Metadata)]
-fn typed_visitor_preserves_crc_when_dependency_changes(#[case] dependency: CrcDependency) {
-    let engine = test_engine();
-    let mut builder = test_builder(&engine);
-    let log_path = FfiLogPath::new(
-        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
-        1,
-        1,
-    );
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_log_paths(
-            &mut builder,
-            LogPathArray {
-                ptr: &log_path,
-                len: 1,
-            },
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_protocol(
-            &mut builder,
-            &test_protocol(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_metadata(
-            &mut builder,
-            &test_metadata(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_crc(
-            &mut builder,
-            &empty_crc(),
-        ));
-        match dependency {
-            CrcDependency::Protocol => ok_or_panic(snapshot_builder_snapshot_hint_set_protocol(
-                &mut builder,
-                &test_protocol(),
-            )),
-            CrcDependency::Metadata => ok_or_panic(snapshot_builder_snapshot_hint_set_metadata(
-                &mut builder,
-                &test_metadata(),
-            )),
-        };
-        ok_or_panic(snapshot_builder_snapshot_hint_finish(&mut builder));
-    }
-
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-    assert!(unsafe { snapshot.as_ref() }
-        .get_file_stats_if_present()
-        .is_some());
-    unsafe {
-        free_snapshot(snapshot);
-        free_engine(engine);
-    }
-}
-
-#[test]
-fn typed_log_paths_reject_null_nonempty_pointer() {
-    let engine = test_engine();
-    let mut builder = test_builder(&engine);
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-    }
-    let result = unsafe {
-        snapshot_builder_snapshot_hint_set_log_paths(
-            &mut builder,
-            LogPathArray {
-                ptr: std::ptr::null(),
-                len: 1,
-            },
-        )
+    let hint = FfiSnapshotHint {
+        version: 0,
+        freshness: SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
+        log_paths: LogPathArray {
+            ptr: std::ptr::null(),
+            len: 1,
+        },
+        protocol: test_protocol(),
+        metadata: test_metadata(),
+        last_checkpoint: std::ptr::null(),
+        crc: std::ptr::null(),
     };
+    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
     assert_extern_result_error_with_message(
         result,
         KernelError::InvalidSnapshotHint,
         Some("Invalid snapshot hint: supplied log paths are invalid"),
     );
-    unsafe {
-        free_snapshot_builder(builder);
-        free_engine(engine);
-    }
-}
-
-#[test]
-fn typed_visitor_finish_requires_protocol_and_metadata() {
-    let engine = test_engine();
-    let mut builder = test_builder(&engine);
-    let log_path = FfiLogPath::new(
-        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
-        1,
-        1,
-    );
-
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_log_paths(
-            &mut builder,
-            LogPathArray {
-                ptr: &log_path,
-                len: 1,
-            },
-        ));
-    }
-    let result = unsafe { snapshot_builder_snapshot_hint_finish(&mut builder) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint protocol was not supplied"),
-    );
-
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_log_paths(
-            &mut builder,
-            LogPathArray {
-                ptr: &log_path,
-                len: 1,
-            },
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_protocol(
-            &mut builder,
-            &test_protocol(),
-        ));
-    }
-    let result = unsafe { snapshot_builder_snapshot_hint_finish(&mut builder) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint metadata was not supplied"),
-    );
 
     unsafe {
         free_snapshot_builder(builder);
@@ -1218,7 +997,7 @@ fn typed_visitor_finish_requires_protocol_and_metadata() {
 }
 
 #[test]
-fn typed_visitor_rejects_log_compaction_paths() {
+fn aggregate_setter_rejects_log_compaction_paths() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
@@ -1229,29 +1008,12 @@ fn typed_visitor_rejects_log_compaction_paths() {
         1,
         1,
     );
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            1,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_log_paths(
-            &mut builder,
-            LogPathArray {
-                ptr: &log_path,
-                len: 1,
-            },
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_protocol(
-            &mut builder,
-            &test_protocol(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_metadata(
-            &mut builder,
-            &test_metadata(),
-        ));
-    }
-    let result = unsafe { snapshot_builder_snapshot_hint_finish(&mut builder) };
+    let hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        1,
+        SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
+    );
+    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
     assert_extern_result_error_with_message(
         result,
         KernelError::InvalidSnapshotHint,
@@ -1265,25 +1027,14 @@ fn typed_visitor_rejects_log_compaction_paths() {
 }
 
 #[test]
-fn typed_crc_accepts_single_bin_histogram() {
+fn aggregate_setter_accepts_single_bin_histogram() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_protocol(
-            &mut builder,
-            &test_protocol(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_metadata(
-            &mut builder,
-            &test_metadata(),
-        ));
-    }
-
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        1,
+        1,
+    );
     let boundary = [0];
     let histogram = FfiFileSizeHistogram {
         sorted_bin_boundaries: KernelI64Slice {
@@ -1300,22 +1051,16 @@ fn typed_crc_accepts_single_bin_histogram() {
         },
     };
     let crc = FfiSnapshotHintCrc {
-        table_size_bytes: 0,
-        num_files: 0,
-        in_commit_timestamp: none_i64(),
         file_size_histogram: &histogram,
-        has_set_transactions: false,
-        set_transactions: FfiSetTransactionArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-        has_domain_metadata: false,
-        domain_metadata: FfiDomainMetadataArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
+        ..empty_crc()
     };
-    unsafe { ok_or_panic(snapshot_builder_snapshot_hint_set_crc(&mut builder, &crc)) };
+    let mut hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
+    );
+    hint.crc = &crc;
+    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
 
     unsafe {
         free_snapshot_builder(builder);
@@ -1324,7 +1069,7 @@ fn typed_crc_accepts_single_bin_histogram() {
 }
 
 #[test]
-fn typed_visitor_builds_latest_snapshot_without_storage_files() {
+fn aggregate_setter_builds_latest_snapshot_without_storage_files() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
@@ -1343,66 +1088,15 @@ fn typed_visitor_builds_latest_snapshot_without_storage_files() {
         tags: none_map(),
         v2_checkpoint: std::ptr::null(),
     };
-    let crc = FfiSnapshotHintCrc {
-        table_size_bytes: 0,
-        num_files: 0,
-        in_commit_timestamp: none_i64(),
-        file_size_histogram: std::ptr::null(),
-        has_set_transactions: false,
-        set_transactions: FfiSetTransactionArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-        has_domain_metadata: false,
-        domain_metadata: FfiDomainMetadataArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-    };
-
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_LATEST,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_log_paths(
-            &mut builder,
-            LogPathArray {
-                ptr: &log_path,
-                len: 1,
-            },
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_protocol(
-            &mut builder,
-            &test_protocol(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_metadata(
-            &mut builder,
-            &test_metadata(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_last_checkpoint(
-            &mut builder,
-            &last_checkpoint,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_crc(&mut builder, &crc));
-        ok_or_panic(snapshot_builder_snapshot_hint_finish(&mut builder));
-    }
-
-    let result =
-        unsafe { snapshot_builder_snapshot_hint_set_metadata(&mut builder, &test_metadata()) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint visitor has already been finished"),
+    let crc = empty_crc();
+    let mut hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        SNAPSHOT_HINT_FRESHNESS_LATEST,
     );
-
-    let result = unsafe { snapshot_builder_snapshot_hint_finish(&mut builder) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint visitor has already been finished"),
-    );
+    hint.last_checkpoint = &last_checkpoint;
+    hint.crc = &crc;
+    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
 
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let snapshot_ref = unsafe { snapshot.as_ref() };
@@ -1422,46 +1116,48 @@ fn typed_visitor_builds_latest_snapshot_without_storage_files() {
     }
 }
 
+#[test]
+fn aggregate_setter_success_does_not_prevalidate_builder_configuration() {
+    let engine = test_engine();
+    let mut builder = test_builder(&engine);
+    unsafe { snapshot_builder_set_version(&mut builder, 1) };
+
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        1,
+        1,
+    );
+    let hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
+    );
+    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+
+    let result = unsafe { snapshot_builder_build(builder) };
+    assert_extern_result_error_with_message(
+        result,
+        KernelError::InvalidSnapshotHint,
+        Some("Invalid snapshot hint: Requested version 1 does not match snapshot hint version 0"),
+    );
+    unsafe { free_engine(engine) };
+}
+
 fn assert_typed_checkpoint_build(
     log_paths: &[FfiLogPath],
-    protocol: &FfiProtocol,
+    protocol: FfiProtocol,
     last_checkpoint: &FfiSnapshotHintLastCheckpoint,
     expected_filenames: &[&str],
     expected_hint: &LastCheckpointHint,
 ) {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_log_paths(
-            &mut builder,
-            LogPathArray {
-                ptr: log_paths.as_ptr(),
-                len: log_paths.len(),
-            },
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_protocol(
-            &mut builder,
-            protocol,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_metadata(
-            &mut builder,
-            &test_metadata(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_last_checkpoint(
-            &mut builder,
-            last_checkpoint,
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_set_crc(
-            &mut builder,
-            &empty_crc(),
-        ));
-        ok_or_panic(snapshot_builder_snapshot_hint_finish(&mut builder));
-    }
+    let crc = empty_crc();
+    let mut hint = test_snapshot_hint(log_paths, 0, SNAPSHOT_HINT_FRESHNESS_UNVERIFIED);
+    hint.protocol = protocol;
+    hint.last_checkpoint = last_checkpoint;
+    hint.crc = &crc;
+    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
 
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let snapshot_ref = unsafe { snapshot.as_ref() };
@@ -1522,7 +1218,7 @@ fn typed_multipart_checkpoint_build() {
         LastCheckpointHint::from_parts(0, 2, Some(2), None, None, None, None, None, None).unwrap();
     assert_typed_checkpoint_build(
         &log_paths,
-        &test_protocol(),
+        test_protocol(),
         &checkpoint,
         &[PART_1, PART_2],
         &expected,
@@ -1569,16 +1265,14 @@ fn typed_v2_checkpoint_build() {
         path: slice(CHECKPOINT),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
-        has_sidecar_files: true,
-        sidecar_files: FfiSidecarArray {
+        sidecar_files: OptionalValue::Some(FfiSidecarArray {
             ptr: &sidecar,
             len: 1,
-        },
-        has_non_file_actions: true,
-        non_file_actions: FfiSnapshotHintV2ActionArray {
+        }),
+        non_file_actions: OptionalValue::Some(FfiSnapshotHintV2ActionArray {
             ptr: &action,
             len: 1,
-        },
+        }),
     };
     let checkpoint = FfiSnapshotHintLastCheckpoint {
         version: 0,
@@ -1617,21 +1311,21 @@ fn typed_v2_checkpoint_build() {
     )
     .unwrap();
     let log_paths = [FfiLogPath::new(slice(CHECKPOINT_URL), 1, 1)];
-    assert_typed_checkpoint_build(&log_paths, &protocol, &checkpoint, &[CHECKPOINT], &expected);
+    assert_typed_checkpoint_build(&log_paths, protocol, &checkpoint, &[CHECKPOINT], &expected);
 }
 
 #[rstest::rstest]
 #[case::multipart_v1(typed_multipart_checkpoint_build)]
 #[case::uuid_v2(typed_v2_checkpoint_build)]
-fn typed_checkpoint_build_preserves_identity_and_reconstructed_state(#[case] run_case: fn()) {
+fn aggregate_checkpoint_build_preserves_identity_and_reconstructed_state(#[case] run_case: fn()) {
     run_case();
 }
 
 #[test]
-fn typed_visitor_rejects_begin_on_existing_snapshot_builder() {
+fn aggregate_setter_rejects_existing_snapshot_builder() {
     let engine = test_engine();
     let mut initial_builder = test_builder(&engine);
-    unsafe { finish_minimal_hint(&mut initial_builder) };
+    unsafe { set_minimal_hint(&mut initial_builder) };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(initial_builder)) };
 
     let mut update_builder = unsafe {
@@ -1640,13 +1334,17 @@ fn typed_visitor_rejects_begin_on_existing_snapshot_builder() {
             engine.shallow_copy(),
         ))
     };
-    let result = unsafe {
-        snapshot_builder_snapshot_hint_begin(
-            &mut update_builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        )
-    };
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        1,
+        1,
+    );
+    let hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
+    );
+    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut update_builder, &hint) };
     assert_extern_result_error_with_message(
         result,
         KernelError::InvalidSnapshotHint,
@@ -1656,48 +1354,6 @@ fn typed_visitor_rejects_begin_on_existing_snapshot_builder() {
     unsafe {
         free_snapshot_builder(update_builder);
         free_snapshot(snapshot);
-        free_engine(engine);
-    }
-}
-
-#[test]
-fn typed_visitor_rejects_missing_fields_and_partial_state_can_be_freed() {
-    let engine = test_engine();
-    let mut missing_fields_builder = test_builder(&engine);
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut missing_fields_builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-    }
-    let result = unsafe { snapshot_builder_snapshot_hint_finish(&mut missing_fields_builder) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint log paths were not supplied"),
-    );
-    let result = unsafe { snapshot_builder_snapshot_hint_finish(&mut missing_fields_builder) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: snapshot hint visitor has not been started"),
-    );
-
-    let mut partial_builder = unsafe {
-        ok_or_panic(get_snapshot_builder(
-            slice("memory:///hinted-table/"),
-            engine.shallow_copy(),
-        ))
-    };
-    unsafe {
-        ok_or_panic(snapshot_builder_snapshot_hint_begin(
-            &mut partial_builder,
-            0,
-            SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
-        ));
-        free_snapshot_builder(missing_fields_builder);
-        free_snapshot_builder(partial_builder);
         free_engine(engine);
     }
 }

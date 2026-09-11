@@ -168,6 +168,12 @@ pub(crate) fn optional_value<T, U>(
     }
 }
 
+/// Borrows a native array after validating its nullable layout.
+///
+/// # Safety
+///
+/// For nonzero `len`, `ptr` must be aligned and address `len` initialized values. The backing
+/// storage must remain valid for the lifetime of the returned slice.
 pub(crate) unsafe fn raw_slice<'a, T>(
     ptr: *const T,
     len: usize,
@@ -185,33 +191,18 @@ pub(crate) unsafe fn raw_slice<'a, T>(
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-pub(crate) unsafe fn optional_array<T, U>(
-    has_value: bool,
-    ptr: *const T,
-    len: usize,
-    name: &str,
-    invalid_input: InvalidInput,
-    map: impl FnMut(&T) -> DeltaResult<U>,
-) -> DeltaResult<Option<Vec<U>>> {
-    has_value
-        .then(|| {
-            unsafe { raw_slice(ptr, len, name, invalid_input) }?
-                .iter()
-                .map(map)
-                .collect()
-        })
-        .transpose()
-}
-
 pub(crate) unsafe fn string(value: &KernelStringSlice) -> DeltaResult<String> {
+    if value.len == 0 {
+        return Ok(String::new());
+    }
+    if value.ptr.is_null() {
+        return Err(Error::generic(format!(
+            "string pointer is null with length {}",
+            value.len
+        )));
+    }
     let value: &str = unsafe { TryFromStringSlice::try_from_slice(value) }?;
     Ok(value.to_string())
-}
-
-pub(crate) unsafe fn optional_string(
-    value: &OptionalValue<KernelStringSlice>,
-) -> DeltaResult<Option<String>> {
-    optional_value(value, |value| unsafe { string(value) })
 }
 
 pub(crate) fn optional_i64(value: &OptionalValue<i64>) -> Option<i64> {
@@ -231,13 +222,6 @@ pub(crate) unsafe fn strings(
         .collect()
 }
 
-pub(crate) unsafe fn optional_strings(
-    value: &OptionalValue<FfiStringArray>,
-    invalid_input: InvalidInput,
-) -> DeltaResult<Option<Vec<String>>> {
-    optional_value(value, |value| unsafe { strings(value, invalid_input) })
-}
-
 pub(crate) unsafe fn string_map(
     value: &FfiStringMap,
     invalid_input: InvalidInput,
@@ -254,13 +238,6 @@ pub(crate) unsafe fn string_map(
     Ok(result)
 }
 
-pub(crate) unsafe fn optional_string_map(
-    value: &OptionalValue<FfiStringMap>,
-    invalid_input: InvalidInput,
-) -> DeltaResult<Option<HashMap<String, String>>> {
-    optional_value(value, |value| unsafe { string_map(value, invalid_input) })
-}
-
 pub(crate) unsafe fn protocol(
     value: &FfiProtocol,
     invalid_input: InvalidInput,
@@ -268,8 +245,12 @@ pub(crate) unsafe fn protocol(
     Protocol::try_new(
         value.min_reader_version,
         value.min_writer_version,
-        unsafe { optional_strings(&value.reader_features, invalid_input) }?,
-        unsafe { optional_strings(&value.writer_features, invalid_input) }?,
+        optional_value(&value.reader_features, |value| unsafe {
+            strings(value, invalid_input)
+        })?,
+        optional_value(&value.writer_features, |value| unsafe {
+            strings(value, invalid_input)
+        })?,
     )
 }
 
@@ -279,8 +260,8 @@ pub(crate) unsafe fn metadata(
 ) -> DeltaResult<Metadata> {
     Ok(Metadata::from_parts(
         unsafe { string(&value.id) }?,
-        unsafe { optional_string(&value.name) }?,
-        unsafe { optional_string(&value.description) }?,
+        optional_value(&value.name, |value| unsafe { string(value) })?,
+        optional_value(&value.description, |value| unsafe { string(value) })?,
         unsafe { string(&value.format_provider) }?,
         unsafe { string_map(&value.format_options, invalid_input) }?,
         unsafe { string(&value.schema_string) }?,
@@ -312,20 +293,31 @@ pub(crate) unsafe fn checkpoint_metadata(
     value: &FfiCheckpointMetadata,
     invalid_input: InvalidInput,
 ) -> DeltaResult<CheckpointMetadata> {
-    Ok(CheckpointMetadata::new(value.version, unsafe {
-        optional_string_map(&value.tags, invalid_input)
-    }?))
+    Ok(CheckpointMetadata::new(
+        value.version,
+        optional_value(&value.tags, |value| unsafe {
+            string_map(value, invalid_input)
+        })?,
+    ))
 }
 
 pub(crate) unsafe fn sidecar(
     value: &FfiSidecar,
     invalid_input: InvalidInput,
 ) -> DeltaResult<Sidecar> {
+    if value.size_in_bytes < 0 {
+        return Err(invalid_input(format!(
+            "sidecar size must be non-negative: {}",
+            value.size_in_bytes
+        )));
+    }
     Ok(Sidecar::new(
         unsafe { string(&value.path) }?,
         value.size_in_bytes,
         value.modification_time,
-        unsafe { optional_string_map(&value.tags, invalid_input) }?,
+        optional_value(&value.tags, |value| unsafe {
+            string_map(value, invalid_input)
+        })?,
     ))
 }
 
