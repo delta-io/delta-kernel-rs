@@ -108,29 +108,70 @@ impl PlanBuilder {
         }
     }
 
-    /// A Parquet scan source over `files` producing rows matching `schema`.
+    /// An unordered Parquet scan source over `files` producing rows matching `schema`.
     ///
     /// `file_constant_columns` names the per-file-constant output columns (see [`ScanParquet`]);
     /// pass `&[]` when there are none. An empty `files` yields the absent relation.
     ///
     /// Produces an error when any file's constant count differs from `file_constant_columns`'s
     /// length, or a `file_constant_columns` entry is absent from `schema`.
+    /// Use [`Self::scan_parquet_ordered`] when ordering and file boundaries are required.
     pub fn scan_parquet(
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        Self::scan_source(FileType::Parquet, files, file_constant_columns, schema)
+        Self::scan_source(
+            FileType::Parquet,
+            files,
+            file_constant_columns,
+            schema,
+            false,
+        )
     }
 
-    /// A newline-delimited JSON scan source over `files` producing rows matching `schema`. See
-    /// [`ScanJson`]. Exhibits same behaviour as [`Self::scan_parquet`].
+    /// An ordered Parquet scan source over `files` producing rows matching `schema`.
+    ///
+    /// The resulting scan preserves the input file order, row order within each file, and file
+    /// boundaries in its output batches. Empty-input behavior and validation errors match
+    /// [`Self::scan_parquet`].
+    pub fn scan_parquet_ordered(
+        files: impl IntoIterator<Item = impl Into<ScanFile>>,
+        file_constant_columns: &[&str],
+        schema: impl Into<SchemaRef>,
+    ) -> DeltaResult<Self> {
+        Self::scan_source(
+            FileType::Parquet,
+            files,
+            file_constant_columns,
+            schema,
+            true,
+        )
+    }
+
+    /// An unordered newline-delimited JSON scan source over `files` producing rows matching
+    /// `schema`. See [`ScanJson`]. Exhibits the same behavior as [`Self::scan_parquet`]. Use
+    /// [`Self::scan_json_ordered`] when ordering and file boundaries are required.
     pub fn scan_json(
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        Self::scan_source(FileType::Json, files, file_constant_columns, schema)
+        Self::scan_source(FileType::Json, files, file_constant_columns, schema, false)
+    }
+
+    /// An ordered newline-delimited JSON scan source over `files` producing rows matching
+    /// `schema`.
+    ///
+    /// The resulting scan preserves the input file order, row order within each file, and file
+    /// boundaries in its output batches. Empty-input behavior and validation errors match
+    /// [`Self::scan_json`].
+    pub fn scan_json_ordered(
+        files: impl IntoIterator<Item = impl Into<ScanFile>>,
+        file_constant_columns: &[&str],
+        schema: impl Into<SchemaRef>,
+    ) -> DeltaResult<Self> {
+        Self::scan_source(FileType::Json, files, file_constant_columns, schema, true)
     }
 
     /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Normalizes and validates the
@@ -141,6 +182,7 @@ impl PlanBuilder {
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
+        ordered_scan: bool,
     ) -> DeltaResult<Self> {
         let schema = schema.into();
         let files = Vec::from_iter(files.into_iter().map(Into::into));
@@ -166,11 +208,13 @@ impl PlanBuilder {
                 files,
                 file_constant_columns,
                 schema: Arc::clone(&schema),
+                ordered_scan,
             }),
             FileType::Json => Operator::from(ScanJson {
                 files,
                 file_constant_columns,
                 schema: Arc::clone(&schema),
+                ordered_scan,
             }),
         };
         Ok(Self::present(schema, op, vec![]))
@@ -719,6 +763,43 @@ mod tests {
         let src = scan(id_schema());
         assert_eq!(src.schema(), &id_schema());
         assert_plan(src, &[(&[], "scan_parquet")]);
+    }
+
+    #[test]
+    fn scan_sources_set_ordered_flag() -> DeltaResult<()> {
+        let scans = [
+            (
+                PlanBuilder::scan_parquet([test_file("file:///a.parquet")], &[], id_schema())?,
+                false,
+            ),
+            (
+                PlanBuilder::scan_json([test_file("file:///a.json")], &[], id_schema())?,
+                false,
+            ),
+            (
+                PlanBuilder::scan_parquet_ordered(
+                    [test_file("file:///a.parquet")],
+                    &[],
+                    id_schema(),
+                )?,
+                true,
+            ),
+            (
+                PlanBuilder::scan_json_ordered([test_file("file:///a.json")], &[], id_schema())?,
+                true,
+            ),
+        ];
+
+        for (scan, expected) in scans {
+            let plan = scan.build()?;
+            let actual = match &plan.nodes[0].op {
+                Operator::ScanParquet(scan) => scan.ordered_scan,
+                Operator::ScanJson(scan) => scan.ordered_scan,
+                op => panic!("expected scan, got {op}"),
+            };
+            assert_eq!(actual, expected);
+        }
+        Ok(())
     }
 
     /// `{ id, part }`, with `part` used as a file-constant column.

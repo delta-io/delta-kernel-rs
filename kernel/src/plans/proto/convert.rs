@@ -171,6 +171,7 @@ impl From<&ScanParquet> for proto_plan::ScanParquetNode {
             files: convert_vec(&node.files),
             file_constant_columns: node.file_constant_columns.clone(),
             schema: Some(node.schema.as_ref().into()),
+            ordered_scan: node.ordered_scan,
         }
     }
 }
@@ -181,6 +182,7 @@ impl From<&ScanJson> for proto_plan::ScanJsonNode {
             files: convert_vec(&node.files),
             file_constant_columns: node.file_constant_columns.clone(),
             schema: Some(node.schema.as_ref().into()),
+            ordered_scan: node.ordered_scan,
         }
     }
 }
@@ -1227,6 +1229,7 @@ mod tests {
                         files: vec![ScanFile::new(sample_file_meta())],
                         file_constant_columns: vec![],
                         schema: schema.clone(),
+                        ordered_scan: false,
                     }),
                     inputs: vec![],
                 },
@@ -1280,6 +1283,7 @@ mod tests {
             files: vec![],
             file_constant_columns: vec![],
             schema: sample_schema(),
+            ordered_scan: false,
         }),
         "scan_parquet"
     )]
@@ -1288,6 +1292,7 @@ mod tests {
             files: vec![],
             file_constant_columns: vec![],
             schema: sample_schema(),
+            ordered_scan: false,
         }),
         "scan_json"
     )]
@@ -1353,30 +1358,38 @@ mod tests {
         assert_eq!(proto.file_constants.len(), 2);
     }
 
-    #[test]
-    fn from_scan_parquet() {
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn from_scan_parquet(#[case] ordered_scan: bool) {
         let node = ScanParquet {
             files: vec![ScanFile::new(sample_file_meta())],
             file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
+            ordered_scan,
         };
         let proto = proto_plan::ScanParquetNode::from(&node);
         assert_eq!(proto.files.len(), 1);
         assert_eq!(proto.file_constant_columns.len(), 1);
         assert!(proto.schema.is_some());
+        assert_eq!(proto.ordered_scan, ordered_scan);
     }
 
-    #[test]
-    fn from_scan_json() {
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn from_scan_json(#[case] ordered_scan: bool) {
         let node = ScanJson {
             files: vec![ScanFile::new(sample_file_meta())],
             file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
+            ordered_scan,
         };
         let proto = proto_plan::ScanJsonNode::from(&node);
         assert_eq!(proto.files.len(), 1);
         assert_eq!(proto.file_constant_columns.len(), 1);
         assert!(proto.schema.is_some());
+        assert_eq!(proto.ordered_scan, ordered_scan);
     }
 
     #[test]

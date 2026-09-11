@@ -16,6 +16,19 @@ pub mod json;
 pub mod parquet;
 pub mod storage;
 
+#[cfg(test)]
+fn assert_ordered_file_batches(batch_values: Vec<Vec<i64>>) {
+    assert!(batch_values.iter().all(|values| {
+        values.is_empty()
+            || values.iter().all(|value| *value <= 2)
+            || values.iter().all(|value| *value >= 3)
+    }));
+    assert_eq!(
+        batch_values.into_iter().flatten().collect::<Vec<_>>(),
+        vec![3, 4, 1, 2]
+    );
+}
+
 use json::PlanBasedJsonHandler;
 use parquet::PlanBasedParquetHandler;
 use storage::PlanBasedStorageHandler;
@@ -94,19 +107,45 @@ impl Engine for PlanBasedEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use tempfile::tempdir;
     use url::Url;
 
-    use super::PlanBasedEngine;
+    use super::{PlanBasedEngine, PlanBasedJsonHandler, PlanBasedParquetHandler};
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
-    use crate::{Engine as _, EngineData, Error};
+    use crate::plans::ir::nodes::Operator;
+    use crate::schema::{DataType, StructField, StructType};
+    use crate::{
+        DeltaResult, Engine as _, EngineData, Error, FileMeta, JsonHandler as _, Operation,
+        ParquetHandler as _, PlanExecutor, PlanResult,
+    };
+
+    #[derive(Default)]
+    struct RecordingPlanExecutor {
+        scans: Mutex<Vec<(&'static str, bool)>>,
+    }
+
+    impl PlanExecutor for RecordingPlanExecutor {
+        fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+            let Operation::QueryPlan(plan) = op else {
+                panic!("expected query plan");
+            };
+            assert_eq!(plan.nodes.len(), 1);
+            let scan = match &plan.nodes[0].op {
+                Operator::ScanJson(scan) => ("json", scan.ordered_scan),
+                Operator::ScanParquet(scan) => ("parquet", scan.ordered_scan),
+                op => panic!("expected scan, got {op}"),
+            };
+            self.scans.lock().unwrap().push(scan);
+            Ok(PlanResult::Data(Box::new(std::iter::empty())))
+        }
+    }
 
     fn plan_engine(fallback: Option<Arc<dyn crate::Engine>>) -> PlanBasedEngine {
         PlanBasedEngine::new(fallback, Arc::new(SyncPlanExecutor::default()))
@@ -201,5 +240,34 @@ mod tests {
             .write_parquet_file(location, Box::new(std::iter::empty()))
             .expect_err("no fallback is configured");
         assert!(matches!(parquet_err, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn plan_based_handlers_request_ordered_scans() {
+        let executor = Arc::new(RecordingPlanExecutor::default());
+        let fallback = SyncEngine::new();
+        let json = PlanBasedJsonHandler::new(executor.clone(), Some(fallback.json_handler()));
+        let parquet =
+            PlanBasedParquetHandler::new(executor.clone(), Some(fallback.parquet_handler()));
+        let file = FileMeta {
+            location: Url::parse("file:///data").unwrap(),
+            last_modified: 0,
+            size: 0,
+        };
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "x",
+            DataType::INTEGER,
+        )]));
+
+        drop(
+            json.read_json_files(std::slice::from_ref(&file), schema.clone(), None)
+                .unwrap(),
+        );
+        drop(parquet.read_parquet_files(&[file], schema, None).unwrap());
+
+        assert_eq!(
+            *executor.scans.lock().unwrap(),
+            vec![("json", true), ("parquet", true)]
+        );
     }
 }
