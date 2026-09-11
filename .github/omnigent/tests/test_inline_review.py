@@ -119,6 +119,29 @@ class InlineReviewTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no matching end"):
             self.review_publish.extract_marked_review(start, marker)
 
+    def test_extract_marked_review_rejects_invalid_marker(self) -> None:
+        with self.assertRaisesRegex(ValueError, "marker is invalid"):
+            self.review_publish.extract_marked_review("review", "not-a-marker")
+
+    def test_extract_marked_review_rejects_end_before_start(self) -> None:
+        marker = "a" * 32
+        end = f"<!-- AI_REVIEW_END_{marker} -->"
+
+        with self.assertRaisesRegex(ValueError, "no matching start"):
+            self.review_publish.extract_marked_review(end, marker)
+
+    def test_extract_marked_review_rejects_missing_markers(self) -> None:
+        with self.assertRaisesRegex(ValueError, "markers are missing"):
+            self.review_publish.extract_marked_review("review", "a" * 32)
+
+    def test_extract_marked_review_rejects_empty_final_revision(self) -> None:
+        marker = "a" * 32
+        start = f"<!-- AI_REVIEW_START_{marker} -->"
+        end = f"<!-- AI_REVIEW_END_{marker} -->"
+
+        with self.assertRaisesRegex(ValueError, "final marked review is empty"):
+            self.review_publish.extract_marked_review(f"{start}\n{end}", marker)
+
     def test_inline_prompt_uses_parser_contract(self) -> None:
         marker = "a" * 32
         prompt = self.inline_review.inline_prompt_instructions(marker)
@@ -624,6 +647,58 @@ class InlineReviewTest(unittest.TestCase):
         remaining = self.inline_review._remove_finding_sections(review, {"Blocker1"})
 
         self.assertEqual(remaining, review)
+
+    def test_removed_finding_preserves_trailing_unmarked_summary(self) -> None:
+        review = (
+            "## Non-blocking notes\n"
+            "### Nit1\n"
+            "Finding published inline.\n\n"
+            "The rest of the change looks correct."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Nit1"})
+
+        self.assertEqual(remaining, review)
+
+    def test_tilde_fence_hides_finding_heading(self) -> None:
+        review = (
+            "## Non-blocking notes\n"
+            "### Nit1\n"
+            "~~~markdown\n"
+            "### Nit2\n"
+            "~~~\n"
+            "## Summary\n"
+            "Needs changes."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Nit1"})
+        _, unclosed_fence_start, hidden_finding_offsets = (
+            self.inline_review._parse_review_boundaries(review)
+        )
+
+        self.assertEqual(remaining, review)
+        self.assertIsNone(unclosed_fence_start)
+        self.assertEqual(len(hidden_finding_offsets), 1)
+
+    def test_shorter_fence_does_not_close_finding_example(self) -> None:
+        review = (
+            "## Non-blocking notes\n"
+            "### Nit1\n"
+            "````markdown\n"
+            "```\n"
+            "### Nit2\n"
+            "## Summary\n"
+            "Needs changes."
+        )
+
+        remaining = self.inline_review._remove_finding_sections(review, {"Nit1"})
+        _, unclosed_fence_start, hidden_finding_offsets = (
+            self.inline_review._parse_review_boundaries(review)
+        )
+
+        self.assertEqual(remaining, review)
+        self.assertIsNotNone(unclosed_fence_start)
+        self.assertEqual(len(hidden_finding_offsets), 1)
 
     def test_unclosed_fence_recovery_preserves_earlier_fence_parsing(self) -> None:
         review = (

@@ -284,7 +284,11 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
             continue
         if finding_id_counts[finding.group(1)] != 1:
             continue
-        end = headings[index + 1][0] if index + 1 < len(headings) else len(review)
+        if index + 1 >= len(headings):
+            # Without a later boundary, finding prose cannot be separated from
+            # an unmarked summary. Keep both in the collapsed review.
+            continue
+        end = headings[index + 1][0]
         if (
             unclosed_fence_start is not None
             and start < unclosed_fence_start < end
@@ -293,8 +297,8 @@ def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
             # deleting a genuine later finding or the summary.
             continue
         if any(start < offset < end for offset in hidden_finding_offsets):
-            # A malformed fence can hide a real finding heading. Preserve the
-            # whole range when its structure is ambiguous.
+            # A balanced fence can enclose a heading-like line that may instead
+            # be a malformed finding boundary. Preserve the ambiguous range.
             continue
         ranges.append((start, end))
 
