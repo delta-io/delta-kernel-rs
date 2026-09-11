@@ -5,11 +5,14 @@
 //! strings may carry their own offset or named timezone. This preserves the Arrow evaluator's
 //! partition-value compatibility; the embedded value takes precedence.
 
-use chrono::{FixedOffset, LocalResult, NaiveDateTime, Offset, TimeDelta, TimeZone, Utc};
+use chrono::{
+    Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeDelta, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 
 use crate::arrow::compute::kernels::cast_utils::string_to_datetime;
-use crate::expressions::MapToStructOptions;
+use crate::expressions::{MapToStructOptions, Scalar};
+use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, Error};
 
 /// A validated timezone used to interpret an offset-less `TIMESTAMP` value.
@@ -77,6 +80,68 @@ impl TimestampTimezone {
                 .map(|timestamp| timestamp.timestamp_micros()),
         }
     }
+}
+
+/// Parses a raw partition value using map-to-struct's empty-string and timestamp semantics.
+/// `timestamp_timezone` applies only to `TIMESTAMP` values without an embedded offset or named
+/// timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
+pub(crate) fn parse_partition_scalar(
+    primitive: &PrimitiveType,
+    raw: &str,
+    timestamp_timezone: TimestampTimezone,
+) -> DeltaResult<Option<Scalar>> {
+    if raw.is_empty() {
+        return Ok(primitive.empty_string_partition_cast());
+    }
+    let parsed = match primitive {
+        PrimitiveType::Date => parse_partition_date(raw).map(Scalar::Date),
+        PrimitiveType::Timestamp => timestamp_timezone
+            .parse_timestamp(raw)
+            .map(Scalar::Timestamp),
+        // Preserve the timestamp forms accepted by the Arrow evaluator without applying the
+        // reader timezone to a timezone-independent value.
+        PrimitiveType::TimestampNtz => TimestampTimezone::default()
+            .parse_timestamp(raw)
+            .map(Scalar::TimestampNtz),
+        _ => {
+            let scalar = primitive.parse_scalar(raw)?;
+            return Ok((!matches!(scalar, Scalar::Null(_))).then_some(scalar));
+        }
+    };
+    parsed
+        .map(Some)
+        .ok_or_else(|| Error::ParseError(raw.to_string(), DataType::Primitive(primitive.clone())))
+}
+
+/// Preserves the date forms accepted by Arrow's partition-value parser.
+fn parse_partition_date(raw: &str) -> Option<i32> {
+    if raw.starts_with(['+', '-']) {
+        let rest = raw.get(1..)?;
+        let year_end = rest.find('-')?;
+        if year_end < 4 {
+            return None;
+        }
+        let year: i32 = raw.get(..=year_end)?.parse().ok()?;
+        let (month, day) = raw.get(year_end + 2..)?.split_once('-')?;
+        let month = month.parse().ok()?;
+        let day = day.parse().ok()?;
+
+        // The Gregorian calendar repeats every 400 years, which lets Date32 represent years
+        // outside chrono's range while still validating the month and day.
+        let era = i64::from(year).div_euclid(400);
+        let year_in_era = year.rem_euclid(400);
+        let date = NaiveDate::from_ymd_opt(year_in_era, month, day)?;
+        let days = era * 146_097 + i64::from(date.num_days_from_ce() - 719_163);
+        return i32::try_from(days).ok();
+    }
+    if raw.len() > 10 {
+        let micros = TimestampTimezone::default().parse_timestamp(raw)?;
+        return i32::try_from(micros.div_euclid(86_400_000_000)).ok();
+    }
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .or_else(|_| NaiveDate::parse_from_str(raw, "%Y%m%d"))
+        .ok()
+        .map(|date| date.num_days_from_ce() - 719_163)
 }
 
 /// Parses a normalized fixed offset within the conventional `-18:00` through `+18:00` range.
@@ -213,5 +278,31 @@ mod tests {
     #[case::time_only("12:30:45")]
     fn rejects_unsupported_partition_timestamps(#[case] raw: &str) {
         assert_eq!(TimestampTimezone::default().parse_timestamp(raw), None);
+    }
+
+    #[rstest]
+    #[case::compact_date(PrimitiveType::Date, "20240115", Scalar::Date(19_737))]
+    #[case::extended_date(PrimitiveType::Date, "+2739877-01-03", Scalar::Date(1_000_000_000))]
+    #[case::timestamp_date(PrimitiveType::Date, "2024-01-15T23:30:00-02:00", Scalar::Date(19_738))]
+    #[case::ntz_t_separator(
+        PrimitiveType::TimestampNtz,
+        "2024-01-15T12:30:45",
+        Scalar::TimestampNtz(1_705_321_845_000_000)
+    )]
+    #[case::ntz_explicit_offset(
+        PrimitiveType::TimestampNtz,
+        "2024-01-15T12:30:45+02:00",
+        Scalar::TimestampNtz(1_705_314_645_000_000)
+    )]
+    fn preserves_compatible_date_and_timestamp_ntz_partition_values(
+        #[case] primitive: PrimitiveType,
+        #[case] raw: &str,
+        #[case] expected: Scalar,
+    ) {
+        let reader_timezone = TimestampTimezone::parse("America/Los_Angeles").unwrap();
+        assert_eq!(
+            parse_partition_scalar(&primitive, raw, reader_timezone).unwrap(),
+            Some(expected)
+        );
     }
 }

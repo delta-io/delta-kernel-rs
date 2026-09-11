@@ -114,7 +114,6 @@ pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
-#[cfg(feature = "arrow-expression")]
 pub(crate) mod timestamp_timezone;
 pub mod transaction;
 pub mod transforms;

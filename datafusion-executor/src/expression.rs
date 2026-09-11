@@ -473,6 +473,7 @@ fn map_to_struct_primitive(field: &StructField) -> DeltaResult<&PrimitiveType> {
 #[derive(Debug, PartialEq, Eq)]
 struct KernelMapToStructUdf {
     output_schema: KernelSchemaRef,
+    output_type: KernelDataType,
     options: MapToStructOptions,
     return_type: ArrowDataType,
     signature: Signature,
@@ -491,9 +492,11 @@ impl KernelMapToStructUdf {
             .as_ref()
             .try_into_arrow()
             .map_err(Error::generic_err)?;
+        let output_type = KernelDataType::from(output_schema.as_ref().clone());
         Ok(Self {
             return_type: ArrowDataType::Struct(arrow_schema.fields().clone()),
             output_schema,
+            output_type,
             options,
             signature: Signature::any(1, Volatility::Immutable),
         })
@@ -521,9 +524,8 @@ impl ScalarUDFImpl for KernelMapToStructUdf {
             KernelExpression::column(["map"]),
             self.options.clone(),
         );
-        let output_type = KernelDataType::from(self.output_schema.as_ref().clone());
         let result =
-            kernel_expression::evaluate_expression(&expression, &batch, Some(&output_type))
+            kernel_expression::evaluate_expression(&expression, &batch, Some(&self.output_type))
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(ColumnarValue::Array(result))
     }

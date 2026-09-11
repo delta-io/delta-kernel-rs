@@ -3,7 +3,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
@@ -14,7 +13,6 @@ use crate::arrow::array::{
     RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -43,7 +41,7 @@ use crate::expressions::{
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-use crate::timestamp_timezone::TimestampTimezone;
+use crate::timestamp_timezone::{parse_partition_scalar, TimestampTimezone};
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -940,44 +938,6 @@ pub fn coalesce_arrays(
     }
 
     Ok(make_array(mutable.freeze()))
-}
-
-/// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
-///
-/// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` applies only to `TIMESTAMP` values without an embedded offset or named
-/// timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
-fn parse_partition_scalar(
-    prim: &PrimitiveType,
-    raw: &str,
-    timestamp_timezone: TimestampTimezone,
-) -> DeltaResult<Option<Scalar>> {
-    if raw.is_empty() {
-        return Ok(prim.empty_string_partition_cast());
-    }
-    match prim {
-        PrimitiveType::Date => {
-            let days = Date32Type::parse(raw).ok_or_else(|| {
-                Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
-            })?;
-            return Ok(Some(Scalar::Date(days)));
-        }
-        PrimitiveType::Timestamp => {
-            let micros = timestamp_timezone.parse_timestamp(raw).ok_or_else(|| {
-                Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
-            })?;
-            return Ok(Some(Scalar::Timestamp(micros)));
-        }
-        PrimitiveType::TimestampNtz => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
-            return Ok(Some(Scalar::TimestampNtz(micros)));
-        }
-        _ => {}
-    }
-    let scalar = prim.parse_scalar(raw)?;
-    Ok((!matches!(scalar, Scalar::Null(_))).then_some(scalar))
 }
 
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
