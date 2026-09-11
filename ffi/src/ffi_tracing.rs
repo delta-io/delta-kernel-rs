@@ -1,22 +1,25 @@
 //! FFI functions to allow engines to receive log, tracing, and metrics events from kernel.
 //!
 //! We use a single global tracing subscriber, registered the first time any of
-//! [`enable_event_tracing`], [`enable_log_line_tracing`], [`enable_formatted_log_line_tracing`], or
-//! [`enable_metrics_reporting`] is called. The subscriber has two layers, one for log events, and
-//! one for metric report events:
+//! [`enable_event_tracing`], [`enable_log_line_tracing`], [`enable_formatted_log_line_tracing`],
+//! [`enable_metrics_reporting`], or [`enable_frame_reporting`] is called. The subscriber has
+//! independent layers for log events, metric reports, and frame lifecycle events:
 //!
 //! - The logging layer is a type-erased [`Layer`] that an `enable_*_tracing` call swaps in (either
 //!   event-based or formatted log-line)
 //! - The metrics slot is a [`ReportGeneratorLayer`] that is `OFF` (zero overhead) until
 //!   [`enable_metrics_reporting`] turns it on.
+//! - The frame slot is a [`FrameReporterLayer`] that is `OFF` until [`enable_frame_reporting`]
+//!   turns it on. Only spans declaring an `enable_call_frame` field are reported.
 //!
-//! Both are reloadable so they can be swapped.
+//! Each layer can be enabled independently. Logging and metrics callbacks can also be replaced.
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::{fmt, io};
 
 use delta_kernel::metrics::{
-    MetricEvent as KernelMetricEvent, MetricsReporter, ReportGeneratorLayer,
+    FrameReporter, FrameReporterLayer, MetricEvent as KernelMetricEvent, MetricsReporter,
+    ReportGeneratorLayer,
 };
 use delta_kernel::{DeltaResult, Error};
 use tracing::field::{Field as TracingField, Visit};
@@ -383,6 +386,48 @@ impl MetricsReporter for FfiMetricsReporter {
     }
 }
 
+/// The lifecycle transition reported for a call-frame-enabled tracing span.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameEventType {
+    /// The current thread entered the span.
+    OPEN = 0,
+    /// The current thread exited the span.
+    CLOSE = 1,
+}
+
+/// Callback registered through [`enable_frame_reporting`] to receive frame lifecycle events.
+///
+/// Calls run synchronously and may overlap across threads, so callback state must be thread-safe.
+/// Profile consumers should capture time and maintain a separate event stack for each callback
+/// thread. `name` is valid only until the callback returns. [`FrameEventType::OPEN`] passes the
+/// span name, while [`FrameEventType::CLOSE`] passes an empty string.
+pub type FrameEventFn =
+    extern "C" fn(event_type: FrameEventType, span_id: u64, name: KernelStringSlice);
+
+/// Forwards frame lifecycle notifications to the registered FFI callback.
+#[derive(Debug)]
+struct FfiFrameReporter {
+    callback: Arc<OnceLock<FrameEventFn>>,
+}
+
+impl FrameReporter for FfiFrameReporter {
+    fn enter(&self, span_id: u64, name: &'static str) {
+        if let Some(callback) = self.callback.get() {
+            callback(FrameEventType::OPEN, span_id, kernel_string_slice!(name));
+        }
+    }
+
+    fn exit(&self, span_id: u64) {
+        if let Some(callback) = self.callback.get() {
+            let name = "";
+            callback(FrameEventType::CLOSE, span_id, kernel_string_slice!(name));
+        }
+    }
+}
+
 fn build_event_layer(callback: TracingEventFn) -> BoxedLayer {
     Box::new(EventLayer { callback })
 }
@@ -442,6 +487,10 @@ struct GlobalTracingState {
     metrics_filter: Option<FilterHandle>,
     /// Shared callback the metrics layer's reporter forwards events to.
     metrics_callback: Arc<Mutex<Option<MetricsEventFn>>>,
+    /// Toggles and filters frame lifecycle reporting.
+    frame_filter: Option<FilterHandle>,
+    /// One-shot callback the frame layer's reporter forwards events to.
+    frame_callback: Arc<OnceLock<FrameEventFn>>,
 }
 
 impl GlobalTracingState {
@@ -452,11 +501,13 @@ impl GlobalTracingState {
             logging_filter: None,
             metrics_filter: None,
             metrics_callback: Arc::new(Mutex::new(None)),
+            frame_filter: None,
+            frame_callback: Arc::new(OnceLock::new()),
         }
     }
 
     /// If the global subscriber hasn't been installed yet, this installs it and sets up all the
-    /// logging layers. When called again, this is a no-op.
+    /// tracing layers. When called again, this is a no-op.
     fn ensure_installed(&mut self) -> DeltaResult<()> {
         if self.installed {
             return Ok(());
@@ -474,12 +525,20 @@ impl GlobalTracingState {
         let metrics: BoxedLayer =
             Box::new(ReportGeneratorLayer::new(reporter).with_filter(metrics_filter_layer));
 
-        let subscriber = Registry::default().with(vec![logging, metrics]);
+        let (frame_filter_layer, frame_filter) = reload::Layer::new(LevelFilter::OFF);
+        let reporter = Arc::new(FfiFrameReporter {
+            callback: self.frame_callback.clone(),
+        });
+        let frames: BoxedLayer =
+            Box::new(FrameReporterLayer::new(reporter).with_filter(frame_filter_layer));
+
+        let subscriber = Registry::default().with(vec![logging, metrics, frames]);
         set_global_default(Dispatch::new(subscriber))?;
 
         self.logging_layer = Some(logging_layer);
         self.logging_filter = Some(logging_filter);
         self.metrics_filter = Some(metrics_filter);
+        self.frame_filter = Some(frame_filter);
         self.installed = true;
         Ok(())
     }
@@ -546,6 +605,19 @@ impl GlobalTracingState {
             .reload(LevelFilter::INFO)
             .map_err(|e| Error::generic(format!("Unable to reload metrics subscriber: {e}")))
     }
+
+    /// Registers the frame callback and enables spans containing the `enable_call_frame` field.
+    fn register_frame_callback(&mut self, callback: FrameEventFn) -> DeltaResult<()> {
+        self.ensure_installed()?;
+        self.frame_callback
+            .set(callback)
+            .map_err(|_| Error::generic("frame callback already registered"))?;
+        self.frame_filter
+            .as_ref()
+            .ok_or_else(|| Error::generic("frame filter not installed"))?
+            .reload(LevelFilter::TRACE)
+            .map_err(|e| Error::generic(format!("Unable to reload frame subscriber: {e}")))
+    }
 }
 
 static TRACING_STATE: LazyLock<Mutex<GlobalTracingState>> =
@@ -602,10 +674,37 @@ fn setup_metrics_reporter(callback: MetricsEventFn) -> DeltaResult<()> {
     state.register_metrics_callback(callback)
 }
 
+/// Enables synchronous callbacks when opted-in kernel tracing spans are entered and exited.
+///
+/// A span opts in by declaring an `enable_call_frame` field. `callback` receives a
+/// [`FrameEventType::OPEN`] event immediately after the current thread enters the span and a
+/// matching [`FrameEventType::CLOSE`] event immediately before the exit completes. Re-entering a
+/// span produces another OPEN/CLOSE pair with the same span ID.
+///
+/// This function may be called only once so a callback cannot be replaced between a span's OPEN
+/// and CLOSE events. This guarantees that both events are delivered to the same callback. If a
+/// frame callback is already registered, this function returns `false` and leaves it active.
+///
+/// Returns `true` if reporting was enabled successfully, or `false` on failure.
+///
+/// # Safety
+///
+/// The caller must pass a valid function pointer. The callback must not unwind across the FFI
+/// boundary and must copy the OPEN event's name before returning if it needs to retain it.
+#[no_mangle]
+pub unsafe extern "C" fn enable_frame_reporting(callback: FrameEventFn) -> bool {
+    TRACING_STATE
+        .lock()
+        .map_err(|_e| Error::generic("Poisoned mutex while setting up frame reporter"))
+        .and_then(|mut state| state.register_frame_callback(callback))
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
 
+    use tracing::field::Empty;
     use tracing::{debug, info, trace};
     use tracing_subscriber::fmt::time::FormatTime;
 
@@ -645,6 +744,14 @@ mod tests {
             callback: Arc::new(Mutex::new(Some(callback))),
         });
         let layer = ReportGeneratorLayer::new(reporter).with_filter(LevelFilter::TRACE);
+        Dispatch::new(Registry::default().with(layer))
+    }
+
+    fn create_frame_dispatch(callback: FrameEventFn) -> Dispatch {
+        let reporter = Arc::new(FfiFrameReporter {
+            callback: Arc::new(OnceLock::from(callback)),
+        });
+        let layer = FrameReporterLayer::new(reporter).with_filter(LevelFilter::TRACE);
         Dispatch::new(Registry::default().with(layer))
     }
 
@@ -1010,5 +1117,119 @@ mod tests {
             lock.as_deref(),
             Some(["json:3:100".to_string(), "parquet:2:50".to_string()].as_slice())
         );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CapturedFrameEvent {
+        event_type: FrameEventType,
+        span_id: u64,
+        name: Option<String>,
+    }
+
+    static FRAME_EVENTS: Mutex<Vec<CapturedFrameEvent>> = Mutex::new(vec![]);
+
+    extern "C" fn capture_frame_event(
+        event_type: FrameEventType,
+        span_id: u64,
+        name: KernelStringSlice,
+    ) {
+        let name: &str = unsafe { TryFromStringSlice::try_from_slice(&name).unwrap() };
+        let name = if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        };
+        FRAME_EVENTS.lock().unwrap().push(CapturedFrameEvent {
+            event_type,
+            span_id,
+            name,
+        });
+    }
+
+    fn emit_reloadable_frame_span() {
+        let span = tracing::trace_span!("reloadable", enable_call_frame = Empty);
+        let _guard = span.enter();
+    }
+
+    #[test]
+    fn frame_reporting_delivers_nested_lifecycle_events_synchronously() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        FRAME_EVENTS.lock().unwrap().clear();
+        let dispatch = create_frame_dispatch(capture_frame_event);
+
+        tracing_core::dispatcher::with_default(&dispatch, || {
+            let ignored = tracing::info_span!("ignored");
+            let _ignored_guard = ignored.enter();
+
+            let outer = tracing::info_span!("outer", enable_call_frame = Empty);
+            let outer_guard = outer.enter();
+            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 1);
+
+            let inner = tracing::info_span!("inner", enable_call_frame = Empty);
+            let inner_guard = inner.enter();
+            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 2);
+            drop(inner_guard);
+            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 3);
+            drop(outer_guard);
+            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 4);
+        });
+
+        let events = FRAME_EVENTS.lock().unwrap();
+        assert_eq!(events[0].event_type, FrameEventType::OPEN);
+        assert_eq!(events[0].name.as_deref(), Some("outer"));
+        assert_eq!(events[1].event_type, FrameEventType::OPEN);
+        assert_eq!(events[1].name.as_deref(), Some("inner"));
+        assert_eq!(events[2].event_type, FrameEventType::CLOSE);
+        assert_eq!(events[2].span_id, events[1].span_id);
+        assert_eq!(events[2].name, None);
+        assert_eq!(events[3].event_type, FrameEventType::CLOSE);
+        assert_eq!(events[3].span_id, events[0].span_id);
+        assert_eq!(events[3].name, None);
+    }
+
+    #[test]
+    fn frame_reporter_callback_can_only_be_registered_once() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        FRAME_EVENTS.lock().unwrap().clear();
+        assert!(unsafe { enable_frame_reporting(capture_frame_event) });
+        assert!(!unsafe { enable_frame_reporting(capture_frame_event) });
+
+        let captured = tracing::info_span!("captured", enable_call_frame = Empty);
+        let captured_guard = captured.enter();
+        drop(captured_guard);
+
+        let events = FRAME_EVENTS.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, FrameEventType::OPEN);
+        assert_eq!(events[0].name.as_deref(), Some("captured"));
+        assert_eq!(events[1].event_type, FrameEventType::CLOSE);
+        assert_eq!(events[1].span_id, events[0].span_id);
+    }
+
+    #[test]
+    fn frame_filter_enables_existing_trace_callsites_when_reloaded() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        FRAME_EVENTS.lock().unwrap().clear();
+        let reporter = Arc::new(FfiFrameReporter {
+            callback: Arc::new(OnceLock::from(capture_frame_event as FrameEventFn)),
+        });
+        let (filter_layer, filter_handle) = reload::Layer::new(LevelFilter::OFF);
+        let layer = FrameReporterLayer::new(reporter).with_filter(filter_layer);
+        let dispatch = Dispatch::new(Registry::default().with(layer));
+
+        tracing_core::dispatcher::with_default(&dispatch, || {
+            emit_reloadable_frame_span();
+            assert!(FRAME_EVENTS.lock().unwrap().is_empty());
+
+            filter_handle.reload(LevelFilter::TRACE).unwrap();
+            emit_reloadable_frame_span();
+        });
+
+        let events = FRAME_EVENTS.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, FrameEventType::OPEN);
+        assert_eq!(events[0].name.as_deref(), Some("reloadable"));
+        assert_eq!(events[1].event_type, FrameEventType::CLOSE);
+        assert_eq!(events[1].span_id, events[0].span_id);
     }
 }

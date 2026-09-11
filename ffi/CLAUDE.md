@@ -43,7 +43,8 @@ the caller's memory space.
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
-- `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
+- `src/ffi_tracing.rs` -- log, metrics, and frame callback registration
+  (`#[cfg(feature = "tracing")]`)
 - `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)
 - `src/alloc_stats.rs` -- `peak_alloc` global allocator and native-heap FFI getters
   (`alloc-tracking`)
@@ -185,11 +186,12 @@ updates require both the `deletionVectors` reader/writer feature and
 
 ## Tracing & Metrics
 
-Gated behind the `tracing` feature. A single global `tracing` subscriber backs both logging and
-metrics; it is installed lazily the first time any `enable_*` function below is called. The
-subscriber has two reloadable slots: a logging layer (swapped wholesale between event-based and
-log-line formats) and a metrics layer (a fixed `ReportGeneratorLayer` toggled on/off via a
-reloadable level filter).
+Gated behind the `tracing` feature. A single global `tracing` subscriber backs logging, metrics,
+and frame lifecycle reporting; it is installed lazily the first time any `enable_*` function below
+is called. The subscriber has three reloadable slots: a logging layer (swapped wholesale between
+event-based and log-line formats), a metrics layer (a fixed `ReportGeneratorLayer` toggled on/off
+via a reloadable level filter), and a frame layer (a fixed `FrameReporterLayer` toggled on/off via
+a reloadable level filter).
 
 Logging registration (each re-callable to replace the active callback, format, and level):
 - `enable_event_tracing(callback, max_level)` -- structured `Event`s; the engine formats them
@@ -200,6 +202,15 @@ Logging registration (each re-callable to replace the active callback, format, a
 Metrics registration:
 - `enable_metrics_reporting(callback)` -- forwards each kernel `MetricEvent` to the callback as a
   `repr(C)` `MetricEvent` (see `src/ffi_metrics.rs`). Re-calling replaces the callback.
+
+Frame lifecycle registration:
+- `enable_frame_reporting(callback)` -- forwards OPEN/CLOSE for each dynamic activation of a span
+  declaring the static `enable_call_frame` field. The callback runs synchronously on the entering
+  or exiting thread. OPEN includes the span id and a borrowed UTF-8 name; CLOSE includes the same
+  id with an empty name. Calls may overlap across threads; callback state must be thread-safe, and
+  profile consumers must maintain a separate event stack for each callback thread. Registration is
+  one-shot so a callback cannot be replaced between a span's OPEN and CLOSE events; another call
+  fails and leaves the existing callback active.
 
 The `MetricEvent` and any `KernelStringSlice` it carries are only valid for the duration of the
 callback. Durations are `u64`, suffixed `_ns` (nanoseconds) or `_ms` (milliseconds). Operation ids
