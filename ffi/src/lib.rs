@@ -1297,12 +1297,19 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
     } = builder;
     let engine = engine.engine();
 
-    fn configure<Mode>(
+    fn build<Mode>(
         mut builder: delta_kernel::snapshot::SnapshotBuilder<Mode>,
+        engine: &dyn Engine,
         version: Option<Version>,
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
-    ) -> delta_kernel::snapshot::SnapshotBuilder<Mode> {
+        snapshot_hint: Option<Box<SnapshotHint>>,
+        apply_snapshot_hint: impl FnOnce(
+            delta_kernel::snapshot::SnapshotBuilder<Mode>,
+            SnapshotHint,
+        )
+            -> DeltaResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
+    ) -> DeltaResult<SnapshotRef> {
         if let Some(version) = version {
             builder = builder.at_version(version);
         }
@@ -1312,38 +1319,37 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         if let Some(max_catalog_version) = max_catalog_version {
             builder = builder.with_max_catalog_version(max_catalog_version);
         }
-        builder
+        if let Some(snapshot_hint) = snapshot_hint {
+            builder = apply_snapshot_hint(builder, *snapshot_hint)?;
+        }
+        builder.build(engine)
     }
 
     let snapshot = match source {
-        FfiSnapshotBuilderSource::TableRoot(url) => {
-            let builder = configure(
-                Snapshot::builder_for(url),
-                version,
-                log_tail,
-                max_catalog_version,
-            );
-            if let Some(hint) = snapshot_hint {
-                builder.with_snapshot_hint(*hint).build(engine.as_ref())
-            } else {
-                builder.build(engine.as_ref())
-            }
-        }
-        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => {
-            let builder = configure(
-                Snapshot::builder_from(snapshot),
-                version,
-                log_tail,
-                max_catalog_version,
-            );
-            if snapshot_hint.is_some() {
-                Err(snapshot_hint::invalid(
+        FfiSnapshotBuilderSource::TableRoot(url) => build(
+            Snapshot::builder_for(url),
+            engine.as_ref(),
+            version,
+            log_tail,
+            max_catalog_version,
+            snapshot_hint,
+            |builder, hint| Ok(builder.with_snapshot_hint(hint)),
+        ),
+        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => build(
+            Snapshot::builder_from(snapshot),
+            engine.as_ref(),
+            version,
+            log_tail,
+            max_catalog_version,
+            snapshot_hint,
+            |_, _| {
+                // The public setter rejects this combination; retain the invariant here for
+                // internal construction paths.
+                Err(delta_types::invalid(
                     "A snapshot hint cannot be used with Snapshot::builder_from",
                 ))
-            } else {
-                builder.build(engine.as_ref())
-            }
-        }
+            },
+        ),
     }?;
     Ok(snapshot.into())
 }

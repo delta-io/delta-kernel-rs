@@ -1,16 +1,17 @@
 //! Typed FFI construction of connector-provided snapshot hints.
 
 use delta_kernel::actions::{Metadata, Protocol};
-use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
+use delta_kernel::crc::Crc;
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
 use delta_kernel::{DeltaResult, Error, Version};
 
 use crate::delta_types::{
-    checkpoint_metadata, domain_metadata, file_stats, metadata, optional_i64, optional_value,
-    protocol, raw_slice, set_transaction, sidecar, string, string_map, FfiCheckpointMetadata,
-    FfiDomainMetadata, FfiDomainMetadataArray, FfiFileSizeHistogram, FfiMetadata, FfiProtocol,
-    FfiSetTransaction, FfiSetTransactionArray, FfiSidecar, FfiSidecarArray, FfiStringMap,
+    checkpoint_metadata, domain_metadata, file_stats, invalid, metadata, optional_i64,
+    optional_value, protocol, raw_slice, set_transaction, sidecar, string, string_map,
+    FfiCheckpointMetadata, FfiDomainMetadata, FfiDomainMetadataArray, FfiFileSizeHistogram,
+    FfiMetadata, FfiProtocol, FfiSetTransaction, FfiSetTransactionArray, FfiSidecar,
+    FfiSidecarArray, FfiStringMap,
 };
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
@@ -79,7 +80,7 @@ pub struct FfiSnapshotHintV2ActionArray {
 
 /// Typed V2 checkpoint fields.
 #[repr(C)]
-pub struct FfiSnapshotHintV2Checkpoint {
+pub struct FfiSnapshotHintLastCheckpointV2 {
     /// Checkpoint file name.
     pub path: KernelStringSlice,
     /// Optional checkpoint file size.
@@ -88,7 +89,8 @@ pub struct FfiSnapshotHintV2Checkpoint {
     pub modification_time: OptionalValue<i64>,
     /// Optional sidecar information. `Some` may contain an empty array.
     pub sidecar_files: OptionalValue<FfiSidecarArray>,
-    /// Optional non-file actions. `Some` may contain an empty array.
+    /// Optional non-file actions. `Some` may contain an empty array. Embedded protocol and
+    /// metadata actions must match the hint's top-level protocol and metadata.
     pub non_file_actions: OptionalValue<FfiSnapshotHintV2ActionArray>,
 }
 
@@ -99,7 +101,8 @@ pub struct FfiSnapshotHintLastCheckpoint {
     pub version: Version,
     /// Number of actions in the checkpoint.
     pub size: i64,
-    /// Optional number of checkpoint parts.
+    /// Optional number of checkpoint parts. Present values must fit in `u32` so the accepted range
+    /// is consistent across targets.
     pub parts: OptionalValue<u64>,
     /// Optional total checkpoint size in bytes.
     pub size_in_bytes: OptionalValue<i64>,
@@ -112,7 +115,7 @@ pub struct FfiSnapshotHintLastCheckpoint {
     /// Optional checkpoint tags.
     pub tags: OptionalValue<FfiStringMap>,
     /// Optional typed V2 checkpoint information.
-    pub v2_checkpoint: *const FfiSnapshotHintV2Checkpoint,
+    pub v2_checkpoint: *const FfiSnapshotHintLastCheckpointV2,
 }
 
 /// Typed CRC fields for a snapshot hint.
@@ -122,11 +125,11 @@ pub struct FfiSnapshotHintCrc {
     pub table_size_bytes: i64,
     /// Number of active files.
     pub num_files: i64,
-    /// In-commit timestamp, required when the supplied table state enables in-commit timestamps.
+    /// Optional in-commit timestamp.
     pub in_commit_timestamp: OptionalValue<i64>,
-    /// Optional file-size histogram. Its arrays must have equal nonzero lengths; bin
+    /// Optional file-size histogram. Its arrays must have equal lengths of at least two; bin
     /// boundaries must start at zero and increase strictly; counts and byte totals must be
-    /// non-negative and sum to `num_files` and `table_size_bytes`, respectively.
+    /// non-negative.
     pub file_size_histogram: *const FfiFileSizeHistogram,
     /// Optional complete transaction list. `None` means the list is not known to be complete.
     pub set_transactions: OptionalValue<FfiSetTransactionArray>,
@@ -156,14 +159,6 @@ pub struct FfiSnapshotHint {
     pub crc: *const FfiSnapshotHintCrc,
 }
 
-pub(super) fn invalid(message: impl Into<String>) -> Error {
-    SnapshotHintError::Connector {
-        message: message.into(),
-        source: None,
-    }
-    .into()
-}
-
 fn invalid_with_source(message: impl Into<String>, source: Error) -> Error {
     SnapshotHintError::Connector {
         message: message.into(),
@@ -186,8 +181,9 @@ fn parse_freshness(value: FfiSnapshotHintFreshness) -> DeltaResult<SnapshotHintF
 
 fn optional_usize(value: &OptionalValue<u64>) -> DeltaResult<Option<usize>> {
     optional_value(value, |value| {
-        usize::try_from(*value)
-            .map_err(|_| invalid(format!("checkpoint part count overflows usize: {value}")))
+        let value = u32::try_from(*value)
+            .map_err(|_| invalid(format!("checkpoint part count exceeds u32: {value}")))?;
+        Ok(value as usize)
     })
 }
 
@@ -213,12 +209,12 @@ unsafe fn v2_action(value: &FfiSnapshotHintV2Action) -> DeltaResult<HintAction> 
     Ok(match value.kind {
         SNAPSHOT_HINT_V2_ACTION_METADATA => HintAction::Metadata(unsafe {
             required_payload(value.value.metadata, "metadata action", |value| {
-                metadata(value, invalid)
+                metadata(value)
             })?
         }),
         SNAPSHOT_HINT_V2_ACTION_PROTOCOL => HintAction::Protocol(unsafe {
             required_payload(value.value.protocol, "protocol action", |value| {
-                protocol(value, invalid)
+                protocol(value)
             })?
         }),
         SNAPSHOT_HINT_V2_ACTION_TRANSACTION => HintAction::Txn(unsafe {
@@ -237,7 +233,7 @@ unsafe fn v2_action(value: &FfiSnapshotHintV2Action) -> DeltaResult<HintAction> 
             required_payload(
                 value.value.checkpoint_metadata,
                 "checkpoint-metadata action",
-                |value| checkpoint_metadata(value, invalid),
+                |value| checkpoint_metadata(value),
             )?
         }),
         kind => {
@@ -248,17 +244,17 @@ unsafe fn v2_action(value: &FfiSnapshotHintV2Action) -> DeltaResult<HintAction> 
     })
 }
 
-unsafe fn v2_checkpoint(value: &FfiSnapshotHintV2Checkpoint) -> DeltaResult<LastCheckpointV2> {
-    let parse_sidecar = |value: &FfiSidecar| unsafe { sidecar(value, invalid) };
+unsafe fn v2_checkpoint(value: &FfiSnapshotHintLastCheckpointV2) -> DeltaResult<LastCheckpointV2> {
+    let parse_sidecar = |value: &FfiSidecar| unsafe { sidecar(value) };
     let sidecar_files = optional_value(&value.sidecar_files, |array| {
-        unsafe { raw_slice(array.ptr, array.len, "sidecar array", invalid) }?
+        unsafe { raw_slice(array.ptr, array.len, "sidecar array") }?
             .iter()
             .map(parse_sidecar)
             .collect::<DeltaResult<Vec<_>>>()
     })?;
     let parse_action = |value: &FfiSnapshotHintV2Action| unsafe { v2_action(value) };
     let non_file_actions = optional_value(&value.non_file_actions, |array| {
-        unsafe { raw_slice(array.ptr, array.len, "non-file action array", invalid) }?
+        unsafe { raw_slice(array.ptr, array.len, "non-file action array") }?
             .iter()
             .map(parse_action)
             .collect::<DeltaResult<Vec<_>>>()
@@ -288,7 +284,7 @@ unsafe fn last_checkpoint(
         optional_i64(&value.num_of_add_files),
         checkpoint_schema,
         optional_value(&value.checksum, |value| unsafe { string(value) })?,
-        optional_value(&value.tags, |value| unsafe { string_map(value, invalid) })?,
+        optional_value(&value.tags, |value| unsafe { string_map(value) })?,
         v2_checkpoint,
     )
 }
@@ -301,19 +297,19 @@ unsafe fn crc(
 ) -> DeltaResult<Crc> {
     let parse_set_transaction = |value: &FfiSetTransaction| unsafe { set_transaction(value) };
     let set_transactions = optional_value(&value.set_transactions, |array| {
-        unsafe { raw_slice(array.ptr, array.len, "set-transaction array", invalid) }?
+        unsafe { raw_slice(array.ptr, array.len, "set-transaction array") }?
             .iter()
             .map(parse_set_transaction)
             .collect::<DeltaResult<Vec<_>>>()
     })?;
     let parse_domain_metadata = |value: &FfiDomainMetadata| unsafe { domain_metadata(value) };
     let domain_metadata = optional_value(&value.domain_metadata, |array| {
-        unsafe { raw_slice(array.ptr, array.len, "domain-metadata array", invalid) }?
+        unsafe { raw_slice(array.ptr, array.len, "domain-metadata array") }?
             .iter()
             .map(parse_domain_metadata)
             .collect::<DeltaResult<Vec<_>>>()
     })?;
-    Ok(Crc::new_complete(
+    Ok(Crc::new_with_complete_file_stats(
         version,
         metadata,
         protocol,
@@ -322,18 +318,11 @@ unsafe fn crc(
                 value.num_files,
                 value.table_size_bytes,
                 value.file_size_histogram,
-                invalid,
             )
         }?,
         optional_i64(&value.in_commit_timestamp),
-        set_transactions
-            .map(SetTransactionState::try_complete)
-            .transpose()?
-            .unwrap_or_default(),
-        domain_metadata
-            .map(DomainMetadataState::try_complete)
-            .transpose()?
-            .unwrap_or_default(),
+        set_transactions,
+        domain_metadata,
     ))
 }
 
@@ -356,8 +345,8 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
     let freshness = parse_freshness(value.freshness)?;
     let log_paths = unsafe { value.log_paths.log_paths() }
         .map_err(|source| invalid_with_source("supplied log paths are invalid", source))?;
-    let protocol = unsafe { protocol(&value.protocol, invalid) }?;
-    let metadata = unsafe { metadata(&value.metadata, invalid) }?;
+    let protocol = unsafe { protocol(&value.protocol) }?;
+    let metadata = unsafe { metadata(&value.metadata) }?;
     let last_checkpoint_hint = unsafe { value.last_checkpoint.as_ref() }
         .map(|checkpoint| unsafe { last_checkpoint(checkpoint) })
         .transpose()?;

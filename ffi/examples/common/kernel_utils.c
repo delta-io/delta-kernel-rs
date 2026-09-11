@@ -169,7 +169,7 @@ void compile_snapshot_hint_abi(void)
     .tag = SomeFfiSnapshotHintV2ActionArray,
     .some = action_array,
   };
-  FfiSnapshotHintV2Checkpoint v2_checkpoint = {
+  FfiSnapshotHintLastCheckpointV2 v2_checkpoint = {
     .path = string,
     .size_in_bytes = optional_i64,
     .modification_time = optional_i64,

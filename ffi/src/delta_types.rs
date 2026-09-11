@@ -6,12 +6,10 @@ use delta_kernel::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
 use delta_kernel::crc::{FileSizeHistogram, FileStats};
+use delta_kernel::snapshot::SnapshotHintError;
 use delta_kernel::{DeltaResult, Error};
 
 use crate::{KernelI64Slice, KernelStringSlice, OptionalValue, TryFromStringSlice};
-
-/// Maps invalid pointer or array layouts to an error appropriate for the calling FFI API.
-pub(crate) type InvalidInput = fn(String) -> Error;
 
 /// Borrowed array of UTF-8 strings.
 #[repr(C)]
@@ -168,6 +166,14 @@ pub(crate) fn optional_value<T, U>(
     }
 }
 
+pub(crate) fn invalid(message: impl Into<String>) -> Error {
+    SnapshotHintError::Connector {
+        message: message.into(),
+        source: None,
+    }
+    .into()
+}
+
 /// Borrows a native array after validating its nullable layout.
 ///
 /// # Safety
@@ -178,15 +184,12 @@ pub(crate) unsafe fn raw_slice<'a, T>(
     ptr: *const T,
     len: usize,
     name: &str,
-    invalid_input: InvalidInput,
 ) -> DeltaResult<&'a [T]> {
     if len == 0 {
         return Ok(&[]);
     }
     if ptr.is_null() {
-        return Err(invalid_input(format!(
-            "{name} pointer is null with length {len}"
-        )));
+        return Err(invalid(format!("{name} pointer is null with length {len}")));
     }
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
@@ -196,7 +199,7 @@ pub(crate) unsafe fn string(value: &KernelStringSlice) -> DeltaResult<String> {
         return Ok(String::new());
     }
     if value.ptr.is_null() {
-        return Err(Error::generic(format!(
+        return Err(invalid(format!(
             "string pointer is null with length {}",
             value.len
         )));
@@ -212,62 +215,46 @@ pub(crate) fn optional_i64(value: &OptionalValue<i64>) -> Option<i64> {
     }
 }
 
-pub(crate) unsafe fn strings(
-    value: &FfiStringArray,
-    invalid_input: InvalidInput,
-) -> DeltaResult<Vec<String>> {
-    unsafe { raw_slice(value.ptr, value.len, "string array", invalid_input) }?
+pub(crate) unsafe fn strings(value: &FfiStringArray) -> DeltaResult<Vec<String>> {
+    unsafe { raw_slice(value.ptr, value.len, "string array") }?
         .iter()
         .map(|value| unsafe { string(value) })
         .collect()
 }
 
-pub(crate) unsafe fn string_map(
-    value: &FfiStringMap,
-    invalid_input: InvalidInput,
-) -> DeltaResult<HashMap<String, String>> {
-    let entries = unsafe { raw_slice(value.ptr, value.len, "string map", invalid_input) }?;
+pub(crate) unsafe fn string_map(value: &FfiStringMap) -> DeltaResult<HashMap<String, String>> {
+    let entries = unsafe { raw_slice(value.ptr, value.len, "string map") }?;
     let mut result = HashMap::with_capacity(entries.len());
     for entry in entries {
         let key = unsafe { string(&entry.key) }?;
         let value = unsafe { string(&entry.value) }?;
         if result.insert(key.clone(), value).is_some() {
-            return Err(invalid_input(format!("duplicate map key: {key}")));
+            return Err(invalid(format!("duplicate map key: {key}")));
         }
     }
     Ok(result)
 }
 
-pub(crate) unsafe fn protocol(
-    value: &FfiProtocol,
-    invalid_input: InvalidInput,
-) -> DeltaResult<Protocol> {
+pub(crate) unsafe fn protocol(value: &FfiProtocol) -> DeltaResult<Protocol> {
     Protocol::try_new(
         value.min_reader_version,
         value.min_writer_version,
-        optional_value(&value.reader_features, |value| unsafe {
-            strings(value, invalid_input)
-        })?,
-        optional_value(&value.writer_features, |value| unsafe {
-            strings(value, invalid_input)
-        })?,
+        optional_value(&value.reader_features, |value| unsafe { strings(value) })?,
+        optional_value(&value.writer_features, |value| unsafe { strings(value) })?,
     )
 }
 
-pub(crate) unsafe fn metadata(
-    value: &FfiMetadata,
-    invalid_input: InvalidInput,
-) -> DeltaResult<Metadata> {
+pub(crate) unsafe fn metadata(value: &FfiMetadata) -> DeltaResult<Metadata> {
     Ok(Metadata::from_parts(
         unsafe { string(&value.id) }?,
         optional_value(&value.name, |value| unsafe { string(value) })?,
         optional_value(&value.description, |value| unsafe { string(value) })?,
         unsafe { string(&value.format_provider) }?,
-        unsafe { string_map(&value.format_options, invalid_input) }?,
+        unsafe { string_map(&value.format_options) }?,
         unsafe { string(&value.schema_string) }?,
-        unsafe { strings(&value.partition_columns, invalid_input) }?,
+        unsafe { strings(&value.partition_columns) }?,
         optional_i64(&value.created_time),
-        unsafe { string_map(&value.configuration, invalid_input) }?,
+        unsafe { string_map(&value.configuration) }?,
     ))
 }
 
@@ -291,22 +278,16 @@ pub(crate) unsafe fn domain_metadata(value: &FfiDomainMetadata) -> DeltaResult<D
 
 pub(crate) unsafe fn checkpoint_metadata(
     value: &FfiCheckpointMetadata,
-    invalid_input: InvalidInput,
 ) -> DeltaResult<CheckpointMetadata> {
     Ok(CheckpointMetadata::new(
         value.version,
-        optional_value(&value.tags, |value| unsafe {
-            string_map(value, invalid_input)
-        })?,
+        optional_value(&value.tags, |value| unsafe { string_map(value) })?,
     ))
 }
 
-pub(crate) unsafe fn sidecar(
-    value: &FfiSidecar,
-    invalid_input: InvalidInput,
-) -> DeltaResult<Sidecar> {
+pub(crate) unsafe fn sidecar(value: &FfiSidecar) -> DeltaResult<Sidecar> {
     if value.size_in_bytes < 0 {
-        return Err(invalid_input(format!(
+        return Err(invalid(format!(
             "sidecar size must be non-negative: {}",
             value.size_in_bytes
         )));
@@ -315,31 +296,20 @@ pub(crate) unsafe fn sidecar(
         unsafe { string(&value.path) }?,
         value.size_in_bytes,
         value.modification_time,
-        optional_value(&value.tags, |value| unsafe {
-            string_map(value, invalid_input)
-        })?,
+        optional_value(&value.tags, |value| unsafe { string_map(value) })?,
     ))
 }
 
 pub(crate) unsafe fn file_size_histogram(
     value: &FfiFileSizeHistogram,
-    invalid_input: InvalidInput,
 ) -> DeltaResult<FileSizeHistogram> {
     let (boundaries_ptr, boundaries_len) = value.sorted_bin_boundaries.as_raw_parts();
     let (counts_ptr, counts_len) = value.file_counts.as_raw_parts();
     let (bytes_ptr, bytes_len) = value.total_bytes.as_raw_parts();
     FileSizeHistogram::try_new(
-        unsafe {
-            raw_slice(
-                boundaries_ptr,
-                boundaries_len,
-                "integer array",
-                invalid_input,
-            )
-        }?
-        .to_vec(),
-        unsafe { raw_slice(counts_ptr, counts_len, "integer array", invalid_input) }?.to_vec(),
-        unsafe { raw_slice(bytes_ptr, bytes_len, "integer array", invalid_input) }?.to_vec(),
+        unsafe { raw_slice(boundaries_ptr, boundaries_len, "integer array") }?.to_vec(),
+        unsafe { raw_slice(counts_ptr, counts_len, "integer array") }?.to_vec(),
+        unsafe { raw_slice(bytes_ptr, bytes_len, "integer array") }?.to_vec(),
     )
 }
 
@@ -347,10 +317,9 @@ pub(crate) unsafe fn file_stats(
     num_files: i64,
     table_size_bytes: i64,
     histogram: *const FfiFileSizeHistogram,
-    invalid_input: InvalidInput,
 ) -> DeltaResult<FileStats> {
     let histogram = (!histogram.is_null())
-        .then(|| unsafe { file_size_histogram(&*histogram, invalid_input) })
+        .then(|| unsafe { file_size_histogram(&*histogram) })
         .transpose()?;
     FileStats::try_new(num_files, table_size_bytes, histogram)
 }

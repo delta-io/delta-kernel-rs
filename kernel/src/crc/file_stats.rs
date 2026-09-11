@@ -39,12 +39,11 @@ pub struct FileStats {
 }
 
 impl FileStats {
-    /// Creates validated, complete file statistics.
+    /// Creates complete file statistics after validating the aggregate values.
     ///
     /// # Errors
     ///
-    /// Returns an error for negative file totals or an invalid or inconsistent file-size
-    /// histogram.
+    /// Returns an error for negative file or byte totals, or negative histogram bins.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn try_new(
@@ -63,36 +62,9 @@ impl FileStats {
             }
         }
         let file_size_histogram = file_size_histogram
-            .map(|histogram| {
-                let histogram = histogram.check_non_negative()?;
-                let file_count = histogram.file_counts().iter().try_fold(
-                    0_i64,
-                    |sum, count| {
-                        sum.checked_add(*count)
-                            .ok_or_else(|| Error::internal_error("Histogram file count overflow"))
-                    },
-                )?;
-                let total_bytes = histogram.total_bytes().iter().try_fold(
-                    0_i64,
-                    |sum, bytes| {
-                        sum.checked_add(*bytes)
-                            .ok_or_else(|| Error::internal_error("Histogram total bytes overflow"))
-                    },
-                )?;
-                if file_count != num_files {
-                    return Err(Error::internal_error(format!(
-                        "Histogram file count {file_count} does not match numFiles {num_files}"
-                    )));
-                }
-                if total_bytes != table_size_bytes {
-                    return Err(Error::internal_error(format!(
-                        "Histogram total bytes {total_bytes} does not match tableSizeBytes {table_size_bytes}"
-                    )));
-                }
-                Ok(histogram)
-            })
+            .map(FileSizeHistogram::check_non_negative)
             .transpose()
-            .map_err(|error: Error| Error::generic(error.to_string()))?;
+            .map_err(|error| Error::generic(error.to_string()))?;
         Ok(Self {
             num_files,
             table_size_bytes,

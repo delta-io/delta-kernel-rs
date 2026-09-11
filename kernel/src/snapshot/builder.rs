@@ -18,7 +18,7 @@ use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
-use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
+use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
@@ -674,17 +674,6 @@ impl<Mode> SnapshotBuilder<Mode> {
                 crc.metadata == *table_configuration.metadata(),
                 SnapshotHintError::CrcMetadata.into()
             );
-            require!(
-                !matches!(
-                    table_configuration.in_commit_timestamp_enablement()?,
-                    InCommitTimestampEnablement::Enabled { .. }
-                ) || crc.in_commit_timestamp_opt.is_some(),
-                SnapshotHintError::Connector {
-                    message: "ICT-enabled CRC is missing inCommitTimestamp".to_string(),
-                    source: None,
-                }
-                .into()
-            );
         }
 
         Snapshot::new_with_crc(
@@ -889,10 +878,6 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::schema::schema_ref;
-    use crate::table_features::TableFeature;
-    use crate::table_properties::{
-        ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-    };
     use crate::unit_test_utils::{
         create_log_path, install_thread_local_metrics_reporter, CapturingReporter,
         TestCancellationToken,
@@ -1326,47 +1311,6 @@ mod tests {
             "CRC metadata does not match",
         );
 
-        let protocol = Protocol::try_new_modern(
-            std::iter::empty::<TableFeature>(),
-            [TableFeature::InCommitTimestamp],
-        )?;
-        let metadata = hint
-            .metadata
-            .clone()
-            .with_configuration_entry(ENABLE_IN_COMMIT_TIMESTAMPS, "true");
-        let mut missing_ict = hint;
-        missing_ict.protocol = protocol.clone();
-        missing_ict.metadata = metadata.clone();
-        missing_ict.crc = Some(Arc::new(Crc {
-            protocol: protocol.clone(),
-            metadata: metadata.clone(),
-            in_commit_timestamp_opt: None,
-            ..matching_crc.clone()
-        }));
-
-        let mut partial_ict_enablement = missing_ict.clone();
-        let partial_metadata =
-            metadata.with_configuration_entry(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "5");
-        partial_ict_enablement.metadata = partial_metadata.clone();
-        partial_ict_enablement.crc = Some(Arc::new(Crc {
-            protocol,
-            metadata: partial_metadata,
-            in_commit_timestamp_opt: Some(1),
-            ..matching_crc
-        }));
-
-        assert_hint_error(
-            SnapshotBuilder::new_for(&table_root),
-            missing_ict,
-            engine.as_ref(),
-            "ICT-enabled CRC is missing inCommitTimestamp",
-        );
-        assert_result_error_with_message(
-            SnapshotBuilder::new_for(&table_root)
-                .with_snapshot_hint(partial_ict_enablement)
-                .build(engine.as_ref()),
-            "enablement timestamp is missing",
-        );
         Ok(())
     }
 

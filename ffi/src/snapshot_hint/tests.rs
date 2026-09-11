@@ -2,6 +2,7 @@ use std::error::Error as _;
 use std::sync::Arc;
 
 use delta_kernel::actions::{CheckpointMetadata, Sidecar};
+use delta_kernel::crc::{DomainMetadataState, SetTransactionState};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::assert_result_error_with_message;
@@ -162,8 +163,8 @@ fn invalid_crc_preserves_source() {
 
 #[test]
 fn typed_components_construct_rich_snapshot_state() {
-    let protocol = unsafe { protocol(&test_protocol(), invalid) }.unwrap();
-    let metadata = unsafe { metadata(&test_metadata(), invalid) }.unwrap();
+    let protocol = unsafe { protocol(&test_protocol()) }.unwrap();
+    let metadata = unsafe { metadata(&test_metadata()) }.unwrap();
 
     let transaction = FfiSetTransaction {
         app_id: slice("app"),
@@ -247,7 +248,7 @@ fn typed_components_construct_rich_snapshot_state() {
         modification_time: 123,
         tags: none_map(),
     };
-    let v2 = FfiSnapshotHintV2Checkpoint {
+    let v2 = FfiSnapshotHintLastCheckpointV2 {
         path: slice("00000000000000000005.checkpoint.uuid.parquet"),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
@@ -291,21 +292,15 @@ fn typed_components_construct_rich_snapshot_state() {
 #[test]
 fn typed_arrays_preserve_absent_and_present_empty() {
     assert_eq!(
-        optional_value(&empty_strings(false), |value| unsafe {
-            strings(value, invalid)
-        })
-        .unwrap(),
+        optional_value(&empty_strings(false), |value| unsafe { strings(value) }).unwrap(),
         None
     );
     assert_eq!(
-        optional_value(&empty_strings(true), |value| unsafe {
-            strings(value, invalid)
-        })
-        .unwrap(),
+        optional_value(&empty_strings(true), |value| unsafe { strings(value) }).unwrap(),
         Some(vec![])
     );
 
-    let v2 = FfiSnapshotHintV2Checkpoint {
+    let v2 = FfiSnapshotHintLastCheckpointV2 {
         path: slice("checkpoint.parquet"),
         size_in_bytes: OptionalValue::None,
         modification_time: OptionalValue::None,
@@ -334,8 +329,8 @@ fn typed_arrays_preserve_absent_and_present_empty() {
         }),
         ..empty_crc()
     };
-    let protocol = unsafe { protocol(&test_protocol(), invalid) }.unwrap();
-    let metadata = unsafe { metadata(&test_metadata(), invalid) }.unwrap();
+    let protocol = unsafe { protocol(&test_protocol()) }.unwrap();
+    let metadata = unsafe { metadata(&test_metadata()) }.unwrap();
     let parsed_crc = unsafe { crc(&crc_value, 0, metadata, protocol) }.unwrap();
     assert!(parsed_crc
         .set_transaction_state
@@ -345,6 +340,18 @@ fn typed_arrays_preserve_absent_and_present_empty() {
         .domain_metadata_state
         .expect_complete()
         .is_empty());
+}
+
+#[test]
+fn checkpoint_part_count_has_a_target_independent_bound() {
+    assert_eq!(
+        optional_usize(&OptionalValue::Some(u64::from(u32::MAX))).unwrap(),
+        Some(u32::MAX as usize)
+    );
+    assert_result_error_with_message(
+        optional_usize(&OptionalValue::Some(u64::from(u32::MAX) + 1)),
+        "checkpoint part count exceeds u32",
+    );
 }
 
 #[test]
@@ -374,7 +381,7 @@ fn typed_sidecar_rejects_negative_size() {
         tags: none_map(),
     };
     assert_result_error_with_message(
-        unsafe { sidecar(&sidecar_value, invalid) },
+        unsafe { sidecar(&sidecar_value) },
         "sidecar size must be non-negative: -1",
     );
 }
@@ -413,7 +420,7 @@ fn typed_metadata_preserves_non_empty_optional_and_container_fields() {
         },
     };
 
-    let actual = unsafe { metadata(&value, invalid) }.unwrap();
+    let actual = unsafe { metadata(&value) }.unwrap();
     assert_eq!(actual.name(), Some("table-name"));
     assert_eq!(actual.description(), Some("description"));
     assert_eq!(actual.created_time(), Some(123));
@@ -444,7 +451,7 @@ fn typed_metadata_rejects_duplicate_map_keys() {
         ..test_metadata()
     };
 
-    let error = unsafe { metadata(&value, invalid) }.unwrap_err();
+    let error = unsafe { metadata(&value) }.unwrap_err();
     assert!(error.to_string().contains("duplicate map key: key"));
 }
 
@@ -454,7 +461,7 @@ fn typed_array_rejects_null_nonempty_pointer() {
         ptr: std::ptr::null(),
         len: 1,
     };
-    assert!(unsafe { strings(&invalid, super::invalid) }.is_err());
+    assert!(unsafe { strings(&invalid) }.is_err());
 }
 
 #[test]
@@ -469,7 +476,7 @@ fn typed_components_reject_invalid_strings() {
         }),
         ..test_protocol()
     };
-    assert!(unsafe { protocol(&invalid_reader_features, invalid) }.is_err());
+    assert!(unsafe { protocol(&invalid_reader_features) }.is_err());
 
     let invalid_feature = [invalid_utf8()];
     let invalid_writer_features = FfiProtocol {
@@ -479,13 +486,13 @@ fn typed_components_reject_invalid_strings() {
         }),
         ..test_protocol()
     };
-    assert!(unsafe { protocol(&invalid_writer_features, invalid) }.is_err());
+    assert!(unsafe { protocol(&invalid_writer_features) }.is_err());
 
     let invalid_name = FfiMetadata {
         name: OptionalValue::Some(invalid_utf8()),
         ..test_metadata()
     };
-    assert!(unsafe { metadata(&invalid_name, invalid) }.is_err());
+    assert!(unsafe { metadata(&invalid_name) }.is_err());
 
     let invalid_partition = [invalid_utf8()];
     let invalid_partition_columns = FfiMetadata {
@@ -495,7 +502,7 @@ fn typed_components_reject_invalid_strings() {
         },
         ..test_metadata()
     };
-    assert!(unsafe { metadata(&invalid_partition_columns, invalid) }.is_err());
+    assert!(unsafe { metadata(&invalid_partition_columns) }.is_err());
 
     let invalid_entry = [FfiStringMapEntry {
         key: invalid_utf8(),
@@ -508,7 +515,7 @@ fn typed_components_reject_invalid_strings() {
         },
         ..test_metadata()
     };
-    assert!(unsafe { metadata(&invalid_configuration, invalid) }.is_err());
+    assert!(unsafe { metadata(&invalid_configuration) }.is_err());
 
     let transaction = FfiSetTransaction {
         app_id: invalid_utf8(),
@@ -530,13 +537,13 @@ fn typed_components_reject_invalid_strings() {
         modification_time: 1,
         tags: none_map(),
     };
-    assert!(unsafe { sidecar(&invalid_sidecar, invalid) }.is_err());
+    assert!(unsafe { sidecar(&invalid_sidecar) }.is_err());
 }
 
 #[test]
 fn typed_nested_arrays_reject_null_nonempty_pointers() {
-    let protocol = unsafe { protocol(&test_protocol(), invalid) }.unwrap();
-    let metadata = unsafe { metadata(&test_metadata(), invalid) }.unwrap();
+    let protocol = unsafe { protocol(&test_protocol()) }.unwrap();
+    let metadata = unsafe { metadata(&test_metadata()) }.unwrap();
     let values = [0, 1];
     let valid = KernelI64Slice {
         ptr: values.as_ptr(),
@@ -557,7 +564,7 @@ fn typed_nested_arrays_reject_null_nonempty_pointers() {
             len: values.len(),
         },
     };
-    assert!(unsafe { file_size_histogram(&invalid_boundaries, invalid) }.is_err());
+    assert!(unsafe { file_size_histogram(&invalid_boundaries) }.is_err());
 
     let invalid_counts = FfiFileSizeHistogram {
         sorted_bin_boundaries: valid,
@@ -570,7 +577,7 @@ fn typed_nested_arrays_reject_null_nonempty_pointers() {
             len: values.len(),
         },
     };
-    assert!(unsafe { file_size_histogram(&invalid_counts, invalid) }.is_err());
+    assert!(unsafe { file_size_histogram(&invalid_counts) }.is_err());
 
     let invalid_bytes = FfiFileSizeHistogram {
         sorted_bin_boundaries: KernelI64Slice {
@@ -586,9 +593,9 @@ fn typed_nested_arrays_reject_null_nonempty_pointers() {
             len: 1,
         },
     };
-    assert!(unsafe { file_size_histogram(&invalid_bytes, invalid) }.is_err());
+    assert!(unsafe { file_size_histogram(&invalid_bytes) }.is_err());
 
-    let checkpoint = FfiSnapshotHintV2Checkpoint {
+    let checkpoint = FfiSnapshotHintLastCheckpointV2 {
         path: slice("checkpoint.parquet"),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
@@ -600,7 +607,7 @@ fn typed_nested_arrays_reject_null_nonempty_pointers() {
     };
     assert!(unsafe { v2_checkpoint(&checkpoint) }.is_err());
 
-    let checkpoint = FfiSnapshotHintV2Checkpoint {
+    let checkpoint = FfiSnapshotHintLastCheckpointV2 {
         path: slice("checkpoint.parquet"),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
@@ -775,9 +782,9 @@ fn typed_actions_reject_invalid_payload_contents() {
 
 #[test]
 fn typed_checkpoint_and_crc_reject_invalid_nested_state() {
-    let protocol = unsafe { protocol(&test_protocol(), invalid) }.unwrap();
-    let metadata = unsafe { metadata(&test_metadata(), invalid) }.unwrap();
-    let invalid_v2 = FfiSnapshotHintV2Checkpoint {
+    let protocol = unsafe { protocol(&test_protocol()) }.unwrap();
+    let metadata = unsafe { metadata(&test_metadata()) }.unwrap();
+    let invalid_v2 = FfiSnapshotHintLastCheckpointV2 {
         path: invalid_utf8(),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
@@ -805,41 +812,6 @@ fn typed_checkpoint_and_crc_reject_invalid_nested_state() {
         ..checkpoint
     };
     assert!(unsafe { last_checkpoint(&checkpoint) }.is_err());
-
-    let transactions = [
-        FfiSetTransaction {
-            app_id: slice("app"),
-            version: 1,
-            last_updated: none_i64(),
-        },
-        FfiSetTransaction {
-            app_id: slice("app"),
-            version: 2,
-            last_updated: none_i64(),
-        },
-    ];
-    let crc = FfiSnapshotHintCrc {
-        set_transactions: OptionalValue::Some(FfiSetTransactionArray {
-            ptr: transactions.as_ptr(),
-            len: transactions.len(),
-        }),
-        ..empty_crc()
-    };
-    assert!(unsafe { super::crc(&crc, 0, metadata.clone(), protocol.clone()) }.is_err());
-
-    let domain = FfiDomainMetadata {
-        domain: slice("domain"),
-        configuration: slice("{}"),
-        removed: true,
-    };
-    let crc = FfiSnapshotHintCrc {
-        domain_metadata: OptionalValue::Some(FfiDomainMetadataArray {
-            ptr: &domain,
-            len: 1,
-        }),
-        ..empty_crc()
-    };
-    assert!(unsafe { super::crc(&crc, 0, metadata.clone(), protocol.clone()) }.is_err());
 
     let crc = FfiSnapshotHintCrc {
         num_files: -1,
@@ -968,7 +940,7 @@ fn aggregate_setter_wraps_invalid_log_path_errors(#[case] location: &'static str
 }
 
 #[test]
-fn aggregate_setter_rejects_null_nonempty_log_path_array() {
+fn aggregate_setter_treats_null_log_path_pointer_as_empty() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
     let hint = FfiSnapshotHint {
@@ -983,12 +955,7 @@ fn aggregate_setter_rejects_null_nonempty_log_path_array() {
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
     };
-    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
-    assert_extern_result_error_with_message(
-        result,
-        KernelError::InvalidSnapshotHint,
-        Some("Invalid snapshot hint: supplied log paths are invalid"),
-    );
+    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
 
     unsafe {
         free_snapshot_builder(builder);
@@ -1027,7 +994,7 @@ fn aggregate_setter_rejects_log_compaction_paths() {
 }
 
 #[test]
-fn aggregate_setter_accepts_single_bin_histogram() {
+fn aggregate_setter_rejects_single_bin_histogram() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
@@ -1060,7 +1027,8 @@ fn aggregate_setter_accepts_single_bin_histogram() {
         SNAPSHOT_HINT_FRESHNESS_UNVERIFIED,
     );
     hint.crc = &crc;
-    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
+    assert_extern_result_error_with_message(result, KernelError::InvalidSnapshotHint, None);
 
     unsafe {
         free_snapshot_builder(builder);
@@ -1261,7 +1229,7 @@ fn typed_v2_checkpoint_build() {
             checkpoint_metadata: &checkpoint_metadata,
         },
     };
-    let v2 = FfiSnapshotHintV2Checkpoint {
+    let v2 = FfiSnapshotHintLastCheckpointV2 {
         path: slice(CHECKPOINT),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),

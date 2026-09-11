@@ -11,11 +11,8 @@
 
 use std::collections::HashMap;
 
-use delta_kernel_derive::internal_api;
-
 use super::file_stats::FileStats;
 use crate::actions::{DomainMetadata, SetTransaction};
-use crate::{DeltaResult, Error};
 
 /// The state of file statistics for a CRC.
 ///
@@ -97,33 +94,6 @@ impl Default for DomainMetadataState {
     }
 }
 
-impl DomainMetadataState {
-    /// Creates complete domain-metadata state from active actions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when an action is a tombstone or a domain occurs more than once.
-    #[internal_api]
-    pub(crate) fn try_complete(values: Vec<DomainMetadata>) -> DeltaResult<Self> {
-        let mut domains = HashMap::with_capacity(values.len());
-        for action in values {
-            if action.is_removed() {
-                return Err(Error::generic(format!(
-                    "complete CRC state contains a tombstone for domain {}",
-                    action.domain()
-                )));
-            }
-            let domain = action.domain().to_string();
-            if domains.insert(domain.clone(), action).is_some() {
-                return Err(Error::generic(format!(
-                    "complete CRC state contains duplicate domain {domain}"
-                )));
-            }
-        }
-        Ok(Self::Complete(domains))
-    }
-}
-
 #[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::panic)]
 impl DomainMetadataState {
@@ -167,27 +137,6 @@ pub enum SetTransactionState {
 impl Default for SetTransactionState {
     fn default() -> Self {
         Self::Partial(HashMap::new())
-    }
-}
-
-impl SetTransactionState {
-    /// Creates complete set-transaction state from active actions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when an application identifier occurs more than once.
-    #[internal_api]
-    pub(crate) fn try_complete(values: Vec<SetTransaction>) -> DeltaResult<Self> {
-        let mut transactions = HashMap::with_capacity(values.len());
-        for transaction in values {
-            let app_id = transaction.app_id.clone();
-            if transactions.insert(app_id.clone(), transaction).is_some() {
-                return Err(Error::generic(format!(
-                    "complete CRC state contains duplicate transaction application id {app_id}"
-                )));
-            }
-        }
-        Ok(Self::Complete(transactions))
     }
 }
 
