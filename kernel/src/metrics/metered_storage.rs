@@ -276,7 +276,7 @@ mod tests {
             _path: &Url,
             cancellation_token: Option<CancellationTokenRef>,
         ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
-            *self.seen.lock().unwrap() = cancellation_token;
+            *self.seen.lock()? = cancellation_token;
             Ok(Box::new(std::iter::empty()))
         }
 
@@ -292,7 +292,7 @@ mod tests {
             _files: Vec<FileSlice>,
             cancellation_token: Option<CancellationTokenRef>,
         ) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
-            *self.seen.lock().unwrap() = cancellation_token;
+            *self.seen.lock()? = cancellation_token;
             Ok(Box::new(std::iter::empty()))
         }
 

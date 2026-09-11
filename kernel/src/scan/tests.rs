@@ -1706,7 +1706,7 @@ impl ParquetHandler for RecordingParquetHandler {
         physical_schema: schema::SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        self.reads.lock().unwrap().push(RecordedParquetRead {
+        self.reads.lock()?.push(RecordedParquetRead {
             files: files.to_vec(),
             physical_schema: physical_schema.clone(),
             predicate: predicate.clone(),

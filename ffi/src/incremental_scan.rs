@@ -234,7 +234,7 @@ pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
 fn incremental_scan_stream_next_arrow_impl(
     stream: &FfiIncrementalScanStream,
 ) -> DeltaResult<*mut ScanMetadataArrowResult> {
-    let mut guard = lock_stream(stream)?;
+    let mut guard = stream.stream.lock()?;
     let Some(inner) = guard.as_mut() else {
         // The stream was already consumed by `into_summary` or dropped by a prior error.
         return Err(Error::generic(
@@ -293,20 +293,13 @@ pub unsafe extern "C" fn incremental_scan_stream_into_summary(
 fn incremental_scan_stream_into_summary_impl(
     stream: &FfiIncrementalScanStream,
 ) -> DeltaResult<Handle<SharedIncrementalScanSummary>> {
-    let inner = lock_stream(stream)?
+    let inner = stream
+        .stream
+        .lock()?
         .take()
         .ok_or_else(|| Error::generic("incremental scan stream was already consumed"))?;
     let summary = inner.into_summary()?;
     Ok(Arc::new(summary).into())
-}
-
-fn lock_stream(
-    stream: &FfiIncrementalScanStream,
-) -> DeltaResult<std::sync::MutexGuard<'_, Option<IncrementalScanStream>>> {
-    stream
-        .stream
-        .lock()
-        .map_err(|_| Error::generic("poisoned incremental scan stream mutex"))
 }
 
 /// The base (exclusive lower bound) version of the scanned range.
