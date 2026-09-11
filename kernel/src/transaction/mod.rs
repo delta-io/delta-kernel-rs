@@ -85,6 +85,7 @@ mod write_validation;
 
 pub use bound_write_context::BoundWriteContext;
 use stats_verifier::StatsColumnVerifier;
+use update::new_dv_column_schema;
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -501,8 +502,11 @@ impl<S> Transaction<S> {
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
         // Step 6: Generate remove actions (collect to avoid borrowing self)
-        let remove_actions =
-            self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
+        let remove_actions = self.generate_remove_actions(
+            engine,
+            self.remove_files_metadata.iter(),
+            false, /* has_dv_update_columns */
+        )?;
 
         // Build the action chain
         // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata
@@ -1438,9 +1442,8 @@ impl<S> Transaction<S> {
     ///
     /// - `engine`: The engine used for expression evaluation
     /// - `remove_files_metadata`: Iterator over scan file metadata to transform into Remove actions
-    /// - `columns_to_drop`: Column names to drop from the scan metadata before transformation. This
-    ///   is used to remove temporary columns like the intermediate deletion vector column added
-    ///   during DV updates.
+    /// - `has_dv_update_columns`: Whether `remove_files_metadata` contains the temporary columns
+    ///   added for a deletion vector update
     ///
     /// # Returns
     ///
@@ -1453,7 +1456,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &dyn Engine,
         remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
-        columns_to_drop: &'a [&str],
+        has_dv_update_columns: bool,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
@@ -1463,48 +1466,100 @@ impl<S> Transaction<S> {
             ));
         }
 
-        let input_schema = scan_row_schema();
         let target_schema = schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA);
         let evaluation_handler = engine.evaluation_handler();
+        let columns_to_drop: Vec<_> = has_dv_update_columns
+            .then(new_dv_column_schema)
+            .into_iter()
+            .flat_map(|schema| schema.fields().map(|field| field.name().to_owned()))
+            .collect();
 
-        let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
+        let make_eval = |has_stats_parsed: bool, has_partition_values_parsed: bool| {
+            let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(
                 self.commit_timestamp,
                 self.data_change,
-                columns_to_drop,
-                coalesce_stats_with_parsed,
+                &columns_to_drop,
+                has_stats_parsed,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
             evaluation_handler.new_expression_evaluator(
-                input_schema.clone(),
+                scan_row_input_schema(
+                    has_stats_parsed,
+                    has_partition_values_parsed,
+                    has_dv_update_columns,
+                )?,
                 expr,
                 target_schema.clone().into(),
             )
         };
 
-        // Build two evaluators: one for the common case where scan files do not include a
-        // stats_parsed column, and one for predicate-based scans that include stats_parsed.
-        // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
-        // case where stats is null (e.g., on V2 checkpoints with writeStatsAsJson=false) and
-        // then drops the stats_parsed column.
-        let base_eval = Arc::new(make_eval(false)?);
-        let stats_parsed_eval = Arc::new(make_eval(true)?);
+        let evaluators = [
+            make_eval(
+                false, /* has_stats_parsed */
+                false, /* has_partition_values_parsed */
+            )?,
+            make_eval(
+                true,  /* has_stats_parsed */
+                false, /* has_partition_values_parsed */
+            )?,
+            make_eval(
+                false, /* has_stats_parsed */
+                true,  /* has_partition_values_parsed */
+            )?,
+            make_eval(
+                true, /* has_stats_parsed */
+                true, /* has_partition_values_parsed */
+            )?,
+        ];
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
+        let partition_values_parsed_col = column_name!(PARTITION_VALUES_PARSED_NAME);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
             let data = file_metadata_batch.data();
-            let evaluator = if data.has_field(&stats_parsed_col) {
-                &stats_parsed_eval
-            } else {
-                &base_eval
+            let evaluator_index = match (
+                data.has_field(&stats_parsed_col),
+                data.has_field(&partition_values_parsed_col),
+            ) {
+                (false, false) => 0,
+                (true, false) => 1,
+                (false, true) => 2,
+                (true, true) => 3,
             };
-            let updated_engine_data = evaluator.evaluate(data)?;
+            let updated_engine_data = evaluators[evaluator_index].evaluate(data)?;
             FilteredEngineData::try_new(
                 updated_engine_data,
                 file_metadata_batch.selection_vector().to_vec(),
             )
         }))
     }
+}
+
+fn scan_row_input_schema(
+    has_stats_parsed: bool,
+    has_partition_values_parsed: bool,
+    has_dv_update_columns: bool,
+) -> DeltaResult<SchemaRef> {
+    let parsed_column_type = StructType::try_new([])?;
+    let mut patch = SchemaStructPatchBuilder::new();
+    if has_stats_parsed {
+        patch = patch.append(StructField::nullable(
+            STATS_PARSED_NAME,
+            parsed_column_type.clone(),
+        ));
+    }
+    if has_partition_values_parsed {
+        patch = patch.append(StructField::nullable(
+            PARTITION_VALUES_PARSED_NAME,
+            parsed_column_type,
+        ));
+    }
+    if has_dv_update_columns {
+        patch = new_dv_column_schema()
+            .fields()
+            .fold(patch, |patch, field| patch.append(field.clone()));
+    }
+    Ok(Arc::new(patch.build(&scan_row_schema())?))
 }
 
 /// Builds the struct patch for converting scan row metadata into a Remove action.

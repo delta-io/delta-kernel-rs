@@ -5,7 +5,7 @@ pub(crate) use evaluate_expression::extract_column;
 use evaluate_expression::{evaluate_expression, evaluate_predicate};
 use tracing::debug;
 
-use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
+use super::arrow_conversion::{TryFromArrow as _, TryFromKernel as _, TryIntoArrow as _};
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -14,7 +14,7 @@ use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::{DataType, PrimitiveType, SchemaRef};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
@@ -253,7 +253,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
-            _input_schema: schema,
+            input_schema: schema,
             expression,
             output_type,
         }))
@@ -265,7 +265,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
         Ok(Arc::new(DefaultPredicateEvaluator {
-            _input_schema: schema,
+            input_schema: schema,
             predicate,
         }))
     }
@@ -327,7 +327,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    _input_schema: SchemaRef,
+    input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
 }
@@ -336,14 +336,8 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
+        // TODO(#3263): Validate nested fields.
+        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::StructPatch(patch), DataType::Struct(_)) if patch.is_empty() => {
                 // Empty patch optimization: Skip expression evaluation and directly apply the
@@ -374,7 +368,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
-    _input_schema: SchemaRef,
+    input_schema: SchemaRef,
     predicate: PredicateRef,
 }
 
@@ -382,14 +376,8 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
+        // TODO(#3263): Validate nested fields.
+        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
         let array = evaluate_predicate(&self.predicate, batch, false)?;
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "output",
@@ -398,5 +386,64 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
         Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+}
+
+fn validate_data_schema_top_level(
+    expected_schema: &SchemaRef,
+    data_schema: &ArrowSchema,
+) -> DeltaResult<()> {
+    let mut data_fields = data_schema.fields().iter();
+    // Some Kernel code does not provide the full input schema to the evaluator. For example,
+    // `scan_metadata_from` may evaluate scan rows containing optional `stats_parsed` and
+    // `partitionValues_parsed` columns using only the base scan-row schema.
+    // TODO(#3263): Require evaluator input schemas to declare every top-level field.
+    for expected_field in expected_schema.fields() {
+        let data_field = data_fields
+            .find(|field| field.name() == expected_field.name())
+            .ok_or_else(|| {
+                Error::schema(format!(
+                    "Expected schema field '{}' is missing or out of order in data schema fields \
+                     {:?}",
+                    expected_field.name(),
+                    data_schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name())
+                        .collect::<Vec<_>>()
+                ))
+            })?;
+        // Only the top-level type is validated. `try_from_arrow` translates the entire field, but
+        // we use it here to keep the validation simple.
+        let data_field = StructField::try_from_arrow(data_field.as_ref())?;
+        require!(
+            top_level_types_compatible(expected_field.data_type(), data_field.data_type()),
+            Error::schema(format!(
+                "Expected schema type for '{}' does not match the data schema type: {:?} != {:?}",
+                expected_field.name(),
+                expected_field.data_type(),
+                data_field.data_type()
+            ))
+        );
+    }
+    Ok(())
+}
+
+fn top_level_types_compatible(expected_type: &DataType, data_type: &DataType) -> bool {
+    match (expected_type, data_type) {
+        (DataType::Primitive(expected), DataType::Primitive(data)) => {
+            expected == data
+                || matches!(
+                    (expected, data),
+                    (PrimitiveType::IntervalYearMonth, PrimitiveType::Integer)
+                        | (PrimitiveType::IntervalDayTime, PrimitiveType::Long)
+                )
+        }
+        (DataType::Struct(_), DataType::Struct(_))
+        | (DataType::Array(_), DataType::Array(_))
+        | (DataType::Map(_), DataType::Map(_)) => true,
+        // Arrow has no Variant type, and it will be converted to structs.
+        (DataType::Variant(_), DataType::Struct(_)) => true,
+        _ => false,
     }
 }

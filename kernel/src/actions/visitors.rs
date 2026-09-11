@@ -1787,7 +1787,7 @@ mod tests {
         engine
             .evaluation_handler()
             .new_expression_evaluator(
-                get_commit_schema().clone(),
+                get_all_actions_schema().clone(),
                 expression.into(),
                 InCommitTimestampVisitor::schema().into(),
             )
