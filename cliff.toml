@@ -5,6 +5,8 @@ header = """
 # Changelog\n
 """
 # Tera template
+# release.sh parses the `## [v{{ version }}]` prefix and `[#N]:` references below when it replaces
+# and verifies a section.
 body = """
 ## [v{{ version }}](https://github.com/delta-io/delta-kernel-rs/tree/v{{ version }}/) ({{ timestamp | date(format="%Y-%m-%d") }})
 
@@ -40,6 +42,9 @@ trim = true
 postprocessors = []
 
 [git]
+# Only plain semver tags mark Kernel releases. Artifact-specific tags such as v0.0.1_dat must not
+# truncate the Kernel changelog range.
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$"
 # parse the commits based on https://www.conventionalcommits.org
 conventional_commits = true
 # filter out the commits that are not conventional
@@ -51,6 +56,8 @@ commit_preprocessors = []
 # regex for parsing and grouping commits. note that e.g. both doc and docs are matched since we have
 # trim = true above.
 commit_parsers = [
+  { message = "^release [0-9]", skip = true },
+  { message = "^chore: refresh release changelog", skip = true },
   { field = "github.pr_labels", pattern = "breaking-change", group = "<!-- 0 --> 🏗️ Breaking changes" },
   { message = "^feat", group = "<!-- 1 -->🚀 Features / new APIs" },
   { message = "^fix", group = "<!-- 2 -->🐛 Bug Fixes" },
