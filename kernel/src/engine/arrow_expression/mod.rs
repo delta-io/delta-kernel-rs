@@ -415,8 +415,11 @@ fn validate_data_schema_top_level(
             expected_schema
                 .fields()
                 .map(|field| field.name())
-                .collect_vec(),
-            data_schema.fields().map(|field| field.name()).collect_vec()
+                .collect::<Vec<_>>(),
+            data_schema
+                .fields()
+                .map(|field| field.name())
+                .collect::<Vec<_>>()
         ))
     );
 
