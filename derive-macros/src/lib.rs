@@ -130,8 +130,9 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 ///   `HashMap`). Those mappings will be dropped when converting to an actual rust `HashMap`.
 ///   Currently this can _only_ be set on `HashMap` fields.
 /// - `#[skip_schema]`: Excludes this field from the generated schema (and, on a struct that also
-///   derives `IntoEngineData` / `IntoStructData`, from the produced engine data / struct scalar).
-///   NOTE: `TryFromStructData` rejects skipped fields because it cannot reconstruct them.
+///   derives `IntoStructData`, from the produced struct scalar).
+///
+/// NOTE: `TryFromStructData` rejects skipped fields because it cannot reconstruct them.
 #[proc_macro_derive(
     ToSchema,
     attributes(allow_null_container_values, field_id, nested_field_id, skip_schema)
@@ -405,49 +406,6 @@ fn gen_schema_fields(data: &Data, span: Span) -> Result<TokenStream, Error> {
     let fields = schema_fields(data, "ToSchema", span)?;
     let fields = fields.iter().map(|f| gen_schema_field(f));
     Ok(quote! { #(#fields),* })
-}
-
-/// Derive an IntoEngineData trait for a struct that has all fields implement `TryInto<Scalar>`.
-///
-/// This is a relatively simple macro to produce the boilerplate for converting a struct into
-/// EngineData using the `create_one` method. TODO: (doc)tests included in the delta_kernel crate:
-/// `IntoEngineData` trait.
-#[proc_macro_derive(IntoEngineData)]
-pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let struct_name = &input.ident;
-
-    let fields = match schema_fields(&input.data, "IntoEngineData", struct_name.span()) {
-        Ok(fields) => fields,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let (field_idents, field_types): (Vec<_>, Vec<_>) =
-        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
-
-    let expanded = quote! {
-        #[automatically_derived]
-        impl delta_kernel::IntoEngineData for #struct_name
-        where
-            #(#field_types: TryInto<delta_kernel::expressions::Scalar>,)*
-            #(delta_kernel::Error: From<<#field_types as TryInto<delta_kernel::expressions::Scalar>>::Error>,)*
-        {
-            fn into_engine_data(
-                self,
-                schema: delta_kernel::schema::SchemaRef,
-                engine: &dyn delta_kernel::Engine)
-            -> delta_kernel::DeltaResult<Box<dyn delta_kernel::EngineData>> {
-                // NB: we `use` here to avoid polluting the caller's namespace
-                use delta_kernel::EvaluationHandlerExtension as _;
-                let values = [
-                    #(self.#field_idents.try_into()?),*
-                ];
-                let evaluator = engine.evaluation_handler();
-                evaluator.create_one(schema, &values)
-            }
-        }
-    };
-
-    proc_macro::TokenStream::from(expanded)
 }
 
 /// Derive `From` conversions into `StructData` and `Scalar` for a rust struct.

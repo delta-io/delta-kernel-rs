@@ -47,8 +47,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData, Expression,
-    FileMeta, IntoEngineData, Predicate, RowVisitor, Version,
+    create_row, version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData,
+    Expression, FileMeta, Predicate, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -445,7 +445,7 @@ impl<S> Transaction<S> {
             .set_transactions
             .clone()
             .into_iter()
-            .map(|txn| txn.into_engine_data(LOG_TXN_SCHEMA.clone(), engine));
+            .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
@@ -473,7 +473,7 @@ impl<S> Transaction<S> {
         let (protocol_action, protocol) = if self.should_emit_protocol {
             let protocol = self.effective_table_config.protocol().clone();
             let schema = LOG_PROTOCOL_SCHEMA.clone();
-            let action = protocol.clone().into_engine_data(schema, engine)?;
+            let action = create_row(engine, schema, protocol.clone())?;
             (Some(action), Some(protocol))
         } else {
             (None, None)
@@ -481,7 +481,7 @@ impl<S> Transaction<S> {
         let (metadata_action, metadata) = if self.should_emit_metadata {
             let metadata = self.effective_table_config.metadata().clone();
             let schema = LOG_METADATA_SCHEMA.clone();
-            let action = metadata.clone().into_engine_data(schema, engine)?;
+            let action = create_row(engine, schema, metadata.clone())?;
             (Some(action), Some(metadata))
         } else {
             (None, None)
@@ -3225,7 +3225,8 @@ mod tests {
                 Scalar::Array(ArrayData::try_new(score_type, [30i32])?),
             ],
         )?);
-        ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
+        let rows = vec![vec![1i64.into(), info1], vec![2i64.into(), info2]];
+        ArrowEvaluationHandler.create_many(schema, rows)
     }
 
     /// Validates that [`BoundWriteContext::logical_to_physical`] correctly renames fields at all
@@ -3487,10 +3488,7 @@ mod tests {
                 ]
             })
             .collect();
-        let row_refs: Vec<&[Scalar]> = rows.iter().map(|r| r.as_slice()).collect();
-        ArrowEvaluationHandler
-            .create_many(schema, &row_refs)
-            .unwrap()
+        ArrowEvaluationHandler.create_many(schema, rows).unwrap()
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA
 use crate::error::Error;
 use crate::row_tracking::{RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME};
 use crate::table_features::TableFeature;
-use crate::{DeltaResult, Engine, IntoEngineData};
+use crate::{create_row, DeltaResult, Engine};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -260,7 +260,7 @@ impl<S> Transaction<S> {
         let dm_actions_iter: Vec<_> = dm_actions_vec
             .iter()
             .cloned()
-            .map(|dm| dm.into_engine_data(schema.clone(), engine))
+            .map(|dm| create_row(engine, schema.clone(), dm))
             .collect();
 
         Ok((Box::new(dm_actions_iter.into_iter()), dm_actions_vec))

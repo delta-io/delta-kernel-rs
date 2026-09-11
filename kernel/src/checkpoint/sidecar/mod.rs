@@ -94,10 +94,9 @@ pub(super) fn create_sidecar_action_batch(
         })
         .try_collect()?;
 
-    let row_refs: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
     let batch = engine
         .evaluation_handler()
-        .create_many(checkpoint_data_schema.clone(), &row_refs)?;
+        .create_many(checkpoint_data_schema.clone(), rows)?;
     Ok(Some(batch))
 }
 

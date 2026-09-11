@@ -187,17 +187,16 @@ pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliati
 use cancellation::check_cancelled;
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
-use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
 pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error};
-use expressions::{literal_expression_transform, Scalar};
+use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
-use schema::{schema_ref, StructField};
+use schema::StructField;
 pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
@@ -505,26 +504,10 @@ pub trait EvaluationHandler: AsAny {
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>>;
 
-    /// Create a single-row all-null-value [`EngineData`] with the schema specified by
-    /// `output_schema`.
-    // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
-    // future.
-    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
-
     /// Create a multi-row [`EngineData`] by applying the given schema to multiple rows of values.
     ///
-    /// Each element in `rows` represents one row of data, where each row is a slice of structured
-    /// scalar values (one scalar per top-level field in the schema).
-    ///
-    /// # Parameters
-    ///
-    /// - `schema`: Schema describing the structure of each row.
-    /// - `rows`: Slice of rows, where each row contains one structured scalar per top-level schema
-    ///   field.
-    ///
-    /// # Returns
-    ///
-    /// A multi-row `EngineData` containing all rows.
+    /// Each element in `rows` represents one row of data, where each row contains one scalar per
+    /// top-level field in the `schema`.
     ///
     /// # Errors
     ///
@@ -539,71 +522,22 @@ pub trait EvaluationHandler: AsAny {
     fn create_many(
         &self,
         schema: SchemaRef,
-        rows: &[&[Scalar]],
+        rows: Vec<Vec<Scalar>>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 }
 
-/// Internal trait to allow us to have a private `create_one` API that's implemented for all
-/// EvaluationHandlers.
-// For some reason rustc doesn't detect it's usage so we allow(dead_code) here...
-#[allow(dead_code)]
-#[internal_api]
-trait EvaluationHandlerExtension: EvaluationHandler {
-    /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
-    /// `values`.
-    // Note: we will stick with a Schema instead of DataType (more constrained can expand in
-    // future)
-    fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
-        // just get a single int column (arbitrary)
-        let null_row_schema = schema_ref! {
-            nullable "null_col": INTEGER,
-        };
-        let null_row = self.null_row(null_row_schema.clone())?;
-
-        // Convert schema and leaf values to an expression
-        let row_expr = literal_expression_transform(schema.as_ref(), values)?;
-
-        let eval =
-            self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into())?;
-        eval.evaluate(null_row.as_ref())
-    }
-}
-
-// Auto-implement the extension trait for all EvaluationHandlers
-impl<T: EvaluationHandler + ?Sized> EvaluationHandlerExtension for T {}
-
-/// A trait that allows converting a type into (single-row) EngineData
+/// Creates one row containing a single scalar value.
 ///
-/// This is typically used with the `#[derive(IntoEngineData)]` macro
-/// which leverages the traits `ToDataType` and `Into<Scalar>` for struct fields
-/// to convert a struct into EngineData.
-///
-/// # Example
-/// ```ignore
-/// # use std::sync::Arc;
-/// # use delta_kernel_derive::{Schema, IntoEngineData};
-///
-/// #[derive(Schema, IntoEngineData)]
-/// struct MyStruct {
-///    a: i32,
-///    b: String,
-/// }
-///
-/// let my_struct = MyStruct { a: 42, b: "Hello".to_string() };
-/// // typically used with ToSchema
-/// let schema = Arc::new(MyStruct::to_schema());
-/// // single-row EngineData
-/// let engine = todo!(); // create an engine
-/// let engine_data = my_struct.into_engine_data(schema, engine);
-/// ```
-#[internal_api]
-pub(crate) trait IntoEngineData {
-    /// Consume this type to produce a single-row EngineData using the provided schema.
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>>;
+/// `schema` must contain exactly one top-level field whose type matches `value`.
+pub(crate) fn create_row(
+    engine: &dyn Engine,
+    schema: SchemaRef,
+    value: impl Into<Scalar>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let value = value.into();
+    engine
+        .evaluation_handler()
+        .create_many(schema, vec![vec![value]])
 }
 
 /// Provides file system related functionalities to Delta Kernel.
