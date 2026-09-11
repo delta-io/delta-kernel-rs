@@ -42,6 +42,9 @@ use crate::expressions::ColumnName;
 use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
+use crate::table_features::{
+    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, V2_VALIDATOR,
+};
 use crate::transaction::{CreateTable, Transaction};
 use crate::utils::current_time_ms;
 use crate::DeltaResult;
@@ -146,6 +149,12 @@ impl CreateTableTransaction {
         clustering_columns: Option<Vec<ColumnName>>,
         correlation_id: Option<Arc<str>>,
     ) -> DeltaResult<Self> {
+        validate_iceberg_compat_if_needed(
+            &effective_table_config,
+            &V2_VALIDATOR,
+            IcebergCompatValidationContext::Write,
+        )?;
+
         let span = tracing::info_span!(
             "txn",
             path = %effective_table_config.table_root(),

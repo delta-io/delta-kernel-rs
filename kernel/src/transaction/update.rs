@@ -35,7 +35,7 @@ use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
-    V3_VALIDATOR,
+    V2_VALIDATOR, V3_VALIDATOR,
 };
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::utils::{current_time_ms, require};
@@ -79,6 +79,12 @@ impl Transaction {
         );
 
         let effective_table_config = read_snapshot.table_configuration().clone();
+
+        validate_iceberg_compat_if_needed(
+            &effective_table_config,
+            &V2_VALIDATOR,
+            IcebergCompatValidationContext::Write,
+        )?;
 
         validate_iceberg_compat_if_needed(
             &effective_table_config,

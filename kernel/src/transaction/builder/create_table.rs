@@ -87,6 +87,9 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // create time is the explicit feature signal
     // `delta.feature.materializePartitionColumns=supported`.
     TableFeature::MaterializePartitionColumns,
+    // IcebergCompatV2 is a writer-only feature that gates Iceberg V2 conversion compatibility.
+    // Dependent features (ColumnMapping) are auto-added during create table.
+    TableFeature::IcebergCompatV2,
     // IcebergCompatV3 is a writer-only feature that gates Iceberg V3 conversion compatibility.
     // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
     // create table.
@@ -117,6 +120,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     SET_TRANSACTION_RETENTION_DURATION,
     // Parquet format version: controls the Parquet writer version for data files
     PARQUET_FORMAT_VERSION,
+    // IcebergCompatV2 enablement: triggers auto-enablement of ColumnMapping.
+    ENABLE_ICEBERG_COMPAT_V2,
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
     // RowTracking, DomainMetadata.
     ENABLE_ICEBERG_COMPAT_V3,
@@ -505,6 +510,77 @@ fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTablePropertie
     }
 }
 
+fn require_iceberg_compat_column_mapping(
+    validated: &mut ValidatedTableProperties,
+    feature_name: &str,
+) -> DeltaResult<()> {
+    match validated
+        .properties
+        .get(COLUMN_MAPPING_MODE)
+        .map(String::as_str)
+    {
+        None => {
+            validated
+                .properties
+                .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        }
+        Some("name") | Some("id") => {}
+        Some(other) => {
+            return Err(Error::generic(format!(
+                "{feature_name} requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got \
+                 '{other}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Adds Column Mapping protocol support whenever IcebergCompatV2 is supported. When
+/// `delta.enableIcebergCompatV2=true`, also enables and validates V2's property dependencies.
+///
+/// Specifically:
+///   * Set `delta.columnMapping.mode` to `name` when absent, reject if it's `none`.
+///   * Reject if `delta.enableIcebergCompatV1`, `delta.enableIcebergCompatV3`, or
+///     `delta.enableDeletionVectors` is `true`.
+fn maybe_enable_iceberg_compat_v2_dependencies(
+    validated: &mut ValidatedTableProperties,
+) -> DeltaResult<()> {
+    let enabled = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2);
+    if !enabled
+        && !validated
+            .writer_features
+            .contains(&TableFeature::IcebergCompatV2)
+    {
+        return Ok(());
+    }
+
+    add_feature_to_lists(
+        TableFeature::ColumnMapping,
+        &mut validated.reader_features,
+        &mut validated.writer_features,
+    );
+    if !enabled {
+        return Ok(());
+    }
+
+    require_iceberg_compat_column_mapping(validated, "IcebergCompatV2")?;
+
+    // V1/V3 and deletion vectors must not be active.
+    for key in [
+        ENABLE_ICEBERG_COMPAT_V1,
+        ENABLE_ICEBERG_COMPAT_V3,
+        ENABLE_DELETION_VECTORS,
+    ] {
+        if validated.is_property_true(key) {
+            return Err(Error::generic(format!(
+                "IcebergCompatV2 cannot be enabled together with '{key}'"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// When `delta.enableIcebergCompatV3=true` is set, auto-enables V3's required dependencies in
 /// `validated.properties` (defaulting them when absent, rejecting conflicting values).
 ///
@@ -520,25 +596,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
         return Ok(());
     }
 
-    // Column mapping: require `name` or `id`; default to `name`.
-    match validated
-        .properties
-        .get(COLUMN_MAPPING_MODE)
-        .map(String::as_str)
-    {
-        None => {
-            validated
-                .properties
-                .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
-        }
-        Some("name") | Some("id") => {}
-        Some(other) => {
-            return Err(Error::generic(format!(
-                "IcebergCompatV3 requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got \
-                 '{other}'"
-            )));
-        }
-    }
+    require_iceberg_compat_column_mapping(validated, "IcebergCompatV3")?;
 
     // Row tracking must not be suspended (suspension cannot coexist with row tracking actively
     // enabled, which V3 requires).
@@ -617,10 +675,11 @@ fn maybe_apply_column_mapping_for_table_create(
             // missing piece of that pair, and assign fresh metadata to bare fields (matches
             // delta-spark's `DeltaColumnMapping.assignColumnIdAndPhysicalName`). Seed
             // `max_id` from the schema's existing max so newly assigned IDs cannot collide
-            // with preserved ones. When IcebergCompatV3 is enabled, also allocate nested ids
-            // for `Array.element` and `Map.key`/`Map.value` and store them under
-            // `delta.columnMapping.nested.ids` on the nearest ancestor `StructField`.
-            let assign_nested_field_ids = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3);
+            // with preserved ones. When IcebergCompatV2 or IcebergCompatV3 is enabled, also
+            // allocate nested ids for `Array.element` and `Map.key`/`Map.value` and store them
+            // under `delta.columnMapping.nested.ids` on the nearest ancestor `StructField`.
+            let assign_nested_field_ids = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2)
+                || validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3);
             let mut max_id = find_max_column_id_in_schema(schema).unwrap_or(0);
             let transformed_schema =
                 assign_column_mapping_metadata(schema, &mut max_id, assign_nested_field_ids)?;
@@ -903,6 +962,13 @@ impl CreateTableTransactionBuilder {
         // - Returns reader/writer features to add to protocol
         let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
 
+        // When IcebergCompatV2 is enabled, fill in / validate required dependencies before column
+        // mapping is applied so the CM mode is in place. This must run before
+        // `maybe_apply_column_mapping_for_table_create`,
+        // `maybe_auto_enable_property_driven_features`, and
+        // `maybe_set_materialized_row_tracking_column_name_properties`.
+        maybe_enable_iceberg_compat_v2_dependencies(&mut validated)?;
+
         // When IcebergCompatV3 is enabled, fill in and validate its column-mapping and row-tracking
         // dependencies. This must run before `maybe_apply_column_mapping_for_table_create`,
         // `maybe_auto_enable_property_driven_features`, and
@@ -1004,8 +1070,8 @@ mod tests {
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
-        COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
-        PARQUET_FORMAT_VERSION,
+        COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+        ENABLE_ICEBERG_COMPAT_V3, PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
     use crate::unit_test_utils::{
@@ -1861,7 +1927,7 @@ mod tests {
         );
     }
 
-    /// Builds the icebergCompatV3 create-table test schema:
+    /// Builds the Iceberg compatibility create-table test schema:
     ///
     /// ```json
     /// {
@@ -1883,7 +1949,7 @@ mod tests {
     ///   ]
     /// }
     /// ```
-    fn build_iceberg_compat_v3_test_schema() -> SchemaRef {
+    fn build_iceberg_compat_test_schema() -> SchemaRef {
         let with_metadata =
             build_complex_nested_kernel_schema(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
         let complex = StripFieldMetadataTransform
@@ -1934,7 +2000,7 @@ mod tests {
         #[case] extra_props: &[(&str, &str)],
         #[case] expected_features: &[TableFeature],
     ) {
-        let schema = build_iceberg_compat_v3_test_schema();
+        let schema = build_iceberg_compat_test_schema();
         let mut props: HashMap<String, String> =
             HashMap::from([(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string())]);
         for (k, v) in extra_props {
@@ -2110,7 +2176,7 @@ mod tests {
     /// applied per the explicit property, but no nested ids are set on Array/Map fields.
     #[test]
     fn test_create_table_v3_supported_but_not_enabled_skips_nested_ids() {
-        let schema = build_iceberg_compat_v3_test_schema();
+        let schema = build_iceberg_compat_test_schema();
         let mut validated = validate_extract_table_features_and_properties(HashMap::from([
             (
                 "delta.feature.icebergCompatV3".to_string(),
@@ -2142,6 +2208,168 @@ mod tests {
             !top.metadata()
                 .contains_key(ColumnMetadataKey::ParquetFieldNestedIds.as_ref()),
             "top should not carry parquet.field.nested.ids when V3 is not enabled",
+        );
+    }
+
+    /// V2 create-table flow: IcebergCompatV2 must assign nested ids for Array/Map fields.
+    #[test]
+    fn test_create_table_iceberg_compat_v2() {
+        let schema = build_iceberg_compat_test_schema();
+        let props: HashMap<String, String> =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string())]);
+        let mut validated = validate_extract_table_features_and_properties(props).unwrap();
+
+        maybe_enable_iceberg_compat_v2_dependencies(&mut validated).unwrap();
+        assert_eq!(
+            validated
+                .properties
+                .get(COLUMN_MAPPING_MODE)
+                .map(String::as_str),
+            Some("name"),
+        );
+        assert_eq!(validated.properties.get(ENABLE_ROW_TRACKING), None);
+
+        // Column mapping + nested-id assignment
+        let (effective_schema, mode) =
+            maybe_apply_column_mapping_for_table_create(&schema, &mut validated).unwrap();
+        assert_eq!(mode, ColumnMappingMode::Name);
+
+        let top = effective_schema.field("top").expect("missing top");
+        let top_physical = expect_field_id_and_physical_name(top, 1);
+        assert_eq!(
+            extract_nested_ids(top),
+            serde_json::json!({
+                format!("{top_physical}.key"): 4,
+                format!("{top_physical}.key.element"): 5,
+                format!("{top_physical}.value"): 6,
+            }),
+            "top's nested-ids JSON",
+        );
+
+        let DataType::Map(top_map) = top.data_type() else {
+            panic!("top must be a map");
+        };
+        let DataType::Struct(value_struct) = top_map.value_type() else {
+            panic!("top's value must be a struct");
+        };
+        let inner = value_struct.fields().next().expect("missing inner");
+        let inner_physical = expect_field_id_and_physical_name(inner, 2);
+        assert_eq!(
+            extract_nested_ids(inner),
+            serde_json::json!({
+                format!("{inner_physical}.key"): 7,
+                format!("{inner_physical}.value"): 8,
+                format!("{inner_physical}.value.element"): 9,
+            }),
+            "inner's nested-ids JSON",
+        );
+
+        // IcebergCompatV2 + ColumnMapping only
+        maybe_enable_invariants(&effective_schema, &mut validated);
+        maybe_auto_enable_property_driven_features(&mut validated);
+        for f in [TableFeature::IcebergCompatV2, TableFeature::ColumnMapping] {
+            assert!(
+                validated.writer_features.contains(&f) || validated.reader_features.contains(&f),
+                "expected {f:?} in protocol features (writer={:?}, reader={:?})",
+                validated.writer_features,
+                validated.reader_features,
+            );
+        }
+        assert!(
+            !validated
+                .writer_features
+                .contains(&TableFeature::RowTracking),
+            "V2 must not auto-add RowTracking",
+        );
+    }
+
+    /// V2 dependency resolution defaults `delta.columnMapping.mode` to `name` when absent and
+    /// accepts an explicit `name`/`id`.
+    #[rstest]
+    #[case::default_to_name(&[], Some("name"))]
+    #[case::name_ok(&[(COLUMN_MAPPING_MODE, "name")], Some("name"))]
+    #[case::id_ok(&[(COLUMN_MAPPING_MODE, "id")], Some("id"))]
+    fn test_v2_dependencies_sets_column_mapping(
+        #[case] extra_props: &[(&str, &str)],
+        #[case] expected_cm: Option<&str>,
+    ) {
+        let mut properties: HashMap<String, String> =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string())]);
+        for (k, v) in extra_props {
+            properties.insert(k.to_string(), v.to_string());
+        }
+        let mut validated = ValidatedTableProperties {
+            properties,
+            reader_features: Vec::new(),
+            writer_features: Vec::new(),
+        };
+        maybe_enable_iceberg_compat_v2_dependencies(&mut validated).unwrap();
+        assert_eq!(
+            validated
+                .properties
+                .get(COLUMN_MAPPING_MODE)
+                .map(String::as_str),
+            expected_cm,
+        );
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::ColumnMapping)
+                && validated
+                    .writer_features
+                    .contains(&TableFeature::ColumnMapping)
+        );
+    }
+
+    #[test]
+    fn test_v2_support_adds_column_mapping_support_without_enabling_mode() {
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: Vec::new(),
+            writer_features: vec![TableFeature::IcebergCompatV2],
+        };
+
+        maybe_enable_iceberg_compat_v2_dependencies(&mut validated).unwrap();
+
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::ColumnMapping)
+                && validated
+                    .writer_features
+                    .contains(&TableFeature::ColumnMapping)
+        );
+        assert!(!validated.properties.contains_key(COLUMN_MAPPING_MODE));
+    }
+
+    /// Property combinations that violate V2's dependency requirements must be rejected by
+    /// `maybe_enable_iceberg_compat_v2_dependencies`.
+    #[rstest]
+    #[case::cm_mode_none(&[(COLUMN_MAPPING_MODE, "none")], "delta.columnMapping.mode")]
+    #[case::v1_concurrent(&[(ENABLE_ICEBERG_COMPAT_V1, "true")], "delta.enableIcebergCompatV1")]
+    #[case::v3_concurrent(&[(ENABLE_ICEBERG_COMPAT_V3, "true")], "delta.enableIcebergCompatV3")]
+    #[case::deletion_vectors_enabled(
+        &[(ENABLE_DELETION_VECTORS, "true")],
+        "delta.enableDeletionVectors",
+    )]
+    fn test_v2_dependencies_rejects_invalid_combinations(
+        #[case] extra_props: &[(&str, &str)],
+        #[case] expected_substring: &str,
+    ) {
+        let mut properties: HashMap<String, String> =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string())]);
+        for (k, v) in extra_props {
+            properties.insert(k.to_string(), v.to_string());
+        }
+        let mut validated = ValidatedTableProperties {
+            properties,
+            reader_features: Vec::new(),
+            writer_features: Vec::new(),
+        };
+        let err = maybe_enable_iceberg_compat_v2_dependencies(&mut validated).unwrap_err();
+        assert!(
+            err.to_string().contains(expected_substring),
+            "expected error mentioning '{expected_substring}', got: {err}",
         );
     }
 

@@ -175,8 +175,8 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///
     /// # Errors
     ///
-    /// - The table enables `icebergCompatV3` or `allowColumnDefaults`, which ALTER TABLE does not
-    ///   yet support
+    /// - The table enables `icebergCompatV2`, `icebergCompatV3`, or `allowColumnDefaults`, which
+    ///   ALTER TABLE does not yet support
     /// - Any individual operation fails validation (see per-method errors above)
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
@@ -187,12 +187,14 @@ impl AlterTableTransactionBuilder<Modifying> {
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
-        // We don't support ALTER TABLE on tables with icebergCompatV3 enabled yet. See
-        // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
-        if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            return Err(Error::unsupported(
-                "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
-            ));
+        let unsupported_iceberg_compat =
+            [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
+                .into_iter()
+                .find(|feature| table_config.is_feature_enabled(feature));
+        if let Some(feature) = unsupported_iceberg_compat {
+            return Err(Error::unsupported(format!(
+                "ALTER TABLE is not yet supported on tables with {feature} enabled"
+            )));
         }
         // TODO(#2630): Support ALTER TABLE on tables with column defaults.
         if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
