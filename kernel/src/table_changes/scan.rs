@@ -173,13 +173,13 @@ impl TableChangesScan {
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
             PhysicalPredicate::None => None,
         };
-        let schema = self.table_changes.end_snapshot.schema();
         let it = table_changes_action_iter(
             engine,
             &self.table_changes.start_table_config,
+            &self.table_changes.read_configuration,
             commits,
-            schema,
             physical_predicate,
+            CdfMode::ChangeDataFeed,
         )?;
         Ok(Some(it).into_iter().flatten())
     }
