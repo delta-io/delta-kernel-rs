@@ -905,6 +905,24 @@ impl CommitInfo {
     }
 }
 
+/// Identifies the location of a file's existing entry within the adaptive metadata tree, pointing
+/// at a specific position in a leaf manifest.
+///
+/// A back reference lets a writer locate (and construct materialized deletion vectors from) an
+/// existing tree entry without scanning entire leaf manifests. It is meaningful only relative to a
+/// specific tree version. See the [Iceberg V4 metadata RFC].
+///
+/// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(test, derive(Serialize, Deserialize), serde(rename_all = "camelCase"))]
+pub(crate) struct BackReference {
+    /// Path to the leaf manifest containing this file, relative to the table root
+    /// (e.g. `metadata/leaf-m1.parquet`).
+    pub(crate) manifest: String,
+    /// Row position (0-indexed) of the file entry within the manifest.
+    pub(crate) pos: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(
     test,
@@ -973,6 +991,11 @@ pub(crate) struct Add {
     /// The name of the clustering implementation
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub clustering_provider: Option<String>,
+
+    /// Back reference into the adaptive metadata tree. Present only when this `add` re-adds a file
+    /// that has no paired `remove` (e.g. stats backfilling); otherwise absent.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) back_reference: Option<BackReference>,
 }
 
 impl Add {
@@ -1046,6 +1069,12 @@ pub(crate) struct Remove {
     /// First commit version in which an add action with the same path was committed to the table.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) default_row_commit_version: Option<i64>,
+
+    /// Back reference into the adaptive metadata tree. Required when the file's entry lives in a
+    /// leaf manifest; absent when the file has no leaf-manifest entry (it has no entry in the
+    /// tree, or its entry is inline in the root manifest).
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) back_reference: Option<BackReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -1785,6 +1814,7 @@ mod tests {
                 nullable "baseRowId": LONG,
                 nullable "defaultRowCommitVersion": LONG,
                 nullable "clusteringProvider": STRING,
+                nullable "backReference": (BackReference::to_schema()),
             },
         };
         assert_eq!(schema, expected);
@@ -1835,6 +1865,7 @@ mod tests {
                 (deletion_vector_field()),
                 nullable "baseRowId": LONG,
                 nullable "defaultRowCommitVersion": LONG,
+                nullable "backReference": (BackReference::to_schema()),
             },
         };
         assert_eq!(schema, expected);

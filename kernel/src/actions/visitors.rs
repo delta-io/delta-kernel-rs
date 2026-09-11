@@ -80,6 +80,9 @@ pub(crate) static PROTOCOL_LEAVES: LazyLock<ColumnNamesAndTypes> =
 /// Number of leaf getters that make up a deletion vector descriptor.
 const DELETION_VECTOR_GETTER_COUNT: usize = 5;
 
+/// Number of leaf getters that make up a back reference (`manifest`, `pos`).
+const BACK_REFERENCE_GETTER_COUNT: usize = 2;
+
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct ProtocolVisitor {
@@ -117,7 +120,7 @@ impl AddVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Add> {
         require!(
-            getters.len() == 15,
+            getters.len() == 17,
             Error::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
@@ -139,6 +142,8 @@ impl AddVisitor {
         let clustering_provider: Option<String> =
             getters[14].get_opt(row_index, "add.clustering_provider")?;
 
+        let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
+
         Ok(Add {
             path,
             partition_values,
@@ -151,6 +156,7 @@ impl AddVisitor {
             base_row_id,
             default_row_commit_version,
             clustering_provider,
+            back_reference,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -191,7 +197,7 @@ impl RemoveVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
         require!(
-            getters.len() == 15,
+            getters.len() == 17,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
@@ -216,6 +222,8 @@ impl RemoveVisitor {
         let default_row_commit_version: Option<i64> =
             getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
+        let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
+
         Ok(Remove {
             path,
             data_change,
@@ -228,6 +236,7 @@ impl RemoveVisitor {
             deletion_vector,
             base_row_id,
             default_row_commit_version,
+            back_reference,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -552,6 +561,29 @@ pub(crate) fn visit_deletion_vector_at<'a>(
             size_in_bytes,
             cardinality,
         }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Get a back reference out of some engine data. The caller slices `getters` so it starts with the
+/// back-reference leaves, beginning at `manifest`. Returns `Ok(None)` when no back reference is
+/// present (its required `manifest` field is absent).
+pub(crate) fn visit_back_reference_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<BackReference>> {
+    if getters.len() < BACK_REFERENCE_GETTER_COUNT {
+        return Err(Error::InternalError(format!(
+            "Wrong number of BackReference getters: {}",
+            getters.len()
+        )));
+    }
+
+    let manifest_opt: Option<String> = getters[0].get_opt(row_index, "backReference.manifest")?;
+    if let Some(manifest) = manifest_opt {
+        let pos: i32 = getters[1].get(row_index, "backReference.pos")?;
+        Ok(Some(BackReference { manifest, pos }))
     } else {
         Ok(None)
     }
@@ -1475,6 +1507,91 @@ mod tests {
             remove.default_row_commit_version,
             Some(5),
             "default_row_commit_version mismatch - check getter index"
+        );
+
+        // No back reference in this commit.
+        assert_eq!(remove.back_reference, None, "back_reference mismatch");
+    }
+
+    #[rstest::rstest]
+    #[case::empty(0)]
+    #[case::too_few(1)]
+    fn visit_back_reference_rejects_too_few_getters(#[case] getter_count: usize) {
+        let null_getter = ();
+        let getters = vec![&null_getter as &dyn GetData<'_>; getter_count];
+
+        let err = visit_back_reference_at(0, &getters).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Wrong number of BackReference getters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_add_with_back_reference() {
+        let json_strings: StringArray = vec![
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":100,"modificationTime":1670892998135,"dataChange":true,"backReference":{"manifest":"_delta_log/_tree/leaf-0001.parquet","pos":7}}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+        let mut add_visitor = AddVisitor::default();
+        add_visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        assert_eq!(add_visitor.adds.len(), 1, "Expected exactly one add action");
+        assert_eq!(
+            add_visitor.adds[0].back_reference,
+            Some(BackReference {
+                manifest: "_delta_log/_tree/leaf-0001.parquet".to_string(),
+                pos: 7,
+            }),
+            "back_reference mismatch"
+        );
+    }
+
+    #[test]
+    fn test_parse_remove_with_back_reference() {
+        let json_strings: StringArray = vec![
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"remove":{"path":"part-00000.parquet","dataChange":true,"backReference":{"manifest":"_delta_log/_tree/leaf-0001.parquet","pos":7}}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+        let mut remove_visitor = RemoveVisitor::default();
+        remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "Expected exactly one remove action"
+        );
+        assert_eq!(
+            remove_visitor.removes[0].back_reference,
+            Some(BackReference {
+                manifest: "_delta_log/_tree/leaf-0001.parquet".to_string(),
+                pos: 7,
+            }),
+            "back_reference mismatch"
+        );
+    }
+
+    #[test]
+    fn visit_back_reference_with_manifest_but_missing_pos_errors() {
+        // `pos` is required whenever the back reference is present (the visitor uses `get`, not
+        // `get_opt`), so a present `manifest` with an absent `pos` must error rather than produce a
+        // half-populated `BackReference`.
+        let manifest: StringArray = vec!["_delta_log/_tree/leaf-0001.parquet"].into();
+        let pos = ();
+        let getters: &[&dyn GetData<'_>] = &[&manifest, &pos];
+
+        let err = visit_back_reference_at(0, getters).unwrap_err();
+        assert!(
+            err.to_string().contains("backReference.pos"),
+            "unexpected error: {err}"
         );
     }
 
