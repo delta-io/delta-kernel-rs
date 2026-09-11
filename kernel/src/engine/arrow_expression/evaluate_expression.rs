@@ -33,7 +33,7 @@ use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_RO
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::{parse_json_impl, prim_array_cmp};
+use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
@@ -559,22 +559,13 @@ fn cast_list_elements(
         },
     };
     let new_field = Arc::new(field.as_ref().clone().with_data_type(to_type));
-    let container = match (vals.data_type(), dir) {
-        (ArrowDataType::List(_), _) => ArrowDataType::List(new_field),
-        (ArrowDataType::LargeList(_), _) => ArrowDataType::LargeList(new_field),
-        (ArrowDataType::ListView(_), ViewCast::ToView) => ArrowDataType::ListView(new_field),
-        (ArrowDataType::ListView(_), ViewCast::ToNonView) => ArrowDataType::List(new_field),
-        (ArrowDataType::LargeListView(_), ViewCast::ToView) => {
-            ArrowDataType::LargeListView(new_field)
+    let container = list_type_with_element(vals.data_type(), new_field)?;
+    let container = match (container, dir) {
+        (ArrowDataType::ListView(field), ViewCast::ToNonView) => ArrowDataType::List(field),
+        (ArrowDataType::LargeListView(field), ViewCast::ToNonView) => {
+            ArrowDataType::LargeList(field)
         }
-        (ArrowDataType::LargeListView(_), ViewCast::ToNonView) => {
-            ArrowDataType::LargeList(new_field)
-        }
-        (dt, _) => {
-            return Err(Error::generic(format!(
-                "cast_list_elements: expected a list type, got {dt:?}"
-            )))
-        }
+        (container, _) => container,
     };
     Ok(cast(vals, &container)?)
 }
