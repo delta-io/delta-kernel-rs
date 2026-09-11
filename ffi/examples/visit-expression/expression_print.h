@@ -295,7 +295,11 @@ void print_tree_helper(ExpressionItem ref, int depth) {
     }
     case MapToStruct: {
       struct MapToStructExpr* m2s = ref.ref;
-      printf("MapToStruct\n");
+      if (m2s->timestamp_timezone == NULL) {
+        printf("MapToStruct\n");
+      } else {
+        printf("MapToStruct(timestamp_timezone=%s)\n", m2s->timestamp_timezone);
+      }
       print_expression_item_list(m2s->child_expr, depth + 1);
       break;
     }

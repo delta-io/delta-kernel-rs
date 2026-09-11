@@ -131,6 +131,7 @@ struct Column {
 };
 struct MapToStructExpr {
   ExpressionItemList child_expr;
+  char* timestamp_timezone;
 };
 struct BinaryData {
   uint8_t* buf;
@@ -428,9 +429,13 @@ void visit_unknown(void *data, uintptr_t sibling_list_id, struct KernelStringSli
 
 void visit_map_to_struct_expr(void* data,
                               uintptr_t sibling_list_id,
-                              uintptr_t child_list_id) {
+                              uintptr_t child_list_id,
+                              struct OptionalValueKernelStringSlice timestamp_timezone) {
   struct MapToStructExpr* m2s = malloc(sizeof(struct MapToStructExpr));
   m2s->child_expr = get_expr_list(data, child_list_id);
+  m2s->timestamp_timezone = timestamp_timezone.tag == SomeKernelStringSlice
+      ? allocate_string(timestamp_timezone.some)
+      : NULL;
   put_expr_item(data, sibling_list_id, m2s, MapToStruct);
 }
 
@@ -729,6 +734,7 @@ void free_expression_item(ExpressionItem ref) {
     case MapToStruct: {
       struct MapToStructExpr* m2s = ref.ref;
       free_expression_list(m2s->child_expr);
+      free(m2s->timestamp_timezone);
       free(m2s);
       break;
     }
