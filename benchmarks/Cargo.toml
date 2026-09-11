@@ -42,3 +42,7 @@ tempfile = "3"
 [[bench]]
 name = "workload_bench"
 harness = false
+
+[[bench]]
+name = "insert_bench"
+harness = false
