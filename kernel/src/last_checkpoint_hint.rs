@@ -109,9 +109,8 @@ pub(crate) enum HintAction {
 }
 
 impl LastCheckpointHint {
-    /// Reconstructs a checkpoint hint from its serialized fields. Caller-provided sidecar and
-    /// non-file-action arrays are preserved regardless of the bounds applied when parsing hints
-    /// from disk.
+    /// Reconstructs a checkpoint hint from its serialized fields, dropping oversized sidecar and
+    /// non-file-action arrays so the retained hint is always bounded.
     ///
     /// # Errors
     ///
@@ -143,7 +142,8 @@ impl LastCheckpointHint {
             checksum,
             tags,
             v2_checkpoint,
-        })
+        }
+        .drop_oversized_fields())
     }
 
     /// Whether this hint describes the checkpoint a log segment selected, given that segment's
@@ -176,7 +176,8 @@ impl LastCheckpointHint {
     }
 
     /// Parses a hint from raw `_last_checkpoint` bytes, dropping oversized fields so the retained
-    /// hint is always bounded.
+    /// hint is always bounded. This is the only way to construct a hint from disk, so callers can
+    /// never hold an untrimmed one.
     fn from_bytes_with_oversized_fields_dropped(bytes: &[u8]) -> serde_json::Result<Self> {
         let hint: Self = serde_json::from_slice(bytes)?;
         Ok(hint.drop_oversized_fields())
@@ -534,9 +535,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::at_disk_threshold(30)]
-    #[case::above_disk_threshold(31)]
-    fn reconstructed_hint_preserves_embedded_fields(#[case] count: usize) {
+    #[case::at_threshold(30, Some(30))]
+    #[case::above_threshold(31, None)]
+    fn reconstructed_hint_bounds_embedded_fields(
+        #[case] count: usize,
+        #[case] expected_count: Option<usize>,
+    ) {
         let sidecar = Sidecar::new("s.parquet".to_string(), 1, 0, None);
         let action = HintAction::Protocol(Protocol::default());
         let hint = LastCheckpointHint::from_parts(
@@ -558,8 +562,30 @@ mod tests {
         )
         .unwrap();
         let v2 = hint.v2_checkpoint.unwrap();
-        assert_eq!(v2.sidecar_files.unwrap().len(), count);
-        assert_eq!(v2.non_file_actions.unwrap().len(), count);
+        assert_eq!(v2.sidecar_files.as_ref().map(Vec::len), expected_count);
+        assert_eq!(v2.non_file_actions.as_ref().map(Vec::len), expected_count);
+    }
+
+    #[test]
+    fn reconstructed_hint_validates_checkpoint_schema() {
+        let schema = r#"{"type":"struct","fields":[]}"#.to_string();
+        let hint =
+            LastCheckpointHint::from_parts(1, 1, None, None, None, Some(schema), None, None, None)
+                .unwrap();
+        assert!(hint.checkpoint_schema.is_some());
+
+        assert!(LastCheckpointHint::from_parts(
+            1,
+            1,
+            None,
+            None,
+            None,
+            Some("not a schema".to_string()),
+            None,
+            None,
+            None,
+        )
+        .is_err());
     }
 
     /// Returns the single `actions` element matching `extract`, asserting there is exactly one.

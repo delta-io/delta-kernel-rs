@@ -11,6 +11,8 @@
 
 use std::collections::HashMap;
 
+use delta_kernel_derive::internal_api;
+
 use super::file_stats::FileStats;
 use crate::actions::{DomainMetadata, SetTransaction};
 use crate::{DeltaResult, Error};
@@ -101,7 +103,8 @@ impl DomainMetadataState {
     /// # Errors
     ///
     /// Returns an error when an action is a tombstone or a domain occurs more than once.
-    pub fn try_complete(values: Vec<DomainMetadata>) -> DeltaResult<Self> {
+    #[internal_api]
+    pub(crate) fn try_complete(values: Vec<DomainMetadata>) -> DeltaResult<Self> {
         let mut domains = HashMap::with_capacity(values.len());
         for action in values {
             if action.is_removed() {
@@ -173,7 +176,8 @@ impl SetTransactionState {
     /// # Errors
     ///
     /// Returns an error when an application identifier occurs more than once.
-    pub fn try_complete(values: Vec<SetTransaction>) -> DeltaResult<Self> {
+    #[internal_api]
+    pub(crate) fn try_complete(values: Vec<SetTransaction>) -> DeltaResult<Self> {
         let mut transactions = HashMap::with_capacity(values.len());
         for transaction in values {
             let app_id = transaction.app_id.clone();

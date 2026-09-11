@@ -103,88 +103,20 @@ pub struct Crc {
     pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
 }
 
-/// Typed fields used to reconstruct a CRC from connector-provided state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[internal_api]
-pub(crate) struct ReconstructedCrc {
-    /// Table version described by the CRC.
-    version: Version,
-    /// Metadata active at `version`.
-    metadata: Metadata,
-    /// Protocol active at `version`.
-    protocol: Protocol,
-    /// Complete file statistics at `version`.
-    file_stats: FileStats,
-    /// In-commit timestamp for `version`, when enabled by the table state.
-    in_commit_timestamp_opt: Option<i64>,
-    /// Explicit completeness state for active set-transaction actions.
-    set_transaction_state: SetTransactionState,
-    /// Explicit completeness state for active domain-metadata actions.
-    domain_metadata_state: DomainMetadataState,
-}
-
-/// File-statistics fields supplied while reconstructing a CRC.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[internal_api]
-pub(crate) struct ReconstructedFileStats {
-    /// Number of active files.
-    pub num_files: i64,
-    /// Total size of all active files in bytes.
-    pub table_size_bytes: i64,
-    /// Optional size distribution of active files.
-    pub file_size_histogram: Option<FileSizeHistogram>,
-}
-
-impl ReconstructedCrc {
-    /// Groups reconstructed CRC fields while preserving explicit completeness states.
+impl Crc {
+    /// Creates a CRC from validated, complete file statistics.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn new(
+    pub(crate) fn new_complete(
         version: Version,
         metadata: Metadata,
         protocol: Protocol,
-        file_stats: ReconstructedFileStats,
+        file_stats: FileStats,
         in_commit_timestamp_opt: Option<i64>,
         set_transaction_state: SetTransactionState,
         domain_metadata_state: DomainMetadataState,
     ) -> Self {
         Self {
-            version,
-            metadata,
-            protocol,
-            file_stats: FileStats {
-                num_files: file_stats.num_files,
-                table_size_bytes: file_stats.table_size_bytes,
-                file_size_histogram: file_stats.file_size_histogram,
-            },
-            in_commit_timestamp_opt,
-            set_transaction_state,
-            domain_metadata_state,
-        }
-    }
-}
-
-impl Crc {
-    /// Creates a validated CRC with complete file statistics from reconstructed state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for negative file totals or an invalid or inconsistent file-size
-    /// histogram.
-    #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn try_new_complete(parts: ReconstructedCrc) -> DeltaResult<Self> {
-        let ReconstructedCrc {
-            version,
-            metadata,
-            protocol,
-            file_stats,
-            in_commit_timestamp_opt,
-            set_transaction_state,
-            domain_metadata_state,
-        } = parts;
-        let file_stats = validate_reconstructed_file_stats(file_stats)?;
-        Ok(Self {
             version,
             metadata,
             protocol,
@@ -197,7 +129,7 @@ impl Crc {
             num_deleted_records_opt: None,
             num_deletion_vectors_opt: None,
             deleted_record_counts_histogram_opt: None,
-        })
+        }
     }
 
     /// Returns absolute file-level statistics only if `file_stats_state` is `Complete`.
@@ -215,74 +147,6 @@ impl Crc {
     pub fn file_stats_state(&self) -> &FileStatsState {
         &self.file_stats_state
     }
-}
-
-/// Creates a validated histogram for reconstructed CRC state.
-///
-/// The three arrays contain bin boundaries, file counts, and byte totals, respectively.
-///
-/// # Errors
-///
-/// Returns an error when the arrays do not describe a valid histogram shape.
-#[internal_api]
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-pub(crate) fn try_new_file_size_histogram(
-    sorted_bin_boundaries: Vec<i64>,
-    file_counts: Vec<i64>,
-    total_bytes: Vec<i64>,
-) -> DeltaResult<FileSizeHistogram> {
-    FileSizeHistogram::try_new(sorted_bin_boundaries, file_counts, total_bytes)
-}
-
-fn validate_reconstructed_file_stats(file_stats: FileStats) -> DeltaResult<FileStats> {
-    for (name, value) in [
-        ("numFiles", file_stats.num_files),
-        ("tableSizeBytes", file_stats.table_size_bytes),
-    ] {
-        if value < 0 {
-            return Err(Error::generic(format!(
-                "CRC has invalid {name}: expected a non-negative value, got {value}"
-            )));
-        }
-    }
-    let file_size_histogram = file_stats
-        .file_size_histogram
-        .map(|histogram| {
-            let histogram = histogram.check_non_negative()?;
-            let file_count = histogram
-                .file_counts()
-                .iter()
-                .try_fold(0_i64, |sum, count| {
-                    sum.checked_add(*count)
-                        .ok_or_else(|| Error::internal_error("Histogram file count overflow"))
-                })?;
-            let total_bytes = histogram
-                .total_bytes()
-                .iter()
-                .try_fold(0_i64, |sum, bytes| {
-                    sum.checked_add(*bytes)
-                        .ok_or_else(|| Error::internal_error("Histogram total bytes overflow"))
-                })?;
-            if file_count != file_stats.num_files {
-                return Err(Error::internal_error(format!(
-                    "Histogram file count {file_count} does not match numFiles {}",
-                    file_stats.num_files
-                )));
-            }
-            if total_bytes != file_stats.table_size_bytes {
-                return Err(Error::internal_error(format!(
-                    "Histogram total bytes {total_bytes} does not match tableSizeBytes {}",
-                    file_stats.table_size_bytes
-                )));
-            }
-            Ok(histogram)
-        })
-        .transpose()
-        .map_err(|error: Error| Error::generic(error.to_string()))?;
-    Ok(FileStats {
-        file_size_histogram,
-        ..file_stats
-    })
 }
 
 /// Refuses to serialize a degraded (non-`Complete`) CRC, so an invalid state can never
@@ -504,7 +368,7 @@ mod tests {
 
     use super::{
         Crc, CrcRaw, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState,
-        ReconstructedCrc, ReconstructedFileStats, SetTransactionState,
+        SetTransactionState,
     };
     use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
     use crate::table_features::TableFeature;
@@ -536,15 +400,12 @@ mod tests {
         transactions: Option<Vec<SetTransaction>>,
         domains: Option<Vec<DomainMetadata>>,
     ) -> Result<Crc, Error> {
-        Crc::try_new_complete(ReconstructedCrc::new(
+        let file_stats = FileStats::try_new(0, 0, histogram)?;
+        Ok(Crc::new_complete(
             0,
             Metadata::default(),
             valid_protocol(),
-            ReconstructedFileStats {
-                num_files: 0,
-                table_size_bytes: 0,
-                file_size_histogram: histogram,
-            },
+            file_stats,
             None,
             transactions
                 .map(SetTransactionState::try_complete)
@@ -1114,15 +975,17 @@ mod tests {
         )
     }
 
-    /// Both the Delta spec field name and the legacy Delta-Spark name must deserialize.
+    /// Both valid histogram shapes and the accepted field names must deserialize.
     #[rstest]
-    #[case::spec_name("fileSizeHistogram")]
-    #[case::legacy_name("histogramOpt")]
-    fn de_valid_file_size_histogram_succeeds(#[case] field_name: &str) {
-        let json = crc_json_with_histogram(
-            field_name,
-            r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [1, 2, 3], "totalBytes": [10, 200, 300]}"#,
-        );
+    fn de_valid_file_size_histogram_succeeds(
+        #[values("fileSizeHistogram", "histogramOpt")] field_name: &str,
+        #[values(
+            r#"{"sortedBinBoundaries": [0], "fileCounts": [0], "totalBytes": [0]}"#,
+            r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [1, 2, 3], "totalBytes": [10, 200, 300]}"#
+        )]
+        histogram_json: &str,
+    ) {
+        let json = crc_json_with_histogram(field_name, histogram_json);
         let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
         assert!(crc.file_stats().unwrap().file_size_histogram().is_some());
     }
@@ -1147,9 +1010,6 @@ mod tests {
     )]
     #[case::mismatched_lengths(
         r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [0], "totalBytes": [0, 0]}"#
-    )]
-    #[case::single_boundary(
-        r#"{"sortedBinBoundaries": [0], "fileCounts": [0], "totalBytes": [0]}"#
     )]
     fn de_malformed_file_size_histogram_returns_error(
         #[case] histogram_json: &str,

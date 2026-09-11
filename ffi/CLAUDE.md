@@ -64,8 +64,8 @@ Snapshot builder API (`ffi/src/lib.rs`):
 - `snapshot_builder_snapshot_hint_begin(builder, version, freshness)` -- optional: begin a
   complete typed snapshot hint
 - `snapshot_builder_snapshot_hint_set_*` -- copy the hint's log paths, protocol, metadata, and
-  optional checkpoint or CRC state into the builder. Snapshot hints accept commit and checkpoint
-  paths, but not log compaction paths
+  optional checkpoint or CRC state into the builder. Log paths may name published or staged
+  commits, checkpoint files, or CRC files; log compaction paths are rejected
 - `snapshot_builder_snapshot_hint_finish(builder)` -- install a structurally complete hint;
   cross-component and table validation occurs when the builder is built. A failed finish consumes
   the in-progress visitor, so call `snapshot_builder_snapshot_hint_begin` before retrying

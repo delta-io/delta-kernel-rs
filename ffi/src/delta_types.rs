@@ -5,40 +5,13 @@ use std::collections::HashMap;
 use delta_kernel::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use delta_kernel::crc::{try_new_file_size_histogram, FileSizeHistogram};
+use delta_kernel::crc::{FileSizeHistogram, FileStats};
 use delta_kernel::{DeltaResult, Error};
 
-use crate::{KernelStringSlice, TryFromStringSlice};
+use crate::{KernelI64Slice, KernelStringSlice, OptionalValue, TryFromStringSlice};
 
 /// Maps invalid pointer or array layouts to an error appropriate for the calling FFI API.
 pub(crate) type InvalidInput = fn(String) -> Error;
-
-/// Borrowed optional UTF-8 string.
-#[repr(C)]
-pub struct FfiOptionalString {
-    /// Whether `value` is present.
-    pub has_value: bool,
-    /// Borrowed string value. Ignored when `has_value` is false.
-    pub value: KernelStringSlice,
-}
-
-/// Borrowed optional signed 64-bit integer.
-#[repr(C)]
-pub struct FfiOptionalI64 {
-    /// Whether `value` is present.
-    pub has_value: bool,
-    /// Integer value. Ignored when `has_value` is false.
-    pub value: i64,
-}
-
-/// Borrowed optional unsigned 64-bit integer.
-#[repr(C)]
-pub struct FfiOptionalU64 {
-    /// Whether `value` is present.
-    pub has_value: bool,
-    /// Integer value. Ignored when `has_value` is false.
-    pub value: u64,
-}
 
 /// Borrowed array of UTF-8 strings.
 #[repr(C)]
@@ -47,15 +20,6 @@ pub struct FfiStringArray {
     pub ptr: *const KernelStringSlice,
     /// Number of strings in the array.
     pub len: usize,
-}
-
-/// Borrowed optional array of UTF-8 strings.
-#[repr(C)]
-pub struct FfiOptionalStringArray {
-    /// Whether the array is present. A present empty array differs from an absent array.
-    pub has_value: bool,
-    /// Borrowed array value. Ignored when `has_value` is false.
-    pub value: FfiStringArray,
 }
 
 /// One borrowed UTF-8 map entry.
@@ -76,24 +40,6 @@ pub struct FfiStringMap {
     pub len: usize,
 }
 
-/// Borrowed optional UTF-8 map.
-#[repr(C)]
-pub struct FfiOptionalStringMap {
-    /// Whether the map is present. A present empty map differs from an absent map.
-    pub has_value: bool,
-    /// Borrowed map value. Ignored when `has_value` is false.
-    pub value: FfiStringMap,
-}
-
-/// Borrowed array of signed 64-bit integers.
-#[repr(C)]
-pub struct FfiI64Array {
-    /// Pointer to `len` integers, or null when `len` is zero.
-    pub ptr: *const i64,
-    /// Number of integers.
-    pub len: usize,
-}
-
 /// Borrowed Delta protocol state.
 #[repr(C)]
 pub struct FfiProtocol {
@@ -102,9 +48,9 @@ pub struct FfiProtocol {
     /// Minimum writer protocol version.
     pub min_writer_version: i32,
     /// Optional reader feature list.
-    pub reader_features: FfiOptionalStringArray,
+    pub reader_features: OptionalValue<FfiStringArray>,
     /// Optional writer feature list.
-    pub writer_features: FfiOptionalStringArray,
+    pub writer_features: OptionalValue<FfiStringArray>,
 }
 
 /// Borrowed Delta metadata state.
@@ -113,9 +59,9 @@ pub struct FfiMetadata {
     /// Table identifier.
     pub id: KernelStringSlice,
     /// Optional table name.
-    pub name: FfiOptionalString,
+    pub name: OptionalValue<KernelStringSlice>,
     /// Optional table description.
-    pub description: FfiOptionalString,
+    pub description: OptionalValue<KernelStringSlice>,
     /// Data format provider.
     pub format_provider: KernelStringSlice,
     /// Data format options.
@@ -125,7 +71,7 @@ pub struct FfiMetadata {
     /// Logical partition column names.
     pub partition_columns: FfiStringArray,
     /// Optional metadata creation time in milliseconds since the Unix epoch.
-    pub created_time: FfiOptionalI64,
+    pub created_time: OptionalValue<i64>,
     /// Table configuration entries.
     pub configuration: FfiStringMap,
 }
@@ -138,7 +84,7 @@ pub struct FfiSetTransaction {
     /// Application-specific transaction version.
     pub version: i64,
     /// Optional last-updated time in milliseconds since the Unix epoch.
-    pub last_updated: FfiOptionalI64,
+    pub last_updated: OptionalValue<i64>,
 }
 
 /// Borrowed Delta domain-metadata action.
@@ -158,7 +104,7 @@ pub struct FfiCheckpointMetadata {
     /// Checkpoint version.
     pub version: i64,
     /// Optional action tags.
-    pub tags: FfiOptionalStringMap,
+    pub tags: OptionalValue<FfiStringMap>,
 }
 
 /// Borrowed Delta checkpoint sidecar action.
@@ -171,18 +117,18 @@ pub struct FfiSidecar {
     /// Sidecar modification time in milliseconds since the Unix epoch.
     pub modification_time: i64,
     /// Optional sidecar tags.
-    pub tags: FfiOptionalStringMap,
+    pub tags: OptionalValue<FfiStringMap>,
 }
 
 /// Borrowed file-size histogram state.
 #[repr(C)]
 pub struct FfiFileSizeHistogram {
     /// Sorted lower boundary of every histogram bin.
-    pub sorted_bin_boundaries: FfiI64Array,
+    pub sorted_bin_boundaries: KernelI64Slice,
     /// File count in every histogram bin.
-    pub file_counts: FfiI64Array,
+    pub file_counts: KernelI64Slice,
     /// Total bytes in every histogram bin.
-    pub total_bytes: FfiI64Array,
+    pub total_bytes: KernelI64Slice,
 }
 
 /// Borrowed array of Delta checkpoint sidecar actions.
@@ -212,11 +158,14 @@ pub struct FfiDomainMetadataArray {
     pub len: usize,
 }
 
-pub(crate) fn optional_value<T>(
-    has_value: bool,
-    value: impl FnOnce() -> DeltaResult<T>,
-) -> DeltaResult<Option<T>> {
-    has_value.then(value).transpose()
+pub(crate) fn optional_value<T, U>(
+    value: &OptionalValue<T>,
+    map: impl FnOnce(&T) -> DeltaResult<U>,
+) -> DeltaResult<Option<U>> {
+    match value {
+        OptionalValue::Some(value) => map(value).map(Some),
+        OptionalValue::None => Ok(None),
+    }
 }
 
 pub(crate) unsafe fn raw_slice<'a, T>(
@@ -244,12 +193,14 @@ pub(crate) unsafe fn optional_array<T, U>(
     invalid_input: InvalidInput,
     map: impl FnMut(&T) -> DeltaResult<U>,
 ) -> DeltaResult<Option<Vec<U>>> {
-    optional_value(has_value, || {
-        unsafe { raw_slice(ptr, len, name, invalid_input) }?
-            .iter()
-            .map(map)
-            .collect()
-    })
+    has_value
+        .then(|| {
+            unsafe { raw_slice(ptr, len, name, invalid_input) }?
+                .iter()
+                .map(map)
+                .collect()
+        })
+        .transpose()
 }
 
 pub(crate) unsafe fn string(value: &KernelStringSlice) -> DeltaResult<String> {
@@ -257,12 +208,17 @@ pub(crate) unsafe fn string(value: &KernelStringSlice) -> DeltaResult<String> {
     Ok(value.to_string())
 }
 
-pub(crate) unsafe fn optional_string(value: &FfiOptionalString) -> DeltaResult<Option<String>> {
-    optional_value(value.has_value, || unsafe { string(&value.value) })
+pub(crate) unsafe fn optional_string(
+    value: &OptionalValue<KernelStringSlice>,
+) -> DeltaResult<Option<String>> {
+    optional_value(value, |value| unsafe { string(value) })
 }
 
-pub(crate) fn optional_i64(value: &FfiOptionalI64) -> Option<i64> {
-    value.has_value.then_some(value.value)
+pub(crate) fn optional_i64(value: &OptionalValue<i64>) -> Option<i64> {
+    match value {
+        OptionalValue::Some(value) => Some(*value),
+        OptionalValue::None => None,
+    }
 }
 
 pub(crate) unsafe fn strings(
@@ -276,12 +232,10 @@ pub(crate) unsafe fn strings(
 }
 
 pub(crate) unsafe fn optional_strings(
-    value: &FfiOptionalStringArray,
+    value: &OptionalValue<FfiStringArray>,
     invalid_input: InvalidInput,
 ) -> DeltaResult<Option<Vec<String>>> {
-    optional_value(value.has_value, || unsafe {
-        strings(&value.value, invalid_input)
-    })
+    optional_value(value, |value| unsafe { strings(value, invalid_input) })
 }
 
 pub(crate) unsafe fn string_map(
@@ -301,12 +255,10 @@ pub(crate) unsafe fn string_map(
 }
 
 pub(crate) unsafe fn optional_string_map(
-    value: &FfiOptionalStringMap,
+    value: &OptionalValue<FfiStringMap>,
     invalid_input: InvalidInput,
 ) -> DeltaResult<Option<HashMap<String, String>>> {
-    optional_value(value.has_value, || unsafe {
-        string_map(&value.value, invalid_input)
-    })
+    optional_value(value, |value| unsafe { string_map(value, invalid_input) })
 }
 
 pub(crate) unsafe fn protocol(
@@ -381,33 +333,32 @@ pub(crate) unsafe fn file_size_histogram(
     value: &FfiFileSizeHistogram,
     invalid_input: InvalidInput,
 ) -> DeltaResult<FileSizeHistogram> {
-    try_new_file_size_histogram(
+    let (boundaries_ptr, boundaries_len) = value.sorted_bin_boundaries.as_raw_parts();
+    let (counts_ptr, counts_len) = value.file_counts.as_raw_parts();
+    let (bytes_ptr, bytes_len) = value.total_bytes.as_raw_parts();
+    FileSizeHistogram::try_new(
         unsafe {
             raw_slice(
-                value.sorted_bin_boundaries.ptr,
-                value.sorted_bin_boundaries.len,
+                boundaries_ptr,
+                boundaries_len,
                 "integer array",
                 invalid_input,
             )
         }?
         .to_vec(),
-        unsafe {
-            raw_slice(
-                value.file_counts.ptr,
-                value.file_counts.len,
-                "integer array",
-                invalid_input,
-            )
-        }?
-        .to_vec(),
-        unsafe {
-            raw_slice(
-                value.total_bytes.ptr,
-                value.total_bytes.len,
-                "integer array",
-                invalid_input,
-            )
-        }?
-        .to_vec(),
+        unsafe { raw_slice(counts_ptr, counts_len, "integer array", invalid_input) }?.to_vec(),
+        unsafe { raw_slice(bytes_ptr, bytes_len, "integer array", invalid_input) }?.to_vec(),
     )
+}
+
+pub(crate) unsafe fn file_stats(
+    num_files: i64,
+    table_size_bytes: i64,
+    histogram: *const FfiFileSizeHistogram,
+    invalid_input: InvalidInput,
+) -> DeltaResult<FileStats> {
+    let histogram = (!histogram.is_null())
+        .then(|| unsafe { file_size_histogram(&*histogram, invalid_input) })
+        .transpose()?;
+    FileStats::try_new(num_files, table_size_bytes, histogram)
 }

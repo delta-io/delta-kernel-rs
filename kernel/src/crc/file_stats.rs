@@ -11,6 +11,8 @@
 
 use std::sync::LazyLock;
 
+use delta_kernel_derive::internal_api;
+
 use super::FileSizeHistogram;
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
@@ -37,6 +39,67 @@ pub struct FileStats {
 }
 
 impl FileStats {
+    /// Creates validated, complete file statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for negative file totals or an invalid or inconsistent file-size
+    /// histogram.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn try_new(
+        num_files: i64,
+        table_size_bytes: i64,
+        file_size_histogram: Option<FileSizeHistogram>,
+    ) -> DeltaResult<Self> {
+        for (name, value) in [
+            ("numFiles", num_files),
+            ("tableSizeBytes", table_size_bytes),
+        ] {
+            if value < 0 {
+                return Err(Error::generic(format!(
+                    "CRC has invalid {name}: expected a non-negative value, got {value}"
+                )));
+            }
+        }
+        let file_size_histogram = file_size_histogram
+            .map(|histogram| {
+                let histogram = histogram.check_non_negative()?;
+                let file_count = histogram.file_counts().iter().try_fold(
+                    0_i64,
+                    |sum, count| {
+                        sum.checked_add(*count)
+                            .ok_or_else(|| Error::internal_error("Histogram file count overflow"))
+                    },
+                )?;
+                let total_bytes = histogram.total_bytes().iter().try_fold(
+                    0_i64,
+                    |sum, bytes| {
+                        sum.checked_add(*bytes)
+                            .ok_or_else(|| Error::internal_error("Histogram total bytes overflow"))
+                    },
+                )?;
+                if file_count != num_files {
+                    return Err(Error::internal_error(format!(
+                        "Histogram file count {file_count} does not match numFiles {num_files}"
+                    )));
+                }
+                if total_bytes != table_size_bytes {
+                    return Err(Error::internal_error(format!(
+                        "Histogram total bytes {total_bytes} does not match tableSizeBytes {table_size_bytes}"
+                    )));
+                }
+                Ok(histogram)
+            })
+            .transpose()
+            .map_err(|error: Error| Error::generic(error.to_string()))?;
+        Ok(Self {
+            num_files,
+            table_size_bytes,
+            file_size_histogram,
+        })
+    }
+
     /// Returns the number of active [`Add`](crate::actions::Add) file actions in this table
     /// version.
     pub fn num_files(&self) -> i64 {

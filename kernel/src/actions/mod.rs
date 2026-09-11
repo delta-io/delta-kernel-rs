@@ -1171,7 +1171,7 @@ pub(crate) struct SetTransaction {
 }
 
 impl SetTransaction {
-    /// Creates a set-transaction action from snapshot hint state.
+    /// Creates a set-transaction action.
     #[internal_api]
     pub(crate) fn new(app_id: String, version: i64, last_updated: Option<i64>) -> Self {
         Self {
@@ -1549,7 +1549,7 @@ fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
 }
 
 impl Sidecar {
-    /// Creates a sidecar action from snapshot hint state.
+    /// Creates a sidecar action.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn new(
@@ -1601,7 +1601,7 @@ pub(crate) struct CheckpointMetadata {
 }
 
 impl CheckpointMetadata {
-    /// Creates checkpoint metadata from snapshot hint state.
+    /// Creates checkpoint metadata.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn new(version: i64, tags: Option<HashMap<String, String>>) -> Self {

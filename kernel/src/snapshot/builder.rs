@@ -79,13 +79,13 @@ pub(crate) struct SnapshotHint {
 impl SnapshotHint {
     /// Creates a hint from connector-provided log paths and table state.
     ///
-    /// The paths pass through the same classification logic used by storage listing. Snapshot
-    /// construction performs the remaining consistency and table-configuration validation.
+    /// The typed paths are sorted and grouped using the same checkpoint-selection logic as storage
+    /// listing. Snapshot construction performs the remaining consistency and table-configuration
+    /// validation.
     ///
     /// # Errors
     ///
-    /// Returns an error if the paths cannot be classified as supported Delta log files. Log
-    /// compaction paths are not supported by snapshot hints.
+    /// Returns [`SnapshotHintError::LogCompaction`] if any path is a compacted commit.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn try_new(
@@ -889,7 +889,9 @@ mod tests {
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::schema::schema_ref;
     use crate::table_features::TableFeature;
-    use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
+    use crate::table_properties::{
+        ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+    };
     use crate::unit_test_utils::{
         create_log_path, install_thread_local_metrics_reporter, CapturingReporter,
         TestCancellationToken,
@@ -986,14 +988,15 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_hint_sorts_caller_supplied_log_paths() -> DeltaResult<()> {
+    fn snapshot_hint_sorts_caller_supplied_log_paths() {
         let log_paths = [
             "memory:///_delta_log/00000000000000000001.json",
             "memory:///_delta_log/00000000000000000000.json",
         ]
         .into_iter()
         .map(|path| LogPath::try_new(create_log_path(path).location))
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<DeltaResult<Vec<_>>>()
+        .unwrap();
         let hint = SnapshotHint::try_new(
             1,
             log_paths,
@@ -1002,7 +1005,8 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
-        )?;
+        )
+        .unwrap();
 
         assert_eq!(
             hint.log_segment_files
@@ -1012,7 +1016,6 @@ mod tests {
                 .collect_vec(),
             vec![0, 1]
         );
-        Ok(())
     }
 
     #[rstest::rstest]
@@ -1334,16 +1337,34 @@ mod tests {
         missing_ict.protocol = protocol.clone();
         missing_ict.metadata = metadata.clone();
         missing_ict.crc = Some(Arc::new(Crc {
-            protocol,
-            metadata,
+            protocol: protocol.clone(),
+            metadata: metadata.clone(),
             in_commit_timestamp_opt: None,
+            ..matching_crc.clone()
+        }));
+
+        let mut partial_ict_enablement = missing_ict.clone();
+        let partial_metadata =
+            metadata.with_configuration_entry(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "5");
+        partial_ict_enablement.metadata = partial_metadata.clone();
+        partial_ict_enablement.crc = Some(Arc::new(Crc {
+            protocol,
+            metadata: partial_metadata,
+            in_commit_timestamp_opt: Some(1),
             ..matching_crc
         }));
+
         assert_hint_error(
             SnapshotBuilder::new_for(&table_root),
             missing_ict,
             engine.as_ref(),
             "ICT-enabled CRC is missing inCommitTimestamp",
+        );
+        assert_result_error_with_message(
+            SnapshotBuilder::new_for(&table_root)
+                .with_snapshot_hint(partial_ict_enablement)
+                .build(engine.as_ref()),
+            "enablement timestamp is missing",
         );
         Ok(())
     }

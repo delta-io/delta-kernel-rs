@@ -79,21 +79,19 @@ bool set_builder_opt(EngineBuilder* engine_builder, char* key, char* val)
 void compile_snapshot_hint_abi(const FfiProtocol* protocol)
 {
   KernelStringSlice string = { .ptr = NULL, .len = 0 };
-  FfiOptionalString optional_string = { .has_value = false, .value = string };
-  FfiOptionalI64 optional_i64 = { .has_value = false, .value = 0 };
-  FfiOptionalU64 optional_u64 = { .has_value = false, .value = 0 };
+  OptionalValueKernelStringSlice optional_string = { .tag = NoneKernelStringSlice };
+  OptionalValuei64 optional_i64 = { .tag = Nonei64 };
+  OptionalValueu64 optional_u64 = { .tag = Noneu64 };
   FfiStringArray string_array = { .ptr = NULL, .len = 0 };
-  FfiOptionalStringArray optional_string_array = {
-    .has_value = false,
-    .value = string_array,
+  OptionalValueFfiStringArray optional_string_array = {
+    .tag = NoneFfiStringArray,
   };
   FfiStringMapEntry string_map_entry = { .key = string, .value = string };
   FfiStringMap string_map = { .ptr = &string_map_entry, .len = 1 };
-  FfiOptionalStringMap optional_string_map = {
-    .has_value = false,
-    .value = string_map,
+  OptionalValueFfiStringMap optional_string_map = {
+    .tag = NoneFfiStringMap,
   };
-  FfiI64Array i64_array = { .ptr = NULL, .len = 0 };
+  KernelI64Slice i64_array = { .ptr = NULL, .len = 0 };
   FfiFileSizeHistogram histogram = {
     .sorted_bin_boundaries = i64_array,
     .file_counts = i64_array,
@@ -136,30 +134,30 @@ void compile_snapshot_hint_abi(const FfiProtocol* protocol)
     .modification_time = 0,
     .tags = optional_string_map,
   };
-  FfiSnapshotHintAction actions[] = {
+  FfiSnapshotHintV2Action actions[] = {
     {
-      .kind = SNAPSHOT_HINT_ACTION_METADATA,
+      .kind = SNAPSHOT_HINT_V2_ACTION_METADATA,
       .value = { .metadata = &metadata },
     },
     {
-      .kind = SNAPSHOT_HINT_ACTION_PROTOCOL,
+      .kind = SNAPSHOT_HINT_V2_ACTION_PROTOCOL,
       .value = { .protocol = &protocol_value },
     },
     {
-      .kind = SNAPSHOT_HINT_ACTION_TRANSACTION,
+      .kind = SNAPSHOT_HINT_V2_ACTION_TRANSACTION,
       .value = { .transaction = &transaction },
     },
     {
-      .kind = SNAPSHOT_HINT_ACTION_DOMAIN_METADATA,
+      .kind = SNAPSHOT_HINT_V2_ACTION_DOMAIN_METADATA,
       .value = { .domain_metadata = &domain_metadata },
     },
     {
-      .kind = SNAPSHOT_HINT_ACTION_CHECKPOINT_METADATA,
+      .kind = SNAPSHOT_HINT_V2_ACTION_CHECKPOINT_METADATA,
       .value = { .checkpoint_metadata = &checkpoint_metadata },
     },
   };
   FfiSidecarArray sidecar_array = { .ptr = &sidecar, .len = 1 };
-  FfiSnapshotHintActionArray action_array = {
+  FfiSnapshotHintV2ActionArray action_array = {
     .ptr = actions,
     .len = sizeof(actions) / sizeof(actions[0]),
   };

@@ -7,6 +7,7 @@
 //!
 //! [FileSizeHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#file-size-histogram-schema
 
+use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::require;
@@ -107,20 +108,18 @@ impl FileSizeHistogram {
     /// Creates a new histogram with the given arrays, after validation.
     ///
     /// Validates that:
-    /// - All arrays have the same length (>= 2)
+    /// - All arrays have the same non-zero length
     /// - The first boundary is 0
     /// - Boundaries are sorted in ascending order
+    #[internal_api]
     pub(crate) fn try_new(
         sorted_bin_boundaries: Vec<i64>,
         file_counts: Vec<i64>,
         total_bytes: Vec<i64>,
     ) -> DeltaResult<Self> {
         require!(
-            sorted_bin_boundaries.len() >= 2,
-            Error::internal_error(format!(
-                "sorted_bin_boundaries must have at least 2 elements, got {}",
-                sorted_bin_boundaries.len()
-            ))
+            !sorted_bin_boundaries.is_empty(),
+            Error::internal_error("sorted_bin_boundaries must not be empty")
         );
         require!(
             sorted_bin_boundaries[0] == 0,
@@ -303,17 +302,27 @@ mod tests {
         assert_eq!(hist.total_bytes, vec![0, 0, 0]);
     }
 
-    #[test]
-    fn try_new_valid_histogram() {
-        let hist = FileSizeHistogram::try_new(vec![0, 100], vec![5, 3], vec![200, 900]).unwrap();
-        assert_eq!(hist.sorted_bin_boundaries, vec![0, 100]);
-        assert_eq!(hist.file_counts, vec![5, 3]);
-        assert_eq!(hist.total_bytes, vec![200, 900]);
+    #[rstest]
+    #[case::single_bin(vec![0], vec![5], vec![200])]
+    #[case::multiple_bins(vec![0, 100], vec![5, 3], vec![200, 900])]
+    fn try_new_accepts_valid_histogram(
+        #[case] boundaries: Vec<i64>,
+        #[case] file_counts: Vec<i64>,
+        #[case] total_bytes: Vec<i64>,
+    ) {
+        let hist = FileSizeHistogram::try_new(
+            boundaries.clone(),
+            file_counts.clone(),
+            total_bytes.clone(),
+        )
+        .unwrap();
+        assert_eq!(hist.sorted_bin_boundaries, boundaries);
+        assert_eq!(hist.file_counts, file_counts);
+        assert_eq!(hist.total_bytes, total_bytes);
     }
 
     #[rstest]
-    #[case::empty_boundaries(vec![], vec![], vec![], "at least 2 elements")]
-    #[case::single_boundary(vec![0], vec![0], vec![0], "at least 2 elements")]
+    #[case::empty_boundaries(vec![], vec![], vec![], "must not be empty")]
     #[case::nonzero_first_boundary(vec![1, 100], vec![0, 0], vec![0, 0], "First boundary must be 0")]
     #[case::mismatched_array_lengths(vec![0, 100], vec![0], vec![0, 0], "same length")]
     #[case::unsorted_boundaries(vec![0, 200, 100], vec![0, 0, 0], vec![0, 0, 0], "strictly ascending")]

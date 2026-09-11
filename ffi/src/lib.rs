@@ -198,11 +198,11 @@ impl KernelBytesSlice {
     }
 }
 
-/// A non-owned slice of signed 64-bit integers intended for passing variable-length arrays from
-/// kernel to an engine callback.
+/// A non-owned slice of signed 64-bit integers intended for passing variable-length arrays across
+/// the FFI boundary.
 ///
-/// The pointed-to data is valid only for the duration of the callback receiving this value. The
-/// callback must copy any values it needs to retain after returning.
+/// The pointed-to data is valid only for the duration of the call or callback receiving this
+/// value. The receiver must copy any values it needs to retain after returning.
 #[repr(C)]
 pub struct KernelI64Slice {
     ptr: *const i64,
@@ -210,6 +210,11 @@ pub struct KernelI64Slice {
 }
 
 impl KernelI64Slice {
+    /// Returns the pointer and length without dereferencing the borrowed data.
+    pub(crate) fn as_raw_parts(&self) -> (*const i64, usize) {
+        (self.ptr, self.len)
+    }
+
     /// Creates a new integer slice from a source slice.
     ///
     /// # Safety
@@ -1209,9 +1214,10 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
     .into_extern_result(&engine_ref)
 }
 
-/// Sets an explicit target version on a snapshot builder. Without a snapshot hint, omission
-/// selects the latest listed table version. With a hint, omission uses the hinted version; an
-/// explicit version must match it or build returns `InvalidSnapshotHint`.
+/// Sets an explicit target version on a snapshot builder. When omitted, a hinted build uses the
+/// hinted version; an ordinary build uses `max_catalog_version` when configured, otherwise the
+/// latest listed version. A hint and explicit target must match or build returns
+/// `InvalidSnapshotHint`.
 ///
 /// # Safety
 ///

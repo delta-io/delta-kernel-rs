@@ -176,6 +176,15 @@ impl TableConfiguration {
         version: Version,
         logical_schema: SchemaRef,
     ) -> DeltaResult<Self> {
+        if let Some(metadata_field) = logical_schema
+            .fields()
+            .find(|field| field.is_metadata_column())
+        {
+            return Err(Error::Schema(format!(
+                "Table schema must not contain metadata columns. Found metadata column: '{}'",
+                metadata_field.name()
+            )));
+        }
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
@@ -934,13 +943,15 @@ impl TableConfiguration {
 mod test {
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{
-        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
+        column_name, schema, schema_ref, ColumnName, DataType, MetadataColumnSpec, SchemaRef,
+        StructField, StructType,
     };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -982,6 +993,21 @@ mod test {
             .try_build();
 
         assert_result_error_with_message(result, "Duplicate partition column: 'part'");
+    }
+
+    #[test]
+    fn table_configuration_rejects_metadata_columns_in_table_schema() {
+        let schema = StructType::try_new([StructField::create_metadata_column(
+            "row_index",
+            MetadataColumnSpec::RowIndex,
+        )])
+        .unwrap();
+        let result = MockTableConfigurationBuilder::new()
+            .with_schema(Arc::new(schema))
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
+            .try_build();
+
+        assert_result_error_with_message(result, "must not contain metadata columns");
     }
 
     #[test]
