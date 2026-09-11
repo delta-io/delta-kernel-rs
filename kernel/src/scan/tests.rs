@@ -821,6 +821,74 @@ fn test_scan_metadata_from_updates_typed_cache_with_new_commits() {
     assert_eq!(replayed_paths, fresh_paths);
 }
 
+#[test_log::test]
+fn test_scan_metadata_from_handles_cached_typed_stats_across_type_widening() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/type-widening/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    // Version 1 has one file where `int_long` is the Int32 value 2. Cache both its JSON and
+    // typed stats.
+    let version_one_snapshot = Snapshot::builder_for(url.clone())
+        .at_version(1)
+        .build(engine.as_ref())
+        .unwrap();
+    let version_one_scan = version_one_snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all())
+        .build()
+        .unwrap();
+    let cached_metadata: Vec<Box<dyn EngineData>> = version_one_scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| scan_files.apply_selection_vector().unwrap())
+        .try_collect()
+        .unwrap();
+
+    // Version 2 widens `int_long` to Int64 and adds a file whose value exceeds 1,000. A fresh
+    // scan therefore prunes the version 1 file and keeps only the new file.
+    let version_two_snapshot = Snapshot::builder_for(url)
+        .at_version(2)
+        .build(engine.as_ref())
+        .unwrap();
+    let predicate: PredicateRef = Arc::new(Pred::gt(col!("int_long"), lit(1_000i64)));
+    let stats_options = StatsOptions::struct_columns(vec![column_name!("int_long")]);
+    let fresh_scan = Arc::clone(&version_two_snapshot)
+        .scan_builder()
+        .with_predicate(predicate.clone())
+        .with_stats(stats_options.clone())
+        .build()
+        .unwrap();
+    let mut fresh_paths = get_files_for_scan(fresh_scan, engine.as_ref()).unwrap();
+    assert_eq!(fresh_paths.len(), 1);
+
+    // Incremental replay must either widen the cached Int32 stats to Int64 or safely fall back to
+    // its cached JSON stats.
+    let replay_scan = version_two_snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats(stats_options)
+        .build()
+        .unwrap();
+    let mut replayed_paths = Vec::new();
+    for metadata in replay_scan
+        .scan_metadata_from(engine.as_ref(), 1, cached_metadata, None)
+        .unwrap()
+    {
+        replayed_paths = metadata
+            .unwrap()
+            .visit_scan_files(replayed_paths, |paths, file| {
+                paths.push(file.path.to_string());
+            })
+            .unwrap();
+    }
+
+    // Compare exact files without depending on iterator order.
+    fresh_paths.sort_unstable();
+    replayed_paths.sort_unstable();
+    assert_eq!(replayed_paths, fresh_paths);
+}
+
 // reading v0 with 3 files.
 // updating to v1 with 3 more files added.
 #[test_log::test]
