@@ -13,7 +13,6 @@ The `create_table` function returns a builder that you configure and then commit
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -29,8 +28,8 @@ let schema = Arc::new(StructType::try_new([
 ])?);
 
 create_table(url.as_str(), schema, "my-app/1.0")
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .legacy_filesystem_commit(&engine)?;
 # Ok(())
 # }
 ```
@@ -96,7 +95,6 @@ You can set custom application properties on the table:
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -113,8 +111,8 @@ create_table(url.as_str(), schema, "my-app/1.0")
         ("myapp.version", "2.0"),
         ("myapp.owner", "data-team"),
     ])
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .legacy_filesystem_commit(&engine)?;
 # Ok(())
 # }
 ```
@@ -132,7 +130,6 @@ layout for queries that filter on the clustering columns:
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -150,8 +147,8 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0")
     .with_data_layout(DataLayout::clustered(["region", "timestamp"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .legacy_filesystem_commit(&engine)?;
 # Ok(())
 # }
 ```
@@ -188,7 +185,6 @@ entire directories when filtering on those columns.
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -207,8 +203,8 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0")
     .with_data_layout(DataLayout::partitioned(["year", "month"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .legacy_filesystem_commit(&engine)?;
 # Ok(())
 # }
 ```
@@ -240,17 +236,16 @@ features may additionally materialize them into the data files; see
 > either `DataLayout::partitioned()` or `DataLayout::clustered()`, but not both. Only the
 > last `with_data_layout()` call takes effect.
 
-## The Committer
+## Committing
 
-The `build()` method takes a `Box<dyn Committer>` that controls how the commit is
-persisted:
+The `build()` method returns a transaction. Choose how to persist the commit when you commit that
+transaction:
 
-- **`FileSystemCommitter`**: For standalone filesystem-based tables. Writes commit files
-  directly to `_delta_log/` using atomic put-if-absent. This is the default for most use
-  cases.
+- **`legacy_filesystem_commit()`**: For standalone filesystem-based tables. Writes commit files
+  directly to `_delta_log/` using atomic put-if-absent.
 
-- **Custom `Committer`**: For catalog-managed tables (e.g. Unity Catalog), you implement
-  the `Committer` trait to route commits through the catalog. See
+- **`legacy_commit()`**: Accepts a custom `Committer` for catalog-managed tables such as Unity
+  Catalog. See
   [Catalog-Managed Tables](../catalog_managed/overview.md).
 
 ## Handling the result
@@ -258,7 +253,7 @@ persisted:
 `commit()` returns a `CommitResult`:
 
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.legacy_filesystem_commit(&engine)? {
     CommitResult::CommittedTransaction(committed) => {
         println!("Created table at version {}", committed.commit_version());
     }

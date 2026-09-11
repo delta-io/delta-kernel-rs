@@ -4,24 +4,24 @@
 //! driver code launches the coroutine by polling the compiler-generated future that represents
 //! it. As with all async code, the task runs inside [`Future::poll`] and can invoke other functions
 //! as it goes. Async functions return futures that it polls in turn. When the coroutine needs to
-//! communicate with the connector, it creates and polls a special [`Wait`] future whose
-//! [`poll`](Wait::poll) method immediately returns [`Poll::Pending`]. That triggers a cascading
+//! communicate with the connector, it creates and polls a special `Wait` future whose `poll`
+//! method immediately returns [`Poll::Pending`]. That triggers a cascading
 //! unwind of all the parent `poll` invocations until control returns to the synchronous coroutine
 //! driver. The driver then returns the coroutine's request to the connector, along with a
 //! [`Resume`] closure. When the connector invokes the `Resume` with its response, the closure again
 //! polls the coroutine's future, which rebuilds the chain of `poll` calls back to
-//! [`Wait::poll`]. This time, that call returns [`Poll::Ready`] with the connector's response, and
+//! `Wait::poll`. This time, that call returns [`Poll::Ready`] with the connector's response, and
 //! execution continues until the coroutine either completes or suspends again.
 //!
-//! Because [`Poll::Pending`] does not carry a payload, the coroutine driver creates an [`Outbox`]
+//! Because [`Poll::Pending`] does not carry a payload, the coroutine driver creates an `Outbox`
 //! which it shares with the coroutine via a [`Channel`]. Whenever the coroutine needs to suspend,
-//! it creates an [`Exchange`] in [`Outbound`](ExchangeState::Outbound) state. It stores one
+//! it creates an `Exchange` in `Outbound` state. It stores one
 //! reference to the exchange in the outbox so the sync coroutine driver can access the request, and
-//! initializes a [`Wait`] instance with a second reference to the exchange. [`Wait::poll`] returns
-//! [`Poll::Pending`] because the exchange is still [`Outbound`](ExchangeState::Outbound), the async
+//! initializes a `Wait` instance with a second reference to the exchange. `Wait::poll` returns
+//! [`Poll::Pending`] because the exchange is still `Outbound`, the async
 //! poll stack unwinds, and the sync driver extracts the exchange from the outbox, leaving it empty
 //! again. When invoked, the [`Resume`] closure stores the connector's response in the exchange as
-//! [`Inbound`](ExchangeState::Inbound), the async poll stack builds back up, and [`Wait::poll`]
+//! `Inbound`, the async poll stack builds back up, and `Wait::poll`
 //! extracts the response from the exchange.
 use std::future::Future;
 use std::mem::ManuallyDrop;

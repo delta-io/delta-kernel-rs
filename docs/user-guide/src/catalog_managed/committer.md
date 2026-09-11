@@ -6,7 +6,7 @@ your catalog's staging and ratification logic. For filesystem-managed tables, th
 tables, you provide your own `Committer` that routes commits through your catalog.
 
 > [!WARNING]
-> Kernel rejects `FileSystemCommitter` on a catalog-managed table at `txn.commit()`
+> Kernel rejects `FileSystemCommitter` on a catalog-managed table at `txn.legacy_commit()`
 > time. You must provide a catalog committer before commit runs.
 
 Before reading this page, make sure you understand [Catalog-managed tables](./overview.md).

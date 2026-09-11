@@ -814,7 +814,7 @@ impl LogSegment {
         Ok(result.actions)
     }
 
-    /// Drives [`Self::read_actions`] through an [`Engine`].
+    /// Drives the coroutine-based action reader through an [`Engine`].
     #[internal_api]
     pub(crate) fn read_actions_with_engine(
         &self,

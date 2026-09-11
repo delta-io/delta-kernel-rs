@@ -155,7 +155,7 @@ A `Transaction` writes data to a table. It is built from a snapshot:
 
 ```rust,ignore
 let mut txn = snapshot                              // Arc<Snapshot>
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(&engine)?
     .with_operation("INSERT".to_string())
     .with_data_change(true);
 
@@ -163,7 +163,7 @@ let mut txn = snapshot                              // Arc<Snapshot>
 txn.add_files(file_metadata);
 
 // Commit atomically
-match txn.commit(&engine)? {
+match txn.legacy_filesystem_commit(&engine)? {
     CommitResult::CommittedTransaction(c) => println!("v{}", c.commit_version()),
     CommitResult::ConflictedTransaction(_) => { /* handle conflict */ }
     CommitResult::RetryableTransaction(_) => { /* retry */ }

@@ -58,6 +58,16 @@ impl<T> TransactionWithCommitter<T> {
     fn map_transaction<U>(self, f: impl FnOnce(T) -> U) -> TransactionWithCommitter<U> {
         TransactionWithCommitter::new(f(self.transaction), self.committer)
     }
+
+    fn try_map_transaction<U>(
+        self,
+        f: impl FnOnce(T) -> DeltaResult<U>,
+    ) -> DeltaResult<TransactionWithCommitter<U>> {
+        Ok(TransactionWithCommitter::new(
+            f(self.transaction)?,
+            self.committer,
+        ))
+    }
 }
 
 impl<T> Deref for TransactionWithCommitter<T> {
@@ -339,10 +349,12 @@ pub unsafe extern "C" fn with_row_tracking_high_water_mark(
 }
 
 fn with_row_tracking_high_water_mark_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter<Transaction>,
     high_water_mark: i64,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
+    let txn =
+        txn.try_map_transaction(|txn| txn.with_row_tracking_high_water_mark(high_water_mark))?;
+    Ok(Box::new(txn).into())
 }
 
 /// Add file metadata to the transaction for files that have been written. The metadata contains
@@ -461,13 +473,13 @@ pub unsafe extern "C" fn create_table_with_domain_metadata(
 }
 
 fn create_table_with_domain_metadata_impl(
-    txn: CreateTableTransaction,
+    txn: TransactionWithCommitter<CreateTableTransaction>,
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
-    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
+    Ok(Box::new(txn.map_transaction(|txn| txn.with_domain_metadata(domain, configuration))).into())
 }
 
 /// Add file metadata to a create-table transaction for files that have been written. The metadata

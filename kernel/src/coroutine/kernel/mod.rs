@@ -11,14 +11,14 @@
 //! returns [`Poll::Ready`](std::task::Poll::Ready), the coroutine completed and leads to
 //! [`Workflow::Done`]; otherwise, the workflow `await`ed a [`Channel`] method future and the
 //! coroutine machinery extracts the corresponding request as [`Workflow::Request`]. When the
-//! connector invokes the [`Resume`](super::Resume), the coroutine machinery makes the response
+//! connector invokes the [`Resume`], the coroutine machinery makes the response
 //! available to the workflow and then resumes it by polling again. That process repeats until the
 //! workflow completes or the connector abandons it.
 //!
 //! It is important to note that there is no async runtime; everything happens on the calling
 //! thread, polling with a no-op [`Waker`](std::task::Waker::noop). Workflows only advance if the
 //! connector directly polls their future by calling [`Workflow::start`] or
-//! [`Resume`](super::Resume).
+//! [`Resume`].
 //!
 //! Generators are special in that they communicate over two channels: Delegated requests go over a
 //! normal [`Channel`] for the connector to handle, while yielded output items go through a

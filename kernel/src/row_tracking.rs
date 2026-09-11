@@ -48,7 +48,7 @@ impl RowTrackingDomainMetadata {
         Self::new(Self::MISSING_ROW_ID_HIGH_WATERMARK)
     }
 
-    /// Engine wrapper around [`Self::get_high_water_mark`].
+    /// Engine wrapper around the coroutine-based high-water-mark lookup.
     pub fn get_high_water_mark_with_engine(
         snapshot: &Snapshot,
         engine: &dyn Engine,

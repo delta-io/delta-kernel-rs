@@ -29,7 +29,6 @@ committing:
 # extern crate delta_kernel_default_engine;
 # extern crate tokio;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::transaction::CommitResult;
@@ -52,7 +51,7 @@ if let Some(committed_version) = snapshot.get_app_id_version(app_id, &engine)? {
 
 // Not yet committed. Proceed with the write.
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(&engine)?
     .with_transaction_id(app_id.to_string(), batch_version)
     .with_operation("STREAMING UPDATE".to_string());
 

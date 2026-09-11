@@ -1284,7 +1284,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
     } = builder;
     let engine = engine.engine();
 
-    fn build<Mode>(
+    fn build<Mode: 'static>(
         mut builder: delta_kernel::snapshot::SnapshotBuilder<Mode>,
         engine: &dyn Engine,
         version: Option<Version>,
