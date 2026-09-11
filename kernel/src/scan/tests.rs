@@ -742,6 +742,85 @@ fn test_scan_metadata_from_projects_cached_typed_stats_for_narrower_scan() {
     assert_eq!(replayed_paths, fresh_paths);
 }
 
+#[test_log::test]
+fn test_scan_metadata_from_updates_typed_cache_with_new_commits() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    // Version 3 has a checkpoint with four files. Cache its complete typed stats.
+    let version_three_snapshot = Snapshot::builder_for(url.clone())
+        .at_version(3)
+        .build(engine.as_ref())
+        .unwrap();
+    let version_three_scan = version_three_snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+    let cached_metadata: Vec<Box<dyn EngineData>> = version_three_scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| {
+            let data = scan_files.apply_selection_vector().unwrap();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+
+            // The cache has typed stats but no JSON stats, so replay cannot fall back to JSON.
+            let json_stats = batch.column_by_name("stats").unwrap();
+            let typed_stats = batch.column_by_name(STATS_PARSED).unwrap();
+            assert_eq!(json_stats.null_count(), batch.num_rows());
+            assert_eq!(typed_stats.null_count(), 0);
+            Box::new(ArrowEngineData::from(batch)) as Box<dyn EngineData>
+        })
+        .try_collect()
+        .unwrap();
+    assert_eq!(
+        cached_metadata.iter().map(|data| data.len()).sum::<usize>(),
+        4
+    );
+
+    // Version 5 adds two commits. A fresh scan establishes the expected files for `id > 250`.
+    let version_five_snapshot = Snapshot::builder_for(url)
+        .at_version(5)
+        .build(engine.as_ref())
+        .unwrap();
+    let predicate: PredicateRef = Arc::new(Pred::gt(col!("id"), lit(250i64)));
+    let stats_options = StatsOptions::struct_columns(vec![column_name!("id")]);
+    let fresh_scan = Arc::clone(&version_five_snapshot)
+        .scan_builder()
+        .with_predicate(predicate.clone())
+        .with_stats(stats_options.clone())
+        .build()
+        .unwrap();
+    let mut fresh_paths = get_files_for_scan(fresh_scan, engine.as_ref()).unwrap();
+    assert_eq!(fresh_paths.len(), 4);
+
+    // Replay from version 3. This must combine the typed cache with both newer commits.
+    let replay_scan = version_five_snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats(stats_options)
+        .build()
+        .unwrap();
+    let mut replayed_paths = Vec::new();
+    for metadata in replay_scan
+        .scan_metadata_from(engine.as_ref(), 3, cached_metadata, None)
+        .unwrap()
+    {
+        replayed_paths = metadata
+            .unwrap()
+            .visit_scan_files(replayed_paths, |paths, file| {
+                paths.push(file.path.to_string());
+            })
+            .unwrap();
+    }
+
+    // Compare exact files rather than only the number selected.
+    fresh_paths.sort_unstable();
+    replayed_paths.sort_unstable();
+    assert_eq!(replayed_paths, fresh_paths);
+}
+
 // reading v0 with 3 files.
 // updating to v1 with 3 more files added.
 #[test_log::test]
