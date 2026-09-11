@@ -400,3 +400,10 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }
+
+#[cfg(test)]
+fn expected_timestamp_micros(value: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .timestamp_micros()
+}

@@ -19,7 +19,8 @@ use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
-/// data feed from the table.
+/// data feed from the table. Offset-less zoned timestamp partition values are interpreted as UTC;
+/// reader-timezone configuration is available only on snapshot scans.
 #[derive(Debug)]
 pub struct TableChangesScan {
     // The [`TableChanges`] that specifies this scan's start and end versions

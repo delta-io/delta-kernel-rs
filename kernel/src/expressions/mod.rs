@@ -659,6 +659,41 @@ impl ParseJsonExpression {
     }
 }
 
+/// Connector-supplied options controlling how a [`MapToStructExpression`] parses map values.
+///
+/// Kernel does not infer these settings from the host environment or table metadata.
+/// Expression producers must use one reader timezone for all partition-value expressions in a
+/// scan so materialization and pruning cannot interpret the same value differently.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct MapToStructOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp_timezone: Option<String>,
+}
+
+impl MapToStructOptions {
+    /// Interpret offset-less `TIMESTAMP` values in `timestamp_timezone`.
+    ///
+    /// Accepts an IANA timezone identifier or a fixed offset in `+HH:MM`, `-HH:MM`, `+HH:MM:SS`,
+    /// or `-HH:MM:SS` form. Named zones preserve their clock-transition rules; fixed offsets apply
+    /// when the reader configuration itself is fixed. Use [`MapToStructOptions::default`] for UTC.
+    pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
+        self.timestamp_timezone = Some(timestamp_timezone.into());
+        self
+    }
+
+    /// Returns the configured IANA timezone or fixed offset, or `None` when UTC applies.
+    ///
+    /// Fixed offsets use `+HH:MM`, `-HH:MM`, `+HH:MM:SS`, or `-HH:MM:SS` form.
+    pub fn timestamp_timezone(&self) -> Option<&str> {
+        self.timestamp_timezone.as_deref()
+    }
+
+    /// Returns whether no parsing options are configured.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// A Delta-specific expression that parses an Add action's `partitionValues` map into a typed
 /// `partitionValues_parsed` struct.
 ///
@@ -703,19 +738,18 @@ impl ParseJsonExpression {
 ///   round or rescale.
 /// - BOOLEAN: accept case-insensitive `true` or `false`, with no numeric or yes/no aliases.
 /// - DATE: parse `{year}-{month}-{day}`.
-/// - TIMESTAMP: parse either 1) an ISO 8601 timestamp with an explicit offset, normalized to UTC;
-///   or 2) a space-separated timestamp without a zone. Currently, kernel expects case 2 to be
-///   interpreted as UTC, however the protocol specifies that it should be interpreted in the
-///   writer's time zone. TODO: MapToStruct needs to be updated to take in a timezone as a
-///   parameter.
+/// - TIMESTAMP: accept date-only values and timestamps with a space, `T`, or `t` separator,
+///   optional fractional seconds, an optional numeric offset, or a trailing IANA timezone. Parse
+///   values with an offset or timezone as absolute instants; parse offset-less values in the reader
+///   timezone from [`MapToStructOptions`], or UTC by default.
 /// - TIMESTAMP_NTZ: parse a space-separated timestamp without an offset and preserve the local
 ///   wall-clock value.
 /// - Interval types: parse an ANSI interval literal accepted by [`PrimitiveType::parse_scalar`].
 /// - VOID: reject every non-empty value.
 ///
-/// Kernel's UTC interpretation of a zone-less TIMESTAMP is explicit here: the Delta protocol says
-/// that form is interpreted in the writer's time zone, but that time zone is not carried by this
-/// expression. Modern writers should use the protocol's UTC-adjusted ISO 8601 form.
+/// The reader timezone does not affect a timestamp carrying its own time zone or offset. Modern
+/// writers use the protocol's UTC-adjusted ISO 8601 form, which therefore reads independently of
+/// the configured reader timezone.
 ///
 /// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
 /// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
@@ -736,12 +770,16 @@ impl ParseJsonExpression {
 pub struct MapToStructExpression {
     /// The expression that evaluates to a `Map<String, String>` column.
     pub map_expr: Box<Expression>,
+    /// Options controlling value parsing.
+    #[serde(default, skip_serializing_if = "MapToStructOptions::is_default")]
+    pub options: MapToStructOptions,
 }
 
 impl MapToStructExpression {
-    pub(crate) fn new(map_expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(map_expr: impl Into<Expression>, options: MapToStructOptions) -> Self {
         Self {
             map_expr: Box::new(map_expr.into()),
+            options,
         }
     }
 }
@@ -932,9 +970,10 @@ impl Expression {
     /// Parses an Add action's `partitionValues` map into a typed struct whose schema comes from the
     /// evaluator's result type. A null map produces a null struct; missing and null values produce
     /// null fields; literal empty strings stay empty only for STRING and BINARY. Duplicate-key
-    /// behavior is undefined. See [`MapToStructExpression`] for the complete contract.
-    pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
-        Self::MapToStruct(MapToStructExpression::new(map_expr))
+    /// behavior is undefined. `options` controls timestamp parsing. See [`MapToStructExpression`]
+    /// for the complete contract.
+    pub fn map_to_struct(map_expr: impl Into<Expression>, options: MapToStructOptions) -> Self {
+        Self::MapToStruct(MapToStructExpression::new(map_expr, options))
     }
 
     /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
@@ -1225,7 +1264,16 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
-            MapToStruct(m) => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
+            MapToStruct(m) => match m.options.timestamp_timezone() {
+                Some(timezone) => {
+                    write!(
+                        f,
+                        "MAP_TO_STRUCT({}, timestamp_timezone={timezone:?})",
+                        m.map_expr
+                    )
+                }
+                None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
+            },
             Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
         }
     }
@@ -1336,7 +1384,9 @@ mod tests {
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{col, column_pred, lit, DataType, Expression as Expr, Predicate as Pred};
+    use super::{
+        col, column_pred, lit, DataType, Expression as Expr, MapToStructOptions, Predicate as Pred,
+    };
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1371,6 +1421,41 @@ mod tests {
             let result = format!("{expr}");
             assert_eq!(result, expected);
         }
+    }
+
+    #[test]
+    fn test_map_to_struct_options_state_and_format() {
+        let default = Expr::map_to_struct(col!("m"), MapToStructOptions::default());
+        let Expr::MapToStruct(default_state) = &default else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(default_state.options.timestamp_timezone(), None);
+        assert_eq!(format!("{default}"), "MAP_TO_STRUCT(Column(m))");
+
+        let configured = Expr::map_to_struct(
+            col!("m"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+        let Expr::MapToStruct(configured_state) = &configured else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(
+            configured_state.options.timestamp_timezone(),
+            Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            format!("{configured}"),
+            "MAP_TO_STRUCT(Column(m), timestamp_timezone=\"America/Los_Angeles\")"
+        );
+
+        let escaped = Expr::map_to_struct(
+            col!("m"),
+            MapToStructOptions::default().with_timestamp_timezone("bad\"\nzone"),
+        );
+        assert_eq!(
+            format!("{escaped}"),
+            "MAP_TO_STRUCT(Column(m), timestamp_timezone=\"bad\\\"\\nzone\")"
+        );
     }
 
     #[test]
@@ -1413,7 +1498,8 @@ mod tests {
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             col, column_name, lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
+            Expression, ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar,
+            UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1644,13 +1730,38 @@ mod tests {
         #[test]
         fn test_map_to_struct_expression_roundtrip() {
             let cases: Vec<Expression> = vec![
-                Expression::map_to_struct(col!("pv")),
-                Expression::map_to_struct(lit("ignored")),
+                Expression::map_to_struct(col!("pv"), MapToStructOptions::default()),
+                Expression::map_to_struct(lit("ignored"), MapToStructOptions::default()),
+                Expression::map_to_struct(
+                    col!("pv"),
+                    MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                ),
             ];
 
             for expr in &cases {
                 assert_roundtrip(expr);
             }
+        }
+
+        #[test]
+        fn test_map_to_struct_options_wire_defaults() {
+            let default = Expression::map_to_struct(col!("pv"), MapToStructOptions::default());
+            let default_json = serde_json::to_value(&default).unwrap();
+            assert!(default_json.pointer("/MapToStruct/options").is_none());
+            assert_eq!(
+                serde_json::from_value::<Expression>(default_json).unwrap(),
+                default
+            );
+
+            let explicit_utc = Expression::map_to_struct(
+                col!("pv"),
+                MapToStructOptions::default().with_timestamp_timezone("UTC"),
+            );
+            let explicit_utc_json = serde_json::to_value(&explicit_utc).unwrap();
+            assert_eq!(
+                explicit_utc_json.pointer("/MapToStruct/options/timestamp_timezone"),
+                Some(&serde_json::json!("UTC"))
+            );
         }
 
         // ==================== Predicate Tests ====================

@@ -114,6 +114,7 @@ pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
+pub(crate) mod timestamp_timezone;
 pub mod transaction;
 pub mod transforms;
 

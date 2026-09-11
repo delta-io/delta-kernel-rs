@@ -103,6 +103,8 @@ StructExpression
   Unknown(mystery)
   MapToStruct
     Column(pv)
+  MapToStruct(timestamp_timezone=America/Los_Angeles)
+    Column(pv)
   Coalesce
     Column(col)
     Integer(0)
@@ -215,6 +217,8 @@ StructExpression
     Long(2)
     Double(3.000000)
   MapToStruct
+    Column(partitionValues)
+  MapToStruct(timestamp_timezone=America/Los_Angeles)
     Column(partitionValues)
 
 === Expression Round-trip Test ===

@@ -253,7 +253,17 @@ uintptr_t convert_engine_to_kernel_expression_item(
       assert(m2s->child_expr.len == 1);
       uintptr_t child = convert_engine_to_kernel_expression_item(
           state, m2s->child_expr.list[0]);
-      return visit_expression_map_to_struct(state, child);
+      struct OptionalValueKernelStringSlice timestamp_timezone = {
+        .tag = NoneKernelStringSlice
+      };
+      if (m2s->timestamp_timezone != NULL) {
+        timestamp_timezone.tag = SomeKernelStringSlice;
+        timestamp_timezone.some = (struct KernelStringSlice) {
+          .ptr = m2s->timestamp_timezone,
+          .len = strlen(m2s->timestamp_timezone)
+        };
+      }
+      return visit_expression_map_to_struct(state, child, timestamp_timezone);
     }
     case StructPatch:
     case FieldPatch:
