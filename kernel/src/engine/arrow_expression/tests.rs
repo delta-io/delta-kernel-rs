@@ -1558,6 +1558,27 @@ fn evaluator_accepts_compatible_arrow_representation(
     validate_data_schema_top_level(&expected_schema, &data_schema).unwrap();
 }
 
+#[rstest]
+#[case::container_and_primitive(empty_struct_type(), DataType::Int32)]
+#[case::different_container_kinds(int_array_type(), arrow_int_string_map_type())]
+fn evaluator_rejects_incompatible_top_level_container_types(
+    #[case] expected_type: KernelDataType,
+    #[case] data_type: DataType,
+) {
+    let expected_schema =
+        Arc::new(StructType::try_new([StructField::nullable("value", expected_type)]).unwrap());
+    let data_schema = Schema::new(vec![Field::new("value", data_type, true)]);
+
+    assert_result_error_with_message(
+        validate_data_schema_top_level(&expected_schema, &data_schema),
+        "Expected schema type for 'value' does not match the data schema type",
+    );
+}
+
+fn empty_struct_type() -> KernelDataType {
+    StructType::try_new([]).unwrap().into()
+}
+
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`
 fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBatch) {
     let handler = ArrowEvaluationHandler;

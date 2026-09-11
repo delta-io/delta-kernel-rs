@@ -24,16 +24,17 @@ pub(crate) struct CheckpointManifestReader {
 }
 
 impl CheckpointManifestReader {
-    /// Create a new manifest phase for a single-part checkpoint.
+    /// Creates a manifest reader for a single-part checkpoint.
     ///
-    /// The schema is automatically augmented with the sidecar column since the manifest
-    /// phase needs to extract sidecar references for phase transitions.
+    /// `read_schema` must include the `sidecar` action field so this reader can discover sidecar
+    /// files.
     ///
     /// # Parameters
-    /// - `manifest_file`: The checkpoint manifest file to process
-    /// - `log_root`: Root URL for resolving sidecar paths
-    /// - `engine`: Engine for reading files
-    /// - `read_schema`: Schema for reading the manifest actions
+    ///
+    /// - `engine`: Engine for reading the checkpoint manifest.
+    /// - `manifest`: Checkpoint manifest to process.
+    /// - `log_root`: Root URL for resolving sidecar paths.
+    /// - `read_schema`: Schema for reading the manifest actions.
     #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
