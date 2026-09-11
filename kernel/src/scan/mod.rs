@@ -754,8 +754,7 @@ fn build_physical_stats_output_schema(
                 return Ok(None);
             }
             let stats_schema = table_configuration
-                .build_expected_stats_schemas(Some(requested), Some(requested))?
-                .physical;
+                .build_expected_physical_stats_schema(Some(requested), Some(requested))?;
             Ok(stats_schema_with_data_columns(stats_schema))
         }
     }

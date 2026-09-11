@@ -226,7 +226,8 @@ impl DataSkippingFilter {
     /// unlike the scan path which reads pre-parsed `stats_parsed` from transformed batches.
     ///
     /// The stats schema is derived from the predicate's column references via
-    /// [`TableConfiguration::build_expected_stats_schemas`], matching the write side exactly;
+    /// [`TableConfiguration::build_expected_physical_stats_schema`], matching the write side
+    /// exactly;
     /// references outside the table's stats columns fold to NULL (keeping the file). Partition
     /// values are parsed from the raw `add.partitionValues` string map with
     /// [`Expression::map_to_struct`], so predicates over partition columns prune too.
@@ -261,9 +262,8 @@ impl DataSkippingFilter {
             .collect();
         let physical_stats_columns = table_configuration.physical_stats_columns_set(None);
         let physical_stats_schema = table_configuration
-            .build_expected_stats_schemas(None, Some(&predicate_refs))
-            .ok()?
-            .physical;
+            .build_expected_physical_stats_schema(None, Some(&predicate_refs))
+            .ok()?;
         let partition_schema = table_configuration.predicate_partition_schema(&predicate_refs);
 
         // Parse JSON stats from the raw action batch's `add.stats` column, parse partition values
