@@ -150,8 +150,17 @@ message ParseJsonExpression {
   delta.kernel.schema.StructType output_schema = 2;
 }
 
+message MapToStructOptions {
+  // Optional connector-supplied IANA timezone or normalized fixed offset (`+HH:MM`, `-HH:MM`,
+  // `+HH:MM:SS`, or `-HH:MM:SS`) for offset-less TIMESTAMP values. Kernel never infers this from
+  // the host or table metadata. A timezone or offset in a value takes precedence; absence means
+  // UTC.
+  optional string timestamp_timezone = 1;
+}
+
 message MapToStructExpression {
   Expression map_expr = 1;
+  MapToStructOptions options = 2;
 }
 
 // `nullability_predicate` is optional: when set and it evaluates to false/null, the whole

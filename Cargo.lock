@@ -1332,6 +1332,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "chrono-tz",
  "crc",
  "criterion",
  "delta_kernel",
