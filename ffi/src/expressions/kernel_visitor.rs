@@ -6,7 +6,7 @@ use std::sync::Arc;
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
     lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
+    JunctionPredicateOp, MapToStructOptions, Predicate, Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
@@ -20,7 +20,7 @@ use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
     AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
-    ReferenceSet, TryFromStringSlice,
+    OptionalValue, ReferenceSet, TryFromStringSlice,
 };
 
 pub(crate) enum ExpressionOrPredicate {
@@ -685,14 +685,34 @@ pub extern "C" fn visit_expression_struct(
     wrap_expression(state, Expression::struct_from(exprs))
 }
 
-/// Visit a MapToStruct expression. The `child_expr` is the map expression.
+/// Builds a `MapToStruct` expression from its map child and optional reader timezone.
+///
+/// `timestamp_timezone` is `None` for the default UTC interpretation. A provided string is copied
+/// into the expression before this function returns.
+///
+/// Returns zero when `child_expr` is invalid or the timezone is not valid UTF-8.
+///
+/// # Safety
+///
+/// A provided `timestamp_timezone` slice must have a non-null pointer to a readable buffer of its
+/// declared number of initialized bytes and remain valid for this call.
 #[no_mangle]
-pub extern "C" fn visit_expression_map_to_struct(
+pub unsafe extern "C" fn visit_expression_map_to_struct(
     state: &mut KernelExpressionVisitorState,
     child_expr: usize,
+    timestamp_timezone: OptionalValue<KernelStringSlice>,
 ) -> usize {
+    let options = match Option::from(timestamp_timezone) {
+        Some(timestamp_timezone) => match unsafe { String::try_from_slice(&timestamp_timezone) } {
+            Ok(timestamp_timezone) => {
+                MapToStructOptions::default().with_timestamp_timezone(timestamp_timezone)
+            }
+            Err(_) => return 0,
+        },
+        None => MapToStructOptions::default(),
+    };
     unwrap_kernel_expression(state, child_expr).map_or(0, |expr| {
-        wrap_expression(state, Expression::map_to_struct(expr))
+        wrap_expression(state, Expression::map_to_struct(expr, options))
     })
 }
 
@@ -867,6 +887,49 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::default(None)]
+    #[case::configured(Some("America/Los_Angeles"))]
+    fn map_to_struct_preserves_options(#[case] timestamp_timezone: Option<&str>) {
+        let mut state = KernelExpressionVisitorState::default();
+        let child = wrap_expression(&mut state, col!("partitionValues"));
+        let ffi_timezone = match timestamp_timezone {
+            Some(timestamp_timezone) => {
+                OptionalValue::Some(crate::kernel_string_slice!(timestamp_timezone))
+            }
+            None => OptionalValue::None,
+        };
+
+        let expression_id =
+            unsafe { visit_expression_map_to_struct(&mut state, child, ffi_timezone) };
+        let expression = unwrap_kernel_expression(&mut state, expression_id).unwrap();
+        let options = timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
+            MapToStructOptions::default().with_timestamp_timezone(timezone)
+        });
+
+        assert_eq!(
+            expression,
+            Expression::map_to_struct(col!("partitionValues"), options)
+        );
+    }
+
+    #[test]
+    fn map_to_struct_rejects_invalid_timezone_utf8() {
+        let mut state = KernelExpressionVisitorState::default();
+        let child = wrap_expression(&mut state, col!("partitionValues"));
+        let invalid_utf8 = [0xff_u8];
+        let timezone = KernelStringSlice {
+            ptr: invalid_utf8.as_ptr().cast(),
+            len: invalid_utf8.len(),
+        };
+
+        let expression_id = unsafe {
+            visit_expression_map_to_struct(&mut state, child, OptionalValue::Some(timezone))
+        };
+
+        assert_eq!(expression_id, 0);
+    }
 
     // ============================================================================
     // NullTypeTag::from_data_type
