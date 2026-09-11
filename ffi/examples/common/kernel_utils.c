@@ -81,6 +81,7 @@ void compile_snapshot_hint_abi(void)
   KernelStringSlice string = { .ptr = NULL, .len = 0 };
   OptionalValueKernelStringSlice optional_string = { .tag = NoneKernelStringSlice };
   OptionalValuei64 optional_i64 = { .tag = Nonei64 };
+  OptionalValuei32 optional_i32 = { .tag = Nonei32 };
   OptionalValueu64 optional_u64 = { .tag = Noneu64 };
   FfiStringArray string_array = { .ptr = NULL, .len = 0 };
   OptionalValueFfiStringArray optional_string_array = {
@@ -134,30 +135,30 @@ void compile_snapshot_hint_abi(void)
     .modification_time = 0,
     .tags = optional_string_map,
   };
-  FfiSnapshotHintV2Action actions[] = {
+  FfiCheckpointNonFileAction actions[] = {
     {
-      .kind = SNAPSHOT_HINT_V2_ACTION_METADATA,
-      .value = { .metadata = &metadata },
+      .tag = FfiCheckpointNonFileActionMetadata,
+      .metadata = &metadata,
     },
     {
-      .kind = SNAPSHOT_HINT_V2_ACTION_PROTOCOL,
-      .value = { .protocol = &protocol_value },
+      .tag = FfiCheckpointNonFileActionProtocol,
+      .protocol = &protocol_value,
     },
     {
-      .kind = SNAPSHOT_HINT_V2_ACTION_TRANSACTION,
-      .value = { .transaction = &transaction },
+      .tag = FfiCheckpointNonFileActionTransaction,
+      .transaction = &transaction,
     },
     {
-      .kind = SNAPSHOT_HINT_V2_ACTION_DOMAIN_METADATA,
-      .value = { .domain_metadata = &domain_metadata },
+      .tag = FfiCheckpointNonFileActionDomainMetadata,
+      .domain_metadata = &domain_metadata,
     },
     {
-      .kind = SNAPSHOT_HINT_V2_ACTION_CHECKPOINT_METADATA,
-      .value = { .checkpoint_metadata = &checkpoint_metadata },
+      .tag = FfiCheckpointNonFileActionCheckpointMetadata,
+      .checkpoint_metadata = &checkpoint_metadata,
     },
   };
   FfiSidecarArray sidecar_array = { .ptr = &sidecar, .len = 1 };
-  FfiSnapshotHintV2ActionArray action_array = {
+  FfiCheckpointNonFileActionArray action_array = {
     .ptr = actions,
     .len = sizeof(actions) / sizeof(actions[0]),
   };
@@ -165,18 +166,18 @@ void compile_snapshot_hint_abi(void)
     .tag = SomeFfiSidecarArray,
     .some = sidecar_array,
   };
-  OptionalValueFfiSnapshotHintV2ActionArray optional_action_array = {
-    .tag = SomeFfiSnapshotHintV2ActionArray,
+  OptionalValueFfiCheckpointNonFileActionArray optional_action_array = {
+    .tag = SomeFfiCheckpointNonFileActionArray,
     .some = action_array,
   };
-  FfiSnapshotHintLastCheckpointV2 v2_checkpoint = {
+  FfiLastCheckpointV2 v2_checkpoint = {
     .path = string,
     .size_in_bytes = optional_i64,
     .modification_time = optional_i64,
     .sidecar_files = optional_sidecar_array,
     .non_file_actions = optional_action_array,
   };
-  FfiSnapshotHintLastCheckpoint last_checkpoint = {
+  FfiLastCheckpoint last_checkpoint = {
     .version = 0,
     .size = 0,
     .parts = optional_u64,
@@ -192,21 +193,67 @@ void compile_snapshot_hint_abi(void)
     .ptr = &domain_metadata,
     .len = 1,
   };
-  OptionalValueFfiSetTransactionArray optional_transaction_array = {
-    .tag = SomeFfiSetTransactionArray,
-    .some = transaction_array,
-  };
-  OptionalValueFfiDomainMetadataArray optional_domain_metadata_array = {
-    .tag = SomeFfiDomainMetadataArray,
-    .some = domain_metadata_array,
-  };
-  FfiSnapshotHintCrc crc = {
-    .table_size_bytes = 0,
+  FfiFileStats file_stats = {
     .num_files = 0,
-    .in_commit_timestamp = optional_i64,
+    .table_size_bytes = 0,
+  };
+  FfiFileStatsState file_stats_state = {
+    .kind = FILE_STATS_STATE_COMPLETE,
+    .file_stats = file_stats,
     .file_size_histogram = &histogram,
-    .set_transactions = optional_transaction_array,
-    .domain_metadata = optional_domain_metadata_array,
+  };
+  FfiSetTransactionState transaction_state = {
+    .kind = SET_TRANSACTION_STATE_COMPLETE,
+    .transactions = transaction_array,
+  };
+  FfiDomainMetadataState domain_metadata_state = {
+    .kind = DOMAIN_METADATA_STATE_COMPLETE,
+    .domain_metadata = domain_metadata_array,
+  };
+  OptionalValueFfiNullableStringMap optional_nullable_string_map = {
+    .tag = NoneFfiNullableStringMap,
+  };
+  FfiDeletionVectorDescriptor deletion_vector = {
+    .storage_type = DELETION_VECTOR_STORAGE_TYPE_PERSISTED_ABSOLUTE,
+    .path_or_inline_dv = string,
+    .offset = optional_i32,
+    .size_in_bytes = 0,
+    .cardinality = 0,
+  };
+  FfiAdd add = {
+    .path = string,
+    .partition_values = string_map,
+    .size = 0,
+    .modification_time = 0,
+    .data_change = true,
+    .stats = optional_string,
+    .tags = optional_nullable_string_map,
+    .deletion_vector = &deletion_vector,
+    .base_row_id = optional_i64,
+    .default_row_commit_version = optional_i64,
+    .clustering_provider = optional_string,
+  };
+  FfiAddArray add_array = { .ptr = &add, .len = 1 };
+  OptionalValueFfiAddArray all_files = {
+    .tag = SomeFfiAddArray,
+    .some = add_array,
+  };
+  FfiDeletedRecordCountsHistogram deleted_record_counts_histogram = {
+    .deleted_record_counts = i64_array,
+  };
+  FfiCrc crc = {
+    .version = 0,
+    .metadata = metadata,
+    .protocol = protocol_value,
+    .file_stats_state = file_stats_state,
+    .in_commit_timestamp = optional_i64,
+    .set_transaction_state = transaction_state,
+    .domain_metadata_state = domain_metadata_state,
+    .txn_id = optional_string,
+    .all_files = all_files,
+    .num_deleted_records = optional_i64,
+    .num_deletion_vectors = optional_i64,
+    .deleted_record_counts_histogram = &deleted_record_counts_histogram,
   };
   LogPathArray log_paths = { .ptr = NULL, .len = 0 };
   FfiSnapshotHint snapshot_hint = {

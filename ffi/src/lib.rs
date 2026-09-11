@@ -165,6 +165,26 @@ impl KernelStringSlice {
         }
     }
 
+    /// Copies this borrowed UTF-8 slice into an owned string.
+    ///
+    /// # Safety
+    ///
+    /// For nonzero `len`, `ptr` must address `len` initialized bytes and remain valid for the
+    /// duration of this call.
+    pub(crate) unsafe fn try_to_string(&self) -> DeltaResult<String> {
+        if self.len == 0 {
+            return Ok(String::new());
+        }
+        if self.ptr.is_null() {
+            return Err(delta_kernel::Error::generic(format!(
+                "string pointer is null with length {}",
+                self.len
+            )));
+        }
+        let value: &str = unsafe { TryFromStringSlice::try_from_slice(self) }?;
+        Ok(value.to_string())
+    }
+
     #[cfg(feature = "tracing")]
     pub(crate) fn empty() -> Self {
         KernelStringSlice {
@@ -257,6 +277,15 @@ impl<T> From<Option<T>> for OptionalValue<T> {
 
 impl<T> From<OptionalValue<T>> for Option<T> {
     fn from(value: OptionalValue<T>) -> Self {
+        match value {
+            OptionalValue::Some(value) => Some(value),
+            OptionalValue::None => None,
+        }
+    }
+}
+
+impl<'a, T> From<&'a OptionalValue<T>> for Option<&'a T> {
+    fn from(value: &'a OptionalValue<T>) -> Self {
         match value {
             OptionalValue::Some(value) => Some(value),
             OptionalValue::None => None,
@@ -1345,7 +1374,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
             |_, _| {
                 // The public setter rejects this combination; retain the invariant here for
                 // internal construction paths.
-                Err(delta_types::invalid(
+                Err(snapshot_hint::invalid(
                     "A snapshot hint cannot be used with Snapshot::builder_from",
                 ))
             },

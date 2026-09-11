@@ -106,47 +106,37 @@ pub struct Crc {
 }
 
 impl Crc {
-    /// Creates a CRC with complete file statistics from reconstructed state.
+    /// Reconstructs CRC state from its in-memory fields.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn new_with_complete_file_stats(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
         version: Version,
         metadata: Metadata,
         protocol: Protocol,
-        file_stats: FileStats,
+        file_stats_state: FileStatsState,
         in_commit_timestamp_opt: Option<i64>,
-        set_transactions: Option<Vec<SetTransaction>>,
-        domain_metadata: Option<Vec<DomainMetadata>>,
+        set_transaction_state: SetTransactionState,
+        domain_metadata_state: DomainMetadataState,
+        txn_id: Option<String>,
+        all_files: Option<Vec<Add>>,
+        num_deleted_records_opt: Option<i64>,
+        num_deletion_vectors_opt: Option<i64>,
+        deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
     ) -> Self {
         Self {
             version,
             metadata,
             protocol,
-            file_stats_state: FileStatsState::Complete(file_stats),
+            file_stats_state,
             in_commit_timestamp_opt,
-            set_transaction_state: match set_transactions {
-                Some(values) => SetTransactionState::Complete(
-                    values
-                        .into_iter()
-                        .map(|transaction| (transaction.app_id.clone(), transaction))
-                        .collect(),
-                ),
-                None => SetTransactionState::Partial(HashMap::new()),
-            },
-            domain_metadata_state: match domain_metadata {
-                Some(values) => DomainMetadataState::Complete(
-                    values
-                        .into_iter()
-                        .map(|action| (action.domain().to_string(), action))
-                        .collect(),
-                ),
-                None => DomainMetadataState::Partial(HashMap::new()),
-            },
-            txn_id: None,
-            all_files: None,
-            num_deleted_records_opt: None,
-            num_deletion_vectors_opt: None,
-            deleted_record_counts_histogram_opt: None,
+            set_transaction_state,
+            domain_metadata_state,
+            txn_id,
+            all_files,
+            num_deleted_records_opt,
+            num_deletion_vectors_opt,
+            deleted_record_counts_histogram_opt,
         }
     }
 
@@ -387,6 +377,17 @@ pub struct DeletedRecordCountsHistogram {
     /// Array of size 10 where each element represents the count of files falling into a specific
     /// deletion count range.
     pub(crate) deleted_record_counts: Vec<i64>,
+}
+
+impl DeletedRecordCountsHistogram {
+    /// Reconstructs a deleted-record-count histogram from its serialized bins.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn from_parts(deleted_record_counts: Vec<i64>) -> Self {
+        Self {
+            deleted_record_counts,
+        }
+    }
 }
 
 #[cfg(test)]

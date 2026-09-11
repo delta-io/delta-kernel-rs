@@ -1049,6 +1049,38 @@ pub(crate) struct Add {
 }
 
 impl Add {
+    /// Reconstructs an Add action from its serialized fields.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        path: String,
+        partition_values: HashMap<String, String>,
+        size: i64,
+        modification_time: i64,
+        data_change: bool,
+        stats: Option<String>,
+        tags: Option<HashMap<String, Option<String>>>,
+        deletion_vector: Option<DeletionVectorDescriptor>,
+        base_row_id: Option<i64>,
+        default_row_commit_version: Option<i64>,
+        clustering_provider: Option<String>,
+    ) -> Self {
+        Self {
+            path,
+            partition_values,
+            size,
+            modification_time,
+            data_change,
+            stats,
+            tags,
+            deletion_vector,
+            base_row_id,
+            default_row_commit_version,
+            clustering_provider,
+        }
+    }
+
     #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn dv_unique_id(&self) -> Option<String> {
