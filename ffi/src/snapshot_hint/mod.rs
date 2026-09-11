@@ -9,14 +9,17 @@ use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::{FfiSnapshotBuilder, FfiSnapshotBuilderSource, MutableFfiSnapshotBuilder};
 
-/// Integer freshness claim attached to a connector-provided snapshot hint.
-pub type FfiSnapshotHintFreshness = u32;
-
-/// The connector has not established that the hinted version is latest.
-pub const SNAPSHOT_HINT_FRESHNESS_UNVERIFIED: FfiSnapshotHintFreshness = 0;
-
-/// The connector has established that the hinted version is latest.
-pub const SNAPSHOT_HINT_FRESHNESS_LATEST: FfiSnapshotHintFreshness = 1;
+/// Freshness claim attached to a connector-provided snapshot hint.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub enum FfiSnapshotHintFreshness {
+    /// The connector has not established that the hinted version is latest.
+    Unverified,
+    /// The connector has established that the hinted version is latest.
+    Latest,
+}
 
 /// Complete borrowed representation of a connector-provided snapshot hint.
 ///
@@ -60,11 +63,12 @@ fn invalid_crc(source: Error) -> Error {
     invalid_with_source("supplied CRC is invalid", source)
 }
 
-fn parse_freshness(value: FfiSnapshotHintFreshness) -> DeltaResult<SnapshotHintFreshness> {
-    match value {
-        SNAPSHOT_HINT_FRESHNESS_UNVERIFIED => Ok(SnapshotHintFreshness::Unverified),
-        SNAPSHOT_HINT_FRESHNESS_LATEST => Ok(SnapshotHintFreshness::Latest),
-        value => Err(invalid(format!("unknown snapshot hint freshness: {value}"))),
+impl From<FfiSnapshotHintFreshness> for SnapshotHintFreshness {
+    fn from(value: FfiSnapshotHintFreshness) -> Self {
+        match value {
+            FfiSnapshotHintFreshness::Unverified => Self::Unverified,
+            FfiSnapshotHintFreshness::Latest => Self::Latest,
+        }
     }
 }
 
@@ -80,11 +84,11 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
         &builder.source,
         FfiSnapshotBuilderSource::ExistingSnapshot(_)
     ) {
-        return Err(invalid(
-            "snapshot hints require a builder created from a table path",
+        return Err(Error::unsupported(
+            "snapshot hints cannot be set on builders created by get_snapshot_builder_from",
         ));
     }
-    let freshness = parse_freshness(value.freshness)?;
+    let freshness = value.freshness.into();
     let log_paths = unsafe { value.log_paths.log_paths() }
         .map_err(|source| invalid_with_source("supplied log paths are invalid", source))?;
     let protocol = unsafe { value.protocol.try_to_kernel() }
@@ -123,12 +127,16 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
 ///
 /// # Errors
 ///
-/// Returns `InvalidSnapshotHint` when the builder was created from an existing snapshot or any
-/// supplied field is invalid. A failed call leaves the builder unchanged.
+/// Returns `UnsupportedError` when the builder was created by
+/// [`get_snapshot_builder_from`](crate::get_snapshot_builder_from). Returns
+/// `InvalidSnapshotHint` when a supplied field cannot be decoded or a log path names an unsupported
+/// log compaction file.
+/// Structural log-segment and table-configuration errors are returned when the builder is built.
+/// A failed call leaves the builder unchanged.
 ///
 /// # Safety
 ///
-/// The builder is borrowed and remains caller-owned. Each action enum must have a valid tag. Every
+/// The builder is borrowed and remains caller-owned. Every enum must have a valid tag. Every
 /// selected pointer must be aligned and address initialized storage for its declared element count,
 /// and all such storage must remain valid for this call.
 #[no_mangle]

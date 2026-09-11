@@ -243,15 +243,19 @@ pub struct FfiLastCheckpoint {
     pub v2_checkpoint: *const FfiLastCheckpointV2,
 }
 
-/// Integer discriminator for deletion-vector storage.
-pub type FfiDeletionVectorStorageType = u32;
-
-/// Persisted-relative deletion-vector storage discriminator.
-pub const DELETION_VECTOR_STORAGE_TYPE_PERSISTED_RELATIVE: FfiDeletionVectorStorageType = 0;
-/// Inline deletion-vector storage discriminator.
-pub const DELETION_VECTOR_STORAGE_TYPE_INLINE: FfiDeletionVectorStorageType = 1;
-/// Persisted-absolute deletion-vector storage discriminator.
-pub const DELETION_VECTOR_STORAGE_TYPE_PERSISTED_ABSOLUTE: FfiDeletionVectorStorageType = 2;
+/// Deletion-vector storage representation.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub enum FfiDeletionVectorStorageType {
+    /// Persisted relative path.
+    PersistedRelative,
+    /// Inline data.
+    Inline,
+    /// Persisted absolute path.
+    PersistedAbsolute,
+}
 
 /// Borrowed Delta deletion-vector descriptor.
 #[repr(C)]
@@ -304,32 +308,41 @@ pub struct FfiAddArray {
     pub len: usize,
 }
 
-/// Integer discriminator for file-statistics completeness.
-pub type FfiFileStatsStateKind = u32;
-
-/// Complete file-statistics discriminator.
-pub const FILE_STATS_STATE_COMPLETE: FfiFileStatsStateKind = 0;
-/// Indeterminate file-statistics discriminator.
-pub const FILE_STATS_STATE_INDETERMINATE: FfiFileStatsStateKind = 1;
+/// File-statistics completeness.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub enum FfiFileStatsStateKind {
+    /// Complete file statistics.
+    Complete,
+    /// Indeterminate file statistics.
+    Indeterminate,
+}
 
 /// Borrowed file-statistics state.
 #[repr(C)]
 pub struct FfiFileStatsState {
     /// State variant.
     pub kind: FfiFileStatsStateKind,
-    /// Complete scalar statistics. Ignored for `FILE_STATS_STATE_INDETERMINATE`.
+    /// Complete scalar statistics. Ignored for [`FfiFileStatsStateKind::Indeterminate`].
     pub file_stats: FfiFileStats,
-    /// Optional complete file-size histogram. Ignored for `FILE_STATS_STATE_INDETERMINATE`.
+    /// Optional complete file-size histogram. Ignored for
+    /// [`FfiFileStatsStateKind::Indeterminate`].
     pub file_size_histogram: *const FfiFileSizeHistogram,
 }
 
-/// Integer discriminator for set-transaction completeness.
-pub type FfiSetTransactionStateKind = u32;
-
-/// Complete set-transaction-state discriminator.
-pub const SET_TRANSACTION_STATE_COMPLETE: FfiSetTransactionStateKind = 0;
-/// Partial set-transaction-state discriminator.
-pub const SET_TRANSACTION_STATE_PARTIAL: FfiSetTransactionStateKind = 1;
+/// Set-transaction completeness.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub enum FfiSetTransactionStateKind {
+    /// Complete set-transaction state.
+    Complete,
+    /// Partial set-transaction state.
+    Partial,
+}
 
 /// Borrowed set-transaction state.
 #[repr(C)]
@@ -340,13 +353,17 @@ pub struct FfiSetTransactionState {
     pub transactions: FfiSetTransactionArray,
 }
 
-/// Integer discriminator for domain-metadata completeness.
-pub type FfiDomainMetadataStateKind = u32;
-
-/// Complete domain-metadata-state discriminator.
-pub const DOMAIN_METADATA_STATE_COMPLETE: FfiDomainMetadataStateKind = 0;
-/// Partial domain-metadata-state discriminator.
-pub const DOMAIN_METADATA_STATE_PARTIAL: FfiDomainMetadataStateKind = 1;
+/// Domain-metadata completeness.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub enum FfiDomainMetadataStateKind {
+    /// Complete domain-metadata state.
+    Complete,
+    /// Partial domain-metadata state.
+    Partial,
+}
 
 /// Borrowed domain-metadata state.
 #[repr(C)]
@@ -670,27 +687,20 @@ impl FfiLastCheckpoint {
     }
 }
 
-fn deletion_vector_storage_type(
-    value: FfiDeletionVectorStorageType,
-) -> DeltaResult<DeletionVectorStorageType> {
-    match value {
-        DELETION_VECTOR_STORAGE_TYPE_PERSISTED_RELATIVE => {
-            Ok(DeletionVectorStorageType::PersistedRelative)
+impl From<FfiDeletionVectorStorageType> for DeletionVectorStorageType {
+    fn from(value: FfiDeletionVectorStorageType) -> Self {
+        match value {
+            FfiDeletionVectorStorageType::PersistedRelative => Self::PersistedRelative,
+            FfiDeletionVectorStorageType::Inline => Self::Inline,
+            FfiDeletionVectorStorageType::PersistedAbsolute => Self::PersistedAbsolute,
         }
-        DELETION_VECTOR_STORAGE_TYPE_INLINE => Ok(DeletionVectorStorageType::Inline),
-        DELETION_VECTOR_STORAGE_TYPE_PERSISTED_ABSOLUTE => {
-            Ok(DeletionVectorStorageType::PersistedAbsolute)
-        }
-        value => Err(invalid(format!(
-            "unknown deletion-vector storage type: {value}"
-        ))),
     }
 }
 
 impl FfiDeletionVectorDescriptor {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DeletionVectorDescriptor> {
         DeletionVectorDescriptor::try_new(
-            deletion_vector_storage_type(self.storage_type)?,
+            self.storage_type.into(),
             unsafe { self.path_or_inline_dv.try_to_string() }?,
             Option::<&i32>::from(&self.offset).copied(),
             self.size_in_bytes,
@@ -741,7 +751,7 @@ impl FfiAddArray {
 impl FfiFileStatsState {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<FileStatsState> {
         match self.kind {
-            FILE_STATS_STATE_COMPLETE => Ok(FileStatsState::Complete(unsafe {
+            FfiFileStatsStateKind::Complete => Ok(FileStatsState::Complete(unsafe {
                 let histogram = self
                     .file_size_histogram
                     .as_ref()
@@ -753,10 +763,7 @@ impl FfiFileStatsState {
                     histogram,
                 )
             }?)),
-            FILE_STATS_STATE_INDETERMINATE => Ok(FileStatsState::Indeterminate),
-            kind => Err(invalid(format!(
-                "unknown file-statistics state kind: {kind}"
-            ))),
+            FfiFileStatsStateKind::Indeterminate => Ok(FileStatsState::Indeterminate),
         }
     }
 }
@@ -777,11 +784,8 @@ impl FfiSetTransactionState {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<SetTransactionState> {
         let transactions = unsafe { self.transactions.try_to_hash_map() }?;
         match self.kind {
-            SET_TRANSACTION_STATE_COMPLETE => Ok(SetTransactionState::Complete(transactions)),
-            SET_TRANSACTION_STATE_PARTIAL => Ok(SetTransactionState::Partial(transactions)),
-            kind => Err(invalid(format!(
-                "unknown set-transaction state kind: {kind}"
-            ))),
+            FfiSetTransactionStateKind::Complete => Ok(SetTransactionState::Complete(transactions)),
+            FfiSetTransactionStateKind::Partial => Ok(SetTransactionState::Partial(transactions)),
         }
     }
 }
@@ -804,11 +808,12 @@ impl FfiDomainMetadataState {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DomainMetadataState> {
         let domain_metadata = unsafe { self.domain_metadata.try_to_hash_map() }?;
         match self.kind {
-            DOMAIN_METADATA_STATE_COMPLETE => Ok(DomainMetadataState::Complete(domain_metadata)),
-            DOMAIN_METADATA_STATE_PARTIAL => Ok(DomainMetadataState::Partial(domain_metadata)),
-            kind => Err(invalid(format!(
-                "unknown domain-metadata state kind: {kind}"
-            ))),
+            FfiDomainMetadataStateKind::Complete => {
+                Ok(DomainMetadataState::Complete(domain_metadata))
+            }
+            FfiDomainMetadataStateKind::Partial => {
+                Ok(DomainMetadataState::Partial(domain_metadata))
+            }
         }
     }
 }
@@ -850,3 +855,6 @@ impl FfiCrc {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests;

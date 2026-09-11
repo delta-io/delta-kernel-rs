@@ -198,23 +198,23 @@ void compile_snapshot_hint_abi(void)
     .table_size_bytes = 0,
   };
   FfiFileStatsState file_stats_state = {
-    .kind = FILE_STATS_STATE_COMPLETE,
+    .kind = FfiFileStatsStateKindComplete,
     .file_stats = file_stats,
     .file_size_histogram = &histogram,
   };
   FfiSetTransactionState transaction_state = {
-    .kind = SET_TRANSACTION_STATE_COMPLETE,
+    .kind = FfiSetTransactionStateKindComplete,
     .transactions = transaction_array,
   };
   FfiDomainMetadataState domain_metadata_state = {
-    .kind = DOMAIN_METADATA_STATE_COMPLETE,
+    .kind = FfiDomainMetadataStateKindComplete,
     .domain_metadata = domain_metadata_array,
   };
   OptionalValueFfiNullableStringMap optional_nullable_string_map = {
     .tag = NoneFfiNullableStringMap,
   };
   FfiDeletionVectorDescriptor deletion_vector = {
-    .storage_type = DELETION_VECTOR_STORAGE_TYPE_PERSISTED_ABSOLUTE,
+    .storage_type = FfiDeletionVectorStorageTypePersistedAbsolute,
     .path_or_inline_dv = string,
     .offset = optional_i32,
     .size_in_bytes = 0,
@@ -258,7 +258,7 @@ void compile_snapshot_hint_abi(void)
   LogPathArray log_paths = { .ptr = NULL, .len = 0 };
   FfiSnapshotHint snapshot_hint = {
     .version = 0,
-    .freshness = SNAPSHOT_HINT_FRESHNESS_LATEST,
+    .freshness = FfiSnapshotHintFreshnessLatest,
     .log_paths = log_paths,
     .protocol = protocol_value,
     .metadata = metadata,
