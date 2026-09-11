@@ -1089,12 +1089,13 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     );
 }
 
-// Partition-only scans have no stats schema, so the partition schema must enable the rewrite.
+// String partition footer values cannot distinguish an empty string from protocol null, so
+// partition-only predicates over them cannot be pushed to checkpoint row-group filtering.
 #[rstest]
 #[case::equality(Pred::eq(
     col!("modified"),
     lit("2021-02-01"),
-), None)]
+))]
 #[case::date_cast_range(Pred::and(
     Pred::ge(
         Expr::cast(col!("modified"), DataType::DATE),
@@ -1104,11 +1105,8 @@ fn test_build_actions_meta_predicate_static_skip_all() {
         Expr::cast(col!("modified"), DataType::DATE),
         Scalar::Date(20_644),
     ),
-), Some("CAST(Column(add.partitionValues_parsed.modified) AS date)"))]
-fn test_build_actions_meta_predicate_partition_only(
-    #[case] predicate: Pred,
-    #[case] expected_cast: Option<&str>,
-) {
+))]
+fn test_build_actions_meta_predicate_omits_string_partition_refs(#[case] predicate: Pred) {
     // `app-txn-checkpoint` is partitioned by `modified` (string), no column mapping.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
@@ -1121,31 +1119,20 @@ fn test_build_actions_meta_predicate_partition_only(
         .build()
         .unwrap();
 
-    let meta_pred = scan
-        .build_actions_meta_predicate()
-        .expect("partition-only predicate should produce a checkpoint meta-predicate");
-    let rendered = meta_pred.to_string();
-    if let Some(expected_cast) = expected_cast {
-        assert!(rendered.contains(expected_cast), "{rendered}");
-    }
-    let refs: Vec<String> = meta_pred
-        .references()
-        .into_iter()
-        .map(|c| c.to_string())
-        .collect();
-    assert_eq!(
-        refs,
-        vec!["add.partitionValues_parsed.modified".to_string()]
+    let meta_predicate = scan.build_actions_meta_predicate();
+    assert!(
+        meta_predicate
+            .as_ref()
+            .is_none_or(|predicate| predicate.references().is_empty()),
+        "{meta_predicate:?}"
     );
 }
 
-// Under column mapping, `partitionValues_parsed` is keyed by the physical partition name, so the
-// checkpoint meta-predicate must reference that physical name (not the logical one) in both name
-// and id mapping modes.
+// String partition footer values are unsafe for null pruning under every column mapping mode.
 #[rstest]
 #[case::name_mode("name")]
 #[case::id_mode("id")]
-fn test_build_actions_meta_predicate_partition_column_mapping(
+fn test_build_actions_meta_predicate_omits_mapped_string_partition_refs(
     #[case] mode: &str,
     #[values(false, true)] casted: bool,
 ) {
@@ -1171,22 +1158,12 @@ fn test_build_actions_meta_predicate_partition_column_mapping(
         .build()
         .unwrap();
 
-    let meta_pred = scan
-        .build_actions_meta_predicate()
-        .expect("partition predicate under column mapping should produce a meta-predicate");
-    let rendered = meta_pred.to_string();
-    assert_eq!(rendered.contains("CAST("), casted, "{rendered}");
-    let refs: Vec<String> = meta_pred
-        .references()
-        .into_iter()
-        .map(|c| c.to_string())
-        .collect();
-    // The hyphenated physical name is backtick-quoted in the column display.
+    let meta_predicate = scan.build_actions_meta_predicate();
     assert!(
-        refs.iter().any(|r| r.contains("partitionValues_parsed")
-            && r.contains("col-6dc68f07-711d-4f00-8bd6-1f5bc698e8ad")),
-        "expected a reference to the PHYSICAL partition column under partitionValues_parsed, \
-         got {refs:?}"
+        meta_predicate
+            .as_ref()
+            .is_none_or(|predicate| predicate.references().is_empty()),
+        "{meta_predicate:?}"
     );
 }
 

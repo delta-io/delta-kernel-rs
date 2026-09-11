@@ -30,9 +30,8 @@ use url::Url;
 /// - `native_checkpoint = false`: no checkpoint, so the struct is synthesized from the
 ///   `partitionValues` string map via `MAP_TO_STRUCT` on a JSON commit.
 /// - `native_checkpoint = true`: a checkpoint with `writeStatsAsStruct=true`, so the read takes the
-///   checkpoint's native `partitionValues_parsed` column directly. For the non-null values this
-///   table writes, that column matches what `MAP_TO_STRUCT` would reconstruct, so both sources
-///   yield the same struct.
+///   checkpoint path. Because this table has string and binary partitions, the scan reconstructs
+///   the struct from `partitionValues` so empty strings can be normalized safely.
 ///
 /// The struct keys on physical names, so a logical-vs-physical mismatch under `Id`/`Name` mapping
 /// would surface every partition value as null. The builder writes well-defined (non-null)
@@ -150,10 +149,8 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
 
 // === Foreign-writer literal empty-string partition values ===
 //
-// The kernel never persists a literal "" partition value (it serializes its own empty and null
-// partition values to JSON null on write), so these tests stand in a raw-JSON foreign writer that
-// did, then assert the kernel reconstructs `partitionValues_parsed` with the empty-string cast: ""
-// stays "" for string, becomes empty bytes for binary, and becomes null for every other type.
+// These tests stand in for a foreign writer that persists an empty string instead of null. Delta's
+// partition value serialization requires readers to normalize that representation to null.
 
 /// Writes a foreign-writer table under `table_path`: protocol + metadata declaring string, binary,
 /// and integer partition columns (with `writeStatsAsStruct` enabled so a checkpoint writes its own
@@ -221,13 +218,11 @@ fn add_action(path: &str, p_str: &str, p_bin: &str, p_int: &str) -> String {
 }
 
 /// A foreign writer can persist a literal "" in the `partitionValues` map. On read, kernel
-/// reconstructs `partitionValues_parsed` with the empty-string cast: "" stays "" for string,
-/// becomes empty bytes for binary, and becomes null for every other type.
+/// reconstructs every empty partition value as null.
 ///
-/// The result is identical whether the value is reconstructed from the `partitionValues` map (JSON
-/// commit) or read from a kernel-written checkpoint's native `partitionValues_parsed` column: the
-/// checkpoint reconstructs that column with the same cast, so a checkpoint never changes the value
-/// a scan surfaces. The `native_checkpoint` axis exercises both sources.
+/// The result is identical whether the map comes from a JSON commit or a checkpoint. Checkpoints
+/// with string or binary partitions do not use the native `partitionValues_parsed` fast path, so
+/// both sources apply the same normalization. The `native_checkpoint` axis exercises both sources.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parsed_partition_values_read_foreign_empty_string(
@@ -287,12 +282,10 @@ async fn parsed_partition_values_read_foreign_empty_string(
         let p_int = pv.column_by_name("p_int").unwrap();
         let p_int = p_int.as_any().downcast_ref::<Int32Array>().unwrap();
 
-        // Identical whether read from the map (JSON commit) or the checkpoint's native column.
-        assert!(!p_str.is_null(0), "string \"\" reconstructs as \"\"");
-        assert_eq!(p_str.value(0), "");
-        assert!(!p_bin.is_null(0), "binary \"\" reconstructs as empty bytes");
-        assert_eq!(p_bin.value(0), b"");
-        assert!(p_int.is_null(0), "non-string \"\" must be null");
+        // Identical whether the map is read from a JSON commit or a checkpoint.
+        assert!(p_str.is_null(0), "string \"\" must be null");
+        assert!(p_bin.is_null(0), "binary \"\" must be null");
+        assert!(p_int.is_null(0), "integer \"\" must be null");
 
         asserted_rows += batch.num_rows();
     }
@@ -306,15 +299,13 @@ fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
     paths.push(scan_file.path);
 }
 
-/// A file whose partition value is a foreign literal "" is a real empty value, not null, so
-/// partition skipping treats it accordingly:
-/// - `p_str = ''` keeps it and `p_str = 'other'` prunes it.
-/// - `p_str IS NULL` prunes it and `p_str IS NOT NULL` keeps it (the value is "", not null).
-/// - the same holds for the binary column (`p_bin`), whose "" reconstructs as empty bytes.
+/// A file whose partition value is a foreign literal "" has a null partition value. Partition
+/// skipping prunes it for equality with a non-null literal, keeps it for `IS NULL`, and prunes it
+/// for `IS NOT NULL`.
 ///
 /// The `native_checkpoint` axis exercises that pruning is identical before and after a kernel
-/// checkpoint: the checkpoint reconstructs the same "" into its native `partitionValues_parsed`
-/// column, so skipping keeps and prunes the same files a scan of the JSON commit would.
+/// checkpoint: both sources normalize the value to null, so skipping keeps and prunes the same
+/// files.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint: bool) {
@@ -359,35 +350,31 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
 
     let empty = "p_str=/empty.parquet".to_string();
     let other = "p_str=other/other.parquet".to_string();
-    let both = vec![empty.clone(), other.clone()];
 
-    // The empty-string value is a real "", so equality and null predicates treat it as such.
-    assert_eq!(
-        surviving(Predicate::eq(col!("p_str"), lit(""))),
-        vec![empty.clone()],
-        "empty-string file must be kept under p_str = ''"
+    assert!(
+        surviving(Predicate::eq(col!("p_str"), lit(""))).is_empty(),
+        "null partition file must be pruned under p_str = ''"
     );
     assert_eq!(
         surviving(Predicate::eq(col!("p_str"), lit("other"))),
         vec![other.clone()],
-        "empty-string file must be pruned under p_str = 'other'"
+        "null partition file must be pruned under p_str = 'other'"
     );
-    // Both partition values are non-null ("" and "other"), so IS NULL prunes both and IS NOT NULL
-    // keeps both.
-    assert!(
-        surviving(Predicate::is_null(col!("p_str"))).is_empty(),
-        "no file has a null p_str, so IS NULL prunes both (the empty file's value is \"\", not null)"
+    assert_eq!(
+        surviving(Predicate::is_null(col!("p_str"))),
+        vec![empty.clone()],
+        "empty-string partition must be kept under p_str IS NULL"
     );
     assert_eq!(
         surviving(Predicate::is_not_null(col!("p_str"))),
-        both,
-        "both files must be kept under p_str IS NOT NULL"
+        vec![other.clone()],
+        "empty-string partition must be pruned under p_str IS NOT NULL"
     );
 
-    // The binary column reconstructs "" as empty bytes, pruned the same way.
+    // The binary empty string follows the same null semantics.
     assert_eq!(
         surviving(Predicate::eq(col!("p_bin"), lit(b"other".as_slice()))),
-        vec![other.clone()],
-        "empty-bytes file must be pruned under p_bin = X'6f74686572'"
+        vec![other],
+        "null partition file must be pruned under p_bin = X'6f74686572'"
     );
 }
