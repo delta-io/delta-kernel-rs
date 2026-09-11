@@ -1252,7 +1252,7 @@ mod tests {
 
     // dv-info is more complex to validate, we validate that works in the test for visit_scan_files
     // in state.rs
-    fn validate_simple(_: &mut (), scan_file: ScanFile) {
+    fn validate_simple(_: &mut (), scan_file: ScanFile) -> bool {
         assert_eq!(
             scan_file.path,
             "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
@@ -1265,6 +1265,7 @@ mod tests {
             Some(&"2017-12-10".to_string())
         );
         assert_eq!(scan_file.partition_values.get("non-existent"), None);
+        true
     }
 
     #[test]
@@ -1957,6 +1958,7 @@ mod tests {
             scan_metadata
                 .visit_scan_files((), |_: &mut (), scan_file: ScanFile| {
                     assert!(scan_file.stats.is_none());
+                    true
                 })
                 .unwrap();
             found_add = true;
@@ -2042,6 +2044,7 @@ mod tests {
                     Vec::new(),
                     |paths: &mut Vec<String>, scan_file: ScanFile| {
                         paths.push(scan_file.path.to_string());
+                        true
                     },
                 )
                 .unwrap();

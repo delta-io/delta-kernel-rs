@@ -1892,8 +1892,9 @@ fn full_scan_surviving_paths(
     engine: &MtEngine,
     predicate: PredicateRef,
 ) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
-    fn insert_path(paths: &mut HashSet<String>, scan_file: ScanFile) {
+    fn insert_path(paths: &mut HashSet<String>, scan_file: ScanFile) -> bool {
         paths.insert(scan_file.path);
+        true
     }
 
     let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
