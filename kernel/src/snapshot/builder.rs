@@ -18,7 +18,7 @@ use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
-use crate::table_configuration::TableConfiguration;
+use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::utils::{require, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
@@ -594,6 +594,14 @@ impl<Mode> SnapshotBuilder<Mode> {
             SnapshotHintError::MaxPublishedVersion { hint: version }.into()
         );
         require!(
+            log_segment
+                .listed
+                .latest_commit_file
+                .as_ref()
+                .is_some_and(|commit| commit.version == version),
+            SnapshotHintError::MissingLatestCommit { hint: version }.into()
+        );
+        require!(
             log_segment.checkpoint_version.is_some()
                 || log_segment
                     .listed
@@ -620,6 +628,18 @@ impl<Mode> SnapshotBuilder<Mode> {
             require!(
                 crc.metadata == *table_configuration.metadata(),
                 SnapshotHintError::CrcMetadata.into()
+            );
+            let ict_enabled = matches!(
+                table_configuration.in_commit_timestamp_enablement()?,
+                InCommitTimestampEnablement::Enabled { .. }
+            );
+            require!(
+                ict_enabled || crc.in_commit_timestamp_opt.is_none(),
+                SnapshotHintError::UnexpectedInCommitTimestamp.into()
+            );
+            require!(
+                !ict_enabled || crc.in_commit_timestamp_opt.is_some(),
+                SnapshotHintError::MissingInCommitTimestamp.into()
             );
         }
 
@@ -825,6 +845,8 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::schema::schema_ref;
+    use crate::table_features::TableFeature;
+    use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::unit_test_utils::{
         create_log_path, install_thread_local_metrics_reporter, CapturingReporter,
         TestCancellationToken,
@@ -992,7 +1014,7 @@ mod tests {
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn complete_snapshot_hint_preserves_checkpoint_state(
+    async fn snapshot_hint_preserves_checkpoint_state_and_requires_target_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
@@ -1009,11 +1031,9 @@ mod tests {
             .last_checkpoint_metadata
             .is_some());
 
-        let mut hint = hint_from_snapshot(&storage_snapshot, SnapshotHintFreshness::Unverified);
-        hint.log_segment_files.ascending_commit_files.clear();
-        hint.log_segment_files.latest_commit_file = None;
+        let hint = hint_from_snapshot(&storage_snapshot, SnapshotHintFreshness::Unverified);
         let hinted_snapshot = SnapshotBuilder::new_for(table_root)
-            .with_snapshot_hint(hint)
+            .with_snapshot_hint(hint.clone())
             .build(engine.as_ref())?;
         assert_eq!(
             hinted_snapshot.log_segment().checkpoint_version,
@@ -1022,6 +1042,19 @@ mod tests {
         assert_eq!(
             hinted_snapshot.log_segment().listed.checkpoint_parts,
             storage_snapshot.log_segment().listed.checkpoint_parts
+        );
+
+        let mut missing_target_commit = hint;
+        missing_target_commit
+            .log_segment_files
+            .ascending_commit_files
+            .clear();
+        missing_target_commit.log_segment_files.latest_commit_file = None;
+        assert_hint_error(
+            SnapshotBuilder::new_for(storage_snapshot.table_root()),
+            missing_target_commit,
+            engine.as_ref(),
+            "commit for snapshot hint version 1 is missing",
         );
         Ok(())
     }
@@ -1226,6 +1259,54 @@ mod tests {
             engine.as_ref(),
             "CRC metadata does not match",
         );
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::disabled_without_timestamp(false, false, None)]
+    #[case::disabled_with_timestamp(
+        false,
+        true,
+        Some("ICT-disabled CRC contains inCommitTimestamp")
+    )]
+    #[case::enabled_without_timestamp(
+        true,
+        false,
+        Some("ICT-enabled CRC is missing inCommitTimestamp")
+    )]
+    #[case::enabled_with_timestamp(true, true, None)]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_hint_requires_ict_timestamp_iff_enabled(
+        #[case] ict_enabled: bool,
+        #[case] ict_value_present: bool,
+        #[case] expected_error: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, table_root, _snapshot, mut hint) =
+            snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
+        let mut crc = hint.crc.as_ref().unwrap().as_ref().clone();
+
+        if ict_enabled {
+            hint.protocol = Protocol::try_new_modern(
+                std::iter::empty::<TableFeature>(),
+                [TableFeature::InCommitTimestamp],
+            )?;
+            hint.metadata = hint
+                .metadata
+                .with_configuration_entry(ENABLE_IN_COMMIT_TIMESTAMPS, "true");
+        }
+        crc.protocol = hint.protocol.clone();
+        crc.metadata = hint.metadata.clone();
+        crc.in_commit_timestamp_opt = ict_value_present.then_some(123);
+        hint.crc = Some(Arc::new(crc));
+
+        let result = SnapshotBuilder::new_for(table_root)
+            .with_snapshot_hint(hint)
+            .build(engine.as_ref());
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            result?;
+        }
         Ok(())
     }
 

@@ -115,41 +115,47 @@ impl FileSizeHistogram {
         file_counts: Vec<i64>,
         total_bytes: Vec<i64>,
     ) -> DeltaResult<Self> {
+        let histogram = Self {
+            sorted_bin_boundaries,
+            file_counts,
+            total_bytes,
+        };
+        histogram.check_shape()?;
+        Ok(histogram)
+    }
+
+    fn check_shape(&self) -> DeltaResult<()> {
         require!(
-            sorted_bin_boundaries.len() >= 2,
+            self.sorted_bin_boundaries.len() >= 2,
             Error::internal_error(format!(
                 "sorted_bin_boundaries must have at least 2 elements, got {}",
-                sorted_bin_boundaries.len()
+                self.sorted_bin_boundaries.len()
             ))
         );
         require!(
-            sorted_bin_boundaries[0] == 0,
+            self.sorted_bin_boundaries[0] == 0,
             Error::internal_error(format!(
                 "First boundary must be 0, got {}",
-                sorted_bin_boundaries[0]
+                self.sorted_bin_boundaries[0]
             ))
         );
         require!(
-            sorted_bin_boundaries.len() == file_counts.len()
-                && sorted_bin_boundaries.len() == total_bytes.len(),
+            self.sorted_bin_boundaries.len() == self.file_counts.len()
+                && self.sorted_bin_boundaries.len() == self.total_bytes.len(),
             Error::internal_error(format!(
                 "All arrays must have the same length: boundaries={}, file_counts={}, total_bytes={}",
-                sorted_bin_boundaries.len(),
-                file_counts.len(),
-                total_bytes.len()
+                self.sorted_bin_boundaries.len(),
+                self.file_counts.len(),
+                self.total_bytes.len()
             ))
         );
         require!(
-            sorted_bin_boundaries.windows(2).all(|w| w[0] < w[1]),
+            self.sorted_bin_boundaries.windows(2).all(|w| w[0] < w[1]),
             Error::internal_error(
                 "sorted_bin_boundaries must be sorted in strictly ascending order"
             )
         );
-        Ok(Self {
-            sorted_bin_boundaries,
-            file_counts,
-            total_bytes,
-        })
+        Ok(())
     }
 
     /// Creates an empty histogram with the given bin boundaries and zero counts/bytes.
@@ -273,6 +279,64 @@ impl FileSizeHistogram {
         }
         Ok(self)
     }
+
+    /// Validates an absolute histogram against its complete file statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the histogram shape is invalid, a bin has impossible aggregate
+    /// statistics for its bounds, a total overflows, or the totals differ from `num_files` and
+    /// `table_size_bytes`.
+    pub(crate) fn validate_complete(
+        &self,
+        num_files: i64,
+        table_size_bytes: i64,
+    ) -> DeltaResult<()> {
+        self.check_shape()?;
+        for i in 0..self.sorted_bin_boundaries.len() {
+            let count = i128::from(self.file_counts[i]);
+            let bytes = i128::from(self.total_bytes[i]);
+            let lower = i128::from(self.sorted_bin_boundaries[i]);
+            let upper = self
+                .sorted_bin_boundaries
+                .get(i + 1)
+                .copied()
+                .map(i128::from);
+            let aggregates_are_possible = (count == 0 && bytes == 0)
+                || (count > 0
+                    && bytes >= lower * count
+                    && upper.is_none_or(|upper| bytes < upper * count));
+            require!(
+                aggregates_are_possible,
+                Error::internal_error(format!(
+                    "Histogram bin {i} has count {count} and total bytes {bytes}, which are \
+                     inconsistent with its bounds"
+                ))
+            );
+        }
+
+        let file_count = self.file_counts.iter().try_fold(0_i64, |sum, count| {
+            sum.checked_add(*count)
+                .ok_or_else(|| Error::internal_error("Histogram file count overflow"))
+        })?;
+        let total_bytes = self.total_bytes.iter().try_fold(0_i64, |sum, bytes| {
+            sum.checked_add(*bytes)
+                .ok_or_else(|| Error::internal_error("Histogram total bytes overflow"))
+        })?;
+        require!(
+            file_count == num_files,
+            Error::internal_error(format!(
+                "Histogram file count {file_count} does not match numFiles {num_files}"
+            ))
+        );
+        require!(
+            total_bytes == table_size_bytes,
+            Error::internal_error(format!(
+                "Histogram total bytes {total_bytes} does not match tableSizeBytes {table_size_bytes}"
+            ))
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +373,73 @@ mod tests {
         assert_eq!(hist.sorted_bin_boundaries, vec![0, 100]);
         assert_eq!(hist.file_counts, vec![5, 3]);
         assert_eq!(hist.total_bytes, vec![200, 900]);
+    }
+
+    #[rstest]
+    #[case::empty_bin_has_bytes(vec![0, 10], vec![0, 0], vec![1, 0], 0, 1)]
+    #[case::below_lower_bound(vec![0, 10], vec![0, 1], vec![0, 9], 1, 9)]
+    #[case::at_exclusive_upper_bound(vec![0, 10], vec![1, 0], vec![10, 0], 1, 10)]
+    fn validate_complete_rejects_impossible_bin_aggregates(
+        #[case] boundaries: Vec<i64>,
+        #[case] file_counts: Vec<i64>,
+        #[case] total_bytes: Vec<i64>,
+        #[case] num_files: i64,
+        #[case] table_size_bytes: i64,
+    ) {
+        let histogram = FileSizeHistogram::try_new(boundaries, file_counts, total_bytes).unwrap();
+        assert_result_error_with_message(
+            histogram.validate_complete(num_files, table_size_bytes),
+            "inconsistent with its bounds",
+        );
+    }
+
+    #[rstest]
+    #[case::empty(vec![0, 10], vec![0, 0], vec![0, 0], 0, 0)]
+    #[case::exclusive_upper_bound(vec![0, 10], vec![2, 0], vec![18, 0], 2, 18)]
+    #[case::last_bin_unbounded(vec![0, 10], vec![0, 1], vec![0, i64::MAX], 1, i64::MAX)]
+    fn validate_complete_accepts_achievable_bin_aggregates(
+        #[case] boundaries: Vec<i64>,
+        #[case] file_counts: Vec<i64>,
+        #[case] total_bytes: Vec<i64>,
+        #[case] num_files: i64,
+        #[case] table_size_bytes: i64,
+    ) {
+        let histogram = FileSizeHistogram::try_new(boundaries, file_counts, total_bytes).unwrap();
+        histogram
+            .validate_complete(num_files, table_size_bytes)
+            .unwrap();
+    }
+
+    #[rstest]
+    #[case::file_count(
+        vec![0, 10],
+        vec![i64::MAX, 1],
+        vec![0, 10],
+        i64::MAX,
+        10,
+        "file count overflow"
+    )]
+    #[case::total_bytes(
+        vec![0, i64::MAX],
+        vec![1, 1],
+        vec![i64::MAX - 1, i64::MAX],
+        2,
+        i64::MAX,
+        "total bytes overflow"
+    )]
+    fn validate_complete_rejects_overflowing_totals(
+        #[case] boundaries: Vec<i64>,
+        #[case] file_counts: Vec<i64>,
+        #[case] total_bytes: Vec<i64>,
+        #[case] num_files: i64,
+        #[case] table_size_bytes: i64,
+        #[case] expected: &str,
+    ) {
+        let histogram = FileSizeHistogram::try_new(boundaries, file_counts, total_bytes).unwrap();
+        assert_result_error_with_message(
+            histogram.validate_complete(num_files, table_size_bytes),
+            expected,
+        );
     }
 
     #[rstest]

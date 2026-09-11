@@ -151,6 +151,12 @@ pub enum SnapshotHintError {
         /// The version described by the snapshot hint.
         hint: Version,
     },
+    /// The hint omits the commit for its target version.
+    #[error("Invalid snapshot hint: commit for snapshot hint version {hint} is missing")]
+    MissingLatestCommit {
+        /// The version described by the snapshot hint.
+        hint: Version,
+    },
     /// The hint has neither a complete checkpoint nor commit version zero.
     #[error("Invalid snapshot hint: snapshot history does not start at version 0")]
     MissingHistoryAnchor,
@@ -170,6 +176,12 @@ pub enum SnapshotHintError {
     /// The supplied CRC metadata differs from the hint metadata.
     #[error("Invalid snapshot hint: CRC metadata does not match snapshot hint metadata")]
     CrcMetadata,
+    /// An ICT-enabled CRC omitted its required in-commit timestamp.
+    #[error("Invalid snapshot hint: ICT-enabled CRC is missing inCommitTimestamp")]
+    MissingInCommitTimestamp,
+    /// An ICT-disabled CRC included an in-commit timestamp.
+    #[error("Invalid snapshot hint: ICT-disabled CRC contains inCommitTimestamp")]
+    UnexpectedInCommitTimestamp,
     /// A connector reported invalid snapshot-hint state, optionally with an underlying error.
     #[error("Invalid snapshot hint: {message}")]
     Connector {

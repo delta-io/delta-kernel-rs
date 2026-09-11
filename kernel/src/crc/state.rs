@@ -45,9 +45,8 @@ impl FileStatsState {
         }
     }
 
-    /// Returns `true` if file stats are known-correct absolute totals. Also gates whether
-    /// the CRC is safe to write to disk: only `Complete` CRCs have well-defined on-disk
-    /// representations.
+    /// Returns `true` if file stats are known-correct absolute totals.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn is_complete(&self) -> bool {
         matches!(self, Self::Complete(_))
     }
@@ -60,8 +59,8 @@ impl FileStatsState {
     }
 }
 
-// TODO(#2568): make `Default` test-only. `Crc::default()` produces a Complete-zero CRC
-//              that passes `is_complete()` and could be silently written.
+// TODO(#2568): make `Default` test-only. `Crc::default()` produces a Complete-zero CRC that could
+//              be silently written.
 impl Default for FileStatsState {
     fn default() -> Self {
         Self::Complete(FileStats::default())
