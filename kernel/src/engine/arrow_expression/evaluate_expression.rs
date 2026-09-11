@@ -10,8 +10,8 @@ use tracing::warn;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
-    AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    RecordBatch, StringArray, StructArray,
+    ArrowNativeTypeOp, AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData,
+    NullBufferBuilder, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
@@ -722,8 +722,33 @@ pub fn evaluate_predicate(
                 (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
             };
 
+            let has_non_nan_literal =
+                is_non_nan_float_literal(left) || is_non_nan_float_literal(right);
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
+            match (left.data_type(), right.data_type()) {
+                (ArrowDataType::Float32, ArrowDataType::Float32) => {
+                    return compare_float_arrays::<Float32Type>(
+                        left.as_primitive(),
+                        right.as_primitive(),
+                        *op,
+                        inverted,
+                        has_non_nan_literal,
+                    );
+                }
+                (ArrowDataType::Float64, ArrowDataType::Float64) => {
+                    return compare_float_arrays::<Float64Type>(
+                        left.as_primitive(),
+                        right.as_primitive(),
+                        *op,
+                        inverted,
+                        has_non_nan_literal,
+                    );
+                }
+                _ => {}
+            }
+            let left = normalize_comparison_zeros(left)?;
+            let right = normalize_comparison_zeros(right)?;
 
             // If the types differ (e.g. one side is a view type and the other is not),
             // normalize both to view types since benchamrking results show that casting from
@@ -1102,6 +1127,117 @@ fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaRes
     Ok(array)
 }
 
+// Fuse signed-zero handling into the comparison to avoid copying full float columns. Arrow's
+// native comparisons preserve NaN payload ordering; Rust equality makes the two zeros equal.
+fn compare_float_arrays<T: ArrowPrimitiveType>(
+    left: &PrimitiveArray<T>,
+    right: &PrimitiveArray<T>,
+    op: BinaryPredicateOp,
+    inverted: bool,
+    has_non_nan_literal: bool,
+) -> DeltaResult<BooleanArray> {
+    if left.len() != right.len() {
+        return Err(Error::invalid_expression(format!(
+            "Cannot compare arrays of different lengths, got {} and {}",
+            left.len(),
+            right.len()
+        )));
+    }
+
+    let result = match op {
+        // A non-NaN literal cannot match a NaN, so IEEE equality is sufficient.
+        BinaryPredicateOp::Equal | BinaryPredicateOp::Distinct if has_non_nan_literal => {
+            BooleanArray::from_binary(left, right, |a, b| a == b)
+        }
+        BinaryPredicateOp::Equal | BinaryPredicateOp::Distinct => {
+            BooleanArray::from_binary(left, right, |a, b| a == b || a.is_eq(b))
+        }
+        BinaryPredicateOp::LessThan => {
+            BooleanArray::from_binary(left, right, |a, b| a.is_lt(b) && a != b)
+        }
+        BinaryPredicateOp::GreaterThan => {
+            BooleanArray::from_binary(left, right, |a, b| a.is_gt(b) && a != b)
+        }
+        BinaryPredicateOp::In => {
+            return Err(Error::internal_error(
+                "unexpected IN predicate in float comparison",
+            ))
+        }
+    };
+    let (mut values, mut nulls) = result.into_parts();
+    if op == BinaryPredicateOp::Distinct {
+        // Null-safe equality: both null, or both valid and equal.
+        if let Some(valid) = &nulls {
+            values &= valid.inner();
+        }
+        if let (Some(left), Some(right)) = (left.nulls(), right.nulls()) {
+            let both_null = !&(left.inner() | right.inner());
+            values |= &both_null;
+        }
+        nulls = None;
+    }
+    if inverted != (op == BinaryPredicateOp::Distinct) {
+        values = !&values;
+    }
+    Ok(BooleanArray::new(values, nulls))
+}
+
+fn is_non_nan_float_literal(expr: &Expression) -> bool {
+    match expr {
+        Expression::Literal(Scalar::Float(value)) => !value.is_nan(),
+        Expression::Literal(Scalar::Double(value)) => !value.is_nan(),
+        _ => false,
+    }
+}
+
+// Dictionary comparisons stay encoded. Normalize only comparison operands so the original arrays
+// retain their signed-zero bits and Arrow preserves its NaN and null semantics.
+fn normalize_comparison_zeros(array: ArrayRef) -> DeltaResult<ArrayRef> {
+    match array.data_type() {
+        ArrowDataType::Float32 => Ok(normalize_float_zeros::<Float32Type>(array)),
+        ArrowDataType::Float64 => Ok(normalize_float_zeros::<Float64Type>(array)),
+        ArrowDataType::Dictionary(_, value_type) => {
+            let mut leaf_type = value_type.as_ref();
+            while let ArrowDataType::Dictionary(_, inner) = leaf_type {
+                leaf_type = inner;
+            }
+            if !matches!(leaf_type, ArrowDataType::Float32 | ArrowDataType::Float64) {
+                return Ok(array);
+            }
+            let dictionary = array.as_any_dictionary();
+            // Arrow comparisons support one dictionary layer. Flatten only nested values, keeping
+            // the outer keys shared instead of materializing every row.
+            let values = if dictionary.values().data_type() == leaf_type {
+                dictionary.values().clone()
+            } else {
+                cast(dictionary.values(), leaf_type)?
+            };
+            let values = normalize_comparison_zeros(values)?;
+            if Arc::ptr_eq(dictionary.values(), &values) {
+                Ok(array)
+            } else {
+                Ok(dictionary.with_values(values))
+            }
+        }
+        _ => Ok(array),
+    }
+}
+
+fn normalize_float_zeros<T: ArrowPrimitiveType>(array: ArrayRef) -> ArrayRef {
+    let floats = array.as_primitive::<T>();
+    let zero = T::Native::ZERO;
+    let negative_zero = zero.neg_wrapping();
+    // Arrow's is_eq compares float bits; the non-short-circuiting reduction can vectorize.
+    let needs_copy = floats
+        .values()
+        .iter()
+        .fold(false, |found, value| found | value.is_eq(negative_zero));
+    if !needs_copy {
+        return array;
+    }
+    Arc::new(floats.unary::<_, T>(|value| if value.is_zero() { zero } else { value }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1184,6 +1320,27 @@ mod tests {
             vec![Arc::new(a_values), Arc::new(nested_struct)],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_compare_float_arrays_rejects_invalid_inputs() {
+        let left = Float64Array::from(vec![0.0]);
+        let right = Float64Array::from(vec![0.0, 1.0]);
+        assert_result_error_with_message(
+            compare_float_arrays::<Float64Type>(
+                &left,
+                &right,
+                BinaryPredicateOp::Equal,
+                false,
+                true,
+            ),
+            "Cannot compare arrays of different lengths",
+        );
+
+        assert_result_error_with_message(
+            compare_float_arrays::<Float64Type>(&left, &left, BinaryPredicateOp::In, false, true),
+            "unexpected IN predicate in float comparison",
+        );
     }
 
     #[test]

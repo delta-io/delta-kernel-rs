@@ -6,13 +6,14 @@ use Predicate as Pred;
 
 use super::*;
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray,
+    create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, DictionaryArray, Float32Array,
+    Float64Array, GenericStringArray, Int32Array, Int32Builder, ListArray, ListViewArray, MapArray,
+    MapBuilder, MapFieldNames, StringArray, StringBuilder, StringViewArray, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use crate::arrow::compute::cast;
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
-use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+use crate::arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
@@ -1294,5 +1295,549 @@ fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
     assert!(
         matches!(err, Error::Unsupported(_)),
         "expected Unsupported, got: {err:?}"
+    );
+}
+// === Negative zero float comparison tests ===
+//
+// Verify that -0.0 and 0.0 compare as logically equal.
+
+#[rstest]
+#[case::equal(Expr::eq, false, [Some(true), Some(true), Some(false), Some(false), None])]
+#[case::less(Expr::lt, false, [Some(false), Some(false), Some(false), Some(true), None])]
+#[case::greater(Expr::gt, false, [Some(false), Some(false), Some(true), Some(false), None])]
+#[case::less_equal(Expr::le, false, [Some(true), Some(true), Some(false), Some(true), None])]
+#[case::greater_equal(Expr::ge, false, [Some(true), Some(true), Some(true), Some(false), None])]
+#[case::distinct(Expr::distinct, false, [Some(false), Some(false), Some(true), Some(true), Some(true)])]
+#[case::inverted_equal(Expr::eq, true, [Some(false), Some(false), Some(true), Some(true), None])]
+#[case::inverted_less(Expr::lt, true, [Some(true), Some(true), Some(true), Some(false), None])]
+#[case::inverted_greater(Expr::gt, true, [Some(true), Some(true), Some(false), Some(true), None])]
+fn test_float_negative_zero_comparisons(
+    #[case] make_predicate: fn(Expr, Expr) -> Pred,
+    #[case] inverted: bool,
+    #[case] expected: [Option<bool>; 5],
+    #[values(DataType::Float32, DataType::Float64)] data_type: DataType,
+    #[values(false, true)] negative_literal: bool,
+) {
+    let values = Float64Array::from(vec![Some(-0.0), Some(0.0), Some(1.0), Some(-1.0), None]);
+    let array = cast(&values, &data_type).unwrap();
+    let zero = if negative_literal { -0.0 } else { 0.0 };
+    let literal = match data_type {
+        DataType::Float32 => Scalar::Float(zero as f32),
+        DataType::Float64 => Scalar::Double(zero),
+        _ => unreachable!(),
+    };
+    let batch = RecordBatch::try_from_iter([("col", array)]).unwrap();
+    let predicate = make_predicate(col!("col"), lit(literal));
+    assert_eq!(
+        evaluate_predicate(&predicate, &batch, inverted).unwrap(),
+        BooleanArray::from(expected.to_vec())
+    );
+}
+
+#[test]
+fn test_float_neg_zero_in_predicate() {
+    // -0.0 should be found IN a list containing 0.0, and vice versa
+    let field = Arc::new(Field::new("item", DataType::Float64, true));
+    let list_field = Arc::new(Field::new("list", DataType::List(field.clone()), true));
+    let schema = Schema::new([list_field]);
+
+    // Three rows: [0.0, 1.0], [-0.0, 2.0], [3.0, 4.0]
+    let values = Float64Array::from(vec![0.0, 1.0, -0.0, 2.0, 3.0, 4.0]);
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 4, 6]));
+    let list_array = ListArray::new(field, offsets, Arc::new(values), None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)]).unwrap();
+
+    // -0.0 IN [0.0, 1.0] should be true (row 0 has 0.0 which equals -0.0)
+    let pred = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal(Scalar::Double(-0.0)),
+        column_expr!("list"),
+    );
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![true, true, false]),
+        "-0.0 IN list"
+    );
+
+    // 0.0 IN [-0.0, 2.0] should be true (row 1 has -0.0 which equals 0.0)
+    let pred = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal(Scalar::Double(0.0)),
+        column_expr!("list"),
+    );
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![true, true, false]),
+        "0.0 IN list"
+    );
+}
+
+#[rstest]
+#[case::above_zero(Expr::gt, 0.0, false, [Some(true), Some(false), Some(true), Some(false), None])]
+#[case::below_nan(Expr::lt, f64::NAN, false, [Some(false), Some(true), Some(true), Some(true), None])]
+#[case::equal_nan(Expr::eq, f64::NAN, false, [Some(true), Some(false), Some(false), Some(false), None])]
+#[case::less_equal_nan(Expr::le, f64::NAN, false, [Some(true), Some(true), Some(true), Some(true), None])]
+#[case::greater_equal_nan(Expr::ge, f64::NAN, false, [Some(true), Some(false), Some(false), Some(false), None])]
+#[case::distinct_nan(Expr::distinct, f64::NAN, false, [Some(false), Some(true), Some(true), Some(true), Some(true)])]
+#[case::inverted_greater(Expr::gt, 0.0, true, [Some(false), Some(true), Some(false), Some(true), None])]
+#[case::inverted_equal(Expr::eq, f64::NAN, true, [Some(false), Some(true), Some(true), Some(true), None])]
+fn test_float_positive_nan_total_ordering(
+    #[case] make_predicate: fn(Expr, Expr) -> Pred,
+    #[case] literal: f64,
+    #[case] inverted: bool,
+    #[case] expected: [Option<bool>; 5],
+    #[values(DataType::Float32, DataType::Float64)] data_type: DataType,
+) {
+    let values = Float64Array::from(vec![
+        Some(f64::NAN),
+        Some(0.0),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        None,
+    ]);
+    let array = cast(&values, &data_type).unwrap();
+    let literal = match data_type {
+        DataType::Float32 => Scalar::Float(literal as f32),
+        DataType::Float64 => Scalar::Double(literal),
+        _ => unreachable!(),
+    };
+    let batch = RecordBatch::try_from_iter([("col", array)]).unwrap();
+    let predicate = make_predicate(col!("col"), lit(literal));
+    assert_eq!(
+        evaluate_predicate(&predicate, &batch, inverted).unwrap(),
+        BooleanArray::from(expected.to_vec())
+    );
+}
+
+/// `IS NOT DISTINCT FROM` treats nulls as comparable: `NULL <=> NULL` is true, `NULL <=> v`
+/// is false. Signed zeros and identical NaN values are not distinct.
+#[rstest]
+#[case::f64(
+    Arc::new(Float64Array::from(vec![Some(-0.0f64), Some(0.0), Some(1.0), Some(f64::NAN), None])) as ArrayRef,
+    DataType::Float64,
+    Scalar::Double(0.0),
+    Scalar::Double(f64::NAN),
+)]
+#[case::f32(
+    Arc::new(Float32Array::from(vec![Some(-0.0f32), Some(0.0), Some(1.0), Some(f32::NAN), None])) as ArrayRef,
+    DataType::Float32,
+    Scalar::Float(0.0),
+    Scalar::Float(f32::NAN),
+)]
+fn test_float_not_distinct_from(
+    #[case] array: ArrayRef,
+    #[case] dtype: DataType,
+    #[case] zero: Scalar,
+    #[case] nan: Scalar,
+) {
+    let schema = Schema::new([Arc::new(Field::new("col", dtype, true))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
+    let col = column_expr!("col");
+
+    let pred = col.clone().distinct(Expr::literal(zero));
+    let result = evaluate_predicate(&pred, &batch, true).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![true, true, false, false, false]),
+        "col not_distinct 0.0: -0.0/0.0 match, 1.0/NaN/NULL do not"
+    );
+
+    let pred = col.distinct(Expr::literal(nan));
+    let result = evaluate_predicate(&pred, &batch, true).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![false, false, false, true, false]),
+        "col not_distinct NaN: only NaN matches"
+    );
+}
+
+/// Covers signed zeros, identical NaNs, disjoint nulls, and matching nulls across float columns.
+#[test]
+fn test_float_column_vs_column() {
+    let left = Arc::new(Float64Array::from(vec![
+        Some(-0.0),
+        Some(f64::NAN),
+        Some(f64::NAN),
+        None,
+        Some(1.0),
+        Some(2.0),
+        None,
+    ])) as ArrayRef;
+    let right = Arc::new(Float64Array::from(vec![
+        Some(0.0),
+        Some(f64::NAN),
+        Some(1.0),
+        Some(1.0),
+        None,
+        Some(2.0),
+        None,
+    ])) as ArrayRef;
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Float64, true),
+        Field::new("b", DataType::Float64, true),
+    ]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![left, right]).unwrap();
+    let a = column_expr!("a");
+    let b = column_expr!("b");
+
+    let pred = a.clone().eq(b.clone());
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![
+            Some(true),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            Some(true),
+            None
+        ]),
+        "a eq b: -0.0/0.0 equal, NaN/NaN equal, NULLs propagate"
+    );
+
+    let pred = a.clone().distinct(b.clone());
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![false, false, true, true, true, false, false]),
+        "a distinct b: NULL is distinct from a value but not from NULL"
+    );
+
+    let pred = a.clone().distinct(b.clone());
+    let result = evaluate_predicate(&pred, &batch, true).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![true, true, false, false, false, true, true]),
+        "a not_distinct b: NULL <=> NULL is true, NULL <=> value is false"
+    );
+
+    let pred = a.gt(b);
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![
+            Some(false),
+            Some(false),
+            Some(true),
+            None,
+            None,
+            Some(false),
+            None
+        ]),
+        "a gt b: NaN > 1.0"
+    );
+}
+
+#[test]
+fn test_float_negative_nan_total_ordering_is_preserved() {
+    let negative_nan = f64::from_bits(f64::NAN.to_bits() | (1 << 63));
+    let array = Arc::new(Float64Array::from(vec![negative_nan, f64::NAN])) as ArrayRef;
+    let schema = Schema::new([Arc::new(Field::new("col", DataType::Float64, false))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
+    let col = col!("col");
+
+    let result = evaluate_predicate(&col.clone().lt(lit(0.0)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![true, false]));
+
+    let result = evaluate_predicate(&col.clone().gt(lit(0.0)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![false, true]));
+
+    let result = evaluate_predicate(&col.eq(lit(0.0)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![false, false]));
+}
+
+#[test]
+fn test_float_nan_payload_total_ordering_is_preserved() {
+    let lower_nan = f64::NAN;
+    let higher_nan = f64::from_bits(lower_nan.to_bits() + 1);
+    let array = Arc::new(Float64Array::from(vec![lower_nan, higher_nan])) as ArrayRef;
+    let schema = Schema::new([Arc::new(Field::new("col", DataType::Float64, false))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
+    let col = col!("col");
+
+    let result = evaluate_predicate(&col.clone().eq(lit(higher_nan)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![false, true]));
+
+    let result = evaluate_predicate(&col.clone().lt(lit(higher_nan)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![true, false]));
+
+    let result = evaluate_predicate(&col.distinct(lit(higher_nan)), &batch, false).unwrap();
+    assert_eq!(result, BooleanArray::from(vec![true, false]));
+}
+
+#[rstest]
+fn test_float_dictionary_comparisons_match_plain_arrays(
+    #[values(DataType::Float32, DataType::Float64)] data_type: DataType,
+    #[values(
+        BinaryPredicateOp::Equal,
+        BinaryPredicateOp::LessThan,
+        BinaryPredicateOp::GreaterThan,
+        BinaryPredicateOp::Distinct
+    )]
+    op: BinaryPredicateOp,
+    #[values(false, true)] inverted: bool,
+    #[values("literal", "column", "dictionary")] rhs: &str,
+    #[values(false, true)] swap: bool,
+    #[values(1, 2)] dictionary_depth: usize,
+) {
+    let values = [
+        Some(-0.0),
+        Some(0.0),
+        Some(-1.0),
+        Some(1.0),
+        Some(f64::NAN),
+        Some(-f64::NAN),
+        None,
+    ];
+    let left_keys = [
+        Some(0),
+        Some(1),
+        Some(2),
+        Some(3),
+        Some(4),
+        Some(5),
+        Some(6),
+        None,
+        Some(0),
+        None,
+        Some(3),
+    ];
+    let right_keys = [
+        Some(1),
+        Some(0),
+        Some(2),
+        Some(2),
+        Some(4),
+        Some(4),
+        Some(0),
+        Some(1),
+        Some(6),
+        None,
+        None,
+    ];
+    let make_arrays = |keys: &[Option<i32>]| {
+        let plain: Float64Array = keys
+            .iter()
+            .map(|key| key.and_then(|key| values[key as usize]))
+            .collect();
+        let plain = cast(&plain, &data_type).unwrap();
+        let dictionary_values = cast(&Float64Array::from(values.to_vec()), &data_type).unwrap();
+        let mut encoded: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(
+            Int32Array::from(keys.to_vec()),
+            dictionary_values,
+        ));
+        for _ in 1..dictionary_depth {
+            encoded = Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from_iter_values(0..keys.len() as i32),
+                encoded,
+            ));
+        }
+        (plain, encoded)
+    };
+    let (plain_left, encoded_left) = make_arrays(&left_keys);
+    let (plain_right, encoded_right) = make_arrays(&right_keys);
+    let encoded_right = if rhs == "dictionary" {
+        encoded_right
+    } else {
+        plain_right.clone()
+    };
+    let plain = RecordBatch::try_from_iter([("left", plain_left), ("right", plain_right)]).unwrap();
+    let encoded =
+        RecordBatch::try_from_iter([("left", encoded_left), ("right", encoded_right)]).unwrap();
+    let right = if rhs == "literal" {
+        lit(match data_type {
+            DataType::Float32 => Scalar::Float(0.0),
+            DataType::Float64 => Scalar::Double(0.0),
+            _ => unreachable!(),
+        })
+    } else {
+        col!("right")
+    };
+    let (left, right) = if swap {
+        (right, col!("left"))
+    } else {
+        (col!("left"), right)
+    };
+    let predicate = Pred::binary(op, left, right);
+    let expected = evaluate_predicate(&predicate, &plain, inverted).unwrap();
+    if op == BinaryPredicateOp::Equal {
+        assert_eq!(expected.value(0), !inverted);
+        assert_eq!(expected.value(1), !inverted);
+    }
+    assert_eq!(
+        evaluate_predicate(&predicate, &encoded, inverted).unwrap(),
+        expected
+    );
+}
+
+#[rstest]
+fn test_float_distinct_without_nulls_across_bitmap_boundaries(
+    #[values(DataType::Float32, DataType::Float64)] data_type: DataType,
+    #[values(0, 1, 63, 64, 65, 129)] len: usize,
+    #[values(false, true)] inverted: bool,
+) {
+    let make_array = |values: &[f64]| -> ArrayRef {
+        match data_type {
+            DataType::Float32 => Arc::new(Float32Array::from_iter_values(
+                (0..len).map(|index| values[index % values.len()] as f32),
+            )),
+            DataType::Float64 => Arc::new(Float64Array::from_iter_values(
+                (0..len).map(|index| values[index % values.len()]),
+            )),
+            _ => unreachable!(),
+        }
+    };
+    let batch = RecordBatch::try_from_iter([
+        ("left", make_array(&[-0.0, 0.0, 1.0, f64::NAN, f64::NAN])),
+        ("right", make_array(&[0.0, -0.0, 2.0, f64::NAN, 1.0])),
+    ])
+    .unwrap();
+    let predicate = col!("left").distinct(col!("right"));
+    let result = evaluate_predicate(&predicate, &batch, inverted).unwrap();
+    let expected = BooleanArray::from_iter(
+        (0..len).map(|index| Some((index % 5 == 2 || index % 5 == 4) ^ inverted)),
+    );
+    assert_eq!(result, expected);
+    assert!(result.nulls().is_none());
+}
+
+#[rstest]
+#[case::left_nulls(true, false)]
+#[case::right_nulls(false, true)]
+#[case::both_nulls(true, true)]
+fn test_float_distinct_nullable_slices_across_bitmap_boundaries(
+    #[case] left_nullable: bool,
+    #[case] right_nullable: bool,
+    #[values(DataType::Float32, DataType::Float64)] data_type: DataType,
+    #[values(0, 1, 63, 64)] offset: usize,
+    #[values(0, 1, 63, 64, 65, 129)] len: usize,
+    #[values(false, true)] inverted: bool,
+) {
+    let make_array = |zero: f64, nullable: bool, period: usize, start: usize| {
+        let values: Float64Array = (0..start + len)
+            .map(|index| (!nullable || !index.is_multiple_of(period)).then_some(zero))
+            .collect();
+        cast(&values, &data_type).unwrap().slice(start, len)
+    };
+    let left = make_array(-0.0, left_nullable, 3, offset);
+    let right = make_array(0.0, right_nullable, 5, offset + 1);
+    let expected = BooleanArray::from_iter((0..len).map(|row| {
+        let left_null = left_nullable && (offset + row).is_multiple_of(3);
+        let right_null = right_nullable && (offset + 1 + row).is_multiple_of(5);
+        Some(match (left_null, right_null) {
+            (true, true) | (false, false) => inverted,
+            _ => !inverted,
+        })
+    }));
+    let batch = RecordBatch::try_from_iter([("left", left), ("right", right)]).unwrap();
+    let result =
+        evaluate_predicate(&col!("left").distinct(col!("right")), &batch, inverted).unwrap();
+    assert_eq!(result, expected);
+    assert!(result.nulls().is_none());
+}
+
+/// Empty and all-null float arrays should not panic and should produce the expected results.
+#[rstest]
+#[case::empty_f64(Arc::new(Float64Array::from(Vec::<Option<f64>>::new())) as ArrayRef, 0)]
+#[case::all_null_f64(Arc::new(Float64Array::from(vec![None::<f64>, None, None])) as ArrayRef, 3)]
+#[case::empty_f32(Arc::new(Float32Array::from(Vec::<Option<f32>>::new())) as ArrayRef, 0)]
+#[case::all_null_f32(Arc::new(Float32Array::from(vec![None::<f32>, None, None])) as ArrayRef, 3)]
+fn test_float_cmp_empty_and_all_null(#[case] array: ArrayRef, #[case] len: usize) {
+    let dtype = array.data_type().clone();
+    let zero = match dtype {
+        DataType::Float64 => Scalar::Double(0.0),
+        DataType::Float32 => Scalar::Float(0.0),
+        _ => unreachable!(),
+    };
+    let schema = Schema::new([Arc::new(Field::new("col", dtype, true))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
+    let col = column_expr!("col");
+
+    let pred = col.clone().eq(Expr::literal(zero.clone()));
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(result.len(), len);
+    assert!((0..len).all(|i| result.is_null(i)));
+
+    let pred = col.distinct(Expr::literal(zero));
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(result.len(), len);
+    assert!(result.nulls().is_none(), "distinct never produces nulls");
+    assert!(
+        (0..len).all(|i| result.value(i)),
+        "NULL is distinct from any value"
+    );
+}
+
+/// Literal-on-left form: dispatch must trigger regardless of operand order.
+#[test]
+fn test_float_literal_on_left() {
+    let array = Arc::new(Float64Array::from(vec![
+        Some(-0.0),
+        Some(0.0),
+        Some(1.0),
+        None,
+    ])) as ArrayRef;
+    let schema = Schema::new([Arc::new(Field::new("col", DataType::Float64, true))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
+
+    let pred = Expr::literal(Scalar::Double(0.0)).eq(column_expr!("col"));
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![Some(true), Some(true), Some(false), None]),
+        "0.0 eq col"
+    );
+}
+
+/// Sliced arrays (offset != 0) should produce results aligned to the slice.
+#[test]
+fn test_float_sliced_array() {
+    let full = Float64Array::from(vec![
+        Some(99.0),
+        Some(99.0),
+        Some(-0.0),
+        Some(0.0),
+        Some(1.0),
+    ]);
+    let sliced: ArrayRef = Arc::new(full.slice(2, 3));
+    let schema = Schema::new([Arc::new(Field::new("col", DataType::Float64, true))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![sliced]).unwrap();
+
+    let pred = column_expr!("col").eq(Expr::literal(Scalar::Double(0.0)));
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![Some(true), Some(true), Some(false)]),
+        "sliced col eq 0.0"
+    );
+}
+
+/// Documents that float `IN` uses IEEE equality: signed zeros are equal, but NaN is not equal to
+/// itself.
+#[test]
+fn test_float_nan_in_predicate_uses_ieee_semantics() {
+    let field = Arc::new(Field::new("item", DataType::Float64, true));
+    let list_field = Arc::new(Field::new("list", DataType::List(field.clone()), true));
+    let schema = Schema::new([list_field]);
+
+    // Two rows: [NaN, 1.0] and [2.0, 3.0]
+    let values = Float64Array::from(vec![f64::NAN, 1.0, 2.0, 3.0]);
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 4]));
+    let list_array = ListArray::new(field, offsets, Arc::new(values), None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)]).unwrap();
+
+    let pred = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal(Scalar::Double(f64::NAN)),
+        column_expr!("list"),
+    );
+    let result = evaluate_predicate(&pred, &batch, false).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![false, false]),
+        "NaN IN [NaN, ...]: false under IEEE PartialEq used by Arrow's in_list"
     );
 }
