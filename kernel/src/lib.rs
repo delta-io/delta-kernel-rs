@@ -792,13 +792,19 @@ pub trait ParquetHandler: AsAny {
     ///
     /// # Type coercion
     ///
-    /// A matched Parquet column whose physical type differs from the `physical_schema`
-    /// [`StructField`] must be coerced to the requested type. In particular, timestamp columns MUST
-    /// be normalized to the protocol specified microsecond precision: a `TIMESTAMP(MILLIS)` (or
-    /// any other non-microsecond unit) column read into a `TIMESTAMP` / `TIMESTAMP_NTZ` field
-    /// must be rescaled to microseconds (a finer unit such as nanosecond is truncated). The
-    /// default engine does this via `arrow::compute::cast` while reordering columns to the
-    /// requested schema.
+    /// When `physical_schema` requests a type different from the matched Parquet column, the reader
+    /// must perform every conversion allowed by the [Delta protocol type widening rules]. Examples
+    /// include `INTEGER` -> `LONG`, `FLOAT` -> `DOUBLE`, integer types -> `DECIMAL`, `DECIMAL`
+    /// precision or scale increases, and `DATE` -> `TIMESTAMP_NTZ`. See the protocol for the
+    /// complete list.
+    ///
+    /// Timestamp columns MUST be normalized to the protocol specified microsecond precision: a
+    /// `TIMESTAMP(MILLIS)` (or any other non-microsecond unit) column read into a `TIMESTAMP` /
+    /// `TIMESTAMP_NTZ` field must be rescaled to microseconds (a finer unit such as nanosecond is
+    /// truncated). The default engine does this via `arrow::compute::cast` while reordering columns
+    /// to the requested schema.
+    ///
+    /// [Delta protocol type widening rules]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#type-widening
     ///
     /// # Metadata Columns
     ///
