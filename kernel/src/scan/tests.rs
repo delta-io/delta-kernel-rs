@@ -32,6 +32,7 @@ use crate::schema::{
     StructType,
 };
 use crate::transaction::create_table::create_table;
+use crate::unit_test_utils::string_array_to_engine_data;
 use crate::{
     DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
     ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
@@ -887,6 +888,76 @@ fn test_scan_metadata_from_handles_cached_typed_stats_across_type_widening() {
     fresh_paths.sort_unstable();
     replayed_paths.sort_unstable();
     assert_eq!(replayed_paths, fresh_paths);
+}
+
+#[test_log::test]
+fn test_scan_metadata_from_falls_back_from_incompatible_typed_stats() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let version = snapshot.version();
+
+    // This cached row has valid JSON stats, but its typed `id` bounds are strings instead of the
+    // Long type required by the table.
+    let incompatible_stats_schema = schema_ref! {
+        nullable "numRecords": LONG,
+        nullable "minValues": { nullable "id": STRING },
+        nullable "maxValues": { nullable "id": STRING },
+        nullable "nullCount": { nullable "id": LONG },
+        nullable "tightBounds": BOOLEAN,
+    };
+    let cached_metadata_schema = Arc::new(
+        SchemaStructPatchBuilder::new()
+            .append(StructField::nullable(
+                STATS_PARSED_NAME,
+                incompatible_stats_schema.as_ref().clone(),
+            ))
+            .build(scan_row_schema().as_ref())
+            .unwrap(),
+    );
+    let cached_metadata = engine
+        .json_handler()
+        .parse_json(
+            string_array_to_engine_data(StringArray::from(vec![r#"
+                {
+                    "path": "cached.parquet",
+                    "size": 1,
+                    "modificationTime": 0,
+                    "stats": "{\"numRecords\":1,\"minValues\":{\"id\":1},\"maxValues\":{\"id\":1},\"nullCount\":{\"id\":0},\"tightBounds\":true}",
+                    "stats_parsed": {
+                        "numRecords": 1,
+                        "minValues": {"id": "not-a-long"},
+                        "maxValues": {"id": "not-a-long"},
+                        "nullCount": {"id": 0},
+                        "tightBounds": true
+                    }
+                }
+            "#])),
+            cached_metadata_schema,
+        )
+        .unwrap();
+
+    // JSON says the file cannot match `id > 400`, so fallback should prune the cached file.
+    let replay_scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::gt(col!("id"), lit(400i64))))
+        .build()
+        .unwrap();
+    let mut replayed_paths = Vec::new();
+    for metadata in replay_scan
+        .scan_metadata_from(engine.as_ref(), version, [cached_metadata], None)
+        .unwrap()
+    {
+        replayed_paths = metadata
+            .unwrap()
+            .visit_scan_files(replayed_paths, |paths, file| {
+                paths.push(file.path.to_string());
+            })
+            .unwrap();
+    }
+
+    assert!(replayed_paths.is_empty());
 }
 
 // reading v0 with 3 files.
