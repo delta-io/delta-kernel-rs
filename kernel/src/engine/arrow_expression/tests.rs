@@ -250,6 +250,20 @@ fn test_literal_type_array() {
 }
 
 #[test]
+fn null_variant_scalar_builds_null_struct_array() {
+    use crate::arrow::array::{Array as _, AsArray as _};
+    // A variant is physically a struct, so a null variant scalar must build as an all-null struct
+    // array rather than erroring ("Variant is not supported as scalar yet").
+    let arr = Scalar::null(KernelDataType::unshredded_variant())
+        .to_array(3)
+        .expect("null variant scalar should build a null struct array");
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr.null_count(), 3);
+    // The underlying representation is a struct.
+    assert_eq!(arr.as_struct().len(), 3);
+}
+
+#[test]
 fn test_literal_complex_type_array() {
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::arrow::datatypes::Int32Type;
