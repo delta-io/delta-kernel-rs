@@ -23,7 +23,6 @@ transactions.
 # extern crate delta_kernel_default_engine;
 # extern crate tokio;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::{DeltaResult, Snapshot};
@@ -33,14 +32,14 @@ transactions.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(&engine)?
     .with_domain_metadata(
         "myConnector.settings".to_string(),
         r#"{"version": 1, "compress": true}"#.to_string(),
     )
     .with_operation("UPDATE METADATA".to_string());
 
-txn.commit(&engine)?;
+txn.legacy_filesystem_commit(&engine)?;
 # Ok(())
 # }
 ```
@@ -70,7 +69,6 @@ exist yet.
 # extern crate delta_kernel_default_engine;
 # extern crate tokio;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::{DeltaResult, Snapshot};
@@ -80,11 +78,11 @@ exist yet.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(&engine)?
     .with_domain_metadata_removed("myConnector.settings".to_string())
     .with_operation("REMOVE METADATA".to_string());
 
-txn.commit(&engine)?;
+txn.legacy_filesystem_commit(&engine)?;
 # Ok(())
 # }
 ```

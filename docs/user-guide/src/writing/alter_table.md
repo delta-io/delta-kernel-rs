@@ -42,7 +42,6 @@ column. The flow is:
 ```rust,no_run
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
@@ -58,9 +57,9 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build()?
     .with_engine_info("my-app/1.0")
-    .commit(&engine)?;
+    .legacy_filesystem_commit(&engine)?;
 
 match result {
     CommitResult::CommittedTransaction(committed) => {
@@ -105,8 +104,8 @@ let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build()?
+    .legacy_filesystem_commit(&engine)?;
 ```
 
 The builder uses a type-state pattern to enforce that at least one operation is

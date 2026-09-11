@@ -311,7 +311,7 @@ impl TableChanges {
         mode: CdfMode,
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_table_changes(
+        let log_segment = LogSegment::for_table_changes_with_storage(
             engine.storage_handler().as_ref(),
             log_root,
             start_version,

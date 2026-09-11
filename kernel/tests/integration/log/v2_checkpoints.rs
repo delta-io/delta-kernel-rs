@@ -11,7 +11,6 @@ use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -265,8 +264,8 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     let schema = schema_ref! { nullable "value": INTEGER };
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     // Commit an add action via the transaction API so the checkpoint has action batches
     let snapshot0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -360,7 +359,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
 
     let post_ckpt_snapshot = begin_transaction(post_ckpt_snapshot, engine.as_ref())?
         .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
-        .commit(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
     // === Step 4: Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles) ===
@@ -771,8 +770,8 @@ async fn test_checkpoint_spec_rejected(
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
     }
     let _ = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
@@ -799,8 +798,8 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     // v2 table, no data commits -> only protocol + metadata at version 0.
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let version = snapshot.version();
@@ -891,8 +890,8 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.domainMetadata", "supported"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     // Insert 8 files (one per commit) -> ids 1..=8
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -913,7 +912,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
             "app.feature_flags".to_string(),
             r#"{"dark_mode":true}"#.to_string(),
         )
-        .commit(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
     // Another domain metadata commit -- updates "app.settings" to verify reconciliation
@@ -924,7 +923,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
             r#"{"tracking":false}"#.to_string(),
         )
         .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
-        .commit(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
     // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
@@ -932,7 +931,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     for (app_id, version) in [("app1", 1i64), ("app2", 5), ("app1", 3)] {
         snapshot = begin_transaction(snapshot, engine.as_ref())?
             .with_transaction_id(app_id.to_string(), version)
-            .commit(engine.as_ref())?
+            .legacy_filesystem_commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
     }
 
@@ -944,7 +943,9 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
-    snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    snapshot = txn
+        .legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
 
     // Insert 8 fresh files (one per commit) -> ids 9..=16
     let names = [
@@ -1132,8 +1133,8 @@ async fn create_partitioned_stats_table<E: TaskExecutor>(
             ("delta.checkpoint.writeStatsAsStruct", "true"),
         ])
         .with_data_layout(DataLayout::partitioned(["part_key"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     let data_schema = schema! {
         nullable "id": LONG,
@@ -1418,8 +1419,8 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
             ("delta.enableDeletionVectors", "true"),
             ("delta.enableRowTracking", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     // === Step 2: Append one batch. ===
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -1455,7 +1456,9 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         scan_files.into_iter().map(Ok),
     )?;
     txn.ack_row_tracking_preservation();
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn
+        .legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
 
     // === Step 4: Write a V2 sidecar checkpoint. ===
     snapshot.checkpoint(
@@ -1511,8 +1514,8 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
     // === Step 1: Create v2Checkpoint table. ===
     let _ = create_table(&table_path, get_simple_schema(), "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     // === Step 2: Run 60 commits of 1_000 synthetic adds each (60_000 total). ===
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -1528,7 +1531,9 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
             .map(|p| (p.as_str(), 100, 0, Some(1)))
             .collect();
         txn.add_files(create_add_files_metadata(&add_files_schema, files)?);
-        snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        snapshot = txn
+            .legacy_filesystem_commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
     }
 
     // === Step 3: Sidecar checkpoint with default hint (None -> 50_000). ===
@@ -1618,8 +1623,8 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
         builder = builder.with_data_layout(layout);
     }
     let _ = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     // For partitioned tables, the data batches must NOT include the partition column --
     // the partition value is supplied separately in `partition_values`.
@@ -1672,8 +1677,8 @@ async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> Delta
     let schema = schema_ref! { nullable "value": INTEGER };
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?;
 
     let snapshot0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let snapshot = insert_data(

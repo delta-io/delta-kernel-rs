@@ -13,7 +13,7 @@ use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{schema_ref, MetadataColumnSpec, SchemaRef, StructField};
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, LegacyTransaction};
 use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
@@ -91,7 +91,7 @@ async fn write_data_to_table(
     table_url: &Url,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     data: Vec<ArrowEngineData>,
-) -> DeltaResult<CommitResult> {
+) -> DeltaResult<CommitResult<LegacyTransaction>> {
     let mut txn =
         load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
 
@@ -111,7 +111,7 @@ async fn write_data_to_table(
     }
 
     // Commit the transaction
-    txn.commit(engine.as_ref())
+    txn.legacy_filesystem_commit(engine.as_ref())
 }
 
 /// Helper function to create a row-tracking table with a single `number: INTEGER` column.
@@ -632,7 +632,9 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     let txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?;
 
     // Commit without adding any add files
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn
+        .legacy_filesystem_commit(engine.as_ref())?
+        .is_committed());
 
     // Fetch and parse the commit
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
@@ -700,7 +702,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     txn2.add_files(metadata2);
 
     // Commit the first transaction - this should succeed
-    let result1 = txn1.commit(engine1.as_ref())?;
+    let result1 = txn1.legacy_filesystem_commit(engine1.as_ref())?;
     match result1 {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(
@@ -721,7 +723,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     }
 
     // Commit the second transaction - this should result in a conflict
-    let result2 = txn2.commit(engine2.as_ref())?;
+    let result2 = txn2.legacy_filesystem_commit(engine2.as_ref())?;
     match result2 {
         CommitResult::CommittedTransaction(committed) => {
             panic!(
@@ -1247,7 +1249,8 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
             .map(Ok),
     )?;
     txn.ack_row_tracking_preservation();
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let after = collect_number_to_column(

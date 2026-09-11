@@ -546,7 +546,7 @@ mod tests {
         mock_table: &LocalMockTable,
     ) -> Vec<CdfScanFile> {
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let log_segment = LogSegment::for_table_changes(
+        let log_segment = LogSegment::for_table_changes_with_storage(
             engine.storage_handler().as_ref(),
             table_root.join("_delta_log/").unwrap(),
             0,
@@ -649,9 +649,13 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let log_root = table_root.join("_delta_log/").unwrap();
-        let log_segment =
-            LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
-                .unwrap();
+        let log_segment = LogSegment::for_table_changes_with_storage(
+            engine.storage_handler().as_ref(),
+            log_root,
+            0,
+            None,
+        )
+        .unwrap();
         let table_schema = schema_ref! {
             nullable "id": INTEGER,
             nullable "value": STRING,

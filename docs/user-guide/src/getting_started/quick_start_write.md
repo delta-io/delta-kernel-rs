@@ -34,7 +34,6 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::util::pretty::print_batches;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel_default_engine::storage::store_from_url;
@@ -61,15 +60,15 @@ async fn main() -> DeltaResult<()> {
     ])?);
 
     create_table(url.as_str(), schema.clone(), "quick-start/1.0")
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
-        .commit(&engine)?;
+        .build(&engine)?
+        .legacy_filesystem_commit(&engine)?;
     println!("Created table at {url}");
 
     // 2. Write data
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction(&engine)?
         .with_operation("INSERT".to_string())
         .with_engine_info("quick-start/1.0")
         .with_data_change(true);
@@ -95,7 +94,7 @@ async fn main() -> DeltaResult<()> {
     txn.add_files(file_metadata);
 
     // Commit
-    match txn.commit(&engine)? {
+    match txn.legacy_filesystem_commit(&engine)? {
         CommitResult::CommittedTransaction(committed) => {
             println!("Committed version {}", committed.commit_version());
         }
@@ -133,8 +132,8 @@ let schema = Arc::new(StructType::try_new(vec![
 ])?);
 
 create_table(url.as_str(), schema.clone(), "quick-start/1.0")
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .legacy_filesystem_commit(&engine)?;
 ```
 
 `create_table` returns a builder. You provide:
@@ -142,8 +141,9 @@ create_table(url.as_str(), schema.clone(), "quick-start/1.0")
 - A schema (using kernel's `StructType`)
 - An engine info string (identifies your application)
 
-`.build()` takes the engine and a `Committer`. For local filesystem tables, use
-`FileSystemCommitter`. For catalog-managed tables, you provide your own committer.
+`.build()` takes the engine and returns a transaction. For local filesystem tables,
+`legacy_filesystem_commit()` commits through a `FileSystemCommitter`. For catalog-managed tables,
+you provide your own committer.
 [Catalog-Managed Tables](../catalog_managed/overview.md) covers that topic.
 
 `.commit()` writes version 0 of the table (the initial Protocol and Metadata actions).
@@ -155,7 +155,7 @@ The write flow has four parts:
 **Start a transaction:**
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(&engine)?
     .with_operation("INSERT".to_string())
     .with_data_change(true);
 ```
@@ -192,7 +192,7 @@ transaction needs. `add_files` registers that metadata with the transaction.
 
 **Commit:**
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.legacy_filesystem_commit(&engine)? {
     CommitResult::CommittedTransaction(committed) => { /* success */ }
     CommitResult::ConflictedTransaction(_) => { /* another writer won */ }
     CommitResult::RetryableTransaction(retry) => { /* transient error, retry */ }

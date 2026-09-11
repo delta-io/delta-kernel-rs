@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use delta_kernel::actions::MIN_VALUES;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -102,7 +101,7 @@ fn verify_column_names_in_clustering_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = snapshot.schema();
     let clustering_columns = snapshot
-        .get_physical_clustering_columns(engine)?
+        .get_physical_clustering_columns_with_engine(engine)?
         .expect("Clustering columns should be present");
 
     assert_eq!(
@@ -220,8 +219,8 @@ async fn run_ctas_test(
             builder = builder.with_data_layout(DataLayout::clustered(["row_number"]));
         }
         let result = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?;
+            .build(engine.as_ref())?
+            .legacy_filesystem_commit(engine.as_ref())?;
         match result {
             CommitResult::CommittedTransaction(c) => c
                 .post_commit_snapshot()
@@ -258,7 +257,7 @@ async fn run_ctas_test(
     if tgt_clustered {
         tgt_builder = tgt_builder.with_data_layout(DataLayout::clustered(["row_number"]));
     }
-    let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let mut tgt_txn = tgt_builder.build(engine.as_ref())?;
 
     let write_context = tgt_txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine
@@ -266,7 +265,7 @@ async fn run_ctas_test(
         .await?;
     tgt_txn.add_files(add_meta);
 
-    let commit_result = tgt_txn.commit(engine.as_ref())?;
+    let commit_result = tgt_txn.legacy_filesystem_commit(engine.as_ref())?;
     let tgt_snapshot = match commit_result {
         CommitResult::CommittedTransaction(c) => c
             .post_commit_snapshot()

@@ -101,9 +101,12 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Self> {
-        let commit_phase: Option<DeltaResultIteratorStatic<ActionsBatch>> = Some(Box::new(
-            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
-        ));
+        let commit_phase: Option<DeltaResultIteratorStatic<ActionsBatch>> =
+            Some(Box::new(log_segment.read_commit_actions_with_engine(
+                engine.as_ref(),
+                COMMIT_READ_SCHEMA.clone(),
+                None,
+            )?));
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.

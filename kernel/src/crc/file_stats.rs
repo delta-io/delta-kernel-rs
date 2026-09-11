@@ -9,6 +9,7 @@
 //! 1. In-memory transaction data via [`FileStatsDelta::try_compute_for_txn`]
 //! 2. A parsed .json commit file
 
+use std::borrow::Borrow;
 use std::sync::LazyLock;
 
 use super::FileSizeHistogram;
@@ -120,8 +121,8 @@ impl FileStatsDelta {
     /// When `None`, the standard default boundaries are used. Callers should pass the previous
     /// CRC's boundaries when available so that `try_apply_delta` in [`Crc::apply`] succeeds.
     pub(crate) fn try_compute_for_txn(
-        add_files_metadata: &[Box<dyn EngineData>],
-        remove_files_metadata: &[FilteredEngineData],
+        add_files_metadata: &[impl AsRef<dyn EngineData>],
+        remove_files_metadata: &[impl Borrow<FilteredEngineData>],
         bin_boundaries: Option<&[i64]>,
     ) -> DeltaResult<Self> {
         let mut histogram = match bin_boundaries {
@@ -144,6 +145,7 @@ impl FileStatsDelta {
         // Visit remove files (remove from histogram). Each FilteredEngineData has its own
         // selection vector, so we create a visitor per batch.
         for filtered_batch in remove_files_metadata {
+            let filtered_batch = filtered_batch.borrow();
             let sv = filtered_batch.selection_vector();
             let sv_opt = if sv.is_empty() { None } else { Some(sv) };
             let mut visitor = FileStatsVisitor::new(sv_opt, true, &mut histogram);
@@ -349,7 +351,9 @@ mod tests {
 
     #[test]
     fn try_compute_empty_batches_produce_zero_histogram() {
-        let stats = FileStatsDelta::try_compute_for_txn(&[], &[], None).unwrap();
+        let adds: Vec<Box<dyn EngineData>> = vec![];
+        let removes: Vec<FilteredEngineData> = vec![];
+        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
         let delta = stats.net_histogram.unwrap();
         assert!(delta.file_counts.iter().all(|&c| c == 0));
         assert!(delta.total_bytes.iter().all(|&b| b == 0));

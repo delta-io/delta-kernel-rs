@@ -5,7 +5,7 @@ use delta_kernel::{DeltaResult, Snapshot};
 
 use crate::error::ExternResult;
 use crate::handle::Handle;
-use crate::transaction::ExclusiveTransaction;
+use crate::transaction::{ExclusiveTransaction, TransactionWithCommitter};
 use crate::{
     ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
     SharedSnapshot, TryFromStringSlice,
@@ -34,11 +34,12 @@ pub unsafe extern "C" fn with_transaction_id(
 }
 
 fn with_transaction_id_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter<Transaction>,
     app_id_res: DeltaResult<String>,
     version: i64,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    Ok(Box::new(txn.with_transaction_id(app_id_res?, version)).into())
+    let app_id = app_id_res?;
+    Ok(Box::new(txn.map_transaction(|txn| txn.with_transaction_id(app_id, version))).into())
 }
 
 /// Retrieves the version associated with an app_id from a snapshot.

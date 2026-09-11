@@ -89,7 +89,8 @@ let committer = Box::new(UCCommitter::new(
 ));
 let create_txn = create_table(table_uri.as_str(), Arc::new(schema), "MyApp/1.0")
     .with_table_properties(disk_props)
-    .build(&engine, committer)?;
+    .build(&engine)?
+    .into_legacy(committer);
 
 let post_commit_snapshot = match create_txn.commit(&engine)? {
     CommitResult::CommittedTransaction(committed) => committed
@@ -163,7 +164,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 let create_txn = create_table(table_uri.as_str(), Arc::new(schema), "MyApp/1.0")
     .with_table_properties(disk_props)
     .with_data_layout(DataLayout::clustered(["region"]))
-    .build(&engine, committer)?;
+    .build(&engine)?
+    .into_legacy(committer);
 ```
 
 `build_uc_create_table_request` forwards the committed `delta.clustering` domain verbatim into the

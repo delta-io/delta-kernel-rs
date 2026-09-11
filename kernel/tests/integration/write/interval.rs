@@ -14,7 +14,6 @@ mod supported {
     };
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use delta_kernel::arrow::record_batch::RecordBatch;
-    use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::transaction::create_table::create_table as create_table_transaction;
@@ -56,8 +55,8 @@ mod supported {
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
         let snapshot = create_table_transaction(&table_path, schema.clone(), "Test/1.0")
             .with_table_properties([("delta.checkpoint.writeStatsAsStruct", "true")])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref())?
+            .legacy_filesystem_commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
         let table_url = snapshot.table_root().clone();
 
@@ -90,7 +89,9 @@ mod supported {
             .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
             .await?;
         txn.add_files(add_files_metadata);
-        let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        let snapshot = txn
+            .legacy_filesystem_commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
 
         let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
         let add = &add_actions[0];
@@ -205,8 +206,8 @@ mod supported {
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let snapshot = create_table_transaction(&table_path, schema.clone(), "Test/1.0")
             .with_table_properties([(property_name, property_value)])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref())?
+            .legacy_filesystem_commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
 
         let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;

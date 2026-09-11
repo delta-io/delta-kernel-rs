@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
-use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
@@ -874,8 +873,6 @@ impl CreateTableTransactionBuilder {
     /// # Arguments
     ///
     /// * `engine` - The engine instance to use for validation
-    /// * `committer` - The committer to use for the transaction
-    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -884,11 +881,7 @@ impl CreateTableTransactionBuilder {
     /// - The schema has `delta.invariants` metadata on any column
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
-    pub fn build(
-        self,
-        engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> DeltaResult<CreateTableTransaction> {
+    pub fn build(self, engine: &dyn Engine) -> DeltaResult<CreateTableTransaction> {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
@@ -982,7 +975,6 @@ impl CreateTableTransactionBuilder {
         Transaction::try_new_create_table(
             table_configuration,
             self.engine_info,
-            committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.correlation_id,

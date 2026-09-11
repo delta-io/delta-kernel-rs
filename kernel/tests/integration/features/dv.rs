@@ -217,7 +217,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     )?;
 
     txn.add_files(add_metadata);
-    let commit_result = txn.commit(engine.as_ref())?;
+    let commit_result = txn.legacy_filesystem_commit(engine.as_ref())?;
     assert!(matches!(
         commit_result,
         CommitResult::CommittedTransaction(_)
@@ -252,7 +252,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     dv_map.insert(data_file_path_1.clone(), dv_descriptor_1);
 
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-    let commit_result = txn.commit(engine.as_ref())?;
+    let commit_result = txn.legacy_filesystem_commit(engine.as_ref())?;
     assert!(matches!(
         commit_result,
         CommitResult::CommittedTransaction(_)
@@ -307,7 +307,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
             .into_iter()
             .map(Ok),
     )?;
-    let commit_result = txn.commit(engine.as_ref())?;
+    let commit_result = txn.legacy_filesystem_commit(engine.as_ref())?;
     assert!(matches!(
         commit_result,
         CommitResult::CommittedTransaction(_)
@@ -428,7 +428,8 @@ async fn test_dv_update_stats_tight_bound(
     let mut dv_map = HashMap::new();
     dv_map.insert(data_file_path.to_string(), dv_descriptor);
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.legacy_filesystem_commit(engine.as_ref())?
+        .unwrap_committed();
 
     // The new AddFile must report tightBounds: false while preserving every other stats field.
     let v2_adds = read_actions_from_commit(&table_url, 2, "add")?;

@@ -5,6 +5,7 @@ mod constants;
 mod errors;
 mod utils;
 
+pub mod coroutine;
 pub use committer::UCCommitter;
 use delta_kernel::snapshot::SnapshotBuilder;
 use delta_kernel::{DeltaResult, Error, LogPath, Snapshot};

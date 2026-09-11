@@ -1,6 +1,7 @@
 use url::Url;
 
 use crate::commit_range::CommitRange;
+use crate::coroutine::{drive_workflow, Channel, Workflow};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::snapshot::SnapshotRef;
@@ -14,6 +15,7 @@ use crate::{DeltaResult, Engine, Error, Version};
 /// commit-file metadata in a snapshot-based builder, then validates contiguity.
 // TODO(#2781): support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
 // `with_max_catalog_version(self, Version)`
+#[derive(Clone)]
 pub struct CommitRangeBuilder {
     table_root: String,
     start_version: Version,
@@ -66,6 +68,19 @@ impl CommitRangeBuilder {
     /// invalid (start > end), the listed commits are non-contiguous, or the requested start version
     /// is not present on the filesystem.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
+        drive_workflow(engine, self.start())
+    }
+
+    /// Start a connector-driven workflow that lists and validates this commit range.
+    ///
+    /// Returns the first workflow state. Errors after suspension are returned by the corresponding
+    /// resume handle.
+    pub fn start(&self) -> DeltaResult<Workflow<CommitRange>> {
+        let builder = self.clone();
+        Workflow::start(async move |channel| builder.build_impl(&channel).await)
+    }
+
+    async fn build_impl(&self, channel: &Channel) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
 
@@ -74,12 +89,9 @@ impl CommitRangeBuilder {
 
         let log_segment = match &self.snapshot {
             Some(snapshot) => snapshot.log_segment().clone(),
-            None => LogSegment::for_table_changes(
-                engine.storage_handler().as_ref(),
-                log_root,
-                start_version,
-                end_version,
-            )?,
+            None => {
+                LogSegment::for_table_changes(channel, log_root, start_version, end_version).await?
+            }
         };
 
         // Preserve invalid-input errors for an explicitly reversed range. When no end was

@@ -102,6 +102,7 @@ pub use metered_parquet::MeteredParquetHandler;
 pub use metered_storage::MeteredStorageHandler;
 pub(crate) use precounted_metrics_iterator::PrecountedMetricsIterator;
 pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
+pub use streaming_metrics_iterator::{emit_storage_list_completed, emit_storage_read_completed};
 pub(crate) use streaming_metrics_iterator::{emit_storage_span, MetricsIterator};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Layered, SubscriberExt as _};

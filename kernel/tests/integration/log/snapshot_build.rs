@@ -86,8 +86,8 @@ async fn setup_multi_version_table<E: TaskExecutor>(
         ]),
     };
     let create_snapshot = builder
-        .build(engine.as_ref(), kind.committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_commit(kind.committer(), engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
     // The create-table snapshot is built as latest (version 0 is necessarily the latest).

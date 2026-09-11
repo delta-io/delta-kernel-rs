@@ -26,7 +26,6 @@ may differ.
 # extern crate tokio;
 # use std::sync::Arc;
 # use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
@@ -42,7 +41,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(&engine)?
     .with_operation("INSERT".to_string())
     .with_engine_info("my-app/1.0")
     .with_data_change(true);
@@ -75,7 +74,7 @@ let file_metadata = engine
 txn.add_files(file_metadata);
 
 // 6. Commit
-match txn.commit(&engine)? {
+match txn.legacy_filesystem_commit(&engine)? {
     CommitResult::CommittedTransaction(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
@@ -92,7 +91,7 @@ writing against:
 
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(&engine)?
     .with_operation("INSERT".to_string())
     .with_engine_info("my-app/1.0")
     .with_data_change(true);
@@ -219,7 +218,7 @@ You can call `add_files` multiple times to write multiple files in one transacti
 `commit()` consumes the transaction and returns a `CommitResult`:
 
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.legacy_filesystem_commit(&engine)? {
     CommitResult::CommittedTransaction(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
@@ -243,7 +242,7 @@ construction:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(&engine)?
     .with_operation("INSERT".to_string())
     .with_blind_append();
 ```
@@ -275,7 +274,7 @@ that action, call `with_commit_info()` with your custom data and its schema:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(&engine)?
     .with_operation("INSERT".to_string())
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```
@@ -308,7 +307,7 @@ A successful commit returns a `CommittedTransaction` with access to a post-commi
 snapshot and post-commit statistics:
 
 ```rust,ignore
-let committed = match txn.commit(&engine)? {
+let committed = match txn.legacy_filesystem_commit(&engine)? {
     CommitResult::CommittedTransaction(c) => c,
     _ => panic!("unexpected result"),
 };

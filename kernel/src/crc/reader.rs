@@ -5,13 +5,18 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::Crc;
+#[cfg(test)]
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::Channel;
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
-use crate::{DeltaResult, Engine, Error};
+use crate::DeltaResult;
+#[cfg(test)]
+use crate::Engine;
 
 /// Attempt to read and parse a CRC file.
 ///
-/// Reads raw bytes via the storage handler and deserializes with serde_json.
+/// Reads raw bytes via a connector file-read offload and deserializes with serde_json.
 ///
 /// Returns `Ok(Crc)` on success, `Err` on any failure (file not readable, corrupt JSON,
 /// missing required fields). The caller should handle errors gracefully by falling back to log
@@ -19,13 +24,12 @@ use crate::{DeltaResult, Engine, Error};
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
 #[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, bytes_read, path = ?crc_path.location.location))]
-pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -> DeltaResult<Crc> {
-    let storage = engine.storage_handler();
+pub(crate) async fn try_read_crc_file(
+    channel: &Channel,
+    crc_path: &ParsedLogPath,
+) -> DeltaResult<Crc> {
     let url = crc_path.location.as_url().clone();
-    let data = storage
-        .read_files(vec![(url, None)])?
-        .next()
-        .ok_or_else(|| Error::generic("CRC file read returned no data"))??;
+    let data = channel.read_small_file(url, None).await?;
     tracing::Span::current().record("bytes_read", data.len() as u64);
     Crc::try_from_json_bytes(&data, crc_path.version)
 }
@@ -34,11 +38,26 @@ pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -
 ///
 /// CRC files are optional, so an unreadable one is not an error: the caller proceeds without
 /// it. The failure is logged and metered by [`try_read_crc_file`]'s instrumentation.
-pub(crate) fn read_crc_file_or_none(
-    engine: &dyn Engine,
+pub(crate) async fn read_crc_file_or_none(
+    channel: &Channel,
     crc_file: &ParsedLogPath,
 ) -> Option<Arc<Crc>> {
-    try_read_crc_file(engine, crc_file).ok().map(Arc::new)
+    try_read_crc_file(channel, crc_file)
+        .await
+        .ok()
+        .map(Arc::new)
+}
+
+/// Test helper that drives [`try_read_crc_file`] through a legacy [`Engine`].
+#[cfg(test)]
+pub(crate) fn try_read_crc_file_with_engine(
+    engine: &dyn Engine,
+    crc_path: &ParsedLogPath,
+) -> DeltaResult<Crc> {
+    let crc_path = crc_path.clone();
+    EngineConnector::run_with(engine, async move |channel| {
+        try_read_crc_file(&channel, &crc_path).await
+    })
 }
 
 #[cfg(test)]
@@ -72,7 +91,7 @@ mod tests {
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
         // Read and parse the CRC file
-        let crc = try_read_crc_file(&engine, &crc_path).unwrap();
+        let crc = try_read_crc_file_with_engine(&engine, &crc_path).unwrap();
 
         // Verify basic fields
         let stats = crc.file_stats().unwrap();
@@ -183,7 +202,10 @@ mod tests {
         let table_root = test_table_root("./tests/data/crc-malformed/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
-        assert_result_error_with_message(try_read_crc_file(&engine, &crc_path), "expected value");
+        assert_result_error_with_message(
+            try_read_crc_file_with_engine(&engine, &crc_path),
+            "expected value",
+        );
 
         let events = reporter.events();
         assert!(

@@ -52,16 +52,16 @@ To begin a write, create a transaction with your catalog's `Committer`, add file
 call `commit()`:
 
 ```rust,ignore
-// transaction() moves the Box<dyn Committer> into the Transaction, and commit()
-// consumes the Transaction, so the boxed committer is gone by the time you need
-// to publish. Construct a second committer for publish() in Phase 3 and clone
-// any catalog-client state you need to keep in scope across both calls.
+// legacy_commit() consumes the Box<dyn Committer> with the Transaction, so the
+// boxed committer is gone by the time you need to publish. Construct a second
+// committer for publish() in Phase 3 and clone any catalog-client state you need
+// to keep in scope across both calls.
 let committer = Box::new(MyCatalogCommitter::new(
     catalog_client.clone(),
     table_id.clone(),
 ));
 let mut txn = snapshot
-    .transaction(committer, &engine)?
+    .transaction(&engine)?
     .with_operation("INSERT".to_string());
 
 // Drive your Parquet writer from the write context, then hand the resulting
@@ -77,15 +77,15 @@ txn.add_files(add_metadata);
 
 // Commit the transaction. Kernel invokes committer.commit() internally; Phase 3
 // handles the result.
-let commit_result = txn.commit(&engine)?;
+let commit_result = txn.legacy_commit(committer, &engine)?;
 ```
 
-The `?` on `txn.commit(&engine)?` only propagates non-recoverable errors. Successful
-commits, conflicts, and retryable I/O errors arrive as the three variants of
-`CommitResult` in the match below. Everything else (auth errors, catalog protocol
-errors, etc.) bubbles out directly.
+The `?` on `txn.legacy_commit(committer, &engine)?` only propagates non-recoverable errors.
+Successful commits, conflicts, and retryable I/O errors arrive as the three variants of
+`CommitResult` in the match below. Everything else (auth errors, catalog protocol errors, etc.)
+bubbles out directly.
 
-When `txn.commit()` runs, Kernel:
+When `txn.legacy_commit()` runs, Kernel:
 
 1. Assembles the actions: a leading `CommitInfo`, any Protocol/Metadata updates
    this transaction makes (absent on steady-state appends), and Add/Remove file

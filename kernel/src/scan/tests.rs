@@ -14,7 +14,6 @@ use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::display::array_value_to_string;
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
@@ -32,9 +31,10 @@ use crate::schema::{
     StructType,
 };
 use crate::transaction::create_table::create_table;
+use crate::unit_test_utils::TestCancellationToken;
 use crate::{
-    DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
-    ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
+    CancellationTokenRef, DeltaResultIteratorStatic, Engine, EngineData,
+    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -338,9 +338,9 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
         nullable "a_float": FLOAT,
     };
     create_table(url, schema, "DefaultEngine")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap()
-        .commit(&engine)
+        .legacy_filesystem_commit(&engine)
         .unwrap()
         .unwrap_committed();
 
@@ -369,9 +369,9 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
 
     let schema = schema_ref! { nullable "id": LONG };
     create_table(url, schema, "DefaultEngine")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap()
-        .commit(&engine)
+        .legacy_filesystem_commit(&engine)
         .unwrap()
         .unwrap_committed();
 
@@ -665,6 +665,39 @@ fn test_scan_metadata_from_same_version() {
         .unwrap();
 
     assert_eq!(new_files.len(), 1);
+}
+
+#[test_log::test]
+fn scan_metadata_from_cancels_cached_metadata_consumption() {
+    let path =
+        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let version = snapshot.version();
+    let uncancelled_scan = snapshot.clone().scan_builder().build().unwrap();
+    let files: Vec<_> = uncancelled_scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| scan_files.into_parts().0)
+        .try_collect()
+        .unwrap();
+
+    let token = Arc::new(TestCancellationToken::default());
+    let token_ref: CancellationTokenRef = token.clone();
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(token_ref)
+        .build()
+        .unwrap();
+    let mut metadata = scan
+        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .unwrap();
+
+    token.cancel();
+    assert!(matches!(metadata.next(), Some(Err(Error::Cancelled))));
+    assert!(metadata.next().is_none());
 }
 
 // reading v0 with 3 files.

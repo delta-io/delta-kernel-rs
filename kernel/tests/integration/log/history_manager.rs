@@ -4,7 +4,6 @@ use std::fs::OpenOptions;
 use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::history_manager::{get_earliest_commit, latest_version_as_of, HistoryCommitType};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
@@ -72,15 +71,15 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> DeltaResult<()> {
     // v0: CreateTable
     let schema = get_simple_int_schema();
     let mut snap = create_table(&table_path, schema, "AtTimestampTest/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .legacy_filesystem_commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
     // v1..=4: noop commits (each writes a metaData-free, add-free commit JSON).
     for _ in 1..=4 {
         snap = test_utils::begin_transaction(snap.clone(), engine.as_ref())?
             .with_engine_info("AtTimestampTest")
-            .commit(engine.as_ref())?
+            .legacy_filesystem_commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
     }
 
