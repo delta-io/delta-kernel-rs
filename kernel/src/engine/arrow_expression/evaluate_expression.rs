@@ -9,21 +9,19 @@ use tracing::warn;
 
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
-    AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    RecordBatch, StringArray, StructArray,
+    self as arrow_array, make_array, new_empty_array, new_null_array, Array, ArrayBuilder,
+    ArrayData, ArrayRef, AsArray, BooleanArray, Datum, GenericListArray, ListArray, MapArray,
+    MutableArrayData, NullBufferBuilder, OffsetSizeTrait, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
-use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
-use crate::arrow::compute::kernels::comparison::in_list_utf8;
+use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, lt};
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
     and_kleene, can_cast_types, cast, is_not_null, is_null, not, or_kleene,
 };
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
-    Schema as ArrowSchema, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
 };
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::writer::{make_encoder, EncoderOptions};
@@ -33,7 +31,7 @@ use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_RO
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::{parse_json_impl, prim_array_cmp};
+use crate::engine::arrow_utils::parse_json_impl;
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
@@ -316,8 +314,39 @@ pub fn evaluate_expression(
             ))),
         },
         (Binary(BinaryExpression { op, left, right }), _) => {
-            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            let mut left_arr = evaluate_expression(left.as_ref(), batch, None)?;
+            let mut right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+
+            if *op == Divide {
+                return evaluate_division(&left_arr, &right_arr, result_type);
+            }
+
+            if !is_numeric_or_null(left_arr.data_type())
+                || !is_numeric_or_null(right_arr.data_type())
+                || (left_arr.data_type() == &ArrowDataType::Null
+                    && right_arr.data_type() == &ArrowDataType::Null)
+            {
+                return Err(Error::invalid_expression(format!(
+                    "Arithmetic requires numeric operands, got {:?} and {:?}",
+                    left_arr.data_type(),
+                    right_arr.data_type()
+                )));
+            }
+            let Some(common_type) =
+                simple_numeric_common_type(left_arr.data_type(), right_arr.data_type())
+            else {
+                return Err(Error::unsupported(format!(
+                    "Arrow evaluator does not yet support arithmetic coercion between {:?} and {:?}",
+                    left_arr.data_type(),
+                    right_arr.data_type()
+                )));
+            };
+            if left_arr.data_type() != &common_type {
+                left_arr = cast(&left_arr, &common_type)?;
+            }
+            if right_arr.data_type() != &common_type {
+                right_arr = cast(&right_arr, &common_type)?;
+            }
 
             type Operation = fn(&dyn Datum, &dyn Datum) -> Result<ArrayRef, ArrowError>;
             let eval: Operation = match op {
@@ -327,7 +356,15 @@ pub fn evaluate_expression(
                 Divide => div,
             };
 
-            validate_array_type(eval(&left_arr, &right_arr)?, result_type)
+            let result = eval(&left_arr, &right_arr).map_err(|error| match error {
+                ArrowError::ArithmeticOverflow(_) | ArrowError::DivideByZero => Error::from(error),
+                error => Error::unsupported(format!(
+                    "Arrow evaluator does not yet support this arithmetic operation: {error}"
+                )),
+            })?;
+            validate_decimal_bounds(&result)?;
+            validate_array_type(result, result_type)
+                .map_err(|error| unsupported_type_conversion("arithmetic result adjustment", error))
         }
         (
             Variadic(VariadicExpression {
@@ -339,7 +376,9 @@ pub fn evaluate_expression(
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
 
             for expr in exprs {
-                let array = evaluate_expression(expr, batch, result_type)?;
+                let array = evaluate_expression(expr, batch, result_type).map_err(|error| {
+                    unsupported_type_conversion("COALESCE common-type conversion", error)
+                })?;
                 let null_count = array.null_count();
                 arrays.push(array);
                 // Short-circuit: if this array has no nulls, we can stop evaluating
@@ -350,10 +389,13 @@ pub fn evaluate_expression(
             }
 
             // Coalesce accumulated arrays
-            Ok(coalesce_arrays(&arrays, result_type)?)
+            coalesce_arrays(&arrays, result_type).map_err(|error| {
+                unsupported_type_conversion("COALESCE common-type conversion", error.into())
+            })
         }
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
             evaluate_array_expression(exprs, batch, result_type)
+                .map_err(|error| unsupported_type_conversion("ARRAY common-type conversion", error))
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -411,12 +453,207 @@ pub fn evaluate_expression(
     }
 }
 
+/// Reclassifies a missing Arrow conversion as unsupported without hiding invalid expressions or
+/// runtime errors such as overflow and division by zero.
+fn unsupported_type_conversion(context: &str, error: Error) -> Error {
+    let is_type_mismatch = match &error {
+        Error::Arrow(ArrowError::InvalidArgumentError(message)) => {
+            message.starts_with("Incorrect datatype.")
+                || message.starts_with("Requested result type ")
+        }
+        Error::Generic(message) => {
+            message.starts_with("Array expression inputs must share the same element type")
+        }
+        _ => false,
+    };
+    if is_type_mismatch {
+        Error::unsupported(format!(
+            "Arrow evaluator does not support {context}: {error}"
+        ))
+    } else {
+        error
+    }
+}
+
+/// Resolves the numeric common types implemented directly by this evaluator.
+///
+/// Decimal/integral coercion and decimal result-type adjustment require expression analysis and
+/// therefore return `None` here.
+fn simple_numeric_common_type(
+    left: &ArrowDataType,
+    right: &ArrowDataType,
+) -> Option<ArrowDataType> {
+    use ArrowDataType::*;
+
+    if left == right && is_numeric_type(left) {
+        return Some(left.clone());
+    }
+    if left == &Null && is_numeric_type(right) {
+        return Some(right.clone());
+    }
+    if right == &Null && is_numeric_type(left) {
+        return Some(left.clone());
+    }
+    if matches!(left, Decimal128(_, _)) || matches!(right, Decimal128(_, _)) {
+        return (matches!(left, Float32 | Float64) || matches!(right, Float32 | Float64))
+            .then_some(Float64);
+    }
+    if matches!(left, Float32 | Float64) || matches!(right, Float32 | Float64) {
+        return Some(if left == &Float32 && right == &Float32 {
+            Float32
+        } else {
+            Float64
+        });
+    }
+    let integral_rank = |data_type: &ArrowDataType| match data_type {
+        Int8 => Some(0),
+        Int16 => Some(1),
+        Int32 => Some(2),
+        Int64 => Some(3),
+        _ => None,
+    };
+    match integral_rank(left)?.max(integral_rank(right)?) {
+        0 => Some(Int8),
+        1 => Some(Int16),
+        2 => Some(Int32),
+        3 => Some(Int64),
+        _ => None,
+    }
+}
+
+/// Implements fractional SQL division for the numeric cases supported by the Arrow evaluator.
+///
+/// Non-decimal operands use `DOUBLE`, positive or negative zero raises divide-by-zero, and
+/// decimal-only division remains unsupported until its resolved precision and scale are available.
+fn evaluate_division(
+    left: &ArrayRef,
+    right: &ArrayRef,
+    result_type: Option<&DataType>,
+) -> DeltaResult<ArrayRef> {
+    use ArrowDataType::*;
+
+    if left.len() != right.len() {
+        return Err(Error::internal_error(format!(
+            "Division operands have different lengths: {} and {}",
+            left.len(),
+            right.len()
+        )));
+    }
+
+    if left.data_type() == &Null && right.data_type() == &Null {
+        return Err(Error::invalid_expression(
+            "Division requires at least one typed numeric operand",
+        ));
+    }
+    if left.data_type() == &Null || right.data_type() == &Null {
+        let other_type = if left.data_type() == &Null {
+            right.data_type()
+        } else {
+            left.data_type()
+        };
+        if !is_numeric_type(other_type) {
+            return Err(Error::invalid_expression(format!(
+                "Division requires numeric operands, got {other_type:?}"
+            )));
+        }
+        if matches!(other_type, ArrowDataType::Decimal128(_, _)) {
+            let Some(result_type @ DataType::Primitive(PrimitiveType::Decimal(_))) = result_type
+            else {
+                return Err(Error::unsupported(
+                    "Arrow evaluator requires the resolved decimal type for NULL division",
+                ));
+            };
+            return Ok(new_null_array(&result_type.try_into_arrow()?, left.len()));
+        }
+        return validate_array_type(
+            new_null_array(&ArrowDataType::Float64, left.len()),
+            result_type,
+        );
+    }
+    if let (ArrowDataType::Decimal128(_, _), ArrowDataType::Decimal128(_, _)) =
+        (left.data_type(), right.data_type())
+    {
+        let left_values = left.as_primitive::<Decimal128Type>();
+        let right_values = right.as_primitive::<Decimal128Type>();
+        for index in 0..left.len() {
+            if left_values.is_valid(index)
+                && right_values.is_valid(index)
+                && right_values.value(index) == 0
+            {
+                return Err(ArrowError::DivideByZero.into());
+            }
+        }
+    }
+    if !is_numeric_type(left.data_type()) || !is_numeric_type(right.data_type()) {
+        return Err(Error::invalid_expression(format!(
+            "Division requires numeric operands, got {:?} and {:?}",
+            left.data_type(),
+            right.data_type()
+        )));
+    }
+    let has_decimal = matches!(left.data_type(), ArrowDataType::Decimal128(_, _))
+        || matches!(right.data_type(), ArrowDataType::Decimal128(_, _));
+    let has_float = matches!(
+        left.data_type(),
+        ArrowDataType::Float32 | ArrowDataType::Float64
+    ) || matches!(
+        right.data_type(),
+        ArrowDataType::Float32 | ArrowDataType::Float64
+    );
+    if has_decimal && !has_float {
+        return Err(Error::unsupported(format!(
+            "Arrow evaluator does not support division between {:?} and {:?}",
+            left.data_type(),
+            right.data_type()
+        )));
+    }
+
+    let left = cast(left, &ArrowDataType::Float64)?;
+    let right = cast(right, &ArrowDataType::Float64)?;
+    let left_values = left.as_primitive::<Float64Type>();
+    let right_values = right.as_primitive::<Float64Type>();
+    for index in 0..left.len() {
+        if left_values.is_valid(index)
+            && right_values.is_valid(index)
+            && right_values.value(index) == 0.0
+        {
+            return Err(ArrowError::DivideByZero.into());
+        }
+    }
+
+    validate_array_type(div(&left, &right)?, result_type)
+}
+
+/// Enforces declared decimal precision after Arrow arithmetic, which may produce an out-of-range
+/// physical value without reporting overflow.
+fn validate_decimal_bounds(array: &ArrayRef) -> DeltaResult<()> {
+    let ArrowDataType::Decimal128(precision, _) = array.data_type() else {
+        return Ok(());
+    };
+    let bound = 10_u128.checked_pow(u32::from(*precision)).ok_or_else(|| {
+        Error::internal_error(format!("Invalid Decimal128 precision: {precision}"))
+    })?;
+    let values = array.as_primitive::<Decimal128Type>();
+    if values
+        .iter()
+        .flatten()
+        .any(|value| value.unsigned_abs() >= bound)
+    {
+        return Err(ArrowError::ArithmeticOverflow(format!(
+            "Decimal128 result exceeds precision {precision}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Evaluate an `ARRAY(e0, e1, ..., eN-1)` constructor expression into an Arrow `ListArray`.
 ///
 /// Each input expression produces one column of length M (rows in the batch); the output
 /// is an `Array<element_type>` column of length M where row i holds
 /// `[arr_0[i], ..., arr_{N-1}[i]]`. The element type is inferred from the inputs (which must
-/// all evaluate to the same Arrow element type); at least one input is required.
+/// all evaluate to the same Arrow element type). An empty constructor requires `result_type` to
+/// supply the element type.
 ///
 /// When provided, `result_type` must be a [`DataType::Array`]. Its element type is forwarded
 /// to the children as a schema hint (struct/nested-array elements need their schema to
@@ -447,11 +684,17 @@ fn evaluate_array_expression(
         .map(|expr| evaluate_expression(expr, batch, element_kernel_type))
         .try_collect()?;
 
-    let element_type = element_arrays
-        .first()
-        .ok_or_else(|| Error::generic("Array expression requires at least one element"))?
-        .data_type()
-        .clone();
+    let element_type = match element_arrays.first() {
+        Some(element) => element.data_type().clone(),
+        None => match element_kernel_type {
+            Some(data_type) => data_type.try_into_arrow()?,
+            None => {
+                return Err(Error::invalid_expression(
+                    "Cannot infer the element type of an empty ARRAY expression",
+                ));
+            }
+        },
+    };
     // Single pass over the evaluated inputs: every input must evaluate to the shared element
     // type, and (when the element field is declared non-nullable) must not contain nulls --
     // otherwise the output's field metadata would lie about the values it holds.
@@ -476,19 +719,23 @@ fn evaluate_array_expression(
     // Build the flat values buffer in row-major order: row r is [arr_0[r], ..., arr_{n-1}[r]].
     // `MutableArrayData` is type-erased (works for any element type) and avoids the
     // (num_rows * n)-sized indices buffer that `arrow_select::interleave` would require.
-    let array_data: Vec<ArrayData> = element_arrays.iter().map(|a| a.to_data()).collect();
     let total_len = num_rows.checked_mul(n).ok_or_else(|| {
         Error::generic(format!(
             "Array expression length overflows usize: num_rows={num_rows} * inputs={n}"
         ))
     })?;
-    let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, total_len);
-    for row in 0..num_rows {
-        for col in 0..n {
-            mutable.extend(col, row, row + 1);
+    let values = if element_arrays.is_empty() {
+        new_empty_array(&element_type)
+    } else {
+        let array_data: Vec<ArrayData> = element_arrays.iter().map(|a| a.to_data()).collect();
+        let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, total_len);
+        for row in 0..num_rows {
+            for col in 0..n {
+                mutable.extend(col, row, row + 1);
+            }
         }
-    }
-    let values = make_array(mutable.freeze());
+        make_array(mutable.freeze())
+    };
 
     // Every row's list has exactly `n` elements. `from_lengths` builds `[0, n, 2n, ..., M*n]`
     // but panics on i32 overflow, so guard first (`LargeListArray` would be needed beyond
@@ -512,14 +759,14 @@ fn evaluate_array_expression(
     validate_array_type(Arc::new(list), result_type)
 }
 
-/// Direction for casting between Arrow view and non-view string/binary types.
+/// Target representation for string and binary normalization.
 #[derive(Clone, Copy)]
 enum ViewCast {
     ToView,
     ToNonView,
 }
 
-/// Casts list element types between view and non-view string/binary variants.
+/// Normalizes list elements to a canonical string or binary representation.
 ///
 /// When [`ViewCast::ToView`], non-view string/binary element types are converted to their view
 /// equivalents (e.g. `List<Utf8>` -> `List<Utf8View>`). View container types (`ListView`,
@@ -543,8 +790,17 @@ fn cast_list_elements(
             _ => return Ok(vals.clone()),
         },
         ViewCast::ToNonView => match field.data_type() {
-            ArrowDataType::Utf8View => ArrowDataType::Utf8,
-            ArrowDataType::BinaryView => ArrowDataType::Binary,
+            ArrowDataType::Utf8View | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8,
+            ArrowDataType::BinaryView
+            | ArrowDataType::LargeBinary
+            | ArrowDataType::FixedSizeBinary(_) => ArrowDataType::Binary,
+            ArrowDataType::Dictionary(_, value) => match value.as_ref() {
+                ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => ArrowDataType::Utf8,
+                ArrowDataType::LargeBinary
+                | ArrowDataType::BinaryView
+                | ArrowDataType::FixedSizeBinary(_) => ArrowDataType::Binary,
+                value => value.clone(),
+            },
             other => {
                 if !matches!(
                     vals.data_type(),
@@ -579,9 +835,7 @@ fn cast_list_elements(
     Ok(cast(vals, &container)?)
 }
 
-/// This function converts ArrowView types to their non-view type equivalents. This is used for
-/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
-/// supports limited conversions (see code for exactly which).
+/// Normalizes supported physical encodings to non-view string, binary, or list types.
 fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
@@ -590,15 +844,20 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn A
         ArrowDataType::LargeListView(field) => {
             cast_list_elements(&vals, field, ViewCast::ToNonView)
         }
-        ArrowDataType::Utf8View => Ok(cast(&vals, &ArrowDataType::Utf8)?),
-        ArrowDataType::BinaryView => Ok(cast(&vals, &ArrowDataType::Binary)?),
+        ArrowDataType::Utf8View | ArrowDataType::LargeUtf8 => {
+            Ok(cast(&vals, &ArrowDataType::Utf8)?)
+        }
+        ArrowDataType::BinaryView
+        | ArrowDataType::LargeBinary
+        | ArrowDataType::FixedSizeBinary(_) => Ok(cast(&vals, &ArrowDataType::Binary)?),
+        ArrowDataType::Dictionary(_, value) => {
+            arrow_convert_to_non_view_type(cast(&vals, value.as_ref())?)
+        }
         _ => Ok(vals),
     }
 }
 
-/// This function converts  Arrow types to their Arrow view type equivalents. This is used for
-/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
-/// supports limited conversions (see code for exactly which).
+/// Normalizes supported physical encodings to view string, binary, or list types.
 fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
@@ -612,6 +871,424 @@ fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array
             Ok(cast(&vals, &ArrowDataType::BinaryView)?)
         }
         _ => Ok(vals),
+    }
+}
+
+fn is_nested_type(data_type: &ArrowDataType) -> bool {
+    matches!(
+        data_type,
+        ArrowDataType::List(_)
+            | ArrowDataType::LargeList(_)
+            | ArrowDataType::ListView(_)
+            | ArrowDataType::LargeListView(_)
+            | ArrowDataType::FixedSizeList(_, _)
+            | ArrowDataType::Map(_, _)
+            | ArrowDataType::Struct(_)
+    )
+}
+
+fn is_numeric_type(data_type: &ArrowDataType) -> bool {
+    matches!(
+        data_type,
+        ArrowDataType::Int8
+            | ArrowDataType::Int16
+            | ArrowDataType::Int32
+            | ArrowDataType::Int64
+            | ArrowDataType::Float32
+            | ArrowDataType::Float64
+            | ArrowDataType::Decimal128(_, _)
+    )
+}
+
+fn is_numeric_or_null(data_type: &ArrowDataType) -> bool {
+    data_type == &ArrowDataType::Null || is_numeric_type(data_type)
+}
+
+/// Returns whether the comparison contract can align two operand types.
+///
+/// The evaluator uses this only to distinguish a valid but unimplemented coercion from an invalid
+/// comparison; it does not perform the coercion here.
+fn comparison_types_may_share_common_type(left: &ArrowDataType, right: &ArrowDataType) -> bool {
+    use ArrowDataType::*;
+
+    if left == right {
+        return is_orderable_type(left);
+    }
+    if left == &Null {
+        return is_orderable_type(right);
+    }
+    if right == &Null {
+        return is_orderable_type(left);
+    }
+    let is_temporal =
+        |data_type: &ArrowDataType| matches!(data_type, Date32 | Date64 | Timestamp(_, _));
+
+    if is_numeric_type(left) && is_numeric_type(right) || is_temporal(left) && is_temporal(right) {
+        return true;
+    }
+    match (left, right) {
+        (List(left), List(right))
+        | (LargeList(left), LargeList(right))
+        | (ListView(left), ListView(right))
+        | (LargeListView(left), LargeListView(right)) => {
+            comparison_types_may_share_common_type(left.data_type(), right.data_type())
+        }
+        (FixedSizeList(left, left_len), FixedSizeList(right, right_len)) => {
+            left_len == right_len
+                && comparison_types_may_share_common_type(left.data_type(), right.data_type())
+        }
+        (Struct(left), Struct(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    let leaf_types_match = left.data_type() == right.data_type();
+                    comparison_types_may_share_common_type(left.data_type(), right.data_type())
+                        && (leaf_types_match || left.name().eq_ignore_ascii_case(right.name()))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Applies Kernel's recursive orderability rules before dispatching to Arrow comparison kernels.
+fn is_orderable_type(data_type: &ArrowDataType) -> bool {
+    use ArrowDataType::*;
+
+    match data_type {
+        Null
+        | Boolean
+        | Int8
+        | Int16
+        | Int32
+        | Int64
+        | Float32
+        | Float64
+        | Decimal128(_, _)
+        | Utf8
+        | LargeUtf8
+        | Utf8View
+        | Binary
+        | LargeBinary
+        | BinaryView
+        | FixedSizeBinary(_)
+        | Date32
+        | Date64
+        | Timestamp(_, _)
+        | Interval(_) => true,
+        List(field) | LargeList(field) | ListView(field) | LargeListView(field) => {
+            is_orderable_type(field.data_type())
+        }
+        FixedSizeList(field, _) => is_orderable_type(field.data_type()),
+        Struct(fields) => fields
+            .iter()
+            .all(|field| is_orderable_type(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Identifies Arrow encodings whose mismatch is an unsupported representation, not an invalid SQL
+/// operand type.
+fn is_alternate_physical_type(data_type: &ArrowDataType) -> bool {
+    matches!(
+        data_type,
+        ArrowDataType::LargeUtf8
+            | ArrowDataType::LargeBinary
+            | ArrowDataType::FixedSizeBinary(_)
+            | ArrowDataType::Dictionary(_, _)
+    )
+}
+
+fn ordering_matches(op: BinaryPredicateOp, ordering: std::cmp::Ordering) -> bool {
+    use std::cmp::Ordering::{Equal as OrdEqual, Greater, Less};
+
+    use BinaryPredicateOp::*;
+
+    match op {
+        LessThan => ordering == Less,
+        GreaterThan => ordering == Greater,
+        Equal => ordering == OrdEqual,
+        Distinct => ordering != OrdEqual,
+        In => false,
+    }
+}
+
+/// Applies SQL float ordering: NaN equals NaN and sorts after every non-NaN value, while signed
+/// zeros compare equal.
+fn evaluate_float_comparison(
+    op: BinaryPredicateOp,
+    left: &ArrayRef,
+    right: &ArrayRef,
+) -> Option<BooleanArray> {
+    macro_rules! compare {
+        ($arrow_type:ty) => {{
+            let left = left.as_primitive::<$arrow_type>();
+            let right = right.as_primitive::<$arrow_type>();
+            let values = (0..left.len()).map(|index| {
+                let (left_valid, right_valid) = (left.is_valid(index), right.is_valid(index));
+                if op == BinaryPredicateOp::Distinct {
+                    return match (left_valid, right_valid) {
+                        (false, false) => Some(false),
+                        (false, true) | (true, false) => Some(true),
+                        (true, true) => {
+                            let (left, right) = (left.value(index), right.value(index));
+                            let ordering = match (left.is_nan(), right.is_nan()) {
+                                (true, true) => std::cmp::Ordering::Equal,
+                                (true, false) => std::cmp::Ordering::Greater,
+                                (false, true) => std::cmp::Ordering::Less,
+                                (false, false) => left
+                                    .partial_cmp(&right)
+                                    .unwrap_or(std::cmp::Ordering::Equal),
+                            };
+                            Some(ordering_matches(op, ordering))
+                        }
+                    };
+                }
+                if !left_valid || !right_valid {
+                    return None;
+                }
+                let (left, right) = (left.value(index), right.value(index));
+                let ordering = match (left.is_nan(), right.is_nan()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => left
+                        .partial_cmp(&right)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                };
+                Some(ordering_matches(op, ordering))
+            });
+            BooleanArray::from_iter(values)
+        }};
+    }
+
+    match left.data_type() {
+        ArrowDataType::Float32 => Some(compare!(Float32Type)),
+        ArrowDataType::Float64 => Some(compare!(Float64Type)),
+        _ => None,
+    }
+}
+
+/// Validates comparison operands, applies the supported common-type conversions, and evaluates
+/// scalar comparisons. Valid nested or coercible cases without Arrow support return `Unsupported`.
+fn evaluate_comparison(
+    op: BinaryPredicateOp,
+    left: ArrayRef,
+    right: ArrayRef,
+    inverted: bool,
+) -> DeltaResult<BooleanArray> {
+    if !is_orderable_type(left.data_type()) || !is_orderable_type(right.data_type()) {
+        return Err(Error::invalid_expression(format!(
+            "Comparison requires orderable operands, got {:?} and {:?}",
+            left.data_type(),
+            right.data_type()
+        )));
+    }
+    if matches!(left.data_type(), ArrowDataType::Interval(_))
+        && matches!(right.data_type(), ArrowDataType::Interval(_))
+        && left.data_type() != right.data_type()
+    {
+        return Err(Error::invalid_expression(
+            "Intervals from different families are not comparable",
+        ));
+    }
+    let (left, right) = if left.data_type() == right.data_type() {
+        (left, right)
+    } else if left.data_type() == &ArrowDataType::Null && !is_nested_type(right.data_type()) {
+        (cast(&left, right.data_type())?, right)
+    } else if right.data_type() == &ArrowDataType::Null && !is_nested_type(left.data_type()) {
+        let common_type = left.data_type().clone();
+        (left, cast(&right, &common_type)?)
+    } else if let Some(common_type) =
+        simple_numeric_common_type(left.data_type(), right.data_type())
+    {
+        (cast(&left, &common_type)?, cast(&right, &common_type)?)
+    } else {
+        (
+            arrow_convert_to_view_type(left)?,
+            arrow_convert_to_view_type(right)?,
+        )
+    };
+    if left.data_type() != right.data_type() {
+        let message = format!(
+            "Comparison operands have incompatible types {:?} and {:?}",
+            left.data_type(),
+            right.data_type()
+        );
+        return if comparison_types_may_share_common_type(left.data_type(), right.data_type()) {
+            Err(Error::unsupported(format!(
+                "Arrow evaluator does not support common-type conversion: {message}"
+            )))
+        } else {
+            Err(Error::invalid_expression(message))
+        };
+    }
+    if is_nested_type(left.data_type()) {
+        return Err(Error::unsupported(format!(
+            "Arrow evaluator does not support nested comparison for {:?}",
+            left.data_type()
+        )));
+    }
+
+    let result = if let Some(result) = evaluate_float_comparison(op, &left, &right) {
+        result
+    } else {
+        match op {
+            BinaryPredicateOp::LessThan => lt(&left, &right)?,
+            BinaryPredicateOp::GreaterThan => gt(&left, &right)?,
+            BinaryPredicateOp::Equal => eq(&left, &right)?,
+            BinaryPredicateOp::Distinct => distinct(&left, &right)?,
+            BinaryPredicateOp::In => {
+                return Err(Error::internal_error(
+                    "IN reached the standard comparison evaluator",
+                ));
+            }
+        }
+    };
+    Ok(if inverted { not(&result)? } else { result })
+}
+
+/// Compares one membership candidate using SQL equality. A null operand returns `None`, and two
+/// NaNs compare equal.
+fn sql_equal_at(
+    left: &ArrayRef,
+    left_index: usize,
+    right: &ArrayRef,
+    right_index: usize,
+) -> DeltaResult<Option<bool>> {
+    if left.is_null(left_index) || right.is_null(right_index) {
+        return Ok(None);
+    }
+    match left.data_type() {
+        ArrowDataType::Float32 => {
+            let left = left.as_primitive::<Float32Type>().value(left_index);
+            let right = right.as_primitive::<Float32Type>().value(right_index);
+            Ok(Some((left.is_nan() && right.is_nan()) || left == right))
+        }
+        ArrowDataType::Float64 => {
+            let left = left.as_primitive::<Float64Type>().value(left_index);
+            let right = right.as_primitive::<Float64Type>().value(right_index);
+            Ok(Some((left.is_nan() && right.is_nan()) || left == right))
+        }
+        _ => {
+            let left = left.slice(left_index, 1);
+            let right = right.slice(right_index, 1);
+            Ok(Some(eq(&left, &right)?.value(0)))
+        }
+    }
+}
+
+/// Evaluates one candidate array per input row using SQL three-valued membership semantics.
+/// Empty candidate arrays return false before inspecting a null left operand.
+fn evaluate_in_list<O: OffsetSizeTrait>(
+    left: &ArrayRef,
+    right: &GenericListArray<O>,
+) -> DeltaResult<BooleanArray> {
+    if left.len() != right.len() {
+        return Err(Error::internal_error(format!(
+            "IN operands have different lengths: {} and {}",
+            left.len(),
+            right.len()
+        )));
+    }
+    let values = right.values();
+    if matches!(values.data_type(), ArrowDataType::Map(_, _)) {
+        return Err(Error::invalid_expression(
+            "IN does not support MAP operands",
+        ));
+    }
+    if left.data_type() != values.data_type()
+        && left.data_type() != &ArrowDataType::Null
+        && values.data_type() != &ArrowDataType::Null
+    {
+        let message = format!(
+            "IN operands have incompatible types {:?} and {:?}",
+            left.data_type(),
+            values.data_type()
+        );
+        return if is_nested_type(left.data_type()) && is_nested_type(values.data_type()) {
+            Err(Error::unsupported(format!(
+                "Arrow evaluator does not support nested common-type conversion: {message}"
+            )))
+        } else if is_numeric_type(left.data_type()) && is_numeric_type(values.data_type()) {
+            Err(Error::unsupported(format!(
+                "Arrow evaluator does not yet support common-type conversion: {message}"
+            )))
+        } else if is_alternate_physical_type(left.data_type())
+            || is_alternate_physical_type(values.data_type())
+        {
+            Err(Error::unsupported(format!(
+                "Arrow evaluator does not support this physical representation: {message}"
+            )))
+        } else {
+            Err(Error::invalid_expression(message))
+        };
+    }
+    if is_nested_type(left.data_type()) || is_nested_type(values.data_type()) {
+        return Err(Error::unsupported(format!(
+            "Arrow evaluator does not support nested IN operands {:?} and {:?}",
+            left.data_type(),
+            values.data_type()
+        )));
+    }
+
+    let mut output = Vec::with_capacity(left.len());
+    for row in 0..left.len() {
+        if right.is_null(row) {
+            output.push(None);
+            continue;
+        }
+        let candidates = right.value(row);
+        if candidates.is_empty() {
+            output.push(Some(false));
+            continue;
+        }
+        if left.is_null(row) {
+            output.push(None);
+            continue;
+        }
+
+        let mut saw_null = false;
+        let mut matched = false;
+        for candidate in 0..candidates.len() {
+            match sql_equal_at(left, row, &candidates, candidate)? {
+                Some(true) => {
+                    matched = true;
+                    break;
+                }
+                Some(false) => {}
+                None => saw_null = true,
+            }
+        }
+        output.push(
+            matched
+                .then_some(true)
+                .or_else(|| (!saw_null).then_some(false)),
+        );
+    }
+    Ok(BooleanArray::from(output))
+}
+
+/// Evaluates any left expression against an array-valued right expression after normalizing the
+/// supported Arrow string, binary, and list encodings.
+fn evaluate_in(
+    left: &Expression,
+    right: &Expression,
+    batch: &RecordBatch,
+) -> DeltaResult<BooleanArray> {
+    let left = arrow_convert_to_non_view_type(evaluate_expression(left, batch, None)?)?;
+    let right = arrow_convert_to_non_view_type(evaluate_expression(right, batch, None)?)?;
+    if let Some(right) = right.as_list_opt::<i32>() {
+        evaluate_in_list(&left, right)
+    } else if let Some(right) = right.as_list_opt::<i64>() {
+        evaluate_in_list(&left, right)
+    } else if matches!(right.data_type(), ArrowDataType::FixedSizeList(_, _)) {
+        Err(Error::unsupported(
+            "Arrow evaluator does not support IN with FixedSizeList right operands",
+        ))
+    } else {
+        Err(Error::invalid_expression(format!(
+            "IN requires an array-valued right operand, got {:?}",
+            right.data_type()
+        )))
     }
 }
 
@@ -652,101 +1329,14 @@ pub fn evaluate_predicate(
         }
         Binary(BinaryPredicate { op, left, right }) => {
             let (left, right) = (left.as_ref(), right.as_ref());
-
-            // IN is different from all the others, and also quite complex, so factor it out.
-            //
-            // TODO: Factor out as a stand-alone function instead of a closure?
-            let eval_in = || match (left, right) {
-                (Expression::Literal(_), Expression::Column(_)) => {
-                    let left = evaluate_expression(left, batch, None)?;
-                    let left = arrow_convert_to_non_view_type(left)?;
-
-                    let right = evaluate_expression(right, batch, None)?;
-                    let right = arrow_convert_to_non_view_type(right)?;
-                    if let Some(string_arr) = left.as_string_opt::<i32>() {
-                        if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            if list_arr.value_type() == ArrowDataType::Utf8 {
-                                let result = in_list_utf8(string_arr, list_arr)?;
-                                return Ok(result);
-                            }
-                        }
-                    }
-
-                    use ArrowDataType::*;
-                    prim_array_cmp! {
-                        left, right,
-                        (Int8, Int8Type),
-                        (Int16, Int16Type),
-                        (Int32, Int32Type),
-                        (Int64, Int64Type),
-                        (UInt8, UInt8Type),
-                        (UInt16, UInt16Type),
-                        (UInt32, UInt32Type),
-                        (UInt64, UInt64Type),
-                        (Float16, Float16Type),
-                        (Float32, Float32Type),
-                        (Float64, Float64Type),
-                        (Timestamp(TimeUnit::Second, _), TimestampSecondType),
-                        (Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
-                        (Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
-                        (Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
-                        (Date32, Date32Type),
-                        (Date64, Date64Type),
-                        (Time32(TimeUnit::Second), Time32SecondType),
-                        (Time32(TimeUnit::Millisecond), Time32MillisecondType),
-                        (Time64(TimeUnit::Microsecond), Time64MicrosecondType),
-                        (Time64(TimeUnit::Nanosecond), Time64NanosecondType),
-                        (Duration(TimeUnit::Second), DurationSecondType),
-                        (Duration(TimeUnit::Millisecond), DurationMillisecondType),
-                        (Duration(TimeUnit::Microsecond), DurationMicrosecondType),
-                        (Duration(TimeUnit::Nanosecond), DurationNanosecondType),
-                        (Interval(IntervalUnit::DayTime), IntervalDayTimeType),
-                        (Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
-                        (Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
-                        (Decimal128(_, _), Decimal128Type),
-                        (Decimal256(_, _), Decimal256Type)
-                    }
-                }
-                (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
-                    // Logical (SQL) equality, so a NULL never matches another NULL. Struct, array,
-                    // and map elements/needles are unsupported: `logical_eq` returns `false` for
-                    // them, so they never match, not even a structurally identical value.
-                    let exists = ad.array_elements().iter().any(|e| lit.logical_eq(e));
-                    Ok(BooleanArray::from(vec![exists]))
-                }
-                (l, r) => Err(Error::invalid_expression(format!(
-                    "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
-                ))),
-            };
-
-            let eval_fn = match (op, inverted) {
-                (LessThan, false) => lt,
-                (LessThan, true) => gt_eq,
-                (GreaterThan, false) => gt,
-                (GreaterThan, true) => lt_eq,
-                (Equal, false) => eq,
-                (Equal, true) => neq,
-                (Distinct, false) => distinct,
-                (Distinct, true) => not_distinct,
-                (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
-            };
-
+            if *op == In {
+                return Ok(maybe_inverted(Cow::Owned(evaluate_in(
+                    left, right, batch,
+                )?))?);
+            }
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
-
-            // If the types differ (e.g. one side is a view type and the other is not),
-            // normalize both to view types since benchamrking results show that casting from
-            // non-view to view type is faster than casting from view type to non-view
-            // type.
-            let (left, right) = if left.data_type() == right.data_type() {
-                (left, right)
-            } else {
-                (
-                    arrow_convert_to_view_type(left)?,
-                    arrow_convert_to_view_type(right)?,
-                )
-            };
-            Ok(eval_fn(&left, &right)?)
+            evaluate_comparison(*op, left, right, inverted)
         }
         Junction(JunctionPredicate { op, preds }) => {
             // Leverage de Morgan's laws (invert the children and swap the operator):
@@ -1914,9 +2504,8 @@ mod tests {
         assert_eq!(result.value(0), expected);
     }
 
-    /// The two element sources `IN` accepts, both holding `elements`: a literal `Array` scalar
-    /// and a single-row `list` column. The batch also carries an `n` column (always `1`) so the
-    /// needle can be a column in the operand-shape rejection test.
+    /// Build equivalent literal-array and list-column right operands, plus a one-row `n` column
+    /// for tests that need a column-valued left operand.
     fn in_element_sources(elements: &[Option<i32>]) -> (Expr, Expr, RecordBatch) {
         let scalars = elements
             .iter()
@@ -1944,40 +2533,45 @@ mod tests {
         (literal, col!("list"), batch)
     }
 
-    /// NULL never matches because logical equality treats it as incomparable, including to itself.
+    /// IN uses SQL three-valued logic: a match wins, otherwise a NULL operand makes the result
+    /// NULL.
     #[rstest]
-    #[case::present(Some(2), &[Some(1), Some(2)], true)]
-    #[case::absent(Some(9), &[Some(1), Some(2)], false)]
-    #[case::null_needle(None, &[Some(1), Some(2)], false)]
-    #[case::null_needle_with_null_element(None, &[Some(1), None], false)]
-    #[case::null_needle_with_only_null_element(None, &[None], false)]
-    #[case::present_alongside_null_element(Some(1), &[Some(1), None], true)]
-    #[case::absent_alongside_null_element(Some(9), &[Some(1), None], false)]
-    fn test_in_membership_never_nulls(
-        #[case] needle: Option<i32>,
+    #[case::present(Some(2), &[Some(1), Some(2)], Some(true))]
+    #[case::absent(Some(9), &[Some(1), Some(2)], Some(false))]
+    #[case::null_value(None, &[Some(1), Some(2)], None)]
+    #[case::null_value_and_element(None, &[Some(1), None], None)]
+    #[case::null_value_with_only_null_element(None, &[None], None)]
+    #[case::present_alongside_null_element(Some(1), &[Some(1), None], Some(true))]
+    #[case::absent_alongside_null_element(Some(9), &[Some(1), None], None)]
+    fn test_in_membership_uses_three_valued_logic(
+        #[case] value: Option<i32>,
         #[case] elements: &[Option<i32>],
-        #[case] expected: bool,
+        #[case] expected: Option<bool>,
     ) {
         let (literal_source, column_source, batch) = in_element_sources(elements);
-        let needle = match needle {
+        let value = match value {
             Some(n) => lit(n),
             None => null_lit(DataType::INTEGER),
         };
-        for elements in [literal_source, column_source] {
-            let pred = Pred::binary(BinaryPredicateOp::In, needle.clone(), elements);
+        for (source, elements) in [("literal", literal_source), ("column", column_source)] {
+            let pred = Pred::binary(BinaryPredicateOp::In, value.clone(), elements);
             let result = evaluate_predicate(&pred, &batch, false).unwrap();
-            assert_eq!(result.null_count(), 0);
-            assert_eq!(result.value(0), expected);
+            assert_eq!(
+                result.is_valid(0).then(|| result.value(0)),
+                expected,
+                "{source} right operand"
+            );
 
-            // `IN` never produces NULL, so `NOT IN` is always its exact complement.
             let result = evaluate_predicate(&Pred::not(pred), &batch, false).unwrap();
-            assert_eq!(result.null_count(), 0);
-            assert_eq!(result.value(0), !expected);
+            assert_eq!(
+                result.is_valid(0).then(|| result.value(0)),
+                expected.map(|value| !value),
+                "{source} right operand"
+            );
         }
     }
 
-    /// Nested elements (struct, array, map) have no logical comparison, See
-    /// [`Scalar::logical_partial_cmp`].
+    /// The Arrow evaluator does not yet implement `IN` for array or struct elements.
     #[rstest]
     #[case::struct_element(Scalar::Struct(
         StructData::try_new(
@@ -1989,45 +2583,104 @@ mod tests {
     #[case::array_element(Scalar::Array(
         ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), vec![1, 2]).unwrap(),
     ))]
-    #[case::map_element(Scalar::Map(
-        MapData::try_new(
-            MapType::new(DataType::STRING, DataType::INTEGER, false),
-            vec![("k", 1)],
-        )
-        .unwrap(),
-    ))]
-    fn test_in_nested_element_never_matches(#[case] needle: Scalar) {
-        // A single-element literal array holding a structurally identical copy of the needle.
-        let elements = ArrayData::try_new(
-            ArrayType::new(needle.data_type(), true),
-            vec![needle.clone()],
-        )
-        .unwrap();
+    fn test_nested_in_is_unsupported(#[case] value: Scalar) {
+        // A single-element literal array holding a structurally identical copy of the value.
+        let elements =
+            ArrayData::try_new(ArrayType::new(value.data_type(), true), vec![value.clone()])
+                .unwrap();
 
         let (_, _, batch) = in_element_sources(&[Some(1)]);
         let pred = Pred::binary(
             BinaryPredicateOp::In,
-            Expr::Literal(needle),
+            Expr::Literal(value),
             Expr::Literal(Scalar::Array(elements)),
         );
-        let result = evaluate_predicate(&pred, &batch, false).unwrap();
-        assert_eq!(result.null_count(), 0);
-        assert!(!result.value(0));
+        assert!(matches!(
+            evaluate_predicate(&pred, &batch, false),
+            Err(Error::Unsupported(_))
+        ));
     }
 
-    /// Only a literal left operand is supported, so a column needle is rejected regardless of where
-    /// the elements come from, as is a right operand that holds no elements at all.
-    #[rstest]
-    #[case::column_in_literal_array(in_element_sources(&[Some(1), Some(2)]).0)]
-    #[case::column_in_column(in_element_sources(&[Some(1), Some(2)]).1)]
-    #[case::non_array_right_operand(lit(1))]
-    fn test_in_rejects_unsupported_operand_shapes(#[case] right: Expr) {
+    #[test]
+    fn test_map_in_is_invalid() {
+        let value = Scalar::Map(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::INTEGER, false),
+                vec![("k", 1)],
+            )
+            .unwrap(),
+        );
+        let elements =
+            ArrayData::try_new(ArrayType::new(value.data_type(), true), vec![value.clone()])
+                .unwrap();
+        let (_, _, batch) = in_element_sources(&[Some(1)]);
+        let pred = Pred::binary(
+            BinaryPredicateOp::In,
+            Expr::Literal(value),
+            Expr::Literal(Scalar::Array(elements)),
+        );
+
+        assert!(matches!(
+            evaluate_predicate(&pred, &batch, false),
+            Err(Error::InvalidExpressionEvaluation(_))
+        ));
+    }
+
+    #[test]
+    fn test_in_rejects_non_array_right_operand() {
         let (.., batch) = in_element_sources(&[Some(1), Some(2)]);
-        let pred = Pred::binary(BinaryPredicateOp::In, col!("n"), right);
+        let pred = Pred::binary(BinaryPredicateOp::In, col!("n"), lit(1));
         assert_result_error_with_message(
             evaluate_predicate(&pred, &batch, false),
-            "Invalid right value for (NOT) IN comparison",
+            "IN requires an array-valued right operand",
         );
+    }
+
+    #[test]
+    fn test_in_normalizes_large_utf8_elements() {
+        let item = Arc::new(ArrowField::new("item", ArrowDataType::LargeUtf8, false));
+        let values = Arc::new(LargeStringArray::from(vec!["a", "b", "c"]));
+        let lists = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 3])),
+            values,
+            None,
+        );
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "items",
+            ArrowDataType::List(item),
+            false,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(lists)]).unwrap();
+        let predicate = Pred::binary(BinaryPredicateOp::In, lit("a"), col!("items"));
+
+        assert_eq!(
+            evaluate_predicate(&predicate, &batch, false).unwrap(),
+            BooleanArray::from(vec![true, false])
+        );
+    }
+
+    #[test]
+    fn test_in_with_fixed_size_list_is_unsupported() {
+        let item = Arc::new(ArrowField::new("item", ArrowDataType::Int32, false));
+        let lists = crate::arrow::array::FixedSizeListArray::new(
+            Arc::clone(&item),
+            2,
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
+        );
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "items",
+            lists.data_type().clone(),
+            false,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(lists)]).unwrap();
+        let predicate = Pred::binary(BinaryPredicateOp::In, lit(1), col!("items"));
+
+        assert!(matches!(
+            evaluate_predicate(&predicate, &batch, false),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[rstest]
@@ -2079,7 +2732,7 @@ mod tests {
     }
 
     #[test]
-    fn test_divide_integer_truncates_and_rejects_zero_divisor() {
+    fn test_divide_integer_is_fractional_and_rejects_zero_divisor() {
         let schema = ArrowSchema::new(vec![
             ArrowField::new("n", ArrowDataType::Int32, false),
             ArrowField::new("d", ArrowDataType::Int32, false),
@@ -2098,24 +2751,24 @@ mod tests {
         let quotient = evaluate_expression(
             &divide(col!("n"), col!("d")),
             &batch,
-            Some(&DataType::INTEGER),
+            Some(&DataType::DOUBLE),
         )
         .unwrap();
         assert_eq!(
-            quotient.as_any().downcast_ref::<Int32Array>().unwrap(),
-            &Int32Array::from(vec![3])
+            quotient.as_any().downcast_ref::<Float64Array>().unwrap(),
+            &Float64Array::from(vec![3.5])
         );
 
         let result = evaluate_expression(
             &divide(col!("n"), col!("zero")),
             &batch,
-            Some(&DataType::INTEGER),
+            Some(&DataType::DOUBLE),
         );
         assert_result_error_with_message(result, "Divide by zero");
     }
 
     #[test]
-    fn test_divide_float_by_zero_yields_infinity_and_nan() {
+    fn test_divide_float_by_zero_returns_error() {
         let schema = ArrowSchema::new(vec![
             ArrowField::new("n", ArrowDataType::Float64, false),
             ArrowField::new("zero", ArrowDataType::Float64, false),
@@ -2129,18 +2782,26 @@ mod tests {
         )
         .unwrap();
 
-        let eval = |expr| {
-            let array = evaluate_expression(&expr, &batch, Some(&DataType::DOUBLE)).unwrap();
-            assert_eq!(array.null_count(), 0);
-            array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(0)
-        };
+        for expression in [
+            divide(col!("n"), col!("zero")),
+            divide(col!("zero"), col!("zero")),
+        ] {
+            assert_result_error_with_message(
+                evaluate_expression(&expression, &batch, Some(&DataType::DOUBLE)),
+                "Divide by zero",
+            );
+        }
+    }
 
-        assert!(eval(divide(col!("n"), col!("zero"))).is_infinite());
-        assert!(eval(divide(col!("zero"), col!("zero"))).is_nan());
+    #[test]
+    fn test_divide_untyped_null_by_untyped_null_is_invalid() {
+        let batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
+        let expression = divide(null_lit(DataType::VOID), null_lit(DataType::VOID));
+
+        assert!(matches!(
+            evaluate_expression(&expression, &batch, Some(&DataType::DOUBLE)),
+            Err(Error::InvalidExpressionEvaluation(_))
+        ));
     }
 
     fn create_json_batch() -> RecordBatch {
@@ -3439,13 +4100,12 @@ mod tests {
     // All validation paths in `evaluate_array_expression` share the shape "expr + batch +
     // result_type -> error containing substring". Each case targets a different guard.
     #[rstest]
-    // Empty Array() is rejected regardless of result_type -- the element type is inferred
-    // from the inputs, so there must be at least one.
+    // Without a result type, an empty ARRAY has no element type to use.
     #[case::empty_inputs(
         create_test_batch(),
         Expr::array(Vec::<Expr>::new()),
         None,
-        "requires at least one element",
+        "Cannot infer the element type",
     )]
     #[case::non_array_result_type(
         create_test_batch(),
