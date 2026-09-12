@@ -793,10 +793,13 @@ pub trait ParquetHandler: AsAny {
     /// # Type coercion
     ///
     /// When `physical_schema` requests a type different from the matched Parquet column, the reader
-    /// must perform every conversion allowed by the [Delta protocol type widening rules]. Examples
-    /// include `INTEGER` -> `LONG`, `FLOAT` -> `DOUBLE`, integer types -> `DECIMAL`, `DECIMAL`
-    /// precision or scale increases, and `DATE` -> `TIMESTAMP_NTZ`. See the protocol for the
-    /// complete list.
+    /// must coerce it to the requested type when the conversion is allowed by the [Delta protocol
+    /// type widening rules]. Examples include `INTEGER` -> `LONG`, `FLOAT` -> `DOUBLE`, and `DATE`
+    /// -> `TIMESTAMP_NTZ`. See the protocol for the complete list.
+    ///
+    /// Kernel additionally requires readers to support `INT32` -> `DATE` and `INT64` ->
+    /// `TIMESTAMP` / `TIMESTAMP_NTZ` conversions for checkpoint `stats_parsed` and
+    /// `partitionValues_parsed` fields.
     ///
     /// Timestamp columns MUST be normalized to the protocol specified microsecond precision: a
     /// `TIMESTAMP(MILLIS)` (or any other non-microsecond unit) column read into a `TIMESTAMP` /
