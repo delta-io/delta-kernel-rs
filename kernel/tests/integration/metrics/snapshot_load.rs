@@ -21,6 +21,8 @@ use delta_kernel::snapshot::IncrementalReplay;
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+#[cfg(feature = "internal-api")]
+use delta_kernel::LogPath;
 use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -51,15 +53,22 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> DeltaResult<()> {
         .build()?;
     let (engine, reporter, _guard) = measuring_engine(table.store().clone());
     let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
-    let hint = SnapshotHint {
-        version: snapshot.version(),
-        log_segment_files: snapshot.log_segment().listed.clone(),
-        protocol: snapshot.table_configuration().protocol().clone(),
-        metadata: snapshot.table_configuration().metadata().clone(),
-        last_checkpoint_hint: snapshot.log_segment().checkpoint_hint().cloned(),
-        crc: snapshot.crc_at_version().cloned(),
-        freshness: SnapshotHintFreshness::Latest,
-    };
+    let log_paths = snapshot
+        .log_segment()
+        .listed
+        .ascending_commit_files
+        .iter()
+        .map(|path| LogPath::try_new(path.location.clone()))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let hint = SnapshotHint::try_new(
+        snapshot.version(),
+        log_paths,
+        snapshot.table_configuration().protocol().clone(),
+        snapshot.table_configuration().metadata().clone(),
+        snapshot.log_segment().checkpoint_hint().cloned(),
+        snapshot.crc_at_version().cloned(),
+        SnapshotHintFreshness::Latest,
+    )?;
     reporter.reset();
 
     let hinted = Snapshot::builder_for(table.table_root())
@@ -103,15 +112,23 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc() -> DeltaResult<()> {
     );
     let crc_bytes = serde_json::to_vec(snapshot.crc_at_version().unwrap())?;
     let parsed_crc = Arc::new(Crc::try_from_json_bytes(&crc_bytes, snapshot.version())?);
-    let hint = SnapshotHint {
-        version: snapshot.version(),
-        log_segment_files: snapshot.log_segment().listed.clone(),
-        protocol: snapshot.table_configuration().protocol().clone(),
-        metadata: snapshot.table_configuration().metadata().clone(),
-        last_checkpoint_hint: snapshot.log_segment().checkpoint_hint().cloned(),
-        crc: Some(parsed_crc),
-        freshness: SnapshotHintFreshness::Latest,
-    };
+    let listed = &snapshot.log_segment().listed;
+    let log_paths = listed
+        .ascending_commit_files
+        .iter()
+        .chain(&listed.checkpoint_parts)
+        .chain(listed.latest_crc_file.iter())
+        .map(|path| LogPath::try_new(path.location.clone()))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let hint = SnapshotHint::try_new(
+        snapshot.version(),
+        log_paths,
+        snapshot.table_configuration().protocol().clone(),
+        snapshot.table_configuration().metadata().clone(),
+        snapshot.log_segment().checkpoint_hint().cloned(),
+        Some(parsed_crc),
+        SnapshotHintFreshness::Latest,
+    )?;
     reporter.reset();
 
     let hinted = Snapshot::builder_for(table.table_root())

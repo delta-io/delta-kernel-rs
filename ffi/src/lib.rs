@@ -21,7 +21,7 @@ use delta_kernel::history_manager::{
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
-use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
+use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotHint, SnapshotRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -51,6 +51,7 @@ mod alloc_stats;
 
 pub mod column_default;
 pub mod commit_range;
+pub mod delta_types;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
@@ -75,6 +76,7 @@ pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
+pub mod snapshot_hint;
 
 #[cfg(test)]
 mod ffi_test_utils;
@@ -163,6 +165,26 @@ impl KernelStringSlice {
         }
     }
 
+    /// Copies this borrowed UTF-8 slice into an owned string.
+    ///
+    /// # Safety
+    ///
+    /// For nonzero `len`, `ptr` must address `len` initialized bytes and remain valid for the
+    /// duration of this call.
+    pub(crate) unsafe fn try_to_string(&self) -> DeltaResult<String> {
+        if self.len == 0 {
+            return Ok(String::new());
+        }
+        if self.ptr.is_null() {
+            return Err(delta_kernel::Error::generic(format!(
+                "string pointer is null with length {}",
+                self.len
+            )));
+        }
+        let value: &str = unsafe { TryFromStringSlice::try_from_slice(self) }?;
+        Ok(value.to_string())
+    }
+
     #[cfg(feature = "tracing")]
     pub(crate) fn empty() -> Self {
         KernelStringSlice {
@@ -196,11 +218,11 @@ impl KernelBytesSlice {
     }
 }
 
-/// A non-owned slice of signed 64-bit integers intended for passing variable-length arrays from
-/// kernel to an engine callback.
+/// A non-owned slice of signed 64-bit integers intended for passing variable-length arrays across
+/// the FFI boundary.
 ///
-/// The pointed-to data is valid only for the duration of the callback receiving this value. The
-/// callback must copy any values it needs to retain after returning.
+/// The pointed-to data is valid only for the duration of the call or callback receiving this
+/// value. The receiver must copy any values it needs to retain after returning.
 #[repr(C)]
 pub struct KernelI64Slice {
     ptr: *const i64,
@@ -208,6 +230,11 @@ pub struct KernelI64Slice {
 }
 
 impl KernelI64Slice {
+    /// Returns the pointer and length without dereferencing the borrowed data.
+    pub(crate) fn as_raw_parts(&self) -> (*const i64, usize) {
+        (self.ptr, self.len)
+    }
+
     /// Creates a new integer slice from a source slice.
     ///
     /// # Safety
@@ -250,6 +277,15 @@ impl<T> From<Option<T>> for OptionalValue<T> {
 
 impl<T> From<OptionalValue<T>> for Option<T> {
     fn from(value: OptionalValue<T>) -> Self {
+        match value {
+            OptionalValue::Some(value) => Some(value),
+            OptionalValue::None => None,
+        }
+    }
+}
+
+impl<'a, T> From<&'a OptionalValue<T>> for Option<&'a T> {
+    fn from(value: &'a OptionalValue<T>) -> Self {
         match value {
             OptionalValue::Some(value) => Some(value),
             OptionalValue::None => None,
@@ -1120,15 +1156,17 @@ pub struct SharedMetadata;
 /// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
 /// (incrementally from an existing snapshot). Configure with [`snapshot_builder_set_version`],
 /// [`snapshot_builder_set_log_tail`], and [`snapshot_builder_set_max_catalog_version`] (for
-/// catalog-managed tables). Finally, call [`snapshot_builder_build`] to consume the builder and
-/// obtain the snapshot. If you need to discard the builder without building, call
-/// [`free_snapshot_builder`].
+/// catalog-managed tables). Builders returned by [`get_snapshot_builder`] may instead receive a
+/// complete typed snapshot hint with [`snapshot_hint::snapshot_builder_set_snapshot_hint`].
+/// Finally, call [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you
+/// need to discard the builder without building, call [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
     engine: Arc<dyn ExternEngine>,
     source: FfiSnapshotBuilderSource,
     version: Option<Version>,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
+    snapshot_hint: Option<Box<SnapshotHint>>,
 }
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiSnapshotBuilder`].
@@ -1150,6 +1188,7 @@ fn make_snapshot_builder(
         version: None,
         log_tail: Vec::new(),
         max_catalog_version: None,
+        snapshot_hint: None,
     })
     .into())
 }
@@ -1204,8 +1243,10 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
     .into_extern_result(&engine_ref)
 }
 
-/// Set the target version on a snapshot builder. When omitted, the snapshot is created at the
-/// latest version of the table.
+/// Sets an explicit target version on a snapshot builder. When omitted, a hinted build uses the
+/// hinted version; an ordinary build uses `max_catalog_version` when configured, otherwise the
+/// latest listed version. A hint and explicit target must match or build returns
+/// `InvalidSnapshotHint`.
 ///
 /// # Safety
 ///
@@ -1281,6 +1322,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         version,
         log_tail,
         max_catalog_version,
+        snapshot_hint,
     } = builder;
     let engine = engine.engine();
 
@@ -1290,6 +1332,12 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         version: Option<Version>,
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
+        snapshot_hint: Option<Box<SnapshotHint>>,
+        apply_snapshot_hint: impl FnOnce(
+            delta_kernel::snapshot::SnapshotBuilder<Mode>,
+            SnapshotHint,
+        )
+            -> DeltaResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
     ) -> DeltaResult<SnapshotRef> {
         if let Some(version) = version {
             builder = builder.at_version(version);
@@ -1299,6 +1347,9 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         }
         if let Some(max_catalog_version) = max_catalog_version {
             builder = builder.with_max_catalog_version(max_catalog_version);
+        }
+        if let Some(snapshot_hint) = snapshot_hint {
+            builder = apply_snapshot_hint(builder, *snapshot_hint)?;
         }
         builder.build(engine)
     }
@@ -1310,6 +1361,8 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
             version,
             log_tail,
             max_catalog_version,
+            snapshot_hint,
+            |builder, hint| Ok(builder.with_snapshot_hint(hint)),
         ),
         FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => build(
             Snapshot::builder_from(snapshot),
@@ -1317,6 +1370,14 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
             version,
             log_tail,
             max_catalog_version,
+            snapshot_hint,
+            |_, _| {
+                // The public setter rejects this combination; retain the invariant here for
+                // internal construction paths.
+                Err(snapshot_hint::invalid(
+                    "A snapshot hint cannot be used with Snapshot::builder_from",
+                ))
+            },
         ),
     }?;
     Ok(snapshot.into())
