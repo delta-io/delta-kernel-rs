@@ -1,10 +1,15 @@
 use std::os::raw::c_void;
+use std::sync::Arc;
 
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
+use delta_kernel::DeltaResult;
 
+use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::scan::CMetadataMap;
-use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
+use crate::{
+    kernel_string_slice, KernelStringSlice, SharedExternEngine, SharedSchema, TryFromStringSlice,
+};
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
 /// representation of a schema from a particular schema within kernel.
@@ -739,5 +744,144 @@ mod tests {
                 .and_then(|geo| geo.algorithm.as_deref()),
             Some(expected)
         );
+    }
+}
+
+// ============================================================================
+// Schema construction (engine -> kernel)
+// ============================================================================
+
+/// Parses a Delta-protocol JSON schema string (the same format found in the
+/// `metaData.schemaString` action) into a [`SharedSchema`] handle.
+///
+/// This is the engine-to-kernel direction: the visitor API above goes
+/// kernel-to-engine. Engines that need to pass a schema into kernel (for
+/// example, [`get_create_table_builder`](crate::transaction::get_create_table_builder))
+/// build the JSON on their side and call this function.
+///
+/// Expected shape (matches the `StructType` serde form):
+///
+/// ```json
+/// {"type":"struct","fields":[
+///   {"name":"id","type":"long","nullable":false,"metadata":{}}
+/// ]}
+/// ```
+///
+/// Field metadata values may be strings, numbers, or booleans and are
+/// preserved as-is on the resulting kernel schema. This matters for
+/// identity-column metadata keys (`delta.identity.v2.{sequenceId,start,step}`)
+/// where `start`/`step` are numbers and `sequenceId` is a string.
+///
+/// # Safety
+///
+/// The caller must pass a valid `json` slice (UTF-8) and engine handle.
+#[no_mangle]
+pub unsafe extern "C" fn schema_from_json(
+    json: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSchema>> {
+    let engine = unsafe { engine.as_ref() };
+    let json = unsafe { TryFromStringSlice::try_from_slice(&json) };
+    schema_from_json_impl(json).into_extern_result(&engine)
+}
+
+fn schema_from_json_impl(json: DeltaResult<&str>) -> DeltaResult<Handle<SharedSchema>> {
+    let schema: StructType = serde_json::from_str(json?)
+        .map_err(|e| delta_kernel::Error::generic(format!("invalid schema JSON: {e}")))?;
+    Ok(Arc::new(schema).into())
+}
+
+#[cfg(test)]
+mod schema_from_json_tests {
+    use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::error::KernelError;
+    use crate::ffi_test_utils::{ok_or_panic, recover_error};
+    use crate::tests::get_default_engine;
+
+    #[test]
+    fn schema_from_json_parses_simple_schema() {
+        let json = r#"{"type":"struct","fields":[
+            {"name":"id","type":"long","nullable":false,"metadata":{}},
+            {"name":"data","type":"string","nullable":true,"metadata":{}}
+        ]}"#;
+        let tmp = tempdir().unwrap();
+        let table = tmp.path().to_str().unwrap().to_string();
+        let engine = get_default_engine(&table);
+
+        let schema_handle = ok_or_panic(unsafe {
+            schema_from_json(kernel_string_slice!(json), engine.shallow_copy())
+        });
+        {
+            let schema = unsafe { schema_handle.as_ref() };
+            assert_eq!(schema.fields().count(), 2);
+            assert_eq!(schema.fields().next().unwrap().name(), "id");
+        }
+        unsafe { crate::free_schema(schema_handle) };
+        unsafe { crate::free_engine(engine) };
+    }
+
+    #[test]
+    fn schema_from_json_preserves_cic_metadata() {
+        let json = r#"{"type":"struct","fields":[
+            {"name":"id","type":"long","nullable":false,"metadata":{
+                "delta.identity.v2.sequenceId":"seq-abc",
+                "delta.identity.v2.start":1,
+                "delta.identity.v2.step":1
+            }}
+        ]}"#;
+        let tmp = tempdir().unwrap();
+        let table = tmp.path().to_str().unwrap().to_string();
+        let engine = get_default_engine(&table);
+
+        let schema_handle = ok_or_panic(unsafe {
+            schema_from_json(kernel_string_slice!(json), engine.shallow_copy())
+        });
+        {
+            let schema = unsafe { schema_handle.as_ref() };
+            let field = schema.field("id").expect("id field present");
+            assert!(matches!(
+                field.get_config_value(&ColumnMetadataKey::IdentityCicSequenceId),
+                Some(MetadataValue::String(s)) if s == "seq-abc"
+            ));
+            assert!(matches!(
+                field.get_config_value(&ColumnMetadataKey::IdentityCicStart),
+                Some(MetadataValue::Number(1))
+            ));
+            assert!(matches!(
+                field.get_config_value(&ColumnMetadataKey::IdentityCicStep),
+                Some(MetadataValue::Number(1))
+            ));
+        }
+        unsafe { crate::free_schema(schema_handle) };
+        unsafe { crate::free_engine(engine) };
+    }
+
+    #[test]
+    fn schema_from_json_rejects_malformed_input() {
+        let json = r#"{"this_is_not":"a_schema"}"#;
+        let tmp = tempdir().unwrap();
+        let table = tmp.path().to_str().unwrap().to_string();
+        let engine = get_default_engine(&table);
+
+        let result = unsafe { schema_from_json(kernel_string_slice!(json), engine.shallow_copy()) };
+        match result {
+            ExternResult::Err(err_ptr) => {
+                let err = unsafe { recover_error(err_ptr) };
+                assert_eq!(err.etype, KernelError::GenericError);
+                assert!(
+                    err.message.contains("invalid schema JSON"),
+                    "unexpected error message: {}",
+                    err.message
+                );
+            }
+            ExternResult::Ok(h) => {
+                unsafe { crate::free_schema(h) };
+                panic!("expected error for malformed JSON schema");
+            }
+        }
+        unsafe { crate::free_engine(engine) };
     }
 }

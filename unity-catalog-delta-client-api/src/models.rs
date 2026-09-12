@@ -813,3 +813,114 @@ mod tests {
         assert!(v.get("report").is_none());
     }
 }
+
+// ============================================================================
+// UC Identity Sequence Service models
+// ============================================================================
+//
+// These mirror the schemas of the UC Identity Sequence Service (the `IdentitySequences` API tag).
+// Sequences are catalog-hosted monotonic counters that back Concurrent Identity Columns. Values
+// follow `start + k * step` for monotonically increasing `k`, never reusing a value. All three
+// RPCs are batch operations scoped to a table and applied atomically.
+
+/// A single sequence to create within a [`CreateIdentitySequences`] batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentitySequenceSpec {
+    /// The client-minted unique id that names the sequence. It is written into the
+    /// Delta column metadata as the counter pointer. Must be non-empty and at most 64
+    /// characters.
+    pub sequence_id: String,
+    /// The first value the sequence issues.
+    pub start: i64,
+    /// The increment between successive values. Must be non-zero. A negative step produces a
+    /// descending sequence.
+    pub step: i64,
+}
+
+/// Request to create (or idempotently get) one or more monotonic identity sequences under a
+/// table.
+///
+/// Re-supplying a sequence id that already exists under the same table is a no-op when the
+/// supplied `(start, step)` match the stored definition, and a conflict otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateIdentitySequences {
+    /// The UC id of the table the sequences belong to. Used to authorize the caller and to scope
+    /// the sequences to a table.
+    pub table_id: String,
+    /// The sequences to create. Must contain at least one entry, and sequence ids must be unique
+    /// within the request.
+    pub sequences: Vec<IdentitySequenceSpec>,
+}
+
+/// A single reservation within a [`ReserveIdentityRanges`] batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityReservation {
+    /// The id of the sequence to reserve from.
+    pub sequence_id: String,
+    /// The number of values to reserve. Must be positive.
+    pub count: i64,
+    /// Optional advisory step. If set, it must match the sequence's stored step.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub step: Option<i64>,
+}
+
+/// Request to reserve a contiguous range of values from one or more sequences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReserveIdentityRanges {
+    /// The UC id of the table the sequences belong to. Must match the table the sequences were
+    /// created under.
+    pub table_id: String,
+    /// The ranges to reserve. Must contain at least one entry, and sequence ids must be unique
+    /// within the request.
+    pub reservations: Vec<IdentityReservation>,
+}
+
+/// A reserved, non-overlapping, inclusive range of identity values.
+///
+/// Consumers must emit `range_start + i * step` for `i` in `[0, count)` and must not assume
+/// `range_start <= range_end`, because a negative step produces a descending range.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityIdRange {
+    /// The id of the sequence the range was reserved from.
+    pub sequence_id: String,
+    /// The first value in the reserved range (inclusive).
+    pub range_start: i64,
+    /// The last value in the reserved range (inclusive).
+    pub range_end: i64,
+    /// The sequence's stored step.
+    pub step: i64,
+}
+
+/// Response to a [`ReserveIdentityRanges`] request: the reserved ranges, positional within the
+/// batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReserveIdentityRangesResponse {
+    /// One reserved range per requested reservation, in batch order.
+    pub ranges: Vec<IdentityIdRange>,
+}
+
+/// Request to drop one or more identity sequences under a table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DropIdentitySequences {
+    /// The UC id of the table the sequences belong to.
+    pub table_id: String,
+    /// The ids of the sequences to drop. Must contain at least one entry, and duplicate ids are
+    /// de-duplicated.
+    pub sequence_ids: Vec<String>,
+}
+
+/// The result of dropping a single sequence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DropIdentitySequenceResult {
+    /// The id of the sequence that was dropped.
+    pub sequence_id: String,
+    /// Whether the sequence existed under the table and was removed.
+    pub existed: bool,
+}
+
+/// Response to a [`DropIdentitySequences`] request: one entry per unique requested sequence id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DropIdentitySequencesResponse {
+    /// One result per unique requested sequence id.
+    pub results: Vec<DropIdentitySequenceResult>,
+}

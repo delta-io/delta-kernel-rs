@@ -112,6 +112,11 @@ pub(crate) enum TableFeature {
     GeneratedColumns,
     /// ID Columns
     IdentityColumns,
+    /// Concurrent Identity Columns (V2). Identity high-water-mark lives in the UC
+    /// Sequence Service instead of the Delta log, allowing concurrent writers.
+    #[strum(serialize = "identityColumnsCic")]
+    #[serde(rename = "identityColumnsCic")]
+    IdentityColumnsCic,
     /// Monotonically increasing timestamps in the CommitInfo
     InCommitTimestamp,
     /// Row tracking on tables
@@ -356,6 +361,26 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 6)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+/// Concurrent Identity Columns (CIC/V2): identity values are handed out by the
+/// UC Sequence Service rather than tracked in Delta metadata. Requires modern
+/// protocol (reader v3+ / writer v7+).
+///
+/// `kernel_support: Supported` here means kernel will not block reads or writes on
+/// tables that carry the feature. Kernel does NOT auto-fill identity values during
+/// writes. It exposes only the sync primitives ([`detect_identity_columns`] and
+/// [`ReservedRange`]). Reserving ranges from the UC Sequence Service and filling batches
+/// is handled by `delta-kernel-unity-catalog`'s identity-column manager.
+///
+/// [`detect_identity_columns`]: crate::identity_columns::detect_identity_columns
+/// [`ReservedRange`]: crate::identity_columns::ReservedRange
+static IDENTITY_COLUMNS_CIC_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -720,6 +745,7 @@ impl TableFeature {
             | TableFeature::ChangeDataFeed
             | TableFeature::GeneratedColumns
             | TableFeature::IdentityColumns
+            | TableFeature::IdentityColumnsCic
             | TableFeature::InCommitTimestamp
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
@@ -754,6 +780,7 @@ impl TableFeature {
             TableFeature::ChangeDataFeed => &CHANGE_DATA_FEED_INFO,
             TableFeature::GeneratedColumns => &GENERATED_COLUMNS_INFO,
             TableFeature::IdentityColumns => &IDENTITY_COLUMNS_INFO,
+            TableFeature::IdentityColumnsCic => &IDENTITY_COLUMNS_CIC_INFO,
             TableFeature::InCommitTimestamp => &IN_COMMIT_TIMESTAMP_INFO,
             TableFeature::RowTracking => &ROW_TRACKING_INFO,
             TableFeature::DomainMetadata => &DOMAIN_METADATA_INFO,
@@ -1105,6 +1132,7 @@ mod tests {
                 TableFeature::ChangeDataFeed => "changeDataFeed",
                 TableFeature::GeneratedColumns => "generatedColumns",
                 TableFeature::IdentityColumns => "identityColumns",
+                TableFeature::IdentityColumnsCic => "identityColumnsCic",
                 TableFeature::InCommitTimestamp => "inCommitTimestamp",
                 TableFeature::RowTracking => "rowTracking",
                 TableFeature::DomainMetadata => "domainMetadata",
