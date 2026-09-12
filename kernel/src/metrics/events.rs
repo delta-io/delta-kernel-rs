@@ -1144,8 +1144,8 @@ impl fmt::Display for CrcReadSuccess {
 // ====================================================================
 
 /// Emitted once per `JsonHandler::read_json_files` call when the returned iterator is fully
-/// consumed or dropped. `bytes_read` is the sum of on-disk `FileMeta::size`, not the
-/// deserialized payload size.
+/// consumed or dropped. `bytes_read` is the planned sum of `FileMeta::size`, not a measurement of
+/// network traffic or deserialized payload size.
 #[derive(Debug, Clone)]
 pub struct JsonReadCompleted {
     // === Set on span creation ===
@@ -1184,7 +1184,8 @@ impl fmt::Display for JsonReadCompleted {
 // ====================================================================
 
 /// Emitted once per `ParquetHandler::read_parquet_files` call when the returned iterator is
-/// fully consumed or dropped. `bytes_read` is the sum of on-disk `FileMeta::size`, not the
+/// fully consumed or dropped. This includes data files, checkpoints, and sidecars.
+/// `bytes_read` is the planned sum of `FileMeta::size`, not a measurement of network traffic or
 /// deserialized payload size.
 #[derive(Debug, Clone)]
 pub struct ParquetReadCompleted {
@@ -1430,9 +1431,10 @@ pub struct ScanMetadataCompleted {
     pub num_add_files_seen: u64,
     /// Add actions in delta-file replay input before predicate filtering and deduplication.
     pub num_add_files_seen_from_delta_files: u64,
-    /// Add files that survived log replay (the files the connector reads).
+    /// Candidate data files that survived log replay, data skipping, and partition pruning. This
+    /// count is recorded before any execute-time file filter.
     pub num_selected_add_files: u64,
-    /// Size in bytes of the files that survived log replay (files to read).
+    /// Size in bytes of the candidate data files, before any execute-time file filter.
     pub selected_add_files_bytes: u64,
     /// Remove actions in delta-file replay input before deduplication.
     pub num_remove_files_seen_from_delta_files: u64,
@@ -1681,7 +1683,8 @@ impl fmt::Display for StorageListCompleted {
 // StorageReadCompleted
 // ============================
 
-/// A storage read operation completed.
+/// A storage read operation completed. `bytes_read` is the planned sum of requested file ranges,
+/// not a measurement of network traffic.
 #[derive(Debug, Clone)]
 pub struct StorageReadCompleted {
     // === Set on span creation ===

@@ -3,13 +3,13 @@ Read Table Single-Threaded
 
 # About
 This example shows a program that reads a table using a single thread. It uses the "all-in-one"
-`Scan::execute` method, which simplifies reading, but does not allow for distributing the work of
-reading the table.
+`Scan::execute` method, which simplifies reading when one process executes every candidate file.
 
-`Scan::execute` returns batches of data along with a deletion vector mask. The data is in arrow
-format, since we're using the default client, which uses arrow. We therefore
-downcast into arrow, and use the arrow functions to filter out deleted rows, and then to print the
-final data.
+`Scan::execute` returns logical table batches after applying deletion vectors and row transforms.
+The data is in Arrow format because this example uses the default engine, so the example converts
+the opaque engine data into Arrow record batches before printing it. Connectors using the
+experimental `internal-api` feature can call `Scan::execute_with_file_filter` to select whole data
+files before deletion-vector and Parquet I/O.
 
 You can run this example from anywhere in this repository by running `cargo run -p read-table-single-threaded -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 

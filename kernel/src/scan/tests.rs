@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,7 @@ use url::Url;
 
 use super::*;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
-use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
+use crate::arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
@@ -515,6 +516,23 @@ fn test_without_row_transforms_rejects_execute() {
         .without_row_transforms()
         .build()
         .unwrap();
+    let callback_invoked = Cell::new(false);
+    let filtered_err = scan
+        .execute_with_file_filter(engine.clone(), |_| {
+            callback_invoked.set(true);
+            true
+        })
+        .err()
+        .expect("filtered execute must error when row transforms are skipped");
+    assert!(
+        filtered_err.to_string().contains("without_row_transforms"),
+        "unexpected error: {filtered_err}"
+    );
+    assert!(
+        !callback_invoked.get(),
+        "eager validation must run before the file filter"
+    );
+
     let err = scan
         .execute(engine)
         .err()
@@ -523,6 +541,202 @@ fn test_without_row_transforms_rejects_execute() {
         err.to_string().contains("without_row_transforms"),
         "unexpected error: {err}"
     );
+}
+
+fn collect_i32_values(
+    data: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
+    column_name: &str,
+) -> DeltaResult<(Vec<usize>, Vec<i32>)> {
+    let mut batch_sizes = Vec::new();
+    let mut values = Vec::new();
+    for result in data {
+        let data = result?;
+        let batch: RecordBatch = (*data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| Error::generic("expected Arrow engine data"))?)
+        .into();
+        batch_sizes.push(batch.num_rows());
+        let column = batch
+            .column_by_name(column_name)
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .ok_or_else(|| Error::generic(format!("missing INTEGER column '{column_name}'")))?;
+        values.extend(column.values().iter().copied());
+    }
+    Ok((batch_sizes, values))
+}
+
+#[test]
+fn execute_with_file_filter_is_lazy_and_preserves_dv_results() -> DeltaResult<()> {
+    let path = fs::canonicalize("./tests/data/table-with-dv-small/")?;
+    let url =
+        Url::from_directory_path(path).map_err(|_| Error::generic("failed to create table URL"))?;
+    let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+
+    let (_, expected) = collect_i32_values(scan.execute(engine.clone())?, "value")?;
+    let callback_count = Cell::new(0);
+    let filtered = scan.execute_with_file_filter(engine, |_| {
+        callback_count.set(callback_count.get() + 1);
+        true
+    })?;
+    assert_eq!(callback_count.get(), 0, "the file filter must be lazy");
+
+    let (_, actual) = collect_i32_values(filtered, "value")?;
+    assert_eq!(callback_count.get(), 1);
+    assert_eq!(actual, expected);
+    assert_eq!(actual, (1..=8).collect::<Vec<_>>());
+    Ok(())
+}
+
+#[test]
+fn execute_with_file_filter_preserves_partition_injection() -> DeltaResult<()> {
+    let path = fs::canonicalize("./tests/data/basic_partitioned/")?;
+    let url =
+        Url::from_directory_path(path).map_err(|_| Error::generic("failed to create table URL"))?;
+    let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+
+    let mut actual = Vec::new();
+    for result in
+        scan.execute_with_file_filter(engine, |file| file.path.starts_with("letter=a/"))?
+    {
+        let data = result?;
+        let batch: RecordBatch = (*data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| Error::generic("expected Arrow engine data"))?)
+        .into();
+        let letters = batch
+            .column_by_name("letter")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| Error::generic("missing STRING column 'letter'"))?;
+        let numbers = batch
+            .column_by_name("number")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| Error::generic("missing LONG column 'number'"))?;
+        actual.extend(
+            letters
+                .iter()
+                .zip(numbers.values())
+                .map(|(letter, number)| (letter.map(str::to_string), *number)),
+        );
+    }
+    actual.sort_unstable();
+    assert_eq!(
+        actual,
+        vec![(Some("a".to_string()), 1), (Some("a".to_string()), 4)]
+    );
+    Ok(())
+}
+
+#[test]
+fn execute_with_file_filter_preserves_column_mapping() -> DeltaResult<()> {
+    let table = "table-with-columnmapping-mode-name";
+    let tempdir = load_test_data("tests/golden_data", table).unwrap();
+    let table_path = tempdir.path().join(table).join("delta");
+    let url = Url::from_directory_path(table_path)
+        .map_err(|_| Error::generic("failed to create table URL"))?;
+    let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let paths = get_files_for_scan(snapshot.clone().scan_builder().build()?, engine.as_ref())?;
+    let target = paths
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::generic("expected a candidate data file"))?;
+    let scan = snapshot.scan_builder().build()?;
+
+    let mut rows = 0;
+    for result in scan.execute_with_file_filter(engine, |file| file.path == target)? {
+        let data = result?;
+        let batch: RecordBatch = (*data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| Error::generic("expected Arrow engine data"))?)
+        .into();
+        rows += batch.num_rows();
+        let schema = batch.schema();
+        assert!(schema.field_with_name("ByteType").is_ok());
+        let nested = schema.field_with_name("nested_struct").unwrap();
+        let ArrowDataType::Struct(fields) = nested.data_type() else {
+            panic!("nested_struct must remain a struct");
+        };
+        assert!(fields.iter().any(|field| field.name() == "aa"));
+        assert!(fields.iter().any(|field| field.name() == "ac"));
+    }
+    assert!(
+        rows > 0,
+        "the selected column-mapped file must produce rows"
+    );
+    Ok(())
+}
+
+#[test]
+fn execute_with_file_filter_preserves_schema_reconciliation() -> DeltaResult<()> {
+    const OLD_FILE: &str = "part-00000-f6dbc649-d5bc-42b1-984c-4376799a50d9-c000.snappy.parquet";
+
+    let path = fs::canonicalize("./tests/data/type-widening/")?;
+    let url =
+        Url::from_directory_path(path).map_err(|_| Error::generic("failed to create table URL"))?;
+    let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+
+    let mut rows = 0;
+    for result in scan.execute_with_file_filter(engine, |file| file.path == OLD_FILE)? {
+        let data = result?;
+        let batch: RecordBatch = (*data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| Error::generic("expected Arrow engine data"))?)
+        .into();
+        rows += batch.num_rows();
+        assert_eq!(
+            batch
+                .schema()
+                .field_with_name("byte_long")
+                .unwrap()
+                .data_type(),
+            &ArrowDataType::Int64
+        );
+        assert_eq!(
+            batch
+                .schema()
+                .field_with_name("float_double")
+                .unwrap()
+                .data_type(),
+            &ArrowDataType::Float64
+        );
+    }
+    assert_eq!(rows, 1, "only the selected old-schema file should execute");
+    Ok(())
+}
+
+#[test]
+fn execute_with_file_filter_preserves_cancellation_errors() -> DeltaResult<()> {
+    let path = fs::canonicalize("./tests/data/basic_partitioned/")?;
+    let url =
+        Url::from_directory_path(path).map_err(|_| Error::generic("failed to create table URL"))?;
+    let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let token = Arc::new(TestCancellationToken::default());
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(token.clone() as CancellationTokenRef)
+        .build()?;
+    let callback_count = Cell::new(0);
+    let mut results = scan.execute_with_file_filter(engine, |_| {
+        callback_count.set(callback_count.get() + 1);
+        false
+    })?;
+
+    token.cancel();
+    assert!(matches!(results.next(), Some(Err(Error::Cancelled))));
+    assert_eq!(callback_count.get(), 0);
+    assert!(results.next().is_none());
+    Ok(())
 }
 
 /// Row commit version metadata columns require a row-tracking-enabled table, including when row
@@ -2379,6 +2593,7 @@ fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
 
 /// Tests for `ScanMetadataCompleted` event emission via the tracing-based metrics system.
 mod scan_metadata_completed_tests {
+    use std::cell::Cell;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -2391,7 +2606,7 @@ mod scan_metadata_completed_tests {
     use crate::metrics::MetricEvent;
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
-    use crate::Snapshot;
+    use crate::{Engine, Snapshot};
 
     fn run_scan(
         table: &str,
@@ -2482,6 +2697,40 @@ mod scan_metadata_completed_tests {
         assert!(rendered.contains(&format!(
             "remove_files_seen_from_delta_files={expected_removes}"
         )));
+    }
+
+    #[test]
+    fn execute_file_filter_preserves_candidate_file_metrics() {
+        let path = std::fs::canonicalize("./tests/data/basic_partitioned/").unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let scan = snapshot
+            .scan_builder()
+            .with_predicate(Arc::new(Expr::eq(col!("letter"), lit("a"))))
+            .build()
+            .unwrap();
+        let callback_count = Cell::new(0);
+
+        let results = scan
+            .execute_with_file_filter(engine, |_| {
+                callback_count.set(callback_count.get() + 1);
+                false
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(results.is_empty());
+        assert_eq!(callback_count.get(), 2);
+        let MetricEvent::ScanMetadataCompleted(event) = get_scan_event(&reporter) else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert_eq!(event.num_selected_add_files, 2);
+        assert_eq!(event.selected_add_files_bytes, 1502);
+        assert_eq!(event.num_predicate_filtered, 4);
     }
 
     // The parallel-scan paths (both sequential and parallel phase events) are covered by

@@ -1354,6 +1354,34 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+        self.execute_with_file_filter(engine, |_| true)
+    }
+
+    /// Perform an "all in one" scan while selecting which candidate data files to execute.
+    ///
+    /// The `engine` reads the transaction log, persisted deletion vectors, and included Parquet
+    /// data files. The `include` callback receives each successfully materialized
+    /// [`state::ScanFile`] and returns whether Kernel should execute that file. Rejected files are
+    /// skipped before path resolution, deletion-vector loading, and Parquet reads. Transaction-log
+    /// and checkpoint replay still occur for the scan.
+    ///
+    /// Selection is lazy and scan-file order is not guaranteed. Dropping the returned iterator
+    /// early can leave candidate files unseen, so distributed assignment callbacks should be
+    /// order-independent functions of stable file metadata such as the logged
+    /// [`state::ScanFile::path`]. Errors materializing scan files remain iterator errors, but
+    /// errors from resolving or reading a rejected file are intentionally not evaluated.
+    ///
+    /// Returns an iterator of logical table data from the included files. Deletion vectors and
+    /// physical-to-logical transforms are applied exactly as they are by [`Scan::execute`].
+    ///
+    /// Returns an error if the scan was built with [`ScanBuilder::without_row_transforms`]; use
+    /// [`Scan::scan_metadata`] instead.
+    #[internal_api]
+    pub(crate) fn execute_with_file_filter(
+        &self,
+        engine: Arc<dyn Engine>,
+        include: impl FnMut(&state::ScanFile) -> bool,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
         if self.state_info.skip_row_transforms {
             return Err(Error::unsupported(
                 "Scan::execute is not supported when the scan was built with \
@@ -1381,7 +1409,9 @@ impl Scan {
                 scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
             })
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
-            .flatten_ok();
+            .flatten_ok()
+            // Preserve scan-file materialization errors while filtering successful files.
+            .filter_ok(include);
 
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
