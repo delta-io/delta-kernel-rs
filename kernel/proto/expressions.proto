@@ -1,5 +1,7 @@
 // Proto mirror of `kernel/src/expressions/mod.rs` + `scalars.rs` (the Rust IR is the source
-// of truth for these shapes).
+// of truth for this wire schema).
+//
+// Standard operator semantics are defined in `kernel/src/expressions/semantics.md`.
 //
 // Opaque{Expression,Predicate} and Unknown are escape hatches: kernel-rs can't serialise the
 // opaque trait objects, and Unknown is the "do not silently interpret" marker. They appear
