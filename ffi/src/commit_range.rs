@@ -1,8 +1,8 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Version};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -281,14 +281,6 @@ pub struct FfiCommitActionsIterator {
     engine: Arc<dyn ExternEngine>,
 }
 
-impl FfiCommitActionsIterator {
-    fn lock_iter(&self) -> DeltaResult<MutexGuard<'_, CommitActionIter>> {
-        self.data
-            .lock()
-            .map_err(|_| Error::generic("poisoned commit-actions iterator mutex"))
-    }
-}
-
 #[handle_descriptor(target=FfiCommitActionsIterator, mutable=false, sized=true)]
 pub struct SharedCommitActionsIterator;
 
@@ -397,7 +389,7 @@ fn commit_range_commits_next_impl(
         commit_action: Handle<SharedCommitAction>,
     ),
 ) -> DeltaResult<bool> {
-    let mut iter = data.lock_iter()?;
+    let mut iter = data.data.lock()?;
     match iter.next().transpose()? {
         Some(commit_action) => {
             (engine_visitor)(engine_context, Arc::new(commit_action).into());

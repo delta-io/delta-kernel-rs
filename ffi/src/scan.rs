@@ -8,7 +8,7 @@ use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Expression, ExpressionRef};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -495,9 +495,7 @@ impl ScanMetadataIterator {
     /// Acquire the iterator's mutex, returning a guard the caller can drain. While the
     /// guard is alive, concurrent `scan_metadata_next` calls on the same handle block.
     pub(crate) fn lock_iter(&self) -> DeltaResult<std::sync::MutexGuard<'_, ScanMetadataIter>> {
-        self.data
-            .lock()
-            .map_err(|_| Error::generic("poisoned scan-metadata iterator mutex"))
+        Ok(self.data.lock()?)
     }
 }
 
@@ -1023,11 +1021,7 @@ pub unsafe extern "C" fn scan_metadata_next_arrow(
 fn scan_metadata_next_arrow_impl(
     data: &ScanMetadataIterator,
 ) -> DeltaResult<*mut ScanMetadataArrowResult> {
-    let mut iter = data
-        .data
-        .lock()
-        .map_err(|_| Error::generic("poisoned mutex"))?;
-
+    let mut iter = data.data.lock()?;
     match iter.next().transpose()? {
         Some(scan_metadata) => {
             let (engine_data, selection_vector) = scan_metadata.scan_files.into_parts();

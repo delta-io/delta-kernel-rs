@@ -591,11 +591,7 @@ impl CheckpointWriter {
             )? {
                 sidecar_metas.push(entry);
             }
-            let is_exhausted = splitter
-                .lock()
-                .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
-                .is_exhausted();
-            if is_exhausted {
+            if splitter.lock()?.is_exhausted() {
                 break;
             }
         }
@@ -605,8 +601,7 @@ impl CheckpointWriter {
             .ok_or_else(|| {
                 Error::internal_error("sidecar splitter Arc should have no other references")
             })?
-            .into_inner()
-            .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
+            .into_inner()?
             .into_non_file_batches();
 
         // Create sidecar action rows for the main checkpoint file. Each row populates only

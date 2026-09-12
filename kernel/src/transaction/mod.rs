@@ -3653,7 +3653,7 @@ mod tests {
             _actions: DeltaResultIterator<'_, FilteredEngineData>,
             commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
-            *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());
+            *self.captured.lock()? = Some(commit_metadata.in_commit_timestamp());
             Ok(CommitResponse::Conflict {
                 version: commit_metadata.version(),
             })
@@ -3738,8 +3738,7 @@ mod tests {
 
         // The ICT in CommitMetadata must be prev_ict + 1 (monotonicity), NOT the wall time.
         let captured = captured_ts
-            .lock()
-            .unwrap()
+            .lock()?
             .expect("should have captured a timestamp");
         assert_eq!(
             captured,

@@ -641,6 +641,12 @@ impl From<object_store::Error> for Error {
     }
 }
 
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(_error: std::sync::PoisonError<T>) -> Self {
+        Self::internal_error("poisoned mutex")
+    }
+}
+
 /// This impl is needed so the `?` operator can auto-convert `Result<T, Infallible>` to
 /// `DeltaResult<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
 /// their error type, and this allows those results to be propagated with `?` in functions
