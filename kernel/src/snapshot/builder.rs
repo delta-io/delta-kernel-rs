@@ -369,12 +369,11 @@ impl<Mode> SnapshotBuilder<Mode> {
 
     /// Supply a [`CancellationToken`] for snapshot builds that list or read the log.
     ///
-    /// Kernel polls the token while consuming a log listing. A cancellation-aware [`Engine`]
-    /// returns from [`build`](Self::build) when either the token is cancelled or the listing and
-    /// log-read work completes, whichever happens first. Snapshot-hint builds perform no listing or
-    /// reads, so the token has no effect on them. On cancellation, `build` returns
-    /// [`Error::Cancelled`] rather than a snapshot built from a partial listing. With no token the
-    /// build is not cancellable.
+    /// Kernel forwards the token (if any) to cancellation-aware [`Engine`] listing and read
+    /// operations, and [`build`](Self::build) fails with [`Error::Cancelled`] if cancellation is
+    /// observed before they complete. Snapshot-hint builds perform no listing or reads, so the
+    /// token has no effect on them. By default (or when passing `None`), the build is not
+    /// cancellable.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
     /// [`Error::Cancelled`]: crate::Error::Cancelled
