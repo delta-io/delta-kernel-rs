@@ -1,4 +1,4 @@
-// Proto mirror of `kernel/src/plans/ir/{plan,nodes}.rs` (the Rust IR is the source of truth).
+// Wire representation of the validated declarative-plan IR.
 //
 // A plan is a DAG of plan nodes: `Plan` is a flat list of `PlanNode`s, and each node wires
 // into the DAG by referencing other nodes' positions (indices into `Plan.nodes`) in its
@@ -55,12 +55,35 @@ message ValuesNode {
 // ============================================================================
 
 message ProjectNode {
-  delta.kernel.expressions.Expression expr = 1;
+  delta.kernel.expressions.PlanExpression expr = 1;
   delta.kernel.schema.StructType schema = 2;
 }
 
 message FilterNode {
-  delta.kernel.expressions.Predicate predicate = 1;
+  delta.kernel.expressions.PlanPredicate predicate = 1;
+}
+
+// Optional analysis input for conservative file pruning. Ignoring this node is identity.
+message DataSkippingStats {
+  delta.kernel.schema.StructType source_schema = 1;
+  delta.kernel.expressions.ColumnName stats_column = 2;
+  delta.kernel.expressions.ColumnName partition_values_column = 3;
+}
+
+message DataSkippingTarget {
+  oneof target {
+    bool adds_only = 1;
+    delta.kernel.expressions.ColumnName is_add = 2;
+  }
+}
+
+message DataSkippingNode {
+  // This broad predicate is analysis input, not an expression the executor must evaluate.
+  delta.kernel.expressions.Predicate source_predicate = 1;
+  DataSkippingStats stats = 2;
+  DataSkippingTarget target = 3;
+  // For mixed-action targets, this predicate includes the guard that retains non-Add rows.
+  delta.kernel.expressions.PlanPredicate kernel_keep_predicate = 4;
 }
 
 message UnionAllNode {}
@@ -150,6 +173,7 @@ message Operator {
     DynamicScanNode dynamic_scan = 7;
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
+    DataSkippingNode data_skipping = 10;
   }
 }
 

@@ -12,7 +12,12 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::error::add_scalar_path_context;
-use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
+use crate::expressions::{
+    ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar, StructData,
+};
+use crate::plans::ir::expression::{
+    PlanColumn, PlanExpression, PlanExpressionRef, PlanPredicate, PlanPredicateRef,
+};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error, FileMeta};
@@ -38,6 +43,7 @@ pub enum Operator {
     // === Unary operators (1 input) ===========================================
     Project(Project),
     Filter(Filter),
+    DataSkipping(DataSkippingSite),
     DynamicScan(DynamicScan),
     Aggregate(Aggregate),
 
@@ -71,6 +77,12 @@ impl_from_payload_for_operator!(
     SemiJoin,
     UnionAll,
 );
+
+impl From<DataSkippingSite> for Operator {
+    fn from(payload: DataSkippingSite) -> Self {
+        Self::DataSkipping(payload)
+    }
+}
 
 /// One file to scan plus literal values broadcast to every row read from that file.
 ///
@@ -327,39 +339,354 @@ where
 ///
 /// # Example
 ///
-/// Input `{ id, first, last, add: { path, size, stats_parsed: { numRecords } } }` projected to
-/// `{ id, names, file_meta }`, showing passthrough, array construction, nested input access, and a
-/// struct output column:
+/// Input `{ id, name, add: { path, size, stats_parsed: { numRecords } } }` projected to
+/// `{ id, name, file_meta }`, showing passthrough, nested input access, and a struct output column:
 ///
 /// ```text
-/// Project {
-///     expr: Expression::struct_from([
+/// input.project(
+///     Expression::struct_from([
 ///         col!("id"),
-///         Expression::array([col!("first"), col!("last")]),
+///         col!("name"),
 ///         Expression::struct_from([
 ///             col!("add.path"),
 ///             col!("add.size"),
 ///             col!("add.stats_parsed.numRecords"),
 ///         ]),
 ///     ]),
-///     schema: {
+///     schema! {
 ///         id: int,
-///         names: array<string>,
+///         name: string,
 ///         file_meta: { path: string, size: long, num_records: long },
 ///     },
-/// }
+/// )?
 /// ```
 #[derive(Debug, Clone)]
 pub struct Project {
-    pub expr: ExpressionRef,
-    pub schema: SchemaRef,
+    expr: PlanExpressionRef,
+    schema: SchemaRef,
+}
+
+impl Project {
+    /// Resolves `expr` against `input_schema` and validates that it produces exactly `schema`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a column does not resolve, an expression is outside the mandatory
+    /// plan dialect, or its resolved type or nullability cannot be assigned to `schema`.
+    pub fn try_new(
+        input_schema: &StructType,
+        expr: impl Into<ExpressionRef>,
+        schema: impl Into<SchemaRef>,
+    ) -> DeltaResult<Self> {
+        let schema = schema.into();
+        let expr = expr.into();
+        if !matches!(
+            expr.as_ref(),
+            Expression::Struct(..) | Expression::StructPatch(_)
+        ) {
+            return Err(Error::generic(
+                "plan Project expression must be a Struct or StructPatch",
+            ));
+        }
+        let output_type = DataType::from(schema.as_ref().clone());
+        let expr = PlanExpression::resolve(expr, input_schema, Some(&output_type))?;
+        Ok(Self { expr, schema })
+    }
+
+    /// Returns the resolved struct expression that produces the output row.
+    pub fn expression(&self) -> &PlanExpressionRef {
+        &self.expr
+    }
+
+    /// Returns the exact output schema of this projection.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
 }
 
 /// Keeps input rows where `predicate` evaluates true (SQL null semantics).
 /// Output schema is the input schema unchanged.
 #[derive(Debug, Clone)]
 pub struct Filter {
-    pub predicate: PredicateRef,
+    predicate: PlanPredicateRef,
+}
+
+impl Filter {
+    /// Resolves `predicate` against `input_schema` and proves that it is Boolean.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a column does not resolve, an expression is outside the mandatory
+    /// plan dialect, or the predicate is not Boolean.
+    pub fn try_new(
+        input_schema: &StructType,
+        predicate: impl Into<PredicateRef>,
+    ) -> DeltaResult<Self> {
+        Ok(Self {
+            predicate: PlanPredicate::resolve(predicate, input_schema)?,
+        })
+    }
+
+    /// Returns the resolved Boolean predicate evaluated by this filter.
+    pub fn predicate(&self) -> &PlanPredicateRef {
+        &self.predicate
+    }
+}
+
+/// Describes the metadata columns available for optional file pruning.
+///
+/// The columns point into the [`DataSkippingSite`]'s input rows. `stats_column`, when present, is
+/// a struct containing Delta statistics such as `numRecords`, `minValues`, `maxValues`, and
+/// `nullCount`. `partition_values_column`, when present, is a struct of exact typed partition
+/// values. `source_schema` describes the table columns referenced by the original row predicate.
+///
+/// The descriptor contains locations, not statistics values. Values continue to flow through the
+/// plan rows. In scan plans, the source predicate and schemas use physical column names. For a
+/// source column `x`, an engine can inspect `<stats_column>.maxValues.x` or the exact value at
+/// `<partition_values_column>.x` when those fields exist.
+#[derive(Debug, Clone)]
+pub struct DataSkippingStats {
+    source_schema: SchemaRef,
+    stats_column: Option<PlanColumn>,
+    partition_values_column: Option<PlanColumn>,
+}
+
+impl DataSkippingStats {
+    /// Resolves the available metadata columns against `input_schema`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither metadata source is present, a column does not resolve, or a
+    /// metadata column is not struct-valued.
+    pub fn try_new(
+        input_schema: &StructType,
+        source_schema: impl Into<SchemaRef>,
+        stats_column: Option<ColumnName>,
+        partition_values_column: Option<ColumnName>,
+    ) -> DeltaResult<Self> {
+        if stats_column.is_none() && partition_values_column.is_none() {
+            return Err(Error::generic(
+                "data-skipping stats require statistics or partition values",
+            ));
+        }
+        let resolve_struct = |name: Option<ColumnName>| -> DeltaResult<Option<PlanColumn>> {
+            name.map(|name| {
+                let column = PlanColumn::resolve(input_schema, name)?;
+                if !matches!(column.data_type(), DataType::Struct(_)) {
+                    return Err(Error::generic(format!(
+                        "data-skipping metadata column `{}` must be a struct, found {}",
+                        column.name(),
+                        column.data_type()
+                    )));
+                }
+                Ok(column)
+            })
+            .transpose()
+        };
+        Ok(Self {
+            source_schema: source_schema.into(),
+            stats_column: resolve_struct(stats_column)?,
+            partition_values_column: resolve_struct(partition_values_column)?,
+        })
+    }
+
+    /// Returns the schema of columns referenced by the source row predicate.
+    pub fn source_schema(&self) -> &SchemaRef {
+        &self.source_schema
+    }
+
+    /// Returns the resolved Delta statistics struct, when available.
+    pub fn stats_column(&self) -> Option<&PlanColumn> {
+        self.stats_column.as_ref()
+    }
+
+    /// Returns the resolved exact partition-values struct, when available.
+    pub fn partition_values_column(&self) -> Option<&PlanColumn> {
+        self.partition_values_column.as_ref()
+    }
+
+    fn validate_input(&self, input_schema: &StructType) -> DeltaResult<()> {
+        let stats_column = self
+            .stats_column
+            .as_ref()
+            .map(|column| column.name().clone());
+        let partition_values_column = self
+            .partition_values_column
+            .as_ref()
+            .map(|column| column.name().clone());
+        let resolved = Self::try_new(
+            input_schema,
+            Arc::clone(&self.source_schema),
+            stats_column,
+            partition_values_column,
+        )?;
+        if resolved.stats_column != self.stats_column
+            || resolved.partition_values_column != self.partition_values_column
+        {
+            return Err(Error::generic(
+                "data-skipping metadata columns were resolved against a different input schema",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Identifies which input rows an optional data-skipping filter may remove.
+#[derive(Debug, Clone)]
+pub enum DataSkippingTarget {
+    /// Every input row represents an Add action and may be considered for pruning.
+    AddsOnly,
+    /// Only rows where `is_add` is true may be pruned; all other rows must pass unchanged.
+    MixedActions {
+        /// A resolved, non-null Boolean discriminator for Add rows.
+        is_add: PlanColumn,
+    },
+}
+
+impl DataSkippingTarget {
+    /// Resolves a mixed-action Add discriminator against `input_schema`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `is_add` is a non-null Boolean column.
+    pub fn mixed_actions(input_schema: &StructType, is_add: ColumnName) -> DeltaResult<Self> {
+        let is_add = PlanColumn::resolve(input_schema, is_add)?;
+        if is_add.data_type() != &DataType::BOOLEAN || is_add.is_nullable() {
+            return Err(Error::generic(format!(
+                "data-skipping Add discriminator `{}` must be a non-null boolean",
+                is_add.name()
+            )));
+        }
+        Ok(Self::MixedActions { is_add })
+    }
+
+    /// Returns the Add discriminator for a mixed-action input.
+    pub fn is_add(&self) -> Option<&PlanColumn> {
+        match self {
+            Self::AddsOnly => None,
+            Self::MixedActions { is_add } => Some(is_add),
+        }
+    }
+
+    fn validate_input(&self, input_schema: &StructType) -> DeltaResult<()> {
+        let Some(is_add) = self.is_add() else {
+            return Ok(());
+        };
+        let resolved = Self::mixed_actions(input_schema, is_add.name().clone())?;
+        let Self::MixedActions {
+            is_add: resolved_is_add,
+        } = resolved
+        else {
+            return Err(Error::internal_error(
+                "mixed data-skipping target resolved as AddsOnly",
+            ));
+        };
+        if &resolved_is_add != is_add {
+            return Err(Error::generic(
+                "data-skipping Add discriminator was resolved against a different input schema",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An optional, conservative file-pruning opportunity at a Kernel-selected safe plan location.
+///
+/// Unlike [`Filter`], this node is semantically an identity operation: an executor may pass every
+/// input row through. `kernel_keep_predicate` is a ready-to-run portable optimization. An executor
+/// may instead analyze `source_predicate` with the described statistics and install a richer
+/// native keep filter. In either case, it may discard a row only when it proves that the file
+/// cannot match the source predicate.
+///
+/// For example, Kernel may provide `DISTINCT(maxValues.x > 100, false)` for `x > 100`. For
+/// `x / 2 > 50`, the portable predicate may be absent; an engine with sound range analysis may
+/// still derive a native filter, while every other engine passes the rows through.
+#[derive(Debug, Clone)]
+pub struct DataSkippingSite {
+    source_predicate: PredicateRef,
+    stats: DataSkippingStats,
+    target: DataSkippingTarget,
+    kernel_keep_predicate: Option<PlanPredicateRef>,
+}
+
+impl DataSkippingSite {
+    /// Creates an optional pruning site and resolves its portable keep predicate.
+    ///
+    /// `source_predicate` is evaluated by the connector's query engine over data rows. It is
+    /// carried here only as input to optional statistics analysis. For a mixed-action target, this
+    /// constructor guards Kernel's keep predicate so every non-Add row passes unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a source column is absent from the source schema, metadata or target
+    /// columns do not match `input_schema`, or the portable predicate is not in the mandatory plan
+    /// predicate dialect.
+    pub fn try_new(
+        input_schema: &StructType,
+        source_predicate: impl Into<PredicateRef>,
+        stats: DataSkippingStats,
+        target: DataSkippingTarget,
+        kernel_keep_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Self> {
+        let source_predicate = source_predicate.into();
+        for column in source_predicate.references() {
+            stats.source_schema.field_at(column)?;
+        }
+        stats.validate_input(input_schema)?;
+        target.validate_input(input_schema)?;
+
+        let kernel_keep_predicate = kernel_keep_predicate
+            .map(|predicate| {
+                let predicate = match target.is_add() {
+                    Some(is_add) => Arc::new(Predicate::or(
+                        Predicate::not(Predicate::from_expr(is_add.name().clone())),
+                        predicate.as_ref().clone(),
+                    )),
+                    None => predicate,
+                };
+                PlanPredicate::resolve(predicate, input_schema)
+            })
+            .transpose()?;
+
+        Ok(Self {
+            source_predicate,
+            stats,
+            target,
+            kernel_keep_predicate,
+        })
+    }
+
+    /// Returns the original row predicate used as input to optional native pruning analysis.
+    pub fn source_predicate(&self) -> &PredicateRef {
+        &self.source_predicate
+    }
+
+    /// Returns the available statistics and partition-value locations.
+    pub fn stats(&self) -> &DataSkippingStats {
+        &self.stats
+    }
+
+    /// Returns the rows that an installed pruning filter is allowed to remove.
+    pub fn target(&self) -> &DataSkippingTarget {
+        &self.target
+    }
+
+    /// Returns Kernel's portable, Remove-safe keep predicate, when one was derived.
+    pub fn kernel_keep_predicate(&self) -> Option<&PlanPredicateRef> {
+        self.kernel_keep_predicate.as_ref()
+    }
+
+    pub(crate) fn validate_input(&self, input_schema: &StructType) -> DeltaResult<()> {
+        for column in self.source_predicate.references() {
+            self.stats.source_schema.field_at(column)?;
+        }
+        self.stats.validate_input(input_schema)?;
+        self.target.validate_input(input_schema)?;
+        if let Some(predicate) = &self.kernel_keep_predicate {
+            PlanPredicate::resolve(Arc::clone(predicate.source_predicate()), input_schema)?;
+        }
+        Ok(())
+    }
 }
 
 /// File formats supported by [`DynamicScan`].
@@ -714,6 +1041,52 @@ impl Aggregate {
             group_by: grouping_keys.collect_into(),
             aggs: Vec::new(),
         }
+    }
+
+    /// Validates this aggregate's operands and output schema against its actual input schema.
+    pub(crate) fn validate_input(&self, input_schema: &StructType) -> DeltaResult<()> {
+        let expected_width = self.group_by.len() + self.aggs.len();
+        if self.schema.fields().len() != expected_width {
+            return Err(Error::generic(format!(
+                "aggregate output has {} field(s), expected {expected_width}",
+                self.schema.fields().len()
+            )));
+        }
+
+        for (index, key) in self.group_by.iter().enumerate() {
+            let expected = input_schema.field_at(key)?;
+            let actual = self.schema.field_at_index(index).ok_or_else(|| {
+                Error::internal_error("validated aggregate output field is missing")
+            })?;
+            if actual != expected {
+                return Err(Error::generic(format!(
+                    "aggregate group key `{key}` produces field `{expected}`, found `{actual}`"
+                )));
+            }
+        }
+
+        for (agg_index, agg) in self.aggs.iter().enumerate() {
+            if let Agg::Sum(value) = agg {
+                let field = input_schema.field_at(value)?;
+                if field.data_type() != &DataType::LONG {
+                    return Err(Error::generic(format!(
+                        "sum operand `{value}` must have type long, found {}",
+                        field.data_type()
+                    )));
+                }
+            }
+            let output_index = self.group_by.len() + agg_index;
+            let actual = self.schema.field_at_index(output_index).ok_or_else(|| {
+                Error::internal_error("validated aggregate output field is missing")
+            })?;
+            let expected = agg.output_field(input_schema, Some(actual.name().to_string()))?;
+            if actual != &expected {
+                return Err(Error::generic(format!(
+                    "aggregate output field {output_index} must be `{expected}`, found `{actual}`"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 

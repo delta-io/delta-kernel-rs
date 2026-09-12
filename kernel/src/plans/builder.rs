@@ -31,8 +31,8 @@
 //! // ... while `build` keeps the plan runnable, replacing the absent relation with a single
 //! // empty `Values` node.
 //! let plan = scan.build()?;
-//! let [node] = plan.nodes.as_slice() else { panic!("expected one node") };
-//! assert!(matches!(&node.op, Operator::Values(values) if values.rows.is_empty()));
+//! let [node] = plan.nodes() else { panic!("expected one node") };
+//! assert!(matches!(node.operator(), Operator::Values(values) if values.rows.is_empty()));
 //! # Ok::<(), delta_kernel::Error>(())
 //! ```
 
@@ -42,8 +42,8 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+    Aggregate, AggregateBuilder, DataSkippingSite, DynamicScan, FileType, Filter, Operator,
+    Project, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -92,7 +92,7 @@ impl PlanBuilder {
     }
 
     /// The output schema of this relation -- carried whether present or absent.
-    fn schema(&self) -> &SchemaRef {
+    pub(crate) fn schema(&self) -> &SchemaRef {
         match &self.0 {
             PlanBuilderRoot::Present(node) => &node.schema,
             PlanBuilderRoot::Absent(schema) => schema,
@@ -224,7 +224,7 @@ impl PlanBuilder {
     /// }
     ///
     /// let plan = PlanBuilder::values_from([Row { id: 1 }, Row { id: 2 }]).build()?;
-    /// let Operator::Values(values) = &plan.nodes[0].op else { panic!("expected Values") };
+    /// let Operator::Values(values) = plan.nodes()[0].operator() else { panic!("expected Values") };
     /// assert_eq!(
     ///     values.rows,
     ///     vec![vec![Scalar::Integer(1)], vec![Scalar::Integer(2)]],
@@ -244,7 +244,8 @@ impl PlanBuilder {
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
     ///
-    /// Produces an error when `predicate` references a column absent from the input schema.
+    /// Produces an error when `predicate` references a column absent from the input schema, is not
+    /// Boolean, or contains an expression outside the mandatory plan dialect.
     ///
     /// # Example
     /// ```
@@ -259,17 +260,34 @@ impl PlanBuilder {
     /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn filter(self, predicate: impl Into<PredicateRef>) -> DeltaResult<Self> {
-        let predicate = predicate.into();
-        check_columns_resolve(self.schema(), predicate.references(), "filter")?;
+        let filter = Filter::try_new(self.schema(), predicate)?;
         let schema = Arc::clone(self.schema());
-        Ok(self.unary_op_or_absent(schema, Filter { predicate }))
+        Ok(self.unary_op_or_absent(schema, filter))
+    }
+
+    /// Marks this relation as a safe site for optional conservative data skipping.
+    ///
+    /// The node is an identity operation when an executor declines the optimization. An executor
+    /// that applies the site must obey [`DataSkippingSite`]'s keep-all fallback and protected-row
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the site's resolved metadata, target, or portable predicate does not
+    /// match this relation's schema.
+    pub fn data_skipping_site(self, site: DataSkippingSite) -> DeltaResult<Self> {
+        site.validate_input(self.schema())?;
+        let schema = Arc::clone(self.schema());
+        Ok(self.unary_op_or_absent(schema, site))
     }
 
     /// Project `self` through `expr` into rows of the caller-declared `schema`. `expr` must be a
     /// struct constructor / patch matching `schema`. See [`Project`].
     ///
-    /// Produces an error when `expr` references a column absent from the input schema. References
-    /// inside a `StructPatch` are validated by [`ProjectionStructPatchBuilder`] when the patch is
+    /// Produces an error when `expr` references a column absent from the input schema, contains a
+    /// node outside the mandatory plan dialect, or cannot produce the declared output type and
+    /// nullability. References inside a `StructPatch` are validated by
+    /// [`ProjectionStructPatchBuilder`] when the patch is
     ///
     /// [`ProjectionStructPatchBuilder`]: crate::struct_patch::ProjectionStructPatchBuilder
     ///
@@ -296,9 +314,8 @@ impl PlanBuilder {
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
         let schema = schema.into();
-        let expr = expr.into();
-        check_columns_resolve(self.schema(), expr.references(), "project")?;
-        Ok(self.unary_op_or_absent(Arc::clone(&schema), Project { expr, schema }))
+        let project = Project::try_new(self.schema(), expr, Arc::clone(&schema))?;
+        Ok(self.unary_op_or_absent(schema, project))
     }
 
     /// Project `self` by editing its columns. `edit` receives a [`ProjectionStructPatchBuilder`]
@@ -426,8 +443,8 @@ impl PlanBuilder {
     ///
     /// Keys are columns (e.g. [`column_name!`](crate::expressions::column_name)), matched pairwise.
     ///
-    /// Produces an error when the probe and build key counts differ, or a probe/build key is absent
-    /// from its input schema.
+    /// Produces an error when the probe and build key counts differ, a key is absent, or paired
+    /// keys have different data types.
     ///
     /// # Example
     /// ```
@@ -481,6 +498,17 @@ impl PlanBuilder {
         }
         check_columns_resolve(self.schema(), &probe_keys, "join probe")?;
         check_columns_resolve(build.schema(), &build_keys, "join build")?;
+        for (probe_key, build_key) in probe_keys.iter().zip(&build_keys) {
+            let probe_field = self.schema().field_at(probe_key)?;
+            let build_field = build.schema().field_at(build_key)?;
+            if probe_field.data_type() != build_field.data_type() {
+                return Err(Error::generic(format!(
+                    "join keys `{probe_key}` and `{build_key}` have different types: {} and {}",
+                    probe_field.data_type(),
+                    build_field.data_type()
+                )));
+            }
+        }
         // An uninhabited probe always produces an uninhabited result; forward it unchanged.
         let PlanBuilderRoot::Present(probe) = self.0 else {
             return Ok(self);
@@ -545,29 +573,27 @@ impl PlanBuilder {
     /// Linearize the DAG reachable from `self` into a [`Plan`]. An absent relation builds to a
     /// single empty [`Values`] node carrying its schema, so the result is always a runnable plan.
     pub fn build(&self) -> DeltaResult<Plan> {
-        Ok(match &self.0 {
+        match &self.0 {
             PlanBuilderRoot::Present(root) => Self::build_plan(root),
-            PlanBuilderRoot::Absent(schema) => Plan {
-                nodes: vec![PlanNode::new(
-                    Values::new(Arc::clone(schema), vec![]),
-                    vec![],
-                )],
-            },
-        })
+            PlanBuilderRoot::Absent(schema) => Plan::try_new(vec![PlanNode::new(
+                Values::new(Arc::clone(schema), vec![]),
+                vec![],
+            )]),
+        }
     }
 
     /// Like [`Self::build`], but yields `None` for an absent relation instead of an empty plan.
     pub fn build_opt(&self) -> DeltaResult<Option<Plan>> {
-        Ok(match &self.0 {
-            PlanBuilderRoot::Present(root) => Some(Self::build_plan(root)),
-            PlanBuilderRoot::Absent(_) => None,
-        })
+        match &self.0 {
+            PlanBuilderRoot::Present(root) => Ok(Some(Self::build_plan(root)?)),
+            PlanBuilderRoot::Absent(_) => Ok(None),
+        }
     }
 
     /// Linearize the DAG rooted at `root` into a topologically sorted [`Plan`] with `root` as the
     /// last (terminal) node. A node's inputs always precede it, referenced by their index in
     /// [`Plan::nodes`]. Shared subgraphs are emitted once; multiple nodes can reference them.
-    fn build_plan(root: &BuilderNodeRef) -> Plan {
+    fn build_plan(root: &BuilderNodeRef) -> DeltaResult<Plan> {
         // Maps a node's Arc pointer to its index, deduping shared subgraphs. Pointers are stable
         // because `root` pins all reachable nodes for the lifetime of `build_plan`.
         fn emit(
@@ -588,7 +614,7 @@ impl PlanBuilder {
         }
         let mut nodes = Vec::new();
         emit(root, &mut nodes, &mut HashMap::new());
-        Plan { nodes }
+        Plan::try_new(nodes)
     }
 }
 
@@ -650,8 +676,8 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::expressions::{col, column_name, lit, Expression};
-    use crate::plans::ir::nodes::FileType;
+    use crate::expressions::{col, column_name, lit, BinaryExpressionOp, Expression, Predicate};
+    use crate::plans::ir::nodes::{DataSkippingStats, DataSkippingTarget, FileType};
     use crate::schema::{
         schema, schema_ref, DataType, MetadataColumnSpec, StructField, StructType,
     };
@@ -682,6 +708,12 @@ mod tests {
         }
     }
 
+    fn x_string_schema() -> SchemaRef {
+        schema_ref! {
+            nullable "x": STRING,
+        }
+    }
+
     /// A one-row (all-null) `Values` source over `schema` -- the common present-source fixture.
     /// (Empty rows would collapse to absent.)
     fn vals(schema: SchemaRef) -> PlanBuilder {
@@ -705,10 +737,10 @@ mod tests {
     /// inspection.
     fn assert_plan(builder: PlanBuilder, expected: &[(&[usize], &str)]) -> Plan {
         let plan = builder.build().unwrap();
-        assert_eq!(plan.nodes.len(), expected.len(), "node count");
-        for (i, (node, &(inputs, op))) in plan.nodes.iter().zip(expected).enumerate() {
-            assert_eq!(node.inputs.as_slice(), inputs, "node {i} inputs");
-            assert_eq!(node.op.to_string(), op, "node {i} op");
+        assert_eq!(plan.nodes().len(), expected.len(), "node count");
+        for (i, (node, &(inputs, op))) in plan.nodes().iter().zip(expected).enumerate() {
+            assert_eq!(node.inputs(), inputs, "node {i} inputs");
+            assert_eq!(node.operator().to_string(), op, "node {i} op");
         }
         plan
     }
@@ -749,7 +781,7 @@ mod tests {
         )?;
         assert_eq!(parquet.schema(), &part_schema());
         let plan = assert_plan(parquet, &[(&[], "scan_parquet")]);
-        let Operator::ScanParquet(node) = &plan.nodes[0].op else {
+        let Operator::ScanParquet(node) = plan.nodes()[0].operator() else {
             panic!("expected ScanParquet");
         };
         assert_eq!(node.file_constant_columns, part);
@@ -760,7 +792,7 @@ mod tests {
             part_schema(),
         )?;
         let plan = assert_plan(json, &[(&[], "scan_json")]);
-        let Operator::ScanJson(node) = &plan.nodes[0].op else {
+        let Operator::ScanJson(node) = plan.nodes()[0].operator() else {
             panic!("expected ScanJson");
         };
         assert_eq!(node.file_constant_columns, part);
@@ -772,6 +804,49 @@ mod tests {
     fn filter_preserves_schema() -> DeltaResult<()> {
         let filtered = vals(id_schema()).filter(col!("id").is_not_null())?;
         assert_eq!(filtered.schema(), &id_schema());
+        Ok(())
+    }
+
+    #[test]
+    fn data_skipping_can_carry_divide_without_adding_it_to_plan_expressions() -> DeltaResult<()> {
+        let source_schema = schema_ref! {
+            nullable "x": LONG,
+        };
+        let stats_schema = StructType::new_unchecked([StructField::nullable(
+            "maxValues",
+            StructType::new_unchecked([StructField::nullable("x", DataType::LONG)]),
+        )]);
+        let input_schema = schema_ref! {
+            nullable "stats": (stats_schema),
+            not_null "is_add": BOOLEAN,
+        };
+        let source_predicate = Predicate::gt(
+            Expression::binary(BinaryExpressionOp::Divide, col!("x"), lit(2i64)),
+            lit(50i64),
+        );
+        let input = scan(Arc::clone(&input_schema));
+        let stats = DataSkippingStats::try_new(
+            &input_schema,
+            source_schema,
+            Some(column_name!("stats")),
+            None,
+        )?;
+        let target = DataSkippingTarget::mixed_actions(&input_schema, column_name!("is_add"))?;
+        let site = DataSkippingSite::try_new(&input_schema, source_predicate, stats, target, None)?;
+
+        let plan = input.data_skipping_site(site)?.build()?;
+        let Operator::DataSkipping(site) = plan.nodes()[1].operator() else {
+            panic!("expected DataSkipping");
+        };
+        assert!(site.kernel_keep_predicate().is_none());
+        assert_eq!(
+            site.stats().source_schema(),
+            &schema_ref! { nullable "x": LONG }
+        );
+        assert_eq!(
+            site.target().is_add().map(|column| column.name()),
+            Some(&column_name!("is_add"))
+        );
         Ok(())
     }
 
@@ -889,9 +964,9 @@ mod tests {
     #[case::semi_join_absent_build(
         vals(id_schema()).semi_join(absent_src(), [column_name!("id")], [column_name!("id")]))]
     #[case::semi_join_absent_probe(
-        absent_src().semi_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
+        absent_src().semi_join(vals(x_string_schema()), [column_name!("id")], [column_name!("x")]))]
     #[case::anti_join_absent_probe(
-        absent_src().anti_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
+        absent_src().anti_join(vals(x_string_schema()), [column_name!("id")], [column_name!("x")]))]
     #[case::union_all_of_absent(PlanBuilder::union_all([absent_src(), absent_src()]))]
     fn collapses_to_absent(#[case] builder: DeltaResult<PlanBuilder>) -> DeltaResult<()> {
         assert!(builder?.build_opt()?.is_none()); // absent has no plan to run
@@ -905,7 +980,7 @@ mod tests {
         let absent = absent_src();
         assert_eq!(absent.schema(), &id_schema());
         let plan = assert_plan(absent, &[(&[], "values")]);
-        let Operator::Values(values) = &plan.nodes[0].op else {
+        let Operator::Values(values) = plan.nodes()[0].operator() else {
             panic!("expected Values");
         };
         assert!(values.rows.is_empty());
@@ -987,7 +1062,7 @@ mod tests {
             Aggregate::group_by(id_schema(), Vec::<ColumnName>::new()).max(column_name!("id")),
         )?;
         let plan = assert_plan(agg, &[(&[], "values"), (&[0], "aggregate")]);
-        let Operator::Values(values) = &plan.nodes[0].op else {
+        let Operator::Values(values) = plan.nodes()[0].operator() else {
             panic!("expected Values input");
         };
         assert!(values.rows.is_empty());
@@ -1004,7 +1079,7 @@ mod tests {
         assert_eq!(schema.fields().count(), 1);
         assert!(schema.field("part").is_some());
         let plan = assert_plan(agg, &[(&[], "values"), (&[0], "aggregate")]);
-        let Operator::Aggregate(node) = &plan.nodes[1].op else {
+        let Operator::Aggregate(node) = plan.nodes()[1].operator() else {
             panic!("expected Aggregate");
         };
         assert!(node.group_by.is_empty());
@@ -1062,13 +1137,21 @@ mod tests {
         Ok(())
     }
 
-    /// `project` records the caller's declared output schema verbatim.
+    /// `project` records the validated caller-declared output schema verbatim.
     #[test]
     fn project_records_declared_schema() -> DeltaResult<()> {
-        let out = x_schema();
+        let out = schema_ref! { nullable "renamed_id": STRING };
         let p = vals(id_schema()).project(Expression::struct_from([col!("id")]), out.clone())?;
         assert_eq!(p.schema(), &out);
-        assert_plan(p, &[(&[], "values"), (&[0], "project")]);
+        let plan = assert_plan(p, &[(&[], "values"), (&[0], "project")]);
+        let Operator::Project(project) = plan.nodes()[1].operator() else {
+            panic!("expected Project");
+        };
+        assert_eq!(project.schema(), &out);
+        assert_eq!(
+            project.expression().data_type(),
+            &DataType::from(out.as_ref().clone())
+        );
         Ok(())
     }
 
@@ -1079,7 +1162,7 @@ mod tests {
         #[values(false, true)] inverted: bool,
     ) -> DeltaResult<()> {
         let probe = vals(id_schema());
-        let build = vals(x_schema());
+        let build = vals(x_string_schema());
         let joined = if inverted {
             probe.anti_join(build, [column_name!("id")], [column_name!("x")])?
         } else {
@@ -1091,7 +1174,7 @@ mod tests {
             joined,
             &[(&[], "values"), (&[], "values"), (&[0, 1], "semi_join")],
         );
-        let Operator::SemiJoin(node) = &plan.nodes[2].op else {
+        let Operator::SemiJoin(node) = plan.nodes()[2].operator() else {
             panic!("expected SemiJoin");
         };
         assert_eq!(node.inverted, inverted);
@@ -1137,9 +1220,12 @@ mod tests {
         let input = dynamic_scan_input_schema();
         let out = dynamic_scan_output_schema();
         let node = dynamic_scan_node(&input, out.clone())?;
-        let dynamic_scan = vals(input).dynamic_scan(node)?;
+        let dynamic_scan = scan(input).dynamic_scan(node)?;
         assert_eq!(dynamic_scan.schema(), &out);
-        assert_plan(dynamic_scan, &[(&[], "values"), (&[0], "dynamic_scan")]);
+        assert_plan(
+            dynamic_scan,
+            &[(&[], "scan_parquet"), (&[0], "dynamic_scan")],
+        );
         Ok(())
     }
 
@@ -1287,10 +1373,24 @@ mod tests {
     #[case::values_row_width("schema has 1 field",
         || PlanBuilder::values(id_schema(), vec![vec!["a".into(), "b".into()]]))]
     // transforms referencing an absent column
-    #[case::filter_unknown_column("`nope` not found",
+    #[case::filter_unknown_column("field 'nope' not found",
         || vals(id_schema()).filter(col!("nope").is_not_null()))]
-    #[case::project_unknown_column("`nope` not found",
+    #[case::project_unknown_column("field 'nope' not found",
         || vals(id_schema()).project(Expression::struct_from([col!("nope")]), id_schema()))]
+    #[case::filter_non_boolean("expected boolean",
+        || vals(id_schema()).filter(Predicate::BooleanExpression(lit(1i64))))]
+    #[case::project_arithmetic("not part of the mandatory plan expression dialect", || {
+        let expr = Expression::struct_from([Expression::binary(
+            BinaryExpressionOp::Divide,
+            lit(4i64),
+            lit(2i64),
+        )]);
+        vals(x_schema()).project(expr, x_schema())
+    })]
+    #[case::project_type_mismatch("expected string",
+        || vals(id_schema()).project(Expression::struct_from([lit(1i64)]), id_schema()))]
+    #[case::project_non_struct("must be a Struct or StructPatch",
+        || vals(id_schema()).project(col!("id"), id_schema()))]
     #[case::project_patch_missing_field("does not exist",
         || vals(id_schema()).project_patch(|p| p.drop("nope")))]
     #[case::aggregate_unknown_value("not found in schema",
@@ -1308,6 +1408,8 @@ mod tests {
         || vals(id_schema()).anti_join(vals(x_schema()), [column_name!("id")], [column_name!("nope")]))]
     #[case::join_key_arity("must match",
         || vals(id_schema()).semi_join(vals(x_schema()), [column_name!("id")], [column_name!("x"), column_name!("x")]))]
+    #[case::join_key_type("different types",
+        || vals(id_schema()).semi_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
     // dynamic scan file constants
     #[case::dynamic_scan_missing_source("`version`", || build_dynamic_scan_with_schemas(
         dynamic_scan_input_missing("version"),

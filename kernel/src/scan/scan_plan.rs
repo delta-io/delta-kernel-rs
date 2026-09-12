@@ -19,7 +19,9 @@ use crate::expressions::{
     col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
     Predicate,
 };
-use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
+use crate::plans::ir::nodes::{
+    DataSkippingSite, DataSkippingStats, DataSkippingTarget, DynamicScan, FileType, ScanFile,
+};
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 use crate::schema::{
@@ -58,32 +60,19 @@ impl Scan {
             return Ok(None);
         }
 
-        let prune = stats_skipping_predicate(state);
-        let prune = prune.as_ref();
-
         // The output `add` after reparsing `stats`/`partitionValues`: shared by the commit arm's
         // dedup carrier and both terminal `{ add }` projections, so every arm agrees on the
         // union schema.
         let add_field = self.normalized_add_field()?;
         let (output_expr, output_schema) = self.metadata_output_projection(&add_field)?;
 
-        let commit_actions = self.commit_arm()?.try_fold_with(prune, |p, prune| {
-            // We filter so that:
-            // * All remove actions are kept
-            // * Add actions that do not match the partition pruning or stats predicate are removed.
-            //
-            // NOTE: It is important that add actions are filtered by the partition predicate
-            // because partition filtering may not be applied on data rows. On the other
-            // hand, failing to skip based on data columns is safe because the data
-            // predicate will also be evaluated on data rows. Thus it is crucial that we partition
-            // prune adds here.
-            //
-            // NOTE: It is not safe to prune remove actions using the partition filter. This is
-            // because a NULL result for `remove.partitionValues.partCol` may be due to
-            // `remove.partitionValues` being NULL, or it may be from `partCol` being
-            // NULL. Thus, we simply do not prune removes.
-            p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
-        })?;
+        // This site is optional: ignoring it returns extra candidate Adds, never an incorrect live
+        // file listing. The mixed-action target makes Remove preservation explicit to executors.
+        let commit_actions = data_skipping_site(
+            self.commit_arm()?,
+            state,
+            DataSkippingSiteTarget::MixedActions,
+        )?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
             // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
@@ -96,9 +85,11 @@ impl Scan {
             )
         })?;
 
-        let checkpoint_adds = self
-            .checkpoint_arm(shape)?
-            .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
+        let checkpoint_adds = data_skipping_site(
+            self.checkpoint_arm(shape)?,
+            state,
+            DataSkippingSiteTarget::AddsOnly,
+        )?;
 
         let checkpoint_live_adds = checkpoint_adds
             .anti_join(
@@ -361,12 +352,15 @@ fn sidecar_actions(
     let sidecar_files = scan(root_parts, &[VERSION], SIDECAR_READ_SCHEMA.clone())?
         .filter(col!(SIDECAR_NAME, FILE_PATH).is_not_null())?
         .project(
-            Expr::struct_from([
-                col!(SIDECAR_NAME, FILE_PATH),
-                col!(SIDECAR_NAME, SIDECAR_SIZE),
-                col!(SIDECAR_NAME, SIDECAR_FILE_MOD),
-                col!(VERSION),
-            ]),
+            Expr::struct_with_nullability_from(
+                [
+                    col!(SIDECAR_NAME, FILE_PATH),
+                    col!(SIDECAR_NAME, SIDECAR_SIZE),
+                    col!(SIDECAR_NAME, SIDECAR_FILE_MOD),
+                    col!(VERSION),
+                ],
+                Expr::from_pred(col!(SIDECAR_NAME, FILE_PATH).is_not_null()),
+            ),
             SIDECAR_FILE_META_SCHEMA.clone(),
         )?;
 
@@ -519,6 +513,60 @@ fn project_nested_struct_to_schema(
     )
 }
 
+#[derive(Clone, Copy)]
+enum DataSkippingSiteTarget {
+    AddsOnly,
+    MixedActions,
+}
+
+/// Adds an optional pruning site whenever the scan has a source predicate and usable metadata.
+///
+/// The source predicate may be broader than the mandatory plan language. Kernel's portable keep
+/// predicate is present only when the built-in rewriter can derive one; otherwise the site remains
+/// useful to an executor with its own conservative range analysis.
+fn data_skipping_site(
+    input: PlanBuilder,
+    state: &StateInfo,
+    target: DataSkippingSiteTarget,
+) -> DeltaResult<PlanBuilder> {
+    let PhysicalPredicate::Some(source_predicate, source_schema) = &state.physical_predicate else {
+        return Ok(input);
+    };
+    let stats_column = state
+        .physical_stats_schema
+        .as_ref()
+        .map(|_| column_name!(ADD_NAME, STATS_PARSED_NAME));
+    let partition_values_column = state
+        .physical_partition_schema
+        .as_ref()
+        .map(|_| column_name!(ADD_NAME, PARTITION_VALUES_PARSED_NAME));
+    if stats_column.is_none() && partition_values_column.is_none() {
+        return Ok(input);
+    }
+
+    let stats = DataSkippingStats::try_new(
+        input.schema(),
+        Arc::clone(source_schema),
+        stats_column,
+        partition_values_column,
+    )?;
+    let target = match target {
+        DataSkippingSiteTarget::AddsOnly => DataSkippingTarget::AddsOnly,
+        DataSkippingSiteTarget::MixedActions => {
+            DataSkippingTarget::mixed_actions(input.schema(), column_name!(IS_ADD))?
+        }
+    };
+    let kernel_keep_predicate = stats_skipping_predicate(state).map(Arc::new);
+    let site = DataSkippingSite::try_new(
+        input.schema(),
+        Arc::clone(source_predicate),
+        stats,
+        target,
+        kernel_keep_predicate,
+    )?;
+    input.data_skipping_site(site)
+}
+
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.
 fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
     /// Re-roots metadata columns under `add`.
@@ -559,7 +607,8 @@ fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
     // A null skipping verdict means the available metadata cannot prove the file is skippable.
     let skipping = Predicate::distinct(skipping, lit(false));
     let mut prefixer = MetadataSkippingColumnPrefixer;
-    Some(prefixer.transform_pred(&skipping).into_owned())
+    let skipping = prefixer.transform_pred(&skipping).into_owned();
+    (!skipping.references().is_empty()).then_some(skipping)
 }
 
 #[cfg(test)]
@@ -572,6 +621,7 @@ mod tests {
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::BinaryExpressionOp;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
     use crate::object_store::memory::InMemory;
@@ -656,7 +706,10 @@ mod tests {
     }
 
     fn tags(plan: &Plan) -> Vec<String> {
-        plan.nodes.iter().map(|node| node.op.to_string()).collect()
+        plan.nodes()
+            .iter()
+            .map(|node| node.operator().to_string())
+            .collect()
     }
 
     fn add_struct(schema: &SchemaRef) -> &StructType {
@@ -763,6 +816,44 @@ mod tests {
         "project",   // extract add
     ];
 
+    #[test]
+    fn unsupported_portable_divide_remains_available_for_native_skipping() -> DeltaResult<()> {
+        let segment = log_segment(
+            log_root(),
+            &["file:///_delta_log/00000000000000000001.json"],
+            None,
+        );
+        let predicate = Predicate::gt(
+            Expr::binary(BinaryExpressionOp::Divide, col!("x"), lit(2i64)),
+            lit(50i64),
+        );
+        let scan = mock_snapshot(segment)?
+            .scan_builder()
+            .with_predicate(Arc::new(predicate))
+            .build()?;
+        let plan = scan
+            .build_metadata_scan_plan(&no_checkpoint())?
+            .expect("non-empty");
+        let site = plan
+            .nodes()
+            .iter()
+            .find_map(|node| match node.operator() {
+                Operator::DataSkipping(site) => Some(site),
+                _ => None,
+            })
+            .expect("data-skipping site");
+
+        assert!(
+            site.kernel_keep_predicate().is_none(),
+            "{:?}",
+            site.kernel_keep_predicate()
+                .map(|predicate| predicate.source_predicate())
+        );
+        assert!(site.stats().stats_column().is_some());
+        assert!(site.target().is_add().is_some());
+        Ok(())
+    }
+
     #[rstest::rstest]
     #[case::leaf_parquet(shape(CheckpointType::Leaf, None), FileType::Parquet,
         vec!["scan_parquet", "filter", "project", "semi_join", "project"])]
@@ -810,9 +901,9 @@ mod tests {
             .expect("non-empty");
 
         let dynamic_scan = plan
-            .nodes
+            .nodes()
             .iter()
-            .find_map(|n| match &n.op {
+            .find_map(|n| match n.operator() {
                 Operator::DynamicScan(dynamic_scan) => Some(dynamic_scan),
                 _ => None,
             })
