@@ -42,6 +42,7 @@ pre-release-hook = [
 delta_kernel_derive = { path = "../derive-macros", version = "0.28.0" }
 bytes = "1.10"
 chrono = "0.4.41"
+chrono-tz = { version = "0.10.4", optional = true }
 crc = "3.2.2"
 indexmap = "2.10.0"
 itertools = "0.14"
@@ -109,7 +110,7 @@ need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 arrow-58 = ["dep:arrow_58", "dep:parquet_58", "dep:object_store_13"]
 arrow-59 = ["dep:arrow_59", "dep:parquet_59", "dep:object_store_13"]
 arrow-conversion = ["need-arrow"]
-arrow-expression = ["need-arrow"]
+arrow-expression = ["need-arrow", "dep:chrono-tz"]
 
 # Schema diffing functionality (experimental)
 schema-diff = []

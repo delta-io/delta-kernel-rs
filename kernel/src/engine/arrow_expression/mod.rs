@@ -20,6 +20,7 @@ use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluat
 
 pub mod evaluate_expression;
 pub mod opaque;
+mod timestamp_timezone;
 
 #[cfg(test)]
 mod tests;
@@ -399,4 +400,11 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
+}
+
+#[cfg(test)]
+fn expected_timestamp_micros(value: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .timestamp_micros()
 }
