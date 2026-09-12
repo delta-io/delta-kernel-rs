@@ -318,7 +318,10 @@ where
 /// `expr` must be a struct constructor or struct patch whose fields match `schema`. It is
 /// evaluated with `schema` as its output struct type: the struct's fields are the output
 /// columns, `schema` supplies names and nullability, and any type or arity mismatch is an error.
-/// Downstream nodes see the logical field names declared in `schema`.
+/// Standard child expressions first resolve their own result types according to the [SQL
+/// expression contract](crate::expressions::semantics). The declared field type is then an
+/// assignment target; it does not change operator inference. Downstream nodes see the logical
+/// field names declared in `schema`.
 ///
 /// A struct patch carries the input struct through field by field, naming only the columns that
 /// change -- replacing or dropping existing fields and injecting new ones -- while everything else
