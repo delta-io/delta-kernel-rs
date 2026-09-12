@@ -390,13 +390,11 @@ fn struct_columns_from_patch(
 /// types come from `output_type`, which must be a struct holding only primitive fields (matching
 /// the kernel evaluator, which supports only primitive targets).
 ///
-/// Each field extracts its value with `cast(get_field(map, name), T)`. For a numeric or temporal
-/// type the raw value is first wrapped in `nullif(.., '')`, mapping an empty string to null before
-/// the cast, so an empty string becomes null (kernel's `empty_string_partition_cast`) while an
-/// unparseable value fails the cast (kernel's hard parse error). String and Binary keep the raw
-/// value (empty is a valid empty string / empty bytes). A missing key or null value is already null
-/// via [`get_field`]. The whole struct is nulled where the input map row is null, via `<map> IS NOT
-/// NULL`.
+/// Each field extracts its value with `cast(get_field(map, name), T)`. For every type except String
+/// and Binary, the raw value is first wrapped in `nullif(.., '')`, mapping an empty string to null
+/// before the cast. String and Binary keep the raw value because empty strings and bytes are valid.
+/// A missing key or null value is already null via [`get_field`]. The whole struct is nulled where
+/// the input map row is null, via `<map> IS NOT NULL`.
 ///
 /// KNOWN DIVERGENCES from the kernel parser, confined to malformed or non-spec-compliant values
 /// (spec-compliant writers never emit them):
@@ -408,14 +406,20 @@ fn struct_columns_from_patch(
 ///   value's scale to match the target's exactly (and hard-errors otherwise).
 ///
 /// # Errors
-/// Returns an error when `output_type` is absent, not a struct, or has a non-primitive field, or
-/// from lowering the map expression.
+///
+/// Returns an error when options are configured, `output_type` is absent, not a struct, or has a
+/// non-primitive field, or from lowering the map expression.
 fn map_to_struct_to_df_expr(
     map_to_struct: &MapToStructExpression,
     input_schema: &StructType,
     output_type: Option<&KernelDataType>,
 ) -> DeltaResult<DFExpr> {
     let target = require_struct_output(output_type, "MapToStruct")?;
+    if !can_lower_map_to_struct_options(map_to_struct) {
+        return Err(Error::unsupported(
+            "DataFusion execution of MapToStruct with configured options",
+        ));
+    }
     let map = to_df_expr(&map_to_struct.map_expr, input_schema, None)?;
 
     let mut args = Vec::with_capacity(target.num_fields() * 2);
@@ -443,6 +447,10 @@ fn map_to_struct_to_df_expr(
     }
 
     Ok(struct_null_when_not(map.is_not_null(), named_struct(args)))
+}
+
+fn can_lower_map_to_struct_options(map_to_struct: &MapToStructExpression) -> bool {
+    map_to_struct.options.is_default()
 }
 
 /// Lowers a `ParseJson` (parse a JSON-string column into a struct) to a call of the
@@ -547,7 +555,7 @@ mod tests {
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
         col, lit, null_lit, ColumnName as KernelColumnName, Expression as KernelExpr,
-        ExpressionStructPatch, ExpressionStructPatchBuilder,
+        ExpressionStructPatch, ExpressionStructPatchBuilder, MapToStructOptions,
     };
     use delta_kernel::schema::{schema, schema_ref, ArrayType, DataType, MapType, StructType};
     use rstest::rstest;
@@ -1001,7 +1009,7 @@ mod tests {
     /// Lowers a `MapToStruct` over `pv` targeting `output_schema` and renders it as a `Display`
     /// string.
     fn lower_map_to_struct(output_schema: StructType) -> String {
-        let kernel = KernelExpr::map_to_struct(col!("pv"));
+        let kernel = KernelExpr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let target: DataType = output_schema.into();
         to_df_expr(&kernel, &pv_map_schema(), Some(&target))
             .unwrap()
@@ -1063,11 +1071,26 @@ mod tests {
         #[case] output_type: Option<DataType>,
         #[case] expected_message: &str,
     ) {
-        let kernel = KernelExpr::map_to_struct(col!("pv"));
+        let kernel = KernelExpr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let err = to_df_expr(&kernel, &pv_map_schema(), output_type.as_ref())
             .unwrap_err()
             .to_string();
         assert!(err.contains(expected_message), "{err}");
+    }
+
+    #[test]
+    fn configured_map_to_struct_is_unsupported() {
+        let target = DataType::from(schema! { nullable "ts": TIMESTAMP });
+        let kernel = KernelExpr::map_to_struct(
+            col!("pv"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+
+        let error = to_df_expr(&kernel, &pv_map_schema(), Some(&target))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("MapToStruct with configured options"));
     }
 
     // === ParseJson Shared Helpers ===

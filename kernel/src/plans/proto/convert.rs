@@ -13,9 +13,10 @@ use super::{
 use crate::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
-    JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression,
-    OpaquePredicate, ParseJsonExpression, Predicate, Scalar, StructData, UnaryExpression,
-    UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, MapToStructOptions,
+    OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, StructData,
+    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
+    VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
     Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
@@ -405,6 +406,15 @@ impl From<&MapToStructExpression> for proto_expr::MapToStructExpression {
     fn from(map_to_struct: &MapToStructExpression) -> Self {
         proto_expr::MapToStructExpression {
             map_expr: Some(Box::new(map_to_struct.map_expr.as_ref().into())),
+            options: (!map_to_struct.options.is_default()).then(|| (&map_to_struct.options).into()),
+        }
+    }
+}
+
+impl From<&MapToStructOptions> for proto_expr::MapToStructOptions {
+    fn from(options: &MapToStructOptions) -> Self {
+        Self {
+            timestamp_timezone: options.timestamp_timezone().map(ToOwned::to_owned),
         }
     }
 }
@@ -978,8 +988,9 @@ mod tests {
     use crate::expressions::{
         col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
         DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
-        StructData, UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
+        MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar,
+        ScalarExpressionEvaluator, StructData, UnaryExpressionOp, UnaryPredicateOp,
+        VariadicExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1573,7 +1584,17 @@ mod tests {
     #[case(Expression::coalesce([lit(1), lit(2)]), "variadic")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
-    #[case(Expression::map_to_struct(col!("m")), "map_to_struct")]
+    #[case(
+        Expression::map_to_struct(col!("m"), MapToStructOptions::default()),
+        "map_to_struct"
+    )]
+    #[case(
+        Expression::map_to_struct(
+            col!("m"),
+            MapToStructOptions::default().with_timestamp_timezone("+01:00")
+        ),
+        "map_to_struct"
+    )]
     #[case(Expression::unknown("x"), "unknown")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
@@ -1703,12 +1724,29 @@ mod tests {
 
     #[test]
     fn from_map_to_struct_expression() {
-        let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
-            expr_kind_of(Expression::map_to_struct(col!("m")))
-        else {
+        let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
+            Expression::map_to_struct(col!("m"), MapToStructOptions::default()),
+        ) else {
             panic!("expected a map_to_struct expression");
         };
         assert!(map_to_struct.map_expr.is_some());
+        assert_eq!(map_to_struct.options, None);
+
+        let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
+            expr_kind_of(Expression::map_to_struct(
+                col!("m"),
+                MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+            ))
+        else {
+            panic!("expected a map_to_struct expression");
+        };
+        assert_eq!(
+            map_to_struct
+                .options
+                .as_ref()
+                .and_then(|options| options.timestamp_timezone.as_deref()),
+            Some("America/Los_Angeles")
+        );
     }
 
     #[test]
