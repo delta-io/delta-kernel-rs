@@ -85,8 +85,10 @@ query, a dropped RPC, a closed session. Kernel supports this cooperatively throu
 
 Cancellation-aware handlers respond at two boundaries:
 
-- **Before starting work.** Cancellation-aware handler methods check the token before starting. Their
-  iterator-producing defaults also check before each pull, preventing new I/O after cancellation.
+- **Before starting or pulling work.** Cancellation-aware handler methods check the token before
+  starting. Their iterator-producing defaults also check before each pull, preventing new I/O from
+  being triggered after cancellation.
+
 - **In flight.** An Engine can additionally interrupt I/O already in flight. This matters when
   one request may otherwise block for a noticeable time.
 

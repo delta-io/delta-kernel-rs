@@ -6,6 +6,11 @@
 //! the I/O and iterators they produce. Kernel polls the token only for work that bypasses an
 //! Engine handler, such as cached scan metadata.
 //!
+//! Part of the cooperative cancellation contract is that consumers of kernel iterators must honor
+//! cancellation instead of continuing past it. Kernel-provided iterators are not guaranteed to
+//! yield `None` after producing Some Err (including [`Error::Cancelled`]), nor are they required to
+//! surface cancellation more than once.
+//!
 //! # Engine operation contract
 //!
 //! A cancellation-aware Engine operation must check the token before initiating I/O. If that check
@@ -20,9 +25,9 @@
 //! iterator stops early because of cancellation, it must surface [`Error::Cancelled`] rather than
 //! normal exhaustion.
 //!
-//! A custom `*_with_cancellation` implementation replaces the provided implementation and owns
-//! this contract itself. The provided iterator implementations check before delegating and before
-//! each pull, but cannot interrupt work inside the delegated operation.
+//! The kernel-provided defaults for cancellation aware handler trait methods obey this contract,
+//! but they cannot interrupt in-flight I/O. A custom `*_with_cancellation` implementation replaces
+//! the provided implementation and owns this contract itself.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -109,7 +114,6 @@ pub trait CancellationToken: AsAny {
 pub(crate) struct CancellableIterator<I> {
     inner: I,
     token: Option<CancellationTokenRef>,
-    /// Set once the inner iterator has returned an error or reached normal exhaustion.
     done: bool,
 }
 
