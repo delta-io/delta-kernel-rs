@@ -47,8 +47,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    version_as_i64, DataType, DeltaResult, Engine, EngineData, Expression, FileMeta,
-    IntoEngineData, Predicate, RowVisitor, Version,
+    create_row, version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData,
+    Expression, FileMeta, Predicate, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -72,6 +72,9 @@ mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
+#[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
+#[internal_api]
+pub(crate) use schema_evolution::SchemaOperation;
 #[cfg(feature = "internal-api")]
 pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]
@@ -82,11 +85,10 @@ mod write_validation;
 
 pub use bound_write_context::BoundWriteContext;
 use stats_verifier::StatsColumnVerifier;
-pub use write_state::WriteState;
+pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
+pub(crate) type EngineDataResultIterator<'a> = DeltaResultIterator<'a, Box<dyn EngineData>>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -231,11 +233,10 @@ pub struct Transaction<S = ExistingTable> {
     commit_timestamp: i64,
     // User-provided domain metadata additions (via with_domain_metadata API).
     user_domain_metadata_additions: Vec<DomainMetadata>,
-    // System-generated domain metadata (from transforms, e.g., clustering).
-    // TODO(#1779): Currently only populated during CREATE TABLE. For inserts, row tracking
-    // domain metadata is handled separately via `row_tracking_high_watermark` parameter in
-    // `generate_domain_metadata_actions`. Consider unifying system domain handling.
+    // System-generated domain metadata produced by create-table transforms, e.g. clustering.
     system_domain_metadata_additions: Vec<DomainMetadata>,
+    // Row-tracking high-water mark explicitly provided by the caller.
+    provided_row_tracking_high_water_mark: Option<i64>,
     // Domain names to remove in this transaction. The configuration values are fetched during
     // commit from the log to preserve the pre-image in tombstones.
     user_domain_removals: Vec<String>,
@@ -245,6 +246,9 @@ pub struct Transaction<S = ExistingTable> {
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
     column_defaults_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
+    // Versions.
+    row_tracking_preservation_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
@@ -357,10 +361,12 @@ impl<S> Transaction<S> {
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
 
-        // Some table features don't yet support removeFiles. Reject here.
-        if !self.remove_files_metadata.is_empty() {
+        // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
+        // that accompany copied or updated rows, so both require the preservation acknowledgment.
+        if !self.remove_files_metadata.is_empty() || self.num_dv_updates > 0 {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;
+            self.ensure_row_tracking_preservation_acknowledged()?;
         }
 
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
@@ -439,24 +445,35 @@ impl<S> Transaction<S> {
             .set_transactions
             .clone()
             .into_iter()
-            .map(|txn| txn.into_engine_data(LOG_TXN_SCHEMA.clone(), engine));
+            .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
-        let kernel_commit_info = CommitInfo::new(
+        let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
         );
+
+        // Kernel requires every commit on an existing Row Tracking-enabled table to preserve
+        // Stable Row IDs and Stable Row Commit Versions, so it always emits true. CREATE TABLE has
+        // no existing Row Tracking state to preserve and therefore omits the flag.
+        if !self.is_create_table()
+            && self
+                .effective_table_config
+                .is_feature_enabled(&TableFeature::RowTracking)
+        {
+            kernel_commit_info.set_row_tracking_preserved();
+        }
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions based on emit flags
         let (protocol_action, protocol) = if self.should_emit_protocol {
             let protocol = self.effective_table_config.protocol().clone();
             let schema = LOG_PROTOCOL_SCHEMA.clone();
-            let action = protocol.clone().into_engine_data(schema, engine)?;
+            let action = create_row(engine, schema, protocol.clone())?;
             (Some(action), Some(protocol))
         } else {
             (None, None)
@@ -464,7 +481,7 @@ impl<S> Transaction<S> {
         let (metadata_action, metadata) = if self.should_emit_metadata {
             let metadata = self.effective_table_config.metadata().clone();
             let schema = LOG_METADATA_SCHEMA.clone();
-            let action = metadata.clone().into_engine_data(schema, engine)?;
+            let action = create_row(engine, schema, metadata.clone())?;
             (Some(action), Some(metadata))
         } else {
             (None, None)
@@ -626,17 +643,23 @@ impl<S> Transaction<S> {
 
     /// Set the content of the commitInfo action for this transaction. Note that kernel will
     /// _always_ write a commitInfo, this function simply allows engines to add their own data
-    /// into that action if they wish. Note that the following fields in `engine_commit_info`
-    /// will be overridden by kernel if they are set (meaning you should not set them):
-    /// - timestamp
-    /// - inCommitTimestamp
-    /// - operation
-    /// - operationParameters
-    /// - operationMetrics
-    /// - kernelVersion
-    /// - isBlindAppend
-    /// - engineInfo
-    /// - txnId
+    /// into that action if they wish. Kernel overrides the following fields if they are set in
+    /// `engine_commit_info`, so connectors should not set them:
+    ///
+    /// - `timestamp`
+    /// - `inCommitTimestamp`
+    /// - `operation`
+    /// - `operationParameters`
+    /// - `operationMetrics`
+    /// - `kernelVersion`
+    /// - `isBlindAppend`
+    /// - `engineInfo`
+    /// - `txnId`
+    ///
+    /// Kernel merges the following field if it is set:
+    ///
+    /// - `tags`: When a connector tag has the same key as a Kernel-provided tag, Kernel's value
+    ///   takes precedence. Otherwise, the connector-provided tag is preserved.
     pub fn with_commit_info(
         mut self,
         engine_commit_info: Box<dyn EngineData>,
@@ -853,6 +876,24 @@ impl<S> Transaction<S> {
             Error::invalid_transaction_state(
                 "Writing data to a table with column defaults requires calling \
                  Transaction::ack_column_defaults() first",
+            )
+        );
+        Ok(())
+    }
+
+    fn ensure_row_tracking_preservation_acknowledged(&self) -> DeltaResult<()> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::RowTracking)
+        {
+            return Ok(());
+        }
+        require!(
+            self.row_tracking_preservation_acknowledged,
+            Error::invalid_transaction_state(
+                "Data manipulation on a table with Row Tracking enabled requires preserving stable \
+                 Row IDs for copied or updated rows and stable Row Commit Versions for copied \
+                 rows. See Transaction::ack_row_tracking_preservation() for more details",
             )
         );
         Ok(())
@@ -1079,8 +1120,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// or it can be encoded and transported to distributed writers. Each context retains a
     /// reference to the same immutable state. All table-wide write validation runs before the
     /// state is returned so a writer does not begin producing files for a table that kernel cannot
-    /// write to safely. Call [`WriteState::unpartitioned_write_context`] for an unpartitioned table
-    /// or [`WriteState::partitioned_write_context`] for each partition being written.
+    /// write to safely. Use [`WriteState::write_context_builder`] to bind values for each partition
+    /// being written.
     ///
     /// The state captures the transaction configuration when this method is called. If the
     /// transaction is subsequently modified, call this method again to capture the updated
@@ -1175,21 +1216,23 @@ impl<S> Transaction<S> {
     )> {
         // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
         // for writers to assign row IDs.
-        let row_tracking_supported = self.effective_table_config.should_write_row_tracking();
+        let assign_fresh_row_tracking_metadata = self
+            .effective_table_config
+            .should_assign_fresh_row_tracking_metadata();
 
         if self.add_files_metadata.is_empty() {
             // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
             // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
             // have a valid starting point. For all other empty commits (metadata-only, etc.),
             // nothing row-tracking-related needs to be written.
-            let row_tracking_dm = (row_tracking_supported && self.is_create_table())
+            let row_tracking_dm = (assign_fresh_row_tracking_metadata && self.is_create_table())
                 .then(RowTrackingDomainMetadata::initial);
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
         let commit_version = version_as_i64(commit_version)?;
 
-        if row_tracking_supported {
+        if assign_fresh_row_tracking_metadata {
             self.generate_adds_with_row_tracking(engine, commit_version)
         } else {
             let add_actions = build_add_actions(
@@ -1312,7 +1355,8 @@ impl<S> Transaction<S> {
                     log_segment,
                     self.effective_table_config,
                     Some(Arc::new(crc)),
-                    true, /* built_as_latest */
+                    true,  /* built_as_latest */
+                    false, /* skipped_new_checkpoints */
                 )?;
                 (stats, Arc::new(snapshot))
             }
@@ -1702,15 +1746,17 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::scan::log_replay::PATH_NAME;
+    use crate::scan::state_info::tests::RowTrackingState;
     use crate::schema::{schema, schema_ref, MapType};
     use crate::table_features::ColumnMappingMode;
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::unit_test_utils::{
-        copy_test_table, create_valid_add_file_batch, install_thread_local_metrics_reporter,
-        load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
-        test_schema_with_array, test_schema_with_map, CapturingReporter,
+        assert_result_error_with_message, copy_test_table, create_valid_add_file_batch,
+        install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
+        test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
+        CapturingReporter,
     };
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
@@ -1993,7 +2039,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
         let write_state = txn.write_state().unwrap();
-        let write_context = write_state.unpartitioned_write_context().unwrap();
+        let write_context = write_state.write_context_builder().build().unwrap();
 
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
@@ -2019,7 +2065,7 @@ mod tests {
     fn write_state_reflects_updated_effective_table_config(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, snapshot) = setup_non_dv_table();
-        let mut txn = snapshot
+        let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
@@ -2027,39 +2073,162 @@ mod tests {
         // Regression coverage for stale WriteState caching: keep the first context alive
         // while the transaction's effective table config changes.
         let initial_write_state = txn.write_state()?;
-        let initial_write_context = initial_write_state.unpartitioned_write_context()?;
+        let initial_write_context = initial_write_state.write_context_builder().build()?;
         assert!(!initial_write_context
-            .logical_schema()
+            .logical_data_schema()
             .contains("fresh_column"));
 
-        let evolved_schema = schema_ref! {
-            ..(txn.effective_table_config.logical_schema().fields()),
-            nullable "fresh_column": INTEGER,
-        };
-        let evolved_metadata = txn
-            .effective_table_config
-            .metadata()
-            .clone()
-            .with_schema(evolved_schema.clone())?;
-        let evolved_table_config = TableConfiguration::try_new_with_schema(
-            &txn.effective_table_config,
-            evolved_metadata,
-            evolved_schema,
-        )?;
-        txn.replace_effective_table_config(evolved_table_config);
+        let txn = txn.with_schema_changes(vec![SchemaOperation::add_column(
+            None,
+            StructField::nullable("fresh_column", DataType::INTEGER),
+        )])?;
 
         let updated_write_state = txn.write_state()?;
-        let updated_write_context = updated_write_state.unpartitioned_write_context()?;
+        let updated_write_context = updated_write_state.write_context_builder().build()?;
         assert!(updated_write_context
-            .logical_schema()
+            .logical_data_schema()
             .contains("fresh_column"));
         assert!(updated_write_context
-            .physical_schema()
+            .physical_data_schema()
             .contains("fresh_column"));
         assert!(!initial_write_context
-            .logical_schema()
+            .logical_data_schema()
             .contains("fresh_column"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn schema_changes_are_applied_once_and_persisted_on_commit() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+
+        let snapshot = txn
+            .with_schema_changes(vec![SchemaOperation::add_column(
+                None,
+                StructField::nullable("first_column", DataType::INTEGER),
+            )])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert!(snapshot.schema().contains("first_column"));
+
+        let snapshot = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_schema_changes(vec![SchemaOperation::add_column(
+                None,
+                StructField::nullable("second_column", DataType::STRING),
+            )])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let schema = snapshot.schema();
+        let field_names: Vec<&str> = schema.fields().map(|field| field.name().as_str()).collect();
+        let first_index = field_names
+            .iter()
+            .position(|name| *name == "first_column")
+            .expect("first schema change must be present");
+        let second_index = field_names
+            .iter()
+            .position(|name| *name == "second_column")
+            .expect("second schema change must be present");
+        assert!(first_index < second_index);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_set_nullable_is_persisted_on_commit() -> DeltaResult<()> {
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let schema = Arc::new(StructType::try_new([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+        ])?);
+        let snapshot = create_table("memory:///set_nullable", schema, "test")
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let snapshot = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_schema_changes(vec![SchemaOperation::SetNullable {
+                column: column_name!("id"),
+            }])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        assert!(snapshot.schema().field("id").unwrap().is_nullable());
+        assert!(snapshot.schema().field("name").unwrap().is_nullable());
+        Ok(())
+    }
+
+    #[test]
+    fn schema_add_struct_then_nested_field_is_persisted_on_commit() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+        let snapshot = txn
+            .with_schema_changes(vec![
+                SchemaOperation::add_column(
+                    None,
+                    StructField::nullable("address", StructType::try_new([])?),
+                ),
+                SchemaOperation::add_column(
+                    column_name!("address"),
+                    StructField::nullable("city", DataType::STRING),
+                ),
+            ])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let schema = snapshot.schema();
+        let address = schema.field("address").expect("address must exist");
+        let DataType::Struct(address) = address.data_type() else {
+            panic!("address must be a struct");
+        };
+        let city = address
+            .field("city")
+            .expect("city must be nested in address");
+        assert_eq!(city.data_type(), &DataType::STRING);
+        assert!(city.is_nullable());
+        Ok(())
+    }
+
+    #[test]
+    fn schema_changes_can_precede_staged_data_in_the_same_commit() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+        let mut txn = txn.with_schema_changes(vec![SchemaOperation::add_column(
+            None,
+            StructField::nullable("fresh_column", DataType::INTEGER),
+        )])?;
+        add_dummy_file(&mut txn);
+
+        let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+        assert!(snapshot.schema().contains("fresh_column"));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_changes_are_rejected_after_staging_data() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        add_dummy_file(&mut txn);
+
+        let result = txn.with_schema_changes(vec![SchemaOperation::add_column(
+            None,
+            StructField::nullable("fresh_column", DataType::INTEGER),
+        )]);
+
+        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_schema_changes_are_rejected() -> DeltaResult<()> {
+        let (_engine, txn, _tempdir) = create_existing_table_txn()?;
+
+        let result = txn.with_schema_changes(vec![]);
+
+        assert_result_error_with_message(
+            result,
+            "with_schema_changes requires at least one schema operation",
+        );
         Ok(())
     }
 
@@ -2205,12 +2374,15 @@ mod tests {
             .with_engine_info("default engine");
 
         let write_state = txn.write_state()?;
-        let write_context = write_state.partitioned_write_context(HashMap::from([(
-            "letter".to_string(),
-            Scalar::String("a".into()),
-        )]))?;
-        let logical_schema = write_context.logical_schema();
-        let physical_schema = write_context.physical_schema();
+        let write_context = write_state
+            .write_context_builder()
+            .with_partition_values(HashMap::from([(
+                "letter".to_string(),
+                Scalar::String("a".into()),
+            )]))
+            .build()?;
+        let logical_schema = write_context.logical_data_schema();
+        let physical_schema = write_context.physical_data_schema();
 
         // Both schemas exclude partition columns.
         assert!(
@@ -2250,7 +2422,10 @@ mod tests {
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let write_state = txn.write_state()?;
-        let wc = write_state.partitioned_write_context(partition_values)?;
+        let wc = write_state
+            .write_context_builder()
+            .with_partition_values(partition_values)
+            .build()?;
         Ok((snapshot, wc))
     }
 
@@ -2261,7 +2436,7 @@ mod tests {
         batch: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
         let input_schema = StructType::try_from_arrow(batch.schema())?;
-        let physical_schema = wc.physical_schema();
+        let physical_schema = wc.physical_data_schema();
         let l2p = wc.logical_to_physical();
 
         let handler = ArrowEvaluationHandler;
@@ -2357,12 +2532,15 @@ mod tests {
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
         let write_state = txn.write_state()?;
-        let wc = write_state.partitioned_write_context(HashMap::from([
-            ("p1".to_string(), Scalar::String("aa".into())),
-            ("p2".to_string(), Scalar::Integer(7)),
-            ("p3".to_string(), Scalar::String("cc".into())),
-            ("p4".to_string(), Scalar::Integer(9)),
-        ]))?;
+        let wc = write_state
+            .write_context_builder()
+            .with_partition_values(HashMap::from([
+                ("p1".to_string(), Scalar::String("aa".into())),
+                ("p2".to_string(), Scalar::Integer(7)),
+                ("p3".to_string(), Scalar::String("cc".into())),
+                ("p4".to_string(), Scalar::Integer(9)),
+            ]))
+            .build()?;
 
         // Input excludes partition columns but keeps the void column, in logical schema
         // order: [d1, v, d2].
@@ -2389,7 +2567,7 @@ mod tests {
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        let physical_schema = wc.physical_schema();
+        let physical_schema = wc.physical_data_schema();
         let expected_names: Vec<&str> = physical_schema
             .fields()
             .map(|f| f.name().as_str())
@@ -2415,7 +2593,7 @@ mod tests {
             "./tests/data/partitioned_with_materialize_feature/",
             HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
         )?;
-        let physical_schema = write_context.physical_schema();
+        let physical_schema = write_context.physical_data_schema();
 
         assert!(
             physical_schema.contains("letter"),
@@ -2428,22 +2606,31 @@ mod tests {
         Ok(())
     }
 
-    /// Using the wrong write context method for the table's partitioning returns an error.
+    // Building the wrong write context for the table's partitioning returns an error.
     #[rstest]
-    #[case::partitioned_on_unpartitioned(
+    #[case::partition_value_on_unpartitioned(
         "./tests/data/table-without-dv-small/",
-        true,
-        "not partitioned"
+        Some(HashMap::from([("x".to_string(), Scalar::Integer(1))])),
+        "not partitioned",
+        None
     )]
-    #[case::unpartitioned_on_partitioned(
+    #[case::missing_values_on_partitioned(
         "./tests/data/basic_partitioned/",
-        false,
-        "table is partitioned"
+        None,
+        "table is partitioned",
+        None
     )]
-    fn test_wrong_write_context_method_returns_error(
+    #[case::empty_values_on_partitioned(
+        "./tests/data/basic_partitioned/",
+        Some(HashMap::new()),
+        "missing partition column",
+        Some("required")
+    )]
+    fn test_write_context_builder_requires_matching_partition_values(
         #[case] table_path: &str,
-        #[case] call_partitioned: bool,
+        #[case] partition_values: Option<HashMap<String, Scalar>>,
         #[case] expected_msg: &str,
+        #[case] unexpected_msg: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
@@ -2451,17 +2638,26 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let write_state = txn.write_state()?;
-        let result = if call_partitioned {
-            write_state
-                .partitioned_write_context(HashMap::from([("x".to_string(), Scalar::Integer(1))]))
-        } else {
-            write_state.unpartitioned_write_context()
-        };
-        let err = result.unwrap_err().to_string();
+        let mut builder = write_state.write_context_builder();
+        if let Some(partition_values) = partition_values {
+            builder = builder.with_partition_values(partition_values);
+        }
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidPartitionValues(_)),
+            "unexpected error: {err}"
+        );
+        let err = err.to_string();
         assert!(
             err.contains(expected_msg),
             "expected '{expected_msg}' in error, got: {err}"
         );
+        if let Some(unexpected_msg) = unexpected_msg {
+            assert!(
+                !err.contains(unexpected_msg),
+                "did not expect '{unexpected_msg}' in error, got: {err}"
+            );
+        }
         Ok(())
     }
 
@@ -2988,10 +3184,10 @@ mod tests {
     ) -> DeltaResult<()> {
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
-        let write_context = write_state.unpartitioned_write_context().unwrap();
+        let write_context = write_state.write_context_builder().build().unwrap();
         crate::unit_test_utils::validate_physical_schema_column_mapping(
-            write_context.logical_schema(),
-            write_context.physical_schema(),
+            write_context.logical_data_schema(),
+            write_context.physical_data_schema(),
             mode,
         );
         Ok(())
@@ -3026,7 +3222,8 @@ mod tests {
                 Scalar::Array(ArrayData::try_new(score_type, [30i32])?),
             ],
         )?);
-        ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
+        let rows = vec![vec![1i64.into(), info1], vec![2i64.into(), info2]];
+        ArrowEvaluationHandler.create_many(schema, rows)
     }
 
     /// Validates that [`BoundWriteContext::logical_to_physical`] correctly renames fields at all
@@ -3038,9 +3235,9 @@ mod tests {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
-        let write_context = write_state.unpartitioned_write_context().unwrap();
-        let logical_schema = write_context.logical_schema();
-        let physical_schema = write_context.physical_schema();
+        let write_context = write_state.write_context_builder().build().unwrap();
+        let logical_schema = write_context.logical_data_schema();
+        let physical_schema = write_context.physical_data_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();
 
         if mode != ColumnMappingMode::None {
@@ -3085,6 +3282,121 @@ mod tests {
     #[case::none_mode(ColumnMappingMode::None)]
     fn test_logical_to_physical_transform(#[case] mode: ColumnMappingMode) -> DeltaResult<()> {
         validate_logical_to_physical_transform(mode)
+    }
+
+    #[rstest]
+    fn test_logical_to_physical_transform_and_row_tracking_state(
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mode: ColumnMappingMode,
+        #[values(
+            RowTrackingState::Enabled,
+            RowTrackingState::SupportedNotEnabled,
+            RowTrackingState::Suspended
+        )]
+        row_tracking_state: RowTrackingState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // === Given every column-mapping mode and Row Tracking state ===
+        let column_mapping_mode = match mode {
+            ColumnMappingMode::None => "none",
+            ColumnMappingMode::Name => "name",
+            ColumnMappingMode::Id => "id",
+        };
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let mut txn = create_table(
+            "memory:///row_tracking_logical_to_physical",
+            schema_ref! { nullable "value": INTEGER },
+            "test",
+        )
+        .with_table_properties([
+            ("delta.columnMapping.mode", column_mapping_mode),
+            ("delta.feature.rowTracking", "supported"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        let mut metadata = txn.effective_table_config.metadata().clone();
+        for (key, value) in row_tracking_state.properties() {
+            metadata = metadata.with_configuration_entry(key, value);
+        }
+        let logical_schema = txn.effective_table_config.logical_schema();
+        let table_config = TableConfiguration::try_new_with_schema(
+            &txn.effective_table_config,
+            metadata,
+            logical_schema,
+        )?;
+        txn.replace_effective_table_config(table_config);
+        let write_state = txn.write_state()?;
+        let base_logical_field = write_state
+            .base_logical_data_schema
+            .fields()
+            .next()
+            .ok_or_else(|| Error::internal_error("base logical data field is missing"))?
+            .clone();
+        let base_physical_field = write_state
+            .base_physical_data_schema
+            .fields()
+            .next()
+            .ok_or_else(|| Error::internal_error("base physical data field is missing"))?
+            .clone();
+        let physical_row_id_name = write_state
+            .materialized_row_id_column_name
+            .clone()
+            .ok_or_else(|| Error::internal_error("materialized Row ID column name is missing"))?;
+        let physical_row_commit_version_name = write_state
+            .materialized_row_commit_version_column_name
+            .clone()
+            .ok_or_else(|| {
+                Error::internal_error("materialized Row Commit Version column name is missing")
+            })?;
+
+        // === When the connector specifies its row-tracking input columns ===
+        let write_context = write_state
+            .write_context_builder()
+            .with_row_tracking_columns(RowTrackingMetadataColumns {
+                row_id_col_name: Some("connector_row_id"),
+                row_commit_version_col_name: Some("connector_row_commit_version"),
+            })
+            .build();
+
+        // === Then ===
+        // Supplying materialized row-tracking columns requires Row Tracking to be enabled.
+        // Logical data schema, physical data schema, and logical_to_physical expression must be
+        // generated correctly.
+        if row_tracking_state != RowTrackingState::Enabled {
+            assert_result_error_with_message(
+                write_context,
+                "Kernel does not allow writing materialized Row IDs or Row Commit Versions when \
+                 Row Tracking is not enabled",
+            );
+            return Ok(());
+        }
+        let write_context = write_context?;
+        assert_eq!(
+            write_context.logical_data_schema(),
+            &schema_ref! {
+                (base_logical_field),
+                nullable "connector_row_id": LONG,
+                nullable "connector_row_commit_version": LONG,
+            }
+        );
+        assert_eq!(
+            write_context.physical_data_schema(),
+            &schema_ref! {
+                (base_physical_field),
+                nullable (physical_row_id_name): LONG,
+                nullable (physical_row_commit_version_name): LONG,
+            }
+        );
+        assert_eq!(
+            write_context.logical_to_physical(),
+            Arc::new(Expression::struct_patch(
+                ExpressionStructPatchBuilder::new()
+            )?)
+        );
+        Ok(())
     }
 
     // =========================================================================
@@ -3173,10 +3485,7 @@ mod tests {
                 ]
             })
             .collect();
-        let row_refs: Vec<&[Scalar]> = rows.iter().map(|r| r.as_slice()).collect();
-        ArrowEvaluationHandler
-            .create_many(schema, &row_refs)
-            .unwrap()
+        ArrowEvaluationHandler.create_many(schema, rows).unwrap()
     }
 
     #[test]

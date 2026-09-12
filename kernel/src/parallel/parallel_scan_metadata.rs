@@ -266,7 +266,7 @@ impl ParallelScanMetadata {
 
     pub fn new_from_iter(
         state: Arc<ParallelState>,
-        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
+        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
         Self {
             processor: ParallelPhase::new_from_iter(state.clone(), iter),
@@ -317,7 +317,8 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
-            physical_stats_columns: HashSet::new(),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: true,
             skip_row_transforms: false,
         });

@@ -275,6 +275,38 @@ fn with_domain_metadata_removed_impl(
     Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
 }
 
+/// Set an explicit row-tracking high-water mark for this transaction.
+///
+/// Use this when row IDs must also be coordinated with another system. Kernel still assigns
+/// row-tracking fields to files passed to [`add_files`] and rejects `high_water_mark` if it is less
+/// than the value calculated from those files. The generic [`with_domain_metadata`] API cannot
+/// modify `delta.rowTracking` or other system-controlled domains.
+///
+/// Returns the updated transaction handle, or an error if the transaction already has an explicit
+/// high-water mark. Table-feature and current-table-state validation occurs during commit.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn with_row_tracking_high_water_mark(
+    txn: Handle<ExclusiveTransaction>,
+    high_water_mark: i64,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_row_tracking_high_water_mark_impl(*txn, high_water_mark).into_extern_result(&engine)
+}
+
+fn with_row_tracking_high_water_mark_impl(
+    txn: Transaction,
+    high_water_mark: i64,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
+}
+
 /// Add file metadata to the transaction for files that have been written. The metadata contains
 /// information about files written during the transaction that will be added to the Delta log
 /// during commit.
@@ -362,6 +394,38 @@ fn create_table_with_engine_info_impl(
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
     let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
     Ok(Box::new(txn.with_engine_info(info)).into())
+}
+
+/// Add domain metadata to a create-table transaction.
+///
+/// `domain` identifies the user-controlled metadata domain, and `configuration` is its arbitrary
+/// string value. Returns the updated transaction handle. Invalid strings are returned as errors;
+/// domain and table-feature validation occurs when the transaction is committed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_with_domain_metadata(
+    txn: Handle<ExclusiveCreateTransaction>,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    create_table_with_domain_metadata_impl(*txn, domain, configuration).into_extern_result(&engine)
+}
+
+fn create_table_with_domain_metadata_impl(
+    txn: CreateTableTransaction,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
+    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
 }
 
 /// Add file metadata to a create-table transaction for files that have been written. The metadata
@@ -798,8 +862,9 @@ mod tests {
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::KernelError;
     use delta_kernel_ffi::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        engine_handle_for_store, ok_or_panic, recover_error, recover_string,
+        allocate_err, allocate_str, assert_extern_result_error_contains,
+        assert_extern_result_error_with_message, build_snapshot, engine_handle_for_store,
+        ok_or_panic, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
@@ -1542,14 +1607,19 @@ mod tests {
             .expect("commit should contain a domainMetadata action")
     }
 
-    /// Create a table with the `domainMetadata` writer feature enabled and return the table
-    /// URL, object store, and FFI engine handle.
+    /// Create a table with the requested domain-metadata features.
     async fn setup_domain_metadata_table(
         name: &str,
+        row_tracking: bool,
     ) -> Result<(Url, Arc<DynObjectStore>, Handle<SharedExternEngine>), Box<dyn std::error::Error>>
     {
         let schema = schema_ref! { nullable "id": INTEGER };
         let (store, _test_engine, table_location) = test_utils::engine_store_setup(name, None);
+        let writer_features = if row_tracking {
+            vec!["rowTracking", "domainMetadata"]
+        } else {
+            vec!["domainMetadata"]
+        };
         let table_url = test_utils::create_table(
             store.clone(),
             table_location,
@@ -1557,7 +1627,7 @@ mod tests {
             &[],
             true,
             vec![],
-            vec!["domainMetadata"],
+            writer_features,
         )
         .await?;
         let engine = engine_handle_for_store(Arc::clone(&store));
@@ -1566,7 +1636,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_domain_metadata_add_and_remove() -> Result<(), Box<dyn std::error::Error>> {
-        let (table_url, store, engine) = setup_domain_metadata_table("test_dm").await?;
+        let (table_url, store, engine) = setup_domain_metadata_table("test_dm", false).await?;
         let table_path_str = table_url.as_str();
 
         // === Transaction 1: add domain metadata ===
@@ -1621,7 +1691,7 @@ mod tests {
     #[tokio::test]
     async fn test_domain_metadata_system_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_sys").await?;
+        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_sys", false).await?;
         let table_path_str = table_url.as_str();
 
         // with_domain_metadata succeeds (validation is lazy), but commit should fail
@@ -1653,9 +1723,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_row_tracking_high_water_mark_requires_row_tracking_feature(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_feature", false).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+
+        assert_extern_result_error_contains(
+            unsafe { commit(txn, engine.shallow_copy()) },
+            KernelError::GenericError,
+            "requires the 'rowTracking' feature",
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_rejects_duplicate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_duplicate", true).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+
+        assert_extern_result_error_contains(
+            unsafe { with_row_tracking_high_water_mark(txn, 8, engine.shallow_copy()) },
+            KernelError::GenericError,
+            "already specified in this transaction",
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm", true).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let row_tracking = read_domain_metadata_action(&store, &table_url, 1).await;
+        assert_eq!(
+            row_tracking["domainMetadata"]["domain"],
+            "delta.rowTracking"
+        );
+        assert_eq!(
+            row_tracking["domainMetadata"]["configuration"],
+            r#"{"rowIdHighWaterMark":7}"#
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_rejects_regression(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_regression", true).await?;
+        let table_path = table_url.as_str();
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 6, engine.shallow_copy())
+        });
+        assert_extern_result_error_contains(
+            unsafe { commit(txn, engine.shallow_copy()) },
+            KernelError::GenericError,
+            "cannot be less than the calculated value 7",
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_with_add_files(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_with_adds", true).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+
+        let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
+            .as_ref()
+            .try_into_arrow()?;
+        let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
+        let file_info_engine_data = ok_or_panic(unsafe {
+            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+        });
+        unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let row_tracking = read_domain_metadata_action(&store, &table_url, 1).await;
+        assert_eq!(
+            row_tracking["domainMetadata"]["configuration"],
+            r#"{"rowIdHighWaterMark":7}"#
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_rejects_value_below_added_files(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_below_adds", true).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+
+        let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
+            .as_ref()
+            .try_into_arrow()?;
+        let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
+        let file_info_engine_data = ok_or_panic(unsafe {
+            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+        });
+        unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 0, engine.shallow_copy())
+        });
+        assert_extern_result_error_contains(
+            unsafe { commit(txn, engine.shallow_copy()) },
+            KernelError::GenericError,
+            "cannot be less than the calculated value 1",
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_domain_metadata_duplicate_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_dup").await?;
+        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_dup", false).await?;
         let table_path_str = table_url.as_str();
 
         // Adding the same domain twice should cause commit to fail
@@ -2180,6 +2422,51 @@ mod tests {
 
         unsafe { free_schema(snap_schema) };
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_domain_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table_domain_metadata", None);
+        let (_table_path, engine, builder) = create_table_builder(
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let domain_feature = "delta.feature.domainMetadata";
+        let supported = "supported";
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_table_property(
+                builder,
+                kernel_string_slice!(domain_feature),
+                kernel_string_slice!(supported),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+        let domain = "test.domain";
+        let configuration = r#"{"key":"value"}"#;
+        let txn = ok_or_panic(unsafe {
+            create_table_with_domain_metadata(
+                txn,
+                kernel_string_slice!(domain),
+                kernel_string_slice!(configuration),
+                engine.shallow_copy(),
+            )
+        });
+
+        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 0);
+        let domain_metadata = read_domain_metadata_action(&store, &table_url, 0).await;
+        assert_eq!(domain_metadata["domainMetadata"]["domain"], domain);
+        assert_eq!(
+            domain_metadata["domainMetadata"]["configuration"],
+            configuration
+        );
+
         unsafe { free_engine(engine) };
         Ok(())
     }

@@ -93,8 +93,8 @@ async fn try_main() -> DeltaResult<()> {
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);
 
-    // Write the data using the engine
-    let write_context = txn.write_state()?.unpartitioned_write_context()?;
+    // This example assumes the table is unpartitioned.
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let file_metadata = engine.write_parquet(&sample_data, &write_context).await?;
 
     // Add the file metadata to the transaction

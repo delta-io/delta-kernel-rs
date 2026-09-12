@@ -525,10 +525,12 @@ fn test_without_row_transforms_rejects_execute() {
     );
 }
 
-/// Row commit version metadata columns are unsupported by scans, so requesting one errors at
-/// build time regardless of `without_row_transforms`.
+/// Row commit version metadata columns require a row-tracking-enabled table, including when row
+/// transforms are disabled.
 #[rstest]
-fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_transforms: bool) {
+fn test_scan_rejects_row_commit_version_when_row_tracking_is_disabled(
+    #[values(false, true)] without_row_transforms: bool,
+) {
     let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
     let schema = Arc::new(
         snapshot
@@ -542,10 +544,10 @@ fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_trans
     }
     let err = builder
         .build()
-        .expect_err("row commit version columns are unsupported by scans");
+        .expect_err("row commit version columns require row tracking");
     assert!(
         err.to_string()
-            .contains("Row commit versions not supported"),
+            .contains("Row commit versions are not enabled on this table"),
         "unexpected error: {err}"
     );
 }
@@ -2103,7 +2105,9 @@ fn test_default_stats_options_no_struct_output() {
 #[case::id_with_json_without_predicate(
     StatsOptions {
         synthesize_json: true,
-        struct_stats: StructStats::Columns(vec![column_name!("id")]),
+        struct_stats: StructStats::Columns {
+            requested: vec![column_name!("id")],
+        },
     },
     &["id"],
     None,
@@ -2269,11 +2273,34 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         .scan_builder()
         .with_stats(StatsOptions {
             synthesize_json: true,
-            struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
+            struct_stats: StructStats::Columns {
+                requested: vec![column_name!("nonexistent_column")],
+            },
         })
         .build();
 
     assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
+}
+
+#[test]
+fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let result = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct_with_extra_indexed(vec![
+            column_name!("nonexistent_column"),
+        ]))
+        .build();
+
+    assert!(
+        result.is_ok(),
+        "unresolvable extra_indexed column should be dropped, not error: {:?}",
+        result.err()
+    );
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.

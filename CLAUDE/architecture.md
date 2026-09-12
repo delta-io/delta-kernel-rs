@@ -30,11 +30,19 @@ Built via `Snapshot::builder_for(url).build(engine)` (latest version) or
 `.at_version(v).build(engine)` (specific version). For catalog-managed tables,
 `.with_log_tail(commits)` supplies recent unpublished commits from the catalog and
 `.with_max_catalog_version(v)` caps the snapshot at the latest catalog-ratified version.
+`Snapshot::builder_from(snapshot)` returns an `IncrementalSnapshotBuilder` that reuses the input
+snapshot. Its opt-in `skip_new_checkpoints()` mode keeps the input checkpoint and every commit in
+the update window so a snapshot-derived `CommitRange` can inspect them without another log
+listing.
+Under `internal-api`, `.with_snapshot_hint(hint)` constructs a snapshot without engine log I/O.
+Kernel validates structural consistency; the connector owns table-root membership,
+protocol/metadata provenance, `max_published_version`, and freshness.
 
 **Snapshot loading internals:**
-1. **LogSegment** (`kernel/src/log_segment/`): discovers commits + checkpoints for the
-   requested version, replays Protocol and Metadata (`protocol_metadata_replay.rs`), and
-   replays domain metadata (`domain_metadata_replay.rs`)
+1. Ordinary builds discover commits and checkpoints through **LogSegment**
+   (`kernel/src/log_segment/`) and resolve Protocol and Metadata through CRC state or log replay.
+   Domain metadata is resolved lazily from CRC state or log replay when queried. Snapshot-hint
+   builds validate and assemble the supplied state instead.
 2. **Log replay** (`kernel/src/log_replay/`): file-action deduplication via
    `FileActionDeduplicator` and `LogReplayProcessor` trait (distinct from Protocol/Metadata
    replay above)
@@ -67,20 +75,21 @@ file listing without re-scanning the table.
 
 ## Write Path
 
-`Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContext`) -> commit
+`Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContextBuilder` ->
+`BoundWriteContext`) -> commit
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
-partition values to create a `BoundWriteContext` containing validated partition values, schemas,
-statistics columns, and the recommended write directory. The transaction registers the resulting
-files, enforces protocol compliance, assembles commit actions, and delegates the atomic commit to
-a `Committer`.
+partition values and any logical materialized row-tracking columns to create a `BoundWriteContext`
+containing validated partition values, data schemas, statistics columns, and the recommended write
+directory. The transaction registers the resulting files, enforces protocol compliance, assembles
+commit actions, and delegates the atomic commit to a `Committer`.
 
 **Data-write steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
-2. Call `txn.write_state()` after configuring the transaction, then get a `BoundWriteContext` from
-   `WriteState::unpartitioned_write_context()` or
-   `WriteState::partitioned_write_context()`. Distributed writers can encode the state and decode
-   it on each worker before binding partition values.
+2. Call `txn.write_state()` after configuring the transaction, then use
+   `WriteState::write_context_builder()` to bind partition values and build a `BoundWriteContext`.
+   Distributed writers can encode the state and decode it on each worker before binding partition
+   values.
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)` and stage any removals or deletion-vector updates
 5. Commit: returns `CommittedTransaction`, `ConflictedTransaction`, or `RetryableTransaction`
@@ -127,7 +136,8 @@ all returned batches: the engine may split a single file across multiple batches
 
 ## Key Modules
 
-- `kernel/src/snapshot/`: `Snapshot`, `SnapshotBuilder`, entry point for reads/writes
+- `kernel/src/snapshot/`: `Snapshot`, `SnapshotBuilder`, `IncrementalSnapshotBuilder`, entry point
+  for reads/writes
 - `kernel/src/scan/`: `Scan`, `ScanBuilder`, log replay, data skipping
 - `kernel/src/incremental_scan/`: `IncrementalScanBuilder`, streaming file-action diff
   between two versions

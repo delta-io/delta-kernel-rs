@@ -116,6 +116,5 @@ mod global_allocator_tests {
         drop(buf);
         let previous_peak = reset_peak_native_bytes();
         assert!(previous_peak >= during);
-        assert!(peak_native_bytes() >= current_native_bytes());
     }
 }

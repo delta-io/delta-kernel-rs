@@ -14,6 +14,8 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
   ExternResultusize visit_res;
   if (strcmp(item->type, "string") == 0) {
     visit_res = visit_field_string(state, name, item->is_nullable, allocate_error);
+  } else if (strcmp(item->type, "void") == 0) {
+    visit_res = visit_field_void(state, name, item->is_nullable, allocate_error);
   } else if (strcmp(item->type, "integer") == 0) {
     visit_res = visit_field_integer(state, name, item->is_nullable, allocate_error);
   } else if (strcmp(item->type, "short") == 0) {

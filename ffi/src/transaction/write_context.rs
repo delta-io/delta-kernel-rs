@@ -40,7 +40,7 @@ pub unsafe extern "C" fn get_unpartitioned_write_context(
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
     txn.write_state()
-        .and_then(|state| state.unpartitioned_write_context())
+        .and_then(|state| state.write_context_builder().build())
         .map(|context| Arc::new(context).into())
         .into_extern_result(&engine)
 }
@@ -61,7 +61,7 @@ pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
     txn.write_state()
-        .and_then(|state| state.unpartitioned_write_context())
+        .and_then(|state| state.write_context_builder().build())
         .map(|context| Arc::new(context).into())
         .into_extern_result(&engine)
 }
@@ -93,7 +93,12 @@ pub unsafe extern "C" fn get_partitioned_write_context(
     let partition_values = unsafe { partition_values.into_inner() };
     let engine = unsafe { engine.as_ref() };
     partitioned_write_context_impl(
-        |pv| txn.write_state()?.partitioned_write_context(pv),
+        |pv| {
+            txn.write_state()?
+                .write_context_builder()
+                .with_partition_values(pv)
+                .build()
+        },
         *partition_values,
     )
     .into_extern_result(&engine)
@@ -116,7 +121,12 @@ pub unsafe extern "C" fn create_table_get_partitioned_write_context(
     let partition_values = unsafe { partition_values.into_inner() };
     let engine = unsafe { engine.as_ref() };
     partitioned_write_context_impl(
-        |pv| txn.write_state()?.partitioned_write_context(pv),
+        |pv| {
+            txn.write_state()?
+                .write_context_builder()
+                .with_partition_values(pv)
+                .build()
+        },
         *partition_values,
     )
     .into_extern_result(&engine)
@@ -148,7 +158,7 @@ pub unsafe extern "C" fn get_write_schema(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedSchema> {
     let write_context = unsafe { write_context.as_ref() };
-    write_context.logical_schema().clone().into()
+    write_context.logical_data_schema().clone().into()
 }
 
 /// Returns the physical write schema from a [`BoundWriteContext`] handle: the schema of the data
@@ -170,7 +180,7 @@ pub unsafe extern "C" fn get_physical_write_schema(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedSchema> {
     let write_context = unsafe { write_context.as_ref() };
-    write_context.physical_schema().clone().into()
+    write_context.physical_data_schema().clone().into()
 }
 
 /// Returns the logical-to-physical expression from a [`BoundWriteContext`] handle. Engines apply

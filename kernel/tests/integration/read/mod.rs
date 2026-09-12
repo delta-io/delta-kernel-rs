@@ -7,10 +7,13 @@ use std::sync::Arc;
 use std::vec;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::{ArrayRef, AsArray as _, RecordBatch, TimestampMicrosecondArray};
+use delta_kernel::arrow::array::{
+    ArrayRef, AsArray as _, Int64Array, ListArray, RecordBatch, TimestampMicrosecondArray,
+};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, Int32Type, Int64Type, Schema as ArrowSchema,
+    TimeUnit,
 };
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
@@ -1629,6 +1632,103 @@ fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
 }
 
+#[tokio::test]
+async fn array_element_type_widening_reads_older_files() -> Result<(), Box<dyn std::error::Error>> {
+    let table_root = "memory:///";
+    let file_name = "part-v0.parquet";
+    let storage = Arc::new(InMemory::new());
+    let values: ListArray =
+        ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(1), Some(2), Some(3)])]);
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ("vals", Arc::new(values) as ArrayRef),
+    ])?;
+    let parquet_bytes = record_batch_to_bytes(&batch);
+
+    let schema = |element_type: &str| {
+        let field_metadata = if element_type == "long" {
+            serde_json::json!({
+                "delta.typeChanges": [{
+                    "fromType": "integer",
+                    "toType": "long",
+                    "fieldPath": "element",
+                }],
+            })
+        } else {
+            serde_json::json!({})
+        };
+        serde_json::json!({
+            "type": "struct",
+            "fields": [
+                {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+                {
+                    "name": "vals",
+                    "type": {
+                        "type": "array",
+                        "elementType": element_type,
+                        "containsNull": true,
+                    },
+                    "nullable": true,
+                    "metadata": field_metadata,
+                },
+            ],
+        })
+        .to_string()
+    };
+    let metadata = |schema_string: String| {
+        serde_json::json!({
+            "metaData": {
+                "id": "array-widen",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema_string,
+                "partitionColumns": [],
+                "configuration": {"delta.enableTypeWidening": "true"},
+            },
+        })
+        .to_string()
+    };
+    let add = serde_json::json!({
+        "add": {
+            "path": file_name,
+            "partitionValues": {},
+            "size": parquet_bytes.len(),
+            "modificationTime": 1000,
+            "dataChange": true,
+        },
+    });
+    let protocol = serde_json::json!({
+        "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["typeWidening"],
+            "writerFeatures": ["typeWidening"],
+        },
+    });
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        format!("{protocol}\n{}\n{add}", metadata(schema("integer"))),
+    )
+    .await?;
+    add_commit(table_root, storage.as_ref(), 1, metadata(schema("long"))).await?;
+    storage
+        .put(&Path::from(file_name), parquet_bytes.into())
+        .await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage).build());
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine)?;
+
+    assert_eq!(batches.len(), 1);
+    let values = batches[0].column_by_name("vals").unwrap().as_list::<i32>();
+    assert_eq!(values.value_type(), ArrowDataType::Int64);
+    let elements = values.values().as_primitive::<Int64Type>();
+    assert_eq!(elements.values().as_ref(), &[1, 2, 3]);
+    Ok(())
+}
+
 #[test]
 fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
@@ -2000,7 +2100,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         (
             "row_commit_version",
             MetadataColumnSpec::RowCommitVersion,
-            "Row commit versions not supported",
+            "Row commit versions are not enabled on this table",
         ),
     ];
 
@@ -2169,7 +2269,7 @@ fn checkpoint_stats_skipping(
 // schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
 // Cross-product covers all five checkpoint variants against four stats option
 // shapes: ScanFile.stats should be populated via the COALESCE/ToJson fallback
-// when both `json=true` and `struct_stats=All` are set; otherwise null on these
+// when both `json=true` and `struct_stats=AllIndexed` are set; otherwise null on these
 // struct-stats-only checkpoints.
 #[rstest::rstest]
 #[case::default_json_only(StatsOptions::default(), false)]

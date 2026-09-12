@@ -173,13 +173,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Cannot cast list to non-list data types during type widening",
-        &[
-            "tw_array_element/specs/tw_array_element_read_",
-            "tw_map_key_value_widening/specs/tw_map_key_value_widening_read_all",
-        ],
-    ),
-    (
         "Schema deserialization fails for TimestampNTZ type",
         &["ds_multi_file_time/"],
     ),

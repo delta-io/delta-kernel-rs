@@ -41,8 +41,15 @@ use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 mod builder;
 mod incremental;
 mod snapshot_crc;
-pub use builder::{IncrementalReplay, SnapshotBuilder};
+#[doc(hidden)]
+pub use builder::{FromSnapshot, FromTableRoot};
+pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
+#[allow(unused_imports)]
+#[internal_api]
+pub(crate) use builder::{SnapshotHint, SnapshotHintFreshness};
 use snapshot_crc::SnapshotCrc;
+
+pub use crate::error::SnapshotHintError;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -81,10 +88,12 @@ pub struct Snapshot {
     crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
+    /// Whether the last applicable incremental build requested ignoring new checkpoints.
+    skipped_new_checkpoints: bool,
 }
 
 impl PartialEq for Snapshot {
-    // Content equality: `built_as_latest` is best-effort build metadata, deliberately excluded.
+    // Content equality excludes build metadata that does not change the table state.
     fn eq(&self, other: &Self) -> bool {
         self.log_segment == other.log_segment
             && self.table_configuration == other.table_configuration
@@ -106,6 +115,7 @@ impl std::fmt::Debug for Snapshot {
             .field("version", &self.version())
             .field("metadata", &self.table_configuration().metadata())
             .field("log_segment", &self.log_segment)
+            .field("skipped_new_checkpoints", &self.skipped_new_checkpoints)
             .finish()
     }
 }
@@ -128,11 +138,9 @@ impl Snapshot {
         SnapshotBuilder::new_for(table_root)
     }
 
-    /// Create a new [`SnapshotBuilder`] to incrementally update an existing [`Snapshot`] to a
-    /// more recent version.
-    ///
-    /// See `Snapshot::try_new_from` for the case-by-case behavior.
-    pub fn builder_from(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
+    /// Create a new [`IncrementalSnapshotBuilder`] to incrementally update an existing [`Snapshot`]
+    /// to a more recent version.
+    pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
 
@@ -152,18 +160,21 @@ impl Snapshot {
             table_configuration,
             None,  /* crc */
             false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
         )
     }
 
     /// Internal constructor that accepts an explicit pre-resolved CRC.
     ///
     /// `built_as_latest` records whether the build confirmed this is the latest version
-    /// (best-effort). See [`Snapshot::built_as_latest`].
+    /// (best-effort). See [`Snapshot::built_as_latest`]. `skipped_new_checkpoints` records the last
+    /// applicable incremental build's checkpoint policy.
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         crc: Option<Arc<Crc>>,
         built_as_latest: bool,
+        skipped_new_checkpoints: bool,
     ) -> DeltaResult<Self> {
         // Will perform version validations.
         let crc = SnapshotCrc::try_new(
@@ -184,6 +195,7 @@ impl Snapshot {
             table_configuration,
             crc,
             built_as_latest,
+            skipped_new_checkpoints,
         })
     }
 
@@ -225,7 +237,13 @@ impl Snapshot {
         tracing::Span::current().record("version", table_configuration.version());
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        Self::new_with_crc(log_segment, table_configuration, crc, built_as_latest)
+        Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            crc,
+            built_as_latest,
+            false, /* skipped_new_checkpoints */
+        )
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -286,6 +304,7 @@ impl Snapshot {
             new_table_configuration,
             new_crc,
             true, /* built_as_latest */
+            self.skipped_new_checkpoints,
         )
     }
 
@@ -297,6 +316,13 @@ impl Snapshot {
     #[internal_api]
     pub(crate) fn log_segment(&self) -> &LogSegment {
         &self.log_segment
+    }
+
+    /// Whether the last applicable incremental build requested ignoring new checkpoints.
+    ///
+    /// This records the build policy, not whether its listing actually found a checkpoint.
+    pub(crate) fn skipped_new_checkpoints(&self) -> bool {
+        self.skipped_new_checkpoints
     }
 
     /// The CRC iff it sits exactly at this snapshot's version. When `Some`, queries backed by the
@@ -324,11 +350,11 @@ impl Snapshot {
 
     /// Whether this snapshot was at the latest table version when it was built.
     ///
-    /// This is best-effort: `true` when the build knows this was the newest version. That holds for
-    /// a build (fresh or incremental) with no time-travel version, a build (fresh or incremental)
-    /// at the catalog's ratified latest version, and a post-commit snapshot. It is not a
-    /// liveness guarantee: another writer may commit a newer version afterward, so a `true`
-    /// snapshot can already be stale.
+    /// This is best-effort: `true` for an ordinary latest-version build, the catalog's ratified
+    /// latest version, a post-commit snapshot, or a snapshot hint marked `Latest` by its connector.
+    /// Kernel does not independently verify hint freshness. This is not a liveness guarantee:
+    /// another writer may commit a newer version afterward, so a `true` snapshot can already be
+    /// stale.
     ///
     /// Version-preserving derivations ([`Self::checkpoint`], [`Self::write_checksum`],
     /// [`Self::publish`]) do not change this flag: they carry it over from the source snapshot.
@@ -809,7 +835,7 @@ impl Snapshot {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
                 Ok(Some(ict))
             }
-            None => Err(Error::generic("Last commit file not found in log segment")),
+            None => Err(Error::MissingVersion(self.version())),
         }
     }
 
@@ -837,28 +863,18 @@ impl Snapshot {
                         let ts = commit_file_meta.location.last_modified;
                         Ok(ts)
                     }
-                    None => Err(Error::generic(format!(
-                        "Last commit file not found in log segment for version {} \
-                         (ICT disabled): cannot read filesystem modification timestamp",
-                        self.version()
-                    ))),
+                    None => Err(Error::MissingVersion(self.version())),
                 }
             }
-            InCommitTimestampEnablement::Enabled { .. } => self
-                .get_in_commit_timestamp(engine)
-                .map_err(|e| {
-                    Error::generic(format!(
-                        "Unable to read in-commit timestamp for version {}: {e}",
-                        self.version()
-                    ))
-                })?
-                .ok_or_else(|| {
+            InCommitTimestampEnablement::Enabled { .. } => {
+                self.get_in_commit_timestamp(engine)?.ok_or_else(|| {
                     Error::internal_error(format!(
                         "Invalid state: version {}, ICT is enabled \
                         but get_in_commit_timestamp returned None",
                         self.version()
                     ))
-                }),
+                })
+            }
         }
     }
 
@@ -1004,6 +1020,7 @@ impl Snapshot {
                     self.table_configuration().clone(),
                     Some(crc),
                     self.built_as_latest,
+                    self.skipped_new_checkpoints,
                 )?);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
@@ -1225,6 +1242,7 @@ impl Snapshot {
                 self.table_configuration().clone(),
                 self.crc_at_version().cloned(),
                 self.built_as_latest,
+                false, /* skipped_new_checkpoints */
             )?),
         ))
     }
@@ -1295,6 +1313,7 @@ impl Snapshot {
             self.table_configuration().clone(),
             self.base_crc().cloned(),
             self.built_as_latest,
+            self.skipped_new_checkpoints,
         )?))
     }
 }
@@ -1463,6 +1482,7 @@ mod tests {
             table_cfg,
             None,  /* crc */
             false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
         )
     }
 
@@ -1995,9 +2015,8 @@ mod tests {
             snapshot.table_configuration().clone(),
         )?;
 
-        // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
-        assert_result_error_with_message(result, "Last commit file not found in log segment");
+        assert!(matches!(result, Err(Error::MissingVersion(0))));
 
         Ok(())
     }
@@ -2160,7 +2179,44 @@ mod tests {
         )?;
 
         let result = snapshot_no_commit.get_timestamp(&engine);
-        assert_result_error_with_message(result, "Last commit file not found in log segment");
+        assert!(matches!(result, Err(Error::MissingVersion(0))));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_timestamp_preserves_commit_read_error() -> DeltaResult<()> {
+        let table_root = "memory:///";
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let commit_data = vec![
+            create_commit_info(1677811175819, Some(1677811175999)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
+            create_metadata(
+                Some("test_id"),
+                Some("{\"type\":\"struct\",\"fields\":[]}"),
+                Some(1677811175819),
+                Some(("0".to_string(), "1612345678".to_string())),
+                false,
+            ),
+        ];
+        commit(table_root, store.as_ref(), 0, commit_data).await;
+        let loaded_snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        // Drop the synthesized CRC so timestamp resolution reads the referenced commit file.
+        let snapshot = Snapshot::new_with_crc(
+            loaded_snapshot.log_segment().clone(),
+            loaded_snapshot.table_configuration().clone(),
+            None,
+            false,
+            false, /* skipped_new_checkpoints */
+        )?;
+        store.delete(&delta_path_for_version(0, "json")).await?;
+
+        let result = snapshot.get_timestamp(&engine);
+        assert!(
+            matches!(&result, Err(Error::FileNotFound(_))),
+            "expected FileNotFound, got {result:?}"
+        );
 
         Ok(())
     }
@@ -2253,6 +2309,7 @@ mod tests {
             built.table_configuration().clone(),
             Some(stale_crc),
             false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
         )
         .unwrap();
         assert!(parent.crc_at_version().is_none());

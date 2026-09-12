@@ -17,6 +17,19 @@ options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelE
 
 Every handle has a corresponding `free_*` function (e.g. `free_engine`, `free_snapshot`).
 
+Handle parameters follow one of two ownership contracts:
+
+1. **Borrow:** Rust accesses the handle with `as_ref()` or `as_mut()`. The caller retains
+   ownership and remains responsible for passing the handle to its `free_*` function.
+2. **Unconditional consume:** Rust calls `into_inner()` before any fallible work. Rust owns the
+   value from native entry onward and is responsible for dropping it on every result, including
+   errors. The caller must not use or free the handle after the call.
+
+Do not conditionally consume a handle only when a fallible operation succeeds. Every function's
+safety documentation must state whether each handle is borrowed or consumed regardless of the
+result. For consuming functions, perform string parsing, visitor decoding, validation, and other
+fallible work only after all consumed handles have been converted with `into_inner()`.
+
 ## Error Handling
 
 Fallible functions return `ExternResult` (tagged union of Ok/Err). The caller provides an
@@ -26,6 +39,7 @@ the caller's memory space.
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
+- `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -47,10 +61,18 @@ Snapshot builder API (`ffi/src/lib.rs`):
 - `snapshot_builder_set_version(builder, version)` -- optional: pin to a specific version
 - `snapshot_builder_set_log_tail(builder, log_tail)` -- optional: set log tail (for catalog-managed tables)
 - `snapshot_builder_set_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
+- `snapshot_builder_set_snapshot_hint(builder, hint)` -- optional: validate and copy a complete
+  typed snapshot hint into the builder. Log paths may name published or staged commits, checkpoint
+  files, or CRC files; log compaction paths are rejected. Kernel cannot verify that supplied log
+  paths belong to the builder's table, so the caller must ensure every path addresses that table.
+  A failed call leaves the builder's existing hint unchanged
 - `snapshot_builder_build(builder)` -- consume the builder and produce a `SharedSnapshot`
 - `free_snapshot_builder(builder)` -- discard without building (e.g. on error paths)
 
-The caller owns the returned builder handle and must call either `snapshot_builder_build` or `free_snapshot_builder`.
+Snapshot-hint inputs and all nested pointers are borrowed only for the setter call and copied into
+the builder. Cross-component and table validation occurs when the builder is built. The caller owns
+the returned builder handle and must call either `snapshot_builder_build` or
+`free_snapshot_builder`.
 
 Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
 `snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
@@ -166,9 +188,9 @@ transaction()
 
 The engine authors the DV file and passes descriptor fields to `dv_descriptor_new`. The
 descriptor map and scan iterator are both consumed by `transaction_update_deletion_vectors`;
-descriptor handles are consumed by `dv_descriptor_map_insert` only on success and must be
-freed by the caller on error. DV updates require both the `deletionVectors` reader/writer
-feature and `delta.enableDeletionVectors=true`.
+descriptor handles are consumed by `dv_descriptor_map_insert` regardless of the result. DV
+updates require both the `deletionVectors` reader/writer feature and
+`delta.enableDeletionVectors=true`.
 
 ## Tracing & Metrics
 

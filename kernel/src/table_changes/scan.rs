@@ -14,7 +14,7 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
-use crate::schema::SchemaRef;
+use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
@@ -123,6 +123,13 @@ impl TableChangesScanBuilder {
         let table_schema: SchemaRef = self.table_changes.schema().clone().into();
         // If no projection is supplied, default to the full CDF-extended schema (SELECT *).
         let logical_read_schema = self.schema.unwrap_or_else(|| table_schema.clone());
+        if logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowId)
+            || logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowCommitVersion)
+        {
+            return Err(Error::unsupported(
+                "Row ID and Row Commit Version metadata are unsupported in CDF scans",
+            ));
+        }
 
         // Create StateInfo using CDF field classifier
         // CDF doesn't support stats output
@@ -355,15 +362,18 @@ fn read_scan_file(
 mod tests {
     use std::sync::Arc;
 
+    use rstest::rstest;
+
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{col, lit};
     use crate::object_store::memory::InMemory;
     use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::schema_ref;
+    use crate::schema::{schema_ref, MetadataColumnSpec};
     use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
     use crate::transaction::create_table::create_table;
+    use crate::unit_test_utils::assert_result_error_with_message;
     use crate::Predicate;
 
     #[test]
@@ -483,6 +493,32 @@ mod tests {
             PhysicalPredicate::Some(pred, pred_schema)
             if pred == &predicate && pred_schema.fields().len() == 1
         ));
+    }
+
+    #[rstest]
+    #[case::row_id(MetadataColumnSpec::RowId)]
+    #[case::row_commit_version(MetadataColumnSpec::RowCommitVersion)]
+    fn cdf_scan_rejects_row_tracking_metadata(#[case] metadata_spec: MetadataColumnSpec) {
+        let path = "./tests/data/table-with-cdf";
+        let engine = SyncEngine::new();
+        let url = delta_kernel::try_parse_uri(path).unwrap();
+        let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
+        let schema = Arc::new(
+            table_changes
+                .schema()
+                .add_metadata_column("row_tracking", metadata_spec)
+                .unwrap(),
+        );
+
+        let result = table_changes
+            .into_scan_builder()
+            .with_schema(schema)
+            .build();
+
+        assert_result_error_with_message(
+            result,
+            "Row ID and Row Commit Version metadata are unsupported in CDF scans",
+        );
     }
 
     // Regression for issue #2468 on the CDF path

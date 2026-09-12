@@ -17,7 +17,6 @@ use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
-use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
@@ -207,10 +206,11 @@ impl LogSegment {
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
     ) -> DeltaResult<Self> {
+        validate_log_path_fields(&listed_files)?;
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
         validate_commit_file_types(&listed_files.ascending_commit_files)?;
-        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
+        validate_commit_files_sorted(&listed_files.ascending_commit_files)?;
 
         // Filter commits before/at checkpoint version
         let checkpoint_version =
@@ -225,6 +225,7 @@ impl LogSegment {
             };
 
         validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
+        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,
             &listed_files.checkpoint_parts,
@@ -476,20 +477,14 @@ impl LogSegment {
         )?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
-        // - [`LogSegmentFiles::list_commits`] also checks that there are no gaps between commits.
+        // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
         // If all three are satisfied, this implies that all the desired commits are present.
         require!(
             listed_files
                 .ascending_commit_files()
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
-            Error::generic(format!(
-                "Expected the first commit to have version {start_version}, got {:?}",
-                listed_files
-                    .ascending_commit_files()
-                    .first()
-                    .map(|c| c.version)
-            ))
+            Error::MissingVersion(start_version)
         );
         LogSegment::try_new(listed_files, log_root, end_version, None)
     }
@@ -530,17 +525,17 @@ impl LogSegment {
             Some(end_version),
             None, // timestamp conversion does not thread a cancellation token
         )?;
+        if listed_commits.ascending_commit_files().is_empty() {
+            return Err(Error::EmptyLog);
+        }
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = listed_commits.ascending_commit_files_mut();
-        if !commits.is_empty() {
-            let mut start_idx = commits.len() - 1;
-            while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version
-            {
-                start_idx -= 1;
-            }
-            commits.drain(..start_idx);
+        let mut start_idx = commits.len() - 1;
+        while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version {
+            start_idx -= 1;
         }
+        commits.drain(..start_idx);
 
         LogSegment::try_new(listed_commits, log_root, Some(end_version), None)
     }
@@ -746,7 +741,7 @@ impl LogSegment {
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
         let commit_stream =
-            CommitReader::try_new(engine, self, commit_read_schema, cancellation_token)?;
+            self.read_commit_actions(engine, commit_read_schema, cancellation_token)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
@@ -782,6 +777,31 @@ impl LogSegment {
             None,
         )?;
         Ok(result.actions)
+    }
+
+    /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
+    /// true`).
+    ///
+    /// Files are returned in descending version order, as log replay expects. Only the commit
+    /// cover is read; checkpoints and sidecars are not consulted.
+    #[internal_api]
+    pub(crate) fn read_commit_actions(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        let commit_files = self.find_commit_cover();
+        let actions = engine
+            .json_handler()
+            .read_json_files_with_cancellation(
+                &commit_files,
+                schema,
+                None,
+                cancellation_token.cloned(),
+            )?
+            .map_ok(|batch| ActionsBatch::new(batch, true));
+        Ok(actions)
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
@@ -889,7 +909,9 @@ impl LogSegment {
             return Ok(None);
         };
         let version = self.checkpoint_version.ok_or_else(|| {
-            Error::generic("Checkpoint hint sidecars require a selected checkpoint version")
+            Error::invalid_checkpoint(
+                "Checkpoint hint sidecars require a selected checkpoint version",
+            )
         })?;
         let version = crate::version_as_i64(version)?;
         sidecars
@@ -1151,7 +1173,7 @@ impl LogSegment {
                     cancellation_token.cloned(),
                 )?,
             Some(parsed_log_path) => {
-                return Err(Error::generic(format!(
+                return Err(Error::invalid_checkpoint(format!(
                     "Unsupported checkpoint file type: {}",
                     parsed_log_path.extension,
                 )));
@@ -1336,13 +1358,17 @@ impl LogSegment {
     }
 
     pub(crate) fn validate_published(&self) -> DeltaResult<()> {
-        require!(
-            self.listed
-                .max_published_version
-                .is_some_and(|v| v == self.end_version),
-            Error::generic("Log segment is not published")
-        );
-        Ok(())
+        match self.listed.max_published_version {
+            Some(version) if version == self.end_version => Ok(()),
+            Some(version) if version < self.end_version => {
+                Err(Error::UnpublishedVersion(version + 1))
+            }
+            Some(version) => Err(Error::invalid_log_segment(format!(
+                "publication watermark {version} exceeds log segment end version {}",
+                self.end_version
+            ))),
+            None => Err(Error::UnpublishedVersion(0)),
+        }
     }
 
     /// Schema to read just the sidecar column from a checkpoint file.
@@ -1502,12 +1528,13 @@ impl LogSegment {
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
     for (i, f) in compactions.iter().enumerate() {
         let LogPathFileType::CompactedCommit { hi } = f.file_type else {
-            return Err(Error::generic(
-                "ascending_compaction_files contains non-compaction file",
-            ));
+            return Err(Error::invalid_log_segment(format!(
+                "ascending_compaction_files contains non-compaction file type: {:?}",
+                f.file_type
+            )));
         };
         if f.version > hi {
-            return Err(Error::generic(format!(
+            return Err(Error::invalid_log_segment(format!(
                 "compaction file has start version {} > end version {}",
                 f.version, hi
             )));
@@ -1517,12 +1544,27 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
             // CompactedCommit since the type error will be caught then.
             if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
                 if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
-                    return Err(Error::generic(format!(
+                    return Err(Error::invalid_log_segment(format!(
                         "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
                     )));
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_log_path_fields(listed_files: &LogSegmentFiles) -> DeltaResult<()> {
+    for path in listed_files.iter_all_paths() {
+        let reparsed = ParsedLogPath::try_from(path.location.clone())?
+            .ok_or_else(|| Error::invalid_log_path(path.location.location.as_str()))?;
+        require!(
+            reparsed == *path,
+            Error::invalid_log_path(format!(
+                "Parsed log path fields do not match its location: {}",
+                path.location.location
+            ))
+        );
     }
     Ok(())
 }
@@ -1533,26 +1575,53 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
     }
     let n = parts.len();
     let first_version = parts[0].version;
+    let mut seen_part_numbers = vec![false; n];
     for p in parts {
         if !p.is_checkpoint() {
-            return Err(Error::generic(
+            return Err(Error::invalid_checkpoint(
                 "checkpoint_parts contains non-checkpoint file",
             ));
         }
         if p.version != first_version {
-            return Err(Error::generic(
+            return Err(Error::invalid_checkpoint(
                 "multi-part checkpoint parts have different versions",
             ));
         }
         match p.file_type {
-            LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts as usize == n => {}
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts,
+            } if num_parts >= 2 && num_parts as usize == n => {
+                let index = usize::try_from(part_num)
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                    .filter(|index| *index < num_parts as usize)
+                    .ok_or_else(|| {
+                        Error::invalid_checkpoint(format!(
+                            "multi-part checkpoint part number {part_num} is outside 1..={num_parts}"
+                        ))
+                    })?;
+                require!(
+                    !seen_part_numbers[index],
+                    Error::invalid_checkpoint(format!(
+                        "multi-part checkpoint contains duplicate part number {part_num}"
+                    ))
+                );
+                seen_part_numbers[index] = true;
+            }
+            // The protocol requires p > 1; path parsing only validates 1 <= part_num <= p.
+            LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts < 2 => {
+                return Err(Error::invalid_checkpoint(format!(
+                    "multi-part checkpoint must contain at least two parts but num_parts field says {num_parts}"
+                )));
+            }
             LogPathFileType::MultiPartCheckpoint { num_parts, .. } => {
-                return Err(Error::generic(format!(
+                return Err(Error::invalid_checkpoint(format!(
                     "multi-part checkpoint part count mismatch: slice has {n} parts but num_parts field says {num_parts}"
                 )));
             }
             _ if n > 1 => {
-                return Err(Error::generic(format!(
+                return Err(Error::invalid_checkpoint(format!(
                     "multi-part checkpoint part count mismatch: expected {n} multi-part checkpoint files but got a non-multi-part checkpoint"
                 )));
             }
@@ -1565,7 +1634,7 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
 fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for f in commits {
         if !f.is_commit() {
-            return Err(Error::generic(
+            return Err(Error::invalid_log_segment(
                 "ascending_commit_files contains non-commit file",
             ));
         }
@@ -1573,13 +1642,29 @@ fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     Ok(())
 }
 
+fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+    if let Some(pair) = commits
+        .windows(2)
+        .find(|pair| pair[0].version >= pair[1].version)
+    {
+        return Err(Error::invalid_log_segment(format!(
+            "ascending_commit_files is not sorted: {:?} -> {:?}",
+            pair[0], pair[1]
+        )));
+    }
+    Ok(())
+}
+
 fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     for pair in commits.windows(2) {
-        if pair[0].version + 1 != pair[1].version {
-            return Err(Error::generic(format!(
-                "Expected contiguous commit files, but found gap: {:?} -> {:?}",
-                pair[0], pair[1]
+        let Some(expected_version) = pair[0].version.checked_add(1) else {
+            return Err(Error::invalid_log_segment(format!(
+                "Expected contiguous commit files, but the version after {:?} overflows",
+                pair[0]
             )));
+        };
+        if expected_version != pair[1].version {
+            return Err(Error::MissingVersion(expected_version));
         }
     }
     Ok(())
@@ -1595,12 +1680,15 @@ fn validate_checkpoint_commit_gap(
     commits: &[ParsedLogPath],
 ) -> DeltaResult<()> {
     if let (Some(checkpoint_version), Some(first_commit)) = (checkpoint_version, commits.first()) {
+        let Some(expected_version) = checkpoint_version.checked_add(1) else {
+            return Err(Error::invalid_checkpoint(format!(
+                "checkpoint version {checkpoint_version} is the maximum supported version and \
+                 cannot have a subsequent commit"
+            )));
+        };
         require!(
-            checkpoint_version + 1 == first_commit.version,
-            Error::InvalidCheckpoint(format!(
-                "Gap between checkpoint version {checkpoint_version} and next commit {}",
-                first_commit.version
-            ))
+            expected_version == first_commit.version,
+            Error::MissingVersion(expected_version)
         );
     }
     Ok(())
@@ -1620,15 +1708,17 @@ fn validate_end_version(
     let effective_version = commits
         .last()
         .or(checkpoint_parts.first())
-        .ok_or(Error::generic("No files in log segment"))?
+        .ok_or(Error::EmptyLog)?
         .version;
     if let Some(end_version) = end_version {
-        require!(
-            effective_version == end_version,
-            Error::generic(format!(
-                "LogSegment end version {effective_version} not the same as the specified end version {end_version}"
-            ))
-        );
+        if effective_version < end_version {
+            return Err(Error::MissingVersion(effective_version + 1));
+        }
+        if effective_version > end_version {
+            return Err(Error::invalid_log_segment(format!(
+                "effective version {effective_version} is newer than requested end version {end_version}"
+            )));
+        }
     }
     Ok(effective_version)
 }
@@ -1641,6 +1731,8 @@ fn validate_latest_commit_file(
     listed: &LogSegmentFiles,
     effective_version: Version,
 ) -> DeltaResult<()> {
+    // TODO(#3293): Determine whether every non-empty commit list can require `latest_commit_file`;
+    // legacy callers may omit it.
     require!(
         listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
         Error::internal_error(
@@ -1669,6 +1761,10 @@ fn validate_crc(
     let Some(crc) = crc else {
         return Ok(());
     };
+    require!(
+        crc.file_type == LogPathFileType::Crc,
+        Error::invalid_log_path("latest_crc_file contains a non-CRC path")
+    );
     if let Some(checkpoint_version) = checkpoint_version {
         require!(
             crc.version >= checkpoint_version,

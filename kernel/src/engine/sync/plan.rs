@@ -40,7 +40,10 @@ use crate::plans::ir::nodes::{
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
-use crate::{DeltaResult, Error, EvaluationHandler as _, FileMeta, StorageHandler as _};
+use crate::{
+    DeltaResult, DeltaResultIteratorStatic, Error, EvaluationHandler as _, FileMeta,
+    StorageHandler as _,
+};
 
 /// A synchronous, test-only [`PlanExecutor`].
 ///
@@ -206,7 +209,7 @@ impl SyncPlanExecutor {
             let metas = [file.meta.clone()];
             let read_schema = read_schema.clone();
             // The two constructors have distinct `impl Iterator` types, so box to unify the arms.
-            let data: Box<dyn Iterator<Item = DeltaResult<ArrowEngineData>>> = match file_type {
+            let data: DeltaResultIteratorStatic<ArrowEngineData> = match file_type {
                 FileType::Json => Box::new(read_files_arrow(
                     store,
                     &metas,

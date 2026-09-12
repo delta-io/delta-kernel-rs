@@ -1,3 +1,4 @@
+use delta_kernel::snapshot::SnapshotHintError;
 use delta_kernel::{DeltaResult, Error};
 use tracing::warn;
 
@@ -66,13 +67,16 @@ pub enum KernelError {
     ChangeDataFeedUnsupported = 37,
     ChangeDataFeedIncompatibleSchema = 38,
     InvalidCheckpoint = 39,
-    LiteralExpressionTransformError = 40,
     CheckpointWriteError = 41,
     SchemaError = 42,
     LogHistoryError = 43,
     RowTrackingChangeFeedUnsupported = 44,
     CancelledError = 45,
     InvalidTransactionStateError = 46,
+    InvalidLogSegment = 47,
+    UnpublishedVersionError = 48,
+    EmptyLogError = 49,
+    InvalidSnapshotHint = 50,
 }
 
 impl From<Error> for KernelError {
@@ -87,7 +91,7 @@ impl From<Error> for KernelError {
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
             Error::MaxCatalogVersion(_) => KernelError::GenericError,
-            Error::LogTailVersionsNotContiguous { .. } => KernelError::GenericError,
+            Error::LogTailVersionsNotContiguous { .. } => KernelError::InvalidLogSegment,
             Error::IOError(_) => KernelError::IOErrorError,
             #[cfg(feature = "default-engine-base")]
             Error::Parquet(_) => KernelError::ParquetError,
@@ -101,7 +105,9 @@ impl From<Error> for KernelError {
             Error::MissingColumn(_) => KernelError::MissingColumnError,
             Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
             Error::MissingData(_) => KernelError::MissingDataError,
-            Error::MissingVersion => KernelError::MissingVersionError,
+            Error::EmptyLog => KernelError::EmptyLogError,
+            Error::MissingVersion(_) => KernelError::MissingVersionError,
+            Error::UnpublishedVersion(_) => KernelError::UnpublishedVersionError,
             Error::DeletionVector(_) => KernelError::DeletionVectorError,
             Error::InvalidUrl(_) => KernelError::InvalidUrlError,
             Error::MalformedJson(_) => KernelError::MalformedJsonError,
@@ -124,6 +130,8 @@ impl From<Error> for KernelError {
             } => Self::from(*source),
             Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
             Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
+            Error::InvalidLogSegment(_) => KernelError::InvalidLogSegment,
+            Error::SnapshotHint(_) => KernelError::InvalidSnapshotHint,
             Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
@@ -135,9 +143,6 @@ impl From<Error> for KernelError {
                 KernelError::ChangeDataFeedIncompatibleSchema
             }
             Error::InvalidCheckpoint(_) => KernelError::InvalidCheckpoint,
-            Error::LiteralExpressionTransformError(_) => {
-                KernelError::LiteralExpressionTransformError
-            }
             Error::Schema(_) => KernelError::SchemaError,
             Error::InvalidTransactionState(_) => KernelError::InvalidTransactionStateError,
             Error::LogHistory(_) => KernelError::LogHistoryError,
@@ -315,14 +320,18 @@ impl From<EngineExecError> for Error {
             KernelError::InvalidStructDataError => Error::InvalidStructData(message),
             KernelError::InvalidExpression => Error::InvalidExpressionEvaluation(message),
             KernelError::InvalidLogPath => Error::InvalidLogPath(message),
+            KernelError::InvalidLogSegment => Error::InvalidLogSegment(message),
+            KernelError::InvalidSnapshotHint => SnapshotHintError::Connector {
+                message,
+                source: None,
+            }
+            .into(),
             KernelError::FileAlreadyExists => Error::FileAlreadyExists(message),
             KernelError::UnsupportedError => Error::Unsupported(message),
             KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
             KernelError::SchemaError => Error::Schema(message),
             KernelError::InvalidTransactionStateError => Error::InvalidTransactionState(message),
-            code @ KernelError::MissingVersionError => {
-                messageless_error(code, message, Error::MissingVersion)
-            }
+            code @ KernelError::EmptyLogError => messageless_error(code, message, Error::EmptyLog),
             code @ KernelError::MissingMetadataError => {
                 messageless_error(code, message, Error::MissingMetadata)
             }
@@ -352,8 +361,9 @@ impl From<EngineExecError> for Error {
             | KernelError::ChangeDataFeedUnsupported
             | KernelError::ChangeDataFeedIncompatibleSchema
             | KernelError::RowTrackingChangeFeedUnsupported
-            | KernelError::LiteralExpressionTransformError
-            | KernelError::LogHistoryError) => {
+            | KernelError::LogHistoryError
+            | KernelError::MissingVersionError
+            | KernelError::UnpublishedVersionError) => {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
             }
             #[cfg(feature = "default-engine-base")]
@@ -372,6 +382,11 @@ impl From<EngineExecError> for Error {
 mod error_code_tests {
     use super::*;
 
+    fn exec_error(etype: KernelError, message: &str) -> EngineExecError {
+        let message: Handle<ExclusiveRustString> = Box::new(message.to_string()).into();
+        EngineExecError { etype, message }
+    }
+
     #[test]
     fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
         assert_eq!(
@@ -379,6 +394,67 @@ mod error_code_tests {
             KernelError::RowTrackingChangeFeedUnsupported
         );
         assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
+    }
+
+    #[test]
+    fn log_segment_errors_have_stable_ffi_mappings() {
+        let missing_version = Error::MissingVersion(7);
+        assert_eq!(
+            missing_version.to_string(),
+            "Table version 7 is missing or unavailable for this log operation."
+        );
+        assert_eq!(
+            KernelError::from(missing_version),
+            KernelError::MissingVersionError
+        );
+        assert_eq!(
+            KernelError::from(Error::EmptyLog),
+            KernelError::EmptyLogError
+        );
+        assert_eq!(
+            KernelError::from(Error::UnpublishedVersion(7)),
+            KernelError::UnpublishedVersionError
+        );
+        assert_eq!(
+            KernelError::from(Error::InvalidLogSegment("invalid".to_string())),
+            KernelError::InvalidLogSegment
+        );
+        assert_eq!(
+            KernelError::from(Error::LogTailVersionsNotContiguous {
+                first_version: 1,
+                second_version: 3,
+            }),
+            KernelError::InvalidLogSegment
+        );
+        assert_eq!(KernelError::InvalidLogSegment as i32, 47);
+        assert_eq!(KernelError::UnpublishedVersionError as i32, 48);
+        assert_eq!(KernelError::EmptyLogError as i32, 49);
+    }
+
+    #[test]
+    fn engine_log_segment_errors_use_supported_ffi_mappings() {
+        let missing_version: Error = exec_error(KernelError::MissingVersionError, "7").into();
+        assert!(matches!(
+            missing_version,
+            Error::Generic(message)
+                if message == "engine execution error (MissingVersionError): 7"
+        ));
+
+        let empty_log: Error = exec_error(KernelError::EmptyLogError, "").into();
+        assert_eq!(empty_log.to_string(), "No table version found.");
+        assert!(matches!(empty_log, Error::EmptyLog));
+    }
+
+    #[test]
+    fn invalid_snapshot_hint_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            KernelError::from(Error::from(SnapshotHintError::Connector {
+                message: "invalid".to_string(),
+                source: None,
+            })),
+            KernelError::InvalidSnapshotHint
+        );
+        assert_eq!(KernelError::InvalidSnapshotHint as i32, 50);
     }
 }
 
@@ -393,16 +469,17 @@ mod tests {
         EngineExecError { etype, message }
     }
 
-    /// Each code should translate into its matching kernel error variant (preserving the message),
-    /// unit variants drop the message, and unmapped codes fall back to a generic error that retains
-    /// both the original code and message.
+    /// Variants that cannot preserve their original message across FFI reconstruct from their
+    /// default `Display`; unmapped codes retain the original code and message.
     #[rstest]
     #[case::file_not_found(KernelError::FileNotFoundError, "File not found: boom")]
     #[case::schema(KernelError::SchemaError, "Schema error: boom")]
     #[case::unsupported(KernelError::UnsupportedError, "Unsupported: boom")]
     #[case::generic(KernelError::GenericError, "Generic delta kernel error: boom")]
     #[case::invalid_expr(KernelError::InvalidExpression, "Invalid expression evaluation: boom")]
-    #[case::unit_missing_version(KernelError::MissingVersionError, "No table version found.")]
+    #[case::invalid_log_segment(KernelError::InvalidLogSegment, "Invalid log segment: boom")]
+    #[case::empty_log(KernelError::EmptyLogError, "No table version found.")]
+    #[case::invalid_snapshot_hint(KernelError::InvalidSnapshotHint, "Invalid snapshot hint: boom")]
     #[case::fallback_io(
         KernelError::IOErrorError,
         "Generic delta kernel error: engine execution error (IOErrorError): boom"
@@ -410,6 +487,14 @@ mod tests {
     #[case::fallback_row_tracking(
         KernelError::RowTrackingChangeFeedUnsupported,
         "Generic delta kernel error: engine execution error (RowTrackingChangeFeedUnsupported): boom"
+    )]
+    #[case::fallback_missing_version(
+        KernelError::MissingVersionError,
+        "Generic delta kernel error: engine execution error (MissingVersionError): boom"
+    )]
+    #[case::fallback_unpublished_version(
+        KernelError::UnpublishedVersionError,
+        "Generic delta kernel error: engine execution error (UnpublishedVersionError): boom"
     )]
     fn engine_exec_error_maps_kernel_error_code(
         #[case] etype: KernelError,

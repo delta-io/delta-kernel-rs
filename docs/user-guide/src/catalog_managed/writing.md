@@ -67,8 +67,10 @@ let mut txn = snapshot
 // Drive your Parquet writer from the write context, then hand the resulting
 // add-file metadata batch to the transaction. See the
 // [Appending data](../writing/append.md) how-to for the full Parquet-writing flow.
+// This example writes to an unpartitioned table. For a partitioned table, call
+// with_partition_values(...) before build().
 let write_state = txn.write_state()?;
-let write_context = write_state.unpartitioned_write_context()?;
+let write_context = write_state.write_context_builder().build()?;
 // ... use write_context to produce add_metadata: Box<dyn EngineData>
 //     matching txn.add_files_schema() ...
 txn.add_files(add_metadata);

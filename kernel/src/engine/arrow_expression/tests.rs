@@ -33,7 +33,6 @@ use crate::schema::{
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
-use crate::EvaluationHandlerExtension as _;
 
 #[test]
 fn test_array_column() {
@@ -768,7 +767,7 @@ fn test_opaque() {
 }
 
 #[test]
-fn test_null_row() {
+fn test_create_many_all_null_row() {
     // note that we _allow_ nested nulls, since the top-level struct can be NULL
     let schema = schema_ref! {
         nullable "x": {
@@ -778,7 +777,11 @@ fn test_null_row() {
         nullable "c": STRING,
     };
     let handler = ArrowEvaluationHandler;
-    let result = handler.null_row(schema.clone()).unwrap();
+    let row: Vec<Scalar> = schema
+        .fields()
+        .map(|f| Scalar::null(f.data_type().clone()))
+        .collect();
+    let result = handler.create_many(schema.clone(), vec![row]).unwrap();
     let expected = RecordBatch::try_new(
         Arc::new(schema.as_ref().try_into_arrow().unwrap()),
         vec![
@@ -800,181 +803,15 @@ fn test_null_row() {
 }
 
 #[test]
-fn test_null_row_err() {
+fn test_create_many_rejects_null_in_non_nullable_field() {
     let not_null_schema = schema_ref! {
         not_null "a": STRING,
     };
     let handler = ArrowEvaluationHandler;
+    let row = vec![Scalar::null(KernelDataType::STRING)];
     assert_result_error_with_message(
-        handler.null_row(not_null_schema),
+        handler.create_many(not_null_schema, vec![row]),
         "Invalid argument error: Column 'a' is declared as non-nullable but contains null values",
-    );
-}
-
-// helper to take values/schema to pass to `create_one` and assert the result = expected
-fn assert_create_one(values: &[Scalar], schema: SchemaRef, expected: RecordBatch) {
-    let handler = ArrowEvaluationHandler;
-    let actual = handler.create_one(schema, values).unwrap();
-    let actual_rb = actual.try_into_record_batch().unwrap();
-    assert_eq!(actual_rb, expected);
-}
-
-#[test]
-fn test_create_one() {
-    let values: &[Scalar] = &[
-        1.into(),
-        "B".into(),
-        3.into(),
-        Scalar::Null(KernelDataType::INTEGER),
-    ];
-    let schema = schema_ref! {
-        nullable "a": INTEGER,
-        nullable "b": STRING,
-        not_null "c": INTEGER,
-        nullable "d": INTEGER,
-    };
-
-    let expected_schema = Arc::new(Schema::new(vec![
-        Field::new("a", DataType::Int32, true),
-        Field::new("b", DataType::Utf8, true),
-        Field::new("c", DataType::Int32, false),
-        Field::new("d", DataType::Int32, true),
-    ]));
-    let expected = RecordBatch::try_new(
-        expected_schema,
-        vec![
-            create_array!(Int32, [1]),
-            create_array!(Utf8, ["B"]),
-            create_array!(Int32, [3]),
-            create_array!(Int32, [None]),
-        ],
-    )
-    .unwrap();
-    assert_create_one(values, schema, expected);
-}
-
-#[test]
-fn test_create_one_nested() {
-    let values: &[Scalar] = &[1.into(), 2.into()];
-    let schema = schema_ref! {
-        not_null "a": {
-            nullable "b": INTEGER,
-            not_null "c": INTEGER,
-        },
-    };
-    let expected_schema = Arc::new(Schema::new(vec![Field::new(
-        "a",
-        DataType::Struct(
-            vec![
-                Field::new("b", DataType::Int32, true),
-                Field::new("c", DataType::Int32, false),
-            ]
-            .into(),
-        ),
-        false,
-    )]));
-    let expected = RecordBatch::try_new(
-        expected_schema,
-        vec![Arc::new(StructArray::from(vec![
-            (
-                Arc::new(Field::new("b", DataType::Int32, true)),
-                create_array!(Int32, [1]) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("c", DataType::Int32, false)),
-                create_array!(Int32, [2]) as ArrayRef,
-            ),
-        ]))],
-    )
-    .unwrap();
-    assert_create_one(values, schema, expected);
-}
-
-#[test]
-fn test_create_one_nested_null() {
-    let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
-    let schema = schema_ref! {
-        not_null "a": {
-            nullable "b": INTEGER,
-            not_null "c": INTEGER,
-        },
-    };
-    let expected_schema = Arc::new(Schema::new(vec![Field::new(
-        "a",
-        DataType::Struct(
-            vec![
-                Field::new("b", DataType::Int32, true),
-                Field::new("c", DataType::Int32, false),
-            ]
-            .into(),
-        ),
-        false,
-    )]));
-    let expected = RecordBatch::try_new(
-        expected_schema,
-        vec![Arc::new(StructArray::from(vec![
-            (
-                Arc::new(Field::new("b", DataType::Int32, true)),
-                create_array!(Int32, [None]) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("c", DataType::Int32, false)),
-                create_array!(Int32, [1]) as ArrayRef,
-            ),
-        ]))],
-    )
-    .unwrap();
-    assert_create_one(values, schema, expected);
-}
-
-#[test]
-fn test_create_one_mismatching_scalar_types() {
-    // Scalar is a LONG but schema specifies INTEGER
-    let values: &[Scalar] = &[Scalar::Long(10)];
-    let schema = schema_ref! {
-        not_null "version": INTEGER,
-    };
-    let handler = ArrowEvaluationHandler;
-    assert_result_error_with_message(
-        handler.create_one(schema, values),
-        "Schema error: Mismatched scalar type while creating Expression: expected Integer, got Long",
-    );
-}
-
-#[test]
-fn test_create_one_not_null_struct() {
-    // Creating a NOT NULL struct field with null values should error.
-    // The error comes from Arrow's RecordBatch validation (non-nullable column has nulls).
-    let values: &[Scalar] = &[
-        Scalar::Null(KernelDataType::INTEGER),
-        Scalar::Null(KernelDataType::INTEGER),
-    ];
-    let schema = schema_ref! {
-        not_null "a": {
-            not_null "b": INTEGER,
-            nullable "c": INTEGER,
-        },
-    };
-    let handler = ArrowEvaluationHandler;
-    assert_result_error_with_message(
-        handler.create_one(schema, values),
-        "Column 'a' is declared as non-nullable but contains null values",
-    );
-}
-
-#[test]
-fn test_create_one_top_level_null() {
-    // Creating a NOT NULL field with null value should error.
-    // The error comes from Arrow's RecordBatch validation.
-    let values = &[Scalar::Null(KernelDataType::INTEGER)];
-    let handler = ArrowEvaluationHandler;
-
-    let schema = schema_ref! {
-        not_null "col_1": INTEGER,
-    };
-    assert_result_error_with_message(
-        handler.create_one(schema, values),
-        "Column 'col_1' is declared as non-nullable but contains null values",
     );
 }
 
@@ -1292,7 +1129,7 @@ fn test_evaluator_mixed_string_types_struct_expression() {
 }
 
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`
-fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBatch) {
+fn assert_create_many(rows: Vec<Vec<Scalar>>, schema: SchemaRef, expected: RecordBatch) {
     let handler = ArrowEvaluationHandler;
     let actual = handler.create_many(schema, rows).unwrap();
     let actual_rb = actual.try_into_record_batch().unwrap();
@@ -1301,9 +1138,9 @@ fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBat
 
 #[test]
 fn test_create_many_multiple_rows() {
-    let row1: &[Scalar] = &[1.into(), "A".into()];
-    let row2: &[Scalar] = &[2.into(), "B".into()];
-    let row3: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), "C".into()];
+    let row1 = vec![1.into(), "A".into()];
+    let row2 = vec![2.into(), "B".into()];
+    let row3 = vec![Scalar::Null(KernelDataType::INTEGER), "C".into()];
     let schema = schema_ref! {
         nullable "id": INTEGER,
         nullable "name": STRING,
@@ -1320,7 +1157,7 @@ fn test_create_many_multiple_rows() {
         ],
     )
     .unwrap();
-    assert_create_many(&[row1, row2, row3], schema, expected);
+    assert_create_many(vec![row1, row2, row3], schema, expected);
 }
 
 #[test]
@@ -1330,7 +1167,7 @@ fn test_create_many_empty_rows_returns_zero_row_batch() {
         nullable "b": STRING,
     };
     let handler = ArrowEvaluationHandler;
-    let result = handler.create_many(schema.clone(), &[]).unwrap();
+    let result = handler.create_many(schema.clone(), vec![]).unwrap();
     assert_eq!(result.len(), 0);
     let rb = result.try_into_record_batch().unwrap();
     assert_eq!(rb.num_rows(), 0);
@@ -1344,10 +1181,10 @@ fn test_create_many_wrong_field_count_returns_error() {
         nullable "b": STRING,
     };
     // Row has 3 scalars but schema has 2 fields
-    let bad_row: &[Scalar] = &[1.into(), "x".into(), 99.into()];
+    let bad_row = vec![1.into(), "x".into(), 99.into()];
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
-        handler.create_many(schema, &[bad_row]),
+        handler.create_many(schema, vec![bad_row]),
         "Row 0 has 3 scalars but schema has 2 fields",
     );
 }
@@ -1359,40 +1196,13 @@ fn test_create_many_wrong_field_type_returns_error() {
         nullable "b": STRING,
     };
     // Row 1 passes a Long where an Integer is expected for field "a"
-    let good_row: &[Scalar] = &[1.into(), "x".into()];
-    let bad_row: &[Scalar] = &[1i64.into(), "y".into()];
+    let good_row = vec![1.into(), "x".into()];
+    let bad_row = vec![1i64.into(), "y".into()];
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
-        handler.create_many(schema, &[good_row, bad_row]),
+        handler.create_many(schema, vec![good_row, bad_row]),
         "Row 1, field 'a' (expected type integer, got long): Invalid expression evaluation: Invalid builder for long",
     );
-}
-
-#[test]
-fn test_create_many_single_row_matches_create_one() {
-    // create_many with one row should produce the same result as create_one
-    let values: &[Scalar] = &[
-        1.into(),
-        "hello".into(),
-        Scalar::Null(KernelDataType::INTEGER),
-    ];
-    let schema = schema_ref! {
-        nullable "a": INTEGER,
-        nullable "b": STRING,
-        nullable "c": INTEGER,
-    };
-    let handler = ArrowEvaluationHandler;
-    let from_one = handler
-        .create_one(schema.clone(), values)
-        .unwrap()
-        .try_into_record_batch()
-        .unwrap();
-    let from_many = handler
-        .create_many(schema, &[values])
-        .unwrap()
-        .try_into_record_batch()
-        .unwrap();
-    assert_eq!(from_one, from_many);
 }
 
 #[test]
@@ -1408,7 +1218,7 @@ fn test_create_many_nested_struct() {
     };
 
     // Row 1: inner = Struct { x: 10, y: "hello" }, flag = true
-    let row1: &[Scalar] = &[
+    let row1 = vec![
         Scalar::Struct(
             crate::expressions::StructData::try_new(
                 vec![
@@ -1422,7 +1232,7 @@ fn test_create_many_nested_struct() {
         true.into(),
     ];
     // Row 2: inner = null struct, flag = false
-    let row2: &[Scalar] = &[Scalar::Null(inner_type), false.into()];
+    let row2 = vec![Scalar::Null(inner_type), false.into()];
 
     let arrow_inner_fields: Fields = vec![
         Field::new("x", DataType::Int32, true),
@@ -1449,7 +1259,7 @@ fn test_create_many_nested_struct() {
         vec![inner_col, create_array!(Boolean, [true, false])],
     )
     .unwrap();
-    assert_create_many(&[row1, row2], schema, expected);
+    assert_create_many(vec![row1, row2], schema, expected);
 }
 
 #[test]

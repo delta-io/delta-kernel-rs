@@ -554,7 +554,7 @@ fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
     let skipping = as_sql_data_skipping_predicate_with_stats_columns(
         pred,
         &partition_column_names,
-        &state.physical_stats_columns,
+        &state.eligible_physical_stats_columns,
     )?;
     // A null skipping verdict means the available metadata cannot prove the file is skippable.
     let skipping = Predicate::distinct(skipping, lit(false));
