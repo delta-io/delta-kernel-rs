@@ -1221,4 +1221,16 @@ fn test_decimal_from_bytes_sign_extends_negative_stats() {
         decimal_from_bytes(Some(&[0x01]), dtype),
         Some(Scalar::decimal(1, 38, 3).unwrap())
     );
+
+    // Empty slice: no most-significant byte, treated as non-negative, decodes to 0.
+    assert_eq!(
+        decimal_from_bytes(Some(&[]), dtype),
+        Some(Scalar::decimal(0, 38, 3).unwrap())
+    );
+
+    // Full 16-byte negative value: resize is a no-op, sign already present.
+    assert_eq!(
+        decimal_from_bytes(Some(&(-1i128).to_be_bytes()), dtype),
+        Some(Scalar::decimal(-1, 38, 3).unwrap())
+    );
 }
