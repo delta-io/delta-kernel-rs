@@ -93,6 +93,37 @@ test_release_command_dispatch() {
     if (
         # shellcheck source=release.sh
         source "$REPOSITORY_ROOT/release.sh"
+        main verify-changelog 0.29.0 extra
+    ) > "$failure_log" 2>&1; then
+        fail "verify-changelog unexpectedly accepted an extra argument"
+    fi
+    assert_contains "$failure_log" "verify-changelog [version]"
+
+    if (
+        # shellcheck source=release.sh
+        source "$REPOSITORY_ROOT/release.sh"
+        check_requirements() { :; }
+        is_main_branch() { return 0; }
+        main release 0.29.0
+    ) > "$failure_log" 2>&1; then
+        fail "main-branch release unexpectedly accepted a version"
+    fi
+    assert_contains "$failure_log" "Version argument not expected on main branch"
+
+    if (
+        # shellcheck source=release.sh
+        source "$REPOSITORY_ROOT/release.sh"
+        check_requirements() { :; }
+        is_main_branch() { return 1; }
+        main release
+    ) > "$failure_log" 2>&1; then
+        fail "release-branch release unexpectedly omitted its version"
+    fi
+    assert_contains "$failure_log" "Version argument required when on release branch"
+
+    if (
+        # shellcheck source=release.sh
+        source "$REPOSITORY_ROOT/release.sh"
         run_cargo_release() { :; }
         verify_release_changelog() { return 1; }
         handle_release_branch 0.29.0
@@ -112,7 +143,7 @@ commit_file() {
 test_changelog_refresh_and_verification() {
     local repository="$TEST_ROOT/repository"
     local failing_bin="$TEST_ROOT/failing-bin"
-    local bullet_backup="$TEST_ROOT/changelog-before-bullet-removal"
+    local section_backup="$TEST_ROOT/changelog-before-section-edit"
     local saved_changelog="$TEST_ROOT/changelog-before-failure"
     local backup refresh_log failure_backup
     mkdir -p "$repository"
@@ -228,7 +259,7 @@ test_changelog_refresh_and_verification() {
     assert_contains CHANGELOG.md "Previous release notes"
     ./release.sh verify-changelog 0.29.0
 
-    cp CHANGELOG.md "$bullet_backup"
+    cp CHANGELOG.md "$section_backup"
     sed -i '/Include late change/d' CHANGELOG.md
     if ./release.sh verify-changelog 0.29.0 > missing-bullet.log 2>&1; then
         fail "verification unexpectedly passed with a missing changelog bullet"
@@ -237,7 +268,17 @@ test_changelog_refresh_and_verification() {
     if grep -Fq "missing the link reference for PR #102" missing-bullet.log; then
         fail "verification treated the retained PR reference as missing"
     fi
-    cp "$bullet_backup" CHANGELOG.md
+    cp "$section_backup" CHANGELOG.md
+
+    sed -i '/^\[#102\]: /d' CHANGELOG.md
+    if ./release.sh verify-changelog 0.29.0 > missing-reference.log 2>&1; then
+        fail "verification unexpectedly passed with a missing PR reference"
+    fi
+    assert_contains missing-reference.log "missing the link reference for PR #102"
+    if grep -Fq "missing the changelog entry for PR #102" missing-reference.log; then
+        fail "verification treated the retained changelog bullet as missing"
+    fi
+    cp "$section_backup" CHANGELOG.md
 
     cp CHANGELOG.md "$saved_changelog"
     if PATH="$failing_bin:$PATH" ./release.sh changelog 0.29.0 > refresh-failure.log 2>&1; then
