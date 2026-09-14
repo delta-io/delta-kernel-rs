@@ -191,6 +191,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
+    use crate::schema::StructType;
 
     /// AMT/Iceberg format version stamped on entries; irrelevant to the `Add` output but required
     /// to build a well-formed [`ContentTreeNodeEntry`].
@@ -206,7 +207,7 @@ mod tests {
     ) -> ContentTreeNodeEntry {
         ContentTreeNodeEntry {
             content_type: DataContentType::Data,
-            location: Some(path.to_string()),
+            location: path.to_string(),
             file_format: DataFileFormat::Parquet,
             tracking: TrackingInfo {
                 status: TrackingStatus::Added,
@@ -223,7 +224,7 @@ mod tests {
             partition: None,
             sort_order_id: None,
             record_count: num_records,
-            file_size_in_bytes: Some(size),
+            file_size_in_bytes: size,
             content_stats: None,
             manifest_info: None,
             key_metadata: None,
@@ -236,11 +237,11 @@ mod tests {
 
     /// Builds a content-tree entry batch (input to the read path) from explicit entries.
     fn entry_batch(engine: &dyn Engine, entries: &[ContentTreeNodeEntry]) -> Box<dyn EngineData> {
-        let rows: Vec<StructData> = entries.iter().cloned().map(Into::into).collect();
-        let row_refs: Vec<&[Scalar]> = rows.iter().map(StructData::values).collect();
+        let structs: Vec<StructData> = entries.iter().cloned().map(Into::into).collect();
+        let rows: Vec<Vec<Scalar>> = structs.iter().map(|s| s.values().to_vec()).collect();
         engine
             .evaluation_handler()
-            .create_many(Arc::new(ContentTreeNodeEntry::to_schema()), &row_refs)
+            .create_many(Arc::new(ContentTreeNodeEntry::to_schema()), rows)
             .unwrap()
     }
 
@@ -285,10 +286,9 @@ mod tests {
     }
 
     fn expected_batch(engine: &dyn Engine, rows: &[Vec<Scalar>]) -> Box<dyn EngineData> {
-        let row_refs: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
         engine
             .evaluation_handler()
-            .create_many(LOG_ADD_SCHEMA.clone(), &row_refs)
+            .create_many(LOG_ADD_SCHEMA.clone(), rows.to_vec())
             .unwrap()
     }
 
@@ -357,14 +357,45 @@ mod tests {
         );
     }
 
+    /// [`ContentTreeNodeEntry::to_schema`] with `fileSizeInBytes` marked nullable, preserving its
+    /// field-id metadata. `fileSizeInBytes` is otherwise required, so this lets a test build an
+    /// input batch that carries a null size.
+    fn schema_with_nullable_file_size() -> StructType {
+        let fields: Vec<StructField> = ContentTreeNodeEntry::to_schema()
+            .fields()
+            .map(|f| {
+                if f.name().as_str() == FILE_SIZE_IN_BYTES {
+                    StructField::nullable(f.name(), f.data_type().clone())
+                        .with_metadata(f.metadata().clone())
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        StructType::try_new(fields).unwrap()
+    }
+
     #[test]
     fn null_file_size_becomes_zero() {
         let engine = SyncEngine::new();
-        let mut entry = added_data_entry("a.parquet", 0, 1, 0, 0);
-        entry.file_size_in_bytes = None;
+        // `fileSizeInBytes` is a required entry field, but the read path coalesces a null size to
+        // 0 defensively. A null cannot flow through the struct, so build the batch under a schema
+        // that marks just that column nullable and null out its scalar.
+        let input_schema = Arc::new(schema_with_nullable_file_size());
+        let size_idx = input_schema
+            .fields()
+            .position(|f| f.name().as_str() == FILE_SIZE_IN_BYTES)
+            .expect("fileSizeInBytes field present");
+        let mut row: Vec<Scalar> = StructData::from(added_data_entry("a.parquet", 0, 1, 0, 0))
+            .values()
+            .to_vec();
+        row[size_idx] = Scalar::Null(DataType::LONG);
+        let input = engine
+            .evaluation_handler()
+            .create_many(input_schema, vec![row])
+            .unwrap();
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref())
-                .unwrap(),
+            convert_root_entries_to_add_actions(&engine, input.as_ref()).unwrap(),
         );
         let expected = expected_batch(&engine, &[expected_add_row("a.parquet", 0, 0, 0)]);
         assert_eq!(
