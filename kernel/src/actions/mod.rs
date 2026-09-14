@@ -1062,6 +1062,7 @@ impl Add {
             base_row_id,
             default_row_commit_version,
             clustering_provider,
+            back_reference: None,
         }
     }
 
