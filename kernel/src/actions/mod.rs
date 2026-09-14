@@ -1070,6 +1070,9 @@ pub(crate) struct Remove {
     pub(crate) path: String,
 
     /// The time this logical file was created, as milliseconds since the epoch.
+    ///
+    /// Must be null when adaptiveMetadata is enabled on the table since metadata cleanup
+    /// uses tree reachability instead of timestamp-based expiration.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) deletion_timestamp: Option<i64>,
 
@@ -1077,7 +1080,9 @@ pub(crate) struct Remove {
     /// in the added file must be contained in one or more remove actions in the same version.
     pub(crate) data_change: bool,
 
-    /// When true the fields `partition_values`, `size`, and `tags` are present
+    /// When true, the fields `partition_values` and `size` are present
+    ///
+    /// Must be true when adaptiveMetadata is enabled on the table.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) extended_file_metadata: Option<bool>,
 
@@ -1098,6 +1103,8 @@ pub(crate) struct Remove {
 
     /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this
     /// logical file encoded as a JSON string.
+    ///
+    /// Must be set when adaptiveMetadata is enabled on the table.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
