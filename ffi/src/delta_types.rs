@@ -382,7 +382,7 @@ unsafe fn required_ref<'a, O: ?Sized, T>(
 
 impl FfiStringArray {
     pub(crate) unsafe fn try_to_strings(&self) -> DeltaResult<Vec<String>> {
-        unsafe { self.try_as_slice("string array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_string() })
             .collect()
@@ -391,7 +391,7 @@ impl FfiStringArray {
 
 impl FfiStringMap {
     pub(crate) unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, String>> {
-        let entries = unsafe { self.try_as_slice("string map") }?;
+        let entries = unsafe { self.try_as_slice() }?;
         let mut result = HashMap::with_capacity(entries.len());
         for entry in entries {
             let key = unsafe { entry.key.try_to_string() }?;
@@ -406,7 +406,7 @@ impl FfiStringMap {
 
 impl FfiNullableStringMap {
     pub(crate) unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, Option<String>>> {
-        let entries = unsafe { self.try_as_slice("nullable string map") }?;
+        let entries = unsafe { self.try_as_slice() }?;
         let mut result = HashMap::with_capacity(entries.len());
         for entry in entries {
             let key = unsafe { entry.key.try_to_string() }?;
@@ -514,16 +514,16 @@ impl FfiSidecar {
 impl FfiFileSizeHistogram {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<FileSizeHistogram> {
         FileSizeHistogram::try_new(
-            unsafe { self.sorted_bin_boundaries.try_as_slice("integer array") }?.to_vec(),
-            unsafe { self.file_counts.try_as_slice("integer array") }?.to_vec(),
-            unsafe { self.total_bytes.try_as_slice("integer array") }?.to_vec(),
+            unsafe { self.sorted_bin_boundaries.try_as_slice() }?.to_vec(),
+            unsafe { self.file_counts.try_as_slice() }?.to_vec(),
+            unsafe { self.total_bytes.try_as_slice() }?.to_vec(),
         )
     }
 }
 
 impl FfiSidecarArray {
     unsafe fn try_to_kernel(&self) -> DeltaResult<Vec<Sidecar>> {
-        unsafe { self.try_as_slice("sidecar array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
             .collect()
@@ -554,7 +554,7 @@ impl FfiCheckpointNonFileAction {
 
 impl FfiCheckpointNonFileActionArray {
     unsafe fn try_to_kernel(&self) -> DeltaResult<Vec<HintAction>> {
-        unsafe { self.try_as_slice("non-file action array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
             .collect()
@@ -669,7 +669,7 @@ impl FfiAdd {
 
 impl FfiAddArray {
     unsafe fn try_to_kernel(&self) -> DeltaResult<Vec<Add>> {
-        unsafe { self.try_as_slice("Add action array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
             .collect()
@@ -698,7 +698,7 @@ impl FfiFileStatsState {
 
 impl FfiSetTransactionArray {
     unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, SetTransaction>> {
-        let values = unsafe { self.try_as_slice("set-transaction array") }?;
+        let values = unsafe { self.try_as_slice() }?;
         let mut result = HashMap::with_capacity(values.len());
         for value in values {
             let key = unsafe { value.app_id.try_to_string() }?;
@@ -720,13 +720,14 @@ impl FfiSetTransactionState {
 
 impl FfiDomainMetadataArray {
     unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, DomainMetadata>> {
-        Ok(unsafe { self.try_as_slice("domain-metadata array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
-            .map(|value| unsafe { value.try_to_kernel() })
-            .collect::<DeltaResult<Vec<_>>>()?
-            .into_iter()
-            .map(|value| (value.domain().to_string(), value))
-            .collect())
+            .map(|value| unsafe {
+                value
+                    .try_to_kernel()
+                    .map(|value| (value.domain().to_string(), value))
+            })
+            .collect()
     }
 }
 
@@ -747,11 +748,7 @@ impl FfiDomainMetadataState {
 impl FfiDeletedRecordCountsHistogram {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DeletedRecordCountsHistogram> {
         Ok(DeletedRecordCountsHistogram::from_parts(
-            unsafe {
-                self.deleted_record_counts
-                    .try_as_slice("deleted-record-count histogram")
-            }?
-            .to_vec(),
+            unsafe { self.deleted_record_counts.try_as_slice() }?.to_vec(),
         ))
     }
 }

@@ -117,19 +117,22 @@ impl Iterator for EngineIterator {
 
 /// A borrowed slice passed across the FFI boundary.
 ///
-/// The pointed-to data is valid only for the duration of the call or callback receiving this
-/// value. The receiver must copy any values it needs to retain after returning. For a non-empty
-/// slice, `ptr` must address `len` aligned, initialized values. A zero-length slice is empty
-/// whether `ptr` is null or non-null.
+/// The array and all borrowed storage reachable from its elements are valid only for the receiving
+/// call or callback. The receiver must deep-copy any elements and borrowed payloads it retains. For
+/// a non-empty slice, `ptr` must address `len` aligned, initialized values. A zero-length slice is
+/// empty whether `ptr` is null or non-null.
+///
+/// Note that we _explicitly_ do not implement `Copy` on this struct despite all types being `Copy`,
+/// to avoid accidental misuse of the pointer.
 #[repr(C)]
-pub struct FfiSlice<T: Sized> {
+pub struct FfiSlice<T> {
     /// Pointer to the first element, or any pointer value when `len` is zero.
     pub ptr: *const T,
     /// Number of elements in the slice.
     pub len: usize,
 }
 
-impl<T: Sized> Clone for FfiSlice<T> {
+impl<T> Clone for FfiSlice<T> {
     fn clone(&self) -> Self {
         Self {
             ptr: self.ptr,
@@ -138,7 +141,7 @@ impl<T: Sized> Clone for FfiSlice<T> {
     }
 }
 
-impl<T: Sized> fmt::Debug for FfiSlice<T> {
+impl<T> fmt::Debug for FfiSlice<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FfiSlice")
@@ -148,19 +151,28 @@ impl<T: Sized> fmt::Debug for FfiSlice<T> {
     }
 }
 
-impl<T: Sized> FfiSlice<T> {
-    /// Creates an empty borrowed slice.
-    #[cfg(test)]
-    fn empty() -> Self {
+impl<T> FfiSlice<T> {
+    /// Creates an empty borrowed FFI slice.
+    pub fn empty() -> Self {
         Self {
             ptr: std::ptr::null(),
             len: 0,
         }
     }
 
-    /// Borrows the pointed-to values as a Rust slice.
+    /// Creates a borrowed FFI slice from a source slice.
     ///
-    /// `name` identifies the input in the error returned for a null, non-empty slice.
+    /// # Safety
+    ///
+    /// Caller must guarantee that `source` remains valid for every use of the returned slice.
+    pub(crate) unsafe fn new_unsafe(source: &[T]) -> Self {
+        Self {
+            ptr: source.as_ptr(),
+            len: source.len(),
+        }
+    }
+
+    /// Borrows the pointed-to values as a Rust slice.
     ///
     /// # Errors
     ///
@@ -170,24 +182,38 @@ impl<T: Sized> FfiSlice<T> {
     ///
     /// For nonzero `len`, `ptr` must be aligned and address `len` initialized values. The backing
     /// storage must remain valid for the lifetime of the returned slice.
-    pub(crate) unsafe fn try_as_slice(&self, name: &str) -> DeltaResult<&[T]> {
-        unsafe { try_borrow_raw_slice(self, self.ptr, self.len, name) }
+    pub(crate) unsafe fn try_as_slice(&self) -> DeltaResult<&[T]> {
+        unsafe { try_borrow_raw_slice(self, self.ptr, self.len) }
+    }
+
+    /// Converts this value into a borrowed Rust slice.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must still be valid and reference `len` initialized values.
+    #[cfg(test)]
+    unsafe fn as_ref(&self) -> &[T] {
+        unsafe { self.try_as_slice() }.unwrap()
     }
 }
 
 /// Borrows raw FFI slice parts, tying the result to the owner that stores those parts.
-unsafe fn try_borrow_raw_slice<'a, O: ?Sized, T>(
-    _owner: &'a O,
+///
+/// # Safety
+///
+/// For nonzero `len`, `ptr` must be aligned and address `len` initialized values. The backing
+/// storage must remain valid for the returned borrow.
+unsafe fn try_borrow_raw_slice<O: ?Sized, T>(
+    _owner: &O,
     ptr: *const T,
     len: usize,
-    name: &str,
-) -> DeltaResult<&'a [T]> {
+) -> DeltaResult<&[T]> {
     if len == 0 {
         return Ok(&[]);
     }
     if ptr.is_null() {
         return Err(delta_kernel::Error::generic(format!(
-            "{name} pointer is null with length {len}"
+            "slice pointer is null with length {len}"
         )));
     }
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
@@ -297,54 +323,8 @@ impl KernelBytesSlice {
     }
 }
 
-/// A non-owned slice of signed 64-bit integers intended for passing variable-length arrays across
-/// the FFI boundary.
-///
-/// The pointed-to data is valid only for the duration of the call or callback receiving this
-/// value. The receiver must copy any values it needs to retain after returning.
-#[repr(C)]
-pub struct KernelI64Slice {
-    ptr: *const i64,
-    len: usize,
-}
-
-impl KernelI64Slice {
-    /// Borrows the pointed-to values as a Rust slice.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `len` is nonzero and `ptr` is null.
-    ///
-    /// # Safety
-    ///
-    /// For nonzero `len`, `ptr` must be aligned and address `len` initialized values. The backing
-    /// storage must remain valid for the lifetime of the returned slice.
-    pub(crate) unsafe fn try_as_slice(&self, name: &str) -> DeltaResult<&[i64]> {
-        unsafe { try_borrow_raw_slice(self, self.ptr, self.len, name) }
-    }
-
-    /// Creates a new integer slice from a source slice.
-    ///
-    /// # Safety
-    ///
-    /// Caller must guarantee that `source` remains valid for every use of the returned slice.
-    unsafe fn new_unsafe(source: &[i64]) -> Self {
-        Self {
-            ptr: source.as_ptr(),
-            len: source.len(),
-        }
-    }
-
-    /// Converts this value into a borrowed Rust slice.
-    ///
-    /// # Safety
-    ///
-    /// The pointer must still be valid and reference `len` initialized `i64` values.
-    #[cfg(test)]
-    unsafe fn as_ref(&self) -> &[i64] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-}
+/// A borrowed slice of signed 64-bit integers.
+pub type KernelI64Slice = FfiSlice<i64>;
 
 /// FFI-safe implementation for Rust's `Option<T>`
 #[derive(PartialEq, Debug)]
@@ -1351,9 +1331,8 @@ pub unsafe extern "C" fn snapshot_builder_set_version(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid builder pointer. The log_tail array and its contents must remain valid
-/// for the duration of this call. A null `log_tail.ptr` is treated as an empty slice regardless of
-/// `log_tail.len`; non-null pointers follow the [`FfiSlice`] contract.
+/// Caller must pass a valid builder pointer. The `log_tail` array and its contents must follow the
+/// [`FfiSlice`] contract and remain valid for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_builder_set_log_tail(
     builder: &mut Handle<MutableFfiSnapshotBuilder>,
@@ -1369,7 +1348,7 @@ unsafe fn snapshot_builder_set_log_tail_impl(
     builder: &mut FfiSnapshotBuilder,
     log_tail: log_path::LogPathArray,
 ) -> DeltaResult<bool> {
-    builder.log_tail = unsafe { log_tail.log_paths_treating_null_as_empty() }?;
+    builder.log_tail = unsafe { log_tail.log_paths() }?;
     Ok(true)
 }
 
@@ -2244,24 +2223,24 @@ mod tests {
             len: 1,
         };
 
-        assert!(unsafe { null_empty.try_as_slice("values") }
-            .unwrap()
-            .is_empty());
-        assert!(unsafe { nonnull_empty.try_as_slice("values") }
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            unsafe { nonnull_nonempty.try_as_slice("values") }.unwrap(),
-            &values
-        );
+        assert!(unsafe { null_empty.try_as_slice() }.unwrap().is_empty());
+        assert!(unsafe { nonnull_empty.try_as_slice() }.unwrap().is_empty());
+        assert_eq!(unsafe { nonnull_nonempty.try_as_slice() }.unwrap(), &values);
         assert_result_error_with_message(
-            unsafe { null_nonempty.try_as_slice("values") },
-            "values pointer is null with length 1",
+            unsafe { null_nonempty.try_as_slice() },
+            "slice pointer is null with length 1",
         );
     }
 
     #[test]
-    fn snapshot_builder_log_tail_preserves_null_nonempty_as_empty() {
+    fn log_path_array_empty_constructs_empty_slice() {
+        let empty = log_path::LogPathArray::empty();
+
+        assert!(unsafe { empty.log_paths() }.unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_builder_log_tail_rejects_null_nonempty_pointer() {
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()),
             allocate_err,
@@ -2279,8 +2258,11 @@ mod tests {
         };
 
         unsafe {
-            ok_or_panic(snapshot_builder_set_log_tail(&mut builder, log_tail));
-            assert!(builder.as_mut().log_tail.is_empty());
+            assert_extern_result_error_with_message(
+                snapshot_builder_set_log_tail(&mut builder, log_tail),
+                KernelError::GenericError,
+                Some("Generic delta kernel error: slice pointer is null with length 1"),
+            );
             free_snapshot_builder(builder);
             free_engine(engine);
         }

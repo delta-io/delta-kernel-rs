@@ -15,24 +15,10 @@ impl LogPathArray {
     /// The ptr must point to `len` valid FfiLogPath elements, and those elements
     /// must remain valid for the duration of this call
     pub(crate) unsafe fn log_paths(&self) -> DeltaResult<Vec<LogPath>> {
-        unsafe { self.try_as_slice("log path array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|ffi_path| unsafe { ffi_path.log_path() })
             .collect::<Result<Vec<_>, _>>()
-    }
-
-    /// Converts this array into log paths, treating any null pointer as an empty array.
-    ///
-    /// # Safety
-    ///
-    /// A non-null `ptr` must point to `len` valid [`FfiLogPath`] elements that remain valid for the
-    /// duration of this call.
-    pub(crate) unsafe fn log_paths_treating_null_as_empty(&self) -> DeltaResult<Vec<LogPath>> {
-        if self.ptr.is_null() {
-            Ok(Vec::new())
-        } else {
-            unsafe { self.log_paths() }
-        }
     }
 }
 
