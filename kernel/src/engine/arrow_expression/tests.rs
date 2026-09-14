@@ -13,6 +13,7 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+use crate::engine::arrow_conversion::TryIntoKernel as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
@@ -1333,14 +1334,12 @@ impl TopLevelSchemaMismatch {
 
     fn expected_error(self) -> &'static str {
         match self {
-            Self::MissingField => {
-                "Expected schema field 'b' is missing or out of order in data schema fields"
+            // Validation treats a renamed field as a missing expected field.
+            Self::MissingField | Self::RenamedField => {
+                "Expected schema field 'b' is missing in data schema fields"
             }
             Self::ReorderedFields => {
-                "Expected schema field 'b' is missing or out of order in data schema fields"
-            }
-            Self::RenamedField => {
-                "Expected schema field 'b' is missing or out of order in data schema fields"
+                "Expected schema field 'b' is out of order in data schema fields"
             }
             Self::WrongType => "Expected schema type for 'a' does not match the data schema type",
         }
@@ -1421,7 +1420,14 @@ fn evaluator_accepts_nested_schema_differences() {
     };
     let batch_schema = Schema::new(vec![Field::new(
         "s",
-        DataType::Struct(Fields::empty()),
+        DataType::Struct(
+            vec![Field::new(
+                "unsupported",
+                DataType::Duration(TimeUnit::Second),
+                true,
+            )]
+            .into(),
+        ),
         true,
     )]);
 
@@ -1469,10 +1475,6 @@ fn int_array_element() -> Arc<Field> {
     Arc::new(Field::new("element", DataType::Int32, true))
 }
 
-fn int_string_map_type() -> KernelDataType {
-    MapType::new(KernelDataType::INTEGER, KernelDataType::STRING, true).into()
-}
-
 fn arrow_int_string_map_type() -> DataType {
     let entries = Field::new(
         "entries",
@@ -1488,73 +1490,79 @@ fn arrow_int_string_map_type() -> DataType {
     DataType::Map(Arc::new(entries), false)
 }
 
+#[test]
+fn evaluator_accepts_round_trippable_arrow_representations() {
+    // Each Arrow type maps unambiguously to a Kernel type through `TryIntoKernel`.
+    let arrow_types = [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Int64,
+        DataType::UInt64,
+        DataType::Int32,
+        DataType::UInt32,
+        DataType::Int16,
+        DataType::UInt16,
+        DataType::Int8,
+        DataType::UInt8,
+        DataType::Null,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Boolean,
+        DataType::Binary,
+        DataType::FixedSizeBinary(16),
+        DataType::LargeBinary,
+        DataType::BinaryView,
+        DataType::Decimal128(10, 2),
+        DataType::Date32,
+        DataType::Date64,
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        DataType::Struct(Fields::empty()),
+        DataType::List(int_array_element()),
+        DataType::ListView(int_array_element()),
+        DataType::LargeList(int_array_element()),
+        DataType::LargeListView(int_array_element()),
+        DataType::FixedSizeList(int_array_element(), 3),
+        arrow_int_string_map_type(),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Utf8),
+            )),
+        ),
+    ];
+
+    for data_type in arrow_types {
+        let expected_type = (&data_type).try_into_kernel().unwrap();
+        assert_top_level_type_compatible(expected_type, data_type);
+    }
+}
+
+// Some Kernel types, such as interval types, are not round-trippable through Arrow. This test
+// ensures `validate_data_schema_top_level` accepts their Arrow representations.
 #[rstest]
-#[case::utf8(KernelDataType::STRING, DataType::Utf8)]
-#[case::large_utf8(KernelDataType::STRING, DataType::LargeUtf8)]
-#[case::utf8_view(KernelDataType::STRING, DataType::Utf8View)]
-#[case::int64(KernelDataType::LONG, DataType::Int64)]
-#[case::uint64(KernelDataType::LONG, DataType::UInt64)]
-#[case::int32(KernelDataType::INTEGER, DataType::Int32)]
-#[case::uint32(KernelDataType::INTEGER, DataType::UInt32)]
-#[case::int16(KernelDataType::SHORT, DataType::Int16)]
-#[case::uint16(KernelDataType::SHORT, DataType::UInt16)]
-#[case::int8(KernelDataType::BYTE, DataType::Int8)]
-#[case::uint8(KernelDataType::BYTE, DataType::UInt8)]
-#[case::null(KernelDataType::VOID, DataType::Null)]
-#[case::float32(KernelDataType::FLOAT, DataType::Float32)]
-#[case::float64(KernelDataType::DOUBLE, DataType::Float64)]
-#[case::boolean(KernelDataType::BOOLEAN, DataType::Boolean)]
-#[case::binary(KernelDataType::BINARY, DataType::Binary)]
-#[case::fixed_size_binary(KernelDataType::BINARY, DataType::FixedSizeBinary(16))]
-#[case::large_binary(KernelDataType::BINARY, DataType::LargeBinary)]
-#[case::binary_view(KernelDataType::BINARY, DataType::BinaryView)]
-#[case::decimal(KernelDataType::decimal(10, 2).unwrap(), DataType::Decimal128(10, 2))]
-#[case::date32(KernelDataType::DATE, DataType::Date32)]
-#[case::date64(KernelDataType::DATE, DataType::Date64)]
-#[case::timestamp_micros(
-    KernelDataType::TIMESTAMP,
-    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-)]
-#[case::timestamp_nanos(
-    KernelDataType::TIMESTAMP,
-    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
-)]
-#[case::timestamp_millis(
-    KernelDataType::TIMESTAMP,
-    DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
-)]
-#[case::timestamp_ntz_micros(
-    KernelDataType::TIMESTAMP_NTZ,
-    DataType::Timestamp(TimeUnit::Microsecond, None)
-)]
-#[case::timestamp_ntz_nanos(
-    KernelDataType::TIMESTAMP_NTZ,
-    DataType::Timestamp(TimeUnit::Nanosecond, None)
-)]
-#[case::timestamp_ntz_millis(
-    KernelDataType::TIMESTAMP_NTZ,
-    DataType::Timestamp(TimeUnit::Millisecond, None)
-)]
-#[case::interval_year_month(KernelDataType::INTERVAL_YEAR_MONTH, DataType::Int32)]
-#[case::interval_day_time(KernelDataType::INTERVAL_DAY_TIME, DataType::Int64)]
-#[case::list(int_array_type(), DataType::List(int_array_element()))]
-#[case::list_view(int_array_type(), DataType::ListView(int_array_element()))]
-#[case::large_list(int_array_type(), DataType::LargeList(int_array_element()))]
-#[case::large_list_view(int_array_type(), DataType::LargeListView(int_array_element()))]
-#[case::fixed_size_list(int_array_type(), DataType::FixedSizeList(int_array_element(), 3))]
-#[case::map(int_string_map_type(), arrow_int_string_map_type())]
-#[case::dictionary(
-    KernelDataType::STRING,
-    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
-)]
-fn evaluator_accepts_compatible_arrow_representation(
+#[case::year_month(KernelDataType::INTERVAL_YEAR_MONTH, DataType::Int32)]
+#[case::year_month_unsigned(KernelDataType::INTERVAL_YEAR_MONTH, DataType::UInt32)]
+#[case::day_time(KernelDataType::INTERVAL_DAY_TIME, DataType::Int64)]
+#[case::day_time_unsigned(KernelDataType::INTERVAL_DAY_TIME, DataType::UInt64)]
+fn evaluator_accepts_non_round_trippable_interval_arrow_representation(
     #[case] expected_type: KernelDataType,
     #[case] data_type: DataType,
 ) {
+    assert_top_level_type_compatible(expected_type, data_type);
+}
+
+fn assert_top_level_type_compatible(expected_type: KernelDataType, data_type: DataType) {
     let expected_schema =
         Arc::new(StructType::try_new([StructField::nullable("value", expected_type)]).unwrap());
     let data_schema = Schema::new(vec![Field::new("value", data_type, true)]);
-
     validate_data_schema_top_level(&expected_schema, &data_schema).unwrap();
 }
 

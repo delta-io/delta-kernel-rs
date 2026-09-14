@@ -467,7 +467,7 @@ static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 };
 
 /// Returns the intermediate schema with deletion vector column appended to scan row schema.
-fn intermediate_dv_schema() -> &'static SchemaRef {
+pub(super) fn intermediate_dv_schema() -> &'static SchemaRef {
     &INTERMEDIATE_DV_SCHEMA
 }
 
