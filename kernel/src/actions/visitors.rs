@@ -580,9 +580,9 @@ pub(crate) fn visit_metadata_at<'a>(
 
     let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
     let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
-    // get format out of primitives
     let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
-    // options for format is always empty, so skip getters[4]
+    let format_options: Option<HashMap<_, _>> =
+        getters[4].get_opt(row_index, "metadata.format.options")?;
     let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
     let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
     let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
@@ -596,7 +596,7 @@ pub(crate) fn visit_metadata_at<'a>(
         description,
         format: Format {
             provider: format_provider,
-            options: HashMap::new(),
+            options: format_options.unwrap_or_default(),
         },
         schema_string,
         partition_columns,
@@ -951,7 +951,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::actions::LOG_CHECKPOINT_SCHEMA;
-    use crate::arrow::array::{BooleanArray, StringArray};
+    use crate::arrow::array::{BooleanArray, ListBuilder, StringArray, StringBuilder};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -994,6 +994,56 @@ mod tests {
             writer_features: Some(vec![TableFeature::DeletionVectors]),
         };
         assert_eq!(parsed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_metadata_preserves_format_options() -> DeltaResult<()> {
+        let metadata_json = concat!(
+            r#"{"metaData":{"id":"test-id","#,
+            r#""format":{"provider":"parquet","options":{"compression":"zstd","#,
+            r#""custom.option":"arbitrary value"}},"#,
+            r#""schemaString":"{\"type\":\"struct\",\"fields\":[]}","#,
+            r#""partitionColumns":[],"configuration":{}}}"#,
+        );
+        let data = parse_json_batch(StringArray::from(vec![metadata_json]));
+
+        let metadata = Metadata::try_new_from_data(data.as_ref())?.unwrap();
+
+        assert_eq!(
+            metadata.format.options,
+            HashMap::from([
+                ("compression".to_string(), "zstd".to_string()),
+                ("custom.option".to_string(), "arbitrary value".to_string()),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_visit_metadata_defaults_missing_format_options() -> DeltaResult<()> {
+        let id = StringArray::from(vec!["test-id"]);
+        let provider = StringArray::from(vec!["parquet"]);
+        let schema = StringArray::from(vec![r#"{"type":"struct","fields":[]}"#]);
+        let mut partition_columns = ListBuilder::new(StringBuilder::new());
+        partition_columns.append(true);
+        let partition_columns = partition_columns.finish();
+        let null = ();
+        let getters: [&dyn GetData<'_>; 9] = [
+            &id,
+            &null,
+            &null,
+            &provider,
+            &null,
+            &schema,
+            &partition_columns,
+            &null,
+            &null,
+        ];
+
+        let metadata = visit_metadata_at(0, &getters)?.unwrap();
+
+        assert!(metadata.format.options.is_empty());
         Ok(())
     }
 
