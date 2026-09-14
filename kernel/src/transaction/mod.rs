@@ -1471,13 +1471,13 @@ impl<S> Transaction<S> {
             .flat_map(|schema| schema.fields().map(|field| field.name().to_owned()))
             .collect();
 
-        let make_eval = |has_stats_parsed: bool| {
+        let make_eval = |coalesce_stats_with_parsed: bool| {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(
                 self.commit_timestamp,
                 self.data_change,
                 &columns_to_drop,
-                has_stats_parsed,
+                coalesce_stats_with_parsed,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
             evaluation_handler.new_expression_evaluator(
@@ -1487,8 +1487,13 @@ impl<S> Transaction<S> {
             )
         };
 
-        let base_eval = make_eval(false /* has_stats_parsed */)?;
-        let stats_parsed_eval = make_eval(true /* has_stats_parsed */)?;
+        // Build two evaluators: one for the common case where scan files do not include a
+        // stats_parsed column, and one for predicate-based scans that include stats_parsed.
+        // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
+        // case where stats is null (e.g., on V2 checkpoints with writeStatsAsJson=false) and
+        // then drops the stats_parsed column.
+        let base_eval = make_eval(false /* coalesce_stats_with_parsed */)?;
+        let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */)?;
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {

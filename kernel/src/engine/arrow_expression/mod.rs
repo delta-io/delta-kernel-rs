@@ -403,6 +403,7 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
     }
 }
 
+/// Validates that each expected field exists and has a compatible type at top-level.
 fn validate_data_schema_top_level(
     expected_schema: &SchemaRef,
     data_schema: &ArrowSchema,
@@ -410,8 +411,8 @@ fn validate_data_schema_top_level(
     let mut data_fields = data_schema.fields().iter();
     // Some Kernel code does not provide the full input schema to the evaluator. For example,
     // `scan_metadata_from` may evaluate scan rows containing optional `stats_parsed` and
-    // `partitionValues_parsed` columns using only the base scan-row schema. Expected fields must
-    // retain their declared order, but the batch may contain additional top-level fields.
+    // `partitionValues_parsed` columns using only the base scan-row schema. As a result,
+    // we allow `data_schema` to contain extra fields.
     // TODO(#3263): Require evaluator input schemas to declare every top-level field.
     for expected_field in expected_schema.fields() {
         let data_field = data_fields

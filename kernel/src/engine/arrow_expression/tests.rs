@@ -1467,11 +1467,11 @@ fn evaluator_accepts_variant_arrow_struct_representation() {
     validate_data_schema_top_level(&input_schema, &batch_schema).unwrap();
 }
 
-fn int_array_type() -> KernelDataType {
+fn kernel_int_array_type() -> KernelDataType {
     ArrayType::new(KernelDataType::INTEGER, true).into()
 }
 
-fn int_array_element() -> Arc<Field> {
+fn arrow_int_array_element() -> Arc<Field> {
     Arc::new(Field::new("element", DataType::Int32, true))
 }
 
@@ -1523,11 +1523,11 @@ fn evaluator_accepts_round_trippable_arrow_representations() {
         DataType::Timestamp(TimeUnit::Nanosecond, None),
         DataType::Timestamp(TimeUnit::Millisecond, None),
         DataType::Struct(Fields::empty()),
-        DataType::List(int_array_element()),
-        DataType::ListView(int_array_element()),
-        DataType::LargeList(int_array_element()),
-        DataType::LargeListView(int_array_element()),
-        DataType::FixedSizeList(int_array_element(), 3),
+        DataType::List(arrow_int_array_element()),
+        DataType::ListView(arrow_int_array_element()),
+        DataType::LargeList(arrow_int_array_element()),
+        DataType::LargeListView(arrow_int_array_element()),
+        DataType::FixedSizeList(arrow_int_array_element(), 3),
         arrow_int_string_map_type(),
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         DataType::Dictionary(
@@ -1568,7 +1568,7 @@ fn assert_top_level_type_compatible(expected_type: KernelDataType, data_type: Da
 
 #[rstest]
 #[case::container_and_primitive(empty_struct_type(), DataType::Int32)]
-#[case::different_container_kinds(int_array_type(), arrow_int_string_map_type())]
+#[case::different_container_kinds(kernel_int_array_type(), arrow_int_string_map_type())]
 fn evaluator_rejects_incompatible_top_level_container_types(
     #[case] expected_type: KernelDataType,
     #[case] data_type: DataType,
