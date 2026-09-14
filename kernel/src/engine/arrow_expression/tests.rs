@@ -1128,6 +1128,55 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         .unwrap();
 }
 
+#[rstest]
+#[case::variant(KernelDataType::unshredded_variant())]
+#[case::interval_year_month(KernelDataType::INTERVAL_YEAR_MONTH)]
+#[case::interval_day_time(KernelDataType::INTERVAL_DAY_TIME)]
+#[case::non_string_map_key(MapType::new(
+    KernelDataType::INTEGER,
+    KernelDataType::STRING,
+    true,
+).into())]
+#[case::void_array_element(ArrayType::new(KernelDataType::VOID, true).into())]
+#[case::void_map_value(MapType::new(
+    KernelDataType::STRING,
+    KernelDataType::VOID,
+    true,
+).into())]
+#[ignore = "pending ParseJson semantics implementation"]
+fn test_parse_json_rejects_unsupported_output_schema_during_planning(
+    #[case] unsupported_type: KernelDataType,
+) {
+    let input_schema = schema_ref! { not_null "json_col": STRING };
+    let parse_schema =
+        Arc::new(StructType::try_new([StructField::nullable("value", unsupported_type)]).unwrap());
+    let output_type = KernelDataType::from(parse_schema.as_ref().clone());
+    let expression = Arc::new(Expr::parse_json(col!("json_col"), parse_schema));
+
+    let result =
+        ArrowEvaluationHandler.new_expression_evaluator(input_schema, expression, output_type);
+    assert!(
+        result.is_err(),
+        "unsupported ParseJson schema must be rejected"
+    );
+}
+
+#[rstest]
+#[ignore = "pending ParseJson semantics implementation"]
+fn test_parse_json_rejects_non_string_child_during_planning() {
+    let input_schema = schema_ref! { not_null "json_col": INTEGER };
+    let parse_schema = schema_ref! { nullable "value": INTEGER };
+    let output_type = KernelDataType::from(parse_schema.as_ref().clone());
+    let expression = Arc::new(Expr::parse_json(col!("json_col"), parse_schema));
+
+    let result =
+        ArrowEvaluationHandler.new_expression_evaluator(input_schema, expression, output_type);
+    assert!(
+        result.is_err(),
+        "a non-string ParseJson child must be rejected"
+    );
+}
+
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`
 fn assert_create_many(rows: Vec<Vec<Scalar>>, schema: SchemaRef, expected: RecordBatch) {
     let handler = ArrowEvaluationHandler;

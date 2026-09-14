@@ -345,12 +345,12 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
-/// Parses a non-null UTF-8 JSON object into a typed row.
+/// Parses a UTF-8 JSON object into a typed row.
 ///
 /// Parsing is directed by `output_schema`; types are selected from the schema, not inferred from
-/// JSON tokens. The result has exactly the type and nullability declared by `output_schema`.
-/// Field matching is exact and case-sensitive, extra object members are ignored, and the root row
-/// is present for every input in the required domain.
+/// JSON tokens. The result fields have exactly the types and nullability declared by
+/// `output_schema`. Field matching is exact and case-sensitive, and extra object members are
+/// ignored. A SQL-null input produces a null row. A defined non-null input produces a present row.
 ///
 /// # Standards
 ///
@@ -366,8 +366,8 @@ pub struct VariadicExpression {
 ///
 /// # Null and JSON-string semantics
 ///
-/// These rules apply recursively at requested object members, array elements, and map values. The
-/// document root must be an object as stated above.
+/// A SQL-null input produces a null root row. For non-null input, these rules apply recursively at
+/// requested object members, array elements, and map values. The document root must be an object.
 ///
 /// - a missing object member becomes SQL null;
 /// - JSON `null` becomes SQL null;
@@ -377,10 +377,10 @@ pub struct VariadicExpression {
 ///
 /// After decoding, the result must be checked against the nullability declared by `output_schema`.
 /// A null in a non-nullable struct field, array element, or map value is an evaluation error. A
-/// null parent struct does not violate the nullability of its children.
+/// null parent struct does not affect the nullability of its children.
 ///
-/// Empty-string-to-null conversion is a rule of Delta partition-value serialization, not generic
-/// JSON or per-file statistics decoding. [`ParseJsonExpression`] does not apply it.
+/// NOTE: Empty-string-to-null conversion is a rule of Delta partition-value serialization, not
+/// JSON or decoding. [`ParseJsonExpression`] does not apply it.
 ///
 /// Container decoding applies recursively:
 ///
@@ -460,8 +460,7 @@ pub struct VariadicExpression {
 /// }
 /// ```
 ///
-/// In the engine-neutral SQL lowering dialect, phase one is the following schema-bound parse.
-/// `ROW<...>` supplies the raw result type to `from_json`; it is not runtime type inference.
+/// Phase one parses the JSON string into the explicitly declared `ROW<...>` type:
 ///
 /// ```sql
 /// WITH raw AS (
@@ -516,17 +515,15 @@ pub struct VariadicExpression {
 /// )
 /// ```
 ///
-/// Phase two is compiled from the requested Delta type. This example uses `CASE` because a plain
-/// `ROW(...)` constructor does not retain the nullable nested struct's parent validity. An engine
-/// may instead use a struct-update operation that preserves the source validity bitmap. Scalar
-/// functions propagate null. `transform(r.times, ...)` calls `transform` as a function with
-/// `r.times` as its array argument; likewise, `transform_values` receives `r.blobs` as its map
-/// argument. These denote the engine's schema-bound array-element and map-value transforms. The
-/// final `ROW` is bound to the requested named output type, in schema field order.
+/// Phase two converts the string fields into their requested Delta types. The outer `CASE` checks
+/// `json_text` so a SQL-null input remains null. `transform` converts each array element, and
+/// `transform_values` converts each map value. These conversions leave null inputs null. Every
+/// rebuilt struct must follow the null semantics above. The final `ROW` uses the names and field
+/// order from the requested output schema.
 ///
 /// ```sql
 /// WITH raw AS (
-///   SELECT from_json(
+///   SELECT json_text, from_json(
 ///     json_text,
 ///     ROW<
 ///       byte_value TINYINT,
@@ -550,7 +547,7 @@ pub struct VariadicExpression {
 ///   ) AS r
 ///   FROM input_rows
 /// )
-/// SELECT ROW(
+/// SELECT CASE WHEN json_text IS NULL THEN NULL ELSE ROW(
 ///   r.byte_value,
 ///   r.short_value,
 ///   r.int_value,
@@ -565,16 +562,13 @@ pub struct VariadicExpression {
 ///   parse_timestamp_utc(r.timestamp_value),
 ///   parse_timestamp_ntz(r.timestamp_ntz_value),
 ///   CAST(NULL AS VOID),
-///   CASE WHEN r.nested_value IS NULL
-///        THEN CAST(NULL AS ROW<ts TIMESTAMP WITH TIME ZONE, binary VARBINARY>)
-///        ELSE ROW(
-///          parse_timestamp_utc(r.nested_value.ts),
-///          base64_decode(r.nested_value.binary)
-///        )
-///   END,
+///   ROW(
+///     parse_timestamp_utc(r.nested_value.ts),
+///     base64_decode(r.nested_value.binary)
+///   ),
 ///   transform(r.times, ts -> parse_timestamp_utc(ts)),
 ///   transform_values(r.blobs, (key, value) -> base64_decode(value))
-/// ) AS parsed
+/// ) END AS parsed
 /// FROM raw;
 /// ```
 ///
@@ -604,42 +598,36 @@ pub struct VariadicExpression {
 /// )
 /// ```
 ///
-/// `from_json`, `base64_decode`, `parse_timestamp_utc`, `parse_timestamp_ntz`, `transform`, and
-/// `transform_values` are semantic operations in this cross-engine example. An engine lowers them
-/// to native SQL functions or schema-bound physical expressions. The function names in this
-/// example are notation for those operations, not required engine APIs.
+/// These function names are illustrative. An engine may use any equivalent JSON parser, Base64
+/// decoder, timestamp parser, and array or map conversion.
 ///
-/// Before applying the type-specific decoder, apply the missing and JSON-null rules above. Wrong
-/// token kinds and other values outside the table are undefined; implementations need not add
-/// guards merely to make those inputs deterministic.
+/// Missing fields and JSON null follow the null rules above. Inputs not listed in the table,
+/// including the wrong JSON token type, have undefined behavior.
 ///
-/// # Required representation and lowering by type
+/// # Type rules
 ///
-/// The input column below describes the accepted type-specific input. The common rules above may
-/// return before this pipeline for missing members and JSON null. Every other value not admitted
-/// by the required-input column is undefined. The final column gives examples; it is not an
-/// alternative conversion rule.
+/// The table lists the defined non-null inputs. All other inputs are undefined.
 ///
-/// | Delta target | Required JSON input | Required SQL-engine decoding pipeline | Undefined examples |
+/// | Delta target | Required JSON input | Required decoding | Undefined examples |
 /// |---|---|---|---|
-/// | `BYTE` | integer token | extract the exact integer and checked-convert to signed 8-bit | `1.0`, `1e0`, `128`, or `"1"` |
-/// | `SHORT` | integer token | extract the exact integer and checked-convert to signed 16-bit | `1.0`, `1e0`, `32768`, or `"1"` |
-/// | `INTEGER` | integer token | extract the exact integer and checked-convert to signed 32-bit | `1.0`, `1e0`, `2147483648`, or `"1"` |
-/// | `LONG` | integer token | extract without passing through `DOUBLE`; checked-convert to signed 64-bit | `1.0`, `1e0`, overflow, or `"1"` |
-/// | `FLOAT` | finite number token | extract as IEEE-754 binary32 using `roundTiesToEven` | finite overflow or a non-numeric token |
-/// | `DOUBLE` | finite number token | extract as IEEE-754 binary64 using `roundTiesToEven` | finite overflow or a non-numeric token |
-/// | `FLOAT` or `DOUBLE` special | exactly `"NaN"`, `"Infinity"`, or `"-Infinity"` | extract as `VARCHAR`, recognize the three strings, and construct the IEEE value | any other string or unquoted non-finite spelling |
-/// | `DECIMAL(p,s)` | number token exactly representable by the target type | read the original number text as arbitrary-precision decimal and convert it exactly, without passing through `DOUBLE` | a string token, a value requiring rounding to scale `s`, or a value exceeding precision `p` |
-/// | `BOOLEAN` | `true` or `false` token | extract as SQL `BOOLEAN` | `"true"`, `0`, or `1` |
-/// | `STRING` | string token | decode JSON escapes and return SQL UTF-8 character data; preserve `""` | a number, boolean, array, or object |
-/// | `BINARY` | padded Base64 string satisfying RFC 4648 sections 3.5 and 4 | extract as `VARCHAR`, validate and decode RFC 4648 Base64, and return SQL binary data; `""` becomes empty bytes | bad alphabet, padding, whitespace, or non-zero unused bits |
-/// | `DATE` | string in exact `YYYY-MM-DD` grammar | extract as `VARCHAR`, parse strictly in the proleptic Gregorian calendar, and return SQL `DATE` | invalid calendar date, non-four-digit year, or alternate spelling |
-/// | `TIMESTAMP` | string in the timestamp grammar below | extract as `VARCHAR`, parse offsetless text as UTC or apply its explicit offset, truncate to microseconds, and return a UTC instant | invalid grammar, leap second, bad offset, or out-of-range instant |
-/// | `TIMESTAMP_NTZ` | offset-free string in the grammar below | extract as `VARCHAR`, parse directly as a timezone-free local date-time, truncate to microseconds, and return timestamp-without-time-zone data | `Z`, a numeric offset, invalid grammar, or out-of-range value |
-/// | `VOID` | no non-null JSON value; only missing and JSON null are defined | return typed SQL null | every non-null JSON value, including `""` |
-/// | `STRUCT` | object token | retain the object's parent validity and build a SQL `ROW` by recursively decoding requested members | an array, scalar, or string |
-/// | `ARRAY<T>` | array token | iterate in input order and build a SQL array by applying the compiled `T` decoder to every element | an object, scalar, or string |
-/// | `MAP<STRING,T>` | object token | iterate members, use decoded member names as SQL string keys, and recursively decode every value | an array, scalar, or string |
+/// | `BYTE` | integer token | parse exactly as a signed 8-bit integer | `1.0`, `1e0`, `128`, or `"1"` |
+/// | `SHORT` | integer token | parse exactly as a signed 16-bit integer | `1.0`, `1e0`, `32768`, or `"1"` |
+/// | `INTEGER` | integer token | parse exactly as a signed 32-bit integer | `1.0`, `1e0`, `2147483648`, or `"1"` |
+/// | `LONG` | integer token | parse exactly as a signed 64-bit integer | `1.0`, `1e0`, overflow, or `"1"` |
+/// | `FLOAT` | finite number token | parse as IEEE-754 binary32 using `roundTiesToEven` | finite overflow or a non-number |
+/// | `DOUBLE` | finite number token | parse as IEEE-754 binary64 using `roundTiesToEven` | finite overflow or a non-number |
+/// | `FLOAT` or `DOUBLE` special | exactly `"NaN"`, `"Infinity"`, or `"-Infinity"` | return the corresponding IEEE value | any other string or an unquoted non-finite value |
+/// | `DECIMAL(p,s)` | exactly representable number token | parse exactly as `DECIMAL(p,s)` | a string, a value requiring rounding, or a value exceeding precision `p` |
+/// | `BOOLEAN` | `true` or `false` | return SQL `BOOLEAN` | `"true"`, `0`, or `1` |
+/// | `STRING` | string token | decode the JSON string; preserve `""` | a non-string |
+/// | `BINARY` | padded RFC 4648 Base64 string | decode to bytes; `""` becomes empty bytes | bad alphabet, padding, whitespace, or non-zero unused bits |
+/// | `DATE` | string in exact `YYYY-MM-DD` grammar | parse as SQL `DATE` | an invalid date or alternate spelling |
+/// | `TIMESTAMP` | string in the grammar below | apply its offset, or use UTC when absent; truncate to microseconds | invalid grammar, leap second, bad offset, or out-of-range instant |
+/// | `TIMESTAMP_NTZ` | offset-free string in the grammar below | parse without a timezone; truncate to microseconds | an offset, invalid grammar, or out-of-range value |
+/// | `VOID` | none | return SQL null | every non-null JSON value |
+/// | `STRUCT` | object token | recursively parse requested members as a SQL row | a non-object |
+/// | `ARRAY<T>` | array token | recursively parse each element in order | a non-array |
+/// | `MAP<STRING,T>` | object token | use member names as keys and recursively parse each value | a non-object |
 ///
 /// `VARIANT`, both interval types, and feature-gated `GEOMETRY` and `GEOGRAPHY` are unsupported.
 /// An output schema containing one of these types anywhere in its recursive type tree must be
@@ -664,7 +652,8 @@ pub struct VariadicExpression {
 ///
 /// # Date and timestamp grammar
 ///
-/// Dates use the proleptic Gregorian calendar. Required timestamps have this grammar:
+/// Dates use Gregorian calendar rules for every year, including years before 1582. Required
+/// timestamps have this grammar:
 ///
 /// ```text
 /// date          := YYYY "-" MM "-" DD
@@ -696,7 +685,6 @@ pub struct VariadicExpression {
 /// An input row is outside the portable contract, and therefore has undefined behavior, for any
 /// of the following reasons:
 ///
-/// - the SQL input is null;
 /// - the text is not exactly one complete strict RFC 8259 JSON object, including an empty or
 ///   partial document, multiple roots, trailing non-whitespace, a byte-order mark, comments, single
 ///   quotes, unquoted names, unescaped controls, or non-standard number syntax;
@@ -730,7 +718,7 @@ pub struct VariadicExpression {
 /// schema, or `VOID` inside an array or map.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
-    /// Expression producing the non-null `STRING` JSON text described by this type's contract.
+    /// Expression producing the `STRING` JSON text described by this type's contract.
     pub json_expr: Box<Expression>,
     /// Root struct shape directing recursive decoding, including result nullability.
     pub output_schema: SchemaRef,
