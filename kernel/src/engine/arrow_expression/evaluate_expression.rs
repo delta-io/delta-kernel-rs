@@ -2460,8 +2460,43 @@ mod tests {
     }
 
     #[rstest]
-    #[case::json_null(r#"{"value":null}"#)]
-    fn test_parse_json_void_semantics(#[case] json: &str) {
+    #[case::void(
+        (r#"{"value":null}"#, schema_ref! { nullable "value": VOID }),
+        expected_single_value_table("Null", "NULL"),
+    )]
+    #[ignore = "pending ParseJson semantics implementation"]
+    #[case::padded_base64(
+        (r#"{"value":"AQI="}"#, schema_ref! { not_null "value": BINARY }),
+        expected_single_value_table("Binary", "0102"),
+    )]
+    #[case::empty_binary(
+        (r#"{"value":""}"#, schema_ref! { not_null "value": BINARY }),
+        expected_single_value_table("Binary", ""),
+    )]
+    #[case::field_matching_missing_null_and_extra_members(
+        (
+            r#"{"name":"lower","Name":"upper","json_null":null,"extra":123}"#,
+            schema_ref! {
+                not_null "name": STRING,
+                nullable "missing": STRING,
+                nullable "json_null": STRING,
+            },
+        ),
+        concat!(
+            "+-------+---------+-----------+\n",
+            "| name  | missing | json_null |\n",
+            "| Utf8  | Utf8    | Utf8      |\n",
+            "+-------+---------+-----------+\n",
+            "| lower | NULL    | NULL      |\n",
+            "+-------+---------+-----------+",
+        )
+        .to_string(),
+    )]
+    fn test_parse_json_pretty_semantics(
+        #[case] input: (&str, Arc<StructType>),
+        #[case] expected: String,
+    ) {
+        let (json, output_schema) = input;
         let input_schema = ArrowSchema::new(vec![ArrowField::new(
             "json_col",
             ArrowDataType::Utf8,
@@ -2470,7 +2505,6 @@ mod tests {
         let json = StringArray::from(vec![json]);
         let batch =
             RecordBatch::try_new(Arc::new(input_schema), vec![Arc::new(json) as ArrayRef]).unwrap();
-        let output_schema = schema_ref! { nullable "value": VOID };
 
         let result = evaluate_expression(
             &Expr::parse_json(col!("json_col"), output_schema),
@@ -2480,73 +2514,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             pretty_struct_with_types_and_nulls(result.as_struct()),
-            expected_single_value_table("Null", "NULL"),
-        );
-    }
-
-    #[rstest]
-    #[ignore = "pending ParseJson semantics implementation"]
-    #[case::padded_base64("AQI=", "0102")]
-    #[case::empty_string("", "")]
-    fn test_parse_json_binary_base64_semantics(
-        #[case] encoded: &str,
-        #[case] expected_value: &str,
-    ) {
-        let schema = ArrowSchema::new(vec![ArrowField::new(
-            "json_col",
-            ArrowDataType::Utf8,
-            false,
-        )]);
-        let json = StringArray::from(vec![format!(r#"{{"value":"{encoded}"}}"#)]);
-        let batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json) as ArrayRef]).unwrap();
-        let output_schema = schema_ref! { not_null "value": BINARY };
-
-        let result = evaluate_expression(
-            &Expr::parse_json(col!("json_col"), output_schema),
-            &batch,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            pretty_struct_with_types_and_nulls(result.as_struct()),
-            expected_single_value_table("Binary", expected_value),
-        );
-    }
-
-    #[rstest]
-    fn test_parse_json_field_matching_missing_null_and_extra_members() {
-        let schema = ArrowSchema::new(vec![ArrowField::new(
-            "json_col",
-            ArrowDataType::Utf8,
-            false,
-        )]);
-        let json = StringArray::from(vec![
-            r#"{"name":"lower","Name":"upper","json_null":null,"extra":123}"#,
-        ]);
-        let batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json) as ArrayRef]).unwrap();
-        let output_schema = schema_ref! {
-            not_null "name": STRING,
-            nullable "missing": STRING,
-            nullable "json_null": STRING,
-        };
-
-        let result = evaluate_expression(
-            &Expr::parse_json(col!("json_col"), output_schema),
-            &batch,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            pretty_struct(result.as_struct()),
-            concat!(
-                "+-------+---------+-----------+\n",
-                "| name  | missing | json_null |\n",
-                "+-------+---------+-----------+\n",
-                "| lower |         |           |\n",
-                "+-------+---------+-----------+",
-            )
+            expected,
         );
     }
 
