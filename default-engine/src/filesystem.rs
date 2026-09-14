@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use delta_kernel::object_store::list::{PaginatedListOptions, PaginatedListStore};
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
+use delta_kernel::object_store::{self, DynObjectStore, ObjectMeta, ObjectStoreExt as _, PutMode};
 use delta_kernel::{
     CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, Error, FileMeta, FileSlice,
     StorageHandler,
@@ -14,17 +15,32 @@ use url::Url;
 use crate::executor::TaskExecutor;
 use crate::UrlExt;
 
-#[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
+    paginated: Option<Arc<dyn PaginatedListStore>>,
     task_executor: Arc<E>,
     readahead: usize,
 }
 
+impl<E: TaskExecutor> std::fmt::Debug for ObjectStoreStorageHandler<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreStorageHandler")
+            .field("inner", &self.inner)
+            .field("paginated", &self.paginated.is_some())
+            .field("readahead", &self.readahead)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
-    pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub(crate) fn new(
+        store: Arc<DynObjectStore>,
+        paginated: Option<Arc<dyn PaginatedListStore>>,
+        task_executor: Arc<E>,
+    ) -> Self {
         Self {
             inner: store,
+            paginated,
             task_executor,
             readahead: 10,
         }
@@ -46,6 +62,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
+    paginated: Option<Arc<dyn PaginatedListStore>>,
     path: Url,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
     // The offset is used for list-after; the prefix is used to restrict the listing to a specific
@@ -66,6 +83,10 @@ async fn list_from_impl(
     };
 
     let has_ordered_listing = supports_ordered_listing(&path);
+
+    if let Some(paginated) = paginated {
+        return list_paginated(paginated, path, prefix, offset, has_ordered_listing).await;
+    }
 
     // `list_with_offset` lets capable stores push down the offset but recursively lists
     // descendants.
@@ -98,6 +119,86 @@ async fn list_from_impl(
         )))
     } else {
         Ok(Box::pin(stream))
+    }
+}
+
+/// Lists one directory level while pushing both the delimiter and offset into cloud requests.
+async fn list_paginated(
+    store: Arc<dyn PaginatedListStore>,
+    base_url: Url,
+    prefix: Path,
+    offset: Path,
+    ordered: bool,
+) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
+    let request_prefix = (!prefix.as_ref().is_empty()).then(|| format!("{}/", prefix.as_ref()));
+    let request_offset = (ordered && offset != prefix).then(|| offset.to_string());
+    let first_options = PaginatedListOptions {
+        offset: request_offset,
+        delimiter: Some("/".into()),
+        ..Default::default()
+    };
+
+    let pages: BoxStream<'static, object_store::Result<Vec<ObjectMeta>>> =
+        stream::try_unfold(Some(first_options), move |options| {
+            let store = store.clone();
+            let request_prefix = request_prefix.clone();
+            async move {
+                let Some(options) = options else {
+                    return Ok::<_, object_store::Error>(None);
+                };
+                let result = store
+                    .list_paginated(request_prefix.as_deref(), options)
+                    .await?;
+                let next_options = result.page_token.map(|page_token| PaginatedListOptions {
+                    delimiter: Some("/".into()),
+                    page_token: Some(page_token),
+                    ..Default::default()
+                });
+                Ok(Some((result.result.objects, next_options)))
+            }
+        })
+        .boxed();
+
+    let filtered_pages = pages.map_ok(move |objects| {
+        let base_url = base_url.clone();
+        let prefix = prefix.clone();
+        let offset = offset.clone();
+        stream::iter(
+            objects
+                .into_iter()
+                .filter(move |meta| {
+                    meta.location.as_ref() > offset.as_ref()
+                        && is_direct_child(&meta.location, &prefix)
+                })
+                .map(move |meta| Ok::<_, object_store::Error>(file_meta(&base_url, meta))),
+        )
+    });
+    let stream = filtered_pages
+        .try_flatten()
+        .err_into::<delta_kernel::Error>();
+
+    if ordered {
+        Ok(stream.boxed())
+    } else {
+        let mut items: Vec<_> = stream.try_collect().await?;
+        items.sort_unstable();
+        Ok(stream::iter(items.into_iter().map(Ok)).boxed())
+    }
+}
+
+fn is_direct_child(location: &Path, prefix: &Path) -> bool {
+    location
+        .prefix_match(prefix)
+        .is_some_and(|parts| parts.count() == 1)
+}
+
+fn file_meta(base_url: &Url, meta: ObjectMeta) -> FileMeta {
+    let mut location = base_url.clone();
+    location.set_path(&format!("/{}", meta.location.as_ref()));
+    FileMeta {
+        location,
+        last_modified: meta.last_modified.timestamp_millis(),
+        size: meta.size,
     }
 }
 
@@ -207,7 +308,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
-        let future = list_from_impl(self.inner.clone(), path.clone());
+        let future = list_from_impl(self.inner.clone(), self.paginated.clone(), path.clone());
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
             future,
@@ -297,18 +398,117 @@ fn supports_ordered_listing(url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
     use delta_kernel::Engine as _;
     use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
     use test_utils::delta_path_for_version;
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::storage::EngineStore;
     use crate::DefaultEngineBuilder;
+
+    #[derive(Debug)]
+    struct RecordingOffsetStore {
+        inner: InMemory,
+        list_requests: Mutex<Vec<(Option<Path>, Path)>>,
+    }
+
+    impl RecordingOffsetStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                list_requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl std::fmt::Display for RecordingOffsetStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordingOffsetStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RecordingOffsetStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.list_requests
+                .lock()
+                .unwrap()
+                .push((prefix.cloned(), offset.clone()));
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     fn setup_test() -> (
         tempfile::TempDir,
@@ -318,7 +518,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor);
+        let handler = ObjectStoreStorageHandler::new(store.clone(), None, executor);
         (tmp, store, handler)
     }
 
@@ -365,7 +565,7 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, None, executor);
 
         let mut slices: Vec<FileSlice> = Vec::new();
 
@@ -396,7 +596,7 @@ mod tests {
             .unwrap();
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, None, executor);
         let file_url = Url::parse("memory:///hello%2C%20world%21").unwrap();
 
         let read_back: Vec<Bytes> = storage
@@ -473,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_from_applies_offset_and_excludes_nested_files() {
-        let store = Arc::new(InMemory::new());
+        let store = Arc::new(RecordingOffsetStore::new());
         for key in [
             "_delta_log/00000000000000000000.json",
             "_delta_log/00000000000000000001.json",
@@ -487,7 +687,7 @@ mod tests {
         }
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor);
+        let handler = ObjectStoreStorageHandler::new(store.clone(), None, executor);
         let start = Url::parse("memory:///_delta_log/00000000000000000001.json").unwrap();
 
         let locations: Vec<_> = handler
@@ -497,6 +697,84 @@ mod tests {
             .collect();
 
         assert_eq!(locations, vec!["/_delta_log/00000000000000000002.json"]);
+        assert_eq!(
+            *store.list_requests.lock().unwrap(),
+            vec![(
+                Some(Path::from("_delta_log")),
+                Path::from("_delta_log/00000000000000000001.json")
+            )]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn azure_listing_pushes_directory_and_offset_and_remains_lazy() {
+        const OFFSET: &str = "table/_delta_log/00000000000000000010.json";
+        const NEXT: &str = "table/_delta_log/00000000000000000011.json";
+
+        let server = MockServer::start().await;
+        let body = format!(
+            "<EnumerationResults><Blobs>\
+             <Blob><Name>table/_delta_log/00000000000000000009.json</Name><Properties>\
+             <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>\
+             <Content-Length>1</Content-Length><Content-Type>application/json</Content-Type>\
+             </Properties></Blob>\
+             <Blob><Name>{OFFSET}</Name><Properties>\
+             <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>\
+             <Content-Length>1</Content-Length><Content-Type>application/json</Content-Type>\
+             </Properties></Blob>\
+             <Blob><Name>{NEXT}</Name><Properties>\
+             <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>\
+             <Content-Length>1</Content-Length><Content-Type>application/json</Content-Type>\
+             </Properties></Blob>\
+             <Blob><Name>table/_delta_log/_staged_commits/nested.json</Name><Properties>\
+             <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>\
+             <Content-Length>1</Content-Length><Content-Type>application/json</Content-Type>\
+             </Properties></Blob>\
+             </Blobs><NextMarker>page-2</NextMarker></EnumerationResults>"
+        );
+        Mock::given(method("GET"))
+            .and(path("/container"))
+            .and(query_param("prefix", "table/_delta_log/"))
+            .and(query_param("delimiter", "/"))
+            .and(query_param("startFrom", OFFSET))
+            .and(query_param_is_missing("marker"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/xml"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/container"))
+            .and(query_param("marker", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<EnumerationResults><Blobs></Blobs></EnumerationResults>",
+                "application/xml",
+            ))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let table_url =
+            Url::parse("abfss://container@account.dfs.core.windows.net/table/").unwrap();
+        let options = vec![
+            ("endpoint", server.uri()),
+            ("allow_http", "true".to_string()),
+            ("skip_signature", "true".to_string()),
+        ];
+        let store = EngineStore::from_url_opts(&table_url, options).unwrap();
+        let engine = DefaultEngineBuilder::new(store).build();
+        let start = table_url
+            .join("_delta_log/00000000000000000010.json")
+            .unwrap();
+        let mut files = engine.storage_handler().list_from(&start).unwrap();
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            files.next().unwrap().unwrap().location,
+            table_url.join(&format!("/{NEXT}")).unwrap()
+        );
+        drop(files);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        server.verify().await;
     }
 
     #[tokio::test]
