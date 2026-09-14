@@ -1118,8 +1118,8 @@ mod tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
-    use crate::arrow::util::pretty::pretty_format_batches;
-    use crate::engine::arrow_conversion::scalar::extract_primitive_scalar;
+    use crate::arrow::util::display::FormatOptions;
+    use crate::arrow::util::pretty::{pretty_format_batches, pretty_format_batches_with_options};
     use crate::expressions::{
         col, column_expr_ref, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
         Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
@@ -1160,6 +1160,28 @@ mod tests {
         pretty_format_batches(&[RecordBatch::from(array.clone())])
             .unwrap()
             .to_string()
+    }
+
+    fn pretty_struct_with_types_and_nulls(array: &StructArray) -> String {
+        let options = FormatOptions::default()
+            .with_null("NULL")
+            .with_types_info(true);
+        pretty_format_batches_with_options(&[RecordBatch::from(array.clone())], &options)
+            .unwrap()
+            .to_string()
+    }
+
+    fn expected_single_value_table(arrow_type: &str, value: &str) -> String {
+        let width = ["value", arrow_type, value]
+            .into_iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap();
+        let border = format!("+{}+", "-".repeat(width + 2));
+        format!(
+            "{border}\n| {name:<width$} |\n| {arrow_type:<width$} |\n{border}\n| {value:<width$} |\n{border}",
+            name = "value",
+        )
     }
 
     fn create_nested_test_batch() -> RecordBatch {
@@ -2367,94 +2389,52 @@ mod tests {
         assert_eq!(b_col.value(2), "test");
     }
 
-    #[derive(Debug)]
-    enum ExpectedJsonScalar {
-        Value(Scalar),
-        FloatNaN,
-        DoubleNaN,
-    }
-
     #[rstest]
-    #[case::byte("-8", DataType::BYTE, ExpectedJsonScalar::Value(Scalar::Byte(-8)))]
-    #[case::short(
-        "32000",
-        DataType::SHORT,
-        ExpectedJsonScalar::Value(Scalar::Short(32_000))
-    )]
-    #[case::integer("-7", DataType::INTEGER, ExpectedJsonScalar::Value(Scalar::Integer(-7)))]
-    #[case::long(
-        "9007199254740993",
-        DataType::LONG,
-        ExpectedJsonScalar::Value(Scalar::Long(9_007_199_254_740_993))
-    )]
-    #[case::float("1.5", DataType::FLOAT, ExpectedJsonScalar::Value(Scalar::Float(1.5)))]
-    #[case::double("-2.25", DataType::DOUBLE, ExpectedJsonScalar::Value(Scalar::Double(-2.25)))]
-    #[case::float_nan(r#""NaN""#, DataType::FLOAT, ExpectedJsonScalar::FloatNaN)]
-    #[case::double_nan(r#""NaN""#, DataType::DOUBLE, ExpectedJsonScalar::DoubleNaN)]
-    #[case::float_infinity(
-        r#""Infinity""#,
-        DataType::FLOAT,
-        ExpectedJsonScalar::Value(Scalar::Float(f32::INFINITY))
-    )]
-    #[case::double_infinity(
-        r#""Infinity""#,
-        DataType::DOUBLE,
-        ExpectedJsonScalar::Value(Scalar::Double(f64::INFINITY))
-    )]
-    #[case::float_negative_infinity(
-        r#""-Infinity""#,
-        DataType::FLOAT,
-        ExpectedJsonScalar::Value(Scalar::Float(f32::NEG_INFINITY))
-    )]
-    #[case::double_negative_infinity(
-        r#""-Infinity""#,
-        DataType::DOUBLE,
-        ExpectedJsonScalar::Value(Scalar::Double(f64::NEG_INFINITY))
-    )]
+    #[case::byte("-8", DataType::BYTE, "Int8", "-8")]
+    #[case::short("32000", DataType::SHORT, "Int16", "32000")]
+    #[case::integer("-7", DataType::INTEGER, "Int32", "-7")]
+    #[case::long("9007199254740993", DataType::LONG, "Int64", "9007199254740993")]
+    #[case::float("1.5", DataType::FLOAT, "Float32", "1.5")]
+    #[case::double("-2.25", DataType::DOUBLE, "Float64", "-2.25")]
+    #[case::float_nan(r#""NaN""#, DataType::FLOAT, "Float32", "NaN")]
+    #[case::double_nan(r#""NaN""#, DataType::DOUBLE, "Float64", "NaN")]
+    #[case::float_infinity(r#""Infinity""#, DataType::FLOAT, "Float32", "inf")]
+    #[case::double_infinity(r#""Infinity""#, DataType::DOUBLE, "Float64", "inf")]
+    #[case::float_negative_infinity(r#""-Infinity""#, DataType::FLOAT, "Float32", "-inf")]
+    #[case::double_negative_infinity(r#""-Infinity""#, DataType::DOUBLE, "Float64", "-inf")]
     #[case::decimal(
         "12345678.90",
         DataType::decimal(10, 2).unwrap(),
-        ExpectedJsonScalar::Value(Scalar::decimal(1_234_567_890, 10, 2).unwrap()),
+        "Decimal128(10, 2)",
+        "12345678.90",
     )]
-    #[case::boolean(
-        "true",
-        DataType::BOOLEAN,
-        ExpectedJsonScalar::Value(Scalar::Boolean(true))
-    )]
-    #[case::string(
-        r#""delta\n\u03bb""#,
-        DataType::STRING,
-        ExpectedJsonScalar::Value(Scalar::String("delta\nλ".into())),
-    )]
-    #[case::empty_string(
-        r#""""#,
-        DataType::STRING,
-        ExpectedJsonScalar::Value(Scalar::String(String::new()))
-    )]
-    #[case::date(
-        r#""2024-02-29""#,
-        DataType::DATE,
-        ExpectedJsonScalar::Value(Scalar::Date(19_782))
-    )]
+    #[case::boolean("true", DataType::BOOLEAN, "Boolean", "true")]
+    #[case::string(r#""delta\u03bb""#, DataType::STRING, "Utf8", "deltaλ")]
+    #[case::empty_string(r#""""#, DataType::STRING, "Utf8", "")]
+    #[case::date(r#""2024-02-29""#, DataType::DATE, "Date32", "2024-02-29")]
     #[case::timestamp_with_offset(
         r#""2020-01-02T03:04:05.123456789+02:30""#,
         DataType::TIMESTAMP,
-        ExpectedJsonScalar::Value(Scalar::Timestamp(1_577_925_245_123_456))
+        "Timestamp(µs, \"UTC\")",
+        "2020-01-02T00:34:05.123456Z"
     )]
     #[case::timestamp_without_offset(
         r#""2020-01-02 03:04:05""#,
         DataType::TIMESTAMP,
-        ExpectedJsonScalar::Value(Scalar::Timestamp(1_577_934_245_000_000))
+        "Timestamp(µs, \"UTC\")",
+        "2020-01-02T03:04:05Z"
     )]
     #[case::timestamp_ntz(
         r#""2020-01-02T03:04:05.987654321""#,
         DataType::TIMESTAMP_NTZ,
-        ExpectedJsonScalar::Value(Scalar::TimestampNtz(1_577_934_245_987_654))
+        "Timestamp(µs)",
+        "2020-01-02T03:04:05.987654"
     )]
     fn test_parse_json_defined_non_binary_scalar_semantics(
         #[case] json_value: &str,
         #[case] data_type: DataType,
-        #[case] expected: ExpectedJsonScalar,
+        #[case] expected_arrow_type: &str,
+        #[case] expected_value: &str,
     ) {
         let input_schema = ArrowSchema::new(vec![ArrowField::new(
             "json_col",
@@ -2473,28 +2453,21 @@ mod tests {
             None,
         )
         .unwrap();
-        let value = result.as_struct().column_by_name("value").unwrap();
-        let actual = extract_primitive_scalar(value.as_ref(), 0).unwrap();
-
-        match expected {
-            ExpectedJsonScalar::Value(expected) => assert_eq!(actual, expected),
-            ExpectedJsonScalar::FloatNaN => {
-                assert!(matches!(actual, Scalar::Float(value) if value.is_nan()))
-            }
-            ExpectedJsonScalar::DoubleNaN => {
-                assert!(matches!(actual, Scalar::Double(value) if value.is_nan()))
-            }
-        }
+        assert_eq!(
+            pretty_struct_with_types_and_nulls(result.as_struct()),
+            expected_single_value_table(expected_arrow_type, expected_value),
+        );
     }
 
     #[rstest]
-    fn test_parse_json_void_semantics() {
+    #[case::json_null(r#"{"value":null}"#)]
+    fn test_parse_json_void_semantics(#[case] json: &str) {
         let input_schema = ArrowSchema::new(vec![ArrowField::new(
             "json_col",
             ArrowDataType::Utf8,
             false,
         )]);
-        let json = StringArray::from(vec![r#"{"value":null}"#]);
+        let json = StringArray::from(vec![json]);
         let batch =
             RecordBatch::try_new(Arc::new(input_schema), vec![Arc::new(json) as ArrayRef]).unwrap();
         let output_schema = schema_ref! { nullable "value": VOID };
@@ -2505,16 +2478,20 @@ mod tests {
             None,
         )
         .unwrap();
-        let value = result.as_struct().column_by_name("value").unwrap();
-        assert_eq!(value.data_type(), &ArrowDataType::Null);
-        assert_eq!(value.len(), 1);
+        assert_eq!(
+            pretty_struct_with_types_and_nulls(result.as_struct()),
+            expected_single_value_table("Null", "NULL"),
+        );
     }
 
     #[rstest]
     #[ignore = "pending ParseJson semantics implementation"]
-    #[case::padded_base64("AQI=", &[0x01, 0x02])]
-    #[case::empty_string("", b"")]
-    fn test_parse_json_binary_base64_semantics(#[case] encoded: &str, #[case] expected: &[u8]) {
+    #[case::padded_base64("AQI=", "0102")]
+    #[case::empty_string("", "")]
+    fn test_parse_json_binary_base64_semantics(
+        #[case] encoded: &str,
+        #[case] expected_value: &str,
+    ) {
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "json_col",
             ArrowDataType::Utf8,
@@ -2531,15 +2508,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let values = result
-            .as_struct()
-            .column_by_name("value")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
-        assert!(values.is_valid(0));
-        assert_eq!(values.value(0), expected);
+        assert_eq!(
+            pretty_struct_with_types_and_nulls(result.as_struct()),
+            expected_single_value_table("Binary", expected_value),
+        );
     }
 
     #[rstest]
