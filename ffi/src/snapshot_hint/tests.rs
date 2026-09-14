@@ -374,7 +374,7 @@ fn aggregate_setter_wraps_invalid_log_path_errors(#[case] location: &'static str
 }
 
 #[test]
-fn aggregate_setter_treats_null_log_path_pointer_as_empty() {
+fn aggregate_setter_rejects_null_nonempty_log_path_array() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
     let hint = FfiSnapshotHint {
@@ -389,7 +389,12 @@ fn aggregate_setter_treats_null_log_path_pointer_as_empty() {
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
     };
-    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
+    assert_extern_result_error_contains(
+        result,
+        KernelError::InvalidSnapshotHint,
+        "supplied log paths are invalid",
+    );
 
     unsafe {
         free_snapshot_builder(builder);

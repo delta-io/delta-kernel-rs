@@ -3,47 +3,36 @@
 use delta_kernel::{DeltaResult, FileMeta, LogPath};
 use url::Url;
 
-use crate::{KernelStringSlice, TryFromStringSlice};
+use crate::{FfiSlice, KernelStringSlice, TryFromStringSlice};
 
-/// FFI-safe array of LogPaths. Note that we _explicitly_ do not implement `Copy` on this struct
-/// despite all types being `Copy`, to avoid accidental misuse of the pointer.
-///
-/// This struct is essentially a borrowed view into an array. The owner must ensure the underlying
-/// array remains valid for the duration of its use.
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct LogPathArray {
-    /// Pointer to the first element of the FfiLogPath array. If len is 0, this pointer may be
-    /// null, otherwise it must be non-null.
-    pub ptr: *const FfiLogPath,
-    /// Number of elements in the array
-    pub len: usize,
-}
+/// Borrowed array of FFI-safe log paths.
+pub type LogPathArray = FfiSlice<FfiLogPath>;
 
 impl LogPathArray {
-    /// Create an empty LogPathArray
-    pub fn empty() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-
     /// Convert this array into a Vec of kernel LogPaths
     ///
     /// # Safety
     /// The ptr must point to `len` valid FfiLogPath elements, and those elements
     /// must remain valid for the duration of this call
     pub(crate) unsafe fn log_paths(&self) -> DeltaResult<Vec<LogPath>> {
-        if self.ptr.is_null() || self.len == 0 {
-            return Ok(Vec::new());
-        }
-
-        let slice = unsafe { std::slice::from_raw_parts(self.ptr, self.len) };
-        slice
+        unsafe { self.try_as_slice("log path array") }?
             .iter()
             .map(|ffi_path| unsafe { ffi_path.log_path() })
             .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Converts this array into log paths, treating any null pointer as an empty array.
+    ///
+    /// # Safety
+    ///
+    /// A non-null `ptr` must point to `len` valid [`FfiLogPath`] elements that remain valid for the
+    /// duration of this call.
+    pub(crate) unsafe fn log_paths_treating_null_as_empty(&self) -> DeltaResult<Vec<LogPath>> {
+        if self.ptr.is_null() {
+            Ok(Vec::new())
+        } else {
+            unsafe { self.log_paths() }
+        }
     }
 }
 
