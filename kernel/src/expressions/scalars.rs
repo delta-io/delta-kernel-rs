@@ -2182,6 +2182,11 @@ mod tests {
         display_names: Vec<String>,
     }
 
+    #[derive(ToSchema, IntoStructData)]
+    struct OptionalFeatures {
+        features: Option<Vec<TableFeature>>,
+    }
+
     fn test_person() -> Person {
         Person {
             id: 1,
@@ -2196,6 +2201,37 @@ mod tests {
     #[test]
     fn derived_struct_conversions_round_trip() {
         assert_round_trip(test_person(), Person::to_schema());
+    }
+
+    #[test]
+    fn derived_struct_conversion_distinguishes_absent_and_empty_arrays() {
+        let Scalar::Struct(absent) = Scalar::from(OptionalFeatures { features: None }) else {
+            unreachable!()
+        };
+        let Scalar::Struct(empty) = Scalar::from(OptionalFeatures {
+            features: Some(vec![]),
+        }) else {
+            unreachable!()
+        };
+
+        let array_type = ArrayType::new(DataType::STRING, false);
+        assert_eq!(absent.values(), &[Scalar::null(array_type.clone())]);
+        let [Scalar::Array(empty)] = empty.values() else {
+            panic!("expected one array value");
+        };
+        assert_eq!(empty.array_type(), &array_type);
+        assert!(empty.array_elements().is_empty());
+    }
+
+    #[test]
+    fn struct_data_rejects_null_for_non_nullable_field() {
+        assert_result_error_with_message(
+            StructData::try_new(
+                vec![StructField::not_null("value", DataType::STRING)],
+                vec![Scalar::null(DataType::STRING)],
+            ),
+            "Value for non-nullable field \"value\" cannot be null",
+        );
     }
 
     #[rstest]

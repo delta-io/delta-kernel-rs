@@ -435,12 +435,6 @@ pub enum Error {
     #[error("Invalid Checkpoint: {0}")]
     InvalidCheckpoint(String),
 
-    /// Error while transforming a schema + leaves into an Expression of literals
-    #[error(transparent)]
-    LiteralExpressionTransformError(
-        #[from] crate::expressions::literal_expression_transform::Error,
-    ),
-
     /// Schema mismatch has occurred or invalid/not-kernel-supported schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
