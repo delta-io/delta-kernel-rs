@@ -15,7 +15,8 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema a
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::display::array_value_to_string;
 use crate::committer::FileSystemCommitter;
-use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_conversion::TryFromArrow as _;
+use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
@@ -660,7 +661,7 @@ fn test_scan_metadata_from_same_version() {
         .try_collect()
         .unwrap();
     let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .scan_metadata_from(engine.as_ref(), version, scan_row_schema(), files, None)
         .unwrap()
         .try_collect()
         .unwrap();
@@ -700,6 +701,9 @@ fn test_scan_metadata_from_projects_cached_typed_stats_for_narrower_scan() {
         })
         .try_collect()
         .unwrap();
+    let cached_batch = extract_record_batch(cached_metadata[0].as_ref()).unwrap();
+    let cached_metadata_schema =
+        Arc::new(StructType::try_from_arrow(cached_batch.schema().as_ref()).unwrap());
     assert_eq!(
         cached_metadata.iter().map(|data| data.len()).sum::<usize>(),
         5
@@ -726,7 +730,13 @@ fn test_scan_metadata_from_projects_cached_typed_stats_for_narrower_scan() {
         .unwrap();
     let mut replayed_paths = Vec::new();
     for metadata in replay_scan
-        .scan_metadata_from(engine.as_ref(), version, cached_metadata, None)
+        .scan_metadata_from(
+            engine.as_ref(),
+            version,
+            cached_metadata_schema,
+            cached_metadata,
+            None,
+        )
         .unwrap()
     {
         replayed_paths = metadata
@@ -775,6 +785,9 @@ fn test_scan_metadata_from_updates_typed_cache_with_new_commits() {
         })
         .try_collect()
         .unwrap();
+    let cached_batch = extract_record_batch(cached_metadata[0].as_ref()).unwrap();
+    let cached_metadata_schema =
+        Arc::new(StructType::try_from_arrow(cached_batch.schema().as_ref()).unwrap());
     assert_eq!(
         cached_metadata.iter().map(|data| data.len()).sum::<usize>(),
         4
@@ -805,7 +818,13 @@ fn test_scan_metadata_from_updates_typed_cache_with_new_commits() {
         .unwrap();
     let mut replayed_paths = Vec::new();
     for metadata in replay_scan
-        .scan_metadata_from(engine.as_ref(), 3, cached_metadata, None)
+        .scan_metadata_from(
+            engine.as_ref(),
+            3,
+            cached_metadata_schema,
+            cached_metadata,
+            None,
+        )
         .unwrap()
     {
         replayed_paths = metadata
@@ -845,6 +864,9 @@ fn test_scan_metadata_from_handles_cached_typed_stats_across_type_widening() {
         .map_ok(|ScanMetadata { scan_files, .. }| scan_files.apply_selection_vector().unwrap())
         .try_collect()
         .unwrap();
+    let cached_batch = extract_record_batch(cached_metadata[0].as_ref()).unwrap();
+    let cached_metadata_schema =
+        Arc::new(StructType::try_from_arrow(cached_batch.schema().as_ref()).unwrap());
 
     // Version 2 widens `int_long` to Int64 and adds a file whose value exceeds 1,000. A fresh
     // scan therefore prunes the version 1 file and keeps only the new file.
@@ -873,7 +895,13 @@ fn test_scan_metadata_from_handles_cached_typed_stats_across_type_widening() {
         .unwrap();
     let mut replayed_paths = Vec::new();
     for metadata in replay_scan
-        .scan_metadata_from(engine.as_ref(), 1, cached_metadata, None)
+        .scan_metadata_from(
+            engine.as_ref(),
+            1,
+            cached_metadata_schema,
+            cached_metadata,
+            None,
+        )
         .unwrap()
     {
         replayed_paths = metadata
@@ -925,6 +953,7 @@ fn test_scan_metadata_from_falls_back_from_incompatible_typed_stats() {
                     "size": 1,
                     "modificationTime": 0,
                     "stats": "{\"numRecords\":1,\"minValues\":{\"id\":1},\"maxValues\":{\"id\":1},\"nullCount\":{\"id\":0},\"tightBounds\":true}",
+                    "fileConstantValues": {"partitionValues": {}},
                     "stats_parsed": {
                         "numRecords": 1,
                         "minValues": {"id": "not-a-long"},
@@ -934,7 +963,7 @@ fn test_scan_metadata_from_falls_back_from_incompatible_typed_stats() {
                     }
                 }
             "#])),
-            cached_metadata_schema,
+            cached_metadata_schema.clone(),
         )
         .unwrap();
 
@@ -946,7 +975,13 @@ fn test_scan_metadata_from_falls_back_from_incompatible_typed_stats() {
         .unwrap();
     let mut replayed_paths = Vec::new();
     for metadata in replay_scan
-        .scan_metadata_from(engine.as_ref(), version, [cached_metadata], None)
+        .scan_metadata_from(
+            engine.as_ref(),
+            version,
+            cached_metadata_schema,
+            [cached_metadata],
+            None,
+        )
         .unwrap()
     {
         replayed_paths = metadata
@@ -998,7 +1033,7 @@ fn test_scan_metadata_from_with_update() {
         .unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
     let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), 0, files, None)
+        .scan_metadata_from(engine.as_ref(), 0, scan_row_schema(), files, None)
         .unwrap()
         .map_ok(|ScanMetadata { scan_files, .. }| {
             let (underlying_data, selection_vector) = scan_files.into_parts();
