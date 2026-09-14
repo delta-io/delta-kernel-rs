@@ -116,11 +116,7 @@ use crate::actions::{
     SIDECAR_FIELD,
 };
 use crate::engine_data::FilteredEngineData;
-<<<<<<< HEAD
-use crate::expressions::{lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar};
-=======
-use crate::expressions::{ExpressionRef, Scalar, StructData};
->>>>>>> 3fc6dbf877d7118aef5a8a8ae088217ad2d0c8bf
+use crate::expressions::{ExpressionRef, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
@@ -682,10 +678,6 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         schema: &SchemaRef,
     ) -> DeltaResult<ActionReconciliationBatch> {
-<<<<<<< HEAD
-        // Start with an all-null row
-        let null_row = engine.evaluation_handler().null_row(schema.clone())?;
-
         // Build the checkpointMetadata struct value. `tags` is left unset (null) since kernel
         // does not currently emit checkpoint tags.
         let checkpoint_metadata_value: Scalar = CheckpointMetadata {
@@ -694,24 +686,7 @@ impl CheckpointWriter {
         }
         .into();
 
-        // Use a struct patch to set just the checkpointMetadata field, keeping others null
-        let patch = ExpressionStructPatchBuilder::new()
-            .replace(CHECKPOINT_METADATA_NAME, lit(checkpoint_metadata_value));
-
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            schema.clone(),
-            Arc::new(Expression::struct_patch(patch)?),
-            schema.clone().into(),
-        )?;
-
-        let checkpoint_metadata_batch = evaluator.evaluate(null_row.as_ref())?;
-=======
-        // Build the checkpointMetadata struct value
-        let checkpoint_metadata_value = Scalar::Struct(StructData::try_new(
-            vec![StructField::not_null("version", DataType::LONG)],
-            vec![Scalar::from(self.version)],
-        )?);
-        // Build an action row with only the checkpointMetadata field set.
+        // Build an action row with only the checkpointMetadata field set; all others null.
         let row: Vec<Scalar> = schema
             .fields()
             .map(|field| {
@@ -725,7 +700,6 @@ impl CheckpointWriter {
         let checkpoint_metadata_batch = engine
             .evaluation_handler()
             .create_many(schema.clone(), vec![row])?;
->>>>>>> 3fc6dbf877d7118aef5a8a8ae088217ad2d0c8bf
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 
