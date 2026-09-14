@@ -11,6 +11,8 @@
 
 use std::sync::LazyLock;
 
+use delta_kernel_derive::internal_api;
+
 use super::FileSizeHistogram;
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
@@ -37,6 +39,39 @@ pub struct FileStats {
 }
 
 impl FileStats {
+    /// Creates complete file statistics after validating the aggregate values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for negative file or byte totals, or negative histogram bins.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn try_new(
+        num_files: i64,
+        table_size_bytes: i64,
+        file_size_histogram: Option<FileSizeHistogram>,
+    ) -> DeltaResult<Self> {
+        for (name, value) in [
+            ("numFiles", num_files),
+            ("tableSizeBytes", table_size_bytes),
+        ] {
+            if value < 0 {
+                return Err(Error::generic(format!(
+                    "CRC has invalid {name}: expected a non-negative value, got {value}"
+                )));
+            }
+        }
+        let file_size_histogram = file_size_histogram
+            .map(FileSizeHistogram::check_non_negative)
+            .transpose()
+            .map_err(|error| Error::generic(error.to_string()))?;
+        Ok(Self {
+            num_files,
+            table_size_bytes,
+            file_size_histogram,
+        })
+    }
+
     /// Returns the number of active [`Add`](crate::actions::Add) file actions in this table
     /// version.
     pub fn num_files(&self) -> i64 {

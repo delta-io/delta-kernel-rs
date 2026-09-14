@@ -106,6 +106,40 @@ pub struct Crc {
 }
 
 impl Crc {
+    /// Reconstructs CRC state from its in-memory fields.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        version: Version,
+        metadata: Metadata,
+        protocol: Protocol,
+        file_stats_state: FileStatsState,
+        in_commit_timestamp_opt: Option<i64>,
+        set_transaction_state: SetTransactionState,
+        domain_metadata_state: DomainMetadataState,
+        txn_id: Option<String>,
+        all_files: Option<Vec<Add>>,
+        num_deleted_records_opt: Option<i64>,
+        num_deletion_vectors_opt: Option<i64>,
+        deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+    ) -> Self {
+        Self {
+            version,
+            metadata,
+            protocol,
+            file_stats_state,
+            in_commit_timestamp_opt,
+            set_transaction_state,
+            domain_metadata_state,
+            txn_id,
+            all_files,
+            num_deleted_records_opt,
+            num_deletion_vectors_opt,
+            deleted_record_counts_histogram_opt,
+        }
+    }
+
     /// Returns absolute file-level statistics only if `file_stats_state` is `Complete`.
     ///
     /// Returns `None` when file stats cannot be trusted -- for example, when the CRC was
@@ -205,6 +239,8 @@ impl Crc {
             }
         }
         // A CRC file on disk is by definition complete; we never deserialize a degraded state.
+        // TODO(#3309): Validate histogram aggregates uniformly across serialized and reconstructed
+        // CRC state.
         let file_stats_state = FileStatsState::Complete(FileStats {
             num_files: raw.num_files,
             table_size_bytes: raw.table_size_bytes,
@@ -218,17 +254,25 @@ impl Crc {
             in_commit_timestamp_opt: raw.in_commit_timestamp_opt,
             // Present array (including empty `[]`) deserializes as Complete; absent or null
             // deserializes as Partial(empty).
+            // TODO(#3309): Validate duplicate application IDs uniformly across CRC input paths.
             set_transaction_state: match raw.set_transactions {
-                Some(v) => SetTransactionState::Complete(
-                    v.into_iter().map(|t| (t.app_id.clone(), t)).collect(),
+                Some(values) => SetTransactionState::Complete(
+                    values
+                        .into_iter()
+                        .map(|transaction| (transaction.app_id.clone(), transaction))
+                        .collect(),
                 ),
                 None => SetTransactionState::Partial(HashMap::new()),
             },
             // Present array (including empty `[]`) deserializes as Complete; absent or null
             // deserializes as Partial(empty).
+            // TODO(#3309): Validate duplicates and tombstones uniformly across CRC input paths.
             domain_metadata_state: match raw.domain_metadata {
-                Some(v) => DomainMetadataState::Complete(
-                    v.into_iter().map(|d| (d.domain().to_string(), d)).collect(),
+                Some(values) => DomainMetadataState::Complete(
+                    values
+                        .into_iter()
+                        .map(|action| (action.domain().to_string(), action))
+                        .collect(),
                 ),
                 None => DomainMetadataState::Partial(HashMap::new()),
             },
@@ -333,6 +377,17 @@ pub struct DeletedRecordCountsHistogram {
     /// Array of size 10 where each element represents the count of files falling into a specific
     /// deletion count range.
     pub(crate) deleted_record_counts: Vec<i64>,
+}
+
+impl DeletedRecordCountsHistogram {
+    /// Reconstructs a deleted-record-count histogram from its serialized bins.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn from_parts(deleted_record_counts: Vec<i64>) -> Self {
+        Self {
+            deleted_record_counts,
+        }
+    }
 }
 
 #[cfg(test)]
