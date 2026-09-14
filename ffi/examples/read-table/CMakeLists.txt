@@ -37,6 +37,12 @@ add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_p
 # `delta.columnMapping.id`, which the schema visitor reads back via get_from_metadata_map and
 # prints per field.
 add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
+if(PRINT_DATA)
+  set(ProjectedColumnMappingExpected ${ExpectedPath}/column-mapping-projected.expected)
+else()
+  set(ProjectedColumnMappingExpected ${ExpectedPath}/column-mapping-projected-no-data.expected)
+endif()
+add_test(NAME read_projected_column_mapping COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ProjectedColumnMappingExpected} -cletter,new_int)
 if(GEO_TYPE_IN_DEV)
   add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)
 endif()

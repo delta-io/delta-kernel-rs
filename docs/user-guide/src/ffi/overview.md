@@ -170,15 +170,21 @@ See [Visitor callbacks](#visitor-callbacks) below for the pattern.
 
 The build-side counterpart to `visit_schema`: per-field callbacks that let the
 engine construct a Kernel `StructType` from its own type system (for example,
-to pass to `scan_builder_with_schema`).
+to pass to `scan_builder_with_schema`). Every field function takes an
+`EngineMetadata`: an opaque engine-owned value plus a synchronous callback that
+inserts the field's metadata into a short-lived `KernelMetadataVisitorState`.
+Neither the state nor borrowed string slices may be retained after the callback.
 
 | Function | Purpose |
 |----------|---------|
+| `EngineMetadata` / `KernelMetadataVisitorState` | Pair engine-owned metadata with its synchronous visitor and receive the field's Kernel metadata values during that callback |
 | `visit_field_byte` / `visit_field_short` / `visit_field_integer` / `visit_field_long` / `visit_field_float` / `visit_field_double` / `visit_field_boolean` | Build a numeric or boolean primitive `StructField` |
 | `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |
+| `visit_metadata_number` / `visit_metadata_string` / `visit_metadata_boolean` | Insert a typed integral, UTF-8 string, or Boolean value into the active field metadata state |
+| `visit_metadata_json` | Insert one arbitrary metadata value from valid UTF-8 JSON (not a complete metadata map) |
 
 **Reading (scans)**
 
@@ -384,6 +390,12 @@ pattern is the same in every case:
 Callbacks run synchronously on the same thread that called `visit_*`. Strings
 passed to callbacks (`KernelStringSlice`) are borrowed for the duration of the
 call; copy them if you need to retain them beyond the callback.
+
+Build-side schema metadata uses the same lifetime rule. Kernel creates a fresh
+`KernelMetadataVisitorState` for one field, invokes `EngineMetadata.visitor`,
+and moves the completed values into that `StructField`. Return `false` from the
+engine callback when an insertion fails; Kernel then rejects the field without
+inserting it into the schema visitor state.
 
 ## Error handling
 
