@@ -35,6 +35,10 @@ test_registry_override() {
     }
 
     DELTA_KERNEL_RELEASE_REGISTRY=mirror run_cargo_release 0.29.0
+    assert_contains "$capture" "--workspace"
+    assert_contains "$capture" "--no-publish"
+    assert_contains "$capture" "--no-push"
+    assert_contains "$capture" "--no-tag"
     assert_contains "$capture" "--registry"
     assert_contains "$capture" "mirror"
 

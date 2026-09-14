@@ -108,11 +108,14 @@ run_cargo_release() {
     cargo "${args[@]}"
 }
 
+kernel_cliff() {
+    git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --use-branch-tags "$@"
+}
+
 # Ask git-cliff for the latest Kernel release so changelog generation and verification use the
 # same tag grammar from cliff.toml.
 latest_kernel_release_tag() {
-    git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --use-branch-tags \
-        --latest --context | jq -r '.[0].version // empty'
+    kernel_cliff --latest --context | jq -r '.[0].version // empty'
 }
 
 release_changelog_heading() {
@@ -150,8 +153,7 @@ release_changelog_section() {
 # for commit filtering and PR references.
 render_release_changelog() {
     local version="$1"
-    git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --use-branch-tags \
-        --unreleased --include-path "*" --tag "$version" --context | \
+    kernel_cliff --unreleased --include-path "*" --tag "$version" --context | \
         git cliff --config "$REPO_ROOT/cliff.toml" --from-context -
 }
 
@@ -249,9 +251,7 @@ refresh_release_changelog() {
     strip_release_changelog_section "$version" "$stripped"
     mv "$stripped" "$changelog"
 
-    if ! git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" \
-        --use-branch-tags --unreleased --prepend "$changelog" --include-path "*" \
-        --tag "$version"; then
+    if ! kernel_cliff --unreleased --prepend "$changelog" --include-path "*" --tag "$version"; then
         cp "$backup" "$changelog"
         log_error "Failed to refresh CHANGELOG.md; original saved at $backup"
     fi
