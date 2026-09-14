@@ -721,6 +721,247 @@ fn test_scan_metadata_from_with_update() {
     assert_eq!(new_files[1].num_rows(), 3);
 }
 
+/// A [`ScanPlanner`] that answers with a fixed file set and records every request it receives.
+struct FixedPlanner {
+    files: HashSet<FileActionKey>,
+    requests: Mutex<Vec<(Url, Version, Option<Pred>)>>,
+}
+
+impl FixedPlanner {
+    fn new(files: impl IntoIterator<Item = FileActionKey>) -> Self {
+        Self {
+            files: files.into_iter().collect(),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<(Url, Version, Option<Pred>)> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl ScanPlanner for FixedPlanner {
+    fn plan(
+        &self,
+        table_root: &Url,
+        snapshot_version: Version,
+        predicate: Option<&Pred>,
+    ) -> DeltaResult<HashSet<FileActionKey>> {
+        self.requests.lock().unwrap().push((
+            table_root.clone(),
+            snapshot_version,
+            predicate.cloned(),
+        ));
+        Ok(self.files.clone())
+    }
+}
+
+/// A [`ScanPlanner`] that always fails.
+struct FailingPlanner;
+
+impl ScanPlanner for FailingPlanner {
+    fn plan(
+        &self,
+        _table_root: &Url,
+        _snapshot_version: Version,
+        _predicate: Option<&Pred>,
+    ) -> DeltaResult<HashSet<FileActionKey>> {
+        Err(Error::generic("planner unavailable"))
+    }
+}
+
+/// The six live files of `./tests/data/basic_partitioned/` at its latest version, sorted.
+const BASIC_PARTITIONED_FILES: [&str; 6] = [
+    "letter=__HIVE_DEFAULT_PARTITION__/part-00000-8eb7f29a-e6a1-436e-a638-bbf0a7953f09.c000.snappy.parquet",
+    "letter=a/part-00000-0dbe0cc5-e3bf-4fb0-b36a-b5fdd67fe843.c000.snappy.parquet",
+    "letter=a/part-00000-a08d296a-d2c5-4a99-bea9-afcea42ba2e9.c000.snappy.parquet",
+    "letter=b/part-00000-41954fb0-ef91-47e5-bd41-b75169c41c17.c000.snappy.parquet",
+    "letter=c/part-00000-27a17b8f-be68-485c-9c49-70c742be30c0.c000.snappy.parquet",
+    "letter=e/part-00000-847cf2d1-1247-4aa0-89ef-2f90c68ea51e.c000.snappy.parquet",
+];
+
+/// Loads the latest snapshot of `table` with a [`SyncEngine`].
+fn planner_test_snapshot(table: &str) -> (Arc<SyncEngine>, Arc<Snapshot>) {
+    let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    (engine, snapshot)
+}
+
+/// A planner naming `paths`, none of which carry a deletion vector.
+fn planner_for_paths(paths: &[&str]) -> ScanPlannerRef {
+    let files = paths.iter().map(|path| FileActionKey::new(*path, None));
+    Arc::new(FixedPlanner::new(files))
+}
+
+/// Collects every listed file as its `(path, dv_unique_id)` identity.
+fn get_file_keys_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<FileActionKey>> {
+    fn scan_metadata_callback(keys: &mut Vec<FileActionKey>, scan_file: ScanFile) {
+        let dv_unique_id = scan_file.dv_info.deletion_vector.map(|dv| dv.unique_id());
+        keys.push(FileActionKey::new(scan_file.path, dv_unique_id));
+    }
+    let mut keys = vec![];
+    for res in scan.scan_metadata(engine)? {
+        keys = res?.visit_scan_files(keys, scan_metadata_callback)?;
+    }
+    Ok(keys)
+}
+
+/// Builds a scan over `snapshot` with `predicate` and a planner that answers with an empty set,
+/// checking that building does not consult the planner.
+fn scan_with_empty_plan(snapshot: Arc<Snapshot>, predicate: &Pred) -> (Scan, Arc<FixedPlanner>) {
+    let planner = Arc::new(FixedPlanner::new([]));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate.clone()))
+        .with_planner(planner.clone() as ScanPlannerRef)
+        .build()
+        .unwrap();
+    assert!(
+        planner.requests().is_empty(),
+        "build must not consult the planner"
+    );
+    (scan, planner)
+}
+
+/// A planner's answer is intersected with log replay's: it can remove files from the listing but
+/// never add one, and absent (or `None`) the listing is unchanged.
+#[rstest]
+#[case::absent(None, &BASIC_PARTITIONED_FILES[..])]
+#[case::all(Some(&BASIC_PARTITIONED_FILES[..]), &BASIC_PARTITIONED_FILES[..])]
+#[case::subset(Some(&BASIC_PARTITIONED_FILES[1..3]), &BASIC_PARTITIONED_FILES[1..3])]
+#[case::unknown_path_is_not_added(
+    Some(&[BASIC_PARTITIONED_FILES[0], "letter=z/part-00000-not-in-the-log.c000.snappy.parquet"][..]),
+    &BASIC_PARTITIONED_FILES[..1]
+)]
+#[case::empty(Some(&[][..]), &[][..])]
+fn test_scan_planner_intersects_with_log_replay(
+    #[case] planned: Option<&[&str]>,
+    #[case] expected: &[&str],
+) {
+    let (engine, snapshot) = planner_test_snapshot("./tests/data/basic_partitioned/");
+    let scan = snapshot
+        .scan_builder()
+        .with_planner(planned.map(planner_for_paths))
+        .build()
+        .unwrap();
+    let mut files = get_files_for_scan(scan, engine.as_ref()).unwrap();
+    files.sort();
+    assert_eq!(files, expected);
+}
+
+/// A logical file is identified by `(path, deletionVector.uniqueId)`, not by path alone. The live
+/// file of `table-with-dv-small` was added without a deletion vector, then removed and re-added
+/// with one; naming its path with no DV id, or the wrong one, lists nothing.
+#[rstest]
+#[case::no_dv(None, false)]
+#[case::wrong_dv(Some("uvBn[lx{q8@P<9BNH/isA@2"), false)]
+#[case::exact_dv(Some("uvBn[lx{q8@P<9BNH/isA@1"), true)]
+fn test_scan_planner_matches_deletion_vector_identity(
+    #[case] dv_unique_id: Option<&str>,
+    #[case] matches: bool,
+) {
+    const PATH: &str = "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet";
+    let (engine, snapshot) = planner_test_snapshot("./tests/data/table-with-dv-small/");
+    let planned = FileActionKey::new(PATH, dv_unique_id.map(str::to_string));
+    let planner: ScanPlannerRef = Arc::new(FixedPlanner::new([planned.clone()]));
+    let scan = snapshot
+        .scan_builder()
+        .with_planner(planner)
+        .build()
+        .unwrap();
+    let keys = get_file_keys_for_scan(scan, engine.as_ref()).unwrap();
+    let expected: Vec<_> = matches.then_some(planned).into_iter().collect();
+    assert_eq!(keys, expected);
+}
+
+/// A planner failure is the caller's error, not a silent fallback to the unplanned listing.
+#[test]
+fn test_scan_planner_error_propagates() {
+    let (engine, snapshot) = planner_test_snapshot("./tests/data/basic_partitioned/");
+    let planner: ScanPlannerRef = Arc::new(FailingPlanner);
+    let scan = snapshot
+        .scan_builder()
+        .with_planner(planner)
+        .build()
+        .unwrap();
+    assert_result_error_with_message(scan.scan_metadata(engine.as_ref()), "planner unavailable");
+}
+
+/// The planner is consulted by `scan_metadata`, not `build`, and receives the table root, the
+/// snapshot version, and the predicate exactly as the caller set it.
+#[test]
+fn test_scan_planner_receives_table_root_version_and_predicate() {
+    let (engine, snapshot) = planner_test_snapshot("./tests/data/basic_partitioned/");
+    let predicate = Pred::is_not_null(col!("number"));
+    let (scan, planner) = scan_with_empty_plan(snapshot.clone(), &predicate);
+    assert!(get_files_for_scan(scan, engine.as_ref())
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        planner.requests(),
+        vec![(
+            snapshot.table_root().clone(),
+            snapshot.version(),
+            Some(predicate)
+        )]
+    );
+}
+
+/// Under column mapping the planner receives the logical predicate, not the physical rewrite
+/// kernel uses for its own data skipping.
+#[test]
+fn test_scan_planner_receives_logical_predicate_under_column_mapping() {
+    let table = "table-with-columnmapping-mode-name";
+    let tempdir = load_test_data("tests/golden_data", table).unwrap();
+    // Golden tables extract to `<name>/delta/` (with a sibling `expected/`).
+    let table_path = tempdir.path().join(table).join("delta");
+    let url = url::Url::from_directory_path(table_path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let predicate = Pred::is_not_null(col!("LongType"));
+    let (scan, planner) = scan_with_empty_plan(snapshot.clone(), &predicate);
+    assert_ne!(scan.physical_predicate().unwrap().as_ref(), &predicate);
+    // The table has two files; the empty plan removes both.
+    assert!(get_files_for_scan(scan, &engine).unwrap().is_empty());
+    assert_eq!(
+        planner.requests(),
+        vec![(
+            snapshot.table_root().clone(),
+            snapshot.version(),
+            Some(predicate)
+        )]
+    );
+}
+
+/// A statically false predicate already lists nothing, so the planner is not consulted.
+#[test]
+fn test_scan_planner_not_consulted_when_predicate_is_statically_false() {
+    let (engine, snapshot) = planner_test_snapshot("./tests/data/basic_partitioned/");
+    let (scan, planner) = scan_with_empty_plan(snapshot, &Pred::FALSE);
+    assert!(get_files_for_scan(scan, engine.as_ref())
+        .unwrap()
+        .is_empty());
+    assert!(planner.requests().is_empty());
+}
+
+/// Like cancellation, a planner is not threaded through `parallel_scan_metadata`, which fails
+/// fast rather than silently listing files the planner did not name.
+#[test]
+fn test_scan_planner_rejected_by_parallel_scan_metadata() {
+    let (engine, snapshot) = planner_test_snapshot("./tests/data/basic_partitioned/");
+    let scan = snapshot
+        .scan_builder()
+        .with_planner(planner_for_paths(&BASIC_PARTITIONED_FILES))
+        .build()
+        .unwrap();
+    assert_result_error_with_message(
+        scan.parallel_scan_metadata(engine),
+        "planner is not supported by parallel_scan_metadata",
+    );
+}
+
 #[test]
 fn test_get_partition_value() {
     let cases = [

@@ -144,6 +144,8 @@ pub struct SerializableScanState {
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique
 ///   file (identified by its path and deletion vector unique ID), only the latest valid Add action
 ///   is processed.
+/// - Planner Restriction: If the scan has a [`ScanPlanner`](crate::scan::ScanPlanner), Adds it did
+///   not name are dropped in the same pass, after deduplication.
 /// - Parse-error fallback: If transformation and data skipping return [`Error::ParseError`],
 ///   deduplicates the raw batch first, then retries transformation and data skipping on the
 ///   surviving actions.
@@ -176,6 +178,8 @@ pub struct ScanLogReplayProcessor {
     partition_values_options: ScanPartitionValuesOptions,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
+    /// Files a [`ScanPlanner`](crate::scan::ScanPlanner) allowed, or `None` without a planner.
+    planned_files: Option<HashSet<FileActionKey>>,
     /// Metrics related to the scan
     metrics: Arc<ScanMetrics>,
 }
@@ -344,6 +348,7 @@ impl ScanLogReplayProcessor {
             stats_options,
             partition_values_options,
             checkpoint_info,
+            planned_files: None,
             metrics,
         })
     }
@@ -578,6 +583,8 @@ struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     state_info: Arc<StateInfo>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
     active_add_file_sizes: Vec<u64>,
+    /// Logical files the scan's planner allowed, or `None` without a planner.
+    planned_files: Option<&'a HashSet<FileActionKey>>,
     metrics: &'a ScanMetrics,
 }
 
@@ -586,6 +593,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         deduplicator: D,
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
+        planned_files: Option<&'a HashSet<FileActionKey>>,
         metrics: &'a ScanMetrics,
     ) -> AddRemoveDedupVisitor<'a, D> {
         let active_add_file_sizes = vec![0; selection_vector.len()];
@@ -595,6 +603,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             state_info,
             row_transform_exprs: Vec::new(),
             active_add_file_sizes,
+            planned_files,
             metrics,
         }
     }
@@ -647,8 +656,13 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             self.metrics.incr_remove_files_seen_from_delta_files();
         };
 
-        // Check both adds and removes (skipping already-seen), but only transform and return adds
-        if self.deduplicator.check_and_record_seen(file_key) || !is_add {
+        // Check both adds and removes (skipping already-seen), but only transform and return adds.
+        // The planner check comes after the key is recorded, so a planner-pruned Add still shadows
+        // older actions for the same logical file.
+        let planned = self
+            .planned_files
+            .is_none_or(|planned| planned.contains(&file_key));
+        if self.deduplicator.check_and_record_seen(file_key) || !is_add || !planned {
             return Ok(false);
         }
 
@@ -986,6 +1000,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 deduplicator,
                 pre_dedup_selection,
                 self.state_info.clone(),
+                self.planned_files.as_ref(),
                 &self.metrics,
             );
             visitor.visit_rows_of(actions.as_ref())?;
@@ -1085,6 +1100,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 deduplicator,
                 pre_dedup_selection,
                 self.state_info.clone(),
+                self.planned_files.as_ref(),
                 &self.metrics,
             );
             visitor.visit_rows_of(actions.as_ref())?;
@@ -1145,6 +1161,9 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// files and columnar data skipping is disabled (no stats-based or partition-value-based
 /// pruning), but row-level partition filtering still applies.
 ///
+/// When `planned_files` is set, only Adds it contains are selected; Removes and deduplication are
+/// unaffected.
+///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
@@ -1154,17 +1173,19 @@ pub(crate) fn scan_action_iter(
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
+    planned_files: Option<HashSet<FileActionKey>>,
 ) -> DeltaResult<(
     impl Iterator<Item = DeltaResult<ScanMetadata>>,
     Arc<ScanMetrics>,
 )> {
-    let processor = ScanLogReplayProcessor::new(
+    let mut processor = ScanLogReplayProcessor::new(
         engine,
         state_info,
         checkpoint_info,
         stats_options,
         partition_values_options,
     )?;
+    processor.planned_files = planned_files;
     let metrics = processor.metrics.clone();
     Ok((processor.process_actions_iter(action_iter), metrics))
 }
@@ -1317,6 +1338,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            None,
         )
         .unwrap();
         for res in iter {
@@ -1346,6 +1368,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -1429,6 +1452,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -1492,6 +1516,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            None,
         )?;
 
         let mut iter = iter.peekable();
@@ -1948,6 +1973,7 @@ mod tests {
                 ..Default::default()
             },
             ScanPartitionValuesOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -2031,6 +2057,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            None,
         )
         .unwrap();
 
